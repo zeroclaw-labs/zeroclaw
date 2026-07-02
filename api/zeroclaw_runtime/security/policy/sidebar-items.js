@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["AutonomyLevel","CommandRiskLevel","EscalationViolation","ToolOperation"],"struct":["ActionTracker","PerSenderTracker","SecurityPolicy"]};

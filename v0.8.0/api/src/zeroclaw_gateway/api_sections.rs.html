@@ -1,0 +1,1800 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `crates/zeroclaw-gateway/src/api_sections.rs`."><title>api_sections.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="zeroclaw_gateway" data-themes="" data-resource-suffix="" data-rustdoc-version="1.96.0 (ac68faa20 2026-05-25)" data-channel="1.96.0" data-search-js="search-b5634cc7.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../../static.files/src-script-813739b1.js"></script><script defer src="../../src-files.js"></script><script defer src="../../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">zeroclaw_gateway/</div>api_sections.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-4"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="doccomment">//! Curated config-section endpoints. Used by the `/config` page in the
+<a href=#2 id=2 data-nosnippet>2</a>//! web dashboard to navigate the schema by curated section rather than
+<a href=#3 id=3 data-nosnippet>3</a>//! raw prop paths. OpenAPI is authoritative for the exact route set.
+<a href=#4 id=4 data-nosnippet>4</a>
+<a href=#5 id=5 data-nosnippet>5</a></span><span class="kw">use </span>axum::{
+<a href=#6 id=6 data-nosnippet>6</a>    extract::{Query, State},
+<a href=#7 id=7 data-nosnippet>7</a>    http::HeaderMap,
+<a href=#8 id=8 data-nosnippet>8</a>    response::{IntoResponse, Response},
+<a href=#9 id=9 data-nosnippet>9</a>};
+<a href=#10 id=10 data-nosnippet>10</a><span class="kw">use </span>serde::{Deserialize, Serialize};
+<a href=#11 id=11 data-nosnippet>11</a><span class="kw">use </span>zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
+<a href=#12 id=12 data-nosnippet>12</a><span class="kw">use </span>zeroclaw_runtime::rpc::types::{
+<a href=#13 id=13 data-nosnippet>13</a>    CatalogModelProvider, CatalogModelsResult, CatalogResponse, ConfigSectionEntry,
+<a href=#14 id=14 data-nosnippet>14</a>    ConfigSectionsResult, ConfigStatusResult, PickerItem, PickerResponse, SelectItemResponse,
+<a href=#15 id=15 data-nosnippet>15</a>};
+<a href=#16 id=16 data-nosnippet>16</a>
+<a href=#17 id=17 data-nosnippet>17</a><span class="kw">use </span><span class="kw">super</span>::AppState;
+<a href=#18 id=18 data-nosnippet>18</a><span class="kw">use </span><span class="kw">super</span>::api::require_auth;
+<a href=#19 id=19 data-nosnippet>19</a>
+<a href=#20 id=20 data-nosnippet>20</a><span class="doccomment">/// `GET /api/config/catalog` — list every model provider the CLI wizard knows
+<a href=#21 id=21 data-nosnippet>21</a>/// about. The dashboard shows these in the "+ Add model provider" picker so
+<a href=#22 id=22 data-nosnippet>22</a>/// CLI / web stay in sync.
+<a href=#23 id=23 data-nosnippet>23</a></span><span class="kw">pub async fn </span>handle_catalog(State(state): State&lt;AppState&gt;, headers: HeaderMap) -&gt; Response {
+<a href=#24 id=24 data-nosnippet>24</a>    <span class="kw">if let </span><span class="prelude-val">Err</span>(e) = require_auth(<span class="kw-2">&amp;</span>state, <span class="kw-2">&amp;</span>headers) {
+<a href=#25 id=25 data-nosnippet>25</a>        <span class="kw">return </span>e.into_response();
+<a href=#26 id=26 data-nosnippet>26</a>    }
+<a href=#27 id=27 data-nosnippet>27</a>    <span class="kw">let _ </span>= state;
+<a href=#28 id=28 data-nosnippet>28</a>
+<a href=#29 id=29 data-nosnippet>29</a>    <span class="kw">let </span>model_providers: Vec&lt;CatalogModelProvider&gt; = zeroclaw_providers::list_model_providers()
+<a href=#30 id=30 data-nosnippet>30</a>        .into_iter()
+<a href=#31 id=31 data-nosnippet>31</a>        .map(|p| CatalogModelProvider {
+<a href=#32 id=32 data-nosnippet>32</a>            name: p.name.to_string(),
+<a href=#33 id=33 data-nosnippet>33</a>            display_name: p.display_name.to_string(),
+<a href=#34 id=34 data-nosnippet>34</a>            local: p.local,
+<a href=#35 id=35 data-nosnippet>35</a>        })
+<a href=#36 id=36 data-nosnippet>36</a>        .collect();
+<a href=#37 id=37 data-nosnippet>37</a>
+<a href=#38 id=38 data-nosnippet>38</a>    axum::Json(CatalogResponse { model_providers }).into_response()
+<a href=#39 id=39 data-nosnippet>39</a>}
+<a href=#40 id=40 data-nosnippet>40</a>
+<a href=#41 id=41 data-nosnippet>41</a><span class="attr">#[derive(Debug, Deserialize)]
+<a href=#42 id=42 data-nosnippet>42</a>#[cfg_attr(feature = <span class="string">"schema-export"</span>, derive(schemars::JsonSchema))]
+<a href=#43 id=43 data-nosnippet>43</a></span><span class="kw">pub struct </span>ModelsQuery {
+<a href=#44 id=44 data-nosnippet>44</a>    <span class="doccomment">/// ModelProvider name (canonical, from CatalogModelProvider.name).
+<a href=#45 id=45 data-nosnippet>45</a>    /// `provider` alias matches the query-string name the web dashboard uses.
+<a href=#46 id=46 data-nosnippet>46</a>    </span><span class="attr">#[serde(alias = <span class="string">"provider"</span>)]
+<a href=#47 id=47 data-nosnippet>47</a>    </span><span class="kw">pub </span>model_provider: String,
+<a href=#48 id=48 data-nosnippet>48</a>}
+<a href=#49 id=49 data-nosnippet>49</a>
+<a href=#50 id=50 data-nosnippet>50</a><span class="doccomment">/// `GET /api/config/catalog/models?model_provider=&lt;name&gt;` — fetch the model list
+<a href=#51 id=51 data-nosnippet>51</a>/// for one model_provider. Same code path the CLI wizard uses
+<a href=#52 id=52 data-nosnippet>52</a>/// (`zeroclaw_providers::create_model_provider(...).list_models()`), which goes
+<a href=#53 id=53 data-nosnippet>53</a>/// through the models.dev cached catalog for OpenAI / Anthropic / Gemini,
+<a href=#54 id=54 data-nosnippet>54</a>/// the live `/v1/models` endpoint for OpenRouter, etc.
+<a href=#55 id=55 data-nosnippet>55</a>///
+<a href=#56 id=56 data-nosnippet>56</a>/// Lazy: the dashboard hits this only when the user picks a model_provider, so
+<a href=#57 id=57 data-nosnippet>57</a>/// initial catalog load stays fast. Fetch failures return an empty list
+<a href=#58 id=58 data-nosnippet>58</a>/// with `live: false` so the form falls back to a free-text input.
+<a href=#59 id=59 data-nosnippet>59</a></span><span class="kw">pub async fn </span>handle_catalog_models(
+<a href=#60 id=60 data-nosnippet>60</a>    State(state): State&lt;AppState&gt;,
+<a href=#61 id=61 data-nosnippet>61</a>    headers: HeaderMap,
+<a href=#62 id=62 data-nosnippet>62</a>    Query(q): Query&lt;ModelsQuery&gt;,
+<a href=#63 id=63 data-nosnippet>63</a>) -&gt; Response {
+<a href=#64 id=64 data-nosnippet>64</a>    <span class="kw">if let </span><span class="prelude-val">Err</span>(e) = require_auth(<span class="kw-2">&amp;</span>state, <span class="kw-2">&amp;</span>headers) {
+<a href=#65 id=65 data-nosnippet>65</a>        <span class="kw">return </span>e.into_response();
+<a href=#66 id=66 data-nosnippet>66</a>    }
+<a href=#67 id=67 data-nosnippet>67</a>    <span class="kw">let _ </span>= state;
+<a href=#68 id=68 data-nosnippet>68</a>    <span class="kw">let </span>local = zeroclaw_runtime::quickstart::model_provider_is_local(<span class="kw-2">&amp;</span>q.model_provider);
+<a href=#69 id=69 data-nosnippet>69</a>    <span class="kw">let </span>(models, pricing, live) =
+<a href=#70 id=70 data-nosnippet>70</a>        zeroclaw_runtime::quickstart::model_catalog(<span class="kw-2">&amp;</span>q.model_provider).<span class="kw">await</span>;
+<a href=#71 id=71 data-nosnippet>71</a>    axum::Json(CatalogModelsResult {
+<a href=#72 id=72 data-nosnippet>72</a>        model_provider: q.model_provider,
+<a href=#73 id=73 data-nosnippet>73</a>        models,
+<a href=#74 id=74 data-nosnippet>74</a>        pricing,
+<a href=#75 id=75 data-nosnippet>75</a>        local,
+<a href=#76 id=76 data-nosnippet>76</a>        live,
+<a href=#77 id=77 data-nosnippet>77</a>    })
+<a href=#78 id=78 data-nosnippet>78</a>    .into_response()
+<a href=#79 id=79 data-nosnippet>79</a>}
+<a href=#80 id=80 data-nosnippet>80</a>
+<a href=#81 id=81 data-nosnippet>81</a><span class="kw">fn </span>error_response(err: ConfigApiError) -&gt; Response {
+<a href=#82 id=82 data-nosnippet>82</a>    <span class="kw">let </span>status = axum::http::StatusCode::from_u16(err.code.http_status())
+<a href=#83 id=83 data-nosnippet>83</a>        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+<a href=#84 id=84 data-nosnippet>84</a>    (status, axum::Json(err)).into_response()
+<a href=#85 id=85 data-nosnippet>85</a>}
+<a href=#86 id=86 data-nosnippet>86</a>
+<a href=#87 id=87 data-nosnippet>87</a><span class="comment">// ── Section + picker (mirrors the TUI flow) ──────────────────────────
+<a href=#88 id=88 data-nosnippet>88</a>
+<a href=#89 id=89 data-nosnippet>89</a></span><span class="doccomment">/// Pure derivation of the section status response from a config snapshot.
+<a href=#90 id=90 data-nosnippet>90</a>/// `needs_quickstart` is `false` iff at least one enabled `[agents.&lt;alias&gt;]`
+<a href=#91 id=91 data-nosnippet>91</a>/// block has a resolved model provider with a selected model plus resolved
+<a href=#92 id=92 data-nosnippet>92</a>/// risk/runtime profile refs. A provider without a bound, runnable agent is
+<a href=#93 id=93 data-nosnippet>93</a>/// not a completion signal: chat dispatch still bounces with a setup error in
+<a href=#94 id=94 data-nosnippet>94</a>/// that state.
+<a href=#95 id=95 data-nosnippet>95</a></span><span class="attr">#[must_use]
+<a href=#96 id=96 data-nosnippet>96</a></span><span class="kw">pub fn </span>derive_section_status(cfg: <span class="kw-2">&amp;</span>zeroclaw_config::schema::Config) -&gt; ConfigStatusResult {
+<a href=#97 id=97 data-nosnippet>97</a>    <span class="kw">let </span>missing = quickstart_missing_requirements(cfg);
+<a href=#98 id=98 data-nosnippet>98</a>    <span class="kw">let </span>ready = missing.is_empty();
+<a href=#99 id=99 data-nosnippet>99</a>    <span class="kw">let </span>has_partial_state = !cfg.onboard_state.completed_sections.is_empty()
+<a href=#100 id=100 data-nosnippet>100</a>        || cfg.providers.models.iter_entries().next().is_some()
+<a href=#101 id=101 data-nosnippet>101</a>        || !cfg.risk_profiles.is_empty()
+<a href=#102 id=102 data-nosnippet>102</a>        || !cfg.runtime_profiles.is_empty()
+<a href=#103 id=103 data-nosnippet>103</a>        || !cfg.agents.is_empty();
+<a href=#104 id=104 data-nosnippet>104</a>    <span class="kw">let </span>reason = <span class="kw">if </span>ready {
+<a href=#105 id=105 data-nosnippet>105</a>        <span class="string">"has_dispatchable_agent"
+<a href=#106 id=106 data-nosnippet>106</a>    </span>} <span class="kw">else if </span>has_partial_state {
+<a href=#107 id=107 data-nosnippet>107</a>        <span class="string">"incomplete_agent"
+<a href=#108 id=108 data-nosnippet>108</a>    </span>} <span class="kw">else </span>{
+<a href=#109 id=109 data-nosnippet>109</a>        <span class="string">"fresh_install"
+<a href=#110 id=110 data-nosnippet>110</a>    </span>};
+<a href=#111 id=111 data-nosnippet>111</a>    ConfigStatusResult {
+<a href=#112 id=112 data-nosnippet>112</a>        needs_quickstart: !ready,
+<a href=#113 id=113 data-nosnippet>113</a>        reason: reason.to_string(),
+<a href=#114 id=114 data-nosnippet>114</a>        has_partial_state,
+<a href=#115 id=115 data-nosnippet>115</a>        missing,
+<a href=#116 id=116 data-nosnippet>116</a>    }
+<a href=#117 id=117 data-nosnippet>117</a>}
+<a href=#118 id=118 data-nosnippet>118</a>
+<a href=#119 id=119 data-nosnippet>119</a><span class="kw">fn </span>quickstart_missing_requirements(cfg: <span class="kw-2">&amp;</span>zeroclaw_config::schema::Config) -&gt; Vec&lt;String&gt; {
+<a href=#120 id=120 data-nosnippet>120</a>    <span class="kw">let </span><span class="kw-2">mut </span>missing = Vec::new();
+<a href=#121 id=121 data-nosnippet>121</a>    <span class="kw">if </span>cfg.providers.models.iter_entries().next().is_none() {
+<a href=#122 id=122 data-nosnippet>122</a>        missing.push(<span class="string">"Add a model provider."</span>.to_string());
+<a href=#123 id=123 data-nosnippet>123</a>    }
+<a href=#124 id=124 data-nosnippet>124</a>    <span class="kw">if </span>cfg.agents.is_empty() {
+<a href=#125 id=125 data-nosnippet>125</a>        missing.push(<span class="string">"Create an agent."</span>.to_string());
+<a href=#126 id=126 data-nosnippet>126</a>        <span class="kw">return </span>missing;
+<a href=#127 id=127 data-nosnippet>127</a>    }
+<a href=#128 id=128 data-nosnippet>128</a>
+<a href=#129 id=129 data-nosnippet>129</a>    <span class="kw">let </span><span class="kw-2">mut </span>agent_aliases: Vec&lt;<span class="kw-2">&amp;</span>String&gt; = cfg.agents.keys().collect();
+<a href=#130 id=130 data-nosnippet>130</a>    agent_aliases.sort();
+<a href=#131 id=131 data-nosnippet>131</a>    <span class="kw">let </span><span class="kw-2">mut </span>has_dispatchable_agent = <span class="bool-val">false</span>;
+<a href=#132 id=132 data-nosnippet>132</a>    <span class="kw">for </span>alias <span class="kw">in </span>agent_aliases {
+<a href=#133 id=133 data-nosnippet>133</a>        <span class="kw">let </span>agent_missing = quickstart_agent_missing_requirements(cfg, alias, <span class="kw-2">&amp;</span>cfg.agents[alias]);
+<a href=#134 id=134 data-nosnippet>134</a>        <span class="kw">if </span>agent_missing.is_empty() {
+<a href=#135 id=135 data-nosnippet>135</a>            has_dispatchable_agent = <span class="bool-val">true</span>;
+<a href=#136 id=136 data-nosnippet>136</a>            <span class="kw">break</span>;
+<a href=#137 id=137 data-nosnippet>137</a>        }
+<a href=#138 id=138 data-nosnippet>138</a>        missing.extend(agent_missing);
+<a href=#139 id=139 data-nosnippet>139</a>    }
+<a href=#140 id=140 data-nosnippet>140</a>    <span class="kw">if </span>has_dispatchable_agent {
+<a href=#141 id=141 data-nosnippet>141</a>        missing.clear();
+<a href=#142 id=142 data-nosnippet>142</a>    }
+<a href=#143 id=143 data-nosnippet>143</a>    missing
+<a href=#144 id=144 data-nosnippet>144</a>}
+<a href=#145 id=145 data-nosnippet>145</a>
+<a href=#146 id=146 data-nosnippet>146</a><span class="kw">fn </span>quickstart_agent_missing_requirements(
+<a href=#147 id=147 data-nosnippet>147</a>    cfg: <span class="kw-2">&amp;</span>zeroclaw_config::schema::Config,
+<a href=#148 id=148 data-nosnippet>148</a>    alias: <span class="kw-2">&amp;</span>str,
+<a href=#149 id=149 data-nosnippet>149</a>    agent: <span class="kw-2">&amp;</span>zeroclaw_config::schema::AliasedAgentConfig,
+<a href=#150 id=150 data-nosnippet>150</a>) -&gt; Vec&lt;String&gt; {
+<a href=#151 id=151 data-nosnippet>151</a>    <span class="kw">let </span><span class="kw-2">mut </span>missing = Vec::new();
+<a href=#152 id=152 data-nosnippet>152</a>    <span class="kw">if </span>!agent.enabled {
+<a href=#153 id=153 data-nosnippet>153</a>        missing.push(<span class="macro">format!</span>(<span class="string">"Enable agent `{alias}`."</span>));
+<a href=#154 id=154 data-nosnippet>154</a>    }
+<a href=#155 id=155 data-nosnippet>155</a>
+<a href=#156 id=156 data-nosnippet>156</a>    <span class="kw">let </span>model_ref = agent.model_provider.trim();
+<a href=#157 id=157 data-nosnippet>157</a>    <span class="kw">if </span>model_ref.is_empty() {
+<a href=#158 id=158 data-nosnippet>158</a>        missing.push(<span class="macro">format!</span>(<span class="string">"Set a model provider for agent `{alias}`."</span>));
+<a href=#159 id=159 data-nosnippet>159</a>    } <span class="kw">else if let </span><span class="prelude-val">Some</span>((family, <span class="kw">_</span>, provider)) = cfg.resolved_model_provider_for_agent(alias) {
+<a href=#160 id=160 data-nosnippet>160</a>        <span class="kw">let </span>has_model = provider
+<a href=#161 id=161 data-nosnippet>161</a>            .model
+<a href=#162 id=162 data-nosnippet>162</a>            .as_deref()
+<a href=#163 id=163 data-nosnippet>163</a>            .map(str::trim)
+<a href=#164 id=164 data-nosnippet>164</a>            .is_some_and(|m| !m.is_empty());
+<a href=#165 id=165 data-nosnippet>165</a>        <span class="kw">if </span>!has_model {
+<a href=#166 id=166 data-nosnippet>166</a>            missing.push(<span class="macro">format!</span>(<span class="string">"Choose a model for model provider `{model_ref}`."</span>));
+<a href=#167 id=167 data-nosnippet>167</a>        } <span class="kw">else if </span>!model_provider_alias_usable(
+<a href=#168 id=168 data-nosnippet>168</a>            provider,
+<a href=#169 id=169 data-nosnippet>169</a>            zeroclaw_runtime::quickstart::model_provider_is_local(family),
+<a href=#170 id=170 data-nosnippet>170</a>        ) {
+<a href=#171 id=171 data-nosnippet>171</a>            missing.push(<span class="macro">format!</span>(
+<a href=#172 id=172 data-nosnippet>172</a>                <span class="string">"Set credential/auth for model provider `{model_ref}`."
+<a href=#173 id=173 data-nosnippet>173</a>            </span>));
+<a href=#174 id=174 data-nosnippet>174</a>        }
+<a href=#175 id=175 data-nosnippet>175</a>    } <span class="kw">else </span>{
+<a href=#176 id=176 data-nosnippet>176</a>        missing.push(<span class="macro">format!</span>(
+<a href=#177 id=177 data-nosnippet>177</a>            <span class="string">"Fix agent `{alias}` model provider `{model_ref}`; it does not resolve to a configured provider."
+<a href=#178 id=178 data-nosnippet>178</a>        </span>));
+<a href=#179 id=179 data-nosnippet>179</a>    }
+<a href=#180 id=180 data-nosnippet>180</a>
+<a href=#181 id=181 data-nosnippet>181</a>    <span class="kw">let </span>risk_ref = agent.risk_profile.trim();
+<a href=#182 id=182 data-nosnippet>182</a>    <span class="kw">if </span>risk_ref.is_empty() {
+<a href=#183 id=183 data-nosnippet>183</a>        missing.push(<span class="macro">format!</span>(<span class="string">"Set a risk profile for agent `{alias}`."</span>));
+<a href=#184 id=184 data-nosnippet>184</a>    } <span class="kw">else if </span>!cfg.risk_profiles.contains_key(risk_ref) {
+<a href=#185 id=185 data-nosnippet>185</a>        missing.push(<span class="macro">format!</span>(
+<a href=#186 id=186 data-nosnippet>186</a>            <span class="string">"Fix agent `{alias}` risk profile `{risk_ref}`; it does not resolve to a configured profile."
+<a href=#187 id=187 data-nosnippet>187</a>        </span>));
+<a href=#188 id=188 data-nosnippet>188</a>    }
+<a href=#189 id=189 data-nosnippet>189</a>
+<a href=#190 id=190 data-nosnippet>190</a>    <span class="kw">let </span>runtime_ref = agent.runtime_profile.trim();
+<a href=#191 id=191 data-nosnippet>191</a>    <span class="kw">if </span>runtime_ref.is_empty() {
+<a href=#192 id=192 data-nosnippet>192</a>        missing.push(<span class="macro">format!</span>(<span class="string">"Set a runtime profile for agent `{alias}`."</span>));
+<a href=#193 id=193 data-nosnippet>193</a>    } <span class="kw">else if </span>!cfg.runtime_profiles.contains_key(runtime_ref) {
+<a href=#194 id=194 data-nosnippet>194</a>        missing.push(<span class="macro">format!</span>(
+<a href=#195 id=195 data-nosnippet>195</a>            <span class="string">"Fix agent `{alias}` runtime profile `{runtime_ref}`; it does not resolve to a configured profile."
+<a href=#196 id=196 data-nosnippet>196</a>        </span>));
+<a href=#197 id=197 data-nosnippet>197</a>    }
+<a href=#198 id=198 data-nosnippet>198</a>
+<a href=#199 id=199 data-nosnippet>199</a>    missing
+<a href=#200 id=200 data-nosnippet>200</a>}
+<a href=#201 id=201 data-nosnippet>201</a>
+<a href=#202 id=202 data-nosnippet>202</a><span class="doccomment">/// `GET /api/config/status` — boolean signal for the dashboard's
+<a href=#203 id=203 data-nosnippet>203</a>/// fresh-install redirect. The daemon writes a default `config.toml` on
+<a href=#204 id=204 data-nosnippet>204</a>/// first init, so file existence isn't a useful "is the user new?" check.
+<a href=#205 id=205 data-nosnippet>205</a>/// Section status: ready iff at least one agent has its
+<a href=#206 id=206 data-nosnippet>206</a>/// `model_provider`, `risk_profile`, and `runtime_profile` bound.
+<a href=#207 id=207 data-nosnippet>207</a></span><span class="kw">pub async fn </span>handle_section_status(State(state): State&lt;AppState&gt;, headers: HeaderMap) -&gt; Response {
+<a href=#208 id=208 data-nosnippet>208</a>    <span class="kw">if let </span><span class="prelude-val">Err</span>(e) = require_auth(<span class="kw-2">&amp;</span>state, <span class="kw-2">&amp;</span>headers) {
+<a href=#209 id=209 data-nosnippet>209</a>        <span class="kw">return </span>e.into_response();
+<a href=#210 id=210 data-nosnippet>210</a>    }
+<a href=#211 id=211 data-nosnippet>211</a>    <span class="kw">let </span>cfg = state.config.read().clone();
+<a href=#212 id=212 data-nosnippet>212</a>    axum::Json(derive_section_status(<span class="kw-2">&amp;</span>cfg)).into_response()
+<a href=#213 id=213 data-nosnippet>213</a>}
+<a href=#214 id=214 data-nosnippet>214</a>
+<a href=#215 id=215 data-nosnippet>215</a><span class="doccomment">/// All alias-reference choices an agent form needs, in one round-trip.
+<a href=#216 id=216 data-nosnippet>216</a>/// Channels and model model_providers are returned in dotted form
+<a href=#217 id=217 data-nosnippet>217</a>/// (`telegram.default`, `anthropic.work`); the bundle/profile/namespace
+<a href=#218 id=218 data-nosnippet>218</a>/// lists are bare HashMap keys.
+<a href=#219 id=219 data-nosnippet>219</a></span><span class="attr">#[derive(Debug, Serialize)]
+<a href=#220 id=220 data-nosnippet>220</a>#[cfg_attr(feature = <span class="string">"schema-export"</span>, derive(schemars::JsonSchema))]
+<a href=#221 id=221 data-nosnippet>221</a></span><span class="kw">pub struct </span>AgentOptionsResponse {
+<a href=#222 id=222 data-nosnippet>222</a>    <span class="kw">pub </span>channels: Vec&lt;String&gt;,
+<a href=#223 id=223 data-nosnippet>223</a>    <span class="doccomment">/// Distinct channel types with at least one configured alias —
+<a href=#224 id=224 data-nosnippet>224</a>    /// `["discord", "telegram"]`. Source for peer-group channel picker.
+<a href=#225 id=225 data-nosnippet>225</a>    </span><span class="kw">pub </span>channel_types: Vec&lt;String&gt;,
+<a href=#226 id=226 data-nosnippet>226</a>    <span class="kw">pub </span>model_providers: Vec&lt;String&gt;,
+<a href=#227 id=227 data-nosnippet>227</a>    <span class="kw">pub </span>risk_profiles: Vec&lt;String&gt;,
+<a href=#228 id=228 data-nosnippet>228</a>    <span class="kw">pub </span>runtime_profiles: Vec&lt;String&gt;,
+<a href=#229 id=229 data-nosnippet>229</a>    <span class="kw">pub </span>skill_bundles: Vec&lt;String&gt;,
+<a href=#230 id=230 data-nosnippet>230</a>    <span class="kw">pub </span>knowledge_bundles: Vec&lt;String&gt;,
+<a href=#231 id=231 data-nosnippet>231</a>    <span class="kw">pub </span>mcp_bundles: Vec&lt;String&gt;,
+<a href=#232 id=232 data-nosnippet>232</a>    <span class="kw">pub </span>agents: Vec&lt;String&gt;,
+<a href=#233 id=233 data-nosnippet>233</a>}
+<a href=#234 id=234 data-nosnippet>234</a>
+<a href=#235 id=235 data-nosnippet>235</a><span class="doccomment">/// Build the `AgentOptionsResponse` from a config snapshot. Pure function
+<a href=#236 id=236 data-nosnippet>236</a>/// so tests can drive the same code path the handler runs without spinning
+<a href=#237 id=237 data-nosnippet>237</a>/// up an `AppState`.
+<a href=#238 id=238 data-nosnippet>238</a>///
+<a href=#239 id=239 data-nosnippet>239</a>/// `get_map_keys` expects **kebab-case** paths (the macro at
+<a href=#240 id=240 data-nosnippet>240</a>/// `crates/zeroclaw-macros/src/lib.rs:366` builds lookup arms with
+<a href=#241 id=241 data-nosnippet>241</a>/// `snake_to_kebab(field_name)`). Passing snake_case for any
+<a href=#242 id=242 data-nosnippet>242</a>/// underscore-bearing field silently returns `None` → empty `Vec` →
+<a href=#243 id=243 data-nosnippet>243</a>/// dashboard renders "No X configured yet" even though X is configured.
+<a href=#244 id=244 data-nosnippet>244</a></span><span class="kw">pub fn </span>build_agent_options(cfg: <span class="kw-2">&amp;</span>zeroclaw_config::schema::Config) -&gt; AgentOptionsResponse {
+<a href=#245 id=245 data-nosnippet>245</a>    <span class="kw">fn </span>dotted_aliases(cfg: <span class="kw-2">&amp;</span>zeroclaw_config::schema::Config, prefix: <span class="kw-2">&amp;</span>str) -&gt; Vec&lt;String&gt; {
+<a href=#246 id=246 data-nosnippet>246</a>        <span class="kw">let </span><span class="kw-2">mut </span>out: Vec&lt;String&gt; = Vec::new();
+<a href=#247 id=247 data-nosnippet>247</a>        <span class="kw">for </span>f <span class="kw">in </span>cfg.prop_fields() {
+<a href=#248 id=248 data-nosnippet>248</a>            <span class="kw">if let </span><span class="prelude-val">Some</span>(rest) = f.name.strip_prefix(<span class="kw-2">&amp;</span><span class="macro">format!</span>(<span class="string">"{prefix}."</span>)) {
+<a href=#249 id=249 data-nosnippet>249</a>                <span class="kw">let </span><span class="kw-2">mut </span>parts = rest.splitn(<span class="number">3</span>, <span class="string">'.'</span>);
+<a href=#250 id=250 data-nosnippet>250</a>                <span class="kw">if let </span>(<span class="prelude-val">Some</span>(ty), <span class="prelude-val">Some</span>(alias), <span class="prelude-val">Some</span>(<span class="kw">_</span>)) = (parts.next(), parts.next(), parts.next())
+<a href=#251 id=251 data-nosnippet>251</a>                {
+<a href=#252 id=252 data-nosnippet>252</a>                    <span class="kw">let </span>dotted = <span class="macro">format!</span>(<span class="string">"{ty}.{alias}"</span>);
+<a href=#253 id=253 data-nosnippet>253</a>                    <span class="kw">if </span>!out.contains(<span class="kw-2">&amp;</span>dotted) {
+<a href=#254 id=254 data-nosnippet>254</a>                        out.push(dotted);
+<a href=#255 id=255 data-nosnippet>255</a>                    }
+<a href=#256 id=256 data-nosnippet>256</a>                }
+<a href=#257 id=257 data-nosnippet>257</a>            }
+<a href=#258 id=258 data-nosnippet>258</a>        }
+<a href=#259 id=259 data-nosnippet>259</a>        out.sort();
+<a href=#260 id=260 data-nosnippet>260</a>        out
+<a href=#261 id=261 data-nosnippet>261</a>    }
+<a href=#262 id=262 data-nosnippet>262</a>
+<a href=#263 id=263 data-nosnippet>263</a>    <span class="kw">let </span>channels = dotted_aliases(cfg, <span class="string">"channels"</span>);
+<a href=#264 id=264 data-nosnippet>264</a>    <span class="kw">let </span><span class="kw-2">mut </span>channel_types: Vec&lt;String&gt; = channels
+<a href=#265 id=265 data-nosnippet>265</a>        .iter()
+<a href=#266 id=266 data-nosnippet>266</a>        .filter_map(|d| d.split_once(<span class="string">'.'</span>).map(|(t, <span class="kw">_</span>)| t.to_string()))
+<a href=#267 id=267 data-nosnippet>267</a>        .collect();
+<a href=#268 id=268 data-nosnippet>268</a>    channel_types.sort();
+<a href=#269 id=269 data-nosnippet>269</a>    channel_types.dedup();
+<a href=#270 id=270 data-nosnippet>270</a>
+<a href=#271 id=271 data-nosnippet>271</a>    AgentOptionsResponse {
+<a href=#272 id=272 data-nosnippet>272</a>        channels,
+<a href=#273 id=273 data-nosnippet>273</a>        channel_types,
+<a href=#274 id=274 data-nosnippet>274</a>        model_providers: dotted_aliases(cfg, <span class="string">"providers.models"</span>),
+<a href=#275 id=275 data-nosnippet>275</a>        risk_profiles: cfg.get_map_keys(<span class="string">"risk_profiles"</span>).unwrap_or_default(),
+<a href=#276 id=276 data-nosnippet>276</a>        runtime_profiles: cfg.get_map_keys(<span class="string">"runtime_profiles"</span>).unwrap_or_default(),
+<a href=#277 id=277 data-nosnippet>277</a>        skill_bundles: cfg.get_map_keys(<span class="string">"skill_bundles"</span>).unwrap_or_default(),
+<a href=#278 id=278 data-nosnippet>278</a>        knowledge_bundles: cfg.get_map_keys(<span class="string">"knowledge_bundles"</span>).unwrap_or_default(),
+<a href=#279 id=279 data-nosnippet>279</a>        mcp_bundles: cfg.get_map_keys(<span class="string">"mcp_bundles"</span>).unwrap_or_default(),
+<a href=#280 id=280 data-nosnippet>280</a>        agents: cfg.get_map_keys(<span class="string">"agents"</span>).unwrap_or_default(),
+<a href=#281 id=281 data-nosnippet>281</a>    }
+<a href=#282 id=282 data-nosnippet>282</a>}
+<a href=#283 id=283 data-nosnippet>283</a>
+<a href=#284 id=284 data-nosnippet>284</a><span class="doccomment">/// `GET /api/config/agent-options` — every alias-reference list the
+<a href=#285 id=285 data-nosnippet>285</a>/// agent form needs, derived from the live config. Mirrors the lists the
+<a href=#286 id=286 data-nosnippet>286</a>/// TUI computes locally for its alias pickers.
+<a href=#287 id=287 data-nosnippet>287</a></span><span class="kw">pub async fn </span>handle_agent_options(State(state): State&lt;AppState&gt;, headers: HeaderMap) -&gt; Response {
+<a href=#288 id=288 data-nosnippet>288</a>    <span class="kw">if let </span><span class="prelude-val">Err</span>(e) = require_auth(<span class="kw-2">&amp;</span>state, <span class="kw-2">&amp;</span>headers) {
+<a href=#289 id=289 data-nosnippet>289</a>        <span class="kw">return </span>e.into_response();
+<a href=#290 id=290 data-nosnippet>290</a>    }
+<a href=#291 id=291 data-nosnippet>291</a>    <span class="kw">let </span>cfg = state.config.read().clone();
+<a href=#292 id=292 data-nosnippet>292</a>    axum::Json(build_agent_options(<span class="kw-2">&amp;</span>cfg)).into_response()
+<a href=#293 id=293 data-nosnippet>293</a>}
+<a href=#294 id=294 data-nosnippet>294</a>
+<a href=#295 id=295 data-nosnippet>295</a><span class="doccomment">/// `GET /api/config/sections` — list every top-level config section.
+<a href=#296 id=296 data-nosnippet>296</a>///
+<a href=#297 id=297 data-nosnippet>297</a>/// Schema-driven: walks `Config::prop_fields()` and collects unique first
+<a href=#298 id=298 data-nosnippet>298</a>/// segments, then asks `Config::map_key_sections()` for which ones have
+<a href=#299 id=299 data-nosnippet>299</a>/// pickers. The 4 quickstart sections (`model_providers`, `channels`, `memory`,
+<a href=#300 id=300 data-nosnippet>300</a>/// `tunnel`) keep their existing per-section dispatch in
+<a href=#301 id=301 data-nosnippet>301</a>/// `handle_section_picker`; everything else (`gateway`, `observability`,
+<a href=#302 id=302 data-nosnippet>302</a>/// `scheduler`, ...) renders as a direct form. Adding a new top-level
+<a href=#303 id=303 data-nosnippet>303</a>/// field to `Config` makes it appear here automatically.
+<a href=#304 id=304 data-nosnippet>304</a></span><span class="kw">pub async fn </span>handle_sections(State(state): State&lt;AppState&gt;, headers: HeaderMap) -&gt; Response {
+<a href=#305 id=305 data-nosnippet>305</a>    <span class="kw">if let </span><span class="prelude-val">Err</span>(e) = require_auth(<span class="kw-2">&amp;</span>state, <span class="kw-2">&amp;</span>headers) {
+<a href=#306 id=306 data-nosnippet>306</a>        <span class="kw">return </span>e.into_response();
+<a href=#307 id=307 data-nosnippet>307</a>    }
+<a href=#308 id=308 data-nosnippet>308</a>    <span class="kw">let </span>cfg = state.config.read().clone();
+<a href=#309 id=309 data-nosnippet>309</a>    <span class="kw">let </span>completed: std::collections::HashSet&lt;String&gt; = cfg
+<a href=#310 id=310 data-nosnippet>310</a>        .onboard_state
+<a href=#311 id=311 data-nosnippet>311</a>        .completed_sections
+<a href=#312 id=312 data-nosnippet>312</a>        .iter()
+<a href=#313 id=313 data-nosnippet>313</a>        .cloned()
+<a href=#314 id=314 data-nosnippet>314</a>        .collect();
+<a href=#315 id=315 data-nosnippet>315</a>
+<a href=#316 id=316 data-nosnippet>316</a>    <span class="comment">// First segment of every reachable prop path. BTreeSet for stable
+<a href=#317 id=317 data-nosnippet>317</a>    // alphabetical order and dedup.
+<a href=#318 id=318 data-nosnippet>318</a>    </span><span class="kw">let </span><span class="kw-2">mut </span>roots: std::collections::BTreeSet&lt;String&gt; = cfg
+<a href=#319 id=319 data-nosnippet>319</a>        .prop_fields()
+<a href=#320 id=320 data-nosnippet>320</a>        .iter()
+<a href=#321 id=321 data-nosnippet>321</a>        .filter_map(|f| f.name.split(<span class="string">'.'</span>).next().map(str::to_string))
+<a href=#322 id=322 data-nosnippet>322</a>        .collect();
+<a href=#323 id=323 data-nosnippet>323</a>
+<a href=#324 id=324 data-nosnippet>324</a>    <span class="comment">// System / housekeeping fields the user never edits via the dashboard.
+<a href=#325 id=325 data-nosnippet>325</a>    </span><span class="kw">for </span>hidden <span class="kw">in </span>HIDDEN_TOP_LEVEL {
+<a href=#326 id=326 data-nosnippet>326</a>        roots.remove(<span class="kw-2">*</span>hidden);
+<a href=#327 id=327 data-nosnippet>327</a>    }
+<a href=#328 id=328 data-nosnippet>328</a>
+<a href=#329 id=329 data-nosnippet>329</a>    <span class="comment">// A section gets a picker only when its OWN root carries a map (path
+<a href=#330 id=330 data-nosnippet>330</a>    // == key) or its immediate child is a typed-family map (path == key
+<a href=#331 id=331 data-nosnippet>331</a>    // + "." + one segment). Deeper nested maps belong to a subsection's
+<a href=#332 id=332 data-nosnippet>332</a>    // own editor and must not promote their top-level section to a
+<a href=#333 id=333 data-nosnippet>333</a>    // picker — `cost.rates.providers.models.&lt;type&gt;` is the rate-sheet's
+<a href=#334 id=334 data-nosnippet>334</a>    // concern, not a reason to give `[cost]` an Add affordance.
+<a href=#335 id=335 data-nosnippet>335</a>    </span><span class="kw">let </span>all_map_paths: Vec&lt;<span class="kw-2">&amp;</span><span class="lifetime">'static </span>str&gt; = zeroclaw_config::schema::Config::map_key_sections()
+<a href=#336 id=336 data-nosnippet>336</a>        .iter()
+<a href=#337 id=337 data-nosnippet>337</a>        .map(|s| s.path)
+<a href=#338 id=338 data-nosnippet>338</a>        .collect();
+<a href=#339 id=339 data-nosnippet>339</a>    <span class="kw">let </span>section_has_picker_for_key = |key: <span class="kw-2">&amp;</span>str| -&gt; bool {
+<a href=#340 id=340 data-nosnippet>340</a>        <span class="kw">let </span>key_dot = <span class="macro">format!</span>(<span class="string">"{key}."</span>);
+<a href=#341 id=341 data-nosnippet>341</a>        all_map_paths.iter().any(|p| {
+<a href=#342 id=342 data-nosnippet>342</a>            <span class="kw-2">*</span>p == key
+<a href=#343 id=343 data-nosnippet>343</a>                || p.strip_prefix(<span class="kw-2">&amp;</span>key_dot)
+<a href=#344 id=344 data-nosnippet>344</a>                    .is_some_and(|rest| !rest.contains(<span class="string">'.'</span>))
+<a href=#345 id=345 data-nosnippet>345</a>        })
+<a href=#346 id=346 data-nosnippet>346</a>    };
+<a href=#347 id=347 data-nosnippet>347</a>
+<a href=#348 id=348 data-nosnippet>348</a>    <span class="comment">// Ensure map-keyed sections surface as sidebar entries even when their
+<a href=#349 id=349 data-nosnippet>349</a>    // HashMap is empty (prop_fields() only yields paths for populated
+<a href=#350 id=350 data-nosnippet>350</a>    // entries). First segments only — the prefix-dedup pass below drops
+<a href=#351 id=351 data-nosnippet>351</a>    // bare parent segments when a multi-segment child is present.
+<a href=#352 id=352 data-nosnippet>352</a>    </span><span class="kw">let </span>map_keyed_roots: std::collections::HashSet&lt;<span class="kw-2">&amp;</span><span class="lifetime">'static </span>str&gt; = all_map_paths
+<a href=#353 id=353 data-nosnippet>353</a>        .iter()
+<a href=#354 id=354 data-nosnippet>354</a>        .filter_map(|p| p.split(<span class="string">'.'</span>).next())
+<a href=#355 id=355 data-nosnippet>355</a>        .collect();
+<a href=#356 id=356 data-nosnippet>356</a>    <span class="kw">for </span><span class="kw-2">&amp;</span>prefix <span class="kw">in </span><span class="kw-2">&amp;</span>map_keyed_roots {
+<a href=#357 id=357 data-nosnippet>357</a>        roots.insert(prefix.to_string());
+<a href=#358 id=358 data-nosnippet>358</a>    }
+<a href=#359 id=359 data-nosnippet>359</a>
+<a href=#360 id=360 data-nosnippet>360</a>    <span class="comment">// Synthetic curated sections — keys that aren't fields on Config
+<a href=#361 id=361 data-nosnippet>361</a>    // but are part of the wizard flow (personality lives as markdown
+<a href=#362 id=362 data-nosnippet>362</a>    // files, not TOML). Inject so the canonical-order sort places them
+<a href=#363 id=363 data-nosnippet>363</a>    // correctly and frontends don't need to know which ones to splice.
+<a href=#364 id=364 data-nosnippet>364</a>    </span><span class="kw">for </span>s <span class="kw">in </span>zeroclaw_config::sections::QUICKSTART_SECTIONS {
+<a href=#365 id=365 data-nosnippet>365</a>        roots.insert(s.as_str().to_string());
+<a href=#366 id=366 data-nosnippet>366</a>    }
+<a href=#367 id=367 data-nosnippet>367</a>
+<a href=#368 id=368 data-nosnippet>368</a>    <span class="comment">// Drop bare parent-segment entries when a dotted child is present
+<a href=#369 id=369 data-nosnippet>369</a>    // — `providers` is phantom once `providers.models` etc. are listed.
+<a href=#370 id=370 data-nosnippet>370</a>    </span><span class="kw">let </span>prefixes_with_children: std::collections::HashSet&lt;String&gt; = roots
+<a href=#371 id=371 data-nosnippet>371</a>        .iter()
+<a href=#372 id=372 data-nosnippet>372</a>        .filter_map(|k| k.split_once(<span class="string">'.'</span>).map(|(parent, <span class="kw">_</span>)| parent.to_string()))
+<a href=#373 id=373 data-nosnippet>373</a>        .collect();
+<a href=#374 id=374 data-nosnippet>374</a>    roots.retain(|k| k.contains(<span class="string">'.'</span>) || !prefixes_with_children.contains(k));
+<a href=#375 id=375 data-nosnippet>375</a>
+<a href=#376 id=376 data-nosnippet>376</a>    <span class="comment">// Hard-ban the rate-sheet subtree from the sidebar. `[cost.rates.*]` is
+<a href=#377 id=377 data-nosnippet>377</a>    // edited from inside the `[cost]` section's tabs (and from each
+<a href=#378 id=378 data-nosnippet>378</a>    // provider-type page's Costs tab); it has no standalone picker, no
+<a href=#379 id=379 data-nosnippet>379</a>    // direct form at any intermediate depth, and surfacing a path like
+<a href=#380 id=380 data-nosnippet>380</a>    // `cost.rates.providers.tts` as its own sidebar entry only yields a
+<a href=#381 id=381 data-nosnippet>381</a>    // dead-end "no picker" page.
+<a href=#382 id=382 data-nosnippet>382</a>    </span>roots.retain(|k| !k.starts_with(<span class="string">"cost.rates"</span>));
+<a href=#383 id=383 data-nosnippet>383</a>
+<a href=#384 id=384 data-nosnippet>384</a>    <span class="comment">// Sort: curated sections first in their canonical order
+<a href=#385 id=385 data-nosnippet>385</a>    // (single source of truth in `zeroclaw_config::sections`), then
+<a href=#386 id=386 data-nosnippet>386</a>    // everything else alphabetically. This is what makes /quickstart's wizard
+<a href=#387 id=387 data-nosnippet>387</a>    // order and /config's foundation grouping derive from one Rust const
+<a href=#388 id=388 data-nosnippet>388</a>    // — frontends consume the response order directly.
+<a href=#389 id=389 data-nosnippet>389</a>    </span><span class="kw">let </span><span class="kw-2">mut </span>ordered: Vec&lt;String&gt; = roots.into_iter().collect();
+<a href=#390 id=390 data-nosnippet>390</a>    ordered.sort_by(|a, b| {
+<a href=#391 id=391 data-nosnippet>391</a>        <span class="kw">match </span>(
+<a href=#392 id=392 data-nosnippet>392</a>            zeroclaw_config::sections::section_index_for_key(a),
+<a href=#393 id=393 data-nosnippet>393</a>            zeroclaw_config::sections::section_index_for_key(b),
+<a href=#394 id=394 data-nosnippet>394</a>        ) {
+<a href=#395 id=395 data-nosnippet>395</a>            (<span class="prelude-val">Some</span>(ai), <span class="prelude-val">Some</span>(bi)) =&gt; ai.cmp(<span class="kw-2">&amp;</span>bi),
+<a href=#396 id=396 data-nosnippet>396</a>            (<span class="prelude-val">Some</span>(<span class="kw">_</span>), <span class="prelude-val">None</span>) =&gt; std::cmp::Ordering::Less,
+<a href=#397 id=397 data-nosnippet>397</a>            (<span class="prelude-val">None</span>, <span class="prelude-val">Some</span>(<span class="kw">_</span>)) =&gt; std::cmp::Ordering::Greater,
+<a href=#398 id=398 data-nosnippet>398</a>            (<span class="prelude-val">None</span>, <span class="prelude-val">None</span>) =&gt; a.cmp(b),
+<a href=#399 id=399 data-nosnippet>399</a>        }
+<a href=#400 id=400 data-nosnippet>400</a>    });
+<a href=#401 id=401 data-nosnippet>401</a>
+<a href=#402 id=402 data-nosnippet>402</a>    <span class="kw">let </span>sections: Vec&lt;ConfigSectionEntry&gt; = ordered
+<a href=#403 id=403 data-nosnippet>403</a>        .into_iter()
+<a href=#404 id=404 data-nosnippet>404</a>        .map(|key| {
+<a href=#405 id=405 data-nosnippet>405</a>            <span class="comment">// Picker eligibility = anything `handle_section_picker`
+<a href=#406 id=406 data-nosnippet>406</a>            // dispatches non-trivially. Wizard sections that opt out
+<a href=#407 id=407 data-nosnippet>407</a>            // (workspace/hardware/personality) are direct-form. Map-keyed
+<a href=#408 id=408 data-nosnippet>408</a>            // sections outside the wizard (multi-agent peer groups, etc.)
+<a href=#409 id=409 data-nosnippet>409</a>            // get the generic schema-walk picker.
+<a href=#410 id=410 data-nosnippet>410</a>            </span><span class="kw">let </span>wizard = zeroclaw_config::sections::Section::from_key(<span class="kw-2">&amp;</span>key);
+<a href=#411 id=411 data-nosnippet>411</a>            <span class="kw">let </span>has_picker = <span class="kw">match </span>wizard {
+<a href=#412 id=412 data-nosnippet>412</a>                <span class="prelude-val">Some</span>(w) =&gt; !<span class="macro">matches!</span>(
+<a href=#413 id=413 data-nosnippet>413</a>                    w,
+<a href=#414 id=414 data-nosnippet>414</a>                    zeroclaw_config::sections::Section::Hardware
+<a href=#415 id=415 data-nosnippet>415</a>                        | zeroclaw_config::sections::Section::Mcp
+<a href=#416 id=416 data-nosnippet>416</a>                        | zeroclaw_config::sections::Section::Skills
+<a href=#417 id=417 data-nosnippet>417</a>                ),
+<a href=#418 id=418 data-nosnippet>418</a>                <span class="prelude-val">None </span>=&gt; section_has_picker_for_key(<span class="kw-2">&amp;</span>key),
+<a href=#419 id=419 data-nosnippet>419</a>            };
+<a href=#420 id=420 data-nosnippet>420</a>            ConfigSectionEntry {
+<a href=#421 id=421 data-nosnippet>421</a>                completed: completed.contains(<span class="kw-2">&amp;</span>key),
+<a href=#422 id=422 data-nosnippet>422</a>                ready: section_ready(<span class="kw-2">&amp;</span>cfg, <span class="kw-2">&amp;</span>key, completed.contains(<span class="kw-2">&amp;</span>key)),
+<a href=#423 id=423 data-nosnippet>423</a>                label: zeroclaw_config::sections::humanize_section_key(<span class="kw-2">&amp;</span>key),
+<a href=#424 id=424 data-nosnippet>424</a>                help: section_help(<span class="kw-2">&amp;</span>key).to_string(),
+<a href=#425 id=425 data-nosnippet>425</a>                has_picker,
+<a href=#426 id=426 data-nosnippet>426</a>                group: section_group(<span class="kw-2">&amp;</span>key).to_string(),
+<a href=#427 id=427 data-nosnippet>427</a>                is_quickstart: wizard.is_some(),
+<a href=#428 id=428 data-nosnippet>428</a>                shape: wizard.map(zeroclaw_config::sections::Section::shape),
+<a href=#429 id=429 data-nosnippet>429</a>                key,
+<a href=#430 id=430 data-nosnippet>430</a>            }
+<a href=#431 id=431 data-nosnippet>431</a>        })
+<a href=#432 id=432 data-nosnippet>432</a>        .collect();
+<a href=#433 id=433 data-nosnippet>433</a>
+<a href=#434 id=434 data-nosnippet>434</a>    axum::Json(ConfigSectionsResult { sections }).into_response()
+<a href=#435 id=435 data-nosnippet>435</a>}
+<a href=#436 id=436 data-nosnippet>436</a>
+<a href=#437 id=437 data-nosnippet>437</a><span class="kw">fn </span>section_ready(cfg: <span class="kw-2">&amp;</span>zeroclaw_config::schema::Config, key: <span class="kw-2">&amp;</span>str, completed_marker: bool) -&gt; bool {
+<a href=#438 id=438 data-nosnippet>438</a>    <span class="kw">use </span>zeroclaw_config::sections::Section;
+<a href=#439 id=439 data-nosnippet>439</a>    <span class="kw">match </span>Section::from_key(key) {
+<a href=#440 id=440 data-nosnippet>440</a>        <span class="prelude-val">Some</span>(Section::ModelProviders) =&gt; any_usable_model_provider(cfg),
+<a href=#441 id=441 data-nosnippet>441</a>        <span class="prelude-val">Some</span>(Section::RiskProfiles) =&gt; !cfg.risk_profiles.is_empty(),
+<a href=#442 id=442 data-nosnippet>442</a>        <span class="prelude-val">Some</span>(Section::RuntimeProfiles) =&gt; !cfg.runtime_profiles.is_empty(),
+<a href=#443 id=443 data-nosnippet>443</a>        <span class="prelude-val">Some</span>(Section::Storage) =&gt; cfg
+<a href=#444 id=444 data-nosnippet>444</a>            .prop_fields()
+<a href=#445 id=445 data-nosnippet>445</a>            .iter()
+<a href=#446 id=446 data-nosnippet>446</a>            .any(|field| field.name.starts_with(<span class="string">"storage."</span>)),
+<a href=#447 id=447 data-nosnippet>447</a>        <span class="prelude-val">Some</span>(Section::Memory) =&gt; completed_marker,
+<a href=#448 id=448 data-nosnippet>448</a>        <span class="prelude-val">Some</span>(Section::Agents) =&gt; cfg.agents.iter().any(|(alias, agent)| {
+<a href=#449 id=449 data-nosnippet>449</a>            quickstart_agent_missing_requirements(cfg, alias, agent).is_empty()
+<a href=#450 id=450 data-nosnippet>450</a>        }),
+<a href=#451 id=451 data-nosnippet>451</a>        <span class="kw">_ </span>=&gt; completed_marker,
+<a href=#452 id=452 data-nosnippet>452</a>    }
+<a href=#453 id=453 data-nosnippet>453</a>}
+<a href=#454 id=454 data-nosnippet>454</a>
+<a href=#455 id=455 data-nosnippet>455</a><span class="doccomment">/// Top-level fields that exist on `Config` but are never user-editable
+<a href=#456 id=456 data-nosnippet>456</a>/// from the dashboard (schema bookkeeping, resolved at runtime).
+<a href=#457 id=457 data-nosnippet>457</a></span><span class="kw">const </span>HIDDEN_TOP_LEVEL: <span class="kw-2">&amp;</span>[<span class="kw-2">&amp;</span>str] = <span class="kw-2">&amp;</span>[
+<a href=#458 id=458 data-nosnippet>458</a>    <span class="string">"schema_version"</span>,
+<a href=#459 id=459 data-nosnippet>459</a>    <span class="string">"onboard_state"</span>,
+<a href=#460 id=460 data-nosnippet>460</a>    <span class="string">"onboard-state"</span>,
+<a href=#461 id=461 data-nosnippet>461</a>    <span class="string">"config_path"</span>,
+<a href=#462 id=462 data-nosnippet>462</a>    <span class="string">"workspace_dir"</span>,
+<a href=#463 id=463 data-nosnippet>463</a>    <span class="string">"env_overridden_paths"</span>,
+<a href=#464 id=464 data-nosnippet>464</a>    <span class="string">"pre_override_snapshots"</span>,
+<a href=#465 id=465 data-nosnippet>465</a>];
+<a href=#466 id=466 data-nosnippet>466</a>
+<a href=#467 id=467 data-nosnippet>467</a><span class="doccomment">/// Display group for a section. Hand-curated until v3 / #5947 lands a
+<a href=#468 id=468 data-nosnippet>468</a>/// schema attribute that encodes grouping declaratively. Unknown keys
+<a href=#469 id=469 data-nosnippet>469</a>/// fall into `Other` so new schema additions still surface — they just
+<a href=#470 id=470 data-nosnippet>470</a>/// land in the catch-all bucket until someone curates them.
+<a href=#471 id=471 data-nosnippet>471</a>///
+<a href=#472 id=472 data-nosnippet>472</a>/// Group order in the dashboard sidebar is governed by the frontend (see
+<a href=#473 id=473 data-nosnippet>473</a>/// `Config.tsx`), not this list.
+<a href=#474 id=474 data-nosnippet>474</a></span><span class="kw">fn </span>section_group(key: <span class="kw-2">&amp;</span>str) -&gt; <span class="kw-2">&amp;</span><span class="lifetime">'static </span>str {
+<a href=#475 id=475 data-nosnippet>475</a>    <span class="kw">match </span>key {
+<a href=#476 id=476 data-nosnippet>476</a>        <span class="string">"providers.models" </span>| <span class="string">"channels" </span>| <span class="string">"memory" </span>| <span class="string">"hardware" </span>| <span class="string">"tunnel" </span>| <span class="string">"agents"
+<a href=#477 id=477 data-nosnippet>477</a>        </span>| <span class="string">"skills" </span>| <span class="string">"skill_bundles" </span>| <span class="string">"risk_profiles" </span>| <span class="string">"runtime_profiles" </span>| <span class="string">"peer_groups" </span>=&gt; {
+<a href=#478 id=478 data-nosnippet>478</a>            <span class="string">"Foundation"
+<a href=#479 id=479 data-nosnippet>479</a>        </span>}
+<a href=#480 id=480 data-nosnippet>480</a>        <span class="comment">// Agent loop, scheduling, and orchestration.
+<a href=#481 id=481 data-nosnippet>481</a>        </span><span class="string">"agent"
+<a href=#482 id=482 data-nosnippet>482</a>        </span>| <span class="string">"cron"
+<a href=#483 id=483 data-nosnippet>483</a>        </span>| <span class="string">"heartbeat"
+<a href=#484 id=484 data-nosnippet>484</a>        </span>| <span class="string">"hooks"
+<a href=#485 id=485 data-nosnippet>485</a>        </span>| <span class="string">"pacing"
+<a href=#486 id=486 data-nosnippet>486</a>        </span>| <span class="string">"pipeline"
+<a href=#487 id=487 data-nosnippet>487</a>        </span>| <span class="string">"query_classification"
+<a href=#488 id=488 data-nosnippet>488</a>        </span>| <span class="string">"reliability"
+<a href=#489 id=489 data-nosnippet>489</a>        </span>| <span class="string">"runtime"
+<a href=#490 id=490 data-nosnippet>490</a>        </span>| <span class="string">"scheduler"
+<a href=#491 id=491 data-nosnippet>491</a>        </span>| <span class="string">"sop"
+<a href=#492 id=492 data-nosnippet>492</a>        </span>| <span class="string">"verifiable_intent" </span>=&gt; <span class="string">"Agent"</span>,
+<a href=#493 id=493 data-nosnippet>493</a>        <span class="comment">// Multi-agent / delegation.
+<a href=#494 id=494 data-nosnippet>494</a>        </span><span class="string">"delegate" </span>=&gt; <span class="string">"Multi-agent"</span>,
+<a href=#495 id=495 data-nosnippet>495</a>        <span class="comment">// Tool integrations.
+<a href=#496 id=496 data-nosnippet>496</a>        </span><span class="string">"browser" </span>| <span class="string">"browser_delegate" </span>| <span class="string">"http_request" </span>| <span class="string">"image_gen" </span>| <span class="string">"knowledge"
+<a href=#497 id=497 data-nosnippet>497</a>        </span>| <span class="string">"link_enricher" </span>| <span class="string">"mcp" </span>| <span class="string">"media_pipeline" </span>| <span class="string">"multimodal" </span>| <span class="string">"plugins"
+<a href=#498 id=498 data-nosnippet>498</a>        </span>| <span class="string">"project_intel" </span>| <span class="string">"shell_tool" </span>| <span class="string">"text_browser" </span>| <span class="string">"transcription" </span>| <span class="string">"tts"
+<a href=#499 id=499 data-nosnippet>499</a>        </span>| <span class="string">"web_fetch" </span>| <span class="string">"web_search" </span>=&gt; <span class="string">"Tools"</span>,
+<a href=#500 id=500 data-nosnippet>500</a>        <span class="comment">// External services / vendor integrations. ACP is included because
+<a href=#501 id=501 data-nosnippet>501</a>        // it is always client-paired — you cannot use it without a client.
+<a href=#502 id=502 data-nosnippet>502</a>        </span><span class="string">"acp" </span>| <span class="string">"claude_code" </span>| <span class="string">"claude_code_runner" </span>| <span class="string">"codex_cli" </span>| <span class="string">"composio" </span>| <span class="string">"gemini_cli"
+<a href=#503 id=503 data-nosnippet>503</a>        </span>| <span class="string">"google_workspace" </span>| <span class="string">"jira" </span>| <span class="string">"linkedin" </span>| <span class="string">"notion" </span>| <span class="string">"opencode_cli" </span>=&gt; <span class="string">"Integrations"</span>,
+<a href=#504 id=504 data-nosnippet>504</a>        <span class="comment">// Networking / multi-node infrastructure.
+<a href=#505 id=505 data-nosnippet>505</a>        </span><span class="string">"gateway" </span>| <span class="string">"node_transport" </span>| <span class="string">"nodes" </span>| <span class="string">"proxy" </span>=&gt; <span class="string">"Network"</span>,
+<a href=#506 id=506 data-nosnippet>506</a>        <span class="comment">// Storage, identity, secrets.
+<a href=#507 id=507 data-nosnippet>507</a>        </span><span class="string">"identity" </span>| <span class="string">"secrets" </span>| <span class="string">"storage" </span>=&gt; <span class="string">"Storage"</span>,
+<a href=#508 id=508 data-nosnippet>508</a>        <span class="comment">// Operations / monitoring / safety / cost.
+<a href=#509 id=509 data-nosnippet>509</a>        </span><span class="string">"backup" </span>| <span class="string">"cloud_ops" </span>| <span class="string">"conversational_ai" </span>| <span class="string">"cost" </span>| <span class="string">"data_retention"
+<a href=#510 id=510 data-nosnippet>510</a>        </span>| <span class="string">"observability" </span>| <span class="string">"peripherals" </span>| <span class="string">"security" </span>| <span class="string">"security_ops" </span>| <span class="string">"trust" </span>=&gt; <span class="string">"Operations"</span>,
+<a href=#511 id=511 data-nosnippet>511</a>        <span class="kw">_ </span>=&gt; <span class="string">"Other"</span>,
+<a href=#512 id=512 data-nosnippet>512</a>    }
+<a href=#513 id=513 data-nosnippet>513</a>}
+<a href=#514 id=514 data-nosnippet>514</a>
+<a href=#515 id=515 data-nosnippet>515</a><span class="doccomment">/// Help text for a section. Delegates to `zeroclaw_config::sections::section_help`
+<a href=#516 id=516 data-nosnippet>516</a>/// so gateway, CLI, and TUI all read from one source — wizard variants
+<a href=#517 id=517 data-nosnippet>517</a>/// pull from `Section::help`, everything else from the matching
+<a href=#518 id=518 data-nosnippet>518</a>/// `#[nested]` field's `///` docstring on the `Config` struct.
+<a href=#519 id=519 data-nosnippet>519</a></span><span class="kw">fn </span>section_help(key: <span class="kw-2">&amp;</span>str) -&gt; <span class="kw-2">&amp;</span><span class="lifetime">'static </span>str {
+<a href=#520 id=520 data-nosnippet>520</a>    zeroclaw_config::sections::section_help(key)
+<a href=#521 id=521 data-nosnippet>521</a>}
+<a href=#522 id=522 data-nosnippet>522</a>
+<a href=#523 id=523 data-nosnippet>523</a><span class="attr">#[derive(Debug, Deserialize)]
+<a href=#524 id=524 data-nosnippet>524</a>#[cfg_attr(feature = <span class="string">"schema-export"</span>, derive(schemars::JsonSchema))]
+<a href=#525 id=525 data-nosnippet>525</a></span><span class="kw">pub struct </span>SectionPath {
+<a href=#526 id=526 data-nosnippet>526</a>    <span class="kw">pub </span>section: String,
+<a href=#527 id=527 data-nosnippet>527</a>}
+<a href=#528 id=528 data-nosnippet>528</a>
+<a href=#529 id=529 data-nosnippet>529</a><span class="doccomment">/// `GET /api/config/sections/&lt;section&gt;` — picker items for that section.
+<a href=#530 id=530 data-nosnippet>530</a>///
+<a href=#531 id=531 data-nosnippet>531</a>/// Per-section dispatch:
+<a href=#532 id=532 data-nosnippet>532</a>/// * `providers` → `zeroclaw_providers::list_model_providers()` (CLI's catalog).
+<a href=#533 id=533 data-nosnippet>533</a>/// * `memory` → `zeroclaw_memory::selectable_memory_backends()`.
+<a href=#534 id=534 data-nosnippet>534</a>/// * `channels` / `tunnel` → schema-walk: clone config, `init_defaults` the
+<a href=#535 id=535 data-nosnippet>535</a>///   section, then strip the section prefix from `prop_fields()` and dedupe
+<a href=#536 id=536 data-nosnippet>536</a>///   by first segment. Same trick the TUI uses; new channels appear
+<a href=#537 id=537 data-nosnippet>537</a>///   automatically when a `#[nested] Option&lt;...&gt;` field is added.
+<a href=#538 id=538 data-nosnippet>538</a>/// * Anything else returns 404 (hardware has no picker).
+<a href=#539 id=539 data-nosnippet>539</a></span><span class="kw">pub async fn </span>handle_section_picker(
+<a href=#540 id=540 data-nosnippet>540</a>    State(state): State&lt;AppState&gt;,
+<a href=#541 id=541 data-nosnippet>541</a>    headers: HeaderMap,
+<a href=#542 id=542 data-nosnippet>542</a>    axum::extract::Path(SectionPath { section }): axum::extract::Path&lt;SectionPath&gt;,
+<a href=#543 id=543 data-nosnippet>543</a>) -&gt; Response {
+<a href=#544 id=544 data-nosnippet>544</a>    <span class="kw">if let </span><span class="prelude-val">Err</span>(e) = require_auth(<span class="kw-2">&amp;</span>state, <span class="kw-2">&amp;</span>headers) {
+<a href=#545 id=545 data-nosnippet>545</a>        <span class="kw">return </span>e.into_response();
+<a href=#546 id=546 data-nosnippet>546</a>    }
+<a href=#547 id=547 data-nosnippet>547</a>    <span class="kw">let </span>cfg = state.config.read().clone();
+<a href=#548 id=548 data-nosnippet>548</a>
+<a href=#549 id=549 data-nosnippet>549</a>    <span class="kw">use </span>zeroclaw_config::sections::Section;
+<a href=#550 id=550 data-nosnippet>550</a>    <span class="kw">let </span><span class="prelude-val">Some</span>(section_enum) = Section::from_key(<span class="kw-2">&amp;</span>section) <span class="kw">else </span>{
+<a href=#551 id=551 data-nosnippet>551</a>        <span class="kw">return </span>error_response(
+<a href=#552 id=552 data-nosnippet>552</a>            ConfigApiError::new(
+<a href=#553 id=553 data-nosnippet>553</a>                ConfigApiCode::PathNotFound,
+<a href=#554 id=554 data-nosnippet>554</a>                <span class="macro">format!</span>(
+<a href=#555 id=555 data-nosnippet>555</a>                    <span class="string">"section `{section}` has no picker; render its fields \
+<a href=#556 id=556 data-nosnippet>556</a>                     via GET /api/config/list?prefix={section}"
+<a href=#557 id=557 data-nosnippet>557</a>                </span>),
+<a href=#558 id=558 data-nosnippet>558</a>            )
+<a href=#559 id=559 data-nosnippet>559</a>            .with_path(section.as_str()),
+<a href=#560 id=560 data-nosnippet>560</a>        );
+<a href=#561 id=561 data-nosnippet>561</a>    };
+<a href=#562 id=562 data-nosnippet>562</a>    <span class="kw">let </span>help = section_help(section_enum.as_str()).to_string();
+<a href=#563 id=563 data-nosnippet>563</a>    <span class="kw">let </span>items = <span class="kw">match </span>picker_items_for(section_enum, <span class="kw-2">&amp;</span>cfg) {
+<a href=#564 id=564 data-nosnippet>564</a>        PickerDispatch::Items(items) =&gt; items,
+<a href=#565 id=565 data-nosnippet>565</a>        PickerDispatch::DirectForm =&gt; {
+<a href=#566 id=566 data-nosnippet>566</a>            <span class="kw">return </span>error_response(
+<a href=#567 id=567 data-nosnippet>567</a>                ConfigApiError::new(
+<a href=#568 id=568 data-nosnippet>568</a>                    ConfigApiCode::PathNotFound,
+<a href=#569 id=569 data-nosnippet>569</a>                    <span class="macro">format!</span>(
+<a href=#570 id=570 data-nosnippet>570</a>                        <span class="string">"section `{section_enum}` is a direct-form section with no picker; \
+<a href=#571 id=571 data-nosnippet>571</a>                         render fields via GET /api/config/list?prefix={section_enum}"
+<a href=#572 id=572 data-nosnippet>572</a>                    </span>),
+<a href=#573 id=573 data-nosnippet>573</a>                )
+<a href=#574 id=574 data-nosnippet>574</a>                .with_path(section_enum.as_str()),
+<a href=#575 id=575 data-nosnippet>575</a>            );
+<a href=#576 id=576 data-nosnippet>576</a>        }
+<a href=#577 id=577 data-nosnippet>577</a>    };
+<a href=#578 id=578 data-nosnippet>578</a>
+<a href=#579 id=579 data-nosnippet>579</a>    axum::Json(PickerResponse {
+<a href=#580 id=580 data-nosnippet>580</a>        section,
+<a href=#581 id=581 data-nosnippet>581</a>        items,
+<a href=#582 id=582 data-nosnippet>582</a>        help,
+<a href=#583 id=583 data-nosnippet>583</a>    })
+<a href=#584 id=584 data-nosnippet>584</a>    .into_response()
+<a href=#585 id=585 data-nosnippet>585</a>}
+<a href=#586 id=586 data-nosnippet>586</a>
+<a href=#587 id=587 data-nosnippet>587</a><span class="doccomment">/// Result of picker dispatch for a [`Section`]. `Items` carries the
+<a href=#588 id=588 data-nosnippet>588</a>/// list rendered into the dashboard / CLI picker UI; `DirectForm`
+<a href=#589 id=589 data-nosnippet>589</a>/// signals a section without a picker step (the caller falls through
+<a href=#590 id=590 data-nosnippet>590</a>/// to `/api/config/list?prefix=&lt;section&gt;` for direct field rendering).
+<a href=#591 id=591 data-nosnippet>591</a>///
+<a href=#592 id=592 data-nosnippet>592</a>/// Splitting this out from `handle_section_picker` keeps the per-Section
+<a href=#593 id=593 data-nosnippet>593</a>/// dispatch a pure function — testable without an `AppState` mock and
+<a href=#594 id=594 data-nosnippet>594</a>/// exhaustively coverable by iterating every variant.
+<a href=#595 id=595 data-nosnippet>595</a></span><span class="kw">enum </span>PickerDispatch {
+<a href=#596 id=596 data-nosnippet>596</a>    Items(Vec&lt;PickerItem&gt;),
+<a href=#597 id=597 data-nosnippet>597</a>    DirectForm,
+<a href=#598 id=598 data-nosnippet>598</a>}
+<a href=#599 id=599 data-nosnippet>599</a>
+<a href=#600 id=600 data-nosnippet>600</a><span class="doccomment">/// Per-section picker dispatch. Exhaustive over [`Section`] so adding a
+<a href=#601 id=601 data-nosnippet>601</a>/// variant fails to compile until it gets a routing arm. The DRY
+<a href=#602 id=602 data-nosnippet>602</a>/// version of what the dashboard's per-section view boils down to.
+<a href=#603 id=603 data-nosnippet>603</a></span><span class="kw">fn </span>picker_items_for(
+<a href=#604 id=604 data-nosnippet>604</a>    section: zeroclaw_config::sections::Section,
+<a href=#605 id=605 data-nosnippet>605</a>    cfg: <span class="kw-2">&amp;</span>zeroclaw_config::schema::Config,
+<a href=#606 id=606 data-nosnippet>606</a>) -&gt; PickerDispatch {
+<a href=#607 id=607 data-nosnippet>607</a>    <span class="kw">use </span>zeroclaw_config::sections::Section;
+<a href=#608 id=608 data-nosnippet>608</a>    <span class="kw">match </span>section {
+<a href=#609 id=609 data-nosnippet>609</a>        Section::ModelProviders =&gt; PickerDispatch::Items(providers_picker(cfg)),
+<a href=#610 id=610 data-nosnippet>610</a>        <span class="comment">// TTS / transcription share the typed-family two-tier shape. Each
+<a href=#611 id=611 data-nosnippet>611</a>        // family enumerates its picker via `schema_walk_picker(&lt;family&gt;)`
+<a href=#612 id=612 data-nosnippet>612</a>        // — the same machinery channels uses, so no per-section catalog
+<a href=#613 id=613 data-nosnippet>613</a>        // table to drift.
+<a href=#614 id=614 data-nosnippet>614</a>        </span>Section::TtsProviders | Section::TranscriptionProviders =&gt; {
+<a href=#615 id=615 data-nosnippet>615</a>            PickerDispatch::Items(schema_walk_picker(cfg, section.as_str()))
+<a href=#616 id=616 data-nosnippet>616</a>        }
+<a href=#617 id=617 data-nosnippet>617</a>        Section::Memory =&gt; PickerDispatch::Items(memory_picker(cfg)),
+<a href=#618 id=618 data-nosnippet>618</a>        Section::Channels =&gt; PickerDispatch::Items(schema_walk_picker(cfg, <span class="string">"channels"</span>)),
+<a href=#619 id=619 data-nosnippet>619</a>        Section::Tunnel =&gt; PickerDispatch::Items(schema_walk_picker_with_none(
+<a href=#620 id=620 data-nosnippet>620</a>            cfg,
+<a href=#621 id=621 data-nosnippet>621</a>            <span class="string">"tunnel"</span>,
+<a href=#622 id=622 data-nosnippet>622</a>            <span class="string">"tunnel.tunnel-provider"</span>,
+<a href=#623 id=623 data-nosnippet>623</a>        )),
+<a href=#624 id=624 data-nosnippet>624</a>        Section::Agents =&gt; PickerDispatch::Items(agents_picker(cfg)),
+<a href=#625 id=625 data-nosnippet>625</a>        <span class="comment">// Storage is two-tier (`storage.&lt;kind&gt;.&lt;alias&gt;`) — same shape
+<a href=#626 id=626 data-nosnippet>626</a>        // and walker as channels and the typed-provider families.
+<a href=#627 id=627 data-nosnippet>627</a>        </span>Section::Storage =&gt; PickerDispatch::Items(storage_picker(cfg)),
+<a href=#628 id=628 data-nosnippet>628</a>        <span class="comment">// OneTierAliasMap explorer sections: pick a key from the live
+<a href=#629 id=629 data-nosnippet>629</a>        // HashMap. Generic walker covers every section whose schema is
+<a href=#630 id=630 data-nosnippet>630</a>        // `&lt;section&gt;.&lt;alias&gt;` (operator-named keys, no closed kind set).
+<a href=#631 id=631 data-nosnippet>631</a>        </span>Section::PeerGroups
+<a href=#632 id=632 data-nosnippet>632</a>        | Section::Cron
+<a href=#633 id=633 data-nosnippet>633</a>        | Section::McpServers
+<a href=#634 id=634 data-nosnippet>634</a>        | Section::McpBundles
+<a href=#635 id=635 data-nosnippet>635</a>        | Section::KnowledgeBundles
+<a href=#636 id=636 data-nosnippet>636</a>        | Section::SkillBundles
+<a href=#637 id=637 data-nosnippet>637</a>        | Section::RiskProfiles
+<a href=#638 id=638 data-nosnippet>638</a>        | Section::RuntimeProfiles =&gt; {
+<a href=#639 id=639 data-nosnippet>639</a>            PickerDispatch::Items(one_tier_alias_map_picker(cfg, section.as_str()))
+<a href=#640 id=640 data-nosnippet>640</a>        }
+<a href=#641 id=641 data-nosnippet>641</a>        Section::Hardware | Section::Mcp | Section::Skills | Section::QuickstartState =&gt; {
+<a href=#642 id=642 data-nosnippet>642</a>            PickerDispatch::DirectForm
+<a href=#643 id=643 data-nosnippet>643</a>        }
+<a href=#644 id=644 data-nosnippet>644</a>    }
+<a href=#645 id=645 data-nosnippet>645</a>}
+<a href=#646 id=646 data-nosnippet>646</a>
+<a href=#647 id=647 data-nosnippet>647</a><span class="kw">fn </span>providers_picker(cfg: <span class="kw-2">&amp;</span>zeroclaw_config::schema::Config) -&gt; Vec&lt;PickerItem&gt; {
+<a href=#648 id=648 data-nosnippet>648</a>    zeroclaw_providers::list_model_providers()
+<a href=#649 id=649 data-nosnippet>649</a>        .into_iter()
+<a href=#650 id=650 data-nosnippet>650</a>        .map(|p| PickerItem {
+<a href=#651 id=651 data-nosnippet>651</a>            key: p.name.to_string(),
+<a href=#652 id=652 data-nosnippet>652</a>            label: p.display_name.to_string(),
+<a href=#653 id=653 data-nosnippet>653</a>            description: <span class="kw">if </span>p.local {
+<a href=#654 id=654 data-nosnippet>654</a>                <span class="prelude-val">Some</span>(<span class="string">"Local — no API key required"</span>.to_string())
+<a href=#655 id=655 data-nosnippet>655</a>            } <span class="kw">else </span>{
+<a href=#656 id=656 data-nosnippet>656</a>                <span class="prelude-val">None
+<a href=#657 id=657 data-nosnippet>657</a>            </span>},
+<a href=#658 id=658 data-nosnippet>658</a>            badge: provider_type_badge(cfg, p.name, p.local),
+<a href=#659 id=659 data-nosnippet>659</a>        })
+<a href=#660 id=660 data-nosnippet>660</a>        .collect()
+<a href=#661 id=661 data-nosnippet>661</a>}
+<a href=#662 id=662 data-nosnippet>662</a>
+<a href=#663 id=663 data-nosnippet>663</a><span class="kw">fn </span>any_usable_model_provider(cfg: <span class="kw-2">&amp;</span>zeroclaw_config::schema::Config) -&gt; bool {
+<a href=#664 id=664 data-nosnippet>664</a>    cfg.providers
+<a href=#665 id=665 data-nosnippet>665</a>        .models
+<a href=#666 id=666 data-nosnippet>666</a>        .iter_entries()
+<a href=#667 id=667 data-nosnippet>667</a>        .any(|(family, <span class="kw">_</span>, base)| {
+<a href=#668 id=668 data-nosnippet>668</a>            model_provider_alias_usable(
+<a href=#669 id=669 data-nosnippet>669</a>                base,
+<a href=#670 id=670 data-nosnippet>670</a>                zeroclaw_runtime::quickstart::model_provider_is_local(family),
+<a href=#671 id=671 data-nosnippet>671</a>            )
+<a href=#672 id=672 data-nosnippet>672</a>        })
+<a href=#673 id=673 data-nosnippet>673</a>}
+<a href=#674 id=674 data-nosnippet>674</a>
+<a href=#675 id=675 data-nosnippet>675</a><span class="kw">fn </span>provider_type_badge(
+<a href=#676 id=676 data-nosnippet>676</a>    cfg: <span class="kw-2">&amp;</span>zeroclaw_config::schema::Config,
+<a href=#677 id=677 data-nosnippet>677</a>    family: <span class="kw-2">&amp;</span>str,
+<a href=#678 id=678 data-nosnippet>678</a>    local: bool,
+<a href=#679 id=679 data-nosnippet>679</a>) -&gt; <span class="prelude-ty">Option</span>&lt;String&gt; {
+<a href=#680 id=680 data-nosnippet>680</a>    <span class="kw">let </span><span class="kw-2">mut </span>has_alias = <span class="bool-val">false</span>;
+<a href=#681 id=681 data-nosnippet>681</a>    <span class="kw">let </span><span class="kw-2">mut </span>has_usable_alias = <span class="bool-val">false</span>;
+<a href=#682 id=682 data-nosnippet>682</a>    <span class="kw">for </span>(ty, <span class="kw">_</span>, base) <span class="kw">in </span>cfg.providers.models.iter_entries() {
+<a href=#683 id=683 data-nosnippet>683</a>        <span class="kw">if </span>ty != family {
+<a href=#684 id=684 data-nosnippet>684</a>            <span class="kw">continue</span>;
+<a href=#685 id=685 data-nosnippet>685</a>        }
+<a href=#686 id=686 data-nosnippet>686</a>        has_alias = <span class="bool-val">true</span>;
+<a href=#687 id=687 data-nosnippet>687</a>        <span class="kw">if </span>model_provider_alias_usable(base, local) {
+<a href=#688 id=688 data-nosnippet>688</a>            has_usable_alias = <span class="bool-val">true</span>;
+<a href=#689 id=689 data-nosnippet>689</a>        }
+<a href=#690 id=690 data-nosnippet>690</a>    }
+<a href=#691 id=691 data-nosnippet>691</a>    <span class="kw">if </span>has_usable_alias {
+<a href=#692 id=692 data-nosnippet>692</a>        <span class="prelude-val">Some</span>(<span class="string">"configured"</span>.to_string())
+<a href=#693 id=693 data-nosnippet>693</a>    } <span class="kw">else if </span>has_alias {
+<a href=#694 id=694 data-nosnippet>694</a>        <span class="prelude-val">Some</span>(<span class="string">"needs setup"</span>.to_string())
+<a href=#695 id=695 data-nosnippet>695</a>    } <span class="kw">else </span>{
+<a href=#696 id=696 data-nosnippet>696</a>        <span class="prelude-val">None
+<a href=#697 id=697 data-nosnippet>697</a>    </span>}
+<a href=#698 id=698 data-nosnippet>698</a>}
+<a href=#699 id=699 data-nosnippet>699</a>
+<a href=#700 id=700 data-nosnippet>700</a><span class="kw">fn </span>model_provider_alias_usable(
+<a href=#701 id=701 data-nosnippet>701</a>    base: <span class="kw-2">&amp;</span>zeroclaw_config::schema::ModelProviderConfig,
+<a href=#702 id=702 data-nosnippet>702</a>    local: bool,
+<a href=#703 id=703 data-nosnippet>703</a>) -&gt; bool {
+<a href=#704 id=704 data-nosnippet>704</a>    <span class="kw">let </span>has_model = base
+<a href=#705 id=705 data-nosnippet>705</a>        .model
+<a href=#706 id=706 data-nosnippet>706</a>        .as_deref()
+<a href=#707 id=707 data-nosnippet>707</a>        .map(str::trim)
+<a href=#708 id=708 data-nosnippet>708</a>        .is_some_and(|model| !model.is_empty());
+<a href=#709 id=709 data-nosnippet>709</a>    <span class="kw">if </span>!has_model {
+<a href=#710 id=710 data-nosnippet>710</a>        <span class="kw">return </span><span class="bool-val">false</span>;
+<a href=#711 id=711 data-nosnippet>711</a>    }
+<a href=#712 id=712 data-nosnippet>712</a>    base.api_key
+<a href=#713 id=713 data-nosnippet>713</a>        .as_deref()
+<a href=#714 id=714 data-nosnippet>714</a>        .map(str::trim)
+<a href=#715 id=715 data-nosnippet>715</a>        .is_some_and(|key| !key.is_empty())
+<a href=#716 id=716 data-nosnippet>716</a>        || base.requires_openai_auth
+<a href=#717 id=717 data-nosnippet>717</a>        || local
+<a href=#718 id=718 data-nosnippet>718</a>}
+<a href=#719 id=719 data-nosnippet>719</a>
+<a href=#720 id=720 data-nosnippet>720</a><span class="kw">fn </span>storage_picker(cfg: <span class="kw-2">&amp;</span>zeroclaw_config::schema::Config) -&gt; Vec&lt;PickerItem&gt; {
+<a href=#721 id=721 data-nosnippet>721</a>    <span class="kw">let </span><span class="kw-2">mut </span>items = schema_walk_picker(cfg, <span class="string">"storage"</span>);
+<a href=#722 id=722 data-nosnippet>722</a>    <span class="kw">for </span>item <span class="kw">in </span><span class="kw-2">&amp;mut </span>items {
+<a href=#723 id=723 data-nosnippet>723</a>        item.description = storage_description(<span class="kw-2">&amp;</span>item.key).map(str::to_string);
+<a href=#724 id=724 data-nosnippet>724</a>        <span class="kw">if </span>item.badge.as_deref() == <span class="prelude-val">Some</span>(<span class="string">"configured"</span>) {
+<a href=#725 id=725 data-nosnippet>725</a>            item.badge = <span class="prelude-val">Some</span>(<span class="string">"created"</span>.to_string());
+<a href=#726 id=726 data-nosnippet>726</a>        }
+<a href=#727 id=727 data-nosnippet>727</a>    }
+<a href=#728 id=728 data-nosnippet>728</a>    items.sort_by_key(|item| storage_rank(<span class="kw-2">&amp;</span>item.key));
+<a href=#729 id=729 data-nosnippet>729</a>    items
+<a href=#730 id=730 data-nosnippet>730</a>}
+<a href=#731 id=731 data-nosnippet>731</a>
+<a href=#732 id=732 data-nosnippet>732</a><span class="kw">fn </span>storage_rank(key: <span class="kw-2">&amp;</span>str) -&gt; usize {
+<a href=#733 id=733 data-nosnippet>733</a>    <span class="kw">match </span>key {
+<a href=#734 id=734 data-nosnippet>734</a>        <span class="string">"sqlite" </span>=&gt; <span class="number">0</span>,
+<a href=#735 id=735 data-nosnippet>735</a>        <span class="string">"postgres" </span>=&gt; <span class="number">1</span>,
+<a href=#736 id=736 data-nosnippet>736</a>        <span class="string">"qdrant" </span>=&gt; <span class="number">2</span>,
+<a href=#737 id=737 data-nosnippet>737</a>        <span class="string">"markdown" </span>=&gt; <span class="number">3</span>,
+<a href=#738 id=738 data-nosnippet>738</a>        <span class="string">"lucid" </span>=&gt; <span class="number">4</span>,
+<a href=#739 id=739 data-nosnippet>739</a>        <span class="kw">_ </span>=&gt; <span class="number">99</span>,
+<a href=#740 id=740 data-nosnippet>740</a>    }
+<a href=#741 id=741 data-nosnippet>741</a>}
+<a href=#742 id=742 data-nosnippet>742</a>
+<a href=#743 id=743 data-nosnippet>743</a><span class="kw">fn </span>storage_description(key: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span><span class="lifetime">'static </span>str&gt; {
+<a href=#744 id=744 data-nosnippet>744</a>    <span class="kw">match </span>key {
+<a href=#745 id=745 data-nosnippet>745</a>        <span class="string">"sqlite" </span>=&gt; <span class="prelude-val">Some</span>(
+<a href=#746 id=746 data-nosnippet>746</a>            <span class="string">"Safe default for single-node installs: file-based, zero-config, no external service."</span>,
+<a href=#747 id=747 data-nosnippet>747</a>        ),
+<a href=#748 id=748 data-nosnippet>748</a>        <span class="string">"postgres" </span>=&gt; {
+<a href=#749 id=749 data-nosnippet>749</a>            <span class="prelude-val">Some</span>(<span class="string">"Shared or multi-instance deployments that need durable server-backed storage."</span>)
+<a href=#750 id=750 data-nosnippet>750</a>        }
+<a href=#751 id=751 data-nosnippet>751</a>        <span class="string">"qdrant" </span>=&gt; {
+<a href=#752 id=752 data-nosnippet>752</a>            <span class="prelude-val">Some</span>(<span class="string">"Vector database backend for semantic search when you already run Qdrant."</span>)
+<a href=#753 id=753 data-nosnippet>753</a>        }
+<a href=#754 id=754 data-nosnippet>754</a>        <span class="string">"markdown" </span>=&gt; {
+<a href=#755 id=755 data-nosnippet>755</a>            <span class="prelude-val">Some</span>(<span class="string">"Human-readable files with simple local storage and no database service."</span>)
+<a href=#756 id=756 data-nosnippet>756</a>        }
+<a href=#757 id=757 data-nosnippet>757</a>        <span class="string">"lucid" </span>=&gt; {
+<a href=#758 id=758 data-nosnippet>758</a>            <span class="prelude-val">Some</span>(<span class="string">"Bridge to local lucid-memory CLI while keeping SQLite-style local operation."</span>)
+<a href=#759 id=759 data-nosnippet>759</a>        }
+<a href=#760 id=760 data-nosnippet>760</a>        <span class="kw">_ </span>=&gt; <span class="prelude-val">None</span>,
+<a href=#761 id=761 data-nosnippet>761</a>    }
+<a href=#762 id=762 data-nosnippet>762</a>}
+<a href=#763 id=763 data-nosnippet>763</a>
+<a href=#764 id=764 data-nosnippet>764</a><span class="kw">fn </span>memory_picker(cfg: <span class="kw-2">&amp;</span>zeroclaw_config::schema::Config) -&gt; Vec&lt;PickerItem&gt; {
+<a href=#765 id=765 data-nosnippet>765</a>    <span class="kw">let </span>current = cfg.memory.backend.clone();
+<a href=#766 id=766 data-nosnippet>766</a>    <span class="kw">let </span>memory_completed = cfg
+<a href=#767 id=767 data-nosnippet>767</a>        .onboard_state
+<a href=#768 id=768 data-nosnippet>768</a>        .completed_sections
+<a href=#769 id=769 data-nosnippet>769</a>        .iter()
+<a href=#770 id=770 data-nosnippet>770</a>        .any(|section| section == <span class="string">"memory"</span>);
+<a href=#771 id=771 data-nosnippet>771</a>    zeroclaw_memory::selectable_memory_backends()
+<a href=#772 id=772 data-nosnippet>772</a>        .iter()
+<a href=#773 id=773 data-nosnippet>773</a>        .map(|b| PickerItem {
+<a href=#774 id=774 data-nosnippet>774</a>            key: b.key.to_string(),
+<a href=#775 id=775 data-nosnippet>775</a>            label: b.label.to_string(),
+<a href=#776 id=776 data-nosnippet>776</a>            description: <span class="prelude-val">None</span>,
+<a href=#777 id=777 data-nosnippet>777</a>            badge: <span class="kw">if </span>b.key == current &amp;&amp; memory_completed {
+<a href=#778 id=778 data-nosnippet>778</a>                <span class="prelude-val">Some</span>(<span class="string">"active"</span>.to_string())
+<a href=#779 id=779 data-nosnippet>779</a>            } <span class="kw">else </span>{
+<a href=#780 id=780 data-nosnippet>780</a>                <span class="prelude-val">None
+<a href=#781 id=781 data-nosnippet>781</a>            </span>},
+<a href=#782 id=782 data-nosnippet>782</a>        })
+<a href=#783 id=783 data-nosnippet>783</a>        .collect()
+<a href=#784 id=784 data-nosnippet>784</a>}
+<a href=#785 id=785 data-nosnippet>785</a>
+<a href=#786 id=786 data-nosnippet>786</a><span class="doccomment">/// Generic schema-walk picker for sections like `channels` whose subsections
+<a href=#787 id=787 data-nosnippet>787</a>/// are `#[nested] HashMap&lt;String, T&gt;` fields. Discovery: use `map_key_sections()`
+<a href=#788 id=788 data-nosnippet>788</a>/// to enumerate all statically-known sub-sections under `&lt;section&gt;.` — this
+<a href=#789 id=789 data-nosnippet>789</a>/// works for HashMap-based channels without needing init_defaults to insert
+<a href=#790 id=790 data-nosnippet>790</a>/// entries (HashMap fields start empty and init_defaults leaves them empty).
+<a href=#791 id=791 data-nosnippet>791</a></span><span class="kw">fn </span>schema_walk_picker(cfg: <span class="kw-2">&amp;</span>zeroclaw_config::schema::Config, section: <span class="kw-2">&amp;</span>str) -&gt; Vec&lt;PickerItem&gt; {
+<a href=#792 id=792 data-nosnippet>792</a>    <span class="kw">let </span>prefix_with_dot = <span class="macro">format!</span>(<span class="string">"{section}."</span>);
+<a href=#793 id=793 data-nosnippet>793</a>
+<a href=#794 id=794 data-nosnippet>794</a>    <span class="comment">// Configured: any alias present on this type (has at least one entry in its HashMap).
+<a href=#795 id=795 data-nosnippet>795</a>    </span><span class="kw">let </span>configured: std::collections::BTreeSet&lt;String&gt; = cfg
+<a href=#796 id=796 data-nosnippet>796</a>        .prop_fields()
+<a href=#797 id=797 data-nosnippet>797</a>        .iter()
+<a href=#798 id=798 data-nosnippet>798</a>        .filter_map(|f| f.name.strip_prefix(<span class="kw-2">&amp;</span>prefix_with_dot))
+<a href=#799 id=799 data-nosnippet>799</a>        .filter_map(|suffix| suffix.split_once(<span class="string">'.'</span>).map(|(head, <span class="kw">_</span>)| head.to_string()))
+<a href=#800 id=800 data-nosnippet>800</a>        .collect();
+<a href=#801 id=801 data-nosnippet>801</a>
+<a href=#802 id=802 data-nosnippet>802</a>    <span class="comment">// All known channel/section types from schema metadata — statically known,
+<a href=#803 id=803 data-nosnippet>803</a>    // no HashMap entries needed.
+<a href=#804 id=804 data-nosnippet>804</a>    </span><span class="kw">let </span>all: std::collections::BTreeSet&lt;String&gt; =
+<a href=#805 id=805 data-nosnippet>805</a>        zeroclaw_config::schema::Config::map_key_sections()
+<a href=#806 id=806 data-nosnippet>806</a>            .into_iter()
+<a href=#807 id=807 data-nosnippet>807</a>            .filter_map(|s| {
+<a href=#808 id=808 data-nosnippet>808</a>                s.path
+<a href=#809 id=809 data-nosnippet>809</a>                    .strip_prefix(<span class="kw-2">&amp;</span>prefix_with_dot)
+<a href=#810 id=810 data-nosnippet>810</a>                    .filter(|rest| !rest.contains(<span class="string">'.'</span>))
+<a href=#811 id=811 data-nosnippet>811</a>                    .map(String::from)
+<a href=#812 id=812 data-nosnippet>812</a>            })
+<a href=#813 id=813 data-nosnippet>813</a>            .collect();
+<a href=#814 id=814 data-nosnippet>814</a>
+<a href=#815 id=815 data-nosnippet>815</a>    all.into_iter()
+<a href=#816 id=816 data-nosnippet>816</a>        .map(|name| {
+<a href=#817 id=817 data-nosnippet>817</a>            <span class="comment">// Channel configs no longer carry an `enabled` field; a channel is
+<a href=#818 id=818 data-nosnippet>818</a>            // active when an enabled agent references it. Badge = "configured" when
+<a href=#819 id=819 data-nosnippet>819</a>            // at least one alias exists, absent otherwise.
+<a href=#820 id=820 data-nosnippet>820</a>            </span><span class="kw">let </span>badge = <span class="kw">if </span>configured.contains(<span class="kw-2">&amp;</span>name) {
+<a href=#821 id=821 data-nosnippet>821</a>                <span class="prelude-val">Some</span>(<span class="string">"configured"</span>.to_string())
+<a href=#822 id=822 data-nosnippet>822</a>            } <span class="kw">else </span>{
+<a href=#823 id=823 data-nosnippet>823</a>                <span class="prelude-val">None
+<a href=#824 id=824 data-nosnippet>824</a>            </span>};
+<a href=#825 id=825 data-nosnippet>825</a>            PickerItem {
+<a href=#826 id=826 data-nosnippet>826</a>                key: name.clone(),
+<a href=#827 id=827 data-nosnippet>827</a>                label: name.clone(),
+<a href=#828 id=828 data-nosnippet>828</a>                description: <span class="prelude-val">None</span>,
+<a href=#829 id=829 data-nosnippet>829</a>                badge,
+<a href=#830 id=830 data-nosnippet>830</a>            }
+<a href=#831 id=831 data-nosnippet>831</a>        })
+<a href=#832 id=832 data-nosnippet>832</a>        .collect()
+<a href=#833 id=833 data-nosnippet>833</a>}
+<a href=#834 id=834 data-nosnippet>834</a>
+<a href=#835 id=835 data-nosnippet>835</a><span class="doccomment">/// Generic picker for `OneTierAliasMap` sections — walks the live
+<a href=#836 id=836 data-nosnippet>836</a>/// `prop_fields()` for the section prefix and returns one PickerItem
+<a href=#837 id=837 data-nosnippet>837</a>/// per operator-defined alias. The closed-kind enumeration that
+<a href=#838 id=838 data-nosnippet>838</a>/// [`schema_walk_picker`] does via `Config::map_key_sections()` doesn't
+<a href=#839 id=839 data-nosnippet>839</a>/// apply here: aliases under `peer_groups`, `cron`, `risk_profiles`,
+<a href=#840 id=840 data-nosnippet>840</a>/// etc. are operator-named, with no statically-known catalog. Every
+<a href=#841 id=841 data-nosnippet>841</a>/// existing alias is reported `configured`; the dashboard's `+ Add`
+<a href=#842 id=842 data-nosnippet>842</a>/// affordance handles new-key creation through
+<a href=#843 id=843 data-nosnippet>843</a>/// [`handle_select_item`].
+<a href=#844 id=844 data-nosnippet>844</a></span><span class="kw">fn </span>one_tier_alias_map_picker(
+<a href=#845 id=845 data-nosnippet>845</a>    cfg: <span class="kw-2">&amp;</span>zeroclaw_config::schema::Config,
+<a href=#846 id=846 data-nosnippet>846</a>    section: <span class="kw-2">&amp;</span>str,
+<a href=#847 id=847 data-nosnippet>847</a>) -&gt; Vec&lt;PickerItem&gt; {
+<a href=#848 id=848 data-nosnippet>848</a>    <span class="kw">let </span>prefix_with_dot = <span class="macro">format!</span>(<span class="string">"{section}."</span>);
+<a href=#849 id=849 data-nosnippet>849</a>    <span class="kw">let </span><span class="kw-2">mut </span>keys: std::collections::BTreeSet&lt;String&gt; = std::collections::BTreeSet::new();
+<a href=#850 id=850 data-nosnippet>850</a>    <span class="kw">for </span>field <span class="kw">in </span>cfg.prop_fields() {
+<a href=#851 id=851 data-nosnippet>851</a>        <span class="kw">let </span><span class="prelude-val">Some</span>(suffix) = field.name.strip_prefix(<span class="kw-2">&amp;</span>prefix_with_dot) <span class="kw">else </span>{
+<a href=#852 id=852 data-nosnippet>852</a>            <span class="kw">continue</span>;
+<a href=#853 id=853 data-nosnippet>853</a>        };
+<a href=#854 id=854 data-nosnippet>854</a>        <span class="kw">let </span>head = suffix.split_once(<span class="string">'.'</span>).map_or(suffix, |(h, <span class="kw">_</span>)| h);
+<a href=#855 id=855 data-nosnippet>855</a>        <span class="kw">if </span>head.is_empty() {
+<a href=#856 id=856 data-nosnippet>856</a>            <span class="kw">continue</span>;
+<a href=#857 id=857 data-nosnippet>857</a>        }
+<a href=#858 id=858 data-nosnippet>858</a>        keys.insert(head.to_string());
+<a href=#859 id=859 data-nosnippet>859</a>    }
+<a href=#860 id=860 data-nosnippet>860</a>    keys.into_iter()
+<a href=#861 id=861 data-nosnippet>861</a>        .map(|key| PickerItem {
+<a href=#862 id=862 data-nosnippet>862</a>            key: key.clone(),
+<a href=#863 id=863 data-nosnippet>863</a>            label: key,
+<a href=#864 id=864 data-nosnippet>864</a>            description: <span class="prelude-val">None</span>,
+<a href=#865 id=865 data-nosnippet>865</a>            badge: <span class="prelude-val">Some</span>(<span class="string">"configured"</span>.to_string()),
+<a href=#866 id=866 data-nosnippet>866</a>        })
+<a href=#867 id=867 data-nosnippet>867</a>        .collect()
+<a href=#868 id=868 data-nosnippet>868</a>}
+<a href=#869 id=869 data-nosnippet>869</a>
+<a href=#870 id=870 data-nosnippet>870</a><span class="doccomment">/// Agents picker: walks `cfg.agents` and returns each alias with an activity badge.
+<a href=#871 id=871 data-nosnippet>871</a>/// `active` = agent exists and `enabled = true`; `configured` = exists but disabled.
+<a href=#872 id=872 data-nosnippet>872</a></span><span class="kw">fn </span>agents_picker(cfg: <span class="kw-2">&amp;</span>zeroclaw_config::schema::Config) -&gt; Vec&lt;PickerItem&gt; {
+<a href=#873 id=873 data-nosnippet>873</a>    <span class="kw">let </span><span class="kw-2">mut </span>items: Vec&lt;PickerItem&gt; = cfg
+<a href=#874 id=874 data-nosnippet>874</a>        .agents
+<a href=#875 id=875 data-nosnippet>875</a>        .iter()
+<a href=#876 id=876 data-nosnippet>876</a>        .map(|(alias, agent)| PickerItem {
+<a href=#877 id=877 data-nosnippet>877</a>            key: alias.clone(),
+<a href=#878 id=878 data-nosnippet>878</a>            label: alias.clone(),
+<a href=#879 id=879 data-nosnippet>879</a>            description: <span class="prelude-val">None</span>,
+<a href=#880 id=880 data-nosnippet>880</a>            badge: <span class="kw">if </span>agent.enabled {
+<a href=#881 id=881 data-nosnippet>881</a>                <span class="prelude-val">Some</span>(<span class="string">"active"</span>.to_string())
+<a href=#882 id=882 data-nosnippet>882</a>            } <span class="kw">else </span>{
+<a href=#883 id=883 data-nosnippet>883</a>                <span class="prelude-val">Some</span>(<span class="string">"configured"</span>.to_string())
+<a href=#884 id=884 data-nosnippet>884</a>            },
+<a href=#885 id=885 data-nosnippet>885</a>        })
+<a href=#886 id=886 data-nosnippet>886</a>        .collect();
+<a href=#887 id=887 data-nosnippet>887</a>    items.sort_by(|a, b| a.key.cmp(<span class="kw-2">&amp;</span>b.key));
+<a href=#888 id=888 data-nosnippet>888</a>    items
+<a href=#889 id=889 data-nosnippet>889</a>}
+<a href=#890 id=890 data-nosnippet>890</a>
+<a href=#891 id=891 data-nosnippet>891</a><span class="kw">fn </span>apply_first_run_agent_defaults(cfg: <span class="kw-2">&amp;mut </span>zeroclaw_config::schema::Config, alias: <span class="kw-2">&amp;</span>str) {
+<a href=#892 id=892 data-nosnippet>892</a>    <span class="kw">let </span>model_provider = cfg
+<a href=#893 id=893 data-nosnippet>893</a>        .providers
+<a href=#894 id=894 data-nosnippet>894</a>        .models
+<a href=#895 id=895 data-nosnippet>895</a>        .iter_entries()
+<a href=#896 id=896 data-nosnippet>896</a>        .next()
+<a href=#897 id=897 data-nosnippet>897</a>        .map(|(ty, alias, <span class="kw">_</span>)| <span class="macro">format!</span>(<span class="string">"{ty}.{alias}"</span>));
+<a href=#898 id=898 data-nosnippet>898</a>    <span class="kw">let </span>risk_profile = first_alias(cfg.risk_profiles.keys());
+<a href=#899 id=899 data-nosnippet>899</a>    <span class="kw">let </span>runtime_profile = first_alias(cfg.runtime_profiles.keys());
+<a href=#900 id=900 data-nosnippet>900</a>
+<a href=#901 id=901 data-nosnippet>901</a>    <span class="kw">let </span><span class="prelude-val">Some</span>(agent) = cfg.agents.get_mut(alias) <span class="kw">else </span>{
+<a href=#902 id=902 data-nosnippet>902</a>        <span class="kw">return</span>;
+<a href=#903 id=903 data-nosnippet>903</a>    };
+<a href=#904 id=904 data-nosnippet>904</a>    <span class="kw">if </span>agent.model_provider.trim().is_empty()
+<a href=#905 id=905 data-nosnippet>905</a>        &amp;&amp; <span class="kw">let </span><span class="prelude-val">Some</span>(model_provider) = model_provider
+<a href=#906 id=906 data-nosnippet>906</a>    {
+<a href=#907 id=907 data-nosnippet>907</a>        agent.model_provider = model_provider.into();
+<a href=#908 id=908 data-nosnippet>908</a>    }
+<a href=#909 id=909 data-nosnippet>909</a>    <span class="kw">if </span>agent.risk_profile.trim().is_empty()
+<a href=#910 id=910 data-nosnippet>910</a>        &amp;&amp; <span class="kw">let </span><span class="prelude-val">Some</span>(risk_profile) = risk_profile
+<a href=#911 id=911 data-nosnippet>911</a>    {
+<a href=#912 id=912 data-nosnippet>912</a>        agent.risk_profile = risk_profile;
+<a href=#913 id=913 data-nosnippet>913</a>    }
+<a href=#914 id=914 data-nosnippet>914</a>    <span class="kw">if </span>agent.runtime_profile.trim().is_empty()
+<a href=#915 id=915 data-nosnippet>915</a>        &amp;&amp; <span class="kw">let </span><span class="prelude-val">Some</span>(runtime_profile) = runtime_profile
+<a href=#916 id=916 data-nosnippet>916</a>    {
+<a href=#917 id=917 data-nosnippet>917</a>        agent.runtime_profile = runtime_profile;
+<a href=#918 id=918 data-nosnippet>918</a>    }
+<a href=#919 id=919 data-nosnippet>919</a>}
+<a href=#920 id=920 data-nosnippet>920</a>
+<a href=#921 id=921 data-nosnippet>921</a><span class="kw">fn </span>mark_section_completed(cfg: <span class="kw-2">&amp;mut </span>zeroclaw_config::schema::Config, section: <span class="kw-2">&amp;</span>str) {
+<a href=#922 id=922 data-nosnippet>922</a>    <span class="kw">if </span>!cfg
+<a href=#923 id=923 data-nosnippet>923</a>        .onboard_state
+<a href=#924 id=924 data-nosnippet>924</a>        .completed_sections
+<a href=#925 id=925 data-nosnippet>925</a>        .iter()
+<a href=#926 id=926 data-nosnippet>926</a>        .any(|completed| completed == section)
+<a href=#927 id=927 data-nosnippet>927</a>    {
+<a href=#928 id=928 data-nosnippet>928</a>        cfg.onboard_state
+<a href=#929 id=929 data-nosnippet>929</a>            .completed_sections
+<a href=#930 id=930 data-nosnippet>930</a>            .push(section.to_string());
+<a href=#931 id=931 data-nosnippet>931</a>        cfg.mark_dirty(<span class="string">"onboard_state.completed_sections"</span>);
+<a href=#932 id=932 data-nosnippet>932</a>    }
+<a href=#933 id=933 data-nosnippet>933</a>}
+<a href=#934 id=934 data-nosnippet>934</a>
+<a href=#935 id=935 data-nosnippet>935</a><span class="kw">fn </span>first_alias&lt;<span class="lifetime">'a</span>&gt;(aliases: <span class="kw">impl </span>Iterator&lt;Item = <span class="kw-2">&amp;</span><span class="lifetime">'a </span>String&gt;) -&gt; <span class="prelude-ty">Option</span>&lt;String&gt; {
+<a href=#936 id=936 data-nosnippet>936</a>    <span class="kw">let </span><span class="kw-2">mut </span>aliases: Vec&lt;<span class="kw-2">&amp;</span>String&gt; = aliases.collect();
+<a href=#937 id=937 data-nosnippet>937</a>    aliases.sort();
+<a href=#938 id=938 data-nosnippet>938</a>    aliases.first().map(|alias| (<span class="kw-2">*</span>alias).clone())
+<a href=#939 id=939 data-nosnippet>939</a>}
+<a href=#940 id=940 data-nosnippet>940</a>
+<a href=#941 id=941 data-nosnippet>941</a><span class="doccomment">/// `tunnel`-flavored picker: same as `schema_walk_picker` plus a synthetic
+<a href=#942 id=942 data-nosnippet>942</a>/// `none` entry at the top, marked active when the current `tunnel.tunnel_provider`
+<a href=#943 id=943 data-nosnippet>943</a>/// matches. Mirrors the TUI's tunnel section.
+<a href=#944 id=944 data-nosnippet>944</a></span><span class="kw">fn </span>schema_walk_picker_with_none(
+<a href=#945 id=945 data-nosnippet>945</a>    cfg: <span class="kw-2">&amp;</span>zeroclaw_config::schema::Config,
+<a href=#946 id=946 data-nosnippet>946</a>    section: <span class="kw-2">&amp;</span>str,
+<a href=#947 id=947 data-nosnippet>947</a>    active_prop_path: <span class="kw-2">&amp;</span>str,
+<a href=#948 id=948 data-nosnippet>948</a>) -&gt; Vec&lt;PickerItem&gt; {
+<a href=#949 id=949 data-nosnippet>949</a>    <span class="kw">let </span>active = cfg.get_prop(active_prop_path).unwrap_or_default();
+<a href=#950 id=950 data-nosnippet>950</a>    <span class="kw">let </span><span class="kw-2">mut </span>items = <span class="macro">vec!</span>[PickerItem {
+<a href=#951 id=951 data-nosnippet>951</a>        key: <span class="string">"none"</span>.to_string(),
+<a href=#952 id=952 data-nosnippet>952</a>        label: <span class="string">"none"</span>.to_string(),
+<a href=#953 id=953 data-nosnippet>953</a>        description: <span class="prelude-val">Some</span>(<span class="string">"Localhost only — no public tunnel."</span>.to_string()),
+<a href=#954 id=954 data-nosnippet>954</a>        badge: <span class="kw">if </span>active == <span class="string">"none" </span>|| active.is_empty() {
+<a href=#955 id=955 data-nosnippet>955</a>            <span class="prelude-val">Some</span>(<span class="string">"active"</span>.to_string())
+<a href=#956 id=956 data-nosnippet>956</a>        } <span class="kw">else </span>{
+<a href=#957 id=957 data-nosnippet>957</a>            <span class="prelude-val">None
+<a href=#958 id=958 data-nosnippet>958</a>        </span>},
+<a href=#959 id=959 data-nosnippet>959</a>    }];
+<a href=#960 id=960 data-nosnippet>960</a>    <span class="kw">let </span><span class="kw-2">mut </span>rest = schema_walk_picker(cfg, section);
+<a href=#961 id=961 data-nosnippet>961</a>    <span class="comment">// Re-mark the active one in the schema-walk results.
+<a href=#962 id=962 data-nosnippet>962</a>    </span><span class="kw">for </span>item <span class="kw">in </span><span class="kw-2">&amp;mut </span>rest {
+<a href=#963 id=963 data-nosnippet>963</a>        <span class="kw">if </span>item.key == active {
+<a href=#964 id=964 data-nosnippet>964</a>            item.badge = <span class="prelude-val">Some</span>(<span class="string">"active"</span>.to_string());
+<a href=#965 id=965 data-nosnippet>965</a>        }
+<a href=#966 id=966 data-nosnippet>966</a>    }
+<a href=#967 id=967 data-nosnippet>967</a>    items.extend(rest);
+<a href=#968 id=968 data-nosnippet>968</a>    items
+<a href=#969 id=969 data-nosnippet>969</a>}
+<a href=#970 id=970 data-nosnippet>970</a>
+<a href=#971 id=971 data-nosnippet>971</a><span class="attr">#[derive(Debug, Deserialize)]
+<a href=#972 id=972 data-nosnippet>972</a>#[cfg_attr(feature = <span class="string">"schema-export"</span>, derive(schemars::JsonSchema))]
+<a href=#973 id=973 data-nosnippet>973</a></span><span class="kw">pub struct </span>SectionItemPath {
+<a href=#974 id=974 data-nosnippet>974</a>    <span class="kw">pub </span>section: String,
+<a href=#975 id=975 data-nosnippet>975</a>    <span class="kw">pub </span>key: String,
+<a href=#976 id=976 data-nosnippet>976</a>}
+<a href=#977 id=977 data-nosnippet>977</a>
+<a href=#978 id=978 data-nosnippet>978</a><span class="doccomment">/// `POST /api/config/sections/&lt;section&gt;/items/&lt;key&gt;` — instantiate the
+<a href=#979 id=979 data-nosnippet>979</a>/// selected item in the live config (idempotent) and return the dotted
+<a href=#980 id=980 data-nosnippet>980</a>/// prefix the frontend should fetch fields under.
+<a href=#981 id=981 data-nosnippet>981</a>///
+<a href=#982 id=982 data-nosnippet>982</a>/// Per-section dispatch:
+<a href=#983 id=983 data-nosnippet>983</a>/// * `providers` → POST equivalent of `/api/config/map-key?path=providers.models&amp;key=&lt;key&gt;`,
+<a href=#984 id=984 data-nosnippet>984</a>///   then return `model_providers.&lt;key&gt;`.
+<a href=#985 id=985 data-nosnippet>985</a>/// * `channels` → init_defaults under `channels.&lt;key&gt;`, return `channels.&lt;key&gt;`.
+<a href=#986 id=986 data-nosnippet>986</a>/// * `memory` → set_prop `memory.backend = &lt;key&gt;`, return `memory`.
+<a href=#987 id=987 data-nosnippet>987</a>/// * `tunnel` → set_prop `tunnel.tunnel_provider = &lt;key&gt;` (and init_defaults the
+<a href=#988 id=988 data-nosnippet>988</a>///   subsection if `&lt;key&gt;` is not "none"), return `tunnel.&lt;key&gt;` (or `tunnel`
+<a href=#989 id=989 data-nosnippet>989</a>///   for the `none` case).
+<a href=#990 id=990 data-nosnippet>990</a>///
+<a href=#991 id=991 data-nosnippet>991</a>/// The optional JSON body `{"alias": "&lt;name&gt;"}` names the entry being created,
+<a href=#992 id=992 data-nosnippet>992</a>/// e.g. `"work"` for `model_providers.anthropic.work`. Omit to use `"default"`.
+<a href=#993 id=993 data-nosnippet>993</a></span><span class="attr">#[derive(Debug, Default, Deserialize)]
+<a href=#994 id=994 data-nosnippet>994</a>#[cfg_attr(feature = <span class="string">"schema-export"</span>, derive(schemars::JsonSchema))]
+<a href=#995 id=995 data-nosnippet>995</a></span><span class="kw">pub struct </span>SectionSelectBody {
+<a href=#996 id=996 data-nosnippet>996</a>    <span class="kw">pub </span>alias: <span class="prelude-ty">Option</span>&lt;String&gt;,
+<a href=#997 id=997 data-nosnippet>997</a>}
+<a href=#998 id=998 data-nosnippet>998</a>
+<a href=#999 id=999 data-nosnippet>999</a><span class="kw">pub async fn </span>handle_section_select(
+<a href=#1000 id=1000 data-nosnippet>1000</a>    State(state): State&lt;AppState&gt;,
+<a href=#1001 id=1001 data-nosnippet>1001</a>    headers: HeaderMap,
+<a href=#1002 id=1002 data-nosnippet>1002</a>    axum::extract::Path(SectionItemPath { section, key }): axum::extract::Path&lt;SectionItemPath&gt;,
+<a href=#1003 id=1003 data-nosnippet>1003</a>    body: <span class="prelude-ty">Option</span>&lt;axum::extract::Json&lt;SectionSelectBody&gt;&gt;,
+<a href=#1004 id=1004 data-nosnippet>1004</a>) -&gt; Response {
+<a href=#1005 id=1005 data-nosnippet>1005</a>    <span class="kw">if let </span><span class="prelude-val">Err</span>(e) = require_auth(<span class="kw-2">&amp;</span>state, <span class="kw-2">&amp;</span>headers) {
+<a href=#1006 id=1006 data-nosnippet>1006</a>        <span class="kw">return </span>e.into_response();
+<a href=#1007 id=1007 data-nosnippet>1007</a>    }
+<a href=#1008 id=1008 data-nosnippet>1008</a>
+<a href=#1009 id=1009 data-nosnippet>1009</a>    <span class="kw">let </span>alias = body
+<a href=#1010 id=1010 data-nosnippet>1010</a>        .and_then(|b| b.<span class="number">0</span>.alias)
+<a href=#1011 id=1011 data-nosnippet>1011</a>        .map(|s| s.trim().to_string())
+<a href=#1012 id=1012 data-nosnippet>1012</a>        .filter(|s| !s.is_empty())
+<a href=#1013 id=1013 data-nosnippet>1013</a>        .unwrap_or_else(|| <span class="string">"default"</span>.to_string());
+<a href=#1014 id=1014 data-nosnippet>1014</a>
+<a href=#1015 id=1015 data-nosnippet>1015</a>    <span class="kw">let </span><span class="kw-2">mut </span>working = state.config.read().clone();
+<a href=#1016 id=1016 data-nosnippet>1016</a>
+<a href=#1017 id=1017 data-nosnippet>1017</a>    <span class="kw">use </span>zeroclaw_config::sections::Section;
+<a href=#1018 id=1018 data-nosnippet>1018</a>    <span class="kw">let </span><span class="prelude-val">Some</span>(section_enum) = Section::from_key(<span class="kw-2">&amp;</span>section) <span class="kw">else </span>{
+<a href=#1019 id=1019 data-nosnippet>1019</a>        <span class="kw">return </span>error_response(
+<a href=#1020 id=1020 data-nosnippet>1020</a>            ConfigApiError::new(
+<a href=#1021 id=1021 data-nosnippet>1021</a>                ConfigApiCode::PathNotFound,
+<a href=#1022 id=1022 data-nosnippet>1022</a>                <span class="macro">format!</span>(<span class="string">"no picker semantics defined for section `{section}`"</span>),
+<a href=#1023 id=1023 data-nosnippet>1023</a>            )
+<a href=#1024 id=1024 data-nosnippet>1024</a>            .with_path(section.as_str()),
+<a href=#1025 id=1025 data-nosnippet>1025</a>        );
+<a href=#1026 id=1026 data-nosnippet>1026</a>    };
+<a href=#1027 id=1027 data-nosnippet>1027</a>
+<a href=#1028 id=1028 data-nosnippet>1028</a>    <span class="kw">let </span>(fields_prefix, created) = <span class="kw">match </span>section_enum {
+<a href=#1029 id=1029 data-nosnippet>1029</a>        Section::ModelProviders | Section::TtsProviders | Section::TranscriptionProviders =&gt; {
+<a href=#1030 id=1030 data-nosnippet>1030</a>            <span class="comment">// Two-tier typed-family path: outer bucket is the family
+<a href=#1031 id=1031 data-nosnippet>1031</a>            // (`model_providers.&lt;type&gt;` etc.), inner key is the alias the
+<a href=#1032 id=1032 data-nosnippet>1032</a>            // operator named. `create_map_key` is idempotent so re-selecting
+<a href=#1033 id=1033 data-nosnippet>1033</a>            // an existing type/alias is a no-op for the bucket and just
+<a href=#1034 id=1034 data-nosnippet>1034</a>            // returns the form prefix for the alias.
+<a href=#1035 id=1035 data-nosnippet>1035</a>            </span><span class="kw">let </span>family = section_enum.as_str();
+<a href=#1036 id=1036 data-nosnippet>1036</a>            <span class="kw">let </span>created = working
+<a href=#1037 id=1037 data-nosnippet>1037</a>                .create_map_key(<span class="kw-2">&amp;</span><span class="macro">format!</span>(<span class="string">"{family}.{key}"</span>), <span class="kw-2">&amp;</span>alias)
+<a href=#1038 id=1038 data-nosnippet>1038</a>                .map_err(|msg| {
+<a href=#1039 id=1039 data-nosnippet>1039</a>                    error_response(
+<a href=#1040 id=1040 data-nosnippet>1040</a>                        ConfigApiError::new(
+<a href=#1041 id=1041 data-nosnippet>1041</a>                            ConfigApiCode::PathNotFound,
+<a href=#1042 id=1042 data-nosnippet>1042</a>                            <span class="macro">format!</span>(<span class="string">"could not select {family} `{key}` alias `{alias}`: {msg}"</span>),
+<a href=#1043 id=1043 data-nosnippet>1043</a>                        )
+<a href=#1044 id=1044 data-nosnippet>1044</a>                        .with_path(<span class="macro">format!</span>(<span class="string">"{family}.{key}"</span>)),
+<a href=#1045 id=1045 data-nosnippet>1045</a>                    )
+<a href=#1046 id=1046 data-nosnippet>1046</a>                });
+<a href=#1047 id=1047 data-nosnippet>1047</a>            <span class="kw">let </span>created = <span class="kw">match </span>created {
+<a href=#1048 id=1048 data-nosnippet>1048</a>                <span class="prelude-val">Ok</span>(c) =&gt; c,
+<a href=#1049 id=1049 data-nosnippet>1049</a>                <span class="prelude-val">Err</span>(resp) =&gt; <span class="kw">return </span>resp,
+<a href=#1050 id=1050 data-nosnippet>1050</a>            };
+<a href=#1051 id=1051 data-nosnippet>1051</a>            <span class="comment">// Per-family typed configs derive their own default endpoint
+<a href=#1052 id=1052 data-nosnippet>1052</a>            // URI via family traits at runtime construction time.
+<a href=#1053 id=1053 data-nosnippet>1053</a>            </span>(<span class="macro">format!</span>(<span class="string">"{family}.{key}.{alias}"</span>), created)
+<a href=#1054 id=1054 data-nosnippet>1054</a>        }
+<a href=#1055 id=1055 data-nosnippet>1055</a>        Section::Channels =&gt; {
+<a href=#1056 id=1056 data-nosnippet>1056</a>            <span class="kw">let </span>created = working
+<a href=#1057 id=1057 data-nosnippet>1057</a>                .create_map_key(<span class="kw-2">&amp;</span><span class="macro">format!</span>(<span class="string">"channels.{key}"</span>), <span class="kw-2">&amp;</span>alias)
+<a href=#1058 id=1058 data-nosnippet>1058</a>                .map_err(|msg| {
+<a href=#1059 id=1059 data-nosnippet>1059</a>                    error_response(
+<a href=#1060 id=1060 data-nosnippet>1060</a>                        ConfigApiError::new(
+<a href=#1061 id=1061 data-nosnippet>1061</a>                            ConfigApiCode::PathNotFound,
+<a href=#1062 id=1062 data-nosnippet>1062</a>                            <span class="macro">format!</span>(<span class="string">"could not select channel `{key}` alias `{alias}`: {msg}"</span>),
+<a href=#1063 id=1063 data-nosnippet>1063</a>                        )
+<a href=#1064 id=1064 data-nosnippet>1064</a>                        .with_path(<span class="macro">format!</span>(<span class="string">"channels.{key}"</span>)),
+<a href=#1065 id=1065 data-nosnippet>1065</a>                    )
+<a href=#1066 id=1066 data-nosnippet>1066</a>                });
+<a href=#1067 id=1067 data-nosnippet>1067</a>            <span class="kw">let </span>created = <span class="kw">match </span>created {
+<a href=#1068 id=1068 data-nosnippet>1068</a>                <span class="prelude-val">Ok</span>(c) =&gt; c,
+<a href=#1069 id=1069 data-nosnippet>1069</a>                <span class="prelude-val">Err</span>(resp) =&gt; <span class="kw">return </span>resp,
+<a href=#1070 id=1070 data-nosnippet>1070</a>            };
+<a href=#1071 id=1071 data-nosnippet>1071</a>            <span class="comment">// The per-channel-type struct's `enabled` field defaults to
+<a href=#1072 id=1072 data-nosnippet>1072</a>            // `false` for paste-safety (don't fire a listener on a
+<a href=#1073 id=1073 data-nosnippet>1073</a>            // half-pasted block). For wizard-driven creation the operator
+<a href=#1074 id=1074 data-nosnippet>1074</a>            // has just consciously added the alias, so flip
+<a href=#1075 id=1075 data-nosnippet>1075</a>            // the new entry's `enabled` to true. Re-selecting an existing
+<a href=#1076 id=1076 data-nosnippet>1076</a>            // alias is a no-op (created=false), so user-edited values are
+<a href=#1077 id=1077 data-nosnippet>1077</a>            // never trampled.
+<a href=#1078 id=1078 data-nosnippet>1078</a>            </span><span class="kw">if </span>created {
+<a href=#1079 id=1079 data-nosnippet>1079</a>                <span class="kw">let </span>enabled_path = <span class="macro">format!</span>(<span class="string">"channels.{key}.{alias}.enabled"</span>);
+<a href=#1080 id=1080 data-nosnippet>1080</a>                <span class="kw">if let </span><span class="prelude-val">Err</span>(e) = working.set_prop_persistent(<span class="kw-2">&amp;</span>enabled_path, <span class="string">"true"</span>) {
+<a href=#1081 id=1081 data-nosnippet>1081</a>                    <span class="macro">::zeroclaw_log::record!</span>(
+<a href=#1082 id=1082 data-nosnippet>1082</a>                        WARN,
+<a href=#1083 id=1083 data-nosnippet>1083</a>                        ::zeroclaw_log::Event::new(<span class="macro">module_path!</span>(), ::zeroclaw_log::Action::Note)
+<a href=#1084 id=1084 data-nosnippet>1084</a>                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+<a href=#1085 id=1085 data-nosnippet>1085</a>                            .with_attrs(
+<a href=#1086 id=1086 data-nosnippet>1086</a>                                <span class="macro">::serde_json::json!</span>({<span class="string">"path"</span>: enabled_path, <span class="string">"error"</span>: <span class="macro">format!</span>(<span class="string">"{}"</span>, e)})
+<a href=#1087 id=1087 data-nosnippet>1087</a>                            ),
+<a href=#1088 id=1088 data-nosnippet>1088</a>                        <span class="string">"failed to default-enable newly created channel; operator must toggle manually"
+<a href=#1089 id=1089 data-nosnippet>1089</a>                    </span>);
+<a href=#1090 id=1090 data-nosnippet>1090</a>                }
+<a href=#1091 id=1091 data-nosnippet>1091</a>            }
+<a href=#1092 id=1092 data-nosnippet>1092</a>            (<span class="macro">format!</span>(<span class="string">"channels.{key}.{alias}"</span>), created)
+<a href=#1093 id=1093 data-nosnippet>1093</a>        }
+<a href=#1094 id=1094 data-nosnippet>1094</a>        Section::Agents
+<a href=#1095 id=1095 data-nosnippet>1095</a>        | Section::PeerGroups
+<a href=#1096 id=1096 data-nosnippet>1096</a>        | Section::Cron
+<a href=#1097 id=1097 data-nosnippet>1097</a>        | Section::McpServers
+<a href=#1098 id=1098 data-nosnippet>1098</a>        | Section::McpBundles
+<a href=#1099 id=1099 data-nosnippet>1099</a>        | Section::KnowledgeBundles
+<a href=#1100 id=1100 data-nosnippet>1100</a>        | Section::SkillBundles
+<a href=#1101 id=1101 data-nosnippet>1101</a>        | Section::RiskProfiles
+<a href=#1102 id=1102 data-nosnippet>1102</a>        | Section::RuntimeProfiles =&gt; {
+<a href=#1103 id=1103 data-nosnippet>1103</a>            <span class="comment">// OneTierAliasMap: the URL path key IS the alias. One
+<a href=#1104 id=1104 data-nosnippet>1104</a>            // `create_map_key("&lt;section&gt;", &amp;key)` call works for every
+<a href=#1105 id=1105 data-nosnippet>1105</a>            // operator-named HashMap section; create_map_key is
+<a href=#1106 id=1106 data-nosnippet>1106</a>            // idempotent, so selecting an existing alias just returns
+<a href=#1107 id=1107 data-nosnippet>1107</a>            // the form prefix without modifying anything.
+<a href=#1108 id=1108 data-nosnippet>1108</a>            </span><span class="kw">let </span>section_key = section_enum.as_str();
+<a href=#1109 id=1109 data-nosnippet>1109</a>            <span class="kw">let </span>created = working.create_map_key(section_key, <span class="kw-2">&amp;</span>key).map_err(|msg| {
+<a href=#1110 id=1110 data-nosnippet>1110</a>                error_response(
+<a href=#1111 id=1111 data-nosnippet>1111</a>                    ConfigApiError::new(
+<a href=#1112 id=1112 data-nosnippet>1112</a>                        ConfigApiCode::PathNotFound,
+<a href=#1113 id=1113 data-nosnippet>1113</a>                        <span class="macro">format!</span>(<span class="string">"could not select {section_key} alias `{key}`: {msg}"</span>),
+<a href=#1114 id=1114 data-nosnippet>1114</a>                    )
+<a href=#1115 id=1115 data-nosnippet>1115</a>                    .with_path(section_key),
+<a href=#1116 id=1116 data-nosnippet>1116</a>                )
+<a href=#1117 id=1117 data-nosnippet>1117</a>            });
+<a href=#1118 id=1118 data-nosnippet>1118</a>            <span class="kw">let </span>created = <span class="kw">match </span>created {
+<a href=#1119 id=1119 data-nosnippet>1119</a>                <span class="prelude-val">Ok</span>(c) =&gt; c,
+<a href=#1120 id=1120 data-nosnippet>1120</a>                <span class="prelude-val">Err</span>(resp) =&gt; <span class="kw">return </span>resp,
+<a href=#1121 id=1121 data-nosnippet>1121</a>            };
+<a href=#1122 id=1122 data-nosnippet>1122</a>            <span class="comment">// Agents need a per-alias workspace dir on disk so the
+<a href=#1123 id=1123 data-nosnippet>1123</a>            // PersonalityEditor and the runtime have somewhere to read
+<a href=#1124 id=1124 data-nosnippet>1124</a>            // and write IDENTITY.md / SOUL.md / USER.md / etc.
+<a href=#1125 id=1125 data-nosnippet>1125</a>            </span><span class="kw">if </span>created &amp;&amp; <span class="macro">matches!</span>(section_enum, Section::Agents) {
+<a href=#1126 id=1126 data-nosnippet>1126</a>                apply_first_run_agent_defaults(<span class="kw-2">&amp;mut </span>working, <span class="kw-2">&amp;</span>key);
+<a href=#1127 id=1127 data-nosnippet>1127</a>                <span class="kw">let </span>workspace_dir = working.agent_workspace_dir(<span class="kw-2">&amp;</span>key);
+<a href=#1128 id=1128 data-nosnippet>1128</a>                <span class="kw">if let </span><span class="prelude-val">Err</span>(err) = tokio::fs::create_dir_all(<span class="kw-2">&amp;</span>workspace_dir).<span class="kw">await </span>{
+<a href=#1129 id=1129 data-nosnippet>1129</a>                    <span class="kw">return </span>error_response(
+<a href=#1130 id=1130 data-nosnippet>1130</a>                        ConfigApiError::new(
+<a href=#1131 id=1131 data-nosnippet>1131</a>                            ConfigApiCode::ValidationFailed,
+<a href=#1132 id=1132 data-nosnippet>1132</a>                            <span class="macro">format!</span>(
+<a href=#1133 id=1133 data-nosnippet>1133</a>                                <span class="string">"created agent `{key}` but failed to scaffold workspace at {}: {err}"</span>,
+<a href=#1134 id=1134 data-nosnippet>1134</a>                                workspace_dir.display()
+<a href=#1135 id=1135 data-nosnippet>1135</a>                            ),
+<a href=#1136 id=1136 data-nosnippet>1136</a>                        )
+<a href=#1137 id=1137 data-nosnippet>1137</a>                        .with_path(section_key),
+<a href=#1138 id=1138 data-nosnippet>1138</a>                    );
+<a href=#1139 id=1139 data-nosnippet>1139</a>                }
+<a href=#1140 id=1140 data-nosnippet>1140</a>                <span class="kw">if let </span><span class="prelude-val">Err</span>(err) =
+<a href=#1141 id=1141 data-nosnippet>1141</a>                    zeroclaw_config::schema::ensure_bootstrap_files(<span class="kw-2">&amp;</span>workspace_dir).<span class="kw">await
+<a href=#1142 id=1142 data-nosnippet>1142</a>                </span>{
+<a href=#1143 id=1143 data-nosnippet>1143</a>                    <span class="macro">::zeroclaw_log::record!</span>(WARN, ::zeroclaw_log::Event::new(<span class="macro">module_path!</span>(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(<span class="macro">::serde_json::json!</span>({<span class="string">"agent"</span>: key, <span class="string">"workspace"</span>: workspace_dir.display().to_string(), <span class="string">"err"</span>: err.to_string()})), <span class="string">"agent workspace scaffolded but bootstrap files seed failed (continuing)"</span>);
+<a href=#1144 id=1144 data-nosnippet>1144</a>                }
+<a href=#1145 id=1145 data-nosnippet>1145</a>            }
+<a href=#1146 id=1146 data-nosnippet>1146</a>            (<span class="macro">format!</span>(<span class="string">"{section_key}.{key}"</span>), created)
+<a href=#1147 id=1147 data-nosnippet>1147</a>        }
+<a href=#1148 id=1148 data-nosnippet>1148</a>        Section::Storage =&gt; {
+<a href=#1149 id=1149 data-nosnippet>1149</a>            <span class="comment">// Two-tier typed-family (`storage.&lt;kind&gt;.&lt;alias&gt;`) — same
+<a href=#1150 id=1150 data-nosnippet>1150</a>            // shape and selection flow as model_providers / tts_providers /
+<a href=#1151 id=1151 data-nosnippet>1151</a>            // transcription_providers. Outer bucket is the storage kind
+<a href=#1152 id=1152 data-nosnippet>1152</a>            // (sqlite, postgres, qdrant, markdown, lucid); inner key is
+<a href=#1153 id=1153 data-nosnippet>1153</a>            // the operator-named alias.
+<a href=#1154 id=1154 data-nosnippet>1154</a>            </span><span class="kw">let </span>created = working
+<a href=#1155 id=1155 data-nosnippet>1155</a>                .create_map_key(<span class="kw-2">&amp;</span><span class="macro">format!</span>(<span class="string">"storage.{key}"</span>), <span class="kw-2">&amp;</span>alias)
+<a href=#1156 id=1156 data-nosnippet>1156</a>                .map_err(|msg| {
+<a href=#1157 id=1157 data-nosnippet>1157</a>                    error_response(
+<a href=#1158 id=1158 data-nosnippet>1158</a>                        ConfigApiError::new(
+<a href=#1159 id=1159 data-nosnippet>1159</a>                            ConfigApiCode::PathNotFound,
+<a href=#1160 id=1160 data-nosnippet>1160</a>                            <span class="macro">format!</span>(<span class="string">"could not select storage `{key}` alias `{alias}`: {msg}"</span>),
+<a href=#1161 id=1161 data-nosnippet>1161</a>                        )
+<a href=#1162 id=1162 data-nosnippet>1162</a>                        .with_path(<span class="macro">format!</span>(<span class="string">"storage.{key}"</span>)),
+<a href=#1163 id=1163 data-nosnippet>1163</a>                    )
+<a href=#1164 id=1164 data-nosnippet>1164</a>                });
+<a href=#1165 id=1165 data-nosnippet>1165</a>            <span class="kw">let </span>created = <span class="kw">match </span>created {
+<a href=#1166 id=1166 data-nosnippet>1166</a>                <span class="prelude-val">Ok</span>(c) =&gt; c,
+<a href=#1167 id=1167 data-nosnippet>1167</a>                <span class="prelude-val">Err</span>(resp) =&gt; <span class="kw">return </span>resp,
+<a href=#1168 id=1168 data-nosnippet>1168</a>            };
+<a href=#1169 id=1169 data-nosnippet>1169</a>            mark_section_completed(<span class="kw-2">&amp;mut </span>working, <span class="string">"storage"</span>);
+<a href=#1170 id=1170 data-nosnippet>1170</a>            (<span class="macro">format!</span>(<span class="string">"storage.{key}.{alias}"</span>), created)
+<a href=#1171 id=1171 data-nosnippet>1171</a>        }
+<a href=#1172 id=1172 data-nosnippet>1172</a>        Section::Memory =&gt; {
+<a href=#1173 id=1173 data-nosnippet>1173</a>            <span class="comment">// Set memory.backend to the picked key. Fields_prefix points at
+<a href=#1174 id=1174 data-nosnippet>1174</a>            // `memory` so the form renders the whole memory section
+<a href=#1175 id=1175 data-nosnippet>1175</a>            // (the active backend's specific fields show up there).
+<a href=#1176 id=1176 data-nosnippet>1176</a>            </span><span class="kw">if let </span><span class="prelude-val">Err</span>(e) = working.set_prop_persistent(<span class="string">"memory.backend"</span>, <span class="kw-2">&amp;</span>key) {
+<a href=#1177 id=1177 data-nosnippet>1177</a>                <span class="kw">return </span>error_response(
+<a href=#1178 id=1178 data-nosnippet>1178</a>                    ConfigApiError::new(
+<a href=#1179 id=1179 data-nosnippet>1179</a>                        ConfigApiCode::ValidationFailed,
+<a href=#1180 id=1180 data-nosnippet>1180</a>                        <span class="macro">format!</span>(<span class="string">"could not set memory.backend = `{key}`: {e}"</span>),
+<a href=#1181 id=1181 data-nosnippet>1181</a>                    )
+<a href=#1182 id=1182 data-nosnippet>1182</a>                    .with_path(<span class="string">"memory.backend"</span>),
+<a href=#1183 id=1183 data-nosnippet>1183</a>                );
+<a href=#1184 id=1184 data-nosnippet>1184</a>            }
+<a href=#1185 id=1185 data-nosnippet>1185</a>            mark_section_completed(<span class="kw-2">&amp;mut </span>working, <span class="string">"memory"</span>);
+<a href=#1186 id=1186 data-nosnippet>1186</a>            (<span class="string">"memory"</span>.to_string(), <span class="bool-val">true</span>)
+<a href=#1187 id=1187 data-nosnippet>1187</a>        }
+<a href=#1188 id=1188 data-nosnippet>1188</a>        Section::Tunnel =&gt; {
+<a href=#1189 id=1189 data-nosnippet>1189</a>            <span class="kw">if let </span><span class="prelude-val">Err</span>(e) = working.set_prop_persistent(<span class="string">"tunnel.tunnel-provider"</span>, <span class="kw-2">&amp;</span>key) {
+<a href=#1190 id=1190 data-nosnippet>1190</a>                <span class="kw">return </span>error_response(
+<a href=#1191 id=1191 data-nosnippet>1191</a>                    ConfigApiError::new(
+<a href=#1192 id=1192 data-nosnippet>1192</a>                        ConfigApiCode::ValidationFailed,
+<a href=#1193 id=1193 data-nosnippet>1193</a>                        <span class="macro">format!</span>(<span class="string">"could not set tunnel.tunnel-provider = `{key}`: {e}"</span>),
+<a href=#1194 id=1194 data-nosnippet>1194</a>                    )
+<a href=#1195 id=1195 data-nosnippet>1195</a>                    .with_path(<span class="string">"tunnel.tunnel-provider"</span>),
+<a href=#1196 id=1196 data-nosnippet>1196</a>                );
+<a href=#1197 id=1197 data-nosnippet>1197</a>            }
+<a href=#1198 id=1198 data-nosnippet>1198</a>            <span class="kw">let </span>prefix = <span class="kw">if </span>key == <span class="string">"none" </span>{
+<a href=#1199 id=1199 data-nosnippet>1199</a>                <span class="string">"tunnel"</span>.to_string()
+<a href=#1200 id=1200 data-nosnippet>1200</a>            } <span class="kw">else </span>{
+<a href=#1201 id=1201 data-nosnippet>1201</a>                <span class="kw">let </span>p = <span class="macro">format!</span>(<span class="string">"tunnel.{key}"</span>);
+<a href=#1202 id=1202 data-nosnippet>1202</a>                working.init_defaults(<span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span>p));
+<a href=#1203 id=1203 data-nosnippet>1203</a>                p
+<a href=#1204 id=1204 data-nosnippet>1204</a>            };
+<a href=#1205 id=1205 data-nosnippet>1205</a>            (prefix, <span class="bool-val">true</span>)
+<a href=#1206 id=1206 data-nosnippet>1206</a>        }
+<a href=#1207 id=1207 data-nosnippet>1207</a>        Section::Hardware | Section::Mcp | Section::Skills | Section::QuickstartState =&gt; {
+<a href=#1208 id=1208 data-nosnippet>1208</a>            <span class="kw">return </span>error_response(
+<a href=#1209 id=1209 data-nosnippet>1209</a>                ConfigApiError::new(
+<a href=#1210 id=1210 data-nosnippet>1210</a>                    ConfigApiCode::PathNotFound,
+<a href=#1211 id=1211 data-nosnippet>1211</a>                    <span class="macro">format!</span>(
+<a href=#1212 id=1212 data-nosnippet>1212</a>                        <span class="string">"section `{}` is a direct-form section with no picker; \
+<a href=#1213 id=1213 data-nosnippet>1213</a>                         render fields via GET /api/config/list?prefix={}"</span>,
+<a href=#1214 id=1214 data-nosnippet>1214</a>                        section_enum, section_enum
+<a href=#1215 id=1215 data-nosnippet>1215</a>                    ),
+<a href=#1216 id=1216 data-nosnippet>1216</a>                )
+<a href=#1217 id=1217 data-nosnippet>1217</a>                .with_path(section_enum.as_str()),
+<a href=#1218 id=1218 data-nosnippet>1218</a>            );
+<a href=#1219 id=1219 data-nosnippet>1219</a>        }
+<a href=#1220 id=1220 data-nosnippet>1220</a>    };
+<a href=#1221 id=1221 data-nosnippet>1221</a>
+<a href=#1222 id=1222 data-nosnippet>1222</a>    <span class="kw">if </span>created {
+<a href=#1223 id=1223 data-nosnippet>1223</a>        working.mark_dirty(<span class="kw-2">&amp;</span>fields_prefix);
+<a href=#1224 id=1224 data-nosnippet>1224</a>    }
+<a href=#1225 id=1225 data-nosnippet>1225</a>
+<a href=#1226 id=1226 data-nosnippet>1226</a>    <span class="kw">if let </span><span class="prelude-val">Err</span>(e) = working.save_dirty().<span class="kw">await </span>{
+<a href=#1227 id=1227 data-nosnippet>1227</a>        <span class="kw">return </span>error_response(ConfigApiError::new(
+<a href=#1228 id=1228 data-nosnippet>1228</a>            ConfigApiCode::ReloadFailed,
+<a href=#1229 id=1229 data-nosnippet>1229</a>            <span class="macro">format!</span>(<span class="string">"save after select failed: {e}"</span>),
+<a href=#1230 id=1230 data-nosnippet>1230</a>        ));
+<a href=#1231 id=1231 data-nosnippet>1231</a>    }
+<a href=#1232 id=1232 data-nosnippet>1232</a>    <span class="kw-2">*</span>state.config.write() = working;
+<a href=#1233 id=1233 data-nosnippet>1233</a>
+<a href=#1234 id=1234 data-nosnippet>1234</a>    axum::Json(SelectItemResponse {
+<a href=#1235 id=1235 data-nosnippet>1235</a>        fields_prefix,
+<a href=#1236 id=1236 data-nosnippet>1236</a>        created,
+<a href=#1237 id=1237 data-nosnippet>1237</a>    })
+<a href=#1238 id=1238 data-nosnippet>1238</a>    .into_response()
+<a href=#1239 id=1239 data-nosnippet>1239</a>}
+<a href=#1240 id=1240 data-nosnippet>1240</a>
+<a href=#1241 id=1241 data-nosnippet>1241</a><span class="attr">#[cfg(test)]
+<a href=#1242 id=1242 data-nosnippet>1242</a></span><span class="kw">mod </span>tests {
+<a href=#1243 id=1243 data-nosnippet>1243</a>    <span class="kw">use </span>super::<span class="kw-2">*</span>;
+<a href=#1244 id=1244 data-nosnippet>1244</a>
+<a href=#1245 id=1245 data-nosnippet>1245</a>    <span class="doccomment">/// Regression guard: every alias-bearing map the handler exposes must
+<a href=#1246 id=1246 data-nosnippet>1246</a>    /// be reachable from `Config::get_map_keys` using the kebab-case path
+<a href=#1247 id=1247 data-nosnippet>1247</a>    /// `build_agent_options` passes. Snake_case silently returns `None` →
+<a href=#1248 id=1248 data-nosnippet>1248</a>    /// empty Vec → dashboard renders "No X configured yet" when X exists.
+<a href=#1249 id=1249 data-nosnippet>1249</a>    /// This test drives the same code the gateway runs and would have
+<a href=#1250 id=1250 data-nosnippet>1250</a>    /// caught the original bug. Adding a new alias-bearing field requires
+<a href=#1251 id=1251 data-nosnippet>1251</a>    /// adding it here too.
+<a href=#1252 id=1252 data-nosnippet>1252</a>    </span><span class="attr">#[test]
+<a href=#1253 id=1253 data-nosnippet>1253</a>    </span><span class="kw">fn </span>build_agent_options_returns_every_configured_alias() {
+<a href=#1254 id=1254 data-nosnippet>1254</a>        <span class="kw">let </span><span class="kw-2">mut </span>cfg = zeroclaw_config::schema::Config::default();
+<a href=#1255 id=1255 data-nosnippet>1255</a>        cfg.create_map_key(<span class="string">"providers.models.anthropic"</span>, <span class="string">"default"</span>)
+<a href=#1256 id=1256 data-nosnippet>1256</a>            .unwrap();
+<a href=#1257 id=1257 data-nosnippet>1257</a>        cfg.create_map_key(<span class="string">"risk_profiles"</span>, <span class="string">"alpha_risk"</span>).unwrap();
+<a href=#1258 id=1258 data-nosnippet>1258</a>        cfg.create_map_key(<span class="string">"runtime_profiles"</span>, <span class="string">"alpha_runtime"</span>)
+<a href=#1259 id=1259 data-nosnippet>1259</a>            .unwrap();
+<a href=#1260 id=1260 data-nosnippet>1260</a>        cfg.create_map_key(<span class="string">"skill_bundles"</span>, <span class="string">"alpha_skills"</span>).unwrap();
+<a href=#1261 id=1261 data-nosnippet>1261</a>        cfg.create_map_key(<span class="string">"knowledge_bundles"</span>, <span class="string">"alpha_knowledge"</span>)
+<a href=#1262 id=1262 data-nosnippet>1262</a>            .unwrap();
+<a href=#1263 id=1263 data-nosnippet>1263</a>        cfg.create_map_key(<span class="string">"mcp_bundles"</span>, <span class="string">"alpha_mcp"</span>).unwrap();
+<a href=#1264 id=1264 data-nosnippet>1264</a>        cfg.create_map_key(<span class="string">"agents"</span>, <span class="string">"alpha_agent"</span>).unwrap();
+<a href=#1265 id=1265 data-nosnippet>1265</a>
+<a href=#1266 id=1266 data-nosnippet>1266</a>        <span class="kw">let </span>resp = build_agent_options(<span class="kw-2">&amp;</span>cfg);
+<a href=#1267 id=1267 data-nosnippet>1267</a>
+<a href=#1268 id=1268 data-nosnippet>1268</a>        <span class="macro">assert_eq!</span>(resp.model_providers, <span class="macro">vec!</span>[<span class="string">"anthropic.default"</span>.to_string()]);
+<a href=#1269 id=1269 data-nosnippet>1269</a>        <span class="macro">assert_eq!</span>(resp.risk_profiles, <span class="macro">vec!</span>[<span class="string">"alpha_risk"</span>.to_string()]);
+<a href=#1270 id=1270 data-nosnippet>1270</a>        <span class="macro">assert_eq!</span>(resp.runtime_profiles, <span class="macro">vec!</span>[<span class="string">"alpha_runtime"</span>.to_string()]);
+<a href=#1271 id=1271 data-nosnippet>1271</a>        <span class="macro">assert_eq!</span>(resp.skill_bundles, <span class="macro">vec!</span>[<span class="string">"alpha_skills"</span>.to_string()]);
+<a href=#1272 id=1272 data-nosnippet>1272</a>        <span class="macro">assert_eq!</span>(resp.knowledge_bundles, <span class="macro">vec!</span>[<span class="string">"alpha_knowledge"</span>.to_string()],);
+<a href=#1273 id=1273 data-nosnippet>1273</a>        <span class="macro">assert_eq!</span>(resp.mcp_bundles, <span class="macro">vec!</span>[<span class="string">"alpha_mcp"</span>.to_string()]);
+<a href=#1274 id=1274 data-nosnippet>1274</a>        <span class="macro">assert_eq!</span>(resp.agents, <span class="macro">vec!</span>[<span class="string">"alpha_agent"</span>.to_string()]);
+<a href=#1275 id=1275 data-nosnippet>1275</a>    }
+<a href=#1276 id=1276 data-nosnippet>1276</a>
+<a href=#1277 id=1277 data-nosnippet>1277</a>    <span class="attr">#[test]
+<a href=#1278 id=1278 data-nosnippet>1278</a>    </span><span class="kw">fn </span>typed_provider_catalog_keys_create_snake_config_sections() {
+<a href=#1279 id=1279 data-nosnippet>1279</a>        <span class="kw">let </span><span class="kw-2">mut </span>cfg = zeroclaw_config::schema::Config::default();
+<a href=#1280 id=1280 data-nosnippet>1280</a>        <span class="kw">let </span>cases = [
+<a href=#1281 id=1281 data-nosnippet>1281</a>            (<span class="string">"providers.models"</span>, <span class="string">"atomic_chat"</span>),
+<a href=#1282 id=1282 data-nosnippet>1282</a>            (<span class="string">"providers.models"</span>, <span class="string">"gemini_cli"</span>),
+<a href=#1283 id=1283 data-nosnippet>1283</a>            (<span class="string">"providers.transcription"</span>, <span class="string">"local_whisper"</span>),
+<a href=#1284 id=1284 data-nosnippet>1284</a>        ];
+<a href=#1285 id=1285 data-nosnippet>1285</a>
+<a href=#1286 id=1286 data-nosnippet>1286</a>        <span class="kw">for </span>(family, key) <span class="kw">in </span>cases {
+<a href=#1287 id=1287 data-nosnippet>1287</a>            <span class="kw">let </span>path = <span class="macro">format!</span>(<span class="string">"{family}.{key}"</span>);
+<a href=#1288 id=1288 data-nosnippet>1288</a>            cfg.create_map_key(<span class="kw-2">&amp;</span>path, <span class="string">"default"</span>)
+<a href=#1289 id=1289 data-nosnippet>1289</a>                .unwrap_or_else(|e| <span class="macro">panic!</span>(<span class="string">"{key} should map to `{path}`: {e}"</span>));
+<a href=#1290 id=1290 data-nosnippet>1290</a>        }
+<a href=#1291 id=1291 data-nosnippet>1291</a>
+<a href=#1292 id=1292 data-nosnippet>1292</a>        <span class="macro">assert!</span>(
+<a href=#1293 id=1293 data-nosnippet>1293</a>            cfg.providers.models.atomic_chat.contains_key(<span class="string">"default"</span>),
+<a href=#1294 id=1294 data-nosnippet>1294</a>            <span class="string">"created Atomic Chat alias should land in the atomic_chat provider map"</span>,
+<a href=#1295 id=1295 data-nosnippet>1295</a>        );
+<a href=#1296 id=1296 data-nosnippet>1296</a>        <span class="macro">assert!</span>(
+<a href=#1297 id=1297 data-nosnippet>1297</a>            cfg.providers.models.gemini_cli.contains_key(<span class="string">"default"</span>),
+<a href=#1298 id=1298 data-nosnippet>1298</a>            <span class="string">"created Gemini CLI alias should land in the gemini_cli provider map"</span>,
+<a href=#1299 id=1299 data-nosnippet>1299</a>        );
+<a href=#1300 id=1300 data-nosnippet>1300</a>        <span class="macro">assert!</span>(
+<a href=#1301 id=1301 data-nosnippet>1301</a>            cfg.providers
+<a href=#1302 id=1302 data-nosnippet>1302</a>                .transcription
+<a href=#1303 id=1303 data-nosnippet>1303</a>                .local_whisper
+<a href=#1304 id=1304 data-nosnippet>1304</a>                .contains_key(<span class="string">"default"</span>),
+<a href=#1305 id=1305 data-nosnippet>1305</a>            <span class="string">"created Local Whisper alias should land in the local_whisper provider map"</span>,
+<a href=#1306 id=1306 data-nosnippet>1306</a>        );
+<a href=#1307 id=1307 data-nosnippet>1307</a>    }
+<a href=#1308 id=1308 data-nosnippet>1308</a>
+<a href=#1309 id=1309 data-nosnippet>1309</a>    <span class="attr">#[test]
+<a href=#1310 id=1310 data-nosnippet>1310</a>    </span><span class="kw">fn </span>derive_section_status_requires_dispatchable_agent() {
+<a href=#1311 id=1311 data-nosnippet>1311</a>        <span class="kw">let </span><span class="kw-2">mut </span>cfg = zeroclaw_config::schema::Config::default();
+<a href=#1312 id=1312 data-nosnippet>1312</a>        <span class="kw">let </span>resp = derive_section_status(<span class="kw-2">&amp;</span>cfg);
+<a href=#1313 id=1313 data-nosnippet>1313</a>        <span class="macro">assert!</span>(resp.needs_quickstart);
+<a href=#1314 id=1314 data-nosnippet>1314</a>        <span class="macro">assert_eq!</span>(resp.reason, <span class="string">"fresh_install"</span>);
+<a href=#1315 id=1315 data-nosnippet>1315</a>
+<a href=#1316 id=1316 data-nosnippet>1316</a>        cfg.create_map_key(<span class="string">"providers.models.anthropic"</span>, <span class="string">"default"</span>)
+<a href=#1317 id=1317 data-nosnippet>1317</a>            .unwrap();
+<a href=#1318 id=1318 data-nosnippet>1318</a>        <span class="kw">let </span>resp = derive_section_status(<span class="kw-2">&amp;</span>cfg);
+<a href=#1319 id=1319 data-nosnippet>1319</a>        <span class="macro">assert!</span>(
+<a href=#1320 id=1320 data-nosnippet>1320</a>            resp.needs_quickstart,
+<a href=#1321 id=1321 data-nosnippet>1321</a>            <span class="string">"provider configured without a bound agent must not flip needs_quickstart"
+<a href=#1322 id=1322 data-nosnippet>1322</a>        </span>);
+<a href=#1323 id=1323 data-nosnippet>1323</a>        <span class="macro">assert_eq!</span>(resp.reason, <span class="string">"incomplete_agent"</span>);
+<a href=#1324 id=1324 data-nosnippet>1324</a>        <span class="macro">assert!</span>(resp.has_partial_state);
+<a href=#1325 id=1325 data-nosnippet>1325</a>
+<a href=#1326 id=1326 data-nosnippet>1326</a>        cfg.create_map_key(<span class="string">"risk_profiles"</span>, <span class="string">"default"</span>).unwrap();
+<a href=#1327 id=1327 data-nosnippet>1327</a>        cfg.create_map_key(<span class="string">"runtime_profiles"</span>, <span class="string">"default"</span>).unwrap();
+<a href=#1328 id=1328 data-nosnippet>1328</a>        cfg.create_map_key(<span class="string">"agents"</span>, <span class="string">"default"</span>).unwrap();
+<a href=#1329 id=1329 data-nosnippet>1329</a>        <span class="kw">let </span>resp = derive_section_status(<span class="kw-2">&amp;</span>cfg);
+<a href=#1330 id=1330 data-nosnippet>1330</a>        <span class="macro">assert!</span>(
+<a href=#1331 id=1331 data-nosnippet>1331</a>            resp.needs_quickstart,
+<a href=#1332 id=1332 data-nosnippet>1332</a>            <span class="string">"agent without provider/profile bindings must still need onboarding"
+<a href=#1333 id=1333 data-nosnippet>1333</a>        </span>);
+<a href=#1334 id=1334 data-nosnippet>1334</a>        <span class="macro">assert_eq!</span>(resp.reason, <span class="string">"incomplete_agent"</span>);
+<a href=#1335 id=1335 data-nosnippet>1335</a>        <span class="macro">assert!</span>(
+<a href=#1336 id=1336 data-nosnippet>1336</a>            resp.missing
+<a href=#1337 id=1337 data-nosnippet>1337</a>                .iter()
+<a href=#1338 id=1338 data-nosnippet>1338</a>                .any(|m| m == <span class="string">"Set a model provider for agent `default`."</span>)
+<a href=#1339 id=1339 data-nosnippet>1339</a>        );
+<a href=#1340 id=1340 data-nosnippet>1340</a>
+<a href=#1341 id=1341 data-nosnippet>1341</a>        <span class="kw">let </span>agent = cfg.agents.get_mut(<span class="string">"default"</span>).unwrap();
+<a href=#1342 id=1342 data-nosnippet>1342</a>        agent.model_provider = <span class="string">"anthropic.default"</span>.into();
+<a href=#1343 id=1343 data-nosnippet>1343</a>        agent.risk_profile = <span class="string">"default"</span>.into();
+<a href=#1344 id=1344 data-nosnippet>1344</a>        agent.runtime_profile = <span class="string">"default"</span>.into();
+<a href=#1345 id=1345 data-nosnippet>1345</a>        <span class="kw">let </span>resp = derive_section_status(<span class="kw-2">&amp;</span>cfg);
+<a href=#1346 id=1346 data-nosnippet>1346</a>        <span class="macro">assert!</span>(
+<a href=#1347 id=1347 data-nosnippet>1347</a>            resp.needs_quickstart,
+<a href=#1348 id=1348 data-nosnippet>1348</a>            <span class="string">"provider alias without a selected model must still need onboarding"
+<a href=#1349 id=1349 data-nosnippet>1349</a>        </span>);
+<a href=#1350 id=1350 data-nosnippet>1350</a>        <span class="macro">assert!</span>(
+<a href=#1351 id=1351 data-nosnippet>1351</a>            resp.missing
+<a href=#1352 id=1352 data-nosnippet>1352</a>                .iter()
+<a href=#1353 id=1353 data-nosnippet>1353</a>                .any(|m| m == <span class="string">"Choose a model for model provider `anthropic.default`."</span>)
+<a href=#1354 id=1354 data-nosnippet>1354</a>        );
+<a href=#1355 id=1355 data-nosnippet>1355</a>
+<a href=#1356 id=1356 data-nosnippet>1356</a>        cfg.set_prop(<span class="string">"providers.models.anthropic.default.model"</span>, <span class="string">"claude-sonnet"</span>)
+<a href=#1357 id=1357 data-nosnippet>1357</a>            .unwrap();
+<a href=#1358 id=1358 data-nosnippet>1358</a>        <span class="kw">let </span>resp = derive_section_status(<span class="kw-2">&amp;</span>cfg);
+<a href=#1359 id=1359 data-nosnippet>1359</a>        <span class="macro">assert!</span>(
+<a href=#1360 id=1360 data-nosnippet>1360</a>            resp.needs_quickstart,
+<a href=#1361 id=1361 data-nosnippet>1361</a>            <span class="string">"hosted provider alias without credential/auth must still need onboarding"
+<a href=#1362 id=1362 data-nosnippet>1362</a>        </span>);
+<a href=#1363 id=1363 data-nosnippet>1363</a>        <span class="macro">assert!</span>(
+<a href=#1364 id=1364 data-nosnippet>1364</a>            resp.missing
+<a href=#1365 id=1365 data-nosnippet>1365</a>                .iter()
+<a href=#1366 id=1366 data-nosnippet>1366</a>                .any(|m| m == <span class="string">"Set credential/auth for model provider `anthropic.default`."</span>)
+<a href=#1367 id=1367 data-nosnippet>1367</a>        );
+<a href=#1368 id=1368 data-nosnippet>1368</a>
+<a href=#1369 id=1369 data-nosnippet>1369</a>        cfg.set_prop(<span class="string">"providers.models.anthropic.default.api_key"</span>, <span class="string">"sk-test"</span>)
+<a href=#1370 id=1370 data-nosnippet>1370</a>            .unwrap();
+<a href=#1371 id=1371 data-nosnippet>1371</a>        <span class="kw">let </span>resp = derive_section_status(<span class="kw-2">&amp;</span>cfg);
+<a href=#1372 id=1372 data-nosnippet>1372</a>        <span class="macro">assert!</span>(!resp.needs_quickstart);
+<a href=#1373 id=1373 data-nosnippet>1373</a>        <span class="macro">assert_eq!</span>(resp.reason, <span class="string">"has_dispatchable_agent"</span>);
+<a href=#1374 id=1374 data-nosnippet>1374</a>        <span class="macro">assert!</span>(!resp.has_partial_state || resp.missing.is_empty());
+<a href=#1375 id=1375 data-nosnippet>1375</a>    }
+<a href=#1376 id=1376 data-nosnippet>1376</a>
+<a href=#1377 id=1377 data-nosnippet>1377</a>    <span class="attr">#[test]
+<a href=#1378 id=1378 data-nosnippet>1378</a>    </span><span class="kw">fn </span>derive_section_status_completed_sections_without_dispatchable_agent_stays_pending() {
+<a href=#1379 id=1379 data-nosnippet>1379</a>        <span class="kw">let </span><span class="kw-2">mut </span>cfg = zeroclaw_config::schema::Config::default();
+<a href=#1380 id=1380 data-nosnippet>1380</a>        cfg.onboard_state
+<a href=#1381 id=1381 data-nosnippet>1381</a>            .completed_sections
+<a href=#1382 id=1382 data-nosnippet>1382</a>            .push(<span class="string">"providers.models"</span>.into());
+<a href=#1383 id=1383 data-nosnippet>1383</a>        <span class="kw">let </span>resp = derive_section_status(<span class="kw-2">&amp;</span>cfg);
+<a href=#1384 id=1384 data-nosnippet>1384</a>        <span class="macro">assert!</span>(
+<a href=#1385 id=1385 data-nosnippet>1385</a>            resp.needs_quickstart,
+<a href=#1386 id=1386 data-nosnippet>1386</a>            <span class="string">"completed_sections marker without a dispatchable agent must NOT flip the redirect"
+<a href=#1387 id=1387 data-nosnippet>1387</a>        </span>);
+<a href=#1388 id=1388 data-nosnippet>1388</a>        <span class="macro">assert_eq!</span>(resp.reason, <span class="string">"incomplete_agent"</span>);
+<a href=#1389 id=1389 data-nosnippet>1389</a>    }
+<a href=#1390 id=1390 data-nosnippet>1390</a>
+<a href=#1391 id=1391 data-nosnippet>1391</a>    <span class="attr">#[test]
+<a href=#1392 id=1392 data-nosnippet>1392</a>    </span><span class="kw">fn </span>apply_first_run_agent_defaults_binds_existing_provider_and_profiles() {
+<a href=#1393 id=1393 data-nosnippet>1393</a>        <span class="kw">let </span><span class="kw-2">mut </span>cfg = zeroclaw_config::schema::Config::default();
+<a href=#1394 id=1394 data-nosnippet>1394</a>        cfg.create_map_key(<span class="string">"providers.models.anthropic"</span>, <span class="string">"work"</span>)
+<a href=#1395 id=1395 data-nosnippet>1395</a>            .unwrap();
+<a href=#1396 id=1396 data-nosnippet>1396</a>        cfg.create_map_key(<span class="string">"risk_profiles"</span>, <span class="string">"default"</span>).unwrap();
+<a href=#1397 id=1397 data-nosnippet>1397</a>        cfg.create_map_key(<span class="string">"runtime_profiles"</span>, <span class="string">"deep_work"</span>).unwrap();
+<a href=#1398 id=1398 data-nosnippet>1398</a>        cfg.create_map_key(<span class="string">"agents"</span>, <span class="string">"default"</span>).unwrap();
+<a href=#1399 id=1399 data-nosnippet>1399</a>
+<a href=#1400 id=1400 data-nosnippet>1400</a>        apply_first_run_agent_defaults(<span class="kw-2">&amp;mut </span>cfg, <span class="string">"default"</span>);
+<a href=#1401 id=1401 data-nosnippet>1401</a>
+<a href=#1402 id=1402 data-nosnippet>1402</a>        <span class="kw">let </span>agent = cfg.agents.get(<span class="string">"default"</span>).unwrap();
+<a href=#1403 id=1403 data-nosnippet>1403</a>        <span class="macro">assert_eq!</span>(agent.model_provider.as_str(), <span class="string">"anthropic.work"</span>);
+<a href=#1404 id=1404 data-nosnippet>1404</a>        <span class="macro">assert_eq!</span>(agent.risk_profile, <span class="string">"default"</span>);
+<a href=#1405 id=1405 data-nosnippet>1405</a>        <span class="macro">assert_eq!</span>(agent.runtime_profile, <span class="string">"deep_work"</span>);
+<a href=#1406 id=1406 data-nosnippet>1406</a>    }
+<a href=#1407 id=1407 data-nosnippet>1407</a>
+<a href=#1408 id=1408 data-nosnippet>1408</a>    <span class="attr">#[test]
+<a href=#1409 id=1409 data-nosnippet>1409</a>    </span><span class="kw">fn </span>memory_section_ready_tracks_onboarding_progress_not_default_backend() {
+<a href=#1410 id=1410 data-nosnippet>1410</a>        <span class="kw">let </span>cfg = zeroclaw_config::schema::Config::default();
+<a href=#1411 id=1411 data-nosnippet>1411</a>        <span class="macro">assert!</span>(
+<a href=#1412 id=1412 data-nosnippet>1412</a>            !section_ready(<span class="kw-2">&amp;</span>cfg, <span class="string">"memory"</span>, <span class="bool-val">false</span>),
+<a href=#1413 id=1413 data-nosnippet>1413</a>            <span class="string">"fresh onboarding should not show Memory checked merely because a default backend exists"
+<a href=#1414 id=1414 data-nosnippet>1414</a>        </span>);
+<a href=#1415 id=1415 data-nosnippet>1415</a>        <span class="macro">assert!</span>(
+<a href=#1416 id=1416 data-nosnippet>1416</a>            section_ready(<span class="kw-2">&amp;</span>cfg, <span class="string">"memory"</span>, <span class="bool-val">true</span>),
+<a href=#1417 id=1417 data-nosnippet>1417</a>            <span class="string">"Memory should show checked after the user has advanced through that section"
+<a href=#1418 id=1418 data-nosnippet>1418</a>        </span>);
+<a href=#1419 id=1419 data-nosnippet>1419</a>    }
+<a href=#1420 id=1420 data-nosnippet>1420</a>
+<a href=#1421 id=1421 data-nosnippet>1421</a>    <span class="kw">fn </span>empty_cfg() -&gt; zeroclaw_config::schema::Config {
+<a href=#1422 id=1422 data-nosnippet>1422</a>        zeroclaw_config::schema::Config::default()
+<a href=#1423 id=1423 data-nosnippet>1423</a>    }
+<a href=#1424 id=1424 data-nosnippet>1424</a>
+<a href=#1425 id=1425 data-nosnippet>1425</a>    <span class="attr">#[test]
+<a href=#1426 id=1426 data-nosnippet>1426</a>    </span><span class="kw">fn </span>handle_sections_derives_every_top_level_field_from_schema() {
+<a href=#1427 id=1427 data-nosnippet>1427</a>        <span class="comment">// Regression: the section list must be schema-driven, not the old
+<a href=#1428 id=1428 data-nosnippet>1428</a>        // hardcoded 6. Adding a new top-level field to `Config` should make
+<a href=#1429 id=1429 data-nosnippet>1429</a>        // it appear here automatically.
+<a href=#1430 id=1430 data-nosnippet>1430</a>        </span><span class="kw">let </span>cfg = empty_cfg();
+<a href=#1431 id=1431 data-nosnippet>1431</a>        <span class="kw">let </span><span class="kw-2">mut </span>roots: std::collections::BTreeSet&lt;String&gt; = cfg
+<a href=#1432 id=1432 data-nosnippet>1432</a>            .prop_fields()
+<a href=#1433 id=1433 data-nosnippet>1433</a>            .iter()
+<a href=#1434 id=1434 data-nosnippet>1434</a>            .filter_map(|f| f.name.split(<span class="string">'.'</span>).next().map(str::to_string))
+<a href=#1435 id=1435 data-nosnippet>1435</a>            .collect();
+<a href=#1436 id=1436 data-nosnippet>1436</a>        <span class="comment">// Mirror handle_sections: map-keyed sections surface even when
+<a href=#1437 id=1437 data-nosnippet>1437</a>        // their HashMap is empty (prop_fields only emits paths for
+<a href=#1438 id=1438 data-nosnippet>1438</a>        // populated entries).
+<a href=#1439 id=1439 data-nosnippet>1439</a>        </span><span class="kw">for </span>s <span class="kw">in </span>zeroclaw_config::schema::Config::map_key_sections() {
+<a href=#1440 id=1440 data-nosnippet>1440</a>            <span class="kw">if let </span><span class="prelude-val">Some</span>(first) = s.path.split(<span class="string">'.'</span>).next() {
+<a href=#1441 id=1441 data-nosnippet>1441</a>                roots.insert(first.to_string());
+<a href=#1442 id=1442 data-nosnippet>1442</a>            }
+<a href=#1443 id=1443 data-nosnippet>1443</a>        }
+<a href=#1444 id=1444 data-nosnippet>1444</a>        <span class="kw">for </span>hidden <span class="kw">in </span>HIDDEN_TOP_LEVEL {
+<a href=#1445 id=1445 data-nosnippet>1445</a>            roots.remove(<span class="kw-2">*</span>hidden);
+<a href=#1446 id=1446 data-nosnippet>1446</a>        }
+<a href=#1447 id=1447 data-nosnippet>1447</a>        <span class="comment">// The 5 onboarding sections must still be in the derived set.
+<a href=#1448 id=1448 data-nosnippet>1448</a>        </span><span class="kw">for </span>required <span class="kw">in </span>[<span class="string">"providers"</span>, <span class="string">"channels"</span>, <span class="string">"memory"</span>, <span class="string">"hardware"</span>, <span class="string">"tunnel"</span>] {
+<a href=#1449 id=1449 data-nosnippet>1449</a>            <span class="macro">assert!</span>(
+<a href=#1450 id=1450 data-nosnippet>1450</a>                roots.contains(required),
+<a href=#1451 id=1451 data-nosnippet>1451</a>                <span class="string">"derived sections must include onboarding section `{required}`; got {roots:?}"</span>,
+<a href=#1452 id=1452 data-nosnippet>1452</a>            );
+<a href=#1453 id=1453 data-nosnippet>1453</a>        }
+<a href=#1454 id=1454 data-nosnippet>1454</a>        <span class="comment">// Plus a sample of the runtime sections that used to be invisible.
+<a href=#1455 id=1455 data-nosnippet>1455</a>        </span><span class="kw">for </span>runtime <span class="kw">in </span>[<span class="string">"gateway"</span>, <span class="string">"observability"</span>, <span class="string">"scheduler"</span>, <span class="string">"security"</span>] {
+<a href=#1456 id=1456 data-nosnippet>1456</a>            <span class="macro">assert!</span>(
+<a href=#1457 id=1457 data-nosnippet>1457</a>                roots.contains(runtime),
+<a href=#1458 id=1458 data-nosnippet>1458</a>                <span class="string">"derived sections must include runtime section `{runtime}`; got {roots:?}"</span>,
+<a href=#1459 id=1459 data-nosnippet>1459</a>            );
+<a href=#1460 id=1460 data-nosnippet>1460</a>        }
+<a href=#1461 id=1461 data-nosnippet>1461</a>        <span class="comment">// System / housekeeping fields must NOT surface.
+<a href=#1462 id=1462 data-nosnippet>1462</a>        </span><span class="kw">for </span>hidden <span class="kw">in </span>HIDDEN_TOP_LEVEL {
+<a href=#1463 id=1463 data-nosnippet>1463</a>            <span class="macro">assert!</span>(
+<a href=#1464 id=1464 data-nosnippet>1464</a>                !roots.contains(<span class="kw-2">*</span>hidden),
+<a href=#1465 id=1465 data-nosnippet>1465</a>                <span class="string">"hidden top-level `{hidden}` must not appear"</span>,
+<a href=#1466 id=1466 data-nosnippet>1466</a>            );
+<a href=#1467 id=1467 data-nosnippet>1467</a>        }
+<a href=#1468 id=1468 data-nosnippet>1468</a>        <span class="kw">for </span>hidden <span class="kw">in </span>[<span class="string">"onboard_state"</span>, <span class="string">"onboard-state"</span>] {
+<a href=#1469 id=1469 data-nosnippet>1469</a>            <span class="macro">assert!</span>(
+<a href=#1470 id=1470 data-nosnippet>1470</a>                !roots.contains(hidden),
+<a href=#1471 id=1471 data-nosnippet>1471</a>                <span class="string">"onboarding bookkeeping root `{hidden}` must not appear"</span>,
+<a href=#1472 id=1472 data-nosnippet>1472</a>            );
+<a href=#1473 id=1473 data-nosnippet>1473</a>        }
+<a href=#1474 id=1474 data-nosnippet>1474</a>    }
+<a href=#1475 id=1475 data-nosnippet>1475</a>
+<a href=#1476 id=1476 data-nosnippet>1476</a>    <span class="attr">#[test]
+<a href=#1477 id=1477 data-nosnippet>1477</a>    </span><span class="kw">fn </span>channels_select_initializes_subsection_so_set_prop_works() {
+<a href=#1478 id=1478 data-nosnippet>1478</a>        <span class="comment">// Regression for the channels init/set flow: after
+<a href=#1479 id=1479 data-nosnippet>1479</a>        // handle_section_select for channels/matrix, the in-memory config
+<a href=#1480 id=1480 data-nosnippet>1480</a>        // must have channels.matrix.&lt;alias&gt; so a subsequent set_prop on
+<a href=#1481 id=1481 data-nosnippet>1481</a>        // channels.matrix.* succeeds rather than bailing "Unknown property".
+<a href=#1482 id=1482 data-nosnippet>1482</a>        // Uses create_map_key directly (the synchronous core of the select
+<a href=#1483 id=1483 data-nosnippet>1483</a>        // endpoint) to keep the test free of HTTP machinery.
+<a href=#1484 id=1484 data-nosnippet>1484</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>cfg = empty_cfg();
+<a href=#1485 id=1485 data-nosnippet>1485</a>        <span class="macro">assert!</span>(cfg.channels.matrix.is_empty(), <span class="string">"fresh config: matrix unset"</span>);
+<a href=#1486 id=1486 data-nosnippet>1486</a>
+<a href=#1487 id=1487 data-nosnippet>1487</a>        cfg.create_map_key(<span class="string">"channels.matrix"</span>, <span class="string">"mymatrixalias"</span>)
+<a href=#1488 id=1488 data-nosnippet>1488</a>            .expect(<span class="string">"create_map_key must succeed for channels.matrix"</span>);
+<a href=#1489 id=1489 data-nosnippet>1489</a>        <span class="macro">assert!</span>(
+<a href=#1490 id=1490 data-nosnippet>1490</a>            cfg.channels.matrix.contains_key(<span class="string">"mymatrixalias"</span>),
+<a href=#1491 id=1491 data-nosnippet>1491</a>            <span class="string">"channels.matrix must have alias after create_map_key"</span>,
+<a href=#1492 id=1492 data-nosnippet>1492</a>        );
+<a href=#1493 id=1493 data-nosnippet>1493</a>
+<a href=#1494 id=1494 data-nosnippet>1494</a>        <span class="comment">// The form would issue a PATCH whose set_prop call hits this path.
+<a href=#1495 id=1495 data-nosnippet>1495</a>        </span>cfg.set_prop(
+<a href=#1496 id=1496 data-nosnippet>1496</a>            <span class="string">"channels.matrix.mymatrixalias.allowed_rooms"</span>,
+<a href=#1497 id=1497 data-nosnippet>1497</a>            <span class="string">r#"["alice","bob"]"#</span>,
+<a href=#1498 id=1498 data-nosnippet>1498</a>        )
+<a href=#1499 id=1499 data-nosnippet>1499</a>        .expect(<span class="string">"set_prop on initialized matrix subsection must succeed"</span>);
+<a href=#1500 id=1500 data-nosnippet>1500</a>        <span class="macro">assert_eq!</span>(
+<a href=#1501 id=1501 data-nosnippet>1501</a>            cfg.channels
+<a href=#1502 id=1502 data-nosnippet>1502</a>                .matrix
+<a href=#1503 id=1503 data-nosnippet>1503</a>                .get(<span class="string">"mymatrixalias"</span>)
+<a href=#1504 id=1504 data-nosnippet>1504</a>                .unwrap()
+<a href=#1505 id=1505 data-nosnippet>1505</a>                .allowed_rooms,
+<a href=#1506 id=1506 data-nosnippet>1506</a>            <span class="macro">vec!</span>[<span class="string">"alice"</span>.to_string(), <span class="string">"bob"</span>.to_string()],
+<a href=#1507 id=1507 data-nosnippet>1507</a>        );
+<a href=#1508 id=1508 data-nosnippet>1508</a>    }
+<a href=#1509 id=1509 data-nosnippet>1509</a>
+<a href=#1510 id=1510 data-nosnippet>1510</a>    <span class="attr">#[test]
+<a href=#1511 id=1511 data-nosnippet>1511</a>    </span><span class="kw">fn </span>providers_picker_sources_from_list_providers() {
+<a href=#1512 id=1512 data-nosnippet>1512</a>        <span class="comment">// Single source of truth: zeroclaw_providers::list_model_providers().
+<a href=#1513 id=1513 data-nosnippet>1513</a>        // Anthropic / OpenAI / OpenRouter must surface in the picker.
+<a href=#1514 id=1514 data-nosnippet>1514</a>        </span><span class="kw">let </span>cfg = empty_cfg();
+<a href=#1515 id=1515 data-nosnippet>1515</a>        <span class="kw">let </span>items = providers_picker(<span class="kw-2">&amp;</span>cfg);
+<a href=#1516 id=1516 data-nosnippet>1516</a>        <span class="kw">let </span>names: Vec&lt;<span class="kw-2">&amp;</span>str&gt; = items.iter().map(|i| i.key.as_str()).collect();
+<a href=#1517 id=1517 data-nosnippet>1517</a>        <span class="macro">assert!</span>(
+<a href=#1518 id=1518 data-nosnippet>1518</a>            names.contains(<span class="kw-2">&amp;</span><span class="string">"anthropic"</span>),
+<a href=#1519 id=1519 data-nosnippet>1519</a>            <span class="string">"expected anthropic in picker, got: {names:?}"
+<a href=#1520 id=1520 data-nosnippet>1520</a>        </span>);
+<a href=#1521 id=1521 data-nosnippet>1521</a>        <span class="macro">assert!</span>(names.contains(<span class="kw-2">&amp;</span><span class="string">"openai"</span>), <span class="string">"expected openai in picker"</span>);
+<a href=#1522 id=1522 data-nosnippet>1522</a>        <span class="macro">assert!</span>(
+<a href=#1523 id=1523 data-nosnippet>1523</a>            names.contains(<span class="kw-2">&amp;</span><span class="string">"openrouter"</span>),
+<a href=#1524 id=1524 data-nosnippet>1524</a>            <span class="string">"expected openrouter in picker"
+<a href=#1525 id=1525 data-nosnippet>1525</a>        </span>);
+<a href=#1526 id=1526 data-nosnippet>1526</a>
+<a href=#1527 id=1527 data-nosnippet>1527</a>        <span class="comment">// Display name is human-readable, not the canonical key.
+<a href=#1528 id=1528 data-nosnippet>1528</a>        </span><span class="kw">let </span>anthropic = items.iter().find(|i| i.key == <span class="string">"anthropic"</span>).unwrap();
+<a href=#1529 id=1529 data-nosnippet>1529</a>        <span class="macro">assert_eq!</span>(anthropic.label, <span class="string">"Anthropic"</span>);
+<a href=#1530 id=1530 data-nosnippet>1530</a>
+<a href=#1531 id=1531 data-nosnippet>1531</a>        <span class="comment">// Local-only model_providers carry a description hint.
+<a href=#1532 id=1532 data-nosnippet>1532</a>        </span><span class="kw">let </span>local = items.iter().find(|i| i.description.is_some());
+<a href=#1533 id=1533 data-nosnippet>1533</a>        <span class="macro">assert!</span>(
+<a href=#1534 id=1534 data-nosnippet>1534</a>            local.is_some(),
+<a href=#1535 id=1535 data-nosnippet>1535</a>            <span class="string">"at least one model_provider should be marked local"
+<a href=#1536 id=1536 data-nosnippet>1536</a>        </span>);
+<a href=#1537 id=1537 data-nosnippet>1537</a>
+<a href=#1538 id=1538 data-nosnippet>1538</a>        <span class="comment">// Empty config has no model_provider aliases — no badges yet.
+<a href=#1539 id=1539 data-nosnippet>1539</a>        </span><span class="macro">assert!</span>(
+<a href=#1540 id=1540 data-nosnippet>1540</a>            items.iter().all(|i| i.badge.is_none()),
+<a href=#1541 id=1541 data-nosnippet>1541</a>            <span class="string">"fresh config shouldn't mark any model_provider as present"
+<a href=#1542 id=1542 data-nosnippet>1542</a>        </span>);
+<a href=#1543 id=1543 data-nosnippet>1543</a>    }
+<a href=#1544 id=1544 data-nosnippet>1544</a>
+<a href=#1545 id=1545 data-nosnippet>1545</a>    <span class="attr">#[test]
+<a href=#1546 id=1546 data-nosnippet>1546</a>    </span><span class="kw">fn </span>providers_picker_marks_alias_readiness() {
+<a href=#1547 id=1547 data-nosnippet>1547</a>        <span class="comment">// Typed-family layout: each canonical family is a map-keyed
+<a href=#1548 id=1548 data-nosnippet>1548</a>        // sub-section at `model_providers.&lt;family&gt;` whose entries are
+<a href=#1549 id=1549 data-nosnippet>1549</a>        // operator-named aliases. Creating the alias alone is not enough
+<a href=#1550 id=1550 data-nosnippet>1550</a>        // for chat dispatch; it still needs model + credential/auth.
+<a href=#1551 id=1551 data-nosnippet>1551</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>cfg = empty_cfg();
+<a href=#1552 id=1552 data-nosnippet>1552</a>        cfg.create_map_key(<span class="string">"providers.models.anthropic"</span>, <span class="string">"default"</span>)
+<a href=#1553 id=1553 data-nosnippet>1553</a>            .expect(<span class="string">"create_map_key"</span>);
+<a href=#1554 id=1554 data-nosnippet>1554</a>        <span class="kw">let </span>items = providers_picker(<span class="kw-2">&amp;</span>cfg);
+<a href=#1555 id=1555 data-nosnippet>1555</a>        <span class="kw">let </span>anthropic = items.iter().find(|i| i.key == <span class="string">"anthropic"</span>).unwrap();
+<a href=#1556 id=1556 data-nosnippet>1556</a>        <span class="macro">assert_eq!</span>(
+<a href=#1557 id=1557 data-nosnippet>1557</a>            anthropic.badge.as_deref(),
+<a href=#1558 id=1558 data-nosnippet>1558</a>            <span class="prelude-val">Some</span>(<span class="string">"needs setup"</span>),
+<a href=#1559 id=1559 data-nosnippet>1559</a>            <span class="string">"anthropic should need setup after adding an empty alias"
+<a href=#1560 id=1560 data-nosnippet>1560</a>        </span>);
+<a href=#1561 id=1561 data-nosnippet>1561</a>
+<a href=#1562 id=1562 data-nosnippet>1562</a>        cfg.set_prop(
+<a href=#1563 id=1563 data-nosnippet>1563</a>            <span class="string">"providers.models.anthropic.default.model"</span>,
+<a href=#1564 id=1564 data-nosnippet>1564</a>            <span class="string">"claude-sonnet-4-5"</span>,
+<a href=#1565 id=1565 data-nosnippet>1565</a>        )
+<a href=#1566 id=1566 data-nosnippet>1566</a>        .expect(<span class="string">"set model"</span>);
+<a href=#1567 id=1567 data-nosnippet>1567</a>        cfg.set_prop(<span class="string">"providers.models.anthropic.default.api_key"</span>, <span class="string">"sk-test"</span>)
+<a href=#1568 id=1568 data-nosnippet>1568</a>            .expect(<span class="string">"set api key"</span>);
+<a href=#1569 id=1569 data-nosnippet>1569</a>        <span class="kw">let </span>items = providers_picker(<span class="kw-2">&amp;</span>cfg);
+<a href=#1570 id=1570 data-nosnippet>1570</a>        <span class="kw">let </span>anthropic = items.iter().find(|i| i.key == <span class="string">"anthropic"</span>).unwrap();
+<a href=#1571 id=1571 data-nosnippet>1571</a>        <span class="macro">assert_eq!</span>(
+<a href=#1572 id=1572 data-nosnippet>1572</a>            anthropic.badge.as_deref(),
+<a href=#1573 id=1573 data-nosnippet>1573</a>            <span class="prelude-val">Some</span>(<span class="string">"configured"</span>),
+<a href=#1574 id=1574 data-nosnippet>1574</a>            <span class="string">"anthropic should be marked configured once required chat fields are present"
+<a href=#1575 id=1575 data-nosnippet>1575</a>        </span>);
+<a href=#1576 id=1576 data-nosnippet>1576</a>    }
+<a href=#1577 id=1577 data-nosnippet>1577</a>
+<a href=#1578 id=1578 data-nosnippet>1578</a>    <span class="attr">#[test]
+<a href=#1579 id=1579 data-nosnippet>1579</a>    </span><span class="kw">fn </span>memory_picker_sources_from_selectable_backends() {
+<a href=#1580 id=1580 data-nosnippet>1580</a>        <span class="kw">let </span>cfg = empty_cfg();
+<a href=#1581 id=1581 data-nosnippet>1581</a>        <span class="kw">let </span>items = memory_picker(<span class="kw-2">&amp;</span>cfg);
+<a href=#1582 id=1582 data-nosnippet>1582</a>        <span class="comment">// Mirrors zeroclaw_memory::selectable_memory_backends() exactly.
+<a href=#1583 id=1583 data-nosnippet>1583</a>        </span><span class="kw">let </span>keys: Vec&lt;<span class="kw-2">&amp;</span>str&gt; = items.iter().map(|i| i.key.as_str()).collect();
+<a href=#1584 id=1584 data-nosnippet>1584</a>        <span class="macro">assert!</span>(keys.contains(<span class="kw-2">&amp;</span><span class="string">"sqlite"</span>));
+<a href=#1585 id=1585 data-nosnippet>1585</a>        <span class="macro">assert!</span>(keys.contains(<span class="kw-2">&amp;</span><span class="string">"none"</span>));
+<a href=#1586 id=1586 data-nosnippet>1586</a>        <span class="comment">// Fresh onboarding should not imply the user selected the default.
+<a href=#1587 id=1587 data-nosnippet>1587</a>        </span><span class="kw">let </span>active = items.iter().find(|i| i.badge.as_deref() == <span class="prelude-val">Some</span>(<span class="string">"active"</span>));
+<a href=#1588 id=1588 data-nosnippet>1588</a>        <span class="macro">assert!</span>(
+<a href=#1589 id=1589 data-nosnippet>1589</a>            active.is_none(),
+<a href=#1590 id=1590 data-nosnippet>1590</a>            <span class="string">"fresh onboarding should not mark a memory backend active before the user confirms the step"
+<a href=#1591 id=1591 data-nosnippet>1591</a>        </span>);
+<a href=#1592 id=1592 data-nosnippet>1592</a>    }
+<a href=#1593 id=1593 data-nosnippet>1593</a>
+<a href=#1594 id=1594 data-nosnippet>1594</a>    <span class="attr">#[test]
+<a href=#1595 id=1595 data-nosnippet>1595</a>    </span><span class="kw">fn </span>channels_picker_walks_schema_via_init_defaults() {
+<a href=#1596 id=1596 data-nosnippet>1596</a>        <span class="comment">// Pure schema discovery — same trick the TUI uses. Whatever channels
+<a href=#1597 id=1597 data-nosnippet>1597</a>        // the build has compiled in (matrix / discord / slack / etc.) appears
+<a href=#1598 id=1598 data-nosnippet>1598</a>        // in the picker without any hand-maintained list. Test asserts a
+<a href=#1599 id=1599 data-nosnippet>1599</a>        // representative sample compiled into the default `ci-all` build.
+<a href=#1600 id=1600 data-nosnippet>1600</a>        </span><span class="kw">let </span>cfg = empty_cfg();
+<a href=#1601 id=1601 data-nosnippet>1601</a>        <span class="kw">let </span>items = schema_walk_picker(<span class="kw-2">&amp;</span>cfg, <span class="string">"channels"</span>);
+<a href=#1602 id=1602 data-nosnippet>1602</a>        <span class="kw">let </span>keys: Vec&lt;<span class="kw-2">&amp;</span>str&gt; = items.iter().map(|i| i.key.as_str()).collect();
+<a href=#1603 id=1603 data-nosnippet>1603</a>        <span class="macro">assert!</span>(!keys.is_empty(), <span class="string">"channel picker must not be empty"</span>);
+<a href=#1604 id=1604 data-nosnippet>1604</a>        <span class="comment">// Channels that are unconditionally compiled (no feature gate)
+<a href=#1605 id=1605 data-nosnippet>1605</a>        // should always appear:
+<a href=#1606 id=1606 data-nosnippet>1606</a>        </span><span class="kw">for </span>expected <span class="kw">in </span>[<span class="string">"telegram"</span>, <span class="string">"slack"</span>, <span class="string">"discord"</span>] {
+<a href=#1607 id=1607 data-nosnippet>1607</a>            <span class="macro">assert!</span>(
+<a href=#1608 id=1608 data-nosnippet>1608</a>                keys.contains(<span class="kw-2">&amp;</span>expected),
+<a href=#1609 id=1609 data-nosnippet>1609</a>                <span class="string">"expected `{expected}` in channels picker, got: {keys:?}"
+<a href=#1610 id=1610 data-nosnippet>1610</a>            </span>);
+<a href=#1611 id=1611 data-nosnippet>1611</a>        }
+<a href=#1612 id=1612 data-nosnippet>1612</a>        <span class="comment">// Fresh config — nothing configured yet.
+<a href=#1613 id=1613 data-nosnippet>1613</a>        </span><span class="macro">assert!</span>(
+<a href=#1614 id=1614 data-nosnippet>1614</a>            items.iter().all(|i| i.badge.is_none()),
+<a href=#1615 id=1615 data-nosnippet>1615</a>            <span class="string">"fresh config shouldn't mark any channel as configured"
+<a href=#1616 id=1616 data-nosnippet>1616</a>        </span>);
+<a href=#1617 id=1617 data-nosnippet>1617</a>    }
+<a href=#1618 id=1618 data-nosnippet>1618</a>
+<a href=#1619 id=1619 data-nosnippet>1619</a>    <span class="attr">#[test]
+<a href=#1620 id=1620 data-nosnippet>1620</a>    </span><span class="kw">fn </span>channels_picker_marks_configured_after_create_map_key() {
+<a href=#1621 id=1621 data-nosnippet>1621</a>        <span class="kw">let </span><span class="kw-2">mut </span>cfg = empty_cfg();
+<a href=#1622 id=1622 data-nosnippet>1622</a>        cfg.create_map_key(<span class="string">"channels.matrix"</span>, <span class="string">"mymatrixalias"</span>)
+<a href=#1623 id=1623 data-nosnippet>1623</a>            .expect(<span class="string">"create_map_key must succeed for channels.matrix"</span>);
+<a href=#1624 id=1624 data-nosnippet>1624</a>        <span class="kw">let </span>items = schema_walk_picker(<span class="kw-2">&amp;</span>cfg, <span class="string">"channels"</span>);
+<a href=#1625 id=1625 data-nosnippet>1625</a>        <span class="kw">let </span>matrix = items.iter().find(|i| i.key == <span class="string">"matrix"</span>).unwrap();
+<a href=#1626 id=1626 data-nosnippet>1626</a>        <span class="macro">assert_eq!</span>(
+<a href=#1627 id=1627 data-nosnippet>1627</a>            matrix.badge.as_deref(),
+<a href=#1628 id=1628 data-nosnippet>1628</a>            <span class="prelude-val">Some</span>(<span class="string">"configured"</span>),
+<a href=#1629 id=1629 data-nosnippet>1629</a>            <span class="string">"matrix should be marked configured after create_map_key"
+<a href=#1630 id=1630 data-nosnippet>1630</a>        </span>);
+<a href=#1631 id=1631 data-nosnippet>1631</a>    }
+<a href=#1632 id=1632 data-nosnippet>1632</a>
+<a href=#1633 id=1633 data-nosnippet>1633</a>    <span class="attr">#[test]
+<a href=#1634 id=1634 data-nosnippet>1634</a>    </span><span class="kw">fn </span>tunnel_picker_includes_synthetic_none() {
+<a href=#1635 id=1635 data-nosnippet>1635</a>        <span class="kw">let </span>cfg = empty_cfg();
+<a href=#1636 id=1636 data-nosnippet>1636</a>        <span class="kw">let </span>items = schema_walk_picker_with_none(<span class="kw-2">&amp;</span>cfg, <span class="string">"tunnel"</span>, <span class="string">"tunnel.tunnel-provider"</span>);
+<a href=#1637 id=1637 data-nosnippet>1637</a>        <span class="macro">assert_eq!</span>(
+<a href=#1638 id=1638 data-nosnippet>1638</a>            items[<span class="number">0</span>].key, <span class="string">"none"</span>,
+<a href=#1639 id=1639 data-nosnippet>1639</a>            <span class="string">"`none` must be the first entry in the tunnel picker"
+<a href=#1640 id=1640 data-nosnippet>1640</a>        </span>);
+<a href=#1641 id=1641 data-nosnippet>1641</a>        <span class="comment">// `none` is the active default for a fresh config.
+<a href=#1642 id=1642 data-nosnippet>1642</a>        </span><span class="macro">assert_eq!</span>(items[<span class="number">0</span>].badge.as_deref(), <span class="prelude-val">Some</span>(<span class="string">"active"</span>));
+<a href=#1643 id=1643 data-nosnippet>1643</a>    }
+<a href=#1644 id=1644 data-nosnippet>1644</a>
+<a href=#1645 id=1645 data-nosnippet>1645</a>    <span class="doccomment">/// Empty OneTierAliasMap section yields zero picker items. No
+<a href=#1646 id=1646 data-nosnippet>1646</a>    /// closed-kind catalog applies for these sections — only operator-defined
+<a href=#1647 id=1647 data-nosnippet>1647</a>    /// aliases populate the picker. Section wire keys are kebab-case
+<a href=#1648 id=1648 data-nosnippet>1648</a>    /// because the Configurable derive runs each field name through
+<a href=#1649 id=1649 data-nosnippet>1649</a>    /// `snake_to_kebab` when registering map-key paths.
+<a href=#1650 id=1650 data-nosnippet>1650</a>    </span><span class="attr">#[test]
+<a href=#1651 id=1651 data-nosnippet>1651</a>    </span><span class="kw">fn </span>one_tier_alias_map_picker_is_empty_for_unconfigured_section() {
+<a href=#1652 id=1652 data-nosnippet>1652</a>        <span class="kw">let </span>cfg = empty_cfg();
+<a href=#1653 id=1653 data-nosnippet>1653</a>        <span class="kw">for </span>section <span class="kw">in </span>[
+<a href=#1654 id=1654 data-nosnippet>1654</a>            <span class="string">"peer_groups"</span>,
+<a href=#1655 id=1655 data-nosnippet>1655</a>            <span class="string">"cron"</span>,
+<a href=#1656 id=1656 data-nosnippet>1656</a>            <span class="string">"mcp_bundles"</span>,
+<a href=#1657 id=1657 data-nosnippet>1657</a>            <span class="string">"knowledge_bundles"</span>,
+<a href=#1658 id=1658 data-nosnippet>1658</a>            <span class="string">"skill_bundles"</span>,
+<a href=#1659 id=1659 data-nosnippet>1659</a>            <span class="string">"risk_profiles"</span>,
+<a href=#1660 id=1660 data-nosnippet>1660</a>            <span class="string">"runtime_profiles"</span>,
+<a href=#1661 id=1661 data-nosnippet>1661</a>        ] {
+<a href=#1662 id=1662 data-nosnippet>1662</a>            <span class="kw">let </span>items = one_tier_alias_map_picker(<span class="kw-2">&amp;</span>cfg, section);
+<a href=#1663 id=1663 data-nosnippet>1663</a>            <span class="macro">assert!</span>(
+<a href=#1664 id=1664 data-nosnippet>1664</a>                items.is_empty(),
+<a href=#1665 id=1665 data-nosnippet>1665</a>                <span class="string">"`{section}` picker must be empty on a fresh config, got: {:?}"</span>,
+<a href=#1666 id=1666 data-nosnippet>1666</a>                items.iter().map(|i| i.key.as_str()).collect::&lt;Vec&lt;<span class="kw">_</span>&gt;&gt;(),
+<a href=#1667 id=1667 data-nosnippet>1667</a>            );
+<a href=#1668 id=1668 data-nosnippet>1668</a>        }
+<a href=#1669 id=1669 data-nosnippet>1669</a>    }
+<a href=#1670 id=1670 data-nosnippet>1670</a>
+<a href=#1671 id=1671 data-nosnippet>1671</a>    <span class="doccomment">/// After `create_map_key("&lt;kebab-section&gt;", "&lt;alias&gt;")`, the picker
+<a href=#1672 id=1672 data-nosnippet>1672</a>    /// surfaces the alias as a `configured` entry. Same shape applies
+<a href=#1673 id=1673 data-nosnippet>1673</a>    /// to every OneTierAliasMap section — the picker is generic over
+<a href=#1674 id=1674 data-nosnippet>1674</a>    /// the prefix.
+<a href=#1675 id=1675 data-nosnippet>1675</a>    </span><span class="attr">#[test]
+<a href=#1676 id=1676 data-nosnippet>1676</a>    </span><span class="kw">fn </span>one_tier_alias_map_picker_surfaces_created_aliases() {
+<a href=#1677 id=1677 data-nosnippet>1677</a>        <span class="kw">let </span>cases: <span class="kw-2">&amp;</span>[(<span class="kw-2">&amp;</span>str, <span class="kw-2">&amp;</span>str)] = <span class="kw-2">&amp;</span>[
+<a href=#1678 id=1678 data-nosnippet>1678</a>            (<span class="string">"peer_groups"</span>, <span class="string">"team_chat"</span>),
+<a href=#1679 id=1679 data-nosnippet>1679</a>            (<span class="string">"cron"</span>, <span class="string">"daily_brief"</span>),
+<a href=#1680 id=1680 data-nosnippet>1680</a>            (<span class="string">"mcp_bundles"</span>, <span class="string">"core_tools"</span>),
+<a href=#1681 id=1681 data-nosnippet>1681</a>            (<span class="string">"knowledge_bundles"</span>, <span class="string">"house_docs"</span>),
+<a href=#1682 id=1682 data-nosnippet>1682</a>            (<span class="string">"skill_bundles"</span>, <span class="string">"ops_skills"</span>),
+<a href=#1683 id=1683 data-nosnippet>1683</a>            (<span class="string">"risk_profiles"</span>, <span class="string">"tight"</span>),
+<a href=#1684 id=1684 data-nosnippet>1684</a>            (<span class="string">"runtime_profiles"</span>, <span class="string">"fast_model"</span>),
+<a href=#1685 id=1685 data-nosnippet>1685</a>        ];
+<a href=#1686 id=1686 data-nosnippet>1686</a>        <span class="kw">for </span>(section, alias) <span class="kw">in </span>cases {
+<a href=#1687 id=1687 data-nosnippet>1687</a>            <span class="kw">let </span><span class="kw-2">mut </span>cfg = empty_cfg();
+<a href=#1688 id=1688 data-nosnippet>1688</a>            cfg.create_map_key(section, alias)
+<a href=#1689 id=1689 data-nosnippet>1689</a>                .unwrap_or_else(|e| <span class="macro">panic!</span>(<span class="string">"create_map_key({section}, {alias}) failed: {e}"</span>));
+<a href=#1690 id=1690 data-nosnippet>1690</a>            <span class="kw">let </span>items = one_tier_alias_map_picker(<span class="kw-2">&amp;</span>cfg, section);
+<a href=#1691 id=1691 data-nosnippet>1691</a>            <span class="macro">assert!</span>(
+<a href=#1692 id=1692 data-nosnippet>1692</a>                items.iter().any(|i| i.key == <span class="kw-2">*</span>alias),
+<a href=#1693 id=1693 data-nosnippet>1693</a>                <span class="string">"`{section}` picker should surface `{alias}` after create_map_key; got: {:?}"</span>,
+<a href=#1694 id=1694 data-nosnippet>1694</a>                items.iter().map(|i| i.key.as_str()).collect::&lt;Vec&lt;<span class="kw">_</span>&gt;&gt;(),
+<a href=#1695 id=1695 data-nosnippet>1695</a>            );
+<a href=#1696 id=1696 data-nosnippet>1696</a>            <span class="kw">let </span>entry = items.iter().find(|i| i.key == <span class="kw-2">*</span>alias).unwrap();
+<a href=#1697 id=1697 data-nosnippet>1697</a>            <span class="macro">assert_eq!</span>(
+<a href=#1698 id=1698 data-nosnippet>1698</a>                entry.badge.as_deref(),
+<a href=#1699 id=1699 data-nosnippet>1699</a>                <span class="prelude-val">Some</span>(<span class="string">"configured"</span>),
+<a href=#1700 id=1700 data-nosnippet>1700</a>                <span class="string">"`{section}.{alias}` should be badged `configured`"</span>,
+<a href=#1701 id=1701 data-nosnippet>1701</a>            );
+<a href=#1702 id=1702 data-nosnippet>1702</a>        }
+<a href=#1703 id=1703 data-nosnippet>1703</a>    }
+<a href=#1704 id=1704 data-nosnippet>1704</a>
+<a href=#1705 id=1705 data-nosnippet>1705</a>    <span class="doccomment">/// Exhaustive picker dispatch: every [`Section`] variant must
+<a href=#1706 id=1706 data-nosnippet>1706</a>    /// resolve through `picker_items_for` without panic. DirectForm
+<a href=#1707 id=1707 data-nosnippet>1707</a>    /// sections (Workspace, Hardware, Mcp) return the
+<a href=#1708 id=1708 data-nosnippet>1708</a>    /// `PickerDispatch::DirectForm` sentinel; every other section
+<a href=#1709 id=1709 data-nosnippet>1709</a>    /// returns at least zero items. Loops over the wizard order plus
+<a href=#1710 id=1710 data-nosnippet>1710</a>    /// every explorer-only variant — adding a new Section variant
+<a href=#1711 id=1711 data-nosnippet>1711</a>    /// fails to compile until it gets a routing arm in
+<a href=#1712 id=1712 data-nosnippet>1712</a>    /// `picker_items_for`.
+<a href=#1713 id=1713 data-nosnippet>1713</a>    </span><span class="attr">#[test]
+<a href=#1714 id=1714 data-nosnippet>1714</a>    </span><span class="kw">fn </span>picker_dispatch_covers_every_section_variant() {
+<a href=#1715 id=1715 data-nosnippet>1715</a>        <span class="kw">use </span>zeroclaw_config::sections::Section;
+<a href=#1716 id=1716 data-nosnippet>1716</a>        <span class="kw">let </span>cfg = empty_cfg();
+<a href=#1717 id=1717 data-nosnippet>1717</a>        <span class="comment">// The full Section surface = wizard steps + explorer-only.
+<a href=#1718 id=1718 data-nosnippet>1718</a>        // Spelling them out here pins both groups, so adding a row to
+<a href=#1719 id=1719 data-nosnippet>1719</a>        // the `sections!` macro forces an update here too.
+<a href=#1720 id=1720 data-nosnippet>1720</a>        </span><span class="kw">let </span>all: <span class="kw-2">&amp;</span>[Section] = <span class="kw-2">&amp;</span>[
+<a href=#1721 id=1721 data-nosnippet>1721</a>            Section::ModelProviders,
+<a href=#1722 id=1722 data-nosnippet>1722</a>            Section::TtsProviders,
+<a href=#1723 id=1723 data-nosnippet>1723</a>            Section::TranscriptionProviders,
+<a href=#1724 id=1724 data-nosnippet>1724</a>            Section::Channels,
+<a href=#1725 id=1725 data-nosnippet>1725</a>            Section::Memory,
+<a href=#1726 id=1726 data-nosnippet>1726</a>            Section::Hardware,
+<a href=#1727 id=1727 data-nosnippet>1727</a>            Section::Tunnel,
+<a href=#1728 id=1728 data-nosnippet>1728</a>            Section::Agents,
+<a href=#1729 id=1729 data-nosnippet>1729</a>            Section::PeerGroups,
+<a href=#1730 id=1730 data-nosnippet>1730</a>            Section::Storage,
+<a href=#1731 id=1731 data-nosnippet>1731</a>            Section::Cron,
+<a href=#1732 id=1732 data-nosnippet>1732</a>            Section::Mcp,
+<a href=#1733 id=1733 data-nosnippet>1733</a>            Section::McpBundles,
+<a href=#1734 id=1734 data-nosnippet>1734</a>            Section::KnowledgeBundles,
+<a href=#1735 id=1735 data-nosnippet>1735</a>            Section::SkillBundles,
+<a href=#1736 id=1736 data-nosnippet>1736</a>            Section::RiskProfiles,
+<a href=#1737 id=1737 data-nosnippet>1737</a>            Section::RuntimeProfiles,
+<a href=#1738 id=1738 data-nosnippet>1738</a>        ];
+<a href=#1739 id=1739 data-nosnippet>1739</a>        <span class="kw">let </span>direct_form = [Section::Hardware, Section::Mcp];
+<a href=#1740 id=1740 data-nosnippet>1740</a>        <span class="kw">for </span>section <span class="kw">in </span>all {
+<a href=#1741 id=1741 data-nosnippet>1741</a>            <span class="kw">match </span>picker_items_for(<span class="kw-2">*</span>section, <span class="kw-2">&amp;</span>cfg) {
+<a href=#1742 id=1742 data-nosnippet>1742</a>                PickerDispatch::Items(_items) =&gt; {
+<a href=#1743 id=1743 data-nosnippet>1743</a>                    <span class="macro">assert!</span>(
+<a href=#1744 id=1744 data-nosnippet>1744</a>                        !direct_form.contains(section),
+<a href=#1745 id=1745 data-nosnippet>1745</a>                        <span class="string">"{section:?} is marked DirectForm but dispatched to Items"</span>,
+<a href=#1746 id=1746 data-nosnippet>1746</a>                    );
+<a href=#1747 id=1747 data-nosnippet>1747</a>                }
+<a href=#1748 id=1748 data-nosnippet>1748</a>                PickerDispatch::DirectForm =&gt; {
+<a href=#1749 id=1749 data-nosnippet>1749</a>                    <span class="macro">assert!</span>(
+<a href=#1750 id=1750 data-nosnippet>1750</a>                        direct_form.contains(section),
+<a href=#1751 id=1751 data-nosnippet>1751</a>                        <span class="string">"{section:?} returned DirectForm but is not in the DirectForm set; \
+<a href=#1752 id=1752 data-nosnippet>1752</a>                         either give it a picker arm or add it to the DirectForm list"</span>,
+<a href=#1753 id=1753 data-nosnippet>1753</a>                    );
+<a href=#1754 id=1754 data-nosnippet>1754</a>                }
+<a href=#1755 id=1755 data-nosnippet>1755</a>            }
+<a href=#1756 id=1756 data-nosnippet>1756</a>        }
+<a href=#1757 id=1757 data-nosnippet>1757</a>    }
+<a href=#1758 id=1758 data-nosnippet>1758</a>
+<a href=#1759 id=1759 data-nosnippet>1759</a>    <span class="doccomment">/// Storage is `[storage.&lt;kind&gt;.&lt;alias&gt;]` — two-tier typed-family
+<a href=#1760 id=1760 data-nosnippet>1760</a>    /// shape, served by the storage picker. The picker
+<a href=#1761 id=1761 data-nosnippet>1761</a>    /// surfaces the 5 storage kinds (sqlite, postgres, qdrant,
+<a href=#1762 id=1762 data-nosnippet>1762</a>    /// markdown, lucid) regardless of which aliases exist, and badges
+<a href=#1763 id=1763 data-nosnippet>1763</a>    /// the kind `created` once any alias under it is created.
+<a href=#1764 id=1764 data-nosnippet>1764</a>    </span><span class="attr">#[test]
+<a href=#1765 id=1765 data-nosnippet>1765</a>    </span><span class="kw">fn </span>storage_picker_lists_all_kinds_and_marks_created() {
+<a href=#1766 id=1766 data-nosnippet>1766</a>        <span class="kw">let </span>cfg = empty_cfg();
+<a href=#1767 id=1767 data-nosnippet>1767</a>        <span class="kw">let </span>items = storage_picker(<span class="kw-2">&amp;</span>cfg);
+<a href=#1768 id=1768 data-nosnippet>1768</a>        <span class="kw">let </span>keys: Vec&lt;<span class="kw-2">&amp;</span>str&gt; = items.iter().map(|i| i.key.as_str()).collect();
+<a href=#1769 id=1769 data-nosnippet>1769</a>        <span class="kw">for </span>expected <span class="kw">in </span>[<span class="string">"sqlite"</span>, <span class="string">"postgres"</span>, <span class="string">"qdrant"</span>, <span class="string">"markdown"</span>, <span class="string">"lucid"</span>] {
+<a href=#1770 id=1770 data-nosnippet>1770</a>            <span class="macro">assert!</span>(
+<a href=#1771 id=1771 data-nosnippet>1771</a>                keys.contains(<span class="kw-2">&amp;</span>expected),
+<a href=#1772 id=1772 data-nosnippet>1772</a>                <span class="string">"storage picker must list `{expected}`, got: {keys:?}"</span>,
+<a href=#1773 id=1773 data-nosnippet>1773</a>            );
+<a href=#1774 id=1774 data-nosnippet>1774</a>        }
+<a href=#1775 id=1775 data-nosnippet>1775</a>        <span class="comment">// Fresh config — no kind should be badged.
+<a href=#1776 id=1776 data-nosnippet>1776</a>        </span><span class="macro">assert!</span>(
+<a href=#1777 id=1777 data-nosnippet>1777</a>            items.iter().all(|i| i.badge.is_none()),
+<a href=#1778 id=1778 data-nosnippet>1778</a>            <span class="string">"fresh config: no storage kind should be marked configured"</span>,
+<a href=#1779 id=1779 data-nosnippet>1779</a>        );
+<a href=#1780 id=1780 data-nosnippet>1780</a>
+<a href=#1781 id=1781 data-nosnippet>1781</a>        <span class="comment">// Create a sqlite instance; the sqlite row should flip to configured.
+<a href=#1782 id=1782 data-nosnippet>1782</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>cfg2 = empty_cfg();
+<a href=#1783 id=1783 data-nosnippet>1783</a>        cfg2.create_map_key(<span class="string">"storage.sqlite"</span>, <span class="string">"primary"</span>)
+<a href=#1784 id=1784 data-nosnippet>1784</a>            .expect(<span class="string">"create_map_key(storage.sqlite, primary) must succeed"</span>);
+<a href=#1785 id=1785 data-nosnippet>1785</a>        <span class="kw">let </span>items = storage_picker(<span class="kw-2">&amp;</span>cfg2);
+<a href=#1786 id=1786 data-nosnippet>1786</a>        <span class="kw">let </span>sqlite = items.iter().find(|i| i.key == <span class="string">"sqlite"</span>).unwrap();
+<a href=#1787 id=1787 data-nosnippet>1787</a>        <span class="macro">assert_eq!</span>(
+<a href=#1788 id=1788 data-nosnippet>1788</a>            sqlite.badge.as_deref(),
+<a href=#1789 id=1789 data-nosnippet>1789</a>            <span class="prelude-val">Some</span>(<span class="string">"created"</span>),
+<a href=#1790 id=1790 data-nosnippet>1790</a>            <span class="string">"storage.sqlite should be marked created after adding an alias"</span>,
+<a href=#1791 id=1791 data-nosnippet>1791</a>        );
+<a href=#1792 id=1792 data-nosnippet>1792</a>        <span class="macro">assert!</span>(
+<a href=#1793 id=1793 data-nosnippet>1793</a>            sqlite.description.is_some(),
+<a href=#1794 id=1794 data-nosnippet>1794</a>            <span class="string">"storage picker should explain each backend tradeoff"</span>,
+<a href=#1795 id=1795 data-nosnippet>1795</a>        );
+<a href=#1796 id=1796 data-nosnippet>1796</a>    }
+<a href=#1797 id=1797 data-nosnippet>1797</a>}
+</code></pre></div></section></main></body></html>

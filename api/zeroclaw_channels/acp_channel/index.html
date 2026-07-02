@@ -1,0 +1,41 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="ACP (Agent Client Protocol) back-channel."><title>zeroclaw_channels::acp_channel - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="zeroclaw_channels" data-themes="" data-resource-suffix="" data-rustdoc-version="1.96.1 (31fca3adb 2026-06-26)" data-channel="1.96.1" data-search-js="search-b5634cc7.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module acp_channel</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../zeroclaw_channels/index.html">zeroclaw_<wbr>channels</a><span class="version">0.8.2</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module acp_<wbr>channel</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#what-this-channel-does" title="What this channel does">What this channel does</a></li><li><a href="#wire-format" title="Wire format">Wire format</a></li></ul><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate zeroclaw_<wbr>channels</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">zeroclaw_channels</a></div><h1>Module <span>acp_<wbr>channel</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>ACP (Agent Client Protocol) back-channel.</p>
+<p>Bridges ZeroClaw’s <a href="../orchestrator/trait.Channel.html" title="trait zeroclaw_channels::orchestrator::Channel"><code>Channel</code></a> abstraction onto an active ACP session so
+tools like <code>ask_user</code>, <code>escalate_to_human</code>, and <code>reaction</code> can talk back
+to the IDE/CLI client (Toad, Zed, etc.) instead of returning
+“no channels available”.</p>
+<h3 id="what-this-channel-does"><a class="doc-anchor" href="#what-this-channel-does">§</a>What this channel does</h3>
+<ul>
+<li><code>send</code> emits an <code>agent_message_chunk</code> <code>session/update</code> notification —
+the ACP client renders it inline in the conversation.</li>
+<li><code>request_choice</code> issues an <code>elicitation/create</code> JSON-RPC request
+(form mode, single-select enum) when the client advertises
+<code>elicitation.form</code> in <code>initialize.clientCapabilities</code>. Otherwise
+it falls back to the legacy <code>session/request_permission</code> overload
+for backward compatibility with clients that haven’t yet shipped
+the <a href="https://agentclientprotocol.com/rfds/elicitation">elicitation RFD</a>
+(<a href="https://agentclientprotocol.com/rfds/elicitation">https://agentclientprotocol.com/rfds/elicitation</a>).</li>
+<li><code>request_multi_choice</code> issues an <code>elicitation/create</code> request
+with a <code>type: array</code> / <code>anyOf</code> schema. There is no legacy
+fallback for multi-select — callers receive <code>Ok(None)</code> when the
+client lacks the capability and should take their own non-ACP
+path.</li>
+<li><code>listen</code> is <strong>not implemented</strong>. Free-form ACP “ask the user” has no
+first-class method in Phase 1 of the elicitation rollout; until
+Phase 2 lands, <code>ask_user</code> callers under ACP must supply structured
+<code>choices</code>.</li>
+</ul>
+<h3 id="wire-format"><a class="doc-anchor" href="#wire-format">§</a>Wire format</h3>
+<p>Per the <a href="https://agentclientprotocol.com/protocol/v1/overview#conventions">ACP conventions</a>: ACP-defined JSON object
+property keys use <strong>camelCase</strong> (<code>sessionId</code>, <code>toolCallId</code>, <code>rawInput</code>,
+<code>sessionUpdate</code>, <code>oldText</code>, <code>newText</code>, …), and string values carried by
+discriminator fields use <strong>snake_case</strong> (<code>agent_message_chunk</code>,
+<code>allow_once</code>, <code>reject_with_edit</code>, …). The JSON-RPC envelope follows the
+2.0 spec and is constructed by <a href="../../zeroclaw_api/jsonrpc/index.html" title="mod zeroclaw_api::jsonrpc"><code>zeroclaw_api::jsonrpc</code></a> using the
+shared <a href="../../zeroclaw_api/jsonrpc/constant.JSONRPC_VERSION.html" title="constant zeroclaw_api::jsonrpc::JSONRPC_VERSION"><code>JSONRPC_VERSION</code></a>
+constant. Do <strong>not</strong> snake_case-rewrite these property keys: the
+upstream ACP spec is the contract these IDE clients (Zed, Toad, …)
+parse against, and divergence breaks them.</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.AcpChannel.html" title="struct zeroclaw_channels::acp_channel::AcpChannel">AcpChannel</a></dt><dd>Per-session ACP back-channel. One instance is registered into each tool’s
+channel map at session/new time and torn down on session/stop.</dd></dl></section></div></main></body></html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Cmd"],"fn":["bin","gen_api","main","node_modules_needs_install","npm_install","npm_run","npx"],"struct":["Cli"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"static":["TOOL_LOOP_RECEIPT_CONTEXT"],"struct":["ReceiptGenerator","ReceiptScope"]};

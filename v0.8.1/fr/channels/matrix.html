@@ -1,0 +1,1067 @@
+<!DOCTYPE HTML>
+<html lang="fr" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Matrice - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-8ddd6fe5.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="matrice"><a class="header" href="#matrice">Matrice</a></h1>
+<p>Exécutez ZeroClaw dans les salles Matrix, y compris les salles chiffrées de bout en bout (E2EE).</p>
+<h2 id="qui-peut-parler-à-lagent"><a class="header" href="#qui-peut-parler-à-lagent">Qui peut parler à l’agent</a></h2>
+<p>Les expéditeurs entrants sont filtrés par rapport au <strong>peer set</strong> résolu pour l’agent lié, issu de la configuration <code>peer_groups</code> à laquelle l’agent appartient. La correspondance supprime le <code>@</code> initial et est insensible à la casse par rapport à l’identifiant d’expéditeur natif du canal. Un ensemble <strong>vide</strong> refuse tout le monde ; un ensemble contenant <code>"*"</code> accepte n’importe qui ; sinon, seuls les pairs externes listés (et les agents pairs) sont acceptés. Ceci est distinct de l’appairage de la passerelle (<code>gateway.require_pairing</code>), qui authentifie les clients HTTP/WebSocket, et non les expéditeurs des canaux de discussion.</p>
+<p>Un groupe de pairs pour matrix définit <code>channel</code> à <code>matrix</code>, liste les expéditeurs autorisés dans <code>external_peers</code> (pour matrix, l’identifiant utilisateur Matrix complet, <code>@user:server.tld</code> ; <code>["*"]</code> accepte n’importe qui), nomme éventuellement des <code>agents</code> pairs pour la répartition inter-agents, une liste de blocage <code>ignore</code>, et une <code>output_modality</code> (<code>mirror</code>, <code>voice</code> ou <code>text</code>). Voir <a href="peer-groups.html">Peer Groups</a> pour la référence des champs.</p>
+<p>Où définir ce paramètre :</p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle"><a class="header" href="#tableau-de-bord-de-la-passerelle">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/peer_groups"><code>/config/peer_groups</code></a> dans le tableau de bord web.</p>
+<h4 id="zerocode"><a class="header" href="#zerocode">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, sous <strong>Peer groups</strong>.</p>
+</div>
+
+<p>Mode d’échec courant que ce guide cible :</p>
+<blockquote>
+<p>« La matrice est configurée correctement, les vérifications passent, mais le bot ne répond pas. »</p>
+</blockquote>
+<h2 id="faq-rapide"><a class="header" href="#faq-rapide">FAQ rapide</a></h2>
+<p>Si Matrix apparaît connecté mais qu’il n’y a pas de réponse, validez d’abord ces points :</p>
+<ol>
+<li>L’expéditeur fait partie de l’ensemble de pairs de l’agent (pour les tests : <code>external_peers = ["*"]</code>).</li>
+<li>Le bot a rejoint la pièce cible.</li>
+<li>Les identifiants appartiennent au compte du bot (vérification <code>whoami</code> sur le chemin du jeton, voir <a href="#c-token-and-identity">§5C</a>).</li>
+<li>La salle chiffrée peut être déchiffrée : <code>recovery_key</code> défini (recommandé) ou clés partagées avec l’appareil du bot.</li>
+<li>Le démon a été redémarré après les modifications de configuration.</li>
+</ol>
+<h2 id="1-exigences"><a class="header" href="#1-exigences">1. Exigences</a></h2>
+<p>Avant de tester le flux de messages :</p>
+<ol>
+<li>
+<ul>
+<li>Le compte du bot est joint à la salle cible.</li>
+</ul>
+</li>
+<li>Les identifiants authentifient le compte du bot : soit <code>user_id</code> + <code>password</code> (recommandé, voir <a href="#2-configuration">§2</a>), soit un <code>access_token</code> (méthode par jeton, <a href="#3-token-path-alternative-obtaining-access_token-and-device_id">§3</a>).</li>
+<li><code>allowed_rooms</code> inclut le salon cible (ou est vide pour autoriser tous les salons que le bot a rejoints). Les entrées sont comparées littéralement à l’ID canonique du salon (<code>!room:server</code>) de chaque message entrant, donc listez ici les ID canoniques des salons : ZeroClaw ne résout <strong>pas</strong> une entrée <code>#alias:server</code> pour cette liste d’autorisation. (Les alias ne sont résolus que pour les cibles de livraison sortantes telles que <code>delivery.to</code> de cron.) Trouvez l’ID canonique d’un salon dans son client (dans Element : Paramètres du salon → Avancé → ID interne du salon).</li>
+<li>Un groupe de pairs autorise l’expéditeur (<code>external_peers = ["*"]</code> pour les tests ouverts, voir <a href="#b-sender-allowlist-peer-groups">§6</a>).</li>
+<li>Pour les salons E2EE, le bot peut déchiffrer : une <code>recovery_key</code> (recommandé) restaure les clés automatiquement, ou les clés sont partagées manuellement avec l’appareil du bot.</li>
+</ol>
+<h2 id="2-configuration"><a class="header" href="#2-configuration">2. Configuration</a></h2>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>access_token</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>null</code></span></summary>
+<p>Jeton d’accès Matrix pour le compte du bot. Lorsqu’il n’est pas défini, le canal se rabat sur la connexion par mot de passe en utilisant <code>user_id</code> + <code>password</code>.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-1"><a class="header" href="#tableau-de-bord-de-la-passerelle-1">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez le champ <code>channels.matrix.&lt;alias&gt;.access_token</code>.</p>
+<h4 id="zerocode-1"><a class="header" href="#zerocode-1">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.access_token</code>.</p>
+<h4 id="zeroclaw-config"><a class="header" href="#zeroclaw-config">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.access_token    # entrée masquée, stockée chiffrée
+</code></pre>
+<h4 id="variable-denvironnement"><a class="header" href="#variable-denvironnement">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__access_token=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>ack_reactions</code> <span class="cfg-field-meta"><code>bool?</code> · default <code>null</code></span></summary>
+<p>Remplace la valeur de premier niveau <code>[channels].ack_reactions</code>. Lorsque <code>None</code>, utilise la valeur par défaut applicable à tous les canaux. Lorsque défini explicitement (<code>true</code>/<code>false</code>), prend la priorité pour cette instance Matrix uniquement.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-2"><a class="header" href="#tableau-de-bord-de-la-passerelle-2">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez le champ <code>channels.matrix.&lt;alias&gt;.ack_reactions</code>.</p>
+<h4 id="zerocode-2"><a class="header" href="#zerocode-2">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.ack_reactions</code>.</p>
+<h4 id="zeroclaw-config-1"><a class="header" href="#zeroclaw-config-1">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.ack_reactions &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-1"><a class="header" href="#variable-denvironnement-1">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__ack_reactions=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>allowed_rooms</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>IDs des salons Matrix autorisés. Vide = autoriser tous les salons que le bot a rejoints. Les entrées sont comparées littéralement à l’ID canonique du salon (<code>!abc:server</code>) de chaque message entrant ; les alias <code>#room:server</code> ne sont pas résolus pour cette liste d’autorisation (ils ne sont résolus que pour les cibles de livraison sortantes telles que <code>delivery.to</code> de cron).</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-3"><a class="header" href="#tableau-de-bord-de-la-passerelle-3">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez le champ <code>channels.matrix.&lt;alias&gt;.allowed_rooms</code>.</p>
+<h4 id="zerocode-3"><a class="header" href="#zerocode-3">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.allowed_rooms</code>.</p>
+<h4 id="zeroclaw-config-2"><a class="header" href="#zeroclaw-config-2">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.allowed_rooms &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-2"><a class="header" href="#variable-denvironnement-2">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__allowed_rooms=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>approval_timeout_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>300</code></span></summary>
+<p>Nombre de secondes d’attente pour l’approbation de l’opérateur sur les outils <code>always_ask</code> avant le refus automatique.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-4"><a class="header" href="#tableau-de-bord-de-la-passerelle-4">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez le champ <code>channels.matrix.&lt;alias&gt;.approval_timeout_secs</code>.</p>
+<h4 id="zerocode-4"><a class="header" href="#zerocode-4">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.approval_timeout_secs</code>.</p>
+<h4 id="zeroclaw-config-3"><a class="header" href="#zeroclaw-config-3">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.approval_timeout_secs &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-3"><a class="header" href="#variable-denvironnement-3">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__approval_timeout_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>device_id</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>ID d’appareil Matrix facultatif.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-5"><a class="header" href="#tableau-de-bord-de-la-passerelle-5">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez le champ <code>channels.matrix.&lt;alias&gt;.device_id</code>.</p>
+<h4 id="zerocode-5"><a class="header" href="#zerocode-5">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.device_id</code>.</p>
+<h4 id="zeroclaw-config-4"><a class="header" href="#zeroclaw-config-4">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.device_id &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-4"><a class="header" href="#variable-denvironnement-4">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__device_id=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>draft_update_interval_ms</code> <span class="cfg-field-meta"><code>integer</code> · default <code>1500</code></span></summary>
+<p>Intervalle minimal (ms) entre les modifications du brouillon de message en mode Partial.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-6"><a class="header" href="#tableau-de-bord-de-la-passerelle-6">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez le champ <code>channels.matrix.&lt;alias&gt;.draft_update_interval_ms</code>.</p>
+<h4 id="zerocode-6"><a class="header" href="#zerocode-6">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.draft_update_interval_ms</code>.</p>
+<h4 id="zeroclaw-config-5"><a class="header" href="#zeroclaw-config-5">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.draft_update_interval_ms &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-5"><a class="header" href="#variable-denvironnement-5">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__draft_update_interval_ms=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>excluded_tools</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Outils exclus de la spécification d’outils de ce canal. Lorsque ce paramètre est défini, ces outils ne sont pas exposés au modèle lors des réponses via ce canal.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-7"><a class="header" href="#tableau-de-bord-de-la-passerelle-7">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez le champ <code>channels.matrix.&lt;alias&gt;.excluded_tools</code>.</p>
+<h4 id="zerocode-7"><a class="header" href="#zerocode-7">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.excluded_tools</code>.</p>
+<h4 id="zeroclaw-config-6"><a class="header" href="#zeroclaw-config-6">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.excluded_tools &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-6"><a class="header" href="#variable-denvironnement-6">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__excluded_tools=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>homeserver</code>* <span class="cfg-field-meta"><code>string</code> · default <code>—</code></span></summary>
+<p>URL du serveur d’accueil Matrix (par ex. <code>"https://matrix.org"</code>).</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-8"><a class="header" href="#tableau-de-bord-de-la-passerelle-8">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez le champ <code>channels.matrix.&lt;alias&gt;.homeserver</code>.</p>
+<h4 id="zerocode-8"><a class="header" href="#zerocode-8">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.homeserver</code>.</p>
+<h4 id="zeroclaw-config-7"><a class="header" href="#zeroclaw-config-7">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.homeserver &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-7"><a class="header" href="#variable-denvironnement-7">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__homeserver=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>interrupt_on_new_message</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>Indique s’il faut interrompre une réponse en cours de l’agent lorsqu’un nouveau message arrive.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-9"><a class="header" href="#tableau-de-bord-de-la-passerelle-9">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez le champ <code>channels.matrix.&lt;alias&gt;.interrupt_on_new_message</code>.</p>
+<h4 id="zerocode-9"><a class="header" href="#zerocode-9">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.interrupt_on_new_message</code>.</p>
+<h4 id="zeroclaw-config-8"><a class="header" href="#zeroclaw-config-8">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.interrupt_on_new_message &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-8"><a class="header" href="#variable-denvironnement-8">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__interrupt_on_new_message=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>mention_only</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>Lorsque cette option est définie sur true, seuls les messages qui mentionnent le bot avec @ dans les groupes reçoivent une réponse. Les messages directs sont toujours traités.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-10"><a class="header" href="#tableau-de-bord-de-la-passerelle-10">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez le champ <code>channels.matrix.&lt;alias&gt;.mention_only</code>.</p>
+<h4 id="zerocode-10"><a class="header" href="#zerocode-10">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.mention_only</code>.</p>
+<h4 id="zeroclaw-config-9"><a class="header" href="#zeroclaw-config-9">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.mention_only &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-9"><a class="header" href="#variable-denvironnement-9">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__mention_only=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>multi_message_delay_ms</code> <span class="cfg-field-meta"><code>integer</code> · default <code>800</code></span></summary>
+<p>Délai (ms) entre l’envoi de chaque paragraphe en mode MultiMessage.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-11"><a class="header" href="#tableau-de-bord-de-la-passerelle-11">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez le champ <code>channels.matrix.&lt;alias&gt;.multi_message_delay_ms</code>.</p>
+<h4 id="zerocode-11"><a class="header" href="#zerocode-11">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.multi_message_delay_ms</code>.</p>
+<h4 id="zeroclaw-config-10"><a class="header" href="#zeroclaw-config-10">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.multi_message_delay_ms &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-10"><a class="header" href="#variable-denvironnement-10">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__multi_message_delay_ms=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>password</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>null</code></span></summary>
+<p>Mot de passe de connexion facultatif pour le compte Matrix (utilisé pour le flux de connexion initial).</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-12"><a class="header" href="#tableau-de-bord-de-la-passerelle-12">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez le champ <code>channels.matrix.&lt;alias&gt;.password</code>.</p>
+<h4 id="zerocode-12"><a class="header" href="#zerocode-12">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.password</code>.</p>
+<h4 id="zeroclaw-config-11"><a class="header" href="#zeroclaw-config-11">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.password    # entrée masquée, stockée chiffrée
+</code></pre>
+<h4 id="variable-denvironnement-11"><a class="header" href="#variable-denvironnement-11">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__password=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>recovery_key</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>null</code></span></summary>
+<p>Clé de récupération Matrix optionnelle pour la restauration automatique de la sauvegarde des clés E2EE. Lorsqu’elle est définie, ZeroClaw récupère les clés de salon et les secrets de signature croisée au démarrage.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-13"><a class="header" href="#tableau-de-bord-de-la-passerelle-13">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez le champ <code>channels.matrix.&lt;alias&gt;.recovery_key</code>.</p>
+<h4 id="zerocode-13"><a class="header" href="#zerocode-13">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.recovery_key</code>.</p>
+<h4 id="zeroclaw-config-12"><a class="header" href="#zeroclaw-config-12">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.recovery_key    # entrée masquée, stockée chiffrée
+</code></pre>
+<h4 id="variable-denvironnement-12"><a class="header" href="#variable-denvironnement-12">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__recovery_key=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>reply_in_thread</code> <span class="cfg-field-meta"><code>bool</code> · default <code>true</code></span></summary>
+<p>Lorsque la valeur est true (par défaut), les réponses sont envoyées comme des réponses de fil de discussion. Démarre un nouveau fil de discussion à partir du message entrant lorsqu’aucun n’existe. Lorsque la valeur est false, seuls les fils de discussion existants sont poursuivis.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-14"><a class="header" href="#tableau-de-bord-de-la-passerelle-14">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez le champ <code>channels.matrix.&lt;alias&gt;.reply_in_thread</code>.</p>
+<h4 id="zerocode-14"><a class="header" href="#zerocode-14">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.reply_in_thread</code>.</p>
+<h4 id="zeroclaw-config-13"><a class="header" href="#zeroclaw-config-13">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.reply_in_thread &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-13"><a class="header" href="#variable-denvironnement-13">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__reply_in_thread=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>reply_min_interval_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>0</code></span></summary>
+<p>Plancher de cadencement sortant par (canal, destinataire) en secondes. Plage : <code>0..=REPLY_MIN_INTERVAL_MAX_SECS</code> (0 désactive).</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-15"><a class="header" href="#tableau-de-bord-de-la-passerelle-15">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez le champ <code>channels.matrix.&lt;alias&gt;.reply_min_interval_secs</code>.</p>
+<h4 id="zerocode-15"><a class="header" href="#zerocode-15">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.reply_min_interval_secs</code>.</p>
+<h4 id="zeroclaw-config-14"><a class="header" href="#zeroclaw-config-14">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.reply_min_interval_secs &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-14"><a class="header" href="#variable-denvironnement-14">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__reply_min_interval_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>reply_queue_depth_max</code> <span class="cfg-field-meta"><code>integer</code> · default <code>0</code></span></summary>
+<p>Profondeur de la file d’attente de régulation sortante par (canal, destinataire). Plage : <code>0..=REPLY_QUEUE_DEPTH_CEILING</code>. Lorsque <code>reply_min_interval_secs &gt; 0</code> et que cette valeur est <code>0</code>, le wrapper de régulation substitue <code>DEFAULT_REPLY_QUEUE_DEPTH</code> (16). Lorsque la file d’attente est pleine, l’envoi le plus récent est abandonné et un <code>WARN</code> est journalisé.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-16"><a class="header" href="#tableau-de-bord-de-la-passerelle-16">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez le champ <code>channels.matrix.&lt;alias&gt;.reply_queue_depth_max</code>.</p>
+<h4 id="zerocode-16"><a class="header" href="#zerocode-16">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.reply_queue_depth_max</code>.</p>
+<h4 id="zeroclaw-config-15"><a class="header" href="#zeroclaw-config-15">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.reply_queue_depth_max &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-15"><a class="header" href="#variable-denvironnement-15">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__reply_queue_depth_max=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>stream_mode</code> <span class="cfg-field-meta"><code>StreamMode</code> · default <code>"off"</code></span></summary>
+<p>Mode streaming pour la livraison progressive des réponses. <code>"off"</code> (par défaut) : message unique. <code>"partial"</code> : brouillon modifié sur place. <code>"multi_message"</code> : livraison fractionnée par paragraphes.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-17"><a class="header" href="#tableau-de-bord-de-la-passerelle-17">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez le champ <code>channels.matrix.&lt;alias&gt;.stream_mode</code>.</p>
+<h4 id="zerocode-17"><a class="header" href="#zerocode-17">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.stream_mode</code>.</p>
+<h4 id="zeroclaw-config-16"><a class="header" href="#zeroclaw-config-16">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.stream_mode &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-16"><a class="header" href="#variable-denvironnement-16">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__stream_mode=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>user_id</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>ID utilisateur Matrix facultatif (p. ex. <code>"@bot:matrix.org"</code>).</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-18"><a class="header" href="#tableau-de-bord-de-la-passerelle-18">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez le champ <code>channels.matrix.&lt;alias&gt;.user_id</code>.</p>
+<h4 id="zerocode-18"><a class="header" href="#zerocode-18">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.user_id</code>.</p>
+<h4 id="zeroclaw-config-17"><a class="header" href="#zeroclaw-config-17">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.user_id &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-17"><a class="header" href="#variable-denvironnement-17">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__user_id=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<p>Matrix se configure sous forme de bloc <code>[channels.matrix.&lt;alias&gt;]</code>. Définissez-le via l’une de ces interfaces :</p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-19"><a class="header" href="#tableau-de-bord-de-la-passerelle-19">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> dans le tableau de bord web.</p>
+<h4 id="zerocode-19"><a class="header" href="#zerocode-19">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, sous <strong>Channels</strong>.</p>
+</div>
+
+<h3 id="configuration-recommandée--mot-de-passe--clé-de-récupération"><a class="header" href="#configuration-recommandée--mot-de-passe--clé-de-récupération">Configuration recommandée : mot de passe + clé de récupération</a></h3>
+<p>La méthode officielle et la plus simple pour exécuter Matrix est de laisser ZeroClaw se connecter avec une nouvelle session et gérer sa propre identité d’appareil :</p>
+<ul>
+<li><strong>Omettez <code>device_id</code>.</strong> Laissez le homeserver en attribuer un à la connexion. ZeroClaw enregistre l’identifiant attribué dans <code>session.json</code> et le réutilise à chaque redémarrage, vous n’avez donc aucune valeur à rechercher, copier ou maintenir synchronisée. Épingler un <code>device_id</code> à la main est la source la plus fréquente de partage de clés défaillant.</li>
+<li><strong>Omettez <code>access_token</code>.</strong> Lorsqu’il n’est pas défini, ZeroClaw revient à la connexion par mot de passe. Une nouvelle connexion est également ce qu’utilise le chemin de récupération automatique (<a href="#8-auto-recovery-from-corrupted-local-state">§8</a>), de sorte que le bot se rétablit de lui-même d’un état local corrompu sans intervention de l’opérateur.</li>
+<li><strong>Définissez <code>password</code>.</strong> En l’absence d’<code>access_token</code>, <code>user_id</code> + <code>password</code> effectuent la connexion.</li>
+<li><strong>Définissez <code>recovery_key</code>.</strong> Cela restaure les clés de salon depuis la sauvegarde côté serveur et signe de manière croisée l’appareil fraîchement enregistré automatiquement à chaque démarrage : pas de vérification par emoji, pas de partage manuel de clés, pas de bootstrap. Consultez <a href="#i-recovery-key-recommended-for-e2ee">§5I</a> pour savoir comment l’obtenir depuis Element.</li>
+</ul>
+<p>Un bloc complet recommandé définit donc <code>homeserver</code>, <code>user_id</code>, <code>password</code> et <code>recovery_key</code>, et laisse <code>access_token</code> et <code>device_id</code> non définis.</p>
+<p>Le chemin <code>access_token</code> + <code>device_id</code> (<a href="#3-token-path-alternative-obtaining-access_token-and-device_id">§3</a>) fonctionne toujours et est documenté en détail pour les opérateurs qui doivent réutiliser un token préexistant, mais il vous oblige à maintenir vous-même un <code>device_id</code> stable, donc préférez le mot de passe + la clé de récupération sauf si vous avez une raison spécifique de ne pas le faire.</p>
+<blockquote>
+<p><strong><code>channels.matrix.&lt;alias&gt;.password</code> est un secret.</strong> Stocké chiffré, jamais en clair dans <code>config.toml</code>. Définissez-le via l’une de ces méthodes, qui chiffrent lors de l’écriture :</p>
+</blockquote>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-20"><a class="header" href="#tableau-de-bord-de-la-passerelle-20">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez-y le champ <code>channels.matrix.&lt;alias&gt;.password</code>.</p>
+<h4 id="zerocode-20"><a class="header" href="#zerocode-20">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.password</code> (la saisie est masquée).</p>
+<h4 id="zeroclaw-config-18"><a class="header" href="#zeroclaw-config-18">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.password    # demande une saisie masquée, stocke de manière chiffrée
+</code></pre>
+</div>
+
+<blockquote>
+<p><strong><code>channels.matrix.&lt;alias&gt;.access_token</code> est un secret.</strong> Stocké chiffré, jamais en clair dans <code>config.toml</code>. Définissez-le via l’une de ces méthodes, qui chiffrent à l’écriture :</p>
+</blockquote>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-21"><a class="header" href="#tableau-de-bord-de-la-passerelle-21">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez-y le champ <code>channels.matrix.&lt;alias&gt;.access_token</code>.</p>
+<h4 id="zerocode-21"><a class="header" href="#zerocode-21">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.access_token</code> (la saisie est masquée).</p>
+<h4 id="zeroclaw-config-19"><a class="header" href="#zeroclaw-config-19">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.access_token    # demande une saisie masquée, stocke de manière chiffrée
+</code></pre>
+</div>
+
+<p><code>homeserver</code> est requis. Pour la configuration recommandée, définissez également <code>user_id</code>, <code>password</code> et <code>recovery_key</code>. <code>access_token</code> et <code>device_id</code> ne sont nécessaires que pour la méthode basée sur les jetons décrite dans la <a href="#3-token-path-alternative-obtaining-access_token-and-device_id">§3</a> ; <code>allowed_rooms</code> permet éventuellement de restreindre les salons dans lesquels le bot répond. Autorisez les expéditeurs avec un <a href="#who-can-talk-to-the-agent">groupe de pairs</a>. Index complet des champs : <a href="../reference/config.html#channels">référence de configuration</a>.</p>
+<blockquote>
+<p><strong>Vous n’avez pas encore de <code>recovery_key</code> ?</strong> Consultez la <a href="#i-recovery-key-recommended-for-e2ee">§5I</a> : elle explique pas à pas comment en générer une dans Element. Vous optez plutôt pour la méthode par jeton ? Consultez la <a href="#3-token-path-alternative-obtaining-access_token-and-device_id">§3</a> pour l’appel API de connexion par mot de passe qui génère un <code>access_token</code> ainsi qu’un <code>device_id</code> stable en une seule fois. Pour retrouver le <code>device_id</code> d’un jeton que vous possédez déjà, consultez la <a href="#h-finding-device_id-for-an-existing-token">§5H</a>.</p>
+</blockquote>
+<h3 id="à-propos-de-user_id-et-device_id"><a class="header" href="#à-propos-de-user_id-et-device_id">À propos de <code>user_id</code> et <code>device_id</code></a></h3>
+<ul>
+<li>Pour la configuration recommandée avec mot de passe + clé de récupération, définissez <code>user_id</code> et laissez <code>device_id</code> non défini : le homeserver l’attribue et ZeroClaw le persiste.</li>
+<li>ZeroClaw lit l’identité depuis Matrix <code>/_matrix/client/v3/account/whoami</code>.</li>
+<li>Ce n’est que sur le chemin <code>access_token</code> que vous définissez <code>device_id</code> manuellement : une connexion par token transporte un appareil déjà créé par le serveur, et ZeroClaw a besoin de cet id exact pour la restauration de session E2EE (voir <a href="#h-finding-device_id-for-an-existing-token">§5H</a> pour le trouver).</li>
+</ul>
+<h3 id="threads-et-contexte"><a class="header" href="#threads-et-contexte">Threads et contexte</a></h3>
+<p>Lorsqu’une conversation Matrix se déroule dans un fil de discussion, ce fil constitue une conversation à part entière. ZeroClaw dérive une clé de session distincte par fil, de sorte que chaque fil dispose d’une fenêtre de contexte et d’un historique indépendants : les messages d’un fil ne débordent jamais dans un autre, et l’agent ne voit pas les tours précédents d’un fil voisin. Pour Matrix, ce comportement est contrôlé par <code>reply_in_thread</code> : lorsqu’il est activé, les messages de premier niveau ouvrent un fil et chaque fil est une conversation séparée ; lorsqu’il est désactivé, les réponses sont publiées à la racine du canal et l’historique est indexé par expéditeur et cible plutôt que par fil.</p>
+<ul>
+<li><strong>L’isolation est l’objectif.</strong> Le contexte de chaque thread est autonome : il ne fuit pas en dehors du thread, et rien de l’extérieur du thread ne s’y infiltre. Les threads parallèles conservent des états conversationnels distincts, de sorte que des tâches sans rapport ne se contaminent jamais entre elles.</li>
+<li><strong>Les threads longs font croître le contexte.</strong> Un thread accumule l’historique tant qu’il reste actif, donc un thread très long finit par remplir la fenêtre de contexte du modèle comme toute autre conversation longue. Démarrez un nouveau thread pour réinitialiser.</li>
+<li><strong>Le travail en cours est limité à chaque fil de discussion.</strong> Un nouveau message dans un fil n’annule pas une réponse en cours dans un autre ; la tâche de chaque fil est indépendante.</li>
+</ul>
+<p>Définissez le comportement du thread sur n’importe quelle surface :</p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-22"><a class="header" href="#tableau-de-bord-de-la-passerelle-22">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et activez ou désactivez le champ <code>channels.matrix.&lt;alias&gt;.reply_in_thread</code>.</p>
+<h4 id="zerocode-22"><a class="header" href="#zerocode-22">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.reply_in_thread</code>.</p>
+<h4 id="zeroclaw-config-20"><a class="header" href="#zeroclaw-config-20">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.reply_in_thread true     # réponses en fil de discussion activées
+zeroclaw config set channels.matrix.&lt;alias&gt;.reply_in_thread false    # réponses à la racine du canal
+</code></pre>
+</div>
+
+<h2 id="3-méthode-par-jeton-alternative--obtention-de-access_token-et-device_id"><a class="header" href="#3-méthode-par-jeton-alternative--obtention-de-access_token-et-device_id">3. Méthode par jeton (alternative) : obtention de <code>access_token</code> et <code>device_id</code></a></h2>
+<blockquote>
+<p>[!IMPORTANT] Cette section concerne uniquement le chemin <code>access_token</code>. Si vous avez suivi la configuration recommandée par mot de passe + clé de récupération dans la <a href="#2-configuration">§2</a>, vous pouvez l’ignorer : vous n’avez pas besoin d’un jeton d’accès ni d’un <code>device_id</code> géré manuellement.</p>
+</blockquote>
+<p>Utilisez ce chemin lorsque vous devez réutiliser un token préexistant (par exemple un token copié depuis un autre déploiement). Element n’expose pas le token directement, donc la méthode canonique pour en générer un est un appel API unique de connexion par mot de passe qui renvoie à la fois le token d’accès et un identifiant d’appareil stable. La connexion par token est associée à un appareil, donc sur ce chemin <code>device_id</code> est requis et doit rester stable.</p>
+<p>Si votre compte opérateur possède déjà un jeton, passez directement à la <a href="#4-quick-validation">§4</a>. Si vous avez seulement besoin de rechercher le <code>device_id</code> d’un jeton existant, consultez la <a href="#h-finding-device_id-for-an-existing-token">§5H</a> Option 1 (<code>whoami</code>) ou Option 2 (Element).</p>
+<h3 id="étape-1--émettre-un-jeton-via-une-connexion-par-mot-de-passe"><a class="header" href="#étape-1--émettre-un-jeton-via-une-connexion-par-mot-de-passe">Étape 1 : Émettre un jeton via une connexion par mot de passe</a></h3>
+<p>Exécutez ceci une seule fois. Remplacez <code>your.homeserver</code>, le nom d’utilisateur du bot, le mot de passe, et choisissez une courte chaîne <code>device_id</code> quelconque (alphanumérique, sans espaces ; il s’agit de l’étiquette d’appareil <em>côté serveur</em> que ZeroClaw réutilisera à chaque redémarrage) :</p>
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">curl -sS -X POST https://your.homeserver/_matrix/client/v3/login \
+  -H "Content-Type: application/json" \
+  -d '{"type":"m.login.password","identifier":{"type":"m.id.user","user":"YOUR_BOT_USERNAME"},"password":"YOUR_PASSWORD","device_id":"NEW_DEVICE_ID"}'
+</code></pre>
+</div>
+
+<p>Réponse :</p>
+<pre><code class="language-json">{"\"user_id\"": "@bot:example.com", "access_token": "syt_...", "\u00ab device_id \u00bb": "APPAREILNEW"}
+</code></pre>
+<h3 id="étape-2--appliquez-les-deux-valeurs-à-zeroclaw"><a class="header" href="#étape-2--appliquez-les-deux-valeurs-à-zeroclaw">Étape 2 : Appliquez les deux valeurs à ZeroClaw</a></h3>
+<p>Placez <code>access_token</code>, <code>device_id</code> et <code>user_id</code> de la réponse dans votre bloc <code>[channels.matrix.&lt;alias&gt;]</code> (voir <a href="#2-configuration">§2</a> pour savoir où les définir), puis redémarrez : <code>zeroclaw service restart</code>.</p>
+<h3 id="notes"><a class="header" href="#notes">Notes</a></h3>
+<ul>
+<li><strong>Conservez une copie du jeton</strong> lorsque vous le collez pour la première fois. Les secrets sont chiffrés au repos et <code>zeroclaw config get</code> affichera <code>[masked]</code> pour le champ du jeton ; vous ne pourrez pas le récupérer ultérieurement. Mettez-le de côté dans une note temporaire si vous en avez besoin pour les extraits de validation curl dans la <a href="#c-token-and-identity">§5C</a>.</li>
+<li><strong>Réutilisez le même <code>device_id</code> à chaque redémarrage</strong> : le modifier force un nouvel enregistrement d’appareil côté serveur, ce qui rompt le partage de clés et la vérification dans les salons chiffrés. Le mécanisme de récupération automatique décrit dans la <a href="#8-auto-recovery-from-corrupted-local-state">§8</a> gère les rares cas où la suppression est réellement le bon choix.</li>
+<li><strong>Rotation ultérieure du jeton d’accès</strong> sans relancer l’assistant : mettez à jour le champ <code>access_token</code> dans votre configuration (voir <a href="#2-configuration">§2</a>), puis exécutez <code>zeroclaw service restart</code>.</li>
+<li><strong>Le jeton apparaît comme expiré ou invalide</strong> au démarrage : générez-en un nouveau avec le même curl, répétez l’étape 2.</li>
+</ul>
+<h2 id="4-validation-rapide"><a class="header" href="#4-validation-rapide">4. Validation rapide</a></h2>
+<p>Appliquez le jeu de champs défini dans la <a href="#2-configuration">§2</a> si ce n’est pas déjà fait, puis redémarrez avec <code>zeroclaw service restart</code> (arrière-plan) ou <code>zeroclaw daemon</code> (premier plan). Envoyez un message en texte brut dans le salon Matrix configuré. Vérifiez :</p>
+<ul>
+<li>Les journaux de ZeroClaw indiquent que l’écouteur Matrix a démarré sans erreurs répétées de synchronisation ou d’authentification.</li>
+<li>Dans une salle chiffrée, le bot peut lire et répondre aux messages chiffrés des utilisateurs autorisés.</li>
+</ul>
+<h2 id="5-résolution-des-problèmes-de--non-réponse-"><a class="header" href="#5-résolution-des-problèmes-de--non-réponse-">5. Résolution des problèmes de « non-réponse »</a></h2>
+<p>Exécutez dans l’ordre.</p>
+<h3 id="a-salle-et-appartenance"><a class="header" href="#a-salle-et-appartenance">A. Salle et appartenance</a></h3>
+<ul>
+<li>Confirmez que le compte du bot a rejoint la salle.</li>
+<li>Si vous ajoutez un salon dans <code>allowed_rooms</code>, il doit s’agir de l’identifiant <strong>canonique</strong> du salon (<code>!room:server</code>), et non d’un alias <code>#alias:server</code>. Les alias ne sont pas résolus pour la liste d’autorisation, donc une entrée sous forme d’alias ne correspond silencieusement à rien. Trouvez l’identifiant canonique dans Element via Paramètres du salon → Avancé → Identifiant interne du salon.</li>
+</ul>
+<h3 id="b-liste-dautorisation-des-expéditeurs-groupes-de-pairs"><a class="header" href="#b-liste-dautorisation-des-expéditeurs-groupes-de-pairs">B. Liste d’autorisation des expéditeurs (groupes de pairs)</a></h3>
+<p>L’expéditeur doit faire partie de l’ensemble des pairs de l’agent, voir <a href="#who-can-talk-to-the-agent">Qui peut communiquer avec l’agent</a> en haut de cette page. Pour le diagnostic, définissez temporairement <code>external_peers = ["*"]</code> et redémarrez le démon.</p>
+<h3 id="c-jetons-et-identité"><a class="header" href="#c-jetons-et-identité">C. Jetons et identité</a></h3>
+<p>Les secrets sont chiffrés au repos et ne sont pas récupérables : <code>zeroclaw config get</code> affiche <code>[masked]</code> pour tout champ secret. Pour exécuter les vérifications ci-dessous, utilisez le jeton d’accès que vous avez généré dans la <a href="#3-token-path-alternative-obtaining-access_token-and-device_id">§3</a> (ou générez-en un nouveau) ainsi que l’URL de votre propre serveur d’accueil (homeserver).</p>
+<p>Validez le jeton côté serveur :</p>
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
+<pre><code class="language-sh">curl -sS -H "Authorization: Bearer &lt;access_token&gt;" \
+  "https://your.homeserver/_matrix/client/v3/account/whoami"
+</code></pre>
+</div>
+
+<ul>
+<li>Le <code>user_id</code> retourné doit correspondre au compte du bot.</li>
+<li>Si <code>device_id</code> est absent de la réponse, définissez-le manuellement (voir <a href="#h-finding-device_id-for-an-existing-token">§5H</a>).</li>
+<li>Effectuez la rotation du jeton d’accès : mettez à jour le champ <code>access_token</code> dans votre configuration (voir <a href="#2-configuration">§2</a>), puis exécutez <code>zeroclaw service restart</code>.</li>
+</ul>
+<h3 id="d-vérifications-spécifiques-à-le2ee"><a class="header" href="#d-vérifications-spécifiques-à-le2ee">D. Vérifications spécifiques à l’E2EE</a></h3>
+<ul>
+<li>Le dispositif du bot doit avoir reçu les clés de salle depuis des dispositifs de confiance.</li>
+<li>Si les clés n’ont pas été partagées avec cet appareil, les événements chiffrés ne peuvent pas être déchiffrés.</li>
+<li>Vérifiez la confiance de l’appareil et le partage de clés à partir d’une session Matrix de confiance.</li>
+<li><code>matrix_sdk_crypto::backups: Trying to backup room keys but no backup key was found</code> : la récupération de la sauvegarde des clés n’est pas encore activée sur cet appareil. Non bloquant pour le flux de messages ; il reste néanmoins recommandé de la finaliser (voir <a href="#i-recovery-key-recommended-for-e2ee">§5I</a>).</li>
+<li>Si les destinataires voient les messages du bot comme « non vérifiés », vérifiez/signez l’appareil du bot depuis une session Matrix de confiance et gardez le <code>device_id</code> stable entre les redémarrages.</li>
+</ul>
+<h3 id="n-niveaux-de-journal"><a class="header" href="#n-niveaux-de-journal">N. Niveaux de journal</a></h3>
+<p>ZeroClaw réduit <code>matrix_sdk</code>, <code>matrix_sdk_base</code> et <code>matrix_sdk_crypto</code> au niveau <code>warn</code> par défaut ; ils sont trop verbeux au niveau <code>info</code>. Pour restaurer la sortie du SDK à des fins de débogage :</p>
+<div class="os-tabs-src">
+<h4 id="sh-2"><a class="header" href="#sh-2">sh</a></h4>
+<pre><code class="language-sh">RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info,matrix_sdk_crypto=info zeroclaw daemon
+</code></pre>
+</div>
+
+<h3 id="f-formatage-des-messages-markdown"><a class="header" href="#f-formatage-des-messages-markdown">F. Formatage des messages (Markdown)</a></h3>
+<ul>
+<li>ZeroClaw envoie les réponses Matrix sous forme de contenu texte <code>m.room.message</code> capable de gérer le markdown.</li>
+<li>Les clients Matrix qui prennent en charge <code>formatted_body</code> affichent les mises en forme, les listes et les blocs de code.</li>
+<li>Si le formatage apparaît en texte brut : vérifiez d’abord la capacité du client, puis confirmez que ZeroClaw exécute une version avec la sortie Matrix activée pour le markdown.</li>
+</ul>
+<h3 id="g-test-de-début-frais"><a class="header" href="#g-test-de-début-frais">G. Test de début frais</a></h3>
+<p>Après avoir modifié la configuration, redémarrez le daemon et envoyez un nouveau message. L’historique de l’ancienne timeline ne sera pas rejoué.</p>
+<h3 id="h-recherche-du-device_id-pour-un-jeton-existant"><a class="header" href="#h-recherche-du-device_id-pour-un-jeton-existant">H. Recherche du <code>device_id</code> pour un jeton existant</a></h3>
+<p>Vous n’avez besoin de ceci que sur le chemin <code>access_token</code> (<a href="#3-token-path-alternative-obtaining-access_token-and-device_id">§3</a>). La configuration recommandée par mot de passe + clé de récupération omet entièrement <code>device_id</code> : le homeserver en attribue un et ZeroClaw le persiste, il n’y a donc rien à rechercher. Si vous êtes passé à la configuration recommandée, ignorez cette section.</p>
+<p>Si vous devez vraiment fixer un <code>device_id</code> (parce que vous réutilisez un jeton d’accès existant plutôt que de vous connecter avec un mot de passe), utilisez ceci pour trouver celui lié à ce jeton. Pour les bots tout nouveaux sur la voie du jeton, consultez <a href="#3-token-path-alternative-obtaining-access_token-and-device_id">§3</a> : le flux de connexion par mot de passe qui s’y trouve renvoie les deux valeurs ensemble.</p>
+<p>ZeroClaw a besoin d’un <code>device_id</code> stable pour la restauration de session E2EE sur le chemin du jeton. Sans cela, un nouvel appareil est enregistré à chaque redémarrage, ce qui rompt le partage de clés et la vérification des appareils.</p>
+<h4 id="option-1--whoami-la-plus-simple"><a class="header" href="#option-1--whoami-la-plus-simple">Option 1 : <code>whoami</code> (la plus simple)</a></h4>
+<div class="os-tabs-src">
+<h4 id="sh-3"><a class="header" href="#sh-3">sh</a></h4>
+<pre><code class="language-sh">curl -sS -H "Authorization: Bearer &lt;access_token&gt;" \
+  "https://your.homeserver/_matrix/client/v3/account/whoami"
+</code></pre>
+</div>
+
+<p>Inclut <code>device_id</code> si le token est lié à une session d’appareil :</p>
+<pre><code class="language-json">{"\"user_id\"": "@bot:example.com", "\u00ab device_id \u00bb": "ABCDEF1234"}
+</code></pre>
+<p>Si <code>device_id</code> est absent, le jeton a été créé sans connexion d’appareil (par ex. via l’API d’administration). Générez un nouveau jeton + device_id ensemble via <a href="#3-token-path-alternative-obtaining-access_token-and-device_id">§3</a>.</p>
+<h4 id="option-2--depuis-element-ou-un-autre-client-matrix"><a class="header" href="#option-2--depuis-element-ou-un-autre-client-matrix">Option 2 : Depuis Element ou un autre client Matrix</a></h4>
+<ol>
+<li>Connectez-vous en tant que compte bot dans Element.</li>
+<li>Paramètres → Sessions.</li>
+<li>Copiez l’ID de l’appareil pour la session active.</li>
+<li>Définissez <code>device_id</code> dans votre configuration (voir <a href="#2-configuration">§2</a>), puis exécutez <code>zeroclaw service restart</code>. Gardez <code>device_id</code> stable : le modifier force un nouvel enregistrement de l’appareil, ce qui rompt le partage de clés et la vérification existants.</li>
+</ol>
+<h3 id="h-suite-récupération-de-la-suppression-du-magasin-de-clés"><a class="header" href="#h-suite-récupération-de-la-suppression-du-magasin-de-clés">H (suite). Récupération de la suppression du magasin de clés</a></h3>
+<p><strong>Symptôme :</strong> <code>Conflit détecté lors du téléchargement de la clé à usage unique de Matrix ; synchronisation arrêtée pour éviter une boucle de retry infinie</code> et le canal devient indisponible.</p>
+<p><strong>Cause:</strong> Le magasin de cryptage local a été supprimé alors que l’ancien appareil avait encore des clés à usage unique enregistrées sur le homeserver. Le SDK ne peut pas télécharger de nouvelles clés car les anciennes clés existent toujours côté serveur, ce qui provoque une boucle infinie de conflits de clés à usage unique (OTK).</p>
+<h4 id="correction--nouvelle-connexion"><a class="header" href="#correction--nouvelle-connexion">Correction : nouvelle connexion</a></h4>
+<p>Une nouvelle connexion crée un nouvel appareil avec un <code>device_id</code> distinct, contournant ainsi entièrement le conflit OTK (aucune suppression d’appareil conditionnée par l’UIA n’est nécessaire).</p>
+<ol>
+<li>
+<p><strong>Arrêter ZeroClaw.</strong></p>
+<div class="os-tabs-src">
+<h4 id="sh-4"><a class="header" href="#sh-4">sh</a></h4>
+<pre><code class="language-sh">zeroclaw service stop
+</code></pre>
+</div>
+
+</li>
+<li>
+<p>Obtenez un nouveau jeton d’accès et <code>device_id</code> :</p>
+<div class="os-tabs-src">
+<h4 id="sh-5"><a class="header" href="#sh-5">sh</a></h4>
+<pre><code class="language-sh">curl -sS -X POST "https://matrix.org/_matrix/client/v3/login" \
+  -H "Content-Type: application/json" \
+  -d '{"type":"m.login.password","identifier":{"type":"m.id.user","user":"YOUR_BOT_USERNAME"},"password":"YOUR_PASSWORD","device_id":"NEW_DEVICE_ID"}'
+</code></pre>
+</div>
+
+<p>Enregistrez le <code>access_token</code> et le <code>device_id</code> retournés.</p>
+</li>
+<li>
+<p>Supprimer le stockage local de crypto :</p>
+<div class="os-tabs-src">
+<h4 id="sh-6"><a class="header" href="#sh-6">sh</a></h4>
+<pre><code class="language-sh">rm -rf ~/.zeroclaw/state/matrix/
+</code></pre>
+</div>
+
+</li>
+<li>
+<p>Appliquez les nouveaux identifiants : définissez <code>access_token</code> (secret, voir <a href="#2-configuration">§2</a>) et <code>device_id</code> dans votre configuration.</p>
+</li>
+<li>
+<p>Redémarrer :</p>
+<div class="os-tabs-src">
+<h4 id="sh-7"><a class="header" href="#sh-7">sh</a></h4>
+<pre><code class="language-sh">zeroclaw service start
+</code></pre>
+</div>
+
+</li>
+</ol>
+<h4 id="à-quoi-sattendre-lors-du-premier-redémarrage"><a class="header" href="#à-quoi-sattendre-lors-du-premier-redémarrage">À quoi s’attendre lors du premier redémarrage</a></h4>
+<ul>
+<li><code>Our own device might have been deleted</code> : sans gravité ; l’ancien appareil a disparu.</li>
+<li><code>Failed to decrypt a room event</code> : anciens messages antérieurs à la réinitialisation ; irrécupérables.</li>
+<li><code>Matrix E2EE recovery successful</code> : clés de salon restaurées depuis la sauvegarde du serveur (uniquement si <code>recovery_key</code> est définie ; voir <a href="#i-recovery-key-recommended-for-e2ee">§5I</a>).</li>
+<li>Les nouveaux messages se déchiffrent et fonctionnent normalement.</li>
+</ul>
+<p><strong>Prévention :</strong> Ne supprimez pas le répertoire d’état local sans préparer une nouvelle connexion. Si vous avez besoin de repartir de zéro, obtenez de nouvelles identifiants, puis supprimez le dépôt, et enfin mettez à jour la configuration.</p>
+<h3 id="i-clé-de-récupération-recommandée-pour-le-chiffrement-de-bout-en-bout"><a class="header" href="#i-clé-de-récupération-recommandée-pour-le-chiffrement-de-bout-en-bout">I. Clé de récupération (recommandée pour le chiffrement de bout en bout)</a></h3>
+<p>Une clé de récupération permet à ZeroClaw de restaurer automatiquement les clés de salon et les secrets de signature croisée à partir de la sauvegarde côté serveur. Les réinitialisations d’appareil, les suppressions du magasin de chiffrement et les nouvelles installations sont toutes récupérées automatiquement : pas de vérification par émojis, pas de partage manuel de clés.</p>
+<h4 id="étape-1--obtenez-votre-clé-de-récupération-depuis-element"><a class="header" href="#étape-1--obtenez-votre-clé-de-récupération-depuis-element">Étape 1 : Obtenez votre clé de récupération depuis Element</a></h4>
+<ol>
+<li>Connectez-vous au compte du bot dans Element (web ou bureau).</li>
+<li>Paramètres → Sécurité et confidentialité → Chiffrement → Sauvegarde sécurisée.</li>
+<li>Si la sauvegarde est déjà configurée, votre clé de récupération a été affichée lors de la première activation. Si vous l’avez sauvegardée, utilisez-la.</li>
+<li>Si la sauvegarde n’est pas configurée, cliquez sur « Set up Secure Backup » → « Generate a Security Key ». Element affiche la clé (elle ressemble à <code>EsTj 3yST y93F SLpB ...</code>) ; copiez-la dans un endroit sûr.</li>
+<li>Continuez après l’affichage de la clé : Element vous demande ensuite de <strong>ressaisir la clé</strong> dans une boîte de confirmation pour prouver que vous l’avez enregistrée. Collez-la et continuez pour terminer la configuration. Il s’agit de la même valeur que celle que vous avez mise dans <code>recovery_key</code>.</li>
+<li>(Facultatif) Déconnectez la session Element du bot une fois la clé enregistrée : cliquez sur le menu du compte → <strong>All settings</strong> → Account, puis <strong>Remove this device</strong>. Laisser la session connectée ne pose pas de problème ; la supprimer permet simplement de garder la liste des appareils ordonnée.</li>
+</ol>
+<h4 id="étape-2--ajouter-la-clé-de-récupération-à-zeroclaw"><a class="header" href="#étape-2--ajouter-la-clé-de-récupération-à-zeroclaw">Étape 2 : Ajouter la clé de récupération à ZeroClaw</a></h4>
+<p>Appliquez la clé de récupération à ZeroClaw :</p>
+<blockquote>
+<p><strong><code>channels.matrix.&lt;alias&gt;.recovery_key</code> est un secret.</strong> Stocké chiffré, jamais en clair dans <code>config.toml</code>. Définissez-le via l’une de ces méthodes, qui chiffrent à l’écriture :</p>
+</blockquote>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-23"><a class="header" href="#tableau-de-bord-de-la-passerelle-23">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez-y le champ <code>channels.matrix.&lt;alias&gt;.recovery_key</code>.</p>
+<h4 id="zerocode-23"><a class="header" href="#zerocode-23">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.recovery_key</code> (la saisie est masquée).</p>
+<h4 id="zeroclaw-config-21"><a class="header" href="#zeroclaw-config-21">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.recovery_key    # demande une saisie masquée, stocke de manière chiffrée
+</code></pre>
+</div>
+
+<p>Ensuite, <code>zeroclaw service restart</code>. La clé de récupération est immédiatement chiffrée au repos.</p>
+<h4 id="étape-3--redémarrer"><a class="header" href="#étape-3--redémarrer">Étape 3 : Redémarrer</a></h4>
+<div class="os-tabs-src">
+<h4 id="sh-8"><a class="header" href="#sh-8">sh</a></h4>
+<pre><code class="language-sh">zeroclaw service restart
+</code></pre>
+</div>
+
+<p>Au démarrage, vous devriez voir :</p>
+<pre><code>Matrix E2EE recovery successful — room keys and cross-signing secrets restored from server backup.
+</code></pre>
+<p>Désormais, même si le magasin de clés local est supprimé, ZeroClaw se rétablit automatiquement au prochain démarrage.</p>
+<h2 id="6-journalisation-de-débogage"><a class="header" href="#6-journalisation-de-débogage">6. Journalisation de débogage</a></h2>
+<p>Diagnostics spécifiques au canal de la matrice :</p>
+<div class="os-tabs-src">
+<h4 id="sh-9"><a class="header" href="#sh-9">sh</a></h4>
+<pre><code class="language-sh">RUST_LOG=zeroclaw::channels::matrix=debug zeroclaw daemon
+</code></pre>
+</div>
+
+<p>Surfaces :</p>
+<ul>
+<li>Confirmation de la restauration de la session</li>
+<li>Chaque achèvement de cycle de synchronisation</li>
+<li>état du commutateur de conflit OTK</li>
+<li>Résultats de la vérification de l’état du service</li>
+<li>Classification des erreurs de synchronisation transitoires versus mortelles</li>
+</ul>
+<p>Pour plus de détails au niveau du SDK :</p>
+<div class="os-tabs-src">
+<h4 id="sh-10"><a class="header" href="#sh-10">sh</a></h4>
+<pre><code class="language-sh">RUST_LOG=zeroclaw::channels::matrix=debug,matrix_sdk_crypto=debug zeroclaw daemon
+</code></pre>
+</div>
+
+<h2 id="7-notes-opérationnelles"><a class="header" href="#7-notes-opérationnelles">7. Notes opérationnelles</a></h2>
+<ul>
+<li>Conservez les jetons Matrix hors des journaux et des captures d’écran.</li>
+<li>Commencez avec une configuration permissive <code>external_peers = ["*"]</code>, puis restreignez à des identifiants utilisateur explicites une fois la vérification effectuée.</li>
+<li>Utilisez toujours les ID de salle canoniques dans <code>allowed_rooms</code> : les alias ne sont pas résolus pour la liste d’autorisation entrante (ils sont résolus uniquement pour <code>delivery.to</code> en sortie).</li>
+<li><strong>Threading :</strong> lorsque <code>channels.matrix.reply_in_thread</code> est à <code>true</code> (valeur par défaut), chaque réponse du bot s’inscrit dans un fil de discussion rattaché au message de l’utilisateur. Les messages utilisateur de premier niveau ouvrent un nouveau fil ; les fils existants sont poursuivis. La chronologie principale du salon ne contient que les messages initiés par l’utilisateur.</li>
+<li><strong>Contexte de racine de fil de discussion :</strong> le premier message entrant que ZeroClaw voit dans un fil donné est préfixé par <code>[Thread root from @sender]: &lt;root body&gt;</code> afin que l’agent dispose de la conversation qui a déclenché la réponse. Les fils démarrés par le bot lui-même omettent le préambule. Le suivi est effectué uniquement en mémoire ; après un redémarrage du démon, le message suivant dans chaque fil actif réinjecte le préambule exactement une fois.</li>
+<li><strong>Médias en réponse en ligne :</strong> <code>channels.matrix.mention_only = true</code> fait que le bot ignore les envois de médias seuls (pas de corps de texte permettant une mention). Lorsque l’utilisateur répond en ligne à un tel événement ignoré avec une question (<code>@bot can you see this?</code>), ZeroClaw parcourt le <code>m.relates_to.m.in_reply_to.event_id</code> de la réponse, récupère l’événement parent et intègre ses médias dans le message courant : le pipeline de vision de l’agent voit l’image même si l’envoi original avait été filtré.</li>
+<li><strong>Les pièces jointes suivent le fil de discussion :</strong> les appels <code>room.send_attachment</code> transmettent un <code>AttachmentConfig::reply(...)</code> avec <code>EnforceThread::Threaded</code> lorsqu’une ancre de fil est présente, de sorte que les PDF / images / notes vocales s’affichent dans le fil du bot plutôt que dans le fil de discussion principal.</li>
+<li><strong>Marqueurs de médias sortants :</strong> l’agent émet <code>[image:url|path]</code>, <code>[file:url|path]</code>, <code>[voice:url|path]</code>, <code>[video:...]</code>, <code>[audio:...]</code> (ainsi que les alias en majuscules / <code>[document:...]</code>) dans le texte de sa réponse ; ZeroClaw récupère les octets (HTTP pour <code>http(s)://</code>, lecture locale sinon) et les téléverse en tant qu’événement de message Matrix approprié. <strong>Les cibles manquantes ou illisibles ne sont pas fatales :</strong> le canal enregistre un avertissement, supprime uniquement ce marqueur et ajoute une ligne <code>(note: I couldn't deliver the file at &lt;path&gt;.)</code> afin que l’opérateur voie ce qui a été tenté au lieu d’une réponse silencieusement supprimée.</li>
+<li><strong>Messages vocaux</strong> (MSC3245) : les événements <code>m.audio</code> entrants portant le champ <code>org.matrix.msc3245.voice</code> sont enregistrés dans <code>{workspace_dir}/matrix_files/</code> et traités par le fournisseur de transcription configuré de l’agent, afin que l’agent reçoive à la fois le texte de la transcription et le chemin source. Les notes vocales sortantes utilisent le marqueur <code>[voice:&lt;url|path&gt;]</code> ; ZeroClaw les téléverse en tant que <code>m.audio</code> avec l’indicateur vocal + une forme d’onde à zéro, afin qu’Element affiche la bulle comme une note vocale. Consultez <a href="../providers/overview.html">Model Providers</a> pour la configuration du fournisseur de transcription.</li>
+<li><strong>Réactions d’accusé de réception :</strong> contrôlées par <code>channels.matrix.ack_reactions</code> (par défaut <code>true</code>). Lorsqu’elle est activée, le bot réagit avec 👀 pendant le traitement et ✅ une fois terminé. Définissez la valeur sur <code>false</code> pour garder les salons sans réactions.</li>
+<li><strong>Sessions persistantes :</strong> lors de la première connexion réussie, ZeroClaw écrit <code>~/.zeroclaw/state/matrix/session.json</code> (user_id + device_id + access_token + refresh_token optionnel). Les redémarrages suivants appellent <code>restore_session()</code> à partir de ce blob : pas de nouvelle connexion. Le magasin cryptographique SQLite de matrix-rust-sdk se trouve à côté, dans <code>~/.zeroclaw/state/matrix/store/</code>. <strong>Une fois que <code>session.json</code> existe, la rotation de <code>access_token</code> dans la configuration n’a aucun effet tant que le fichier n’est pas supprimé</strong> : le jeton enregistré a la priorité. Supprimez <code>session.json</code> pour forcer une nouvelle connexion à partir des valeurs de configuration.</li>
+<li><strong>Signature croisée :</strong> lorsque <code>recovery_key</code> correspond à ce qui est scellé dans le stockage secret côté serveur de votre compte, ZeroClaw exécute <code>recovery().recover(key)</code> à chaque démarrage, le SDK importe vos clés existantes master / self-signing / user-signing, et l’appareil nouvellement enregistré est automatiquement signé. <strong>Pas de bootstrap, pas d’UIA, pas de rotation de clés.</strong> Si votre compte n’a pas encore de signature croisée configurée, générez la clé de récupération dans Element (Settings → Security &amp; Privacy → Secure Backup) avant de configurer <code>recovery_key</code>.</li>
+<li><strong>Livraison Cron :</strong> <code>delivery.to</code> doit être un identifiant de salon simple (<code>!abc:server</code>) ou un alias (<code>#room:server</code>). Les anciennes configurations qui écrivaient <code>&lt;sender&gt;||&lt;room&gt;</code> sont tolérées : ZeroClaw extrait le dernier segment préfixé par <code>!</code>/<code>#</code> et émet un avertissement concernant la valeur mal formée.</li>
+</ul>
+<h3 id="diffusion-en-continu"><a class="header" href="#diffusion-en-continu">Diffusion en continu</a></h3>
+<p>Matrix diffuse les réponses en continu via le paramètre <code>stream_mode</code> :</p>
+<ul>
+<li><strong><code>off</code></strong> (par défaut) : la réponse entière est publiée en un seul message une fois que l’agent a terminé. C’est l’option la plus simple, et elle n’affiche jamais de réponse partiellement rédigée.</li>
+<li><strong><code>partial</code></strong> : le bot publie immédiatement un brouillon et le modifie sur place au fur et à mesure que la réponse arrive en streaming. <code>draft_update_interval_ms</code> régule le rythme des modifications ; augmentez-le si Matrix les limite par rate-limiting.</li>
+<li><strong><code>multi_message</code></strong> : chaque paragraphe est publié comme un message distinct, séparé par <code>multi_message_delay_ms</code>. Idéal pour les réponses longues qui formeraient sinon un seul bloc de texte.</li>
+</ul>
+<p>Posez-le sur n’importe quelle surface :</p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-24"><a class="header" href="#tableau-de-bord-de-la-passerelle-24">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> et définissez le champ <code>channels.matrix.&lt;alias&gt;.stream_mode</code>.</p>
+<h4 id="zerocode-24"><a class="header" href="#zerocode-24">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>channels.matrix.&lt;alias&gt;.stream_mode</code>.</p>
+<h4 id="zeroclaw-config-22"><a class="header" href="#zeroclaw-config-22">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.stream_mode &lt;value&gt;
+</code></pre>
+</div>
+
+<p>Spécificités de Matrix : en mode <code>partial</code>, le statut d’exécution des outils est affiché via le même pipeline d’édition. En mode <code>multi_message</code>, chaque paragraphe est publié comme un message distinct dans le fil de discussion, et la séparation tient compte des blocs de code délimités, de sorte que les lignes vides à l’intérieur des blocs délimités ne fragmentent pas un bloc de code entre plusieurs messages.</p>
+<h2 id="8-récupération-automatique-après-corruption-de-létat-local"><a class="header" href="#8-récupération-automatique-après-corruption-de-létat-local">8. Récupération automatique après corruption de l’état local</a></h2>
+<p>Le store SQLite par défaut de matrix-rust-sdk est mono-appareil et suppose que la vue locale reste synchronisée avec le homeserver. Deux modes de défaillance brisent cette hypothèse de manière irrécupérable ; ZeroClaw détecte chacun d’eux au démarrage et (lorsque <code>password</code> + <code>user_id</code> sont tous deux configurés) efface automatiquement <code>~/.zeroclaw/state/matrix/</code> et se ré-authentifie afin qu’un nouvel appareil soit créé côté serveur.</p>
+<ul>
+<li><strong>État de chiffrement orphelin.</strong> Un répertoire <code>store/</code> existe mais pas <code>session.json</code> (nettoyage manuel, installation antérieure interrompue, etc.). Une nouvelle connexion par-dessus un état de chiffrement orphelin reproduit les conflits <code>Duplicate one-time keys</code> / <code>SigningKeyChanged</code> qui ne se résolvent pas d’eux-mêmes.</li>
+<li><strong>Indicateur <code>StateStoreDataKey::OneTimeKeyAlreadyUploaded</code> défini.</strong> Le SDK persiste cette clé dans le magasin d’état la première fois qu’il détecte un téléversement OTK en double (selon le commentaire du SDK lui-même : « we forgot about some of our one-time keys. This will lead to UTDs. »). Elle survit aux redémarrages ; la seule solution est d’effacer et de réenregistrer.</li>
+</ul>
+<p><strong>Le décalage de <code>device_id</code> est détecté mais toléré, sans réinitialisation.</strong> Si <code>channels.matrix.device_id</code> diffère de l’identifiant d’appareil stocké dans <code>session.json</code>, le canal consigne un avertissement et utilise l’identifiant sauvegardé (qui correspond à la valeur réellement attribuée par le serveur d’accueil lors de la connexion). Réinitialiser en cas de décalage créerait une boucle de récupération, car la récupération automatique génère elle-même un nouvel identifiant, laissant la configuration et la session définitivement désynchronisées.</p>
+<p>Lorsque <strong><code>recover()</code> échoue lui-même</strong> (typiquement <code>MAC check for the secret storage key failed</code>), le canal journalise l’id de la clé de stockage de secrets par défaut du homeserver, si l’événement de clé contient des informations de phrase secrète, la longueur de l’entrée après suppression des espaces, et la chaîne d’erreur complète : ces éléments indiquent <em>quelle</em> couche a rejeté la clé de récupération sans divulguer sa valeur. Les échecs de récupération sont <strong>non fatals</strong> (ils ne déclenchent pas d’effacement automatique) ; le bot continue, le nouvel appareil ne sera simplement pas cross-signé.</p>
+<p>Si <code>password</code> + <code>user_id</code> ne sont pas configurés, la récupération automatique ne peut pas s’exécuter : le canal s’interrompt avec une erreur exploitable indiquant les deux choix possibles : les configurer, ou exécuter manuellement <code>rm -rf ~/.zeroclaw/state/matrix/</code>.</p>
+<h2 id="voir-aussi"><a class="header" href="#voir-aussi">Voir aussi</a></h2>
+<ul>
+<li>-<a href="../ops/network-deployment.html">Déploiement réseau</a></li>
+<li><a href="../reference/config.html">Référence de configuration</a> : générée à partir du schéma en vigueur</li>
+<li><a href="./overview.html">Vue d’ensemble des canaux</a></li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../channels/peer-groups.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../channels/discord.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../channels/peer-groups.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../channels/discord.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

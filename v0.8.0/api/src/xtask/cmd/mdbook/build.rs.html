@@ -1,0 +1,250 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `xtask/src/cmd/mdbook/build.rs`."><title>build.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../../static.files/rustdoc-17e0aaed.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../../../" data-static-root-path="../../../../static.files/" data-current-crate="xtask" data-themes="" data-resource-suffix="" data-rustdoc-version="1.96.0 (ac68faa20 2026-05-25)" data-channel="1.96.0" data-search-js="search-b5634cc7.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../../static.files/storage-41dd4d93.js"></script><script defer src="../../../../static.files/src-script-813739b1.js"></script><script defer src="../../../../src-files.js"></script><script defer src="../../../../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">xtask/cmd/mdbook/</div>build.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="kw">use </span><span class="kw">crate</span>::cmd::mdbook::refs::{build_api, build_refs};
+<a href=#2 id=2 data-nosnippet>2</a><span class="kw">use </span><span class="kw">crate</span>::util::<span class="kw-2">*</span>;
+<a href=#3 id=3 data-nosnippet>3</a><span class="kw">use </span>std::path::Path;
+<a href=#4 id=4 data-nosnippet>4</a><span class="kw">use </span>std::process::Command;
+<a href=#5 id=5 data-nosnippet>5</a>
+<a href=#6 id=6 data-nosnippet>6</a><span class="kw">const </span>DEFAULT_TAG: <span class="kw-2">&amp;</span>str = <span class="string">"master"</span>;
+<a href=#7 id=7 data-nosnippet>7</a>
+<a href=#8 id=8 data-nosnippet>8</a><span class="kw">pub fn </span>run(tag: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt;) -&gt; anyhow::Result&lt;()&gt; {
+<a href=#9 id=9 data-nosnippet>9</a>    <span class="kw">let </span>root = repo_root();
+<a href=#10 id=10 data-nosnippet>10</a>    require_tool(<span class="string">"cargo"</span>, <span class="string">"https://rustup.rs"</span>)<span class="question-mark">?</span>;
+<a href=#11 id=11 data-nosnippet>11</a>    ensure_cargo_tool(<span class="string">"mdbook"</span>, <span class="string">"mdbook"</span>)<span class="question-mark">?</span>;
+<a href=#12 id=12 data-nosnippet>12</a>    ensure_cargo_tool(<span class="string">"mdbook-xgettext"</span>, <span class="string">"mdbook-i18n-helpers"</span>)<span class="question-mark">?</span>;
+<a href=#13 id=13 data-nosnippet>13</a>    ensure_cargo_tool(<span class="string">"mdbook-gettext"</span>, <span class="string">"mdbook-i18n-helpers"</span>)<span class="question-mark">?</span>;
+<a href=#14 id=14 data-nosnippet>14</a>    ensure_cargo_tool(<span class="string">"mdbook-mermaid"</span>, <span class="string">"mdbook-mermaid"</span>)<span class="question-mark">?</span>;
+<a href=#15 id=15 data-nosnippet>15</a>
+<a href=#16 id=16 data-nosnippet>16</a>    build_refs(<span class="kw-2">&amp;</span>root)<span class="question-mark">?</span>;
+<a href=#17 id=17 data-nosnippet>17</a>    build_api(<span class="kw-2">&amp;</span>root)<span class="question-mark">?</span>;
+<a href=#18 id=18 data-nosnippet>18</a>    build_locales(<span class="kw-2">&amp;</span>root, tag)<span class="question-mark">?</span>;
+<a href=#19 id=19 data-nosnippet>19</a>    <span class="kw">crate</span>::cmd::mdbook::linkcheck::check_internal_links(<span class="kw-2">&amp;</span>root, tag.unwrap_or(DEFAULT_TAG))<span class="question-mark">?</span>;
+<a href=#20 id=20 data-nosnippet>20</a>    assemble(<span class="kw-2">&amp;</span>root, tag)<span class="question-mark">?</span>;
+<a href=#21 id=21 data-nosnippet>21</a>    <span class="macro">println!</span>(
+<a href=#22 id=22 data-nosnippet>22</a>        <span class="string">"==&gt; Done. Open: {}"</span>,
+<a href=#23 id=23 data-nosnippet>23</a>        book_dir(<span class="kw-2">&amp;</span>root)
+<a href=#24 id=24 data-nosnippet>24</a>            .join(<span class="string">"book"</span>)
+<a href=#25 id=25 data-nosnippet>25</a>            .join(tag.unwrap_or(DEFAULT_TAG))
+<a href=#26 id=26 data-nosnippet>26</a>            .join(<span class="string">"index.html"</span>)
+<a href=#27 id=27 data-nosnippet>27</a>            .display()
+<a href=#28 id=28 data-nosnippet>28</a>    );
+<a href=#29 id=29 data-nosnippet>29</a>    <span class="prelude-val">Ok</span>(())
+<a href=#30 id=30 data-nosnippet>30</a>}
+<a href=#31 id=31 data-nosnippet>31</a>
+<a href=#32 id=32 data-nosnippet>32</a><span class="kw">pub fn </span>build_locales(root: <span class="kw-2">&amp;</span>std::path::Path, tag: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt;) -&gt; anyhow::Result&lt;()&gt; {
+<a href=#33 id=33 data-nosnippet>33</a>    <span class="kw">let </span>book = book_dir(root);
+<a href=#34 id=34 data-nosnippet>34</a>    <span class="kw">let </span>entries = locale_entries();
+<a href=#35 id=35 data-nosnippet>35</a>    <span class="macro">println!</span>(
+<a href=#36 id=36 data-nosnippet>36</a>        <span class="string">"==&gt; Building mdBook for locales: {}"</span>,
+<a href=#37 id=37 data-nosnippet>37</a>        entries
+<a href=#38 id=38 data-nosnippet>38</a>            .iter()
+<a href=#39 id=39 data-nosnippet>39</a>            .map(|e| e.code.as_str())
+<a href=#40 id=40 data-nosnippet>40</a>            .collect::&lt;Vec&lt;<span class="kw">_</span>&gt;&gt;()
+<a href=#41 id=41 data-nosnippet>41</a>            .join(<span class="string">" "</span>)
+<a href=#42 id=42 data-nosnippet>42</a>    );
+<a href=#43 id=43 data-nosnippet>43</a>    inject_lang_switcher_locales(<span class="kw-2">&amp;</span>book, <span class="kw-2">&amp;</span>entries)<span class="question-mark">?</span>;
+<a href=#44 id=44 data-nosnippet>44</a>    <span class="kw">crate</span>::cmd::mdbook::themes::run(root)<span class="question-mark">?</span>;
+<a href=#45 id=45 data-nosnippet>45</a>    <span class="kw">crate</span>::cmd::mdbook::keymap::run(root)<span class="question-mark">?</span>;
+<a href=#46 id=46 data-nosnippet>46</a>    <span class="kw">crate</span>::cmd::mdbook::hardware::run(root)<span class="question-mark">?</span>;
+<a href=#47 id=47 data-nosnippet>47</a>    <span class="kw">let </span>mdbook = mdbook_program()<span class="question-mark">?</span>;
+<a href=#48 id=48 data-nosnippet>48</a>    <span class="kw">let </span>preprocessor_env = peer_groups_preprocessor_env();
+<a href=#49 id=49 data-nosnippet>49</a>    <span class="kw">let </span>tag_dir = tag.unwrap_or(DEFAULT_TAG);
+<a href=#50 id=50 data-nosnippet>50</a>    <span class="kw">for </span>entry <span class="kw">in </span><span class="kw-2">&amp;</span>entries {
+<a href=#51 id=51 data-nosnippet>51</a>        <span class="kw">let </span>dest = <span class="macro">format!</span>(<span class="string">"book/{}/{}"</span>, tag_dir, entry.code);
+<a href=#52 id=52 data-nosnippet>52</a>        <span class="kw">let </span><span class="kw-2">mut </span>cmd = Command::new(<span class="kw-2">&amp;</span>mdbook);
+<a href=#53 id=53 data-nosnippet>53</a>        cmd.args([<span class="string">"build"</span>, <span class="string">"-d"</span>, <span class="kw-2">&amp;</span>dest])
+<a href=#54 id=54 data-nosnippet>54</a>            .env(<span class="string">"MDBOOK_BOOK__LANGUAGE"</span>, <span class="kw-2">&amp;</span>entry.code)
+<a href=#55 id=55 data-nosnippet>55</a>            .current_dir(<span class="kw-2">&amp;</span>book);
+<a href=#56 id=56 data-nosnippet>56</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>((key, value)) = <span class="kw-2">&amp;</span>preprocessor_env {
+<a href=#57 id=57 data-nosnippet>57</a>            cmd.env(key, value);
+<a href=#58 id=58 data-nosnippet>58</a>        }
+<a href=#59 id=59 data-nosnippet>59</a>        run_cmd(<span class="kw-2">&amp;mut </span>cmd)<span class="question-mark">?</span>;
+<a href=#60 id=60 data-nosnippet>60</a>    }
+<a href=#61 id=61 data-nosnippet>61</a>    <span class="prelude-val">Ok</span>(())
+<a href=#62 id=62 data-nosnippet>62</a>}
+<a href=#63 id=63 data-nosnippet>63</a>
+<a href=#64 id=64 data-nosnippet>64</a><span class="doccomment">/// Render `theme/lang-switcher.js.tpl` into `theme/lang-switcher.js` with the
+<a href=#65 id=65 data-nosnippet>65</a>/// `LOCALES` array filled from `locales.toml`. The `.js` output is gitignored
+<a href=#66 id=66 data-nosnippet>66</a>/// (every locale add/remove rewrites it); the `.tpl` source is the tracked
+<a href=#67 id=67 data-nosnippet>67</a>/// truth. Errors loudly when the template is missing — silently skipping
+<a href=#68 id=68 data-nosnippet>68</a>/// would let mdBook fail later with a confusing "missing additional-js"
+<a href=#69 id=69 data-nosnippet>69</a>/// message.
+<a href=#70 id=70 data-nosnippet>70</a></span><span class="kw">pub fn </span>inject_lang_switcher_locales(book: <span class="kw-2">&amp;</span>Path, entries: <span class="kw-2">&amp;</span>[LocaleEntry]) -&gt; anyhow::Result&lt;()&gt; {
+<a href=#71 id=71 data-nosnippet>71</a>    <span class="kw">let </span>tpl_path = book.join(<span class="string">"theme/lang-switcher.js.tpl"</span>);
+<a href=#72 id=72 data-nosnippet>72</a>    <span class="kw">let </span>js_path = book.join(<span class="string">"theme/lang-switcher.js"</span>);
+<a href=#73 id=73 data-nosnippet>73</a>    <span class="kw">let </span>src = std::fs::read_to_string(<span class="kw-2">&amp;</span>tpl_path).map_err(|e| {
+<a href=#74 id=74 data-nosnippet>74</a>        anyhow::Error::msg(<span class="macro">format!</span>(
+<a href=#75 id=75 data-nosnippet>75</a>            <span class="string">"lang-switcher.js.tpl missing at {}: {e}. The template is the tracked source of \
+<a href=#76 id=76 data-nosnippet>76</a>             truth for the locale switcher; do not delete it."</span>,
+<a href=#77 id=77 data-nosnippet>77</a>            tpl_path.display(),
+<a href=#78 id=78 data-nosnippet>78</a>        ))
+<a href=#79 id=79 data-nosnippet>79</a>    })<span class="question-mark">?</span>;
+<a href=#80 id=80 data-nosnippet>80</a>    <span class="kw">let </span>locale_lines: String = entries
+<a href=#81 id=81 data-nosnippet>81</a>        .iter()
+<a href=#82 id=82 data-nosnippet>82</a>        .map(|e| <span class="macro">format!</span>(<span class="string">"    {{ code: {:?}, label: {:?} }},"</span>, e.code, e.label))
+<a href=#83 id=83 data-nosnippet>83</a>        .collect::&lt;Vec&lt;<span class="kw">_</span>&gt;&gt;()
+<a href=#84 id=84 data-nosnippet>84</a>        .join(<span class="string">"\n"</span>);
+<a href=#85 id=85 data-nosnippet>85</a>    <span class="kw">let </span>new_block = <span class="macro">format!</span>(<span class="string">"const LOCALES = [\n{locale_lines}\n  ];"</span>);
+<a href=#86 id=86 data-nosnippet>86</a>
+<a href=#87 id=87 data-nosnippet>87</a>    <span class="kw">let </span>start = src
+<a href=#88 id=88 data-nosnippet>88</a>        .find(<span class="string">"const LOCALES = ["</span>)
+<a href=#89 id=89 data-nosnippet>89</a>        .ok_or_else(|| anyhow::Error::msg(<span class="string">"lang-switcher.js.tpl: LOCALES array not found"</span>))<span class="question-mark">?</span>;
+<a href=#90 id=90 data-nosnippet>90</a>    <span class="kw">let </span>end = src[start..]
+<a href=#91 id=91 data-nosnippet>91</a>        .find(<span class="string">"];"</span>)
+<a href=#92 id=92 data-nosnippet>92</a>        .ok_or_else(|| anyhow::Error::msg(<span class="string">"lang-switcher.js.tpl: LOCALES closing ]; not found"</span>))<span class="question-mark">?</span>;
+<a href=#93 id=93 data-nosnippet>93</a>    <span class="kw">let </span>updated = <span class="macro">format!</span>(<span class="string">"{}{}{}"</span>, <span class="kw-2">&amp;</span>src[..start], new_block, <span class="kw-2">&amp;</span>src[start + end + <span class="number">2</span>..]);
+<a href=#94 id=94 data-nosnippet>94</a>    std::fs::write(<span class="kw-2">&amp;</span>js_path, updated)<span class="question-mark">?</span>;
+<a href=#95 id=95 data-nosnippet>95</a>    <span class="prelude-val">Ok</span>(())
+<a href=#96 id=96 data-nosnippet>96</a>}
+<a href=#97 id=97 data-nosnippet>97</a>
+<a href=#98 id=98 data-nosnippet>98</a><span class="kw">pub fn </span>print_locales() {
+<a href=#99 id=99 data-nosnippet>99</a>    <span class="kw">let </span>codes: Vec&lt;String&gt; = locale_entries().into_iter().map(|e| e.code).collect();
+<a href=#100 id=100 data-nosnippet>100</a>    <span class="macro">println!</span>(<span class="string">"{}"</span>, codes.join(<span class="string">" "</span>));
+<a href=#101 id=101 data-nosnippet>101</a>}
+<a href=#102 id=102 data-nosnippet>102</a>
+<a href=#103 id=103 data-nosnippet>103</a><span class="kw">pub fn </span>assemble(root: <span class="kw-2">&amp;</span>std::path::Path, tag: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt;) -&gt; anyhow::Result&lt;()&gt; {
+<a href=#104 id=104 data-nosnippet>104</a>    <span class="macro">println!</span>(<span class="string">"==&gt; Assembling site (rustdoc + locale redirect)"</span>);
+<a href=#105 id=105 data-nosnippet>105</a>    <span class="kw">let </span>book = book_dir(root);
+<a href=#106 id=106 data-nosnippet>106</a>    <span class="kw">let </span>tag_dir = tag.unwrap_or(DEFAULT_TAG);
+<a href=#107 id=107 data-nosnippet>107</a>    <span class="kw">let </span>api_dest = book.join(<span class="string">"book"</span>).join(tag_dir).join(<span class="string">"api"</span>);
+<a href=#108 id=108 data-nosnippet>108</a>    <span class="kw">let _ </span>= std::fs::remove_dir_all(<span class="kw-2">&amp;</span>api_dest);
+<a href=#109 id=109 data-nosnippet>109</a>    copy_dir_all(doc_dir(root), <span class="kw-2">&amp;</span>api_dest)<span class="question-mark">?</span>;
+<a href=#110 id=110 data-nosnippet>110</a>
+<a href=#111 id=111 data-nosnippet>111</a>    <span class="kw">const </span>INDEX_HTML: <span class="kw-2">&amp;</span>str = <span class="string">"&lt;!doctype html&gt;\n&lt;meta charset=\"utf-8\"&gt;\n&lt;meta http-equiv=\"refresh\" content=\"0; url=./en/\"&gt;\n&lt;link rel=\"canonical\" href=\"./en/\"&gt;\n&lt;title&gt;ZeroClaw Docs&lt;/title&gt;\n"</span>;
+<a href=#112 id=112 data-nosnippet>112</a>    <span class="kw">let </span>out_dir = book.join(<span class="string">"book"</span>).join(tag_dir);
+<a href=#113 id=113 data-nosnippet>113</a>    std::fs::create_dir_all(<span class="kw-2">&amp;</span>out_dir)<span class="question-mark">?</span>;
+<a href=#114 id=114 data-nosnippet>114</a>    std::fs::write(out_dir.join(<span class="string">"index.html"</span>), INDEX_HTML)<span class="question-mark">?</span>;
+<a href=#115 id=115 data-nosnippet>115</a>    <span class="comment">// Write small metadata file with the version tag
+<a href=#116 id=116 data-nosnippet>116</a>    </span><span class="kw">let </span>version_meta = <span class="macro">format!</span>(<span class="string">"{}\n"</span>, tag.unwrap_or(DEFAULT_TAG));
+<a href=#117 id=117 data-nosnippet>117</a>    std::fs::write(out_dir.join(<span class="string">"_version.txt"</span>), version_meta)<span class="question-mark">?</span>;
+<a href=#118 id=118 data-nosnippet>118</a>
+<a href=#119 id=119 data-nosnippet>119</a>    <span class="kw">let </span>version_dir = out_dir;
+<a href=#120 id=120 data-nosnippet>120</a>    <span class="kw">let </span>shared_dir = book.join(<span class="string">"book"</span>).join(<span class="string">"_shared"</span>);
+<a href=#121 id=121 data-nosnippet>121</a>    extract_shared_chrome(<span class="kw-2">&amp;</span>version_dir, <span class="kw-2">&amp;</span>shared_dir)<span class="question-mark">?</span>;
+<a href=#122 id=122 data-nosnippet>122</a>    <span class="prelude-val">Ok</span>(())
+<a href=#123 id=123 data-nosnippet>123</a>}
+<a href=#124 id=124 data-nosnippet>124</a>
+<a href=#125 id=125 data-nosnippet>125</a><span class="kw">pub fn </span>extract_shared_chrome(version_dir: <span class="kw-2">&amp;</span>Path, shared_dir: <span class="kw-2">&amp;</span>Path) -&gt; anyhow::Result&lt;()&gt; {
+<a href=#126 id=126 data-nosnippet>126</a>    <span class="macro">println!</span>(<span class="string">"==&gt; Extracting shared chrome layer"</span>);
+<a href=#127 id=127 data-nosnippet>127</a>
+<a href=#128 id=128 data-nosnippet>128</a>    <span class="kw">let </span>first_locale = locale_entries()
+<a href=#129 id=129 data-nosnippet>129</a>        .into_iter()
+<a href=#130 id=130 data-nosnippet>130</a>        .next()
+<a href=#131 id=131 data-nosnippet>131</a>        .map(|e| e.code)
+<a href=#132 id=132 data-nosnippet>132</a>        .unwrap_or_else(|| <span class="string">"en"</span>.to_string());
+<a href=#133 id=133 data-nosnippet>133</a>    <span class="kw">let </span>src_dir = version_dir.join(<span class="kw-2">&amp;</span>first_locale);
+<a href=#134 id=134 data-nosnippet>134</a>    <span class="kw">if </span>!src_dir.exists() {
+<a href=#135 id=135 data-nosnippet>135</a>        <span class="kw">return </span><span class="prelude-val">Ok</span>(());
+<a href=#136 id=136 data-nosnippet>136</a>    }
+<a href=#137 id=137 data-nosnippet>137</a>
+<a href=#138 id=138 data-nosnippet>138</a>    <span class="comment">// Map each hashed chrome file (path relative to the locale dir, e.g.
+<a href=#139 id=139 data-nosnippet>139</a>    // `theme/custom-abc12345.css`) to its unhashed `_shared`-relative path
+<a href=#140 id=140 data-nosnippet>140</a>    // (e.g. `theme/custom.css`). The `../` prefix is applied per HTML file
+<a href=#141 id=141 data-nosnippet>141</a>    // below, because a page's correct depth to the version root — and thus to
+<a href=#142 id=142 data-nosnippet>142</a>    // `_shared` at the gh-pages root — depends on how deep the page sits.
+<a href=#143 id=143 data-nosnippet>143</a>    </span><span class="kw">let </span><span class="kw-2">mut </span>replacements = Vec::new();
+<a href=#144 id=144 data-nosnippet>144</a>    <span class="kw">let </span>prefixes = [
+<a href=#145 id=145 data-nosnippet>145</a>        <span class="string">"css/chrome"</span>,
+<a href=#146 id=146 data-nosnippet>146</a>        <span class="string">"theme/custom"</span>,
+<a href=#147 id=147 data-nosnippet>147</a>        <span class="string">"theme/version-selector"</span>,
+<a href=#148 id=148 data-nosnippet>148</a>        <span class="string">"theme/lang-switcher"</span>,
+<a href=#149 id=149 data-nosnippet>149</a>        <span class="string">"favicon"</span>,
+<a href=#150 id=150 data-nosnippet>150</a>        <span class="string">"theme/pc-themes"</span>,
+<a href=#151 id=151 data-nosnippet>151</a>        <span class="string">"theme/pc-enhance"</span>,
+<a href=#152 id=152 data-nosnippet>152</a>    ];
+<a href=#153 id=153 data-nosnippet>153</a>
+<a href=#154 id=154 data-nosnippet>154</a>    <span class="kw">let </span>walk_dir = |dir: <span class="kw-2">&amp;</span>Path| -&gt; Vec&lt;std::path::PathBuf&gt; {
+<a href=#155 id=155 data-nosnippet>155</a>        <span class="kw">let </span><span class="kw-2">mut </span>paths = Vec::new();
+<a href=#156 id=156 data-nosnippet>156</a>        <span class="kw">let </span><span class="kw-2">mut </span>stack = <span class="macro">vec!</span>[dir.to_path_buf()];
+<a href=#157 id=157 data-nosnippet>157</a>        <span class="kw">while let </span><span class="prelude-val">Some</span>(path) = stack.pop() {
+<a href=#158 id=158 data-nosnippet>158</a>            <span class="kw">if let </span><span class="prelude-val">Ok</span>(entries) = std::fs::read_dir(<span class="kw-2">&amp;</span>path) {
+<a href=#159 id=159 data-nosnippet>159</a>                <span class="kw">for </span>entry <span class="kw">in </span>entries.flatten() {
+<a href=#160 id=160 data-nosnippet>160</a>                    <span class="kw">if let </span><span class="prelude-val">Ok</span>(ty) = entry.file_type() {
+<a href=#161 id=161 data-nosnippet>161</a>                        <span class="kw">if </span>ty.is_dir() {
+<a href=#162 id=162 data-nosnippet>162</a>                            stack.push(entry.path());
+<a href=#163 id=163 data-nosnippet>163</a>                        } <span class="kw">else </span>{
+<a href=#164 id=164 data-nosnippet>164</a>                            paths.push(entry.path());
+<a href=#165 id=165 data-nosnippet>165</a>                        }
+<a href=#166 id=166 data-nosnippet>166</a>                    }
+<a href=#167 id=167 data-nosnippet>167</a>                }
+<a href=#168 id=168 data-nosnippet>168</a>            }
+<a href=#169 id=169 data-nosnippet>169</a>        }
+<a href=#170 id=170 data-nosnippet>170</a>        paths
+<a href=#171 id=171 data-nosnippet>171</a>    };
+<a href=#172 id=172 data-nosnippet>172</a>
+<a href=#173 id=173 data-nosnippet>173</a>    <span class="kw">for </span>file <span class="kw">in </span>walk_dir(<span class="kw-2">&amp;</span>src_dir) {
+<a href=#174 id=174 data-nosnippet>174</a>        <span class="kw">if let </span><span class="prelude-val">Ok</span>(rel) = file.strip_prefix(<span class="kw-2">&amp;</span>src_dir) {
+<a href=#175 id=175 data-nosnippet>175</a>            <span class="kw">let </span>rel_str = rel.to_string_lossy().replace(<span class="string">'\\'</span>, <span class="string">"/"</span>);
+<a href=#176 id=176 data-nosnippet>176</a>            <span class="kw">if </span>!prefixes.iter().any(|p| rel_str.starts_with(p)) {
+<a href=#177 id=177 data-nosnippet>177</a>                <span class="kw">continue</span>;
+<a href=#178 id=178 data-nosnippet>178</a>            }
+<a href=#179 id=179 data-nosnippet>179</a>            <span class="kw">let </span>file_name = file.file_name().unwrap().to_string_lossy();
+<a href=#180 id=180 data-nosnippet>180</a>            <span class="kw">if let </span><span class="prelude-val">Some</span>(pos) = file_name.rfind(<span class="string">'-'</span>)
+<a href=#181 id=181 data-nosnippet>181</a>                &amp;&amp; <span class="kw">let </span><span class="prelude-val">Some</span>(ext_pos) = file_name.rfind(<span class="string">'.'</span>)
+<a href=#182 id=182 data-nosnippet>182</a>                &amp;&amp; pos &lt; ext_pos
+<a href=#183 id=183 data-nosnippet>183</a>            {
+<a href=#184 id=184 data-nosnippet>184</a>                <span class="kw">let </span>hash = <span class="kw-2">&amp;</span>file_name[pos + <span class="number">1</span>..ext_pos];
+<a href=#185 id=185 data-nosnippet>185</a>                <span class="kw">if </span>hash.len() == <span class="number">8 </span>&amp;&amp; hash.chars().all(|c| c.is_ascii_hexdigit()) {
+<a href=#186 id=186 data-nosnippet>186</a>                    <span class="kw">let </span>unhashed_name = <span class="macro">format!</span>(<span class="string">"{}{}"</span>, <span class="kw-2">&amp;</span>file_name[..pos], <span class="kw-2">&amp;</span>file_name[ext_pos..]);
+<a href=#187 id=187 data-nosnippet>187</a>                    <span class="kw">let </span>dest_rel = rel.parent().unwrap().join(unhashed_name);
+<a href=#188 id=188 data-nosnippet>188</a>                    <span class="kw">let </span>dest = shared_dir.join(<span class="kw-2">&amp;</span>dest_rel);
+<a href=#189 id=189 data-nosnippet>189</a>                    std::fs::create_dir_all(dest.parent().unwrap())<span class="question-mark">?</span>;
+<a href=#190 id=190 data-nosnippet>190</a>                    std::fs::copy(<span class="kw-2">&amp;</span>file, <span class="kw-2">&amp;</span>dest)<span class="question-mark">?</span>;
+<a href=#191 id=191 data-nosnippet>191</a>                    <span class="kw">let </span>dest_rel_str = dest_rel.to_string_lossy().replace(<span class="string">'\\'</span>, <span class="string">"/"</span>);
+<a href=#192 id=192 data-nosnippet>192</a>                    <span class="comment">// Store (locale-relative hashed path, unhashed shared-relative path).
+<a href=#193 id=193 data-nosnippet>193</a>                    </span>replacements.push((rel_str.clone(), dest_rel_str));
+<a href=#194 id=194 data-nosnippet>194</a>                }
+<a href=#195 id=195 data-nosnippet>195</a>            }
+<a href=#196 id=196 data-nosnippet>196</a>        }
+<a href=#197 id=197 data-nosnippet>197</a>    }
+<a href=#198 id=198 data-nosnippet>198</a>
+<a href=#199 id=199 data-nosnippet>199</a>    <span class="kw">for </span>entry <span class="kw">in </span>locale_entries() {
+<a href=#200 id=200 data-nosnippet>200</a>        <span class="kw">let </span>loc_dir = version_dir.join(<span class="kw-2">&amp;</span>entry.code);
+<a href=#201 id=201 data-nosnippet>201</a>        <span class="kw">for </span>file <span class="kw">in </span>walk_dir(<span class="kw-2">&amp;</span>loc_dir) {
+<a href=#202 id=202 data-nosnippet>202</a>            <span class="comment">// Depth of this HTML file below the locale dir. mdBook emits chrome
+<a href=#203 id=203 data-nosnippet>203</a>            // refs as `&lt;../ × (locale_depth + page_depth)&gt;theme/foo-HASH.css`
+<a href=#204 id=204 data-nosnippet>204</a>            // for an HTML page `page_depth` levels under the locale dir; the
+<a href=#205 id=205 data-nosnippet>205</a>            // matching `_shared` ref needs the same total `../` count plus one
+<a href=#206 id=206 data-nosnippet>206</a>            // to clear the version dir up to the gh-pages root where `_shared`
+<a href=#207 id=207 data-nosnippet>207</a>            // lives. Concretely: page directly in `&lt;tag&gt;/&lt;locale&gt;/` -&gt; `../../`,
+<a href=#208 id=208 data-nosnippet>208</a>            // one level deeper -&gt; `../../../`, and so on.
+<a href=#209 id=209 data-nosnippet>209</a>            </span><span class="kw">let </span>page_depth = file
+<a href=#210 id=210 data-nosnippet>210</a>                .strip_prefix(<span class="kw-2">&amp;</span>loc_dir)
+<a href=#211 id=211 data-nosnippet>211</a>                .ok()
+<a href=#212 id=212 data-nosnippet>212</a>                .map(|rel| rel.components().count().saturating_sub(<span class="number">1</span>))
+<a href=#213 id=213 data-nosnippet>213</a>                .unwrap_or(<span class="number">0</span>);
+<a href=#214 id=214 data-nosnippet>214</a>            <span class="kw">let </span>up = <span class="string">"../"</span>.repeat(page_depth + <span class="number">2</span>);
+<a href=#215 id=215 data-nosnippet>215</a>
+<a href=#216 id=216 data-nosnippet>216</a>            <span class="kw">if </span>file.extension().is_some_and(|e| e == <span class="string">"html"</span>)
+<a href=#217 id=217 data-nosnippet>217</a>                &amp;&amp; <span class="kw">let </span><span class="prelude-val">Ok</span>(<span class="kw-2">mut </span>content) = std::fs::read_to_string(<span class="kw-2">&amp;</span>file)
+<a href=#218 id=218 data-nosnippet>218</a>            {
+<a href=#219 id=219 data-nosnippet>219</a>                <span class="kw">let </span><span class="kw-2">mut </span>changed = <span class="bool-val">false</span>;
+<a href=#220 id=220 data-nosnippet>220</a>                <span class="kw">for </span>(hashed_rel, shared_rel) <span class="kw">in </span><span class="kw-2">&amp;</span>replacements {
+<a href=#221 id=221 data-nosnippet>221</a>                    <span class="comment">// mdBook references the chrome file relative to the page, so
+<a href=#222 id=222 data-nosnippet>222</a>                    // the on-disk ref is `&lt;../ × page_depth&gt;&lt;hashed_rel&gt;`. Match
+<a href=#223 id=223 data-nosnippet>223</a>                    // and replace at that exact depth with the `_shared` ref at
+<a href=#224 id=224 data-nosnippet>224</a>                    // the correct depth — never a hardcoded prefix.
+<a href=#225 id=225 data-nosnippet>225</a>                    </span><span class="kw">let </span>page_up = <span class="string">"../"</span>.repeat(page_depth);
+<a href=#226 id=226 data-nosnippet>226</a>                    <span class="kw">let </span>from = <span class="macro">format!</span>(<span class="string">"{page_up}{hashed_rel}"</span>);
+<a href=#227 id=227 data-nosnippet>227</a>                    <span class="kw">let </span>to = <span class="macro">format!</span>(<span class="string">"{up}_shared/{shared_rel}"</span>);
+<a href=#228 id=228 data-nosnippet>228</a>                    <span class="kw">if </span>content.contains(<span class="kw-2">&amp;</span>from) {
+<a href=#229 id=229 data-nosnippet>229</a>                        content = content.replace(<span class="kw-2">&amp;</span>from, <span class="kw-2">&amp;</span>to);
+<a href=#230 id=230 data-nosnippet>230</a>                        changed = <span class="bool-val">true</span>;
+<a href=#231 id=231 data-nosnippet>231</a>                    }
+<a href=#232 id=232 data-nosnippet>232</a>                }
+<a href=#233 id=233 data-nosnippet>233</a>                <span class="kw">if </span>changed {
+<a href=#234 id=234 data-nosnippet>234</a>                    <span class="kw">let _ </span>= std::fs::write(<span class="kw-2">&amp;</span>file, content);
+<a href=#235 id=235 data-nosnippet>235</a>                }
+<a href=#236 id=236 data-nosnippet>236</a>            }
+<a href=#237 id=237 data-nosnippet>237</a>            <span class="kw">if let </span><span class="prelude-val">Ok</span>(rel) = file.strip_prefix(<span class="kw-2">&amp;</span>loc_dir) {
+<a href=#238 id=238 data-nosnippet>238</a>                <span class="kw">let </span>rel_str = rel.to_string_lossy().replace(<span class="string">'\\'</span>, <span class="string">"/"</span>);
+<a href=#239 id=239 data-nosnippet>239</a>                <span class="kw">if </span>replacements.iter().any(|(from, <span class="kw">_</span>)| from == <span class="kw-2">&amp;</span>rel_str) {
+<a href=#240 id=240 data-nosnippet>240</a>                    <span class="kw">let _ </span>= std::fs::remove_file(<span class="kw-2">&amp;</span>file);
+<a href=#241 id=241 data-nosnippet>241</a>                }
+<a href=#242 id=242 data-nosnippet>242</a>            }
+<a href=#243 id=243 data-nosnippet>243</a>        }
+<a href=#244 id=244 data-nosnippet>244</a>    }
+<a href=#245 id=245 data-nosnippet>245</a>
+<a href=#246 id=246 data-nosnippet>246</a>    <span class="prelude-val">Ok</span>(())
+<a href=#247 id=247 data-nosnippet>247</a>}
+</code></pre></div></section></main></body></html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ApprovalMode","ApprovalTimeoutAction"],"mod":["decision","ledger","principal","resolve","timeout"]};

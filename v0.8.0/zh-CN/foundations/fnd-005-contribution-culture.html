@@ -1,0 +1,714 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>贡献文化 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+            window.path_to_searchindex_js = "../searchindex-0ee61a64.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-9364d956.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="fnd-005贡献文化人际协作ai-协作与团队成长"><a class="header" href="#fnd-005贡献文化人际协作ai-协作与团队成长">FND-005：贡献文化：人际协作、AI 协作与团队成长</a></h1>
+<blockquote>
+<p>从 v0.7.0 开始 · 类型：文化 · 修订版 1</p>
+<p><strong>规范参考</strong> · 团队已批准 · 修订版 1 讨论线程及完整修订历史：<a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5615">#5615</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p><strong>在你们阅读此内容之前，给团队的一条提示。</strong></p>
+<p>这是 ZeroClaw 成熟度框架中的第五份文档。其余四份分别涉及架构、文档、治理和工程基础设施，即让项目得以运转的结构层。而这一份要探讨的，是前四份文档默认为前提、却从未明确传授的内容：如何协作。</p>
+<p>其他 RFC 中的工具和流程的效果，完全取决于使用它们的团队。一个完美的 CI 流水线无法帮助那些无法提供诚实反馈的团队。一个清晰的架构无法在无法进行建设性分歧的团队中存活。一个治理模型也无法在从未被教导过“所有权”含义的人中建立主人翁意识。</p>
+<p>本文档关注的是如何打造这样一个团队——不仅仅是培养技术能力出众的个体，更是培养懂得如何给予和接受反馈、如何寻求帮助、如何负责任地使用强大工具，以及如何随着时间共同成长的人。这些都是可以习得的技能。没有人天生就完全具备它们。本文档将这些技能清晰地一一列出，让你能够开始有意识地加以练习——就在这里，在真正重要的实际工作场景中。</p>
+<p>本文档中的内容并非对您个人身份或起点的批评，而是我们共同致力于实现的目标的路线图。</p>
+</blockquote>
+<hr>
+<h2 id="成熟度框架套件"><a class="header" href="#成熟度框架套件">成熟度框架套件</a></h2>
+<p>本 RFC 是五份文档中的第五份，这五份文档共同构成了 ZeroClaw 的成熟度框架。它们设计为整体阅读，但每份文档也可独立阅读。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>RFC</th><th>范围</th><th>问题</th></tr>
+</thead>
+<tbody>
+<tr><td>刻意架构：微内核转型</td><td>我们正在构建的内容及其结构</td><td>#5574</td></tr>
+<tr><td>文档标准与知识架构</td><td>我们如何记录我们所构建的内容</td><td>#5576</td></tr>
+<tr><td>团队组织与项目治理</td><td>我们如何协调和做出决策</td><td>#5577</td></tr>
+<tr><td>工程基础设施：CI/CD 流水线</td><td>我们如何可靠地构建、测试和发布</td><td>#5579</td></tr>
+<tr><td><strong>贡献文化：人类协作与 AI 协同</strong></td><td><strong>我们如何协作与成长</strong></td><td><strong>FND-005</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>前四个 RFC 回答了结构性的问题。本文回答的是一个关于人的问题：在既定结构下，其中的人如何彼此互动，以及如何对待他们的工具？这个问题没有编译器、代码检查器或 CI 门禁来约束。它只依赖于我们养成的习惯、树立的榜样，以及我们对此投入的用心。</p>
+<hr>
+<h2 id="目录"><a class="header" href="#目录">目录</a></h2>
+<ol>
+<li><a href="#1-why-this-document-exists">为什么需要此文档</a></li>
+<li><a href="#2-the-work-before-the-work">前面的工作</a></li>
+<li><a href="#3-working-with-people">与人员协作</a>
+<ul>
+<li><a href="#giving-feedback">提供反馈</a></li>
+<li><a href="#receiving-feedback">接收反馈</a></li>
+<li><a href="#asking-for-help">寻求帮助</a></li>
+<li><a href="#disagreeing-productively">建设性地表达不同意见</a></li>
+<li><a href="#ownership">所有权</a></li>
+<li><a href="#supporting-someone-who-is-struggling">支持正在挣扎的人</a></li>
+</ul>
+</li>
+<li><a href="#4-working-with-ai">与 AI 协作</a>
+<ul>
+<li><a href="#the-delegation-mental-model">委派心智模型</a></li>
+<li><a href="#ai-works-at-the-implementation-layer">AI 在实现层工作</a></li>
+<li><a href="#amplification-is-not-magic">放大并非魔法</a></li>
+<li><a href="#the-review-discipline">审查纪律</a></li>
+<li><a href="#what-this-means-for-your-career">这对你的职业生涯意味着什么</a></li>
+</ul>
+</li>
+<li><a href="#5-the-feedback-taxonomy">反馈分类法</a></li>
+<li><a href="#6-a-note-to-reviewers-and-mentors">给评审者和导师的说明</a></li>
+</ol>
+<hr>
+<h2 id="1-本文档的存在原因"><a class="header" href="#1-本文档的存在原因">1. 本文档的存在原因</a></h2>
+<p>大多数贡献指南会告诉你如何提交 PR。它们会说明使用哪些标签、如何运行测试套件，以及提交信息中应包含的内容。这些都很重要，我们也有相关的文档来涵盖这些内容。</p>
+<p>本文档涵盖的是另一方面的内容：那些决定一群有才华的人能否成为一个高效团队，还是仅仅成为共享同一个代码库的个体集合的技能。</p>
+<p>这些都是可以习得的技能。它们并非那种你要么天生拥有、要么没有的性格特质，也不是随技术能力自然而然就会具备的东西。它们需要在反馈中、随着时间推移，缓慢地加以练习，就像学习任何其他技能一样。大多数软件工程教育几乎只关注技术层面，而把人的层面交给运气去决定。其结果是，许多技术能力出众的人最终所在的团队却无法良好协作，而他们对究竟缺少了什么、又该如何改进，毫无清晰的认识。</p>
+<p>本文档的目标是清晰地命名这些技能，以便你能够在重要的实际工作背景下，开始有意识地练习它们。</p>
+<hr>
+<h2 id="2-工作前的工作"><a class="header" href="#2-工作前的工作">2. 工作前的工作</a></h2>
+<p>在编写代码、提交 PR 或要求 AI 生成任何内容之前，你应该能够回答一组问题。本项目使用决策层级来描述这些问题：</p>
+<pre><code>Vision
+  └── Architecture
+        └── Design
+              └── Implementation
+                    └── Testing
+                          └── Documentation
+                                └── Release
+</code></pre>
+<p>该层次结构在架构 RFC（#5574）中有完整描述。这里重要的是其背后的原则：<strong>你做出的每一个决策都应该能够追溯至顶层。</strong></p>
+<p>在实践中，这意味着在开始构建之前，先问自己：</p>
+<ul>
+<li><strong>我在解决什么问题？</strong> 不是“我在关闭哪个工单“，而是：这实际上为某人解决了什么问题？</li>
+<li><strong>这是否符合架构要求？</strong> 如果你无法描述它在系统结构中的位置，说明你对系统的理解还不够深入，不足以对其进行修改。</li>
+<li><strong>完成的标准是什么？</strong> 在编写代码之前，先写出验收标准。“它能运行”不是一个验收标准。“用户无需 Rust 工具链即可安装插件并正常运行”才是。</li>
+<li><strong>谁需要知道这件事？</strong> 涉及他人工作的变更，或者需要整个团队共同决策的事项，应在实施之前而非之后获得知晓。</li>
+</ul>
+<p>这不是官僚主义，而是“构建某物”与“构建正确之物”之间的区别。这也直接适用于你如何使用 AI 工具，我们将在第 4 节中详细讨论。</p>
+<p>当你跳过这一步时，会发生什么——说实话是这样的：你做出了一个能用的东西，开了 PR，然后在评审中才得知它解决的是错误的问题，或者它解决正确问题的方式与别处早已做出的决策相冲突。这浪费了你的时间、评审者的时间，并拖延了依赖这项工作的人。前期工作并不是额外的负担，而是你保护自己劳动成果的方式。</p>
+<hr>
+<h2 id="3-与人协作"><a class="header" href="#3-与人协作">3. 与人协作</a></h2>
+<h3 id="提供反馈"><a class="header" href="#提供反馈">提供反馈</a></h3>
+<p>反馈是你能为其他工程师做的最有影响力的事情之一。一条写得好的评审评论可以教会别人多年才能自己学到的东西。而一条写得差的评论则可能让某人不再愿意贡献代码。</p>
+<p><strong>具体说明。</strong> 模糊的反馈只会带来焦虑，却缺乏明确的方向。</p>
+<blockquote>
+<p>❌ “这很难阅读。”</p>
+<p>✅ “这个函数处理了三个独立的关注点：输入校验、业务逻辑和响应格式化。建议将它们拆分开，让每个函数只做一件事。这样既便于单独测试每个部分，也能让人一眼看懂各自的功能。”</p>
+</blockquote>
+<p>第二个版本更长，但它教会了读者一些东西。读者现在知道了问题是什么、为什么重要以及该如何解决。</p>
+<p><strong>解释原理，而不仅仅是结论。</strong> 如果你要求某人做出更改，请告诉他们原因。“将 X 更改为 Y”只能产生修复效果；而“将 X 更改为 Y，因为 Z”则能产生理解，这种理解会在接下来十个适用相同原理的情境中发挥作用。</p>
+<p><strong>将工作与人分开。</strong> “这个方法有问题”和“你犯了一个错误”并不是同一回事。前者是关于代码的，后者则是针对个人的。请确保你的反馈集中在工作上。</p>
+<p><strong>指出好的地方。</strong> 这不是为了客气，而是为了实用。当你告诉别人他们哪里做对了，并解释为什么这样做是对的，你就在教他们应该重复哪些模式。泛泛的表扬（“干得好！”）什么也教不了。具体的表扬（“把这部分提取成独立的 crate 是正确的决定，因为这意味着我们现在可以隔离地测试这段逻辑，而不必启动整个 agent 循环”）则传授了原则，并强化了这个决策。</p>
+<p><strong>使用反馈分类法。</strong> 第 5 节中的分类法为每条评论赋予明确的权重。如果审阅者将阻塞性问题与次要建议混在一起而不加以区分，就会迫使作者去猜测哪些内容真正需要修改。不要让人去猜。</p>
+<hr>
+<h3 id="接收反馈"><a class="header" href="#接收反馈">接收反馈</a></h3>
+<p>这对大多数人来说比提供反馈更难，而且诚实地说明原因很有价值。</p>
+<p>当你在某件事上花费了数小时，攻克难题、做出决策、编写代码，而有人告诉你它存在问题时，人类的自然反应是觉得这些批评是针对你本人的。其实不然。批评针对的是工作成果。学会将这两者区分开来是一项技能，需要不断练习。</p>
+<p>以下是一些有帮助的事项：</p>
+<p>**先读完反馈，再作出回应。**不要只看摘要那一行，而要看完整条评论，包括其中的解释说明。很多反馈回应都是在还没有消化完原因之前，就针对结论作出的本能反应。先读懂“为什么“，再决定你对“是什么“的态度。</p>
+<p><strong>区分“我不同意”和“我不理解”。</strong> 这两种情况需要不同的回应方式。如果你不理解反馈内容，请提出澄清性问题；如果你理解反馈但不同意，请提供证据明确表达你的观点。这两种情况都是良好的结果。而当你有疑问时保持沉默，或者明明不同意却只说“好吧，行”，则毫无帮助。</p>
+<p><strong>你不必认同每一条反馈才能从中有所收获。</strong> 有时反馈是错误的。有时它反映的是与你所优化的目标不同的另一组权衡取舍。你完全可以提出异议。参见下文的“高效地表达异议“。但即便是你最终拒绝采纳的反馈,也值得在决定拒绝之前充分理解清楚。</p>
+<p><strong>形成闭环。</strong> 当有人花时间审查你的工作时，请在你处理完他们的反馈后告知他们。你不必过分致谢，一句简单的“已在最新提交中处理”就足够了。这能让他们知道自己的付出是有价值的，并推动 PR 持续进展。</p>
+<p><strong>对你的代码的反馈并不反映你的价值。</strong> 这听起来显而易见。但当你身处其中时，却并不明显。每一位经验丰富的工程师都会接受更有经验的人的代码审查，而这个过程每次都会让人感到不适。这种不适感正是学习的感觉。它不会消失；你只是逐渐学会与之共处。</p>
+<hr>
+<h3 id="请求帮助"><a class="header" href="#请求帮助">请求帮助</a></h3>
+<p>在学校里，寻求帮助可能会让人觉得你落后于人，或者你不属于这个群体。而在团队中，寻求帮助是你所能做的最专业的事情之一。</p>
+<p><strong>陷入困境而不求助的代价，几乎总是高于求助的代价。</strong> 花三个小时在一个只需五分钟对话就能解决的问题上打转，意味着你和团队的时间白白浪费了。知道何时求助是一种技能，而不是弱点。</p>
+<p>一个良好的帮助请求包含三个部分：</p>
+<ol>
+<li>**您想要实现的目标。**不要只说“它坏了“，而要说明您的目标是什么。</li>
+<li><strong>你已经尝试过的操作。</strong> 这表明你已投入精力解决问题，并为提供帮助的人提供了一个非零的起点。</li>
+<li><strong>你具体卡在哪里。</strong> “我不知道哪里出了问题”与“我知道哪里出了问题，但不知道如何修复”以及“我修复了问题，但不知道为什么我的修复有效”是不同的问题。</li>
+</ol>
+<p>包含这三个部分的问题求助会得到更快的解答，并且能让你学到更多，因为提供帮助的人可以准确地了解你当前的情况。</p>
+<p><strong>尽可能公开提问。</strong> 在共享频道或 PR 中提出的问题，能让日后遇到相同疑问的每个人受益。私下提出的问题只对你自己有益。有些情况下私下沟通才合适，比如敏感的反馈、个人状况，但关于代码库的技术性问题几乎总是公开提问更好。</p>
+<p><strong>不知道某件事并不丢人。</strong> 没有人无所不知。那些看似无所不知的工程师，是在漫长的时间里不断提问，才积累了这些答案。而通往这一境界的唯一途径，就是开始提问。</p>
+<hr>
+<h3 id="建设性地表达不同意见"><a class="header" href="#建设性地表达不同意见">建设性地表达不同意见</a></h3>
+<p>架构上的分歧是健康的。它意味着人们关心系统的构建方式，并且在关注所做的决策。一个无人提出异议的团队，并不是一个所有人都意见一致的团队，而是一个人们已经停止参与的团队。</p>
+<p>建设性分歧与无建设性分歧之间的差异通常在于表述方式。</p>
+<p><strong>先提出关切，而非结论。</strong></p>
+<blockquote>
+<p>❌ “这种方法是不正确的。”</p>
+<p>✅ “我对这种方法有些担忧：具体来说，如果我们在这里把网关直接接入运行时，就会违反 RFC §4.2 中的依赖规则。我们能否讨论一下，是否有办法在不引入这种耦合的情况下达到同样的效果？”</p>
+</blockquote>
+<p>第二个版本会打开一个对话。第一个版本会关闭一个对话。</p>
+<p><strong>提供证据。</strong> 基于测量事实、特定 RFC 章节或具体故障场景的架构分歧是一种贡献。而基于“我就是觉得”的架构分歧则是一种观点。两者都值得表达，但只有一种能推动对话快速进展。</p>
+<p><strong>真诚地接受自己可能是错的。</strong> 如果你在进入一场分歧时就已经认定自己是对的，那你并不是在交流，而是在游说。人们能分辨出这种区别，这会让他们不太愿意认真对待你的顾虑。我们的目标是为项目取得最佳结果，而不是证明自己正确。</p>
+<p><strong>当团队作出决定后，与团队一起行动。</strong> 你可以将自己的反对意见记录在案：在 issue 中、在 RFC 评论中、在 PR 讨论串中，然后你去构建已经决定好的方案。这不是妥协退让，而是团队运作的方式。一个不断重新争论已定决策的团队是无法交付成果的。</p>
+<p><strong>有些决策是可逆的，有些则不可逆。</strong> 明确你正在讨论的是哪一类决策。命名决策是可逆的，而一旦写入生产环境二进制文件并持续使用两年的协议决策则不可逆。请据此合理分配你的精力。</p>
+<hr>
+<h3 id="所有权"><a class="header" href="#所有权">所有权</a></h3>
+<p>“所有权”是一个经常被使用但缺乏明确定义的词。以下是它在该项目中的实际含义：</p>
+<p><strong>拥有者意味着你在被要求之前就能看到问题。</strong> 这意味着阅读涉及你负责区域的 PR，并注意到作者未察觉的副作用。这意味着看到一个没有分配负责人的后续问题并主动接手。这意味着不等待被指示。</p>
+<p><strong>所有权意味着你的承诺是有分量的。</strong> 如果你提交了一个署有你名字的后续问题，那么这个问题就是你的承诺。不是“应该有人来做这件事“：而是你将完成这件事。如果情况发生变化，你无法完成，那么你要尽早说明，并找到接手的人。一个充斥着署名却被提交后即遗忘的问题的跟踪器，是一份破裂的信任记录。</p>
+<p><strong>当责并不是“我做完了我那部分”。</strong> 而是“我在乎整体能否正常运转”。你可以负责一个 crate，但这不意味着你可以对它所在系统是否健康漠不关心。你可以负责一项功能，但这不意味着你可以对用户是否真正用得上它漠不关心。狭隘的当责——“我做完了我那一块，剩下的是别人的问题”——会催生出这样的系统：每一块在名义上都有归属人，但在实际运作中却没有人对任何事情负责。</p>
+<p><strong>所有权包括后续跟进。</strong> 发布代码并不是所有权的终点，而是责任的开始——确保代码正常运行、修复出现的问题，并教会接下来在该领域工作的人你所学到的经验。</p>
+<hr>
+<h3 id="支持正在挣扎的人"><a class="header" href="#支持正在挣扎的人">支持正在挣扎的人</a></h3>
+<p>在这个项目的某个阶段，你可能会比线程中的其他人更有经验。也许你在这里的时间更长，也许你恰好了解他们正在处理的代码部分，也许你之前见过这种特定的故障模式。</p>
+<p>你如何使用这个职位很重要。</p>
+<p><strong>不要只是替他们修复问题。</strong> 在不解释问题所在或你的解决方案为何有效的前提下，直接给出一段可运行的代码，虽然能促成 PR 合并，但无法带来任何学习价值。下次他们遇到类似问题时，依然会陷入同样的困境。请多花五分钟时间，说明你发现的问题以及修复方案背后的原理。</p>
+<p><strong>带着传授的意图来评审。</strong> 一个糟糕的 PR 不仅仅是一个需要关闭的问题，它更是一次教学的机会。一个轻率敷衍的评审（“这不符合架构”）远不如一个能指出遗漏之处、解释其违反的原则、并指引贡献者从何处进一步学习的评审来得有用。这份额外的付出，是对一位贡献者的投资——从那时起，他将写出更好的 PR。</p>
+<p><strong>如果有人遇到了阻碍却没有寻求帮助，主动说点什么。</strong> 有时候人们不开口，是因为不想让自己看起来很吃力。有时候他们不确定该问谁。有时候他们已经卡了太久，以至于不再意识到自己有多么束手无策。一句轻声的“看起来这个问题已经搁置一段时间了，有什么我能帮忙解决的吗？”几乎不需要任何成本，但对一个正在原地打转的人来说可能意义重大。</p>
+<p><strong>营造“不知道也没关系”的安全感。</strong> 如果团队成员因为不了解某些事情而感到被评判，他们就会假装自己知道。这会导致更糟糕的决策，而不是更好的决策。那些能够让大家安心地说“我不知道，让我去查一下”的团队，会比那些每个人都表现得自信满满的团队做出更好的决策。</p>
+<hr>
+<h2 id="4-使用-ai"><a class="header" href="#4-使用-ai">4. 使用 AI</a></h2>
+<p>本节涉及大多数贡献指南未涵盖的内容：如何以使你变得更强，而不仅仅是更快的方式使用 AI 编码工具。</p>
+<h3 id="委派心智模型"><a class="header" href="#委派心智模型">委派心智模型</a></h3>
+<p>以下是与 AI 高效协作的最实用思维框架：</p>
+<p><strong>与 AI 协作的技能与向人委派任务相同。</strong></p>
+<p>当你将工作委托给同事或初级工程师时，你会提供上下文。你会解释目标、约束条件、什么是好的标准以及边界在哪里。你不会只是说“给我做一个功能”，而是会说：这是用户想要做的事情，这是它如何与系统契合，我们将如何知道它已经完成，以及你不应该做的事情。</p>
+<p>然后，最关键的是，你要审查返回的结果。你不会不读就接受一位初级工程师的 PR。你要检查它是否实现了所要求的功能、是否符合架构、是否有测试覆盖、错误处理是否正确。你给出反馈。你可能需要多次迭代。</p>
+<p>AI 工具的工作原理完全相同。你得到的结果质量几乎完全取决于你输入的内容质量。模糊的提示词会产生模糊的输出。而包含清晰上下文、具体约束条件和明确验收标准的提示词，则能生成真正有用的、可作为起点的输出。</p>
+<p>那些在使用 AI 工具时举步维艰的工程师，通常仍在学习如何向任何对象——无论是人还是 AI——清晰地下达指令。而那些借助 AI 工具如鱼得水的工程师，则早在提出需求之前，就已经清楚地知道自己想要什么。</p>
+<p>这种心智模型也意味着输出结果由你负责。你不能提交 PR 并说“是 AI 写的”。你审核了它，你提交了 PR。这是你的工作。</p>
+<hr>
+<h3 id="ai-在实现层工作"><a class="header" href="#ai-在实现层工作">AI 在实现层工作</a></h3>
+<p>这是需要理解的最重要的技术限制。</p>
+<p>AI 代码生成工作在决策层级的<strong>实现层</strong>：</p>
+<pre><code>Vision          ← AI cannot set this. You must.
+Architecture    ← AI cannot make these decisions. You must.
+Design          ← AI will sometimes guess. You must verify.
+Implementation  ← AI can help here.
+Testing         ← AI can help, but you define what to test.
+Documentation   ← AI can draft. You must review for accuracy.
+Release         ← Human judgment required.
+</code></pre>
+<p>一个 AI 工具会生成一个实现你所描述功能的函数。但它不会告诉你该函数应该属于当前 crate 还是另一个 crate。它不会指出该方法与三个月前做出的架构决策相矛盾。它不会询问你是否考虑过安全影响。它也不会注意到你正在解决的是一个错误的问题。</p>
+<p>ZeroClaw 本身就是一个有用的例子。其初始代码库是在 AI 辅助下快速搭建起来的。正如架构 RFC 所描述的那样，其结果是“功能上令人印象深刻，但架构上纯属偶然“。这些代码能完成当下所需的工作，但它并非经过设计，而是逐渐堆积而成的。这并不是 AI 工具的失败，而是在没有先完成愿景、架构和设计工作（这些工作为实现指明方向）的情况下使用实现层工具的可预见结果。</p>
+<p>解决方案不是少用 AI，而是始终在要求 AI 构建任何内容之前，自己完成顶层层级的工作。</p>
+<hr>
+<h3 id="放大不是魔法"><a class="header" href="#放大不是魔法">放大不是魔法</a></h3>
+<p>AI 工具放大了你现有的能力。这是对其作用的诚实描述。</p>
+<p>如果你有清晰的愿景、明确的架构、能够清楚表达的质量标准，以及批判性评估输出的能力，AI 就是真正的力量倍增器。你的速度会更快。你会探索更多方案。你会编写更多测试。你会起草更多文档。</p>
+<p>如果你没有这些东西，AI 会生成大量看似令人信服却经不起推敲的代码。它生成的测试虽然能通过，却没有测试任何有意义的内容。它生成的文档描述了代码本身，却没有体现意图。它生成的架构在局部是一致的，但在全局上却缺乏连贯性。</p>
+<p>这种放大是中性化的。它以同样的热情放大好的输入和坏的输入。</p>
+<p>这意味着在 AI 辅助工作流中，最有价值的技能不是提示工程，而是评估输出的能力。这要求你在提出任何请求之前，就清楚什么是好的结果。而这又让你一次次回到决策层级的顶端。</p>
+<p>在使用 AI 工具实现某个功能之前，一个有用的自检步骤是：</p>
+<ul>
+<li>可以，用一句话描述问题而不提及实现细节是完全可行的。</li>
+<li>我可以为这个实现所服务的 RFC 章节或设计决策命名吗？</li>
+<li>我可以在看到正确的实现之前，先描述一下它应该是什么样的吗？</li>
+<li>在查看生成的实现后，我可以解释它是否正确或不正确吗？</li>
+</ul>
+<p>如果其中任何一个问题的答案是否定的，那么您尚未准备好实施。您仍处于设计阶段。</p>
+<hr>
+<h3 id="审查纪律"><a class="header" href="#审查纪律">审查纪律</a></h3>
+<p>AI 生成的代码需要与人工编写的代码相同的审查纪律。在某些方面，它甚至需要更多的审查，因为你需要检查的问题范围更广。</p>
+<p>当你审查 AI 生成的输出（无论是你自己的还是他人的）时，请检查以下方面：</p>
+<p><strong>架构契合度。</strong> 这是否遵循了依赖规则？它是否位于正确的 crate 中？它是否引入了设计明确避免的耦合？</p>
+<p><strong>边界情况的正确性。</strong> AI 模型在常见情况下表现良好，但在边界情况下经常出错。检查当输入为空、为 null、格式错误或达到最大预期大小时会发生什么。检查当依赖项不可用时会发生什么。</p>
+<p><strong>安全影响。</strong> AI 工具默认不具备安全思维。它们会生成接受未验证用户输入的代码、记录敏感值、使用已弃用的密码学原语、以及在不检查文件路径的情况下打开文件路径。你必须明确引入安全视角。</p>
+<p><strong>测试质量。</strong> AI 生成的测试经常测试实现而非行为。一个断言函数返回特定内部结构体值的测试并不是行为测试。它只是实现的一个快照，每当实现发生变化时就会失效。请自问：这个测试验证的是系统是否满足用户或调用方的需求，还是仅仅验证代码是否在做它当前所做的事情？</p>
+<p><strong>完整性。</strong> AI 工具倾向于优化看似完整的代码。它们会生成详尽处理正常路径的代码，而对错误路径的处理则较为表面。请检查错误是否以真正对调用者有用的方式被传播、处理或暴露出来。</p>
+<hr>
+<h3 id="这对你的职业生涯意味着什么"><a class="header" href="#这对你的职业生涯意味着什么">这对你的职业生涯意味着什么</a></h3>
+<p>这里所描述的技能——清晰地给出方向、批判性地评估输出、理解某个组件在更大系统中的定位、在动手构建之前就知道好的标准是什么样——并不是 AI 特有的技能。它们正是使一个人成为高效工程师、高效技术负责人,并最终成为高效工程经理的技能。</p>
+<p>在一个被 AI 生成代码充斥的世界里，最有价值的工程师并不是那些能够最快编写最多代码的人，而是那些能够判断代码是否正确的人。这需要系统思维、架构判断力，以及根据内化的标准来评估工作的能力。</p>
+<p>你在这里实践的每一件事——在动手实现前先理解 RFC，在构建前先追问“为什么“，以审视初级工程师 PR 的同样眼光去审查 AI 的输出——都是在锤炼那种判断力。它会日积月累、不断叠加。每一个你认真投入架构思考的 PR，都是一个数据点，让下一次架构决策变得更加从容。</p>
+<p>本项目的贡献者拥有一个独特的优势：你正在一个真实的系统上构建这些习惯，面对真实的架构约束，并且会有人审查你的工作并解释原因。这种组合非常罕见，值得认真对待。</p>
+<hr>
+<h2 id="5-反馈分类法"><a class="header" href="#5-反馈分类法">5. 反馈分类法</a></h2>
+<p>本项目中的每条评审意见都带有明确的权重等级。一致地使用这些权重等级，意味着评审者能够清晰地传达意见，而作者也能准确知道哪些内容需要处理。</p>
+<p>下面的分类描述了项目的审查意图。PR 审查通过审查协议的表情符号标题来呈现该意图：🔴 阻塞、🟡 警告、🔵 建议、🟢 赞扬和 ✅ 已解决。请参阅 <code>docs/book/src/contributing/pr-review-protocol.md</code> 获取确切的 PR 审查格式。</p>
+<hr>
+<h3 id="-表彰"><a class="header" href="#-表彰">✅ 表彰</a></h3>
+<p>作者做对的一件事，具体命名并加以解释，以便该模式得以重复。</p>
+<p>这不是礼貌。泛泛的赞美（如“做得好！”）无法带来任何学习。具体的赞美并附带解释，能够阐明做得好的地方背后的原则，这些原则适用于未来同一类别的每一个决策。</p>
+<p><strong>表彰不需要任何操作。</strong> 其目的是强化。</p>
+<blockquote>
+<p><em>示例：将工具调用解析器提取到独立的 crate 中是正确的决定：这段代码对 agent 状态零依赖，现在可以独立测试了。你新增的 91 个测试正是这类覆盖，而当这段逻辑还在 <code>loop_.rs</code> 里时是不可能实现的。</em></p>
+</blockquote>
+<hr>
+<h3 id="-阻塞"><a class="header" href="#-阻塞">🔴 阻塞</a></h3>
+<p>在 PR 合并之前必须解决的问题。阻塞项分为两类：</p>
+<ul>
+<li><strong>架构违规</strong>：代码违反了设计中明确禁止的依赖边界，或与 RFC 或 ADR 中记录的决策相矛盾。</li>
+<li><strong>质量回退</strong>：新行为缺少测试覆盖、安全问题、契约兼容性破坏，或引入缺陷的代码。</li>
+</ul>
+<p>阻断性评论会说明问题是什么、为什么重要，以及在可能的情况下解决方案是什么样的。阻断性评论不是对作者的评判，而是审查者对代码库以及依赖该代码库的用户所应尽的责任。</p>
+<p><strong>作者不应将阻塞性评论视为拒绝。</strong> 这是一个具体且可解决的问题。解决它并继续前进。</p>
+<hr>
+<h3 id="-条件"><a class="header" href="#-条件">🟡 条件</a></h3>
+<p>可以接受推迟处理，但前提是必须有一个已跟踪的问题（tracked issue）并指定了负责人。这种条件性要求是审查者所说的：“我相信这个问题会得到解决，但在合并之前，我需要这个承诺有记录。”</p>
+<p>阻塞式与条件式的区别通常在于时机和风险。下一个 PR 中将交付的缺失功能是条件式。而存在安全漏洞的缺失功能则是阻塞式。</p>
+<p><strong>没有指派负责人的条件性延期不是延期，而是空想。</strong> 没有负责人的跟踪问题往往会无限期地保持开放状态。当审查者将某项内容标记为条件性时，他们要求的是明确指派的承诺，而非理论上的未来意向。</p>
+<hr>
+<h3 id="-团队决策"><a class="header" href="#-团队决策">🔵 团队决策</a></h3>
+<p>PR 揭示出的、不应由任何单个评审者或作者单方面解决的问题。团队决策涉及影响项目方向、架构或用户的权衡取舍，应交由整个团队共同决定。</p>
+<p>使用此标签是审阅者避免因那些实际上关乎共同方向的问题而拖延个人贡献者的方式。它将决策摆上台面，阐明各种权衡取舍，并请团队发表意见，同时不会让作者觉得自己的 PR 被某些超出其控制范围的事情所阻塞。</p>
+<p><strong>团队决策应在 PR 线程中以书面形式记录，并由需要对结果负责的人员作出。</strong> 任何未在 PR 线程中体现的私下讨论，对于后续查阅历史记录的人来说，都不存在。</p>
+<hr>
+<h2 id="6-给评审者和导师的说明"><a class="header" href="#6-给评审者和导师的说明">6. 给评审者和导师的说明</a></h2>
+<p>如果你处于审阅他人工作的位置，无论是作为代码所有者、更有经验的贡献者，还是仅仅是来得更久的人，本节都适合你。</p>
+<p><strong>你正在塑造协作的样子。</strong> 你撰写的每一次评审都在教作者如何评审。你在 PR 讨论中提出的每一个问题，都在教导新加入的贡献者哪些问题值得提出。你无法置身事外：唯一的选择是有意为之，还是听之任之。</p>
+<p><strong>细致是对作者的尊重。</strong> 一份详尽且阐明其推理过程的审查，比草率的批准更能体现对作者付出的尊重。作者为这项工作投入了时间，他们理应了解代码为何尚未达到合并标准，以及可以从这次审查中获得哪些改进方向。</p>
+<p><strong>每次评审交互的目标，是让作者比之前更有能力。</strong> 不仅仅是合并一个 PR。不是为了展示你自己的知识。不是为了强制执行规则。而是给作者留下他们可以使用的东西：一条原则、一种模式、对某个权衡的理解，这些都能超越当前 PR 而发挥作用。</p>
+<p><strong>说明模式，而不仅仅是具体实例。</strong> 当你要求做出修改时，请解释其背后的原则。“将这个变量重命名为能描述其内容的名称”不如“变量名应当从调用者的视角描述其用途，而非从实现的视角：调用此函数的人真正关心的是这个值代表什么？”更有用。后一种说法适用于作者今后将编写的每个函数中的每个变量。</p>
+<p><strong>坦诚区分哪些是你的个人偏好，哪些是硬性要求。</strong>“我会用不同的方式来写“和“这必须修改“并不是一回事。如果你表达的是个人偏好，就明确说出来。如果你援引的是硬性要求：架构、安全、兼容性，那就列出具体原因。如果作者无法分辨审阅者的个人偏好和架构上的必然要求，他们要么会改动所有内容，要么什么都不改。这两种结果对他们都没有好处。</p>
+<p><strong>你正在帮助构建的团队，就是你将加入的团队。</strong> 你今天投入的细致、教育性的审查工作，会逐步培养出一个能写出更优质代码、提出更高质量 PR，并对他人进行更深思熟虑审查的贡献者。这会让整个项目变得更好。同时，它也会让你的工作更轻松，因为你身边的同事都在不断成长。</p>
+<p>这不是软技能，而是工程工作。</p>
+<hr>
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/fnd-004-engineering-infrastructure.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../foundations/fnd-006-zero-compromise-in-practice.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/fnd-004-engineering-infrastructure.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../foundations/fnd-006-zero-compromise-in-practice.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-d3ccd83c.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

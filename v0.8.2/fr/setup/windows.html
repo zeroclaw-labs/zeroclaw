@@ -1,0 +1,581 @@
+<!DOCTYPE HTML>
+<html lang="fr" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Windows - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-466867d0.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="windows"><a class="header" href="#windows">Windows</a></h1>
+<p>Installer, mettre à jour, exécuter en tant que tâche planifiée Windows et désinstaller sur Windows 10 / 11.</p>
+<p>Si vous utilisez WSL2, vous pouvez suivre la <a href="./linux.html">configuration Linux</a> à la place ; <code>install.sh</code> s’exécute sans modification sous WSL.</p>
+<blockquote>
+<p><strong>Note sur <code>setup.bat</code>.</strong> Les échecs bloquants de <code>#6118</code> (le dépassement d’espace disque dû à <code>set /a</code> en 32 bits et l’erreur d’analyse <code>if/else</code> due aux parenthèses non échappées) ont été corrigés dans <a href="https://github.com/zeroclaw-labs/zeroclaw/pull/6137">#6137</a> et sont disponibles à partir de la <strong>v0.7.4</strong>. Les versions actuelles se terminent normalement. Une réserve subsiste : <code>setup.bat --prebuilt</code> vérifie toujours la présence de <code>cargo</code> avant d’atteindre la branche prebuilt, de sorte que le chemin <strong>prebuilt manuel</strong> (Option 1 ci-dessous) constitue la véritable installation sans Rust. La compilation depuis les sources (Option 3) fonctionne également.</p>
+</blockquote>
+<h2 id="installer"><a class="header" href="#installer">Installer</a></h2>
+<h3 id="option-1--binaire-précompilé-recommandé"><a class="header" href="#option-1--binaire-précompilé-recommandé">Option 1 : Binaire précompilé (recommandé)</a></h3>
+<p>Téléchargez le fichier zip de la dernière version Windows, extrayez <code>zeroclaw.exe</code>, et placez-le dans votre <code>PATH</code>.</p>
+<p>À partir d’une invite PowerShell :</p>
+<pre><code class="language-powershell"># Idempotent : réexécuter ce bloc est sans effet lorsque zeroclaw est déjà
+# installé dans sa dernière version et présent dans le PATH de l'utilisateur. Après
+# une montée de version, la vérification de version échoue et l'installation se relance.
+$ver = (Invoke-RestMethod 'https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest').tag_name.TrimStart('v')
+$dst = "$env:USERPROFILE\.zeroclaw\bin"
+$exe = "$dst\zeroclaw.exe"
+
+$current = if (Test-Path $exe) {
+    ((&amp; $exe --version 2&gt;$null) | Select-String -Pattern '\d+\.\d+\.\d+').Matches.Value
+} else { '' }
+
+if ($current -ne $ver) {
+    $url = "https://github.com/zeroclaw-labs/zeroclaw/releases/download/v$ver/zeroclaw-x86_64-pc-windows-msvc.zip"
+    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+    Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\zeroclaw.zip" -UseBasicParsing
+    Expand-Archive -Force -Path "$env:TEMP\zeroclaw.zip" -DestinationPath $dst
+}
+
+$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (($userPath -split ';') -notcontains $dst) {
+    [Environment]::SetEnvironmentVariable('Path', "$dst;$userPath", 'User')
+}
+if (($env:Path -split ';') -notcontains $dst) {
+    $env:Path = "$dst;$env:Path"
+}
+
+&amp; $exe quickstart
+</code></pre>
+<p>Le fichier zip fournit un binaire autonome, sans toolchain Rust ni Visual Studio Build Tools nécessaires.</p>
+<p>Après l’installation, vérifiez :</p>
+<pre><code class="language-powershell">zeroclaw --version    # matches the latest release
+</code></pre>
+<h3 id="option-2--setupbat-à-partir-dune-version"><a class="header" href="#option-2--setupbat-à-partir-dune-version">Option 2 : <code>setup.bat</code> (à partir d’une version)</a></h3>
+<pre><code class="language-cmd">setup.bat --prebuilt
+</code></pre>
+<p>Indicateurs :</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Indicateur</th><th>Comportement</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--prebuilt</code></td><td>Télécharger le binaire précompilé depuis GitHub Releases (le plus rapide une fois disponible ; le script actuel vérifie toujours <code>cargo</code> en premier)</td></tr>
+<tr><td><code>--minimal</code></td><td>Compiler uniquement le cœur (sans canaux, sans matériel)</td></tr>
+<tr><td><code>--standard</code></td><td>Créez avec des canaux courants (Telegram, Discord, Slack, Matrix)</td></tr>
+<tr><td><code>--full</code></td><td>Tout générer</td></tr>
+</tbody>
+</table>
+</div>
+<blockquote>
+<p>⚠️ <strong>Problème connu (actuel).</strong> <code>setup.bat --prebuilt</code> vérifie toujours la présence de <code>cargo</code> avant d’atteindre la branche prebuilt, donc l’option 2 ne respecte pas la promesse d’absence de Rust. Si vous n’avez pas de chaîne d’outils Rust, utilisez l’<strong>option 1</strong> ci-dessus.</p>
+<p><em>Historique (avant <code>v0.7.4</code>).</em> Les versions antérieures présentaient deux échecs bloquants et une incohérence de commande d’intégration signalés dans <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/6118">#6118</a> : un dépassement de capacité d’espace disque <code>set /a</code> sur 32 bits (<code>Invalid number. Numbers are limited to 32-bits of precision.</code>), une erreur d’analyse <code>if/else</code> due à des parenthèses non échappées (<code>.[0m was unexpected at this time.</code>) et une invite finale <code>zeroclaw init</code>. Tous ont été corrigés dans <a href="https://github.com/zeroclaw-labs/zeroclaw/pull/6137">#6137</a> (v0.7.4 / 0.7.5 / 0.8.0) ; les versions actuelles affichent <code>zeroclaw quickstart</code> et se terminent normalement.</p>
+</blockquote>
+<h3 id="option-3--à-partir-des-sources"><a class="header" href="#option-3--à-partir-des-sources">Option 3 : À partir des sources</a></h3>
+<p>Requiert Rust (<code>rustup</code>) et les Outils de génération Visual Studio :</p>
+<pre><code class="language-cmd">git clone https://github.com/zeroclaw-labs/zeroclaw
+cd zeroclaw
+cargo install --locked --path .
+zeroclaw quickstart
+</code></pre>
+<h3 id="option-4--scoop-actuellement-obsolète"><a class="header" href="#option-4--scoop-actuellement-obsolète">Option 4 : Scoop (actuellement obsolète)</a></h3>
+<blockquote>
+<p>⚠️ <strong>Le manifeste Scoop dans le dépôt est épinglé à la v0.5.9</strong> (23 versions correctives de retard sur master). Tant qu’un hook CI au moment de la publication ne le met pas à jour, préférez l’Option 1 ou 3. Si vous utilisez Scoop et rencontrez des problèmes, veuillez ouvrir une PR sur <code>dist/scoop/zeroclaw.json</code>.</p>
+</blockquote>
+<pre><code>scoop install zeroclaw     # currently installs an older release; see warning above
+zeroclaw quickstart
+</code></pre>
+<h3 id="option-5--docker"><a class="header" href="#option-5--docker">Option 5 : Docker</a></h3>
+<p>ZeroClaw publie une image de conteneur Linux sur <strong><code>ghcr.io/zeroclaw-labs/zeroclaw:latest</code></strong> (et <code>:vX.Y.Z</code> pour les versions taguées). Sous Windows, exécutez-la via Docker Desktop ou via <code>sudo apt install docker.io</code> dans une distribution WSL ; les deux fonctionnent, et le comportement du conteneur est identique.</p>
+<p>Démarrage rapide :</p>
+<pre><code class="language-powershell"># Volume persistant pour la configuration + l'espace de travail ; le répertoire de données de ZeroClaw à l'intérieur du conteneur est /zeroclaw-data
+docker run -d --name zeroclaw `
+  --restart=unless-stopped `
+  -p 42617:42617 `
+  -v zeroclaw-data:/zeroclaw-data `
+  ghcr.io/zeroclaw-labs/zeroclaw:latest
+
+# Suivre les journaux de premier démarrage
+docker logs -f zeroclaw
+
+# Vérification de l'état (aucune authentification requise)
+curl http://localhost:42617/health
+
+# (Facultatif) appairer un client. REMARQUE : l'image publiée définit par défaut
+# `require_pairing = false`, donc par défaut aucun code d'appairage n'est émis
+# et `/api/*` accepte les requêtes sans authentification. Pour activer l'appairage,
+# remplacez la configuration (définissez `require_pairing = true` dans
+# /zeroclaw-data/.zeroclaw/config.toml à l'intérieur du conteneur) et redémarrez ;
+# un code à usage unique est alors affiché sur stdout au premier démarrage, après quoi
+# les clients l'envoient via POST à `/pair` :
+curl -X POST http://localhost:42617/pair -H 'X-Pairing-Code: &lt;code-from-logs&gt;'
+</code></pre>
+<p><strong>Faits relatifs à l’image (vérifiés par rapport à <code>ghcr.io/zeroclaw-labs/zeroclaw:latest</code>) :</strong></p>
+<ul>
+<li><strong>Base :</strong> <code>gcr.io/distroless/cc-debian13:nonroot</code> (étape de release ; l’étape <code>dev</code> est <code>debian:trixie-slim</code>)</li>
+<li><strong><code>ENTRYPOINT ["zeroclaw"]</code></strong>, <code>CMD ["daemon"]</code> : l’exécution sans argument démarre le daemon et la passerelle</li>
+<li><strong><code>EXPOSE 42617</code></strong> : le daemon et la passerelle écoutent tous deux sur ce port</li>
+<li><strong>Répertoire de données :</strong> <code>/zeroclaw-data</code> (config : <code>/zeroclaw-data/.zeroclaw/config.toml</code>, espace de travail : <code>/zeroclaw-data/workspace</code>). Montez un volume nommé ou un bind ici pour la persistance ; notez qu’il ne s’agit <strong>pas</strong> de <code>/root/.zeroclaw</code>.</li>
+<li><strong>Appairage :</strong> l’image publiée utilise par défaut <code>require_pairing = false</code>, donc <code>/api/*</code> accepte les requêtes sans authentification d’emblée. Lorsque l’appairage est activé (définissez <code>require_pairing = true</code> dans <code>/zeroclaw-data/.zeroclaw/config.toml</code> et redémarrez), le démon affiche un code à usage unique sur stdout au premier démarrage, et les clients l’envoient ensuite par POST à <code>/pair</code> avec l’en-tête <code>X-Pairing-Code</code> avant que tout point de terminaison authentifié ne réponde.</li>
+<li><strong>Tableau de bord web :</strong> intégré et servi par défaut dans l’image publiée. L’image définit <code>gateway.web_dist_dir = "/usr/share/zeroclawlabs/web/dist"</code> et y inclut le frontend compilé, de sorte que le gateway sert le fallback SPA clé en main. Les assets se trouvent <strong>en dehors</strong> du point de montage <code>/zeroclaw-data</code>, de sorte qu’un montage de volume <code>-v …:/zeroclaw-data</code> ne peut pas les masquer (réf. #6400).</li>
+</ul>
+<p>Compilez à partir du source en utilisant le Dockerfile fourni :</p>
+<pre><code class="language-powershell">git clone https://github.com/zeroclaw-labs/zeroclaw
+cd zeroclaw
+docker build -t zeroclaw:local -f Dockerfile.debian .
+</code></pre>
+<p><strong>Vérifié sous Windows + Docker :</strong></p>
+<ul>
+<li><strong>Le comportement du conteneur correspond à celui de Linux.</strong> Image <code>ghcr.io/zeroclaw-labs/zeroclaw:latest</code> téléchargée et exécutée sous WSL Debian sur Windows 11 build 26200.8313. L’image démarre proprement, la passerelle écoute sur <code>:42617</code>, et <code>/health</code> renvoie un JSON valide. Avec <code>require_pairing = true</code> défini dans la configuration et le conteneur redémarré, le flux de code d’appairage sur <code>/pair</code> fonctionne également comme documenté.</li>
+<li><strong>Docker sans Docker Desktop.</strong> <code>wsl --install</code> pour activer WSL2, puis <code>sudo apt install docker.io</code> dans la distribution WSL, vous donne le démon directement ; vérifié pour récupérer et exécuter l’image publiée sans modification.</li>
+</ul>
+<p><strong>Bonnes pratiques côté hôte</strong> : recommandations générales pour Docker + WSL2, et non des affirmations spécifiques au runtime de zeroclaw. Sourcées depuis Microsoft Learn et la documentation officielle de Docker le cas échéant :</p>
+<ul>
+<li>
+<p><strong>Montages de volumes.</strong> Le bind-mount de chemins côté Windows (<code>-v C:/Users/...:/zeroclaw-data</code>) dans un conteneur Linux franchit la limite du système de fichiers WSL2 ⇄ Windows ; Microsoft documente la disposition et les implications des chemins inter-OS dans la référence <a href="https://learn.microsoft.com/en-us/windows/wsl/filesystems">WSL file systems</a>. Préférez les volumes nommés Docker (<code>-v zeroclaw-data:/zeroclaw-data</code>) ou stockez l’espace de travail dans le système de fichiers WSL (<code>\\wsl$\Debian\home\...</code>) pour des performances quasi natives.</p>
+</li>
+<li>
+<p><strong>Réseau.</strong> Par défaut, le réseau WSL2 utilise du NAT, donc les services dans le conteneur sont accessibles depuis Windows via <code>localhost:&lt;port&gt;</code> après redirection avec <code>-p</code> (vérifié sur Windows 11 + WSL2). Si vous devez accéder au conteneur depuis une autre machine du réseau local, ou exécuter des configurations multi-conteneurs où le DNS inter-conteneurs est important, passez en mode miroir selon la référence <a href="https://learn.microsoft.com/en-us/windows/wsl/networking#mirrored-mode-networking">Mirrored mode networking</a> de Microsoft, en ajoutant à <code>%USERPROFILE%\.wslconfig</code> :</p>
+<pre><code>[wsl2]
+networkingMode=mirrored
+</code></pre>
+</li>
+<li>
+<p><strong>Démon sous Docker, pas Planificateur de tâches.</strong> À l’intérieur du conteneur, il n’y a pas de Planificateur de tâches Windows. Utilisez la <a href="https://docs.docker.com/engine/containers/start-containers-automatically/">politique de redémarrage</a> de Docker, <code>--restart=unless-stopped</code> comme dans l’exemple ci-dessus, pour le démarrage en mode démon. L’image publiée s’exécute en tant que PID 1 / utilisateur nonroot ; le conteneur <em>est</em> le service ; n’exécutez pas <code>zeroclaw service install</code> à l’intérieur.</p>
+</li>
+<li>
+<p><strong>Sandbox de compétences via le socket Docker hôte.</strong> Le sandbox d’exécution de compétences de ZeroClaw peut faire appel à Docker. Si vous exécutez ZeroClaw lui-même dans un conteneur et que vous souhaitez que le sandbox de compétences utilise également Docker, montez le socket Docker hôte afin que les conteneurs enfants s’exécutent sur le daemon hôte plutôt que d’imbriquer Docker-in-Docker :</p>
+<pre><code># PowerShell / cmd.exe : utilisez une seule barre oblique au début.
+# Git Bash / MINGW : utilisez //var/run/docker.sock pour contourner la réécriture de chemin MSYS.
+-v /var/run/docker.sock:/var/run/docker.sock
+</code></pre>
+<p>Sachez que monter le socket Docker accorde un accès à l’hôte équivalent à root pour tout ce qui se trouve dans le conteneur ; la page <a href="https://docs.docker.com/engine/security/protect-access/">Protect the Docker daemon socket</a> de Docker traite de ce compromis. Sur Docker Desktop pour Windows, le socket de l’hôte est <code>\\.\pipe\docker_engine</code> ; la syntaxe de bind-mount ci-dessus se traduit correctement. Le modèle est général ; il n’a pas été spécifiquement évalué par rapport au sandbox de compétences de zeroclaw dans ce document.</p>
+</li>
+<li>
+<p><strong>Limites de ressources.</strong> Docker Desktop sur Windows alloue la RAM/le CPU via <code>%USERPROFILE%\.wslconfig</code>, qui utilise par défaut la moitié de la RAM de l’hôte. L’ensemble des options de configuration est documenté dans la référence Microsoft <a href="https://learn.microsoft.com/en-us/windows/wsl/wsl-config">Advanced settings configuration in WSL</a>. Une enveloppe de départ raisonnable pour un déploiement ZeroClaw mono-utilisateur est :</p>
+<pre><code>[wsl2]
+memory=8GB
+processors=4
+</code></pre>
+<p>Augmentez cette valeur si vous exécutez des charges de travail de compétences intensives ou de l’inférence LLM locale dans la même distribution WSL ; il s’agit de recommandations de dimensionnement, et non d’une exigence stricte de l’image.</p>
+</li>
+</ul>
+<h2 id="dépendances-système"><a class="header" href="#dépendances-système">Dépendances système</a></h2>
+<p>Les builds Windows utilisent la chaîne d’outils MSVC. Pour compiler depuis les sources, vous avez besoin de :</p>
+<ul>
+<li>Outils de build Visual Studio (ou Visual Studio complet) avec la charge de travail « Développement de bureau avec C++ »</li>
+<li>Rust stable (via <code>rustup</code>)</li>
+</ul>
+<p>Si vous utilisez l’<strong>Option 1</strong>, vous n’avez pas besoin de la chaîne d’outils Rust ; le binaire est autonome. L’option 2 (<code>setup.bat --prebuilt</code>) est censée utiliser le même chemin de binaire, mais le script actuel vérifie toujours la présence de <code>cargo</code> avant d’atteindre la branche prebuilt ; consultez le problème connu ci-dessus.</p>
+<h2 id="exécution-en-tant-que-service"><a class="header" href="#exécution-en-tant-que-service">Exécution en tant que service</a></h2>
+<p>Sous Windows, ZeroClaw s’installe en tant que <strong>tâche planifiée à portée utilisateur</strong> nommée <code>ZeroClaw Daemon</code>. Il n’existe pas d’option Windows Service / LocalSystem dans la version actuelle ; le chemin de code sous-jacent installe toujours une tâche planifiée, que <code>zeroclaw service install</code> soit exécuté depuis un shell avec ou sans élévation de privilèges.</p>
+<pre><code class="language-cmd">zeroclaw service install
+zeroclaw service start
+</code></pre>
+<p>Cela crée une tâche dans le Planificateur de tâches (<code>taskschd.msc</code>) sous votre compte utilisateur qui démarre à l’ouverture de session. Gérez-la via :</p>
+<pre><code class="language-cmd">zeroclaw service status
+zeroclaw service restart
+zeroclaw service stop
+zeroclaw service logs
+</code></pre>
+<blockquote>
+<p><strong>À propos de <code>--service-init</code>.</strong> La CLI expose un indicateur <code>--service-init [auto|systemd|openrc]</code> pour assurer la cohérence multiplateforme, mais sous Windows il n’a aucun effet ; le chemin de tâche planifiée est toujours utilisé.</p>
+</blockquote>
+<p>Les journaux sont enregistrés dans <code>%USERPROFILE%\.zeroclaw\logs\</code> (plus précisément, <code>&lt;config_dir&gt;/logs/</code> où <code>&lt;config_dir&gt;</code> correspond par défaut à <code>%USERPROFILE%\.zeroclaw\</code>). Le wrapper de la tâche planifiée, en revanche, se trouve à côté du fichier de configuration dans <code>%USERPROFILE%\.zeroclaw\zeroclaw-daemon.cmd</code>. Seuls les fichiers de sortie du démon (<code>daemon.stdout.log</code> / <code>daemon.stderr.log</code>) sont écrits dans <code>logs\</code>.</p>
+<blockquote>
+<p><strong>Installations serveur / multi-utilisateurs.</strong> La prise en charge native de Windows Service / LocalSystem est prévue dans la feuille de route mais pas encore implémentée. Pour l’instant, sur un serveur, installez ZeroClaw sous le compte sous lequel l’agent doit s’exécuter ; le chemin de tâche planifiée le démarrera à l’ouverture de session de cet utilisateur. Si vous avez besoin qu’il démarre avant l’ouverture de session d’un utilisateur, utilisez <strong>Planificateur de tâches → ZeroClaw Daemon → Propriétés → Général → « Exécuter que l’utilisateur soit connecté ou non ».</strong></p>
+</blockquote>
+<h2 id="mettre-à-jour"><a class="header" href="#mettre-à-jour">Mettre à jour</a></h2>
+<h3 id="manuel-chemin-de-loption-1"><a class="header" href="#manuel-chemin-de-loption-1">Manuel (chemin de l’option 1)</a></h3>
+<p>Réexécutez le bloc d’installation PowerShell de l’<strong>Option 1</strong> avec le nouveau <code>$ver</code>. Le nouveau fichier zip remplace le <code>zeroclaw.exe</code> existant sur place. Ensuite :</p>
+<pre><code class="language-powershell">zeroclaw service restart
+</code></pre>
+<h3 id="setupbat"><a class="header" href="#setupbat"><code>setup.bat</code></a></h3>
+<p>Téléchargez à nouveau la dernière version et relancez <code>setup.bat --prebuilt</code> (ou le drapeau que vous avez utilisé initialement). Ensuite :</p>
+<pre><code class="language-cmd">zeroclaw service restart
+</code></pre>
+<h3 id="scoop"><a class="header" href="#scoop">Scoop</a></h3>
+<pre><code>scoop update zeroclaw       # subject to the staleness caveat above
+zeroclaw service restart
+</code></pre>
+<h3 id="depuis-la-source"><a class="header" href="#depuis-la-source">Depuis la source</a></h3>
+<pre><code class="language-cmd">cd C:\path\to\zeroclaw
+git pull
+cargo install --locked --path . --force
+zeroclaw service restart
+</code></pre>
+<h2 id="désinstaller"><a class="header" href="#désinstaller">Désinstaller</a></h2>
+<p>Arrêter et supprimer la tâche planifiée :</p>
+<pre><code class="language-cmd">zeroclaw service stop
+zeroclaw service uninstall
+</code></pre>
+<p>Supprimer le binaire :</p>
+<pre><code class="language-cmd">:Option 1 (préfabriqué manuel) ou setup.bat
+rmdir /s /q "%USERPROFILE%\.zeroclaw\bin"
+
+:: Option 3 (cargo install)
+del "%USERPROFILE%\.cargo\bin\zeroclaw.exe"
+
+:: Option 4 (Scoop)
+scoop uninstall zeroclaw
+</code></pre>
+<p>Supprimer la configuration, l’espace de travail et les journaux (facultatif ; cela supprime l’historique des conversations) :</p>
+<pre><code class="language-cmd">rmdir /s /q "%USERPROFILE%\.zeroclaw"
+</code></pre>
+<blockquote>
+<p>La version précédente de ce document faisait référence à <code>%LOCALAPPDATA%\ZeroClaw\</code> ; ce chemin n’est <strong>pas</strong> utilisé par la version actuelle ; seul <code>%USERPROFILE%\.zeroclaw\</code> l’est.</p>
+</blockquote>
+<h2 id="pièges"><a class="header" href="#pièges">Pièges</a></h2>
+<ul>
+<li>
+<p><strong>Chemins longs.</strong> Certains systèmes de fichiers Windows limitent encore la longueur des chemins à 260 caractères. Activez la prise en charge des chemins longs si vous rencontrez des erreurs <code>path too long</code> lors d’une compilation depuis les sources :</p>
+<pre><code>reg add HKLM\SYSTEM\CurrentControlSet\Control\FileSystem /v LongPathsEnabled /t REG_DWORD /d 1 /f
+</code></pre>
+</li>
+<li>
+<p><strong>SmartScreen.</strong> Le binaire non signé peut déclencher SmartScreen lors du premier lancement depuis l’Explorateur (double-clic). Clic droit → Propriétés → « Débloquer » est la solution de contournement standard en attendant que nous ajoutions un MSI signé. Le lancement depuis PowerShell ou <code>cmd.exe</code> ne déclenche généralement pas SmartScreen.</p>
+</li>
+<li>
+<p><strong>Arrêt en cas d’inactivité/batterie du Planificateur de tâches.</strong> Par défaut, Windows peut interrompre les tâches planifiées en cas d’inactivité ou de fonctionnement sur batterie. La tâche <code>ZeroClaw Daemon</code> installée désactive ces conditions, mais si vous avez effectué l’installation à partir d’une version plus ancienne, vous pouvez le vérifier dans <strong>Planificateur de tâches → ZeroClaw Daemon → Propriétés → Conditions</strong> :</p>
+<ul>
+<li>« Démarrer la tâche uniquement si l’ordinateur est sur secteur » : décoché</li>
+<li>« Arrêter si l’ordinateur passe sur batterie » : décoché</li>
+<li>« Démarrer la tâche uniquement si l’ordinateur est inactif depuis… » : décoché</li>
+</ul>
+</li>
+<li>
+<p><strong>Authentification par mot de passe OpenSSH.</strong> Si vous pilotez Windows via SSH et que l’authentification par clé publique n’est pas acceptée, placez votre clé dans <code>C:\Users\&lt;user&gt;\.ssh\authorized_keys</code> (utilisateur standard) ou <code>C:\ProgramData\ssh\administrators_authorized_keys</code> (lorsque vous êtes connecté en tant que membre du groupe <code>Administrators</code>).</p>
+</li>
+</ul>
+<h2 id="suivant"><a class="header" href="#suivant">Suivant</a></h2>
+<ul>
+<li><a href="./service.html">Gestion des services</a></li>
+<li><a href="../getting-started/quickstart.html">Démarrage rapide</a></li>
+<li><a href="../ops/overview.html">Opérations → Vue d’ensemble</a></li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../setup/macos.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../setup/freebsd.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../setup/macos.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../setup/freebsd.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["handle_ws_nodes"],"struct":["NodeCapability","NodeInfo","NodeInvocation","NodeInvocationResult","NodeRegistry","NodeWsQuery"]};

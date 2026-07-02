@@ -1,0 +1,1634 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>提供商目录 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+            window.path_to_searchindex_js = "../searchindex-0ee61a64.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-9364d956.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="提供程序目录"><a class="header" href="#提供程序目录">提供程序目录</a></h1>
+<p>ZeroClaw 附带的每个模型提供商系列。针对每一项：配置结构、关于身份验证和端点行为的说明，以及在 <code>[providers.models.&lt;type&gt;.&lt;alias&gt;]</code> 下使用的槽位键。</p>
+<p>有关通用字段（<code>api_key</code>、<code>uri</code>、<code>model</code> 等）及其解析顺序，请参阅<a href="./configuration.html">配置</a>。</p>
+<blockquote>
+<p>以下示例使用 <code>home</code> 作为别名，以强调别名部分是由操作员自行选择的，可以使用任何合适的名称（<code>work</code>、<code>personal</code>、<code>cn</code>、<code>prod</code>……）。在 agent 中通过 <code>model_provider = "&lt;type&gt;.&lt;alias&gt;"</code> 来引用它。</p>
+</blockquote>
+<hr>
+<h2 id="原生"><a class="header" href="#原生">原生</a></h2>
+<h3 id="anthropic插槽-anthropic"><a class="header" href="#anthropic插槽-anthropic">Anthropic：插槽 <code>anthropic</code></a></h3>
+<p>支持来自 Claude Pro/Team 订阅的 OAuth 令牌（<code>sk-ant-oat*</code>），无需单独的 API 计费。支持流式传输、工具调用、视觉和推理。自定义端点（与 Anthropic 兼容的代理，例如 Z.AI 的 Anthropic API）也使用此插槽：设置 <code>uri</code> 即可覆盖。</p>
+<h3 id="openai插槽-openai"><a class="header" href="#openai插槽-openai">OpenAI：插槽 <code>openai</code></a></h3>
+<p>GPT-4o、GPT-5、o 系列推理模型。推理令牌以 <code>ReasoningDelta</code> 事件形式呈现；详见 <a href="./streaming.html">流式传输</a>。</p>
+<h3 id="openai-codex启用-requires_openai_auth--true-的-openai-槽位"><a class="header" href="#openai-codex启用-requires_openai_auth--true-的-openai-槽位">OpenAI Codex：启用 <code>requires_openai_auth = true</code> 的 <code>openai</code> 槽位</a></h3>
+<p>OpenAI Codex 订阅认证位于 <code>openai</code> 槽位中。设置 <code>wire_api = "responses"</code> 可将请求路由至 <code>POST /v1/responses</code>，设置 <code>requires_openai_auth = true</code> 可使用 Codex 订阅登录（来自 Codex CLI 自身的 <code>~/.codex/auth.json</code>），而非条目中的 <code>api_key</code> 字段。订阅路径不会读取 <code>OPENAI_API_KEY</code>；该变量仅适用于按量计费的 <code>openai</code> API 密钥模式。有关凭据模型，请参阅 <a href="./configuration.html#oauth-and-subscription-auth">Provider Configuration → OAuth and subscription auth</a>。</p>
+<h3 id="ollama插槽-ollama"><a class="header" href="#ollama插槽-ollama">Ollama：插槽 <code>ollama</code></a></h3>
+<p>通过 Ollama 原生 <code>/api/chat</code> 进行本地推理。通过 <code>format</code> 实现基于 Schema 的结构化输出。无需 API 密钥。</p>
+<h3 id="bedrock插槽-bedrock"><a class="header" href="#bedrock插槽-bedrock">Bedrock：插槽 <code>bedrock</code></a></h3>
+<h3 id="gemini插槽-gemini"><a class="header" href="#gemini插槽-gemini">Gemini：插槽 <code>gemini</code></a></h3>
+<p>Google 的 Gemini API。支持视觉和预执行的接地搜索（有关 <code>PreExecutedToolCall</code> 事件，请参阅 <a href="./streaming.html">流式传输</a>）。</p>
+<h3 id="gemini-cli插槽-gemini_cli"><a class="header" href="#gemini-cli插槽-gemini_cli">Gemini CLI：插槽 <code>gemini_cli</code></a></h3>
+<p>通过 shell 调用 <code>gemini</code> CLI；使用该 CLI 现有的身份验证。</p>
+<h3 id="azure-openai插槽-azure"><a class="header" href="#azure-openai插槽-azure">Azure OpenAI：插槽 <code>azure</code></a></h3>
+<p><code>resource</code>、<code>deployment</code> 和 <code>api_version</code> 存放在此类型化配置中，它们不会从环境变量读取。</p>
+<h3 id="copilot插槽-copilot"><a class="header" href="#copilot插槽-copilot">Copilot：插槽 <code>copilot</code></a></h3>
+<p>使用 GitHub Copilot 订阅进行 agent 推理。身份验证使用从 GitHub 获取的 Copilot OAuth 令牌。</p>
+<h3 id="telnyx插槽-telnyx"><a class="header" href="#telnyx插槽-telnyx">Telnyx：插槽 <code>telnyx</code></a></h3>
+<p>面向语音的 AI 端点。与 <code>clawdtalk</code> 通道配对，用于实时 SIP 通话。</p>
+<h3 id="kilocli插槽-kilocli"><a class="header" href="#kilocli插槽-kilocli">KiloCLI：插槽 <code>kilocli</code></a></h3>
+<p>通过 KiloCLI 进行本地推理。</p>
+<h3 id="kilo-ai-gateway插槽-kilo"><a class="header" href="#kilo-ai-gateway插槽-kilo">Kilo AI Gateway：插槽 <code>kilo</code></a></h3>
+<pre><code class="language-toml">[providers.models.kilo.home]
+model   = "anthropic/claude-sonnet-4-6"
+api_key = "..."
+# endpoint = "gateway"  # 默认 → https://api.kilo.ai/api/gateway
+</code></pre>
+<p>通过 Kilo AI Gateway 访问的 Cloud API。采用 Bearer-token 鉴权，提供多个模型层级（free、balanced、pro）。<code>/models</code> 端点是公开的（<code>PUBLIC_MODEL_LISTING</code>），因此无需凭据即可列出模型。由于它是实时查询的，它也是将定价信息带入成本费率编辑器的数据来源。共享的 models.dev 目录（<code>kilo</code> 键）仅在实时端点不可达时作为后备，且不包含定价信息。</p>
+<blockquote>
+<p><strong>命名迁移：</strong> <code>kilo</code> 现在指代此网关提供程序。KiloCLI 子进程提供程序保留其 <code>kilocli</code> 槽位（同义词 <code>kilo-cli</code>）。如果你之前在 <code>kilo</code> 简写下配置了 CLI 提供程序，请改用 <code>kilocli</code>。</p>
+</blockquote>
+<hr>
+<h2 id="所有插槽"><a class="header" href="#所有插槽">所有插槽</a></h2>
+<p>每个规范槽位、其默认端点、是否在本地运行，以及由提供方注册表和配置模式生成的完整配置字段集。点击槽位可展开其字段；点击字段可查看如何设置。没有固定默认值的槽位需要在别名条目上设置 <code>uri</code>（Azure、<code>custom</code>、多区域系列、CLI shim）。</p>
+<h3 id="共享字段"><a class="header" href="#共享字段">共享字段</a></h3>
+<p>每个提供程序槽位都接受这些字段。各提供程序特有的额外字段在下方分别列出。</p>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>api_key</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>—</code></span></summary>
+<p>此 model_provider 的密钥 API 令牌。请从 model_provider 的控制台获取（OpenAI platform、Anthropic console、OpenRouter keys 页面等）。尽可能通过操作系统密钥环存储；切勿直接将其提交到 config.toml 中。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板"><a class="header" href="#网关仪表板">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/openrouter"><code>/config/providers.models/openrouter</code></a> 并设置 <code>providers.models.openrouter.&lt;alias&gt;.api_key</code> 字段。</p>
+<h4 id="zerocode"><a class="header" href="#zerocode">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.openrouter.&lt;alias&gt;.api_key</code> 字段。</p>
+<h4 id="zeroclaw-config"><a class="header" href="#zeroclaw-config">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.openrouter.&lt;alias&gt;.api_key    # 掩码输入，加密存储
+</code></pre>
+<h4 id="环境变量"><a class="header" href="#环境变量">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__openrouter__&lt;alias&gt;__api_key=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>chat_template_kwargs</code> <span class="cfg-field-meta"><code>table</code> · default <code>—</code></span></summary>
+<p>作为请求体中的 <code>chat_template_kwargs</code> 原样转发的任意键/值对（llama.cpp 专用）。使用此项可传递模型系列的模板变量，以控制其他字段未公开的行为。示例（Qwen3 思考抑制）：<code>chat_template_kwargs = { enable_thinking = false }</code></p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-1"><a class="header" href="#网关仪表板-1">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/openrouter"><code>/config/providers.models/openrouter</code></a> 并设置 <code>providers.models.openrouter.&lt;alias&gt;.chat_template_kwargs</code> 字段。</p>
+<h4 id="zerocode-1"><a class="header" href="#zerocode-1">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.openrouter.&lt;alias&gt;.chat_template_kwargs</code> 字段。</p>
+<h4 id="zeroclaw-config-1"><a class="header" href="#zeroclaw-config-1">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.openrouter.&lt;alias&gt;.chat_template_kwargs &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-1"><a class="header" href="#环境变量-1">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__openrouter__&lt;alias&gt;__chat_template_kwargs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>extra_headers</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>—</code></span></summary>
+<p>每个请求都会附带发送的额外 HTTP 头。小众功能：用于身份验证桥接、企业代理或需要追踪头的自定义网关。大多数用户无需使用此功能；如有需要，请直接编辑 <code>config.toml</code>。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-2"><a class="header" href="#网关仪表板-2">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/openrouter"><code>/config/providers.models/openrouter</code></a> 并设置 <code>providers.models.openrouter.&lt;alias&gt;.extra_headers</code> 字段。</p>
+<h4 id="zerocode-2"><a class="header" href="#zerocode-2">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.openrouter.&lt;alias&gt;.extra_headers</code> 字段。</p>
+<h4 id="zeroclaw-config-2"><a class="header" href="#zeroclaw-config-2">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.openrouter.&lt;alias&gt;.extra_headers    # 掩码输入，加密存储
+</code></pre>
+<h4 id="环境变量-2"><a class="header" href="#环境变量-2">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__openrouter__&lt;alias&gt;__extra_headers=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>fallback</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>—</code></span></summary>
+<p>当此别名上的每个模型都失败后，按顺序尝试的其他提供方别名列表。每个条目都是指向 <code>providers.models</code> 的点分 <code>&lt;type&gt;.&lt;alias&gt;</code> 引用，并使用其自身的凭据、端点和模型进行解析。回退别名绝不会继承此别名的密钥。遍历采用深度优先方式：先用尽此别名的模型，然后依次深入每个回退别名（应用其自身的 <code>fallback_models</code> 和 <code>fallback</code>）。为空表示没有提供方级别的回退。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-3"><a class="header" href="#网关仪表板-3">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/openrouter"><code>/config/providers.models/openrouter</code></a> 并设置 <code>providers.models.openrouter.&lt;alias&gt;.fallback</code> 字段。</p>
+<h4 id="zerocode-3"><a class="header" href="#zerocode-3">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.openrouter.&lt;alias&gt;.fallback</code> 字段。</p>
+<h4 id="zeroclaw-config-3"><a class="header" href="#zeroclaw-config-3">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.openrouter.&lt;alias&gt;.fallback &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-3"><a class="header" href="#环境变量-3">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__openrouter__&lt;alias&gt;__fallback=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>fallback_models</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>—</code></span></summary>
+<p>在转向 <code>fallback</code> 别名之前，按顺序尝试当前提供方上的备用模型。使用与主 <code>model</code> 相同的端点、密钥和请求头，仅更改模型标识符。当某个提供方提供了备用模型（例如更小或更旧的变体），且应在彻底切换提供方之前先行尝试时，请使用此选项。留空则仅尝试 <code>model</code>。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-4"><a class="header" href="#网关仪表板-4">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/openrouter"><code>/config/providers.models/openrouter</code></a> 并设置 <code>providers.models.openrouter.&lt;alias&gt;.fallback_models</code> 字段。</p>
+<h4 id="zerocode-4"><a class="header" href="#zerocode-4">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.openrouter.&lt;alias&gt;.fallback_models</code> 字段。</p>
+<h4 id="zeroclaw-config-4"><a class="header" href="#zeroclaw-config-4">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.openrouter.&lt;alias&gt;.fallback_models &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-4"><a class="header" href="#环境变量-4">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__openrouter__&lt;alias&gt;__fallback_models=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>kind</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>为此配置文件实例化的 Provider 实现。当某个规范化的类型化槽位应通过兼容实现运行时使用，例如 <code>[providers.models.openai.proxy] kind = "openai-compatible"</code>。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-5"><a class="header" href="#网关仪表板-5">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/openrouter"><code>/config/providers.models/openrouter</code></a> 并设置 <code>providers.models.openrouter.&lt;alias&gt;.kind</code> 字段。</p>
+<h4 id="zerocode-5"><a class="header" href="#zerocode-5">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.openrouter.&lt;alias&gt;.kind</code> 字段。</p>
+<h4 id="zeroclaw-config-5"><a class="header" href="#zeroclaw-config-5">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.openrouter.&lt;alias&gt;.kind &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-5"><a class="header" href="#环境变量-5">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__openrouter__&lt;alias&gt;__kind=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>max_tokens</code> <span class="cfg-field-meta"><code>integer?</code> · default <code>—</code></span></summary>
+<p>响应长度的硬性上限（以 token 计）。大多数模型已内置了合理的限制；除非你出于成本或延迟方面的考虑需要裁剪过长的输出，否则请保持不设置。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-6"><a class="header" href="#网关仪表板-6">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/openrouter"><code>/config/providers.models/openrouter</code></a>，并设置 <code>providers.models.openrouter.&lt;alias&gt;.max_tokens</code> 字段。</p>
+<h4 id="zerocode-6"><a class="header" href="#zerocode-6">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.openrouter.&lt;alias&gt;.max_tokens</code> 字段。</p>
+<h4 id="zeroclaw-config-6"><a class="header" href="#zeroclaw-config-6">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.openrouter.&lt;alias&gt;.max_tokens &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-6"><a class="header" href="#环境变量-6">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__openrouter__&lt;alias&gt;__max_tokens=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>merge_system_into_user</code> <span class="cfg-field-meta"><code>bool</code> · default <code>—</code></span></summary>
+<p>ModelProvider 特定的兼容性处理：将系统提示合并到第一条用户消息中，而不是单独发送一个 system 角色。仅在模型拒绝（或错误处理）独立的 system 角色时才需要，例如某些较旧的 Mistral 变体。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-7"><a class="header" href="#网关仪表板-7">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/openrouter"><code>/config/providers.models/openrouter</code></a> 并设置 <code>providers.models.openrouter.&lt;alias&gt;.merge_system_into_user</code> 字段。</p>
+<h4 id="zerocode-7"><a class="header" href="#zerocode-7">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.openrouter.&lt;alias&gt;.merge_system_into_user</code> 字段。</p>
+<h4 id="zeroclaw-config-7"><a class="header" href="#zeroclaw-config-7">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.openrouter.&lt;alias&gt;.merge_system_into_user &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-7"><a class="header" href="#环境变量-7">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__openrouter__&lt;alias&gt;__merge_system_into_user=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>model</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>随每个请求发送的模型标识符：来自 model_provider 目录的 ID 字符串（例如 <code>gpt-4o</code>、<code>claude-sonnet-4-5</code>、<code>llama-3.3-70b</code>）。必须与 model_provider 在此账户上实际提供的模型相匹配。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-8"><a class="header" href="#网关仪表板-8">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/openrouter"><code>/config/providers.models/openrouter</code></a>，并设置 <code>providers.models.openrouter.&lt;alias&gt;.model</code> 字段。</p>
+<h4 id="zerocode-8"><a class="header" href="#zerocode-8">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.openrouter.&lt;alias&gt;.model</code> 字段。</p>
+<h4 id="zeroclaw-config-8"><a class="header" href="#zeroclaw-config-8">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.openrouter.&lt;alias&gt;.model &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-8"><a class="header" href="#环境变量-8">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__openrouter__&lt;alias&gt;__model=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>native_tools</code> <span class="cfg-field-meta"><code>bool?</code> · default <code>—</code></span></summary>
+<p>覆盖提供方的原生工具调用默认设置。<code>None</code>（默认）遵循提供方的内置选择。<code>Some(true)</code> 强制开启原生工具调用，<code>Some(false)</code> 强制使用文本回退。目前仅 Groq 工厂会参考此设置，它默认使用文本回退，因为 llama 系列的 Groq 模型会以 HTTP 400 拒绝原生工具调用。设置 <code>native_tools = true</code> 可为支持原生工具调用的 Groq 模型重新启用该功能。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-9"><a class="header" href="#网关仪表板-9">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/openrouter"><code>/config/providers.models/openrouter</code></a> 并设置 <code>providers.models.openrouter.&lt;alias&gt;.native_tools</code> 字段。</p>
+<h4 id="zerocode-9"><a class="header" href="#zerocode-9">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.openrouter.&lt;alias&gt;.native_tools</code> 字段。</p>
+<h4 id="zeroclaw-config-9"><a class="header" href="#zeroclaw-config-9">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.openrouter.&lt;alias&gt;.native_tools &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-9"><a class="header" href="#环境变量-9">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__openrouter__&lt;alias&gt;__native_tools=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>pricing</code> <span class="cfg-field-meta"><code>map</code> · default <code>—</code></span></summary>
+<p>用于成本追踪的按模型定价，单位为每 100 万 token 的美元数。自由格式的键/值映射。键为用户自定义的模型标识符；当运维人员希望区分费率时，可使用可选的 <code>.input</code> / <code>.output</code> 后缀来表示定价维度。不带后缀的裸键在未指定任一维度时用作统一的按 token 费率。默认值为空：此时成本追踪会回退到“未知”费率，仅记录 token 用量。示例：<code>pricing = { opus = 15.0, sonnet = 3.0 }</code> 或拆分：<code>pricing = { "opus.input" = 15.0, "opus.output" = 75.0 }</code></p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-10"><a class="header" href="#网关仪表板-10">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/openrouter"><code>/config/providers.models/openrouter</code></a>，并设置 <code>providers.models.openrouter.&lt;alias&gt;.pricing</code> 字段。</p>
+<h4 id="zerocode-10"><a class="header" href="#zerocode-10">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.openrouter.&lt;alias&gt;.pricing</code> 字段。</p>
+<h4 id="zeroclaw-config-10"><a class="header" href="#zeroclaw-config-10">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.openrouter.&lt;alias&gt;.pricing &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-10"><a class="header" href="#环境变量-10">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__openrouter__&lt;alias&gt;__pricing=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>provider_extra</code> <span class="cfg-field-meta"><code>table</code> · default <code>—</code></span></summary>
+<p>在 API 请求中包含的额外 JSON 参数。在请求体的顶层进行合并，从而无需修改代码即可使用特定提供商的功能（路由、转换等）。示例：<code>provider_extra = { model_provider = { only = ["Anthropic"] } }</code></p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-11"><a class="header" href="#网关仪表板-11">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/openrouter"><code>/config/providers.models/openrouter</code></a> 并设置 <code>providers.models.openrouter.&lt;alias&gt;.provider_extra</code> 字段。</p>
+<h4 id="zerocode-11"><a class="header" href="#zerocode-11">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.openrouter.&lt;alias&gt;.provider_extra</code> 字段。</p>
+<h4 id="zeroclaw-config-11"><a class="header" href="#zeroclaw-config-11">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.openrouter.&lt;alias&gt;.provider_extra &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-11"><a class="header" href="#环境变量-11">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__openrouter__&lt;alias&gt;__provider_extra=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>requires_openai_auth</code> <span class="cfg-field-meta"><code>bool</code> · default <code>—</code></span></summary>
+<p>为 true 时，客户端将从 <code>OPENAI_API_KEY</code> 或 <code>~/.codex/auth.json</code> 中获取凭据，而不是使用上面的 <code>api_key</code> 字段。仅对 OpenAI Codex model_provider 启用；对于标准 API 密钥的 model_provider 请保持关闭。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-12"><a class="header" href="#网关仪表板-12">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/openrouter"><code>/config/providers.models/openrouter</code></a> 并设置 <code>providers.models.openrouter.&lt;alias&gt;.requires_openai_auth</code> 字段。</p>
+<h4 id="zerocode-12"><a class="header" href="#zerocode-12">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.openrouter.&lt;alias&gt;.requires_openai_auth</code> 字段。</p>
+<h4 id="zeroclaw-config-12"><a class="header" href="#zeroclaw-config-12">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.openrouter.&lt;alias&gt;.requires_openai_auth &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-12"><a class="header" href="#环境变量-12">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__openrouter__&lt;alias&gt;__requires_openai_auth=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>temperature</code> <span class="cfg-field-meta"><code>number?</code> · default <code>—</code></span></summary>
+<p>传递给模型的采样温度。较低的值（0.0–0.3）会产生确定性、近乎逐字的输出，适用于代码、路由、摘要等场景。较高的值（0.7–1.2）会产生更多样化的输出，适用于开放式对话。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-13"><a class="header" href="#网关仪表板-13">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/openrouter"><code>/config/providers.models/openrouter</code></a> 并设置 <code>providers.models.openrouter.&lt;alias&gt;.temperature</code> 字段。</p>
+<h4 id="zerocode-13"><a class="header" href="#zerocode-13">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.openrouter.&lt;alias&gt;.temperature</code> 字段。</p>
+<h4 id="zeroclaw-config-13"><a class="header" href="#zeroclaw-config-13">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.openrouter.&lt;alias&gt;.temperature &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-13"><a class="header" href="#环境变量-13">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__openrouter__&lt;alias&gt;__temperature=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>think</code> <span class="cfg-field-meta"><code>bool?</code> · default <code>—</code></span></summary>
+<p>为支持思维链推理的模型（例如 Qwen3、GLM-4）启用或禁用该功能。<code>true</code> 开启思维链，<code>false</code> 关闭。<code>None</code>（默认）则由模型自行决定。在请求体中以 <code>enable_thinking</code> 转发；对应 Ollama 提供方的 <code>think</code> 字段。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-14"><a class="header" href="#网关仪表板-14">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/openrouter"><code>/config/providers.models/openrouter</code></a> 并设置 <code>providers.models.openrouter.&lt;alias&gt;.think</code> 字段。</p>
+<h4 id="zerocode-14"><a class="header" href="#zerocode-14">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.openrouter.&lt;alias&gt;.think</code> 字段。</p>
+<h4 id="zeroclaw-config-14"><a class="header" href="#zeroclaw-config-14">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.openrouter.&lt;alias&gt;.think &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-14"><a class="header" href="#环境变量-14">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__openrouter__&lt;alias&gt;__think=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>timeout_secs</code> <span class="cfg-field-meta"><code>integer?</code> · default <code>—</code></span></summary>
+<p>HTTP 请求超时时间（秒）。如果本地 model_providers 较慢（CPU 上运行的 Ollama、大型本地模型）或网络延迟较高，请调大此值；否则请保持未设置。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-15"><a class="header" href="#网关仪表板-15">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/openrouter"><code>/config/providers.models/openrouter</code></a> 并设置 <code>providers.models.openrouter.&lt;alias&gt;.timeout_secs</code> 字段。</p>
+<h4 id="zerocode-15"><a class="header" href="#zerocode-15">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.openrouter.&lt;alias&gt;.timeout_secs</code> 字段。</p>
+<h4 id="zeroclaw-config-15"><a class="header" href="#zeroclaw-config-15">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.openrouter.&lt;alias&gt;.timeout_secs &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-15"><a class="header" href="#环境变量-15">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__openrouter__&lt;alias&gt;__timeout_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>uri</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>客户端访问的端点 URI。当指向自托管网关（LiteLLM、vLLM、Ollama）、自定义代理或任何非标准 URL 时，可覆盖该系列的默认端点。保持未设置则使用该系列 <code>ModelEndpoint</code> 实现中的默认 URI。请将此项设置为完整的端点 URL；不存在单独的路径后缀字段。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-16"><a class="header" href="#网关仪表板-16">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/openrouter"><code>/config/providers.models/openrouter</code></a> 并设置 <code>providers.models.openrouter.&lt;alias&gt;.uri</code> 字段。</p>
+<h4 id="zerocode-16"><a class="header" href="#zerocode-16">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.openrouter.&lt;alias&gt;.uri</code> 字段。</p>
+<h4 id="zeroclaw-config-16"><a class="header" href="#zeroclaw-config-16">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.openrouter.&lt;alias&gt;.uri &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-16"><a class="header" href="#环境变量-16">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__openrouter__&lt;alias&gt;__uri=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>wire_api</code> <span class="cfg-field-meta"><code>`responses` \| `chat_completions`</code> · default <code>—</code></span></summary>
+<p>model_provider 客户端的传输协议类型。<code>responses</code> 通过 OpenAI 的 Codex/Responses API（<code>POST /v1/responses</code>）路由；<code>chat_completions</code> 通过传统的 <code>/v1/chat/completions</code>（或该系列兼容 chat-completions 的端点）路由。未设置时按系列自动选择。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-17"><a class="header" href="#网关仪表板-17">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/openrouter"><code>/config/providers.models/openrouter</code></a> 并设置 <code>providers.models.openrouter.&lt;alias&gt;.wire_api</code> 字段。</p>
+<h4 id="zerocode-17"><a class="header" href="#zerocode-17">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.openrouter.&lt;alias&gt;.wire_api</code> 字段。</p>
+<h4 id="zeroclaw-config-17"><a class="header" href="#zeroclaw-config-17">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.openrouter.&lt;alias&gt;.wire_api &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-17"><a class="header" href="#环境变量-17">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__openrouter__&lt;alias&gt;__wire_api=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<h3 id="主要"><a class="header" href="#主要">主要</a></h3>
+<div class="provider-fields">
+<div class="provider-row"><code>openrouter</code> <span class="provider-endpoint"><code>https://openrouter.ai/api/v1</code></span></div>
+
+<div class="provider-row"><code>anthropic</code> <span class="provider-endpoint"><code>https://api.anthropic.com</code></span></div>
+
+<div class="provider-row"><code>openai</code> <span class="provider-endpoint"><code>https://api.openai.com/v1</code></span></div>
+
+<div class="provider-row"><code>telnyx</code> <span class="provider-endpoint"><code>https://api.telnyx.com/v2/ai</code></span></div>
+
+<details class="provider-entry"><summary><code>azure</code> <span class="provider-endpoint">no fixed default</span></summary>
+<p><strong>Slot-specific fields</strong> (in addition to the shared fields above):</p>
+
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>api_version</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>Azure API 版本字符串（例如 <code>2024-10-21</code>）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-18"><a class="header" href="#网关仪表板-18">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/azure"><code>/config/providers.models/azure</code></a> 并设置 <code>providers.models.azure.&lt;alias&gt;.api_version</code> 字段。</p>
+<h4 id="zerocode-18"><a class="header" href="#zerocode-18">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.azure.&lt;alias&gt;.api_version</code> 字段。</p>
+<h4 id="zeroclaw-config-18"><a class="header" href="#zeroclaw-config-18">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.azure.&lt;alias&gt;.api_version &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-18"><a class="header" href="#环境变量-18">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__azure__&lt;alias&gt;__api_version=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>deployment</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>Azure 部署名称：在 Azure AI Studio 中创建的部署。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-19"><a class="header" href="#网关仪表板-19">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/azure"><code>/config/providers.models/azure</code></a> 并设置 <code>providers.models.azure.&lt;alias&gt;.deployment</code> 字段。</p>
+<h4 id="zerocode-19"><a class="header" href="#zerocode-19">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.azure.&lt;alias&gt;.deployment</code> 字段。</p>
+<h4 id="zeroclaw-config-19"><a class="header" href="#zeroclaw-config-19">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.azure.&lt;alias&gt;.deployment &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-19"><a class="header" href="#环境变量-19">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__azure__&lt;alias&gt;__deployment=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>resource</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>Azure 资源名称（<code>&lt;resource&gt;.openai.azure.com</code> 中的 <code>&lt;resource&gt;</code> 部分）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-20"><a class="header" href="#网关仪表板-20">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/azure"><code>/config/providers.models/azure</code></a> 并设置 <code>providers.models.azure.&lt;alias&gt;.resource</code> 字段。</p>
+<h4 id="zerocode-20"><a class="header" href="#zerocode-20">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.azure.&lt;alias&gt;.resource</code> 字段。</p>
+<h4 id="zeroclaw-config-20"><a class="header" href="#zeroclaw-config-20">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.azure.&lt;alias&gt;.resource &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-20"><a class="header" href="#环境变量-20">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__azure__&lt;alias&gt;__resource=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+</details>
+<details class="provider-entry"><summary><code>ollama</code> <span class="provider-endpoint"><code>http://localhost:11434</code> · local</span></summary>
+<p><strong>Slot-specific fields</strong> (in addition to the shared fields above):</p>
+
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>num_ctx</code> <span class="cfg-field-meta"><code>integer?</code> · default <code>—</code></span></summary>
+<p>覆盖每次 <code>/api/chat</code> 请求中发送的 Ollama <code>num_ctx</code>（上下文窗口，以 token 为单位）。未设置时默认使用框架常量（<code>OLLAMA_DEFAULT_NUM_CTX</code>）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-21"><a class="header" href="#网关仪表板-21">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/ollama"><code>/config/providers.models/ollama</code></a> 并设置 <code>providers.models.ollama.&lt;alias&gt;.num_ctx</code> 字段。</p>
+<h4 id="zerocode-21"><a class="header" href="#zerocode-21">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.ollama.&lt;alias&gt;.num_ctx</code> 字段。</p>
+<h4 id="zeroclaw-config-21"><a class="header" href="#zeroclaw-config-21">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.ollama.&lt;alias&gt;.num_ctx &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-21"><a class="header" href="#环境变量-21">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__ollama__&lt;alias&gt;__num_ctx=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>num_predict</code> <span class="cfg-field-meta"><code>integer?</code> · default <code>—</code></span></summary>
+<p>覆盖每次 <code>/api/chat</code> 请求中发送的 Ollama <code>num_predict</code>（最大输出 token 数）。未设置时默认使用框架常量（<code>OLLAMA_DEFAULT_NUM_PREDICT</code>）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-22"><a class="header" href="#网关仪表板-22">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/ollama"><code>/config/providers.models/ollama</code></a> 并设置 <code>providers.models.ollama.&lt;alias&gt;.num_predict</code> 字段。</p>
+<h4 id="zerocode-22"><a class="header" href="#zerocode-22">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.ollama.&lt;alias&gt;.num_predict</code> 字段。</p>
+<h4 id="zeroclaw-config-22"><a class="header" href="#zeroclaw-config-22">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.ollama.&lt;alias&gt;.num_predict &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-22"><a class="header" href="#环境变量-22">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__ollama__&lt;alias&gt;__num_predict=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>temperature_override</code> <span class="cfg-field-meta"><code>number?</code> · default <code>—</code></span></summary>
+<p>强制每个 Ollama <code>/api/chat</code> 请求使用此温度值，覆盖通过 <code>ModelProvider::chat_with_system(.., temperature)</code> 传入的每次调用的值。当未设置时（<code>None</code>，默认值），每次调用的温度值生效：完全向后兼容。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-23"><a class="header" href="#网关仪表板-23">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/ollama"><code>/config/providers.models/ollama</code></a> 并设置 <code>providers.models.ollama.&lt;alias&gt;.temperature_override</code> 字段。</p>
+<h4 id="zerocode-23"><a class="header" href="#zerocode-23">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.ollama.&lt;alias&gt;.temperature_override</code> 字段。</p>
+<h4 id="zeroclaw-config-23"><a class="header" href="#zeroclaw-config-23">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.ollama.&lt;alias&gt;.temperature_override &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-23"><a class="header" href="#环境变量-23">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__ollama__&lt;alias&gt;__temperature_override=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+</details>
+<details class="provider-entry"><summary><code>gemini</code> <span class="provider-endpoint"><code>https://generativelanguage.googleapis.com/v1beta</code></span></summary>
+<p><strong>Slot-specific fields</strong> (in addition to the shared fields above):</p>
+
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>auth_mode</code> <span class="cfg-field-meta"><code>table</code> · default <code>—</code></span></summary>
+<p>支持多种认证方式的 model_provider 系列所采用的认证模式（例如 Qwen、Minimax 可使用 API key 或 OAuth）。仅支持单一认证流程的系列只需在其配置结构体中省略此字段即可。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-24"><a class="header" href="#网关仪表板-24">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/gemini"><code>/config/providers.models/gemini</code></a> 并设置 <code>providers.models.gemini.&lt;alias&gt;.auth_mode</code> 字段。</p>
+<h4 id="zerocode-24"><a class="header" href="#zerocode-24">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.gemini.&lt;alias&gt;.auth_mode</code> 字段。</p>
+<h4 id="zeroclaw-config-24"><a class="header" href="#zeroclaw-config-24">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.gemini.&lt;alias&gt;.auth_mode &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-24"><a class="header" href="#环境变量-24">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__gemini__&lt;alias&gt;__auth_mode=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>oauth_client_id</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>Google OAuth 应用的 <code>client_id</code>，当此别名驱动 ZeroClaw 自身的浏览器/设备代码登录流程时使用（<code>zeroclaw auth login --model-provider gemini --profile &lt;alias&gt;</code>）。依赖上游 <code>gemini login</code> 工具的运维人员不需要此项；该工具会将自己的 client_id / client_secret 写入 <code>~/.gemini/oauth_creds.json</code>。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-25"><a class="header" href="#网关仪表板-25">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/gemini"><code>/config/providers.models/gemini</code></a> 并设置 <code>providers.models.gemini.&lt;alias&gt;.oauth_client_id</code> 字段。</p>
+<h4 id="zerocode-25"><a class="header" href="#zerocode-25">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.gemini.&lt;alias&gt;.oauth_client_id</code> 字段。</p>
+<h4 id="zeroclaw-config-25"><a class="header" href="#zeroclaw-config-25">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.gemini.&lt;alias&gt;.oauth_client_id &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-25"><a class="header" href="#环境变量-25">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__gemini__&lt;alias&gt;__oauth_client_id=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>oauth_client_secret</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>Google OAuth 应用的 <code>client_secret</code>。与 <code>oauth_client_id</code> 一同设置。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-26"><a class="header" href="#网关仪表板-26">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/gemini"><code>/config/providers.models/gemini</code></a> 并设置 <code>providers.models.gemini.&lt;alias&gt;.oauth_client_secret</code> 字段。</p>
+<h4 id="zerocode-26"><a class="header" href="#zerocode-26">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.gemini.&lt;alias&gt;.oauth_client_secret</code> 字段。</p>
+<h4 id="zeroclaw-config-26"><a class="header" href="#zeroclaw-config-26">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.gemini.&lt;alias&gt;.oauth_client_secret &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-26"><a class="header" href="#环境变量-26">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__gemini__&lt;alias&gt;__oauth_client_secret=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>oauth_project</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>为 OAuth <code>loadCodeAssist</code> 发现调用固定指定的 GCP 项目 ID。未设置时，发现过程会在凭据所属账户上探测已加入的项目。替代 <code>GOOGLE_CLOUD_PROJECT</code> / <code>GOOGLE_CLOUD_PROJECT_ID</code> 环境变量。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-27"><a class="header" href="#网关仪表板-27">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/gemini"><code>/config/providers.models/gemini</code></a> 并设置 <code>providers.models.gemini.&lt;alias&gt;.oauth_project</code> 字段。</p>
+<h4 id="zerocode-27"><a class="header" href="#zerocode-27">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.gemini.&lt;alias&gt;.oauth_project</code> 字段。</p>
+<h4 id="zeroclaw-config-27"><a class="header" href="#zeroclaw-config-27">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.gemini.&lt;alias&gt;.oauth_project &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-27"><a class="header" href="#环境变量-27">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__gemini__&lt;alias&gt;__oauth_project=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+</details>
+</div>
+
+<h3 id="openai-兼容"><a class="header" href="#openai-兼容">OpenAI 兼容</a></h3>
+<div class="provider-fields">
+<div class="provider-row"><code>venice</code> <span class="provider-endpoint">no fixed default</span></div>
+
+<div class="provider-row"><code>vercel</code> <span class="provider-endpoint"><code>https://ai-gateway.vercel.sh/v1</code></span></div>
+
+<div class="provider-row"><code>cloudflare</code> <span class="provider-endpoint"><code>https://gateway.ai.cloudflare.com/v1</code></span></div>
+
+<details class="provider-entry"><summary><code>moonshot</code> <span class="provider-endpoint">no fixed default</span></summary>
+<p><strong>Slot-specific fields</strong> (in addition to the shared fields above):</p>
+
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>endpoint</code> <span class="cfg-field-meta"><code>table</code> · default <code>—</code></span></summary>
+<p>Moonshot 端点变体。运维人员选择与其账户匹配的区域；除非通过 <code>base.uri</code> 覆盖，否则运行时会根据所选变体解析 URI。Code 变体仅支持国际版（intl-only）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-28"><a class="header" href="#网关仪表板-28">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/moonshot"><code>/config/providers.models/moonshot</code></a> 并设置 <code>providers.models.moonshot.&lt;alias&gt;.endpoint</code> 字段。</p>
+<h4 id="zerocode-28"><a class="header" href="#zerocode-28">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.moonshot.&lt;alias&gt;.endpoint</code> 字段。</p>
+<h4 id="zeroclaw-config-28"><a class="header" href="#zeroclaw-config-28">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.moonshot.&lt;alias&gt;.endpoint &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-28"><a class="header" href="#环境变量-28">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__moonshot__&lt;alias&gt;__endpoint=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+</details>
+<div class="provider-row"><code>synthetic</code> <span class="provider-endpoint"><code>https://api.synthetic.new/openai/v1</code></span></div>
+
+<div class="provider-row"><code>opencode</code> <span class="provider-endpoint"><code>https://opencode.ai/zen/v1</code></span></div>
+
+<details class="provider-entry"><summary><code>zai</code> <span class="provider-endpoint">no fixed default</span></summary>
+<p><strong>Slot-specific fields</strong> (in addition to the shared fields above):</p>
+
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>endpoint</code> <span class="cfg-field-meta"><code>`cn` \| `global`</code> · default <code>—</code></span></summary>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-29"><a class="header" href="#网关仪表板-29">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/zai"><code>/config/providers.models/zai</code></a> 并设置 <code>providers.models.zai.&lt;alias&gt;.endpoint</code> 字段。</p>
+<h4 id="zerocode-29"><a class="header" href="#zerocode-29">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.zai.&lt;alias&gt;.endpoint</code> 字段。</p>
+<h4 id="zeroclaw-config-29"><a class="header" href="#zeroclaw-config-29">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.zai.&lt;alias&gt;.endpoint &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-29"><a class="header" href="#环境变量-29">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__zai__&lt;alias&gt;__endpoint=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+</details>
+<details class="provider-entry"><summary><code>glm</code> <span class="provider-endpoint">no fixed default</span></summary>
+<p><strong>Slot-specific fields</strong> (in addition to the shared fields above):</p>
+
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>endpoint</code> <span class="cfg-field-meta"><code>`cn` \| `global`</code> · default <code>—</code></span></summary>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-30"><a class="header" href="#网关仪表板-30">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/glm"><code>/config/providers.models/glm</code></a> 并设置 <code>providers.models.glm.&lt;alias&gt;.endpoint</code> 字段。</p>
+<h4 id="zerocode-30"><a class="header" href="#zerocode-30">zerocode</a></h4>
+<p>在<strong>Config</strong>窗格中，设置 <code>providers.models.glm.&lt;alias&gt;.endpoint</code> 字段。</p>
+<h4 id="zeroclaw-config-30"><a class="header" href="#zeroclaw-config-30">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.glm.&lt;alias&gt;.endpoint &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-30"><a class="header" href="#环境变量-30">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__glm__&lt;alias&gt;__endpoint=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+</details>
+<details class="provider-entry"><summary><code>minimax</code> <span class="provider-endpoint">no fixed default</span></summary>
+<p><strong>Slot-specific fields</strong> (in addition to the shared fields above):</p>
+
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>auth_mode</code> <span class="cfg-field-meta"><code>table</code> · default <code>—</code></span></summary>
+<p>支持多种认证方式的 model_provider 系列所采用的认证模式（例如 Qwen、Minimax 可使用 API key 或 OAuth）。仅支持单一认证流程的系列只需在其配置结构体中省略此字段即可。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-31"><a class="header" href="#网关仪表板-31">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/minimax"><code>/config/providers.models/minimax</code></a> 并设置 <code>providers.models.minimax.&lt;alias&gt;.auth_mode</code> 字段。</p>
+<h4 id="zerocode-31"><a class="header" href="#zerocode-31">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.minimax.&lt;alias&gt;.auth_mode</code> 字段。</p>
+<h4 id="zeroclaw-config-31"><a class="header" href="#zeroclaw-config-31">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.minimax.&lt;alias&gt;.auth_mode &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-31"><a class="header" href="#环境变量-31">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__minimax__&lt;alias&gt;__auth_mode=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>endpoint</code> <span class="cfg-field-meta"><code>`cn` \| `intl`</code> · default <code>—</code></span></summary>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-32"><a class="header" href="#网关仪表板-32">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/minimax"><code>/config/providers.models/minimax</code></a> 并设置 <code>providers.models.minimax.&lt;alias&gt;.endpoint</code> 字段。</p>
+<h4 id="zerocode-32"><a class="header" href="#zerocode-32">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.minimax.&lt;alias&gt;.endpoint</code> 字段。</p>
+<h4 id="zeroclaw-config-32"><a class="header" href="#zeroclaw-config-32">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.minimax.&lt;alias&gt;.endpoint &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-32"><a class="header" href="#环境变量-32">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__minimax__&lt;alias&gt;__endpoint=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>oauth_client_id</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>覆盖 MiniMax 发布的 OAuth client_id。大多数运营者应保持此项未设置；运行时默认使用供应商发布的 client_id（与 MiniMax 自己门户使用的相同）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-33"><a class="header" href="#网关仪表板-33">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/minimax"><code>/config/providers.models/minimax</code></a> 并设置 <code>providers.models.minimax.&lt;alias&gt;.oauth_client_id</code> 字段。</p>
+<h4 id="zerocode-33"><a class="header" href="#zerocode-33">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.minimax.&lt;alias&gt;.oauth_client_id</code> 字段。</p>
+<h4 id="zeroclaw-config-33"><a class="header" href="#zeroclaw-config-33">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.minimax.&lt;alias&gt;.oauth_client_id &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-33"><a class="header" href="#环境变量-33">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__minimax__&lt;alias&gt;__oauth_client_id=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>oauth_refresh_token</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>由 MiniMax 颁发的长期有效 OAuth 刷新令牌。设置后，运行时会在构建 provider 时用它换取一个短期有效的访问令牌，并将该令牌用作 API 凭据。如果操作员更倾向于使用控制台生成的长期有效 API 密钥，则可以将此项留空，直接填写 <code>api_key</code>。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-34"><a class="header" href="#网关仪表板-34">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/minimax"><code>/config/providers.models/minimax</code></a> 并设置 <code>providers.models.minimax.&lt;alias&gt;.oauth_refresh_token</code> 字段。</p>
+<h4 id="zerocode-34"><a class="header" href="#zerocode-34">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.minimax.&lt;alias&gt;.oauth_refresh_token</code> 字段。</p>
+<h4 id="zeroclaw-config-34"><a class="header" href="#zeroclaw-config-34">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.minimax.&lt;alias&gt;.oauth_refresh_token &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-34"><a class="header" href="#环境变量-34">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__minimax__&lt;alias&gt;__oauth_refresh_token=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+</details>
+<details class="provider-entry"><summary><code>bedrock</code> <span class="provider-endpoint">no fixed default</span></summary>
+<p><strong>Slot-specific fields</strong> (in addition to the shared fields above):</p>
+
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>region</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>用于 Bedrock 端点的 AWS 区域（例如 <code>us-east-1</code>、<code>eu-west-1</code>）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-35"><a class="header" href="#网关仪表板-35">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/bedrock"><code>/config/providers.models/bedrock</code></a> 并设置 <code>providers.models.bedrock.&lt;alias&gt;.region</code> 字段。</p>
+<h4 id="zerocode-35"><a class="header" href="#zerocode-35">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.bedrock.&lt;alias&gt;.region</code> 字段。</p>
+<h4 id="zeroclaw-config-35"><a class="header" href="#zeroclaw-config-35">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.bedrock.&lt;alias&gt;.region &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-35"><a class="header" href="#环境变量-35">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__bedrock__&lt;alias&gt;__region=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+</details>
+<div class="provider-row"><code>qianfan</code> <span class="provider-endpoint">no fixed default</span></div>
+
+<div class="provider-row"><code>doubao</code> <span class="provider-endpoint"><code>https://ark.cn-beijing.volces.com/api/v3</code></span></div>
+
+<details class="provider-entry"><summary><code>qwen</code> <span class="provider-endpoint">no fixed default</span></summary>
+<p><strong>Slot-specific fields</strong> (in addition to the shared fields above):</p>
+
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>auth_mode</code> <span class="cfg-field-meta"><code>table</code> · default <code>—</code></span></summary>
+<p>支持多种认证方式的 model_provider 系列所采用的认证模式（例如 Qwen、Minimax 可使用 API key 或 OAuth）。仅支持单一认证流程的系列只需在其配置结构体中省略此字段即可。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-36"><a class="header" href="#网关仪表板-36">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/qwen"><code>/config/providers.models/qwen</code></a> 并设置 <code>providers.models.qwen.&lt;alias&gt;.auth_mode</code> 字段。</p>
+<h4 id="zerocode-36"><a class="header" href="#zerocode-36">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.qwen.&lt;alias&gt;.auth_mode</code> 字段。</p>
+<h4 id="zeroclaw-config-36"><a class="header" href="#zeroclaw-config-36">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.qwen.&lt;alias&gt;.auth_mode &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-36"><a class="header" href="#环境变量-36">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__qwen__&lt;alias&gt;__auth_mode=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>endpoint</code> <span class="cfg-field-meta"><code>table</code> · default <code>—</code></span></summary>
+<p>Qwen 端点变体。运营人员选择与其账户匹配的区域。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-37"><a class="header" href="#网关仪表板-37">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/qwen"><code>/config/providers.models/qwen</code></a> 并设置 <code>providers.models.qwen.&lt;alias&gt;.endpoint</code> 字段。</p>
+<h4 id="zerocode-37"><a class="header" href="#zerocode-37">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.qwen.&lt;alias&gt;.endpoint</code> 字段。</p>
+<h4 id="zeroclaw-config-37"><a class="header" href="#zeroclaw-config-37">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.qwen.&lt;alias&gt;.endpoint &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-37"><a class="header" href="#环境变量-37">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__qwen__&lt;alias&gt;__endpoint=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>oauth_client_id</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>覆盖 Qwen 发布的 OAuth client_id。大多数运维人员应保持此项不设置。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-38"><a class="header" href="#网关仪表板-38">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/qwen"><code>/config/providers.models/qwen</code></a> 并设置 <code>providers.models.qwen.&lt;alias&gt;.oauth_client_id</code> 字段。</p>
+<h4 id="zerocode-38"><a class="header" href="#zerocode-38">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.qwen.&lt;alias&gt;.oauth_client_id</code> 字段。</p>
+<h4 id="zeroclaw-config-38"><a class="header" href="#zeroclaw-config-38">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.qwen.&lt;alias&gt;.oauth_client_id &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-38"><a class="header" href="#环境变量-38">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__qwen__&lt;alias&gt;__oauth_client_id=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>oauth_refresh_token</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>长期有效的 Qwen OAuth 刷新令牌。设置后，运行时会在 provider 构建时将其交换为短期有效的访问令牌。依赖上游 <code>qwen login</code> 工具（该工具会写入 <code>~/.qwen/oauth_creds.json</code>）的操作者请保持此项未设置；此时将由文件缓存集成接管。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-39"><a class="header" href="#网关仪表板-39">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/qwen"><code>/config/providers.models/qwen</code></a> 并设置 <code>providers.models.qwen.&lt;alias&gt;.oauth_refresh_token</code> 字段。</p>
+<h4 id="zerocode-39"><a class="header" href="#zerocode-39">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.qwen.&lt;alias&gt;.oauth_refresh_token</code> 字段。</p>
+<h4 id="zeroclaw-config-39"><a class="header" href="#zeroclaw-config-39">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.qwen.&lt;alias&gt;.oauth_refresh_token &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-39"><a class="header" href="#环境变量-39">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__qwen__&lt;alias&gt;__oauth_refresh_token=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>oauth_resource_url</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>运维人员可覆盖刷新后的访问令牌所配对的资源 URL。未设置时，运行时将回退到由 <code>endpoint</code> 派生的 URL（或在从 <code>~/.qwen/oauth_creds.json</code> 读取时使用缓存的 <code>resource_url</code>）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-40"><a class="header" href="#网关仪表板-40">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/qwen"><code>/config/providers.models/qwen</code></a> 并设置 <code>providers.models.qwen.&lt;alias&gt;.oauth_resource_url</code> 字段。</p>
+<h4 id="zerocode-40"><a class="header" href="#zerocode-40">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.qwen.&lt;alias&gt;.oauth_resource_url</code> 字段。</p>
+<h4 id="zeroclaw-config-40"><a class="header" href="#zeroclaw-config-40">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.qwen.&lt;alias&gt;.oauth_resource_url &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-40"><a class="header" href="#环境变量-40">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__qwen__&lt;alias&gt;__oauth_resource_url=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+</details>
+<div class="provider-row"><code>groq</code> <span class="provider-endpoint">no fixed default</span></div>
+
+<div class="provider-row"><code>mistral</code> <span class="provider-endpoint"><code>https://api.mistral.ai/v1</code></span></div>
+
+<div class="provider-row"><code>xai</code> <span class="provider-endpoint">no fixed default</span></div>
+
+<div class="provider-row"><code>deepseek</code> <span class="provider-endpoint"><code>https://api.deepseek.com</code></span></div>
+
+<div class="provider-row"><code>together</code> <span class="provider-endpoint"><code>https://api.together.xyz</code></span></div>
+
+<div class="provider-row"><code>fireworks</code> <span class="provider-endpoint"><code>https://api.fireworks.ai/inference/v1</code></span></div>
+
+<div class="provider-row"><code>novita</code> <span class="provider-endpoint"><code>https://api.novita.ai/openai</code></span></div>
+
+<div class="provider-row"><code>perplexity</code> <span class="provider-endpoint"><code>https://api.perplexity.ai</code></span></div>
+
+<div class="provider-row"><code>cohere</code> <span class="provider-endpoint"><code>https://api.cohere.com/compatibility</code></span></div>
+
+<div class="provider-row"><code>copilot</code> <span class="provider-endpoint">no fixed default</span></div>
+
+<details class="provider-entry"><summary><code>gemini_cli</code> <span class="provider-endpoint">no fixed default · local</span></summary>
+<p><strong>Slot-specific fields</strong> (in addition to the shared fields above):</p>
+
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>binary_path</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p><code>gemini</code> CLI 二进制文件的路径。回退到 <code>gemini</code>（PATH 查找）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-41"><a class="header" href="#网关仪表板-41">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/gemini_cli"><code>/config/providers.models/gemini_cli</code></a> 并设置 <code>providers.models.gemini_cli.&lt;alias&gt;.binary_path</code> 字段。</p>
+<h4 id="zerocode-41"><a class="header" href="#zerocode-41">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.gemini_cli.&lt;alias&gt;.binary_path</code> 字段。</p>
+<h4 id="zeroclaw-config-41"><a class="header" href="#zeroclaw-config-41">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.gemini_cli.&lt;alias&gt;.binary_path &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-41"><a class="header" href="#环境变量-41">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__gemini_cli__&lt;alias&gt;__binary_path=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+</details>
+<details class="provider-entry"><summary><code>kilocli</code> <span class="provider-endpoint">no fixed default · local</span></summary>
+<p><strong>Slot-specific fields</strong> (in addition to the shared fields above):</p>
+
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>binary_path</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p><code>kilo</code> CLI 二进制文件的路径。回退到 <code>kilo</code>（PATH 查找）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-42"><a class="header" href="#网关仪表板-42">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/kilocli"><code>/config/providers.models/kilocli</code></a> 并设置 <code>providers.models.kilocli.&lt;alias&gt;.binary_path</code> 字段。</p>
+<h4 id="zerocode-42"><a class="header" href="#zerocode-42">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.kilocli.&lt;alias&gt;.binary_path</code> 字段。</p>
+<h4 id="zeroclaw-config-42"><a class="header" href="#zeroclaw-config-42">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.kilocli.&lt;alias&gt;.binary_path &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-42"><a class="header" href="#环境变量-42">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__kilocli__&lt;alias&gt;__binary_path=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+</details>
+<details class="provider-entry"><summary><code>kilo</code> <span class="provider-endpoint">no fixed default</span></summary>
+<p><strong>Slot-specific fields</strong> (in addition to the shared fields above):</p>
+
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>endpoint</code> <span class="cfg-field-meta"><code>`gateway`</code> · default <code>—</code></span></summary>
+<p>Kilo AI Gateway 端点。位于 kilo.ai 的单一规范端点。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-43"><a class="header" href="#网关仪表板-43">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/kilo"><code>/config/providers.models/kilo</code></a> 并设置 <code>providers.models.kilo.&lt;alias&gt;.endpoint</code> 字段。</p>
+<h4 id="zerocode-43"><a class="header" href="#zerocode-43">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.kilo.&lt;alias&gt;.endpoint</code> 字段。</p>
+<h4 id="zeroclaw-config-43"><a class="header" href="#zeroclaw-config-43">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.kilo.&lt;alias&gt;.endpoint &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-43"><a class="header" href="#环境变量-43">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__kilo__&lt;alias&gt;__endpoint=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+</details>
+<div class="provider-row"><code>lmstudio</code> <span class="provider-endpoint">no fixed default · local</span></div>
+
+<div class="provider-row"><code>llamacpp</code> <span class="provider-endpoint">no fixed default · local</span></div>
+
+<div class="provider-row"><code>sglang</code> <span class="provider-endpoint"><code>http://localhost:30000/v1</code> · local</span></div>
+
+<div class="provider-row"><code>vllm</code> <span class="provider-endpoint"><code>http://localhost:8000/v1</code> · local</span></div>
+
+<div class="provider-row"><code>osaurus</code> <span class="provider-endpoint">no fixed default · local</span></div>
+
+<div class="provider-row"><code>nvidia</code> <span class="provider-endpoint">no fixed default</span></div>
+
+<div class="provider-row"><code>siliconflow</code> <span class="provider-endpoint"><code>https://api.siliconflow.com/v1</code></span></div>
+
+<div class="provider-row"><code>aihubmix</code> <span class="provider-endpoint"><code>https://aihubmix.com/v1</code></span></div>
+
+<div class="provider-row"><code>litellm</code> <span class="provider-endpoint"><code>http://localhost:4000/v1</code></span></div>
+
+<div class="provider-row"><code>atomic_chat</code> <span class="provider-endpoint">no fixed default · local</span></div>
+
+<div class="provider-row"><code>astrai</code> <span class="provider-endpoint"><code>https://as-trai.com/v1</code></span></div>
+
+<div class="provider-row"><code>deepmyst</code> <span class="provider-endpoint">no fixed default</span></div>
+
+<div class="provider-row"><code>morph</code> <span class="provider-endpoint"><code>https://api.morphllm.com/v1</code></span></div>
+
+<div class="provider-row"><code>github_models</code> <span class="provider-endpoint"><code>https://models.github.ai/inference</code></span></div>
+
+<div class="provider-row"><code>upstage</code> <span class="provider-endpoint"><code>https://api.upstage.ai/v1</code></span></div>
+
+<div class="provider-row"><code>featherless</code> <span class="provider-endpoint"><code>https://api.featherless.ai/v1</code></span></div>
+
+<div class="provider-row"><code>arcee</code> <span class="provider-endpoint"><code>https://api.arcee.ai/api/v1</code></span></div>
+
+<div class="provider-row"><code>lambda_ai</code> <span class="provider-endpoint"><code>https://api.lambda.ai/v1</code></span></div>
+
+<div class="provider-row"><code>inception</code> <span class="provider-endpoint"><code>https://api.inceptionlabs.ai/v1</code></span></div>
+
+<div class="provider-row"><code>custom</code> <span class="provider-endpoint">no fixed default</span></div>
+
+</div>
+
+<h3 id="快速推理"><a class="header" href="#快速推理">快速推理</a></h3>
+<div class="provider-fields">
+<div class="provider-row"><code>cerebras</code> <span class="provider-endpoint"><code>https://api.cerebras.ai/v1</code></span></div>
+
+<div class="provider-row"><code>sambanova</code> <span class="provider-endpoint"><code>https://api.sambanova.ai/v1</code></span></div>
+
+<div class="provider-row"><code>hyperbolic</code> <span class="provider-endpoint"><code>https://api.hyperbolic.xyz/v1</code></span></div>
+
+</div>
+
+<h3 id="模型托管平台"><a class="header" href="#模型托管平台">模型托管平台</a></h3>
+<div class="provider-fields">
+<div class="provider-row"><code>deepinfra</code> <span class="provider-endpoint"><code>https://api.deepinfra.com/v1/openai</code></span></div>
+
+<div class="provider-row"><code>huggingface</code> <span class="provider-endpoint"><code>https://router.huggingface.co/v1</code></span></div>
+
+<div class="provider-row"><code>ai21</code> <span class="provider-endpoint"><code>https://api.ai21.com/studio/v1</code></span></div>
+
+<div class="provider-row"><code>reka</code> <span class="provider-endpoint"><code>https://api.reka.ai/v1</code></span></div>
+
+<div class="provider-row"><code>baseten</code> <span class="provider-endpoint"><code>https://inference.baseten.co/v1</code></span></div>
+
+<div class="provider-row"><code>nscale</code> <span class="provider-endpoint"><code>https://inference.api.nscale.com/v1</code></span></div>
+
+<div class="provider-row"><code>anyscale</code> <span class="provider-endpoint"><code>https://api.endpoints.anyscale.com/v1</code></span></div>
+
+<div class="provider-row"><code>nebius</code> <span class="provider-endpoint"><code>https://api.studio.nebius.ai/v1</code></span></div>
+
+<div class="provider-row"><code>friendli</code> <span class="provider-endpoint"><code>https://api.friendli.ai/serverless/v1</code></span></div>
+
+<div class="provider-row"><code>lepton</code> <span class="provider-endpoint"><code>https://llama3-1-405b.lepton.run/api/v1</code></span></div>
+
+</div>
+
+<h3 id="中文-ai"><a class="header" href="#中文-ai">中文 AI</a></h3>
+<div class="provider-fields">
+<details class="provider-entry"><summary><code>stepfun</code> <span class="provider-endpoint">no fixed default</span></summary>
+<p><strong>Slot-specific fields</strong> (in addition to the shared fields above):</p>
+
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>endpoint</code> <span class="cfg-field-meta"><code>table</code> · default <code>—</code></span></summary>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-44"><a class="header" href="#网关仪表板-44">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/stepfun"><code>/config/providers.models/stepfun</code></a> 并设置 <code>providers.models.stepfun.&lt;alias&gt;.endpoint</code> 字段。</p>
+<h4 id="zerocode-44"><a class="header" href="#zerocode-44">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.stepfun.&lt;alias&gt;.endpoint</code> 字段。</p>
+<h4 id="zeroclaw-config-44"><a class="header" href="#zeroclaw-config-44">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.stepfun.&lt;alias&gt;.endpoint &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-44"><a class="header" href="#环境变量-44">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__stepfun__&lt;alias&gt;__endpoint=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+</details>
+<div class="provider-row"><code>baichuan</code> <span class="provider-endpoint"><code>https://api.baichuan-ai.com/v1</code></span></div>
+
+<div class="provider-row"><code>yi</code> <span class="provider-endpoint"><code>https://api.lingyiwanwu.com/v1</code></span></div>
+
+<div class="provider-row"><code>hunyuan</code> <span class="provider-endpoint">no fixed default</span></div>
+
+</div>
+
+<h3 id="云-ai-端点"><a class="header" href="#云-ai-端点">云 AI 端点</a></h3>
+<div class="provider-fields">
+<div class="provider-row"><code>ovh</code> <span class="provider-endpoint">no fixed default</span></div>
+
+<div class="provider-row"><code>avian</code> <span class="provider-endpoint">no fixed default</span></div>
+
+</div>
+
+<p>有关每个系列的实例演示，请参阅<a href="./configuration.html">配置</a>。如果列表中没有你的供应商，请使用 <code>custom</code> 槽位（<a href="./custom.html">自定义供应商</a>）。</p>
+<h3 id="实战示例morphgithub-modelsupstagefeatherlessarceelambda-aiinception"><a class="header" href="#实战示例morphgithub-modelsupstagefeatherlessarceelambda-aiinception">实战示例：Morph、GitHub Models、Upstage、Featherless、Arcee、Lambda AI、Inception</a></h3>
+<p>以下每一项都是标准的 OpenAI 兼容槽位：设置 <code>model</code> 和 <code>api_key</code>，并省略 <code>uri</code>（由所选类型的端点自动提供）。它们均不附带公开的模型索引，因此在你粘贴凭据之前，模型选择器将保持为空。一旦设置了密钥，ZeroClaw 就会从该提供商的实时 <code>/models</code> 端点列出模型。下方的模型 ID 仅作示例，请在供应商的控制台中确认当前的目录。</p>
+<p><strong>Morph</strong>：插槽 <code>morph</code>。快速应用编辑模型（<code>morph-v3-large</code>、<code>morph-v3-fast</code> 或 <code>auto</code>）。密钥来自 <a href="https://morphllm.com">Morph dashboard</a>。</p>
+<p><strong>GitHub Models</strong>：插槽 <code>github_models</code>（别名 <code>github-models</code>）。通过单个 GitHub 个人访问令牌即可使用 OpenAI / Meta / Microsoft 模型。创建一个具有 <strong><code>models</code></strong> 权限的 PAT（细粒度）；Copilot 令牌与此_并非_同一种凭据。模型 ID 带有发布者前缀（例如 <code>openai/gpt-4o</code>）。</p>
+<p><strong>Upstage</strong>：插槽 <code>upstage</code>。Solar Pro / Solar Mini（例如 <code>solar-pro2</code>）。密钥从 <a href="https://console.upstage.ai/api-keys">Upstage 控制台</a>获取。</p>
+<p><strong>Featherless</strong>：插槽 <code>featherless</code>。无服务器开放权重模型，通过其 Hugging Face 仓库 ID 进行寻址（例如 <code>meta-llama/Meta-Llama-3.1-8B-Instruct</code>）。密钥来自 <a href="https://featherless.ai">featherless.ai</a>。</p>
+<p><strong>Arcee</strong>：插槽 <code>arcee</code>。原生模型包括 <code>conductor</code>、<code>maestro</code>、<code>virtuoso-large</code>、<code>coder-large</code> 和 <code>blitz</code>。密钥来自 <a href="https://www.arcee.ai">Arcee 平台</a>。Arcee 的平台 API 使用非标准的 <code>/api/v1</code> 基础路径；类型化端点已经考虑到这一点，因此仍然保持不设置 <code>uri</code>。</p>
+<p><strong>Lambda AI</strong>：插槽 <code>lambda_ai</code>（别名 <code>lambda-ai</code>）。Lambda 托管推理服务（例如 <code>hermes3-405b</code>）。密钥可从 <a href="https://cloud.lambda.ai">Lambda Cloud</a> 的 API 密钥页面获取。</p>
+<p><strong>Inception</strong>：插槽 <code>inception</code>。Mercury 扩散式 LLM 系列（<code>mercury-coder</code> 以及更新的 <code>mercury-2</code>）。密钥来自 <a href="https://platform.inceptionlabs.ai">Inception 平台</a>。</p>
+<blockquote>
+<p>凭据仅来自配置（<code>api_key</code>）或运行时的 <code>--credential</code> 覆盖，这些位置<strong>不会</strong>读取各提供商专属的 <code>*_API_KEY</code> 环境变量。</p>
+</blockquote>
+<hr>
+<h2 id="多区域家庭"><a class="header" href="#多区域家庭">多区域家庭</a></h2>
+<p>多家中国厂商提供不同区域的独立端点，且默认模型各不相同。请使用一个规范化的配置槽，并通过别名条目上类型化的 <code>endpoint</code> 字段来选择区域。</p>
+<h3 id="moonshot插槽-moonshot"><a class="header" href="#moonshot插槽-moonshot">Moonshot：插槽 <code>moonshot</code></a></h3>
+<p>变体：<code>cn</code>、<code>intl</code>、<code>code</code>。</p>
+<h3 id="qwen--dashscope槽位-qwen"><a class="header" href="#qwen--dashscope槽位-qwen">Qwen / DashScope：槽位 <code>qwen</code></a></h3>
+<p>OAuth 支持的 Qwen 账户使用带有 <code>auth_mode = "oauth"</code> 的相同槽位。</p>
+<h3 id="glm插槽-glm"><a class="header" href="#glm插槽-glm">GLM：插槽 <code>glm</code></a></h3>
+<h3 id="minimax插槽-minimax"><a class="header" href="#minimax插槽-minimax">MiniMax：插槽 <code>minimax</code></a></h3>
+<h3 id="zai插槽-zai"><a class="header" href="#zai插槽-zai">Z.AI：插槽 <code>zai</code></a></h3>
+<p>对于 Z.AI 的 Anthropic 兼容 API，请改用 <code>[providers.models.anthropic.zai]</code> 并设置 <code>uri = "https://api.z.ai/api/anthropic"</code>。</p>
+<h3 id="豆包--火山引擎槽位-doubao"><a class="header" href="#豆包--火山引擎槽位-doubao">豆包 / 火山引擎：槽位 <code>doubao</code></a></h3>
+<p>其余中文区域插槽（<code>yi</code>、<code>hunyuan</code>、<code>qianfan</code>、<code>baichuan</code>）显示在上方的全插槽表中；请通过别名条目上带类型的 <code>endpoint</code> 字段选择区域。</p>
+<hr>
+<h2 id="路由层"><a class="header" href="#路由层">路由层</a></h2>
+<p>OpenRouter 被视为单一的一等提供方，而非元路由器。运行时只看到一个端点；OpenRouter 在该端点背后处理供应商分发。</p>
+<p>对于按任务路由，可运行多个 agent 并让 channels 选择由哪个 agent 处理哪些流量，详见 <a href="./routing.html">Routing</a>。如需更精细的配置内提示机制，请使用 <code>[[model_routes]]</code>。</p>
+<hr>
+<h2 id="缺少某些内容"><a class="header" href="#缺少某些内容">缺少某些内容？</a></h2>
+<ul>
+<li>如果端点兼容 OpenAI，请使用 <code>custom</code> 插槽并设置 <code>uri</code>。</li>
+<li>如果它在上方有自己的规范槽位，请使用该槽位，即使你只看到它的某个区域，该槽位的 <code>endpoint</code> 枚举也涵盖了其余部分。</li>
+<li>如果它使用非 OpenAI 的传输格式并需要自己的实现，请参阅<a href="./custom.html">自定义提供程序</a>。</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../providers/overview.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../providers/configuration.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../providers/overview.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../providers/configuration.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../mermaid-193ae996.min.js"></script>
+        <script src="../mermaid-init-d3ccd83c.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

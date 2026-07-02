@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["handle_agent_workspace_delete","handle_agent_workspace_list","handle_agent_workspace_mkdir","handle_agent_workspace_move","handle_agent_workspace_read","handle_browse","handle_browse_mkdir","handle_browse_rmdir"],"struct":["BrowsePathBody","BrowseQuery","BrowseResponse","FileReadResponse","MoveBody"]};

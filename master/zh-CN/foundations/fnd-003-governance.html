@@ -1,0 +1,1113 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>治理 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-79b552de.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="fnd-003团队组织项目治理与贡献流程"><a class="header" href="#fnd-003团队组织项目治理与贡献流程">FND-003：团队组织、项目治理与贡献流程</a></h1>
+<blockquote>
+<p>起始 v0.7.0 · 类型：治理 · 修订 5</p>
+<p><strong>权威参考</strong> · 由团队批准 · 修订版 5 原始治理讨论：<a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5577">#5577</a> 后续工作通道及标签治理策略：<a href="https://github.com/zeroclaw-labs/zeroclaw/issues/6808">#6808</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p><strong>在你们阅读此内容之前，给团队的一条提示。</strong></p>
+<p>软件项目失败并不是因为代码写得糟糕，而是因为编写代码的人无法协同配合。功能被重复开发，缺陷被遗漏，好的想法因为没人记录下来而烟消云散。新贡献者满怀热情前来想要帮忙，却找不到从何处入手。本 RFC 旨在搭建轻量级的框架结构，以避免这些失败——目的不在于让项目显得井井有条，而在于让团队能够更快速、更有信心、更顺畅地推进工作。本文中的每一条建议都专门针对规模较小、不断成长、由学生主导的开源团队而设计。这里没有任何内容需要项目经理、Scrum Master 或正式委员会的参与。</p>
+</blockquote>
+<hr>
+<h2 id="修订历史"><a class="header" href="#修订历史">修订历史</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>修订</th><th>日期</th><th>摘要</th></tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>2026年4月9日</td><td>初始草稿</td></tr>
+<tr><td>2</td><td>2026年4月9日</td><td>新增第 6.4 节“架构合规性：人工审查与 AI 辅助”；新增关于 AI 自动化架构审查的讨论问题</td></tr>
+<tr><td>3</td><td>2026-05-24</td><td>添加了 #6808 operational-label-policy 指引；当前标签行为说明位于维护者文档中</td></tr>
+<tr><td>4</td><td>2026-05-24</td><td>添加 #6808 community-pickup 和 issue-risk/PR-risk 操作指引</td></tr>
+<tr><td>5</td><td>2026-05-25</td><td>将 #6808 面向特性的工作流与标签治理策略提升至 FND-003；明确了持久化源边界、Discussions 管理职责、Discord 到 GitHub 的交接流程，以及操作门控问题的归属位置</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="目录"><a class="header" href="#目录">目录</a></h2>
+<ol>
+<li><a href="#1-the-coordination-problem">协调问题</a></li>
+<li><a href="#2-the-three-part-system">三部分组成系统</a></li>
+<li><a href="#3-github-projects-the-work-pipeline">GitHub 项目：工作流水线</a>
+<ul>
+<li><a href="#36-work-lanes-and-state-ownership">3.6 工作通道与状态所有权</a></li>
+</ul>
+</li>
+<li><a href="#4-github-discussions-community-discussion-and-handoff">GitHub Discussions：社区讨论与交接</a>
+<ul>
+<li><a href="#45-discussions-stewardship-and-discord-to-github-handoff">4.5 讨论管理与 Discord 到 GitHub 的交接</a></li>
+</ul>
+</li>
+<li><a href="#5-team-tiers-and-contribution-authority">团队层级与贡献权限</a></li>
+<li><a href="#6-codeowners-and-branch-protection">代码所有者和分支保护</a>
+<ul>
+<li><a href="#64-architectural-compliance-human-review-ai-support">6.4 架构合规性：人工审查，AI 支持</a></li>
+</ul>
+</li>
+<li><a href="#7-issue-templates">问题模板</a></li>
+<li><a href="#8-the-rfc-governance-loop">RFC 治理循环</a></li>
+<li><a href="#9-label-taxonomy">标签分类</a></li>
+<li><a href="#10-definition-of-done">完成定义</a></li>
+<li><a href="#11-automation">自动化</a></li>
+<li><a href="#12-phased-rollout">分阶段发布</a></li>
+</ol>
+<hr>
+<h2 id="1-协调问题"><a class="header" href="#1-协调问题">1. 协调问题</a></h2>
+<p>每个没有有意协调系统的项目都会发展出一个偶然的协调系统。大多数开源项目的偶然协调系统如下所示：</p>
+<ul>
+<li>想法存在于某人的脑海中，或出现在一条会滚出屏幕的聊天消息里</li>
+<li>问题在跟踪器中堆积，没有优先级、没有负责人，也没有明确的完成定义</li>
+<li>贡献者提交无人请求的 PR，或主动提出帮助却得不到回应</li>
+<li>团队的工作方式是被动应对：谁的声音最大谁就得到关注，哪里出了问题就修哪里，任何事情的规划都不会超过一周。</li>
+<li>架构决策在 PR 评论中做出，但从未在任何地方记录。</li>
+</ul>
+<p>这并非对任何人付出努力的批评，而是对默认情况下所发生现象的描述。解决方案不是增加流程，而是采用正确的流程，并根据团队的规模和成熟度在恰当的层级上加以应用。</p>
+<p>ZeroClaw 需要以下三样东西：</p>
+<ol>
+<li><strong>一个管道</strong>，用于将想法转化为已发布的代码，在每个阶段都有可见的步骤，并在每次转换时有明确的关卡。</li>
+<li><strong>一个持续维护的讨论区</strong>，用于汇集社区的问题、想法、作品展示以及尚未进入正式流程的早期探索，既不会让这些内容流失，也不会干扰正在进行的工作</li>
+<li><strong>治理模型</strong>，定义谁可以决定什么、架构决策如何制定以及团队如何成长</li>
+</ol>
+<p>这是三个截然不同的关注点。将它们混为一谈、把所有内容都放进同一块看板，或依赖非正式的聊天来做决策，正是制造团队试图摆脱的混乱的根源。</p>
+<hr>
+<h2 id="2-三部分系统"><a class="header" href="#2-三部分系统">2. 三部分系统</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>担忧</th><th>工具</th><th>为什么选择这个工具</th></tr>
+</thead>
+<tbody>
+<tr><td>工作流（待办事项 → 发布）</td><td><strong>GitHub 项目 v2</strong></td><td>自定义字段、多视图、看板 + 路线图、内置自动化、里程碑跟踪</td></tr>
+<tr><td>社区讨论与创意孵化</td><td><strong>GitHub 讨论</strong></td><td>社区可见，无需 PR，将早期讨论与已提交的工作分离，将具体成果提升至所属的跟踪界面</td></tr>
+<tr><td>治理与决策权限</td><td><strong>RFC 流程 + 团队层级 + CODEOWNERS</strong></td><td>已通过 <code>docs/proposals/</code> 部分建立，需要正式化并闭环</td></tr>
+</tbody>
+</table>
+</div>
+<p>核心原则：**项目看板只包含团队已承诺要考虑的工作。**早期社区讨论、想法、问答和展示在该通道维护期间可以存放在 Discussions 中。已经过评估、接受并明确范围的工作则进入项目。正是这种区分让看板保持实用。</p>
+<p>FND-003 是工作流通道和贡献管道策略的持久治理来源。RFC #6808 是面向功能的工作流通道、标签治理、问题分流和维护者路由的暂存讨论；在其策略片段被提升后，其持久规则将存放于本基础文档以及下方链接的维护者操作页面中。在策略被提升至此处之后，请勿将该 RFC 问题视为与之竞争的治理文档。</p>
+<p>操作细节有意紧贴使用它们的工作流：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>持久决策</th><th>运营主页</th></tr>
+</thead>
+<tbody>
+<tr><td>项目看板用途与阶段关卡</td><td>本文档</td></tr>
+<tr><td>PR 通道与合并/审查队列规范</td><td><a href="../maintainers/pr-workflow.html">维护者 PR 工作流</a></td></tr>
+<tr><td>标签定义、所有权边界与清理协议</td><td><a href="../maintainers/labels.html">维护者标签指南</a></td></tr>
+<tr><td>审查接收、风险深度、问题分类与队列维护</td><td><a href="../maintainers/reviewer-playbook.html">审阅者操作手册</a></td></tr>
+<tr><td>问题分类的具体操作流程和过期清理处理细节</td><td><a href="../maintainers/skills.html#issue-triage-workflow">维护者技能指南</a>和<a href="../maintainers/reviewer-playbook.html#issue-triage">审查者操作手册</a></td></tr>
+<tr><td>面向贡献者的问题提交与 PR 操作流程</td><td>问题模板、PR 模板和<a href="../contributing/how-to.html">如何贡献</a></td></tr>
+<tr><td>贡献者沟通、Discussions 管理以及 Discord 到 GitHub 的交接</td><td><a href="../contributing/communication.html">沟通</a>以及下文 §4.5</td></tr>
+<tr><td>实现前采用 RFC 形式的贡献路由</td><td><a href="../contributing/architecture-map.html">架构与贡献图</a>和 <a href="../contributing/rfcs.html">RFC 流程</a></td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="3-github-项目工作流水线"><a class="header" href="#3-github-项目工作流水线">3. GitHub 项目：工作流水线</a></h2>
+<h3 id="31-管道阶段"><a class="header" href="#31-管道阶段">3.1 管道阶段</a></h3>
+<p>项目看板包含一个 <strong>状态</strong> 字段，共有七个值。每个值代表流水线中的一个阶段。这些阶段按线性顺序排列，但项目项可以回退：</p>
+<pre><code>💡 Idea
+    ↓  Gate: Vision alignment check
+📋 Backlog
+    ↓  Gate: Architecture fit + acceptance criteria
+🎯 Defined
+    ↓  Gate: Assignee, size, risk tier confirmed
+🚧 In Progress
+    ↓  Gate: Tests written, CI passing
+👀 In Review
+    ↓  Gate: Correct reviewer tier approved, docs updated
+✅ Done
+</code></pre>
+<p>加上一个可以从任何地方到达的终端状态：</p>
+<pre><code>🚫 Won't Do  ← explicit decision not to pursue; never silently closed
+</code></pre>
+<p>看板级别的 <code>Won't Do</code> 状态是一项持久性的关闭决策。当前的关闭标签拼写规则和替换流程规则记录在 <a href="../maintainers/labels.html#resolution-labels">维护者标签指南</a> 和 <a href="../maintainers/superseding.html">取代指南</a> 中。</p>
+<h3 id="32-门控问题"><a class="header" href="#32-门控问题">3.2 门控问题</a></h3>
+<p>每个状态转换都有一个准入问题。该问题必须先回答“是“，条目才能向前推进。这就是项目看板付诸实践的方式：Vision → Architecture → Design → Implementation → Testing → Documentation 的层级结构在每个阶段都变成了一份检查清单。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>过渡</th><th>门问题</th><th>谁检查</th></tr>
+</thead>
+<tbody>
+<tr><td>想法 → 待办事项</td><td>这是否符合愿景声明？它是否符合目标架构？</td><td>核心团队分类</td></tr>
+<tr><td>待办事项 → 已定义</td><td>是否有明确的验收标准？是否需要 ADR 或设计说明？是否已分配风险等级？</td><td>负责人 + 审查者</td></tr>
+<tr><td>已定义 → 进行中</td><td>是否有指派人？是否已确定规模？相关的 ADR 或文档是否已明确？</td><td>负责人</td></tr>
+<tr><td>进行中 → 审核中</td><td>是否有针对新行为的测试？CI 是否通过？PR 描述是否完整？</td><td>作者（自检）</td></tr>
+<tr><td>在“审查”→“完成”</td><td>是否已获正确级别的审核员批准？文档是否已更新？CHANGELOG 条目是否已编写？</td><td>审查者</td></tr>
+<tr><td>任何 → 不会执行</td><td>该项目的评论中是否已说明未继续推进的原因？</td><td>核心团队</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>为什么显式门禁对学生团队至关重要：</strong> 如果没有门禁，卡片会因为有人觉得自己完成了而移动，而不是因为“完成”有明确的定义。这是导致“已完成”工作实际上并未完成的最常见原因。门禁使定义变得可见且共享。</p>
+<p>这些关卡问题是治理性的提示，而非需要在每个 PR 正文或问题评论中重复填写的另一份检查清单。其操作性的具体形式存在于维护者已经接触的工件中：</p>
+<ul>
+<li>问题模板会收集首次分类所需的报告、用户价值、复现步骤、架构影响及风险提示；</li>
+<li>PR 模板收集范围边界、验证证据、安全/隐私影响、兼容性、回滚、标签和关联的 issue；</li>
+<li>维护者 PR 工作流定义了就绪定义（Definition of Ready）、完成定义（Definition of Done）、PR 通道和合并检查；</li>
+<li>标签指南定义持久化分类、过期策略标签以及清理顺序；</li>
+<li>审查者操作手册定义了受理、审查深度、问题分类、自动化覆盖和队列整理。</li>
+</ul>
+<p>如果发现某个旧的 FND-003 门控问题似乎缺失，请先检查这些运行位置，然后再在此处添加副本。</p>
+<h3 id="33-自定义字段"><a class="header" href="#33-自定义字段">3.3 自定义字段</a></h3>
+<p>在 GitHub 项目设置中创建以下字段：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>字段</th><th>类型</th><th>值</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>状态</strong></td><td>单选</td><td>💡 想法 · 📋 待办 · 🎯 已定义 · 🚧 进行中 · 👀 审核中 · ✅ 已完成 · 🚫 不做</td></tr>
+<tr><td><strong>类型</strong></td><td>单选</td><td>功能 · 缺陷 · 重构 · ADR · 文档 · 安全 · 基础设施 · RFC</td></tr>
+<tr><td><strong>优先级</strong></td><td>单选</td><td>🔴 严重 · 🟠 高 · 🟡 中 · 🟢 低</td></tr>
+<tr><td><strong>大小</strong></td><td>单选</td><td>XS · S · M · L · XL</td></tr>
+<tr><td><strong>风险等级</strong></td><td>单选</td><td>低 · 中 · 高（与 <code>AGENTS.md</code> 中的风险等级对应）</td></tr>
+<tr><td><strong>组件</strong></td><td>单选</td><td>内核 · 网关 · 通道 · 工具 · 内存 · 安全 · 硬件 · 文档 · 基础设施</td></tr>
+<tr><td><strong>里程碑</strong></td><td>里程碑</td><td>v0.7.0 · v0.8.0 · v0.9.0 · v1.0.0 · Icebox</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>关于规模估算（T 恤尺码）：</strong> 故事点需要校准和历史数据，而团队目前尚不具备这些数据。T 恤尺码直观易懂，对于当前阶段的团队来说已经足够：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>大小</th><th>它的含义</th><th>近似作用域</th></tr>
+</thead>
+<tbody>
+<tr><td>XS</td><td>不到 2 小时</td><td>一个拼写错误修复，一个配置调整，一行代码的更改</td></tr>
+<tr><td>S</td><td>半天</td><td>一个小错误修复，一个次要功能添加，一个文档更新</td></tr>
+<tr><td>M</td><td>1–3 天</td><td>一个有意义的功能、一个模块的重构、一个新的测试套件</td></tr>
+<tr><td>L</td><td>1–2 周</td><td>一个显著的特性，一个新的 crate 提取，一个跨领域的变更</td></tr>
+<tr><td>XL</td><td>超过两周</td><td>架构变更；应拆分为更小的项目</td></tr>
+</tbody>
+</table>
+</div>
+<p>XL 项在进入“进行中”状态前，几乎都应被拆解。如果无法拆解，说明设计还不够完善。</p>
+<h3 id="34-视图"><a class="header" href="#34-视图">3.4 视图</a></h3>
+<p>在项目中创建四个命名视图：</p>
+<h4 id="视图-1路线图"><a class="header" href="#视图-1路线图">视图 1：路线图</a></h4>
+<ul>
+<li>类型：路线图（时间线）</li>
+<li>按里程碑分组</li>
+<li>可见字段：标题、类型、大小、组件、负责人</li>
+<li>用途：面向公众。“即将发布的内容及时间安排。”请在 README 中分享此链接，并与社区共享。请保持其更新。</li>
+</ul>
+<h4 id="视图-2看板"><a class="header" href="#视图-2看板">视图 2：看板</a></h4>
+<ul>
+<li>类型：看板（Kanban）</li>
+<li>列：状态字段值</li>
+<li>仅筛选当前里程碑</li>
+<li>可见字段：标题、负责人、大小、风险等级</li>
+<li>目的：日常工作的可见性。每个人现在正在做什么？有哪些工作被阻塞了？</li>
+</ul>
+<h4 id="视图-3待办事项"><a class="header" href="#视图-3待办事项">视图 3：待办事项</a></h4>
+<ul>
+<li>类型：表格</li>
+<li>按优先级（降序），然后按大小（升序）排序</li>
+<li>筛选条件：状态 = 待办 或 已定义</li>
+<li>可见字段：标题、类型、优先级、大小、组件、里程碑、风险等级</li>
+<li>用途：在梳理会议中使用。接下来需要处理哪些工作？哪些已经估算好并准备好被认领？</li>
+</ul>
+<h4 id="视图-4我的工作"><a class="header" href="#视图-4我的工作">视图 4：我的工作</a></h4>
+<ul>
+<li>类型：板</li>
+<li>筛选条件：分配人 = @me</li>
+<li>用途：个人仪表板。每位贡献者只能看到自己的项目，避免无关信息干扰。</li>
+</ul>
+<h3 id="35-固定项"><a class="header" href="#35-固定项">3.5 固定项</a></h3>
+<p>GitHub 允许每个仓库最多固定六个问题。将它们用于高信号、始终可见的沟通：</p>
+<ol>
+<li>当前正在讨论的活跃 RFC</li>
+<li>社区最期待的功能（最高票讨论）</li>
+<li>下一个发布里程碑跟踪问题</li>
+<li>适合新手的问题索引（一个链接到所有当前 <code>good first issue</code> 项目的问题）</li>
+</ol>
+<p>已固定的问题是对社区的一种承诺：这些是当前最重要的事项。当优先级发生变化时，请更新它们。</p>
+<h3 id="36-工作通道与状态所有权"><a class="header" href="#36-工作通道与状态所有权">3.6 工作通道与状态所有权</a></h3>
+<p>工作通道策略可避免看板、标签、PR 和议题在不同位置尝试回答同一个问题。</p>
+<p>使用此拆分:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Surface</th><th>所有者</th><th>不拥有</th></tr>
+</thead>
+<tbody>
+<tr><td>标签</td><td>持久分类：类型、范围、风险、规模、贡献者等级、过期/分诊策略</td><td>每次推送的审查状态、当前 CI 状态、个人任务列表</td></tr>
+<tr><td>项目看板</td><td>规划状态：就绪程度、路由依据、路线图分组、依赖/阻塞状态，以及当某字段存在时的过期豁免原因</td><td>权威 PR 审查队列、可合并性、必需的检查</td></tr>
+<tr><td>原生 PR 状态</td><td>审查决定、必需检查、分支新鲜度、冲突、可合并性、草稿/就绪状态</td><td>长期路线图负责制</td></tr>
+<tr><td>问题/RFC</td><td>持久化讨论记录、验收状态、用户需求、关联实现追踪</td><td>策略推广后维护者文档的实时替换</td></tr>
+</tbody>
+</table>
+</div>
+<p>PR 通道、贡献者认领标签、过期豁免标签以及标签迁移都是稳定的治理概念，但它们的具体操作标准存放在维护者文档中。FND-003 负责划分职责：标签用于分类稳定工作，项目看板用于规划工作，原生 PR 状态负责实时审查与合并状态，issue/RFC 则用于保存决策。<a href="../maintainers/pr-workflow.html#pr-lanes">维护者 PR 工作流</a>定义 PR 通道，<a href="../maintainers/labels.html">标签指南</a>定义具体的标签含义和清理规则，<a href="../maintainers/reviewer-playbook.html#issue-triage">审查者操作手册</a>说明审查者在分类和审查过程中如何应用这些信号。请将实时标签迁移视为单独的、需维护者批准的清理工作，而非普通的 PR 审查。</p>
+<p>过期豁免属于治理例外，而非永久性的标签护盾。目标策略是：仅当泳道的运维数据源记录了该议题为何被豁免，以及哪些可见的路由证据将承载下一步决策时，<code>status:no-stale</code> 才有效。维护者文档定义了这些事实存放在何处，以及过期自动化或过期清理如何强制执行该规则。</p>
+<hr>
+<h2 id="4-github-discussions社区讨论与交接"><a class="header" href="#4-github-discussions社区讨论与交接">4. GitHub Discussions：社区讨论与交接</a></h2>
+<h3 id="41-维护讨论通道"><a class="header" href="#41-维护讨论通道">4.1 维护讨论通道</a></h3>
+<p>将 GitHub Discussions 视为一个需要维护的社区平台。Discussions 适用于提问、想法、投票、公告、作品展示、项目或集成演示，以及那些比 Discord 更需要持久保留、但尚未纳入工作跟踪的探索性讨论。</p>
+<p>确切的类别、类别描述和审查周期属于操作细节。它们应记录在贡献者沟通指南和维护者工作流文档中，并且可能在不修订本基础文档的情况下演进。</p>
+<h3 id="42-从讨论提升为跟踪工作"><a class="header" href="#42-从讨论提升为跟踪工作">4.2 从讨论提升为跟踪工作</a></h3>
+<p>讨论不会仅仅因为存在一个话题串就变成待办工作。当讨论产生具体的、可跟踪的结果时，才将其提升为待办事项。面向贡献者的触发示例参见 <a href="../contributing/communication.html">Communication</a>。</p>
+<p>目标取决于讨论结果。已确认的缺陷和已接受的功能范围转入 issues。架构决策通过 RFC 流程处理。PR 相关的具体细节转入 PR 评论。持久性的运作规则转入维护者或贡献者文档。</p>
+<p>在发起讨论中完成闭环。如果该分类支持答案，请在适当情况下将摘要或跟踪工作链接标记为答案。如果不支持，请添加一条最终的摘要评论，附上问题、RFC、PR 或文档链接。</p>
+<h3 id="43-不应等待投票的想法"><a class="header" href="#43-不应等待投票的想法">4.3 不应等待投票的想法</a></h3>
+<p>某些条目会绕过 Discussions，直接进入受跟踪的界面：</p>
+<ul>
+<li>安全漏洞（通过私有安全报告，绝不公开）</li>
+<li>已确认的带有复现步骤的 Bug（请直接使用 Bug 报告问题模板）</li>
+<li>RFC 接受的基础架构项（直接从 RFC 关闭循环中生成）</li>
+<li>来自项目路线图的项目（由核心团队直接放置）</li>
+</ul>
+<h3 id="44-架构探索"><a class="header" href="#44-架构探索">4.4 架构探索</a></h3>
+<p>当问题面向社区且尚未准备好进行正式 RFC 时，架构探讨可以从 Discussions 开始。这降低了提出设计顾虑的门槛，不必将每个早期想法都变成需要追踪的正式决策。</p>
+<p>当讨论线程形成具体的架构提案时，请创建 RFC issue，并将持久化的提案迁移到 RFC 中。此后，Discussion 可链接到该 RFC，不再作为唯一可信来源。</p>
+<h3 id="45-讨论管理及-discord-到-github-的交接"><a class="header" href="#45-讨论管理及-discord-到-github-的交接">4.5 讨论管理及 Discord 到 GitHub 的交接</a></h3>
+<p>Discord 用于快速交流，GitHub 则是持久的记录。Discussions 是一个长期维护的 GitHub 平台，用于面向社区的交流——这类交流比 Discord 需要更高的持久性，但尚未形成可追踪的工作项。</p>
+<p>讨论(Discussions)只有在有人负责该领域时才有效。这种责任归属可以是指定的管理员，也可以是有文档记录的审查周期。如果没有明确的责任归属，讨论(Discussions)只是一个被动的归档，而不是一条必需的接收渠道。</p>
+<p>对于探索性、面向社区或需要广泛反馈的讨论，请使用 Discussions。当结果已经明确或具有权威性时，请使用 issue、RFC issue、PR 评论或维护者文档。面向贡献者的触发条件列表和分类示例位于 <a href="../contributing/communication.html">Communication</a>。</p>
+<p>交接无需复制整个聊天记录。只需记录结果以及足够的上下文,让其他维护者能够继续工作即可。如果某次讨论后续产生了需要跟踪的工作或长期有效的策略,请将该结果提升到负责它的相应平台中。</p>
+<hr>
+<h2 id="5-团队层级与贡献权限"><a class="header" href="#5-团队层级与贡献权限">5. 团队层级与贡献权限</a></h2>
+<h3 id="51-三个层级"><a class="header" href="#51-三个层级">5.1 三个层级</a></h3>
+<p>开源项目奉行<strong>精英主义</strong>：影响力和话语权来自实际贡献，而非资历、头衔或人脉。这正是开源软件区别于商业软件的特质之一，值得明确传授。</p>
+<p>这三个层级反映了逐步增强的对项目承诺：</p>
+<hr>
+<h4 id="第-1-级社区"><a class="header" href="#第-1-级社区">第 1 级：社区</a></h4>
+<p>任何人。无需审批。</p>
+<p><em>他们能做什么：</em></p>
+<ul>
+<li>使用问题模板打开问题</li>
+<li>在任何问题或拉取请求中发表评论</li>
+<li>参与讨论并对想法进行投票</li>
+<li>提交拉取请求（将在合并前进行审核）</li>
+<li>编辑 GitHub Wiki</li>
+</ul>
+<p><em>他们无法做到：</em></p>
+<ul>
+<li>被分配问题（可以请求被分配）</li>
+<li>批准 PR</li>
+<li>合并 PR</li>
+<li>对具有约束力的 RFC 进行投票</li>
+</ul>
+<hr>
+<h4 id="层级-2贡献者"><a class="header" href="#层级-2贡献者">层级 2：贡献者</a></h4>
+<p>已在 <code>master</code> 分支中合并至少两个 PR 的社区成员。</p>
+<p><em>如何成为贡献者：</em> 合并两个 PR。核心团队成员会将你添加到 GitHub 的 Contributors 团队以及 <code>CONTRIBUTORS.md</code> 文件中。</p>
+<p><em>他们在社区之外获得的收益：</em></p>
+<ul>
+<li>可以分配问题</li>
+<li>可以作为 PR 的审查者（非必需的审查）</li>
+<li>在讨论中对想法投票计入晋升阈值</li>
+<li>可以请求 RFC 讨论，而无需先通过讨论</li>
+</ul>
+<p><em>他们仍然无法做到的是：</em></p>
+<ul>
+<li>批准高风险路径的 PR</li>
+<li>合并 PR</li>
+<li>投 RFC 投票</li>
+</ul>
+<p><em>为什么需要这个层级：</em> 它为新手贡献者设立了一个可见且可实现的初步里程碑。“如何更深入地参与？”有了明确的答案：合并两个 PR。这有助于激励早期的优质贡献，并为团队提供了一种公开认可贡献者的方式。</p>
+<hr>
+<h4 id="第三级核心团队"><a class="header" href="#第三级核心团队">第三级：核心团队</a></h4>
+<p>在过去一段时间内展现出持续且高质量贡献，并已被现有核心团队成员邀请的贡献者。</p>
+<p><em>如何成为核心团队成员：</em> 由现有核心团队成员发出邀请，并在 Discussions 中公开宣布。没有正式的门槛；这是基于以往贡献的质量、一致性和契合度所做出的判断。</p>
+<p><em>他们作为贡献者之外获得的权益：</em></p>
+<ul>
+<li>对仓库的写入访问</li>
+<li>可以合并已满足审查要求的 PR</li>
+<li>可以批准高风险路径的 PR（需符合 CODEOWNERS 要求）</li>
+<li>在 RFC 上投出绑定投票</li>
+<li>可以通过项目管道移动项目</li>
+<li>可以发布版本</li>
+<li>参与治理决策（核心团队讨论）</li>
+</ul>
+<p><em>职责：</em></p>
+<ul>
+<li>在3个工作日内处理新提交的问题</li>
+<li>在5个工作日内审查其专业领域的PR</li>
+<li>参与 RFC 投票</li>
+<li>遵守项目的行为准则</li>
+</ul>
+<hr>
+<h3 id="52-懒共识规则"><a class="header" href="#52-懒共识规则">5.2 懒共识规则</a></h3>
+<p>对于常规决策——比如添加标签、关闭过期 issue、更新文档——核心团队成员遵循 <strong>lazy consensus（默认同意）</strong> 原则：如果你在相关 issue 中宣布了自己的意图，且 48 小时内没有任何核心团队成员提出反对，你即可继续推进。这样既避免了凡事都要明确批准所导致的停滞，又保持了透明度。</p>
+<p>“惰性共识”不适用于：</p>
+<ul>
+<li>RFC 接受或拒绝</li>
+<li>发布</li>
+<li>对 CODEOWNERS 或分支保护规则的更改</li>
+<li>对本治理文档的更改</li>
+<li>核心团队新增成员</li>
+</ul>
+<p>这些始终需要核心团队的明确投票。</p>
+<h3 id="53-记录团队成员"><a class="header" href="#53-记录团队成员">5.3 记录团队成员</a></h3>
+<p>团队成员信息记录在两个地方：</p>
+<p>仓库根目录下的 <strong><code>CONTRIBUTORS.md</code></strong>：所有贡献者的公开记录，按等级组织。由核心团队成员在贡献者获得认可时更新。</p>
+<p>组织设置中的 <strong>GitHub Teams</strong>：<code>zeroclaw-core</code> 和 <code>zeroclaw-contributors</code> 团队，在 CODEOWNERS 中引用并用于通知路由。</p>
+<hr>
+<h2 id="6-codeowners-和分支保护"><a class="header" href="#6-codeowners-和分支保护">6. CODEOWNERS 和分支保护</a></h2>
+<h3 id="61-codeowners"><a class="header" href="#61-codeowners">6.1 CODEOWNERS</a></h3>
+<p><code>CODEOWNERS</code> 文件使治理自动化。它定义了哪些路径在 PR 合并前需要哪个团队的审查。GitHub 将其作为必需审查来强制执行：在满足该要求之前，PR 无法合并。</p>
+<p>创建 <code>.github/CODEOWNERS</code> 文件：</p>
+<pre><code># CODEOWNERS — Automatic review routing by risk tier
+# See AGENTS.md for risk tier definitions.
+# See docs/proposals/project-governance.md for team tier definitions.
+
+# ── High Risk: requires Core Team approval ──────────────────────────────────
+
+src/security/**                 @zeroclaw-labs/zeroclaw-core
+src/gateway/**                  @zeroclaw-labs/zeroclaw-core
+src/runtime/**                  @zeroclaw-labs/zeroclaw-core
+src/tools/shell.rs              @zeroclaw-labs/zeroclaw-core
+src/tools/file_write.rs         @zeroclaw-labs/zeroclaw-core
+src/tools/security_ops.rs       @zeroclaw-labs/zeroclaw-core
+
+# ── Governance and configuration: requires Core Team approval ───────────────
+
+.github/**                      @zeroclaw-labs/zeroclaw-core
+CODEOWNERS                      @zeroclaw-labs/zeroclaw-core
+Cargo.toml                      @zeroclaw-labs/zeroclaw-core
+deny.toml                       @zeroclaw-labs/zeroclaw-core
+
+# ── Architecture documents: requires Core Team review ───────────────────────
+
+docs/proposals/**               @zeroclaw-labs/zeroclaw-core
+docs/architecture/decisions/**  @zeroclaw-labs/zeroclaw-core
+AGENTS.md                       @zeroclaw-labs/zeroclaw-core
+
+# ── Default: any Contributor or Core Team member can review ─────────────────
+
+*                               @zeroclaw-labs/zeroclaw-contributors
+</code></pre>
+<p>当特定的核心团队成员对组件负责时，请在团队句柄旁添加他们各自的句柄。在 CODEOWNERS 中，越具体的规则优先级越高：更具体的路径规则会覆盖更通用的规则。</p>
+<h3 id="62-分支保护规则"><a class="header" href="#62-分支保护规则">6.2 分支保护规则</a></h3>
+<p>为 <code>master</code> 分支配置以下分支保护规则：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>规则</th><th>设置</th><th>原因</th></tr>
+</thead>
+<tbody>
+<tr><td>合并前需要拉取请求</td><td>已启用</td><td>严禁直接推送到 master 分支</td></tr>
+<tr><td>需要审批</td><td>1 表示低风险/中风险；2 表示高风险</td><td>CODEOWNERS 强制执行处理“谁”</td></tr>
+<tr><td>要求状态检查通过</td><td><code>cargo fmt</code>、<code>cargo clippy</code>、<code>cargo test</code></td><td>合并前必须确保 CI 通过</td></tr>
+<tr><td>要求分支保持最新</td><td>已启用</td><td>防止合并过时的代码</td></tr>
+<tr><td>需要解决对话中的问题</td><td>已启用</td><td>所有审查意见必须解决</td></tr>
+<tr><td>不允许绕过上述设置</td><td>已启用</td><td>适用于所有人，包括管理员</td></tr>
+<tr><td>允许强制推送</td><td>已禁用</td><td>保留提交历史</td></tr>
+<tr><td>允许删除</td><td>已禁用</td><td>保护该分支</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>为什么管理员不能绕过：</strong> 小型团队项目中最常见的错误之一，就是把分支保护视为“给别人用的“。一旦管理员可以绕过，他们就会在时间压力下、紧急情况中、抱着“就这一次“的心态去绕过。久而久之，这便成了常态。规则只有对所有人都适用，才有意义。如果真的遇到紧急情况，正确的应对方式是更快地走完流程，而不是跳过它。</p>
+<h3 id="63-必需的签核状态"><a class="header" href="#63-必需的签核状态">6.3 必需的签核状态</a></h3>
+<p>在合并任何 PR 之前必须通过的 CI 检查：</p>
+<pre><code>build (stable)          ← cargo build --release
+test                    ← cargo test
+fmt                     ← cargo fmt --all -- --check
+clippy                  ← cargo clippy --all-targets -- -D warnings
+</code></pre>
+<p>随着工作区按照架构 RFC 拆分为多个 crate，请为每个 crate 添加相应的检查。对 <code>crates/zeroclaw-api</code> 的更改应独立运行该 crate 的测试套件。</p>
+<h3 id="64-架构合规性人工审查ai-支持"><a class="header" href="#64-架构合规性人工审查ai-支持">6.4 架构合规性：人工审查，AI 支持</a></h3>
+<p>本节之所以存在，是因为这个问题终将被提出（实际上已经出现过了），它理应有一个清晰、有据可查的答案，而不是在每个 PR 上反复争论。</p>
+<p><strong>问题：</strong> 我们是否应该添加一个自动化门禁，用于检查 PR 是否符合 RFC 中定义的架构和设计模式？</p>
+<p><strong>答案：</strong> 不是。理解其中的原因非常重要。</p>
+<hr>
+<p><strong>存在两种根本不同的质量保障方式，它们需要不同的机制。</strong></p>
+<p>第一种是_结构合规性_：这段代码是否违反了机械规则？<code>zeroclaw-kernel</code> 是否导入了 <code>TelegramChannel</code>？依赖图的边是否指向了错误的方向？是否存在 clippy 警告？这些都是二元问题。代码要么违反了规则，要么没有。编译器、<code>cargo deny</code> 和 <code>cargo clippy --workspace</code> 已经强制执行这些规则。不需要人类参与，也不需要 AI 介入。机器是权威的、快速的，并且对于事实性违规绝不会出错。</p>
+<p>第二种是 <em>架构意图</em>：这个决策是否应该放在这里？这个抽象是否处在正确的层次？这个权衡是否与愿景一致？这种耦合在第 3 阶段会不会带来痛苦？这个 PR 是否会造成在当前 diff 中看不出来的维护负担？这些问题需要判断力、上下文，以及对架构 <em>为何</em> 存在的理解，而不仅仅是了解规则是什么。没有任何自动化工具能够可靠地回答这些问题，因为答案取决于不在 diff 中的信息：路线图、团队当前的优先事项、贡献者的意图，以及该决策的长期成本。</p>
+<p><strong>自动化架构判断的失败模式都很糟糕。</strong></p>
+<p>一个对细微架构违规视而不见的门禁会制造虚假的信心。开发者看到 ✅，便以为自己的决策得到了验证。最具破坏性的架构漂移——那种需要数年才能理清的——在结构上看起来是正确的。它能编译通过。它能通过 lint 检查。依赖图也没有问题。问题在于，它违背了设计的本意，而这种违背只会在后期才显现出来，那时撤销它的代价已经非常高昂。</p>
+<p>一个因工具误读上下文而标记了有效架构决策的关卡，会教导开发者完全忽略该关卡。一旦团队学会了点击跳过嘈杂的自动化检查，该检查在实际操作中便形同虚设，尽管它在 CI 中仍在运行。项目为此浪费了 CI 分钟数，却产生了负价值。</p>
+<p><strong>CODEOWNERS 是架构合规的关卡，审查者是工具。</strong></p>
+<p>§6.1 中的 <code>CODEOWNERS</code> 配置已经强制要求：凡是涉及高风险路径、crate 边界、trait 定义、依赖关系图、<code>src/security/</code>、<code>.github/</code> 的 PR，都必须经过核心团队成员的审查。这位核心团队成员以 RFC 作为参考框架，承担着架构合规性检查的职责。他们带来的是任何自动化都无法复制的情境判断力。</p>
+<p>这就是 RFC、AGENTS.md 文件以及文档规范存在的原因：不是为了供机器解析并生成评分，而是为了让人类审查者有一个一致且文档化的框架来应用。RFC 回答了“为什么存在这种架构”，而审查者则回答“这个 PR 是服务于还是削弱了这种架构”。</p>
+<p><strong>AI 应融入开发流程，而非合并门禁。</strong></p>
+<p>AI 工具，比如 Claude、Copilot、Cursor，以及未来出现的任何工具，在用对地方时对架构工作确实很有帮助。而对的地方是_在开发过程中_，而不是_在合并关卡处_。</p>
+<p>在开发过程中，配备 RFC 和 crate 的 AGENTS.md 的 AI 助手可以帮助贡献者在编写代码之前理解新的功能属于哪个 crate，在代码结构仍在塑造时标记潜在的依赖倒置问题，解释设计模式存在的原因，并建议新的抽象是否处于正确的层级。这是增量的，它使贡献者更加有能力。</p>
+<p>在代码审查过程中，AI 助手可以帮助人类审查者起草结构化的反馈，将变更与 RFC（请求评论）进行交叉引用，并识别 RFC 中与当前 PR（拉取请求）相关的讨论问题。这一过程也是增量的。审查者提供判断力，而 AI 提供速度和记忆能力。</p>
+<p>AI 无法取代的是判断力。“AI 帮我评估这个 PR“和“AI 自动为这个 PR 把关“是性质完全不同的两件事，而只有前者适用于架构决策。一旦项目把架构合规性交由某个自动化关卡来把关（无论它多么精密），架构就会开始以无人察觉的方式逐渐偏移，等到发现时为时已晚。</p>
+<p><strong>实际策略，直白地说：</strong></p>
+<ul>
+<li>结构合规性（导入方向、依赖图、代码检查、格式化）由 CI 强制执行。这是不可协商的，并且已自动化。</li>
+<li>架构意图合规性通过 CODEOWNERS 路由至核心团队审查员来强制执行。这是不可协商的，并且需要人工处理。</li>
+<li>AI 工具在开发阶段为贡献者提供支持，并在代码审查阶段为审查者提供支持。它们不会仅凭自身权限来阻止合并操作。</li>
+<li>如果团队希望在未来评估 AI 辅助审查工具，该评估需先通过 RFC 流程。未经文档化的决策，不得将其添加到 <code>.github/workflows/</code> 中。</li>
+</ul>
+<p>此政策并非对人工智能或自动化的限制，而是认识到不同的问题需要不同的工具，在合适的地方使用合适的工具正是架构 RFC 对代码库所提出的要求。</p>
+<hr>
+<h2 id="7-问题模板"><a class="header" href="#7-问题模板">7. 问题模板</a></h2>
+<p>Issue 模板将传入的报告引导至正确的处理流程，然后再由人工处理。编写良好的模板可以自动收集分类所需的信息。如果缺少或忽略模板，则会导致需要三次评论交互才能理解的问题。</p>
+<p>运维真实信息源为 <code>.github/ISSUE_TEMPLATE/</code>。请勿在此重复完整的模板 YAML。当模板措辞发生变更时，请更新 issue 表单本身，并将本节内容保持在持久意图层面。</p>
+<p>当前进料通道:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>模板</th><th>目的</th><th>已收集摄入信号</th></tr>
+</thead>
+<tbody>
+<tr><td><code>bug_report.yml</code></td><td>可复现缺陷</td><td>组件、严重程度、复现步骤、预期行为、环境、隐私检查</td></tr>
+<tr><td><code>support_config.yml</code></td><td>设置、配置和使用帮助</td><td>目标、观察到的行为，以及相关时经过脱敏处理的配置或命令</td></tr>
+<tr><td><code>feature_request.yml</code></td><td>普通功能创意</td><td>用户问题、建议的解决方案、非目标、架构/风险提示、预期路由</td></tr>
+<tr><td><code>rfc_design.yml</code></td><td>架构、治理、默认设置、发布或贡献模式提案</td><td>问题、提案、风险、破坏性变更评估、决策/复审范围</td></tr>
+<tr><td><code>roadmap_tracker.yml</code></td><td>活跃发布、路线图、RFC、实现、清理或审计追踪器</td><td>目的、范围、关联工作、路由证据、关闭条件、过期豁免请求</td></tr>
+<tr><td><code>docs_issue.yml</code></td><td>文档缺失、错误、混乱或过时</td><td>位置、问题、预期文档、相关的事实来源</td></tr>
+<tr><td><code>contributor_task.yml</code></td><td>面向外部贡献者的维护者职责范围工作</td><td>背景、验收标准、相关文件、衔接适配性、导师或评审联系人</td></tr>
+</tbody>
+</table>
+</div>
+<p>安全漏洞不提供公开的问题模板。<code>config.yml</code> 链接到私密安全策略、Discord、GitHub Discussions、贡献指南、RFC 流程以及维护者 PR 工作流，以便贡献者在创建受跟踪的问题之前选择合适的渠道。</p>
+<p>Issue 模板用于收集证据，但其本身并不决定最终标签。维护者在检查正文、讨论和关联工作后，仍会应用需要人工判断的标签，例如 <code>status:accepted</code>、<code>status:no-stale</code>、<code>help wanted</code> 和 <code>good first issue</code>。特别是，<code>status:no-stale</code> 不应通过模板自动应用。在添加或保留 stale 保护之前，tracker、RFC 或长期存续的已接受 issue 必须同时记录 stale 豁免原因以及可见的下一步决策或复审面。</p>
+<hr>
+<h2 id="8-rfc-治理循环"><a class="header" href="#8-rfc-治理循环">8. RFC 治理循环</a></h2>
+<p>RFC 流程在文档 RFC 和架构 RFC 中确立。本节定义了闭环：RFC 如何从提案推进到决策再到执行。</p>
+<h3 id="81-rfc-的完整生命周期"><a class="header" href="#81-rfc-的完整生命周期">8.1 RFC 的完整生命周期</a></h3>
+<pre><code>1. AUTHOR writes proposal → docs/proposals/&lt;slug&gt;.md
+           ↓
+2. AUTHOR opens PR with the proposal document
+           ↓
+3. AUTHOR opens RFC issue using the RFC issue template
+   linking to the PR
+           ↓
+4. DISCUSSION PERIOD — minimum 7 days
+   Anyone can comment. Core Team members engage substantively.
+   Discussions happen on the issue, not the PR.
+           ↓
+5. CORE TEAM VOTE on the issue
+   Format: comment with one of:
+     ✅ APPROVE — with brief rationale
+     ❌ REJECT — with specific objections
+     🔄 REVISE — with specific requests
+           ↓
+   ┌── Majority APPROVE ──────────────────────────────────────┐
+   │  RFC is accepted                                          │
+   │  PR is merged                                            │
+   │  Issue labeled rfc:accepted                              │
+   │  Author writes ADR(s) in docs/architecture/decisions/    │
+   │  ADR issue(s) linked back to RFC issue                   │
+   │  RFC issue closed                                        │
+   └──────────────────────────────────────────────────────────┘
+           ↓
+   ┌── Any REJECT ────────────────────────────────────────────┐
+   │  RFC is rejected                                          │
+   │  PR is closed (not merged)                               │
+   │  Issue labeled rfc:rejected                              │
+   │  Rejecting members document specific objections          │
+   │  RFC issue closed with rejection summary comment         │
+   └──────────────────────────────────────────────────────────┘
+           ↓
+   ┌── REVISE requested ──────────────────────────────────────┐
+   │  RFC is not voted on until revisions are complete        │
+   │  Issue labeled rfc:revision-requested                    │
+   │  Author revises proposal document                        │
+   │  Author re-requests review via issue comment             │
+   │  Process returns to step 4                               │
+   └──────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="82-投票阈值"><a class="header" href="#82-投票阈值">8.2 投票阈值</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>更改类型</th><th>需要投票</th><th>理由</th></tr>
+</thead>
+<tbody>
+<tr><td>文档、工具、非破坏性特性</td><td>活跃核心团队成员的简单多数</td><td>低风险，快速迭代</td></tr>
+<tr><td>API 变更、新子系统、行为变更</td><td>核心团队三分之二多数</td><td>中等风险，需要真正的共识</td></tr>
+<tr><td>架构变更、安全模型变更、破坏性变更</td><td>核心团队成员的一致同意</td><td>高风险，影响所有人</td></tr>
+</tbody>
+</table>
+</div>
+<p>“活跃”核心团队成员是指在过去 90 天内至少参与过一次投票的成员。不活跃的成员不计入多数阈值，但仍会收到投票通知。</p>
+<h3 id="83-adr-连接"><a class="header" href="#83-adr-连接">8.3 ADR 连接</a></h3>
+<p>每个被采纳的 RFC 在对应的实现开始之前，都必须至少产出一份 ADR。ADR 并不是 RFC 的摘要：它是对所做出的特定决策的永久记录，采用文档 RFC 中定义的 Nygard 格式。RFC 可以很长且具有探索性，而 ADR 则简短且具有确定性。</p>
+<p>RFC 是提案，ADR 是决策。两者都是必要的，且互不替代。</p>
+<h3 id="84-本仓库中现有的-rfc"><a class="header" href="#84-本仓库中现有的-rfc">8.4 本仓库中现有的 RFC</a></h3>
+<p>截至本文撰写时，已提交以下 RFC，应立即将其转换为正式的 RFC 问题：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>RFC 文档</th><th>要创建的问题</th><th>优先级</th></tr>
+</thead>
+<tbody>
+<tr><td><code>docs/proposals/microkernel-architecture.md</code></td><td>微内核架构 RFC (v0.7.0+)</td><td>高</td></tr>
+<tr><td><code>docs/proposals/documentation-standards.md</code></td><td>文档规范和国际化 RFC</td><td>高</td></tr>
+<tr><td><code>docs/proposals/project-governance.md</code></td><td>团队组织与治理 RFC</td><td>中等</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="9-标签分类"><a class="header" href="#9-标签分类">9. 标签分类</a></h2>
+<p>标签是 issue 和 PR 上的元数据层。一套一致、设计良好的标签系统能够实现筛选、报告和自动化。而不一致的标签系统（常见情况是由创建 issue 的人随意添加标签）则会产生干扰。</p>
+<p>使用<strong>命名空间</strong>标签系统。每个标签都有一个前缀，用于标识其类别：</p>
+<h3 id="type-这是哪种类型的工作"><a class="header" href="#type-这是哪种类型的工作"><code>type:</code> 这是哪种类型的工作？</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标签</th><th>颜色</th><th>使用</th></tr>
+</thead>
+<tbody>
+<tr><td><code>type:feature</code></td><td><code>#0075ca</code> 蓝色</td><td>新功能或增强</td></tr>
+<tr><td><code>type:bug</code></td><td><code>#d73a4a</code> 红色</td><td>某些功能未正常工作</td></tr>
+<tr><td><code>type:refactor</code></td><td><code>#e4e669</code> 黄色</td><td>在不改变行为的情况下重构代码</td></tr>
+<tr><td><code>type:docs</code></td><td><code>#0075ca</code> 蓝色</td><td>仅文档更改</td></tr>
+<tr><td><code>type:security</code></td><td><code>#e11d48</code> 深红色</td><td>与安全相关的更改</td></tr>
+<tr><td><code>type:infrastructure</code></td><td><code>#6366f1</code> 紫色</td><td>持续集成（CI）、工具链、构建系统</td></tr>
+<tr><td><code>type:adr</code></td><td><code>#a855f7</code> 浅紫色</td><td>架构决策记录</td></tr>
+<tr><td><code>type:rfc</code></td><td><code>#f59e0b</code> 琥珀色</td><td>请求评论 / 提案</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="priority-这有多紧急"><a class="header" href="#priority-这有多紧急"><code>priority:</code> 这有多紧急？</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标签</th><th>颜色</th><th>使用</th></tr>
+</thead>
+<tbody>
+<tr><td><code>priority:critical</code></td><td><code>#b91c1c</code> 深红色</td><td>阻止发布或导致数据丢失</td></tr>
+<tr><td><code>priority:high</code></td><td><code>#f97316</code> 橙色</td><td>重要，应在下一个里程碑中</td></tr>
+<tr><td><code>priority:medium</code></td><td><code>#eab308</code> 黄色</td><td>普通优先级</td></tr>
+<tr><td><code>priority:low</code></td><td><code>#22c55e</code> 绿色</td><td>锦上添花，低优先级</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="size-这个工作项有多大"><a class="header" href="#size-这个工作项有多大"><code>size:</code> 这个工作项有多大？</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标签</th><th>颜色</th><th>使用</th></tr>
+</thead>
+<tbody>
+<tr><td><code>size:XS</code></td><td><code>#dcfce7</code> 浅绿色</td><td>不到 2 小时</td></tr>
+<tr><td><code>size:S</code></td><td><code>#bbf7d0</code> 绿色</td><td>半天</td></tr>
+<tr><td><code>size:M</code></td><td><code>#86efac</code> 中等绿色</td><td>1–3 天</td></tr>
+<tr><td><code>size:L</code></td><td><code>#4ade80</code> 深绿色</td><td>1–2 周</td></tr>
+<tr><td><code>size:XL</code></td><td><code>#16a34a</code> 深绿色</td><td>超过两周；应进行分解</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="component-系统的哪个部分"><a class="header" href="#component-系统的哪个部分"><code>component:</code> 系统的哪个部分？</a></h3>
+<p><code>组件:内核</code> · <code>组件:网关</code> · <code>组件:通道</code> · <code>组件:工具</code> · <code>组件:内存</code> · <code>组件:安全</code> · <code>组件:硬件</code> · <code>组件:文档</code> · <code>组件:基础设施</code></p>
+<p>使用 <code>#f1f5f9</code>（浅灰色）作为所有组件标签的颜色，以便在视觉上与其他类别区分开来。</p>
+<h3 id="risk-风险等级是什么与-agentsmd-保持一致"><a class="header" href="#risk-风险等级是什么与-agentsmd-保持一致"><code>risk:</code> 风险等级是什么？（与 <code>AGENTS.md</code> 保持一致）</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标签</th><th>颜色</th><th>使用</th></tr>
+</thead>
+<tbody>
+<tr><td><code>risk:low</code></td><td><code>#dcfce7</code></td><td>文档、测试、小改动</td></tr>
+<tr><td><code>risk:medium</code></td><td><code>#fef9c3</code></td><td>大多数 <code>src/**</code> 的更改</td></tr>
+<tr><td><code>risk:high</code></td><td><code>#fee2e2</code></td><td>安全、网关、运行时、持续集成</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="status-此处处于流程中的哪个阶段"><a class="header" href="#status-此处处于流程中的哪个阶段"><code>status：</code> 此处处于流程中的哪个阶段？</a></h3>
+<p>此表记录了治理意图和历史分类结构。如需了解当前实际生效的标签语义和自动化行为，请参考维护者标签指南作为操作依据；维护者文档包含了来自 #6808 的后续标签策略修正。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标签</th><th>颜色</th><th>使用</th></tr>
+</thead>
+<tbody>
+<tr><td><code>status:needs-triage</code></td><td><code>#f8fafc</code> 白色</td><td>新打开，尚未审核</td></tr>
+<tr><td><code>status:accepted</code></td><td><code>#0e8a16</code> 绿色</td><td>RFC 或工作项已批准；其本身并不豁免过期标记</td></tr>
+<tr><td><code>status:blocked</code></td><td><code>#b60205</code> 红色</td><td>等待已记录的未解决外部依赖、维护者决定或关联的前置条件</td></tr>
+<tr><td><code>status:in-progress</code></td><td><code>#0075ca</code> 蓝色</td><td>打开的 PR 正在积极处理该 issue；在 stale 检查期间验证 PR 的实时状态</td></tr>
+<tr><td><code>status:stale</code></td><td><code>#e4e669</code> 黄色</td><td>在过期阈值窗口期内没有原作者的活动</td></tr>
+<tr><td><code>status:no-stale</code></td><td><code>#0e8a16</code> 绿色</td><td>针对已接受或其他长期存续工作的显式过期豁免；目标策略要求在运维源中记录原因并保留可见的路由证据</td></tr>
+<tr><td><code>status:help-wanted</code></td><td><code>#059669</code> 绿色</td><td>寻找贡献者</td></tr>
+<tr><td><code>status:good-first-issue</code></td><td><code>#059669</code> 绿色</td><td>适合新贡献者</td></tr>
+<tr><td><code>status:discussion</code></td><td><code>#a78bfa</code> 紫色</td><td>需要在开始工作之前进行团队讨论</td></tr>
+</tbody>
+</table>
+</div>
+<p>当前社区认领标签是无前缀的 <code>good first issue</code> 和 <code>help wanted</code>；上方的 <code>status:*</code> 认领条目属于历史分类法。当前运营风险标签还区分问题风险（根据报告预估的修复影响范围）与 PR 风险（实际待审查的 diff）。有关当前策略，请参阅<a href="../maintainers/labels.html">维护者标签指南</a>。</p>
+<p>终态关闭标签属于运营策略，并非本基础文档中历史 <code>status:*</code> 分类体系的一部分。当前的解决标签请参阅<a href="../maintainers/labels.html#resolution-labels">维护者标签指南</a>，替换流程规则请参阅<a href="../maintainers/superseding.html">取代指南</a>。</p>
+<h3 id="rfc-rfc-专属状态"><a class="header" href="#rfc-rfc-专属状态"><code>rfc:</code> RFC 专属状态</a></h3>
+<p><code>rfc:accepted</code> · <code>rfc:rejected</code> · <code>rfc:revision-requested</code></p>
+<hr>
+<h2 id="10-完成定义"><a class="header" href="#10-完成定义">10. 完成定义</a></h2>
+<p><strong>“完成”有其特定含义。如果你不加以定义，每个人都会有不同的理解，而分歧会在最糟糕的时刻浮现：在评审时、在发布时，或在用户提交缺陷报告之后。</strong></p>
+<p>当满足以下条件时，一项任务即被视为<strong>已完成</strong>：</p>
+<h3 id="对于代码更改"><a class="header" href="#对于代码更改">对于代码更改</a></h3>
+<ul>
+<li><input disabled="" type="checkbox"> 该 PR 已经过所需审查者层级（根据 CODEOWNERS 和风险等级）的审查和批准。</li>
+<li><input disabled="" type="checkbox"> 所有 CI 检查均通过：<code>cargo fmt</code>、<code>cargo clippy</code>、<code>cargo test</code></li>
+<li><input disabled="" type="checkbox"> 针对新增或更改的行为编写了测试（至少包含单元测试；面向用户的特性需包含集成测试）</li>
+<li><input disabled="" type="checkbox"> PR 之前通过的测试覆盖率没有丢失</li>
+<li><input disabled="" type="checkbox"> PR 描述说明 <em>改动内容</em> 及 <em>改动原因</em>（不能只写“修复 bug”：是什么 bug、问题出在哪里、做了哪些改动）</li>
+<li><input disabled="" type="checkbox"> 如果更改影响了面向用户的行为，则相关参考文档将在同一 PR 中更新。</li>
+<li><input disabled="" type="checkbox"> 如果变更较大，请在正确的里程碑部分添加 CHANGELOG.md 条目</li>
+<li><input disabled="" type="checkbox"> 如果该变更需要 ADR：则 ADR 应在实现 PR 之前或与其同时编写、链接并合并。</li>
+</ul>
+<h3 id="用于文档变更"><a class="header" href="#用于文档变更">用于文档变更</a></h3>
+<ul>
+<li><input disabled="" type="checkbox"> 存在且有效的 YAML frontmatter</li>
+<li><input disabled="" type="checkbox"> 所有内部链接均正确解析</li>
+<li><input disabled="" type="checkbox"> 如果文档描述的是当前行为，则其准确性基于当前的 <code>master</code> 分支。</li>
+<li><input disabled="" type="checkbox"> 如果文档是 ADR，它遵循 Nygard 格式，并包含一个 <code>status</code> 字段。</li>
+</ul>
+<h3 id="用于发布"><a class="header" href="#用于发布">用于发布</a></h3>
+<ul>
+<li><input disabled="" type="checkbox"> 里程碑中的所有项目都处于“完成”状态，或者已明确移至下一个里程碑，并附有解释原因的注释。</li>
+<li><input disabled="" type="checkbox"> 该版本的 CHANGELOG.md 条目已完成</li>
+<li><input disabled="" type="checkbox"> 此里程碑中由已接受的 RFC 生成的所有 ADR 均已编写并获批准</li>
+<li><input disabled="" type="checkbox"> 该版本已在至少一个平台上进行了测试（至少包括 Linux x86_64）。</li>
+<li><input disabled="" type="checkbox"> 发布标签遵循语义化版本控制</li>
+</ul>
+<h3 id="完成定义规则"><a class="header" href="#完成定义规则">“完成定义”规则</a></h3>
+<p>在软件团队中，存在一种“已完成”但并非“完全完成”的工作概念。“已完成”仅表示代码已编写完毕，而“完全完成”则意味着代码已经过测试、文档化、审查、合并并正式发布。上述的“完成定义”描述的就是“完全完成”的状态。只有满足完整定义的工作，才能被称为“已完成”。</p>
+<hr>
+<h2 id="11-自动化"><a class="header" href="#11-自动化">11. 自动化</a></h2>
+<p>GitHub Projects v2 与 GitHub Actions 结合使用，能够实现显著的自动化，从而减少手动协调的工作量。以下是按价值与工作量比排序的实施建议。</p>
+<h3 id="111-项目板自动化内置无需操作"><a class="header" href="#111-项目板自动化内置无需操作">11.1 项目板自动化（内置，无需操作）</a></h3>
+<p>在项目的内置自动化设置中配置这些内容：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>触发器</th><th>操作</th></tr>
+</thead>
+<tbody>
+<tr><td>问题已开启</td><td>添加到项目；设置状态 = 💡 想法</td></tr>
+<tr><td>标记为 <code>type:bug</code> 的问题</td><td>设置优先级 = 🟠 高（如果未设置优先级）</td></tr>
+<tr><td>已打开的 PR 引用了某个 issue</td><td>设置关联问题状态 = 👀 审核中</td></tr>
+<tr><td>PR 已合并</td><td>设置关联问题状态为 ✅ 完成；关闭关联问题</td></tr>
+<tr><td>问题已关闭，因为未计划</td><td>设置状态 = 🚫 不会执行</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="112-github-actions-工作流"><a class="header" href="#112-github-actions-工作流">11.2 GitHub Actions 工作流</a></h3>
+<p><strong>根据变更文件自动添加标签：</strong></p>
+<p>活动路径标注器会根据已更改的文件为 PR 应用范围标签。风险和大小标签目前由维护者手动应用；维护者标签指南是标签名称、自动化状态和风险语义的实时来源。</p>
+<p><strong>自动请求 CODEOWNERS 评审（内置于 CODEOWNERS：无需 Action）：</strong></p>
+<p>当文件存在且分支保护要求启用时，GitHub 会自动强制执行 CODEOWNERS。无需采取任何操作。</p>
+<p><strong>过期问题管理 (<code>.github/workflows/stale.yml</code>):</strong></p>
+<p>45 天无活动的 issue 会被标记为 <code>status:stale</code>，并发布一条评论询问该 issue 是否仍然相关。应用 stale 标签后 15 天内仍无活动的 issue 将被关闭。这可以防止积压的 issue 累积到数百个数月之久且不再相关的状态。排除 <code>priority:p0</code>、<code>type:rfc</code>、有未关闭关联 PR 的 issue，以及在已记录的阻塞项尚未解决时带有 <code>status:blocked</code> 的 issue。预期的 <code>status:no-stale</code> 后续处理是：仅当操作来源同时记录了 stale 豁免原因和贡献者可见的路由证据时，才将其排除。维护者标签指南和 issue 分类协议包含当前的操作细节。</p>
+<p><strong>PR size labeling (future/optional):</strong></p>
+<p>If size automation is added later, it should follow the maintainer label guide’s live names (<code>size:XS</code> through <code>size:XL</code>) and recalculate on pushed updates so the label describes the diff under review. Until then, size labels are maintainer-applied.</p>
+<p><strong>合并 PR 时的里程碑检查 (<code>.github/workflows/milestone-check.yml</code>)：</strong></p>
+<p>如果合并 PR 时未关联已分配里程碑的 issue，则发出警告（而非阻止）。这是一种温和的提醒，而非强制限制：目的是避免工作未被跟踪到某个发布版本就开展。</p>
+<h3 id="113-哪些内容暂不要自动化"><a class="header" href="#113-哪些内容暂不要自动化">11.3 哪些内容暂不要自动化</a></h3>
+<ul>
+<li><strong>自动发布草稿：</strong> GitHub 的 release-drafter 很有用，但会增加配置开销。在团队建立了稳定的发布节奏后再添加它。</li>
+<li><strong>自动依赖更新（Dependabot PR）：</strong> 启用 Dependabot 安全更新（免费、低噪音），但在团队实现 CI 稳定性之前，暂缓自动版本升级。在 CI 基础尚未稳固时，升级版本会产生大量噪音。</li>
+<li><strong>Sprint 规划自动化：</strong> 不要自动化 Sprint 规划。它需要关于容量、优先级和团队背景的人类判断，在当前团队规模下，没有任何自动化可以替代这种判断。</li>
+</ul>
+<hr>
+<h2 id="12-分阶段发布"><a class="header" href="#12-分阶段发布">12. 分阶段发布</a></h2>
+<p>治理和工具必须逐步引入。一次性引入所有内容会在团队理解每个部分的存在意义之前产生开销。</p>
+<hr>
+<h3 id="第-1-阶段--本周基础"><a class="header" href="#第-1-阶段--本周基础">第 1 阶段 · 本周：“基础”</a></h3>
+<p>最小可行的治理设置。让团队立即协调起来。</p>
+<ul>
+<li><input disabled="" type="checkbox"> 创建包含状态、类型、优先级和里程碑字段的 GitHub 项目</li>
+<li><input disabled="" type="checkbox"> 创建四个项目视图（路线图、看板、待办事项、我的工作）</li>
+<li><input disabled="" type="checkbox"> 在贡献者沟通文档和维护者工作流文档中，启用 GitHub Discussions 并维护其分类说明</li>
+<li><input disabled="" type="checkbox"> 为现有提案（第 8.4 节）创建三个 RFC 问题</li>
+<li><input disabled="" type="checkbox"> 添加第 7 节中列出的 issue 模板</li>
+<li><input disabled="" type="checkbox"> 创建 <code>CODEOWNERS</code> 文件（第 6.1 节）</li>
+<li><input disabled="" type="checkbox"> 在 <code>master</code> 分支上启用分支保护规则（第 6.2 节）</li>
+<li><input disabled="" type="checkbox"> 将剩余的标签分类体系（第 9 节）添加到仓库中</li>
+<li><input disabled="" type="checkbox"> 固定这三个 RFC 问题和下一个发布里程碑问题</li>
+</ul>
+<p><strong>成功信号：</strong> 新问题会自动出现在项目中。团队清楚在哪里查找活跃工作，以及在哪里发布想法。</p>
+<hr>
+<h3 id="阶段-2--v070-里程碑the-pipeline"><a class="header" href="#阶段-2--v070-里程碑the-pipeline">阶段 2 · v0.7.0 里程碑：“The Pipeline”</a></h3>
+<p>建立完整的工作流程，并根据已批准的 RFC 填充待办事项列表。</p>
+<ul>
+<li><input disabled="" type="checkbox"> 向项目添加“大小”、“风险等级”和“组件”字段</li>
+<li><input disabled="" type="checkbox"> 将微内核架构 RFC 中的交付物填充到待办事项列表中</li>
+<li><input disabled="" type="checkbox"> 将文档标准 RFC 中的交付物填充到待办事项列表中。</li>
+<li><input disabled="" type="checkbox"> 对现有的三项提案进行首次正式 RFC 投票</li>
+<li><input disabled="" type="checkbox"> 为已接受的 RFC 编写 ADR（ADR-001 至 ADR-007，依据文档中的 RFC 规范）</li>
+<li><input disabled="" type="checkbox"> 在 <code>CONTRIBUTORS.md</code> 文件中添加当前团队成员及其所属层级</li>
+<li><input disabled="" type="checkbox"> 实现按路径自动标记的 Actions 工作流</li>
+<li><input disabled="" type="checkbox"> 实现过期的问题管理流程</li>
+<li><input disabled="" type="checkbox"> 创建 <code>zeroclaw-core</code> 和 <code>zeroclaw-contributors</code> GitHub 团队</li>
+</ul>
+<p><strong>成功信号：</strong> 团队每天都在使用看板。项目在各个阶段中推进，并可见地执行关卡检查。微内核架构的 RFC 已记录了投票结果。</p>
+<hr>
+<h3 id="第三阶段--v080-里程碑发展社区"><a class="header" href="#第三阶段--v080-里程碑发展社区">第三阶段 · v0.8.0 里程碑：“发展社区”</a></h3>
+<p>随着插件系统逐渐可用，外部贡献者将陆续加入。贡献基础设施必须准备就绪。</p>
+<ul>
+<li><input disabled="" type="checkbox"> 实现 PR 大小标签工作流</li>
+<li><input disabled="" type="checkbox"> 为插件 SDK 工作创建第一批 <code>good first issue</code> 条目（至少 5 个）</li>
+<li><input disabled="" type="checkbox"> 将 <code>Good First Issue Index</code> 添加为置顶 issue，并附上当前适合新手的 issue 链接</li>
+<li><input disabled="" type="checkbox"> 建立想法推广阈值，并将第一个讨论想法推广为问题</li>
+<li><input disabled="" type="checkbox"> 记录核心团队扩充流程：邀请新核心团队成员的标准</li>
+</ul>
+<p><strong>成功信号：</strong> 至少有一名外部贡献者（不在当前团队中）通过一个 good first issue 提交了 PR。Discussions Ideas 分类有活跃的社区参与。</p>
+<hr>
+<h3 id="阶段-4--v100可持续治理"><a class="header" href="#阶段-4--v100可持续治理">阶段 4 · v1.0.0：“可持续治理”</a></h3>
+<p>到 v1.0.0 时，治理模型应当能够自我维持：团队无需为此费心，它应当自然而然地运转。</p>
+<ul>
+<li><input disabled="" type="checkbox"> 根据实际效果，审查并更新治理文档</li>
+<li><input disabled="" type="checkbox"> 确定发布周期（发布的频率以及由谁负责发布）</li>
+<li><input disabled="" type="checkbox"> 发布插件注册表治理文档（根据架构 RFC）</li>
+<li><input disabled="" type="checkbox"> 如果仅基于里程碑的规划感觉过于松散，可以考虑引入时间盒周期（如两周或四周）。</li>
+<li><input disabled="" type="checkbox"> 记录核心团队成员退出或变为不活跃状态的过程</li>
+</ul>
+<p><strong>成功信号：</strong> 过去六个月的开发历史显示，团队持续使用该流水线。问题在 3 天内被分类处理，PR 在 5 天内完成审查，每次合并都会更新 CHANGELOG。</p>
+<hr>
+<h2 id="附录-a术语表"><a class="header" href="#附录-a术语表">附录 A：术语表</a></h2>
+<p><strong>Backlog 整理</strong>：一项定期的团队活动（通常每周或每两周进行一次），团队在此过程中审查 backlog、重新调整事项优先级、关闭陈旧的事项，并确保排在前面的事项处于“已定义“状态且可供着手处理。</p>
+<p><strong>分支保护</strong>：一项 GitHub 功能，可阻止直接推送到受保护的分支，并在合并前强制执行各项要求（代码评审、CI 检查）。</p>
+<p><strong>CODEOWNERS</strong>：一个 GitHub 文件，当 PR 中修改了某些人或团队所拥有的文件时，会自动向其请求审查。</p>
+<p><strong>完成的定义</strong>：一份共享的检查清单，明确规定了某个工作项的“完成“究竟意味着什么。如果没有共享的定义，“完成“对每个人来说都意味着不同的东西。</p>
+<p><strong>默认通过（Lazy consensus）</strong>：一种决策方式，即提议的操作在规定时间内无人反对即可继续执行。这减少了对常规决策要求显式批准所带来的开销。</p>
+<p><strong>精英治理</strong>：一种治理模式，其中权威和影响力是通过实际贡献赢得的，而非通过资历或头衔。在开源项目中是标准做法。</p>
+<p><strong>里程碑</strong>：GitHub 的一项功能，用于按发布目标对议题和 PR 进行分组。里程碑代表软件的一个版本。</p>
+<p><strong>T 恤尺码法</strong>：一种使用抽象尺寸（XS、S、M、L、XL）而非数字故事点的估算技术。无需历史校准数据即可轻松使用，适合处于早期阶段的团队。</p>
+<p><strong>问题分类</strong>：审查新问题的过程，用于确认问题是否有效、分配标签和优先级、将其关联到里程碑，并确定其应纳入待办事项列表还是应予关闭。</p>
+<hr>
+<h2 id="附录-b延伸阅读"><a class="header" href="#附录-b延伸阅读">附录 B：延伸阅读</a></h2>
+<ul>
+<li><a href="https://docs.github.com/en/issues/planning-and-tracking-with-projects">GitHub Projects 文档</a>：GitHub Projects v2 功能的完整参考。</li>
+<li><a href="https://docs.github.com/en/discussions">GitHub Discussions 文档</a>：GitHub Discussions 的设置指南和治理选项。</li>
+<li><a href="https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners">CODEOWNERS 语法参考</a>：CODEOWNERS 文件的完整语法。</li>
+<li><strong>《Producing Open Source Software》</strong>：Karl Fogel 著：关于运营开源项目的权威著作。可在 <a href="https://producingoss.com">producingoss.com</a> 免费在线阅读。其中关于治理、贡献者管理和沟通的章节可直接应用。</li>
+<li><strong>《开源治理模型简介》</strong>：Apache Software Foundation 的治理文档是一个很好的范例，展示了成熟的开源项目如何将权威与决策制度化：<a href="https://www.apache.org/foundation/governance/">https://www.apache.org/foundation/governance/</a></li>
+<li><strong>Vale 散文检查工具</strong>：<a href="https://vale.sh">Vale</a>：在文档 RFC 中被引用；与 <code>good first issue</code> 文档改进工作流程集成。</li>
+</ul>
+<hr>
+<p>本提案是在 ZeroClaw v0.6.8 及之前两份架构与文档 RFC 的背景下制定的。这里提出的治理模型有意保持轻量，以适应处于社区成长早期阶段、由学生主导的项目。它的设计具备可扩展性：随着团队的成长逐步增加流程，而非一次性全部引入。</p>
+<p>最好的治理模型是团队真正会遵循的最简单模型。从这里开始，根据你所学到的进行调整。</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/fnd-002-documentation-standards.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../foundations/fnd-004-engineering-infrastructure.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/fnd-002-documentation-standards.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../foundations/fnd-004-engineering-infrastructure.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ApprovalDecision","ApprovalMode","ApprovalSource","ApprovalTimeoutAction","GateEventKind","ResolveOutcome"],"mod":["decision","ledger","principal","resolve","timeout"],"struct":["ApprovalPrincipal","GateLedgerEntry"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["QUICKSTART_SECTIONS"],"enum":["Section","SectionShape"],"fn":["humanize_section_key","is_known_section","section_for_path","section_has_signal","section_help","section_index","section_index_for_key"]};

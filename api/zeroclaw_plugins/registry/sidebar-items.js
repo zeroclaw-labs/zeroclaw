@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["REGISTRY_CACHE_DIR_NAME","REGISTRY_CACHE_FILE_NAME"],"fn":["install_command","install_source","parse_plugin_spec","read_cached_registry_index","registry_cache_path","resolve_entry","search_entries","write_cached_registry_index"],"struct":["PluginRegistryEntry","PluginRegistryIndex","PluginSpec"]};

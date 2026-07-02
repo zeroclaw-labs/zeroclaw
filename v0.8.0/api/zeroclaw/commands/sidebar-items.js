@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["self_test","update"]};

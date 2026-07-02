@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["lookup","set_active","set_row"],"type":["OverrideTable"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["validate_skill_content"],"struct":["SkillImprover"]};

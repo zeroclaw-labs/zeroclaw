@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["CaptureAction","ChatTabAction","ConfigEditorAction","ConfigTabAction","DashboardTabAction","DoctorTabAction","FileExplorerAction","FileExplorerSearchAction","GlobalAction","InputBarAction","LogsTabAction","ModalAction","QuickstartModalAction","QuickstartTabAction","SearchBoxAction"]};

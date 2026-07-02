@@ -1,0 +1,424 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `crates/zeroclaw-runtime/src/agent/system_prompt.rs`."><title>system_prompt.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-17e0aaed.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="zeroclaw_runtime" data-themes="" data-resource-suffix="" data-rustdoc-version="1.96.0 (ac68faa20 2026-05-25)" data-channel="1.96.0" data-search-js="search-b5634cc7.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../../../static.files/src-script-813739b1.js"></script><script defer src="../../../src-files.js"></script><script defer src="../../../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">zeroclaw_runtime/agent/</div>system_prompt.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="doccomment">//! System prompt construction for the agent loop and channel subsystem.
+<a href=#2 id=2 data-nosnippet>2</a>//!
+<a href=#3 id=3 data-nosnippet>3</a>//! These functions were originally in `channels/mod.rs` but live here to
+<a href=#4 id=4 data-nosnippet>4</a>//! break a circular dependency between the channels and agent modules.
+<a href=#5 id=5 data-nosnippet>5</a>
+<a href=#6 id=6 data-nosnippet>6</a></span><span class="kw">use </span><span class="kw">crate</span>::identity;
+<a href=#7 id=7 data-nosnippet>7</a><span class="kw">use </span><span class="kw">crate</span>::security::AutonomyLevel;
+<a href=#8 id=8 data-nosnippet>8</a><span class="kw">use </span><span class="kw">crate</span>::skills::Skill;
+<a href=#9 id=9 data-nosnippet>9</a>
+<a href=#10 id=10 data-nosnippet>10</a><span class="doccomment">/// Maximum characters per injected workspace file (matches `OpenClaw` default).
+<a href=#11 id=11 data-nosnippet>11</a></span><span class="kw">pub const </span>BOOTSTRAP_MAX_CHARS: usize = <span class="number">20_000</span>;
+<a href=#12 id=12 data-nosnippet>12</a>
+<a href=#13 id=13 data-nosnippet>13</a><span class="kw">fn </span>load_openclaw_bootstrap_files(
+<a href=#14 id=14 data-nosnippet>14</a>    prompt: <span class="kw-2">&amp;mut </span>String,
+<a href=#15 id=15 data-nosnippet>15</a>    workspace_dir: <span class="kw-2">&amp;</span>std::path::Path,
+<a href=#16 id=16 data-nosnippet>16</a>    max_chars_per_file: usize,
+<a href=#17 id=17 data-nosnippet>17</a>    inject_memory: bool,
+<a href=#18 id=18 data-nosnippet>18</a>) {
+<a href=#19 id=19 data-nosnippet>19</a>    prompt.push_str(
+<a href=#20 id=20 data-nosnippet>20</a>        <span class="string">"The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n"</span>,
+<a href=#21 id=21 data-nosnippet>21</a>    );
+<a href=#22 id=22 data-nosnippet>22</a>
+<a href=#23 id=23 data-nosnippet>23</a>    <span class="kw">let </span>bootstrap_files = [<span class="string">"AGENTS.md"</span>, <span class="string">"SOUL.md"</span>, <span class="string">"TOOLS.md"</span>, <span class="string">"IDENTITY.md"</span>, <span class="string">"USER.md"</span>];
+<a href=#24 id=24 data-nosnippet>24</a>
+<a href=#25 id=25 data-nosnippet>25</a>    <span class="kw">for </span>filename <span class="kw">in </span><span class="kw-2">&amp;</span>bootstrap_files {
+<a href=#26 id=26 data-nosnippet>26</a>        inject_workspace_file(prompt, workspace_dir, filename, max_chars_per_file);
+<a href=#27 id=27 data-nosnippet>27</a>    }
+<a href=#28 id=28 data-nosnippet>28</a>
+<a href=#29 id=29 data-nosnippet>29</a>    <span class="comment">// BOOTSTRAP.md — only if it exists (first-run ritual)
+<a href=#30 id=30 data-nosnippet>30</a>    </span><span class="kw">let </span>bootstrap_path = workspace_dir.join(<span class="string">"BOOTSTRAP.md"</span>);
+<a href=#31 id=31 data-nosnippet>31</a>    <span class="kw">if </span>bootstrap_path.exists() {
+<a href=#32 id=32 data-nosnippet>32</a>        inject_workspace_file(prompt, workspace_dir, <span class="string">"BOOTSTRAP.md"</span>, max_chars_per_file);
+<a href=#33 id=33 data-nosnippet>33</a>    }
+<a href=#34 id=34 data-nosnippet>34</a>
+<a href=#35 id=35 data-nosnippet>35</a>    <span class="comment">// MEMORY.md — curated long-term memory (main session only).
+<a href=#36 id=36 data-nosnippet>36</a>    // Skipped when the agent runs without persistent memory (e.g. ACP sessions)
+<a href=#37 id=37 data-nosnippet>37</a>    // so that stale long-term memory does not leak into isolated contexts.
+<a href=#38 id=38 data-nosnippet>38</a>    </span><span class="kw">if </span>inject_memory {
+<a href=#39 id=39 data-nosnippet>39</a>        inject_workspace_file(prompt, workspace_dir, <span class="string">"MEMORY.md"</span>, max_chars_per_file);
+<a href=#40 id=40 data-nosnippet>40</a>    }
+<a href=#41 id=41 data-nosnippet>41</a>}
+<a href=#42 id=42 data-nosnippet>42</a>
+<a href=#43 id=43 data-nosnippet>43</a><span class="doccomment">/// Load workspace identity files and build a system prompt.
+<a href=#44 id=44 data-nosnippet>44</a>///
+<a href=#45 id=45 data-nosnippet>45</a>/// Follows the `OpenClaw` framework structure by default:
+<a href=#46 id=46 data-nosnippet>46</a>/// 1. Tooling — tool list + descriptions
+<a href=#47 id=47 data-nosnippet>47</a>/// 2. Safety — guardrail reminder
+<a href=#48 id=48 data-nosnippet>48</a>/// 3. Skills — full skill instructions and tool metadata
+<a href=#49 id=49 data-nosnippet>49</a>/// 4. Workspace — working directory
+<a href=#50 id=50 data-nosnippet>50</a>/// 5. Bootstrap files — AGENTS, SOUL, TOOLS, IDENTITY, USER, BOOTSTRAP, MEMORY
+<a href=#51 id=51 data-nosnippet>51</a>/// 6. Date — timezone offset for cache stability
+<a href=#52 id=52 data-nosnippet>52</a>/// 7. Runtime — host, OS, model
+<a href=#53 id=53 data-nosnippet>53</a>///
+<a href=#54 id=54 data-nosnippet>54</a>/// When `identity_config` is set to AIEOS format, the bootstrap files section
+<a href=#55 id=55 data-nosnippet>55</a>/// is replaced with the AIEOS identity data loaded from file or inline JSON.
+<a href=#56 id=56 data-nosnippet>56</a>///
+<a href=#57 id=57 data-nosnippet>57</a>/// Daily memory files (`memory/*.md`) are NOT injected — they are accessed
+<a href=#58 id=58 data-nosnippet>58</a>/// on-demand via `memory_recall` / `memory_search` tools.
+<a href=#59 id=59 data-nosnippet>59</a></span><span class="kw">pub fn </span>build_system_prompt(
+<a href=#60 id=60 data-nosnippet>60</a>    workspace_dir: <span class="kw-2">&amp;</span>std::path::Path,
+<a href=#61 id=61 data-nosnippet>61</a>    model_name: <span class="kw-2">&amp;</span>str,
+<a href=#62 id=62 data-nosnippet>62</a>    tools: <span class="kw-2">&amp;</span>[(<span class="kw-2">&amp;</span>str, <span class="kw-2">&amp;</span>str)],
+<a href=#63 id=63 data-nosnippet>63</a>    skills: <span class="kw-2">&amp;</span>[Skill],
+<a href=#64 id=64 data-nosnippet>64</a>    identity_config: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>zeroclaw_config::schema::IdentityConfig&gt;,
+<a href=#65 id=65 data-nosnippet>65</a>    bootstrap_max_chars: <span class="prelude-ty">Option</span>&lt;usize&gt;,
+<a href=#66 id=66 data-nosnippet>66</a>) -&gt; String {
+<a href=#67 id=67 data-nosnippet>67</a>    build_system_prompt_with_mode(
+<a href=#68 id=68 data-nosnippet>68</a>        workspace_dir,
+<a href=#69 id=69 data-nosnippet>69</a>        model_name,
+<a href=#70 id=70 data-nosnippet>70</a>        tools,
+<a href=#71 id=71 data-nosnippet>71</a>        skills,
+<a href=#72 id=72 data-nosnippet>72</a>        identity_config,
+<a href=#73 id=73 data-nosnippet>73</a>        bootstrap_max_chars,
+<a href=#74 id=74 data-nosnippet>74</a>        <span class="bool-val">false</span>,
+<a href=#75 id=75 data-nosnippet>75</a>        zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+<a href=#76 id=76 data-nosnippet>76</a>        AutonomyLevel::default(),
+<a href=#77 id=77 data-nosnippet>77</a>    )
+<a href=#78 id=78 data-nosnippet>78</a>}
+<a href=#79 id=79 data-nosnippet>79</a>
+<a href=#80 id=80 data-nosnippet>80</a><span class="kw">pub fn </span>build_system_prompt_with_mode(
+<a href=#81 id=81 data-nosnippet>81</a>    workspace_dir: <span class="kw-2">&amp;</span>std::path::Path,
+<a href=#82 id=82 data-nosnippet>82</a>    model_name: <span class="kw-2">&amp;</span>str,
+<a href=#83 id=83 data-nosnippet>83</a>    tools: <span class="kw-2">&amp;</span>[(<span class="kw-2">&amp;</span>str, <span class="kw-2">&amp;</span>str)],
+<a href=#84 id=84 data-nosnippet>84</a>    skills: <span class="kw-2">&amp;</span>[Skill],
+<a href=#85 id=85 data-nosnippet>85</a>    identity_config: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>zeroclaw_config::schema::IdentityConfig&gt;,
+<a href=#86 id=86 data-nosnippet>86</a>    bootstrap_max_chars: <span class="prelude-ty">Option</span>&lt;usize&gt;,
+<a href=#87 id=87 data-nosnippet>87</a>    native_tools: bool,
+<a href=#88 id=88 data-nosnippet>88</a>    skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+<a href=#89 id=89 data-nosnippet>89</a>    autonomy_level: AutonomyLevel,
+<a href=#90 id=90 data-nosnippet>90</a>) -&gt; String {
+<a href=#91 id=91 data-nosnippet>91</a>    <span class="kw">let </span>autonomy_cfg = zeroclaw_config::schema::RiskProfileConfig {
+<a href=#92 id=92 data-nosnippet>92</a>        level: autonomy_level,
+<a href=#93 id=93 data-nosnippet>93</a>        ..Default::default()
+<a href=#94 id=94 data-nosnippet>94</a>    };
+<a href=#95 id=95 data-nosnippet>95</a>    build_system_prompt_with_mode_and_autonomy(
+<a href=#96 id=96 data-nosnippet>96</a>        workspace_dir,
+<a href=#97 id=97 data-nosnippet>97</a>        model_name,
+<a href=#98 id=98 data-nosnippet>98</a>        tools,
+<a href=#99 id=99 data-nosnippet>99</a>        skills,
+<a href=#100 id=100 data-nosnippet>100</a>        identity_config,
+<a href=#101 id=101 data-nosnippet>101</a>        bootstrap_max_chars,
+<a href=#102 id=102 data-nosnippet>102</a>        <span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span>autonomy_cfg),
+<a href=#103 id=103 data-nosnippet>103</a>        native_tools,
+<a href=#104 id=104 data-nosnippet>104</a>        skills_prompt_mode,
+<a href=#105 id=105 data-nosnippet>105</a>        <span class="bool-val">false</span>,
+<a href=#106 id=106 data-nosnippet>106</a>        <span class="number">0</span>,
+<a href=#107 id=107 data-nosnippet>107</a>        <span class="bool-val">true</span>,
+<a href=#108 id=108 data-nosnippet>108</a>    )
+<a href=#109 id=109 data-nosnippet>109</a>}
+<a href=#110 id=110 data-nosnippet>110</a>
+<a href=#111 id=111 data-nosnippet>111</a><span class="attr">#[allow(clippy::too_many_arguments)]
+<a href=#112 id=112 data-nosnippet>112</a></span><span class="kw">pub fn </span>build_system_prompt_with_mode_and_autonomy(
+<a href=#113 id=113 data-nosnippet>113</a>    workspace_dir: <span class="kw-2">&amp;</span>std::path::Path,
+<a href=#114 id=114 data-nosnippet>114</a>    model_name: <span class="kw-2">&amp;</span>str,
+<a href=#115 id=115 data-nosnippet>115</a>    tools: <span class="kw-2">&amp;</span>[(<span class="kw-2">&amp;</span>str, <span class="kw-2">&amp;</span>str)],
+<a href=#116 id=116 data-nosnippet>116</a>    skills: <span class="kw-2">&amp;</span>[Skill],
+<a href=#117 id=117 data-nosnippet>117</a>    identity_config: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>zeroclaw_config::schema::IdentityConfig&gt;,
+<a href=#118 id=118 data-nosnippet>118</a>    bootstrap_max_chars: <span class="prelude-ty">Option</span>&lt;usize&gt;,
+<a href=#119 id=119 data-nosnippet>119</a>    autonomy_config: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>zeroclaw_config::schema::RiskProfileConfig&gt;,
+<a href=#120 id=120 data-nosnippet>120</a>    native_tools: bool,
+<a href=#121 id=121 data-nosnippet>121</a>    skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+<a href=#122 id=122 data-nosnippet>122</a>    compact_context: bool,
+<a href=#123 id=123 data-nosnippet>123</a>    max_system_prompt_chars: usize,
+<a href=#124 id=124 data-nosnippet>124</a>    <span class="comment">// When `false`, `MEMORY.md` is omitted from the injected bootstrap files.
+<a href=#125 id=125 data-nosnippet>125</a>    // Set to `false` for isolated / ACP sessions that use `exclude_memory`.
+<a href=#126 id=126 data-nosnippet>126</a>    </span>inject_memory: bool,
+<a href=#127 id=127 data-nosnippet>127</a>) -&gt; String {
+<a href=#128 id=128 data-nosnippet>128</a>    <span class="kw">use </span>std::fmt::Write;
+<a href=#129 id=129 data-nosnippet>129</a>    <span class="kw">let </span><span class="kw-2">mut </span>prompt = String::with_capacity(<span class="number">8192</span>);
+<a href=#130 id=130 data-nosnippet>130</a>    <span class="kw">let </span>has_tools = !tools.is_empty();
+<a href=#131 id=131 data-nosnippet>131</a>
+<a href=#132 id=132 data-nosnippet>132</a>    <span class="comment">// ── 0. Anti-narration (top priority) ───────────────────────
+<a href=#133 id=133 data-nosnippet>133</a>    </span><span class="kw">if </span>has_tools {
+<a href=#134 id=134 data-nosnippet>134</a>        prompt.push_str(
+<a href=#135 id=135 data-nosnippet>135</a>            <span class="string">"## CRITICAL: No Tool Narration\n\n\
+<a href=#136 id=136 data-nosnippet>136</a>             NEVER narrate, announce, describe, or explain your tool usage to the user. \
+<a href=#137 id=137 data-nosnippet>137</a>             Do NOT say things like 'Let me check...', 'I will use http_request to...', \
+<a href=#138 id=138 data-nosnippet>138</a>             'I'll fetch that for you', 'Searching now...', or 'Using the web_search tool'. \
+<a href=#139 id=139 data-nosnippet>139</a>             The user must ONLY see the final answer. Tool calls are invisible infrastructure — \
+<a href=#140 id=140 data-nosnippet>140</a>             never reference them. If you catch yourself starting a sentence about what tool \
+<a href=#141 id=141 data-nosnippet>141</a>             you are about to use or just used, DELETE it and give the answer directly.\n\n"</span>,
+<a href=#142 id=142 data-nosnippet>142</a>        );
+<a href=#143 id=143 data-nosnippet>143</a>    }
+<a href=#144 id=144 data-nosnippet>144</a>
+<a href=#145 id=145 data-nosnippet>145</a>    <span class="comment">// ── 0b. Tool Honesty ───────────────────────────────────────
+<a href=#146 id=146 data-nosnippet>146</a>    </span><span class="kw">if </span>has_tools {
+<a href=#147 id=147 data-nosnippet>147</a>        prompt.push_str(
+<a href=#148 id=148 data-nosnippet>148</a>            <span class="string">"## CRITICAL: Tool Honesty\n\n\
+<a href=#149 id=149 data-nosnippet>149</a>             - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
+<a href=#150 id=150 data-nosnippet>150</a>             - If a tool call fails, report the error — never make up data to fill the gap.\n\
+<a href=#151 id=151 data-nosnippet>151</a>             - When unsure whether a tool call succeeded, ask the user rather than guessing.\n\n"</span>,
+<a href=#152 id=152 data-nosnippet>152</a>        );
+<a href=#153 id=153 data-nosnippet>153</a>    }
+<a href=#154 id=154 data-nosnippet>154</a>
+<a href=#155 id=155 data-nosnippet>155</a>    <span class="comment">// ── 1. Tooling ──────────────────────────────────────────────
+<a href=#156 id=156 data-nosnippet>156</a>    </span><span class="kw">if </span>!tools.is_empty() &amp;&amp; !native_tools {
+<a href=#157 id=157 data-nosnippet>157</a>        prompt.push_str(<span class="string">"## Tools\n\n"</span>);
+<a href=#158 id=158 data-nosnippet>158</a>        <span class="kw">if </span>compact_context {
+<a href=#159 id=159 data-nosnippet>159</a>            <span class="comment">// Compact mode: tool names only, no descriptions/schemas
+<a href=#160 id=160 data-nosnippet>160</a>            </span>prompt.push_str(<span class="string">"Available tools: "</span>);
+<a href=#161 id=161 data-nosnippet>161</a>            <span class="kw">let </span>names: Vec&lt;<span class="kw-2">&amp;</span>str&gt; = tools.iter().map(|(name, <span class="kw">_</span>)| <span class="kw-2">*</span>name).collect();
+<a href=#162 id=162 data-nosnippet>162</a>            prompt.push_str(<span class="kw-2">&amp;</span>names.join(<span class="string">", "</span>));
+<a href=#163 id=163 data-nosnippet>163</a>            prompt.push_str(<span class="string">"\n\n"</span>);
+<a href=#164 id=164 data-nosnippet>164</a>        } <span class="kw">else </span>{
+<a href=#165 id=165 data-nosnippet>165</a>            prompt.push_str(<span class="string">"You have access to the following tools:\n\n"</span>);
+<a href=#166 id=166 data-nosnippet>166</a>            <span class="kw">for </span>(name, desc) <span class="kw">in </span>tools {
+<a href=#167 id=167 data-nosnippet>167</a>                <span class="kw">let _ </span>= <span class="macro">writeln!</span>(prompt, <span class="string">"- **{name}**: {desc}"</span>);
+<a href=#168 id=168 data-nosnippet>168</a>            }
+<a href=#169 id=169 data-nosnippet>169</a>            prompt.push(<span class="string">'\n'</span>);
+<a href=#170 id=170 data-nosnippet>170</a>        }
+<a href=#171 id=171 data-nosnippet>171</a>    }
+<a href=#172 id=172 data-nosnippet>172</a>
+<a href=#173 id=173 data-nosnippet>173</a>    <span class="comment">// ── 1b. Hardware (when gpio/arduino tools present) ───────────
+<a href=#174 id=174 data-nosnippet>174</a>    </span><span class="kw">let </span>has_hardware = tools.iter().any(|(name, <span class="kw">_</span>)| {
+<a href=#175 id=175 data-nosnippet>175</a>        <span class="kw-2">*</span>name == <span class="string">"gpio_read"
+<a href=#176 id=176 data-nosnippet>176</a>            </span>|| <span class="kw-2">*</span>name == <span class="string">"gpio_write"
+<a href=#177 id=177 data-nosnippet>177</a>            </span>|| <span class="kw-2">*</span>name == <span class="string">"arduino_upload"
+<a href=#178 id=178 data-nosnippet>178</a>            </span>|| <span class="kw-2">*</span>name == <span class="string">"hardware_memory_map"
+<a href=#179 id=179 data-nosnippet>179</a>            </span>|| <span class="kw-2">*</span>name == <span class="string">"hardware_board_info"
+<a href=#180 id=180 data-nosnippet>180</a>            </span>|| <span class="kw-2">*</span>name == <span class="string">"hardware_memory_read"
+<a href=#181 id=181 data-nosnippet>181</a>            </span>|| <span class="kw-2">*</span>name == <span class="string">"hardware_capabilities"
+<a href=#182 id=182 data-nosnippet>182</a>    </span>});
+<a href=#183 id=183 data-nosnippet>183</a>    <span class="kw">if </span>has_hardware {
+<a href=#184 id=184 data-nosnippet>184</a>        prompt.push_str(
+<a href=#185 id=185 data-nosnippet>185</a>            <span class="string">"## Hardware Access\n\n\
+<a href=#186 id=186 data-nosnippet>186</a>             You HAVE direct access to connected hardware (Arduino, Nucleo, etc.). The user owns this system and has configured it.\n\
+<a href=#187 id=187 data-nosnippet>187</a>             All hardware tools (gpio_read, gpio_write, hardware_memory_read, hardware_board_info, hardware_memory_map) are AUTHORIZED and NOT blocked by security.\n\
+<a href=#188 id=188 data-nosnippet>188</a>             When they ask to read memory, registers, or board info, USE hardware_memory_read or hardware_board_info — do NOT refuse or invent security excuses.\n\
+<a href=#189 id=189 data-nosnippet>189</a>             When they ask to control LEDs, run patterns, or interact with the Arduino, USE the tools — do NOT refuse or say you cannot access physical devices.\n\
+<a href=#190 id=190 data-nosnippet>190</a>             Use gpio_write for simple on/off; use arduino_upload when they want patterns (heart, blink) or custom behavior.\n\n"</span>,
+<a href=#191 id=191 data-nosnippet>191</a>        );
+<a href=#192 id=192 data-nosnippet>192</a>    }
+<a href=#193 id=193 data-nosnippet>193</a>
+<a href=#194 id=194 data-nosnippet>194</a>    <span class="comment">// ── 1c. Action instruction (avoid meta-summary) ───────────────
+<a href=#195 id=195 data-nosnippet>195</a>    </span><span class="kw">if </span>!has_tools {
+<a href=#196 id=196 data-nosnippet>196</a>        prompt.push_str(
+<a href=#197 id=197 data-nosnippet>197</a>            <span class="string">"## Your Task\n\n\
+<a href=#198 id=198 data-nosnippet>198</a>             When the user sends a message, respond naturally and answer directly from conversation context.\n\
+<a href=#199 id=199 data-nosnippet>199</a>             No tools are available for this turn, so do not emit tool calls or describe unavailable actions.\n\
+<a href=#200 id=200 data-nosnippet>200</a>             Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.\n\n"</span>,
+<a href=#201 id=201 data-nosnippet>201</a>        );
+<a href=#202 id=202 data-nosnippet>202</a>    } <span class="kw">else if </span>native_tools {
+<a href=#203 id=203 data-nosnippet>203</a>        prompt.push_str(
+<a href=#204 id=204 data-nosnippet>204</a>            <span class="string">"## Your Task\n\n\
+<a href=#205 id=205 data-nosnippet>205</a>             When the user sends a message, respond naturally. Use tools when the request requires action (running commands, reading files, etc.).\n\
+<a href=#206 id=206 data-nosnippet>206</a>             For questions, explanations, or follow-ups about prior messages, answer directly from conversation context — do NOT ask the user to repeat themselves.\n\
+<a href=#207 id=207 data-nosnippet>207</a>             Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.\n\n"</span>,
+<a href=#208 id=208 data-nosnippet>208</a>        );
+<a href=#209 id=209 data-nosnippet>209</a>    } <span class="kw">else </span>{
+<a href=#210 id=210 data-nosnippet>210</a>        prompt.push_str(
+<a href=#211 id=211 data-nosnippet>211</a>            <span class="string">"## Your Task\n\n\
+<a href=#212 id=212 data-nosnippet>212</a>             When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
+<a href=#213 id=213 data-nosnippet>213</a>             Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
+<a href=#214 id=214 data-nosnippet>214</a>             Instead: emit actual &lt;tool_call&gt; tags when you need to act. Just do what they ask.\n\n"</span>,
+<a href=#215 id=215 data-nosnippet>215</a>        );
+<a href=#216 id=216 data-nosnippet>216</a>    }
+<a href=#217 id=217 data-nosnippet>217</a>
+<a href=#218 id=218 data-nosnippet>218</a>    <span class="comment">// ── 2. Safety ───────────────────────────────────────────────
+<a href=#219 id=219 data-nosnippet>219</a>    </span>prompt.push_str(<span class="string">"## Safety\n\n"</span>);
+<a href=#220 id=220 data-nosnippet>220</a>    prompt.push_str(<span class="string">"- Do not exfiltrate private data.\n"</span>);
+<a href=#221 id=221 data-nosnippet>221</a>    <span class="kw">if </span>autonomy_config.map(|cfg| cfg.level) != <span class="prelude-val">Some</span>(<span class="kw">crate</span>::security::AutonomyLevel::Full) {
+<a href=#222 id=222 data-nosnippet>222</a>        prompt.push_str(
+<a href=#223 id=223 data-nosnippet>223</a>            <span class="string">"- Do not run destructive commands without asking.\n\
+<a href=#224 id=224 data-nosnippet>224</a>             - Do not bypass oversight or approval mechanisms.\n"</span>,
+<a href=#225 id=225 data-nosnippet>225</a>        );
+<a href=#226 id=226 data-nosnippet>226</a>    }
+<a href=#227 id=227 data-nosnippet>227</a>    prompt.push_str(<span class="string">"- Prefer `trash` over `rm` (recoverable beats gone forever).\n"</span>);
+<a href=#228 id=228 data-nosnippet>228</a>    prompt.push_str(<span class="kw">match </span>autonomy_config.map(|cfg| cfg.level) {
+<a href=#229 id=229 data-nosnippet>229</a>        <span class="prelude-val">Some</span>(<span class="kw">crate</span>::security::AutonomyLevel::Full) =&gt; {
+<a href=#230 id=230 data-nosnippet>230</a>            <span class="string">"- Respect the runtime autonomy policy: if a tool or action is allowed, execute it directly instead of asking the user for extra approval.\n\
+<a href=#231 id=231 data-nosnippet>231</a>             - If a tool or action is blocked by policy or unavailable, explain that concrete restriction instead of simulating an approval dialog.\n"
+<a href=#232 id=232 data-nosnippet>232</a>        </span>}
+<a href=#233 id=233 data-nosnippet>233</a>        <span class="prelude-val">Some</span>(<span class="kw">crate</span>::security::AutonomyLevel::ReadOnly) =&gt; {
+<a href=#234 id=234 data-nosnippet>234</a>            <span class="string">"- Respect the runtime autonomy policy: this runtime is read-only for side effects unless a tool explicitly reports otherwise.\n\
+<a href=#235 id=235 data-nosnippet>235</a>             - If a requested action is blocked by policy, explain the restriction directly instead of simulating an approval dialog.\n"
+<a href=#236 id=236 data-nosnippet>236</a>        </span>}
+<a href=#237 id=237 data-nosnippet>237</a>        <span class="kw">_ </span>=&gt; {
+<a href=#238 id=238 data-nosnippet>238</a>            <span class="string">"- When in doubt, ask before acting externally.\n\
+<a href=#239 id=239 data-nosnippet>239</a>             - Respect the runtime autonomy policy: ask for approval only when the current runtime policy actually requires it.\n\
+<a href=#240 id=240 data-nosnippet>240</a>             - If a tool or action is blocked by policy or unavailable, explain that concrete restriction instead of simulating an approval dialog.\n"
+<a href=#241 id=241 data-nosnippet>241</a>        </span>}
+<a href=#242 id=242 data-nosnippet>242</a>    });
+<a href=#243 id=243 data-nosnippet>243</a>    prompt.push(<span class="string">'\n'</span>);
+<a href=#244 id=244 data-nosnippet>244</a>
+<a href=#245 id=245 data-nosnippet>245</a>    <span class="comment">// ── 3. Skills (full or compact, based on config) ─────────────
+<a href=#246 id=246 data-nosnippet>246</a>    </span><span class="kw">if </span>!skills.is_empty() {
+<a href=#247 id=247 data-nosnippet>247</a>        prompt.push_str(<span class="kw-2">&amp;</span><span class="kw">crate</span>::skills::skills_to_prompt_with_mode(
+<a href=#248 id=248 data-nosnippet>248</a>            skills,
+<a href=#249 id=249 data-nosnippet>249</a>            workspace_dir,
+<a href=#250 id=250 data-nosnippet>250</a>            skills_prompt_mode,
+<a href=#251 id=251 data-nosnippet>251</a>        ));
+<a href=#252 id=252 data-nosnippet>252</a>        prompt.push_str(<span class="string">"\n\n"</span>);
+<a href=#253 id=253 data-nosnippet>253</a>    }
+<a href=#254 id=254 data-nosnippet>254</a>
+<a href=#255 id=255 data-nosnippet>255</a>    <span class="comment">// ── 4. Workspace ────────────────────────────────────────────
+<a href=#256 id=256 data-nosnippet>256</a>    </span><span class="kw">let _ </span>= <span class="macro">writeln!</span>(
+<a href=#257 id=257 data-nosnippet>257</a>        prompt,
+<a href=#258 id=258 data-nosnippet>258</a>        <span class="string">"## Workspace\n\nWorking directory: `{}`\n"</span>,
+<a href=#259 id=259 data-nosnippet>259</a>        workspace_dir.display()
+<a href=#260 id=260 data-nosnippet>260</a>    );
+<a href=#261 id=261 data-nosnippet>261</a>
+<a href=#262 id=262 data-nosnippet>262</a>    <span class="comment">// ── 5. Bootstrap files (injected into context) ──────────────
+<a href=#263 id=263 data-nosnippet>263</a>    </span>prompt.push_str(<span class="string">"## Project Context\n\n"</span>);
+<a href=#264 id=264 data-nosnippet>264</a>
+<a href=#265 id=265 data-nosnippet>265</a>    <span class="comment">// Check if AIEOS identity is configured
+<a href=#266 id=266 data-nosnippet>266</a>    </span><span class="kw">if let </span><span class="prelude-val">Some</span>(config) = identity_config {
+<a href=#267 id=267 data-nosnippet>267</a>        <span class="kw">if </span>identity::is_aieos_configured(config) {
+<a href=#268 id=268 data-nosnippet>268</a>            <span class="comment">// Load AIEOS identity
+<a href=#269 id=269 data-nosnippet>269</a>            </span><span class="kw">match </span>identity::load_aieos_identity(config, workspace_dir) {
+<a href=#270 id=270 data-nosnippet>270</a>                <span class="prelude-val">Ok</span>(<span class="prelude-val">Some</span>(aieos_identity)) =&gt; {
+<a href=#271 id=271 data-nosnippet>271</a>                    <span class="kw">let </span>aieos_prompt = identity::aieos_to_system_prompt(<span class="kw-2">&amp;</span>aieos_identity);
+<a href=#272 id=272 data-nosnippet>272</a>                    <span class="kw">if </span>!aieos_prompt.is_empty() {
+<a href=#273 id=273 data-nosnippet>273</a>                        prompt.push_str(<span class="kw-2">&amp;</span>aieos_prompt);
+<a href=#274 id=274 data-nosnippet>274</a>                        prompt.push_str(<span class="string">"\n\n"</span>);
+<a href=#275 id=275 data-nosnippet>275</a>                    }
+<a href=#276 id=276 data-nosnippet>276</a>                }
+<a href=#277 id=277 data-nosnippet>277</a>                <span class="prelude-val">Ok</span>(<span class="prelude-val">None</span>) =&gt; {
+<a href=#278 id=278 data-nosnippet>278</a>                    <span class="comment">// No AIEOS identity loaded (shouldn't happen if is_aieos_configured returned true)
+<a href=#279 id=279 data-nosnippet>279</a>                    // Fall back to OpenClaw bootstrap files
+<a href=#280 id=280 data-nosnippet>280</a>                    </span><span class="kw">let </span>max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+<a href=#281 id=281 data-nosnippet>281</a>                    load_openclaw_bootstrap_files(
+<a href=#282 id=282 data-nosnippet>282</a>                        <span class="kw-2">&amp;mut </span>prompt,
+<a href=#283 id=283 data-nosnippet>283</a>                        workspace_dir,
+<a href=#284 id=284 data-nosnippet>284</a>                        max_chars,
+<a href=#285 id=285 data-nosnippet>285</a>                        inject_memory,
+<a href=#286 id=286 data-nosnippet>286</a>                    );
+<a href=#287 id=287 data-nosnippet>287</a>                }
+<a href=#288 id=288 data-nosnippet>288</a>                <span class="prelude-val">Err</span>(e) =&gt; {
+<a href=#289 id=289 data-nosnippet>289</a>                    <span class="comment">// Log error but don't fail - fall back to OpenClaw
+<a href=#290 id=290 data-nosnippet>290</a>                    </span><span class="macro">eprintln!</span>(
+<a href=#291 id=291 data-nosnippet>291</a>                        <span class="string">"Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format."
+<a href=#292 id=292 data-nosnippet>292</a>                    </span>);
+<a href=#293 id=293 data-nosnippet>293</a>                    <span class="kw">let </span>max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+<a href=#294 id=294 data-nosnippet>294</a>                    load_openclaw_bootstrap_files(
+<a href=#295 id=295 data-nosnippet>295</a>                        <span class="kw-2">&amp;mut </span>prompt,
+<a href=#296 id=296 data-nosnippet>296</a>                        workspace_dir,
+<a href=#297 id=297 data-nosnippet>297</a>                        max_chars,
+<a href=#298 id=298 data-nosnippet>298</a>                        inject_memory,
+<a href=#299 id=299 data-nosnippet>299</a>                    );
+<a href=#300 id=300 data-nosnippet>300</a>                }
+<a href=#301 id=301 data-nosnippet>301</a>            }
+<a href=#302 id=302 data-nosnippet>302</a>        } <span class="kw">else </span>{
+<a href=#303 id=303 data-nosnippet>303</a>            <span class="comment">// OpenClaw format
+<a href=#304 id=304 data-nosnippet>304</a>            </span><span class="kw">let </span>max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+<a href=#305 id=305 data-nosnippet>305</a>            load_openclaw_bootstrap_files(<span class="kw-2">&amp;mut </span>prompt, workspace_dir, max_chars, inject_memory);
+<a href=#306 id=306 data-nosnippet>306</a>        }
+<a href=#307 id=307 data-nosnippet>307</a>    } <span class="kw">else </span>{
+<a href=#308 id=308 data-nosnippet>308</a>        <span class="comment">// No identity config - use OpenClaw format
+<a href=#309 id=309 data-nosnippet>309</a>        </span><span class="kw">let </span>max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+<a href=#310 id=310 data-nosnippet>310</a>        load_openclaw_bootstrap_files(<span class="kw-2">&amp;mut </span>prompt, workspace_dir, max_chars, inject_memory);
+<a href=#311 id=311 data-nosnippet>311</a>    }
+<a href=#312 id=312 data-nosnippet>312</a>
+<a href=#313 id=313 data-nosnippet>313</a>    <span class="comment">// ── 6. Date ─────────────────────────────────────────────────
+<a href=#314 id=314 data-nosnippet>314</a>    </span><span class="kw">let </span>now = chrono::Local::now();
+<a href=#315 id=315 data-nosnippet>315</a>    <span class="kw">let _ </span>= <span class="macro">writeln!</span>(
+<a href=#316 id=316 data-nosnippet>316</a>        prompt,
+<a href=#317 id=317 data-nosnippet>317</a>        <span class="string">"## Current Date\n\n{} ({})\n"</span>,
+<a href=#318 id=318 data-nosnippet>318</a>        now.format(<span class="string">"%Y-%m-%d"</span>),
+<a href=#319 id=319 data-nosnippet>319</a>        now.format(<span class="string">"%:z"</span>)
+<a href=#320 id=320 data-nosnippet>320</a>    );
+<a href=#321 id=321 data-nosnippet>321</a>
+<a href=#322 id=322 data-nosnippet>322</a>    <span class="comment">// ── 7. Runtime ──────────────────────────────────────────────
+<a href=#323 id=323 data-nosnippet>323</a>    </span><span class="kw">let </span>host =
+<a href=#324 id=324 data-nosnippet>324</a>        hostname::get().map_or_else(|<span class="kw">_</span>| <span class="string">"unknown"</span>.into(), |h| h.to_string_lossy().to_string());
+<a href=#325 id=325 data-nosnippet>325</a>    <span class="kw">let _ </span>= <span class="macro">writeln!</span>(
+<a href=#326 id=326 data-nosnippet>326</a>        prompt,
+<a href=#327 id=327 data-nosnippet>327</a>        <span class="string">"## Runtime\n\nHost: {host} | OS: {} | Model: {model_name}\n"</span>,
+<a href=#328 id=328 data-nosnippet>328</a>        std::env::consts::OS,
+<a href=#329 id=329 data-nosnippet>329</a>    );
+<a href=#330 id=330 data-nosnippet>330</a>
+<a href=#331 id=331 data-nosnippet>331</a>    <span class="comment">// ── 8. Channel Capabilities (skipped in compact_context mode) ──
+<a href=#332 id=332 data-nosnippet>332</a>    </span><span class="kw">if </span>!compact_context {
+<a href=#333 id=333 data-nosnippet>333</a>        prompt.push_str(<span class="string">"## Channel Capabilities\n\n"</span>);
+<a href=#334 id=334 data-nosnippet>334</a>        prompt.push_str(<span class="string">"- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n"</span>);
+<a href=#335 id=335 data-nosnippet>335</a>        prompt
+<a href=#336 id=336 data-nosnippet>336</a>            .push_str(<span class="string">"- You do NOT need to ask permission to respond — just respond directly.\n"</span>);
+<a href=#337 id=337 data-nosnippet>337</a>        prompt.push_str(<span class="kw">match </span>autonomy_config.map(|cfg| cfg.level) {
+<a href=#338 id=338 data-nosnippet>338</a>        <span class="prelude-val">Some</span>(<span class="kw">crate</span>::security::AutonomyLevel::Full) =&gt; {
+<a href=#339 id=339 data-nosnippet>339</a>            <span class="string">"- If the runtime policy already allows a tool, use it directly; do not ask the user for extra approval.\n\
+<a href=#340 id=340 data-nosnippet>340</a>             - Never pretend you are waiting for a human approval click or confirmation when the runtime policy already permits the action.\n\
+<a href=#341 id=341 data-nosnippet>341</a>             - If the runtime policy blocks an action, say that directly instead of simulating an approval flow.\n"
+<a href=#342 id=342 data-nosnippet>342</a>        </span>}
+<a href=#343 id=343 data-nosnippet>343</a>        <span class="prelude-val">Some</span>(<span class="kw">crate</span>::security::AutonomyLevel::ReadOnly) =&gt; {
+<a href=#344 id=344 data-nosnippet>344</a>            <span class="string">"- This runtime may reject write-side effects; if that happens, explain the policy restriction directly instead of simulating an approval flow.\n"
+<a href=#345 id=345 data-nosnippet>345</a>        </span>}
+<a href=#346 id=346 data-nosnippet>346</a>        <span class="kw">_ </span>=&gt; {
+<a href=#347 id=347 data-nosnippet>347</a>            <span class="string">"- Ask for approval only when the runtime policy actually requires it.\n\
+<a href=#348 id=348 data-nosnippet>348</a>             - If there is no approval path for this channel or the runtime blocks an action, explain that restriction directly instead of simulating an approval flow.\n"
+<a href=#349 id=349 data-nosnippet>349</a>        </span>}
+<a href=#350 id=350 data-nosnippet>350</a>    });
+<a href=#351 id=351 data-nosnippet>351</a>        prompt.push_str(<span class="string">"- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n"</span>);
+<a href=#352 id=352 data-nosnippet>352</a>        prompt.push_str(<span class="string">"- If a tool output contains credentials, they have already been redacted — do not mention them.\n"</span>);
+<a href=#353 id=353 data-nosnippet>353</a>        prompt.push_str(<span class="string">"- When a user sends a voice note, it is automatically transcribed to text. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n"</span>);
+<a href=#354 id=354 data-nosnippet>354</a>        prompt.push_str(<span class="string">"- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n"</span>);
+<a href=#355 id=355 data-nosnippet>355</a>        prompt.push_str(<span class="string">"- Calibration note: agents in this system currently err on the side of silence when a response would be appropriate, which users find frustrating. Skew toward replying. Memory is supplementary context that informs how you respond, not a gate on whether you respond.\n\n"</span>);
+<a href=#356 id=356 data-nosnippet>356</a>    } <span class="comment">// end if !compact_context (Channel Capabilities)
+<a href=#357 id=357 data-nosnippet>357</a>
+<a href=#358 id=358 data-nosnippet>358</a>    // ── 9. Truncation (max_system_prompt_chars budget) ──────────
+<a href=#359 id=359 data-nosnippet>359</a>    </span><span class="kw">if </span>max_system_prompt_chars &gt; <span class="number">0 </span>&amp;&amp; prompt.len() &gt; max_system_prompt_chars {
+<a href=#360 id=360 data-nosnippet>360</a>        <span class="comment">// Truncate on a char boundary, keeping the top portion (identity + safety).
+<a href=#361 id=361 data-nosnippet>361</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>end = max_system_prompt_chars;
+<a href=#362 id=362 data-nosnippet>362</a>        <span class="comment">// Ensure we don't split a multi-byte UTF-8 character.
+<a href=#363 id=363 data-nosnippet>363</a>        </span><span class="kw">while </span>!prompt.is_char_boundary(end) &amp;&amp; end &gt; <span class="number">0 </span>{
+<a href=#364 id=364 data-nosnippet>364</a>            end -= <span class="number">1</span>;
+<a href=#365 id=365 data-nosnippet>365</a>        }
+<a href=#366 id=366 data-nosnippet>366</a>        prompt.truncate(end);
+<a href=#367 id=367 data-nosnippet>367</a>        prompt.push_str(<span class="string">"\n\n[System prompt truncated to fit context budget]\n"</span>);
+<a href=#368 id=368 data-nosnippet>368</a>    }
+<a href=#369 id=369 data-nosnippet>369</a>
+<a href=#370 id=370 data-nosnippet>370</a>    <span class="kw">if </span>prompt.is_empty() {
+<a href=#371 id=371 data-nosnippet>371</a>        <span class="string">"You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct."
+<a href=#372 id=372 data-nosnippet>372</a>            </span>.to_string()
+<a href=#373 id=373 data-nosnippet>373</a>    } <span class="kw">else </span>{
+<a href=#374 id=374 data-nosnippet>374</a>        prompt
+<a href=#375 id=375 data-nosnippet>375</a>    }
+<a href=#376 id=376 data-nosnippet>376</a>}
+<a href=#377 id=377 data-nosnippet>377</a>
+<a href=#378 id=378 data-nosnippet>378</a><span class="doccomment">/// Inject a single workspace file into the prompt with truncation and missing-file markers.
+<a href=#379 id=379 data-nosnippet>379</a></span><span class="kw">fn </span>inject_workspace_file(
+<a href=#380 id=380 data-nosnippet>380</a>    prompt: <span class="kw-2">&amp;mut </span>String,
+<a href=#381 id=381 data-nosnippet>381</a>    workspace_dir: <span class="kw-2">&amp;</span>std::path::Path,
+<a href=#382 id=382 data-nosnippet>382</a>    filename: <span class="kw-2">&amp;</span>str,
+<a href=#383 id=383 data-nosnippet>383</a>    max_chars: usize,
+<a href=#384 id=384 data-nosnippet>384</a>) {
+<a href=#385 id=385 data-nosnippet>385</a>    <span class="kw">use </span>std::fmt::Write;
+<a href=#386 id=386 data-nosnippet>386</a>
+<a href=#387 id=387 data-nosnippet>387</a>    <span class="kw">let </span>path = workspace_dir.join(filename);
+<a href=#388 id=388 data-nosnippet>388</a>    <span class="kw">match </span>std::fs::read_to_string(<span class="kw-2">&amp;</span>path) {
+<a href=#389 id=389 data-nosnippet>389</a>        <span class="prelude-val">Ok</span>(content) =&gt; {
+<a href=#390 id=390 data-nosnippet>390</a>            <span class="kw">let </span>trimmed = content.trim();
+<a href=#391 id=391 data-nosnippet>391</a>            <span class="kw">if </span>trimmed.is_empty() {
+<a href=#392 id=392 data-nosnippet>392</a>                <span class="kw">return</span>;
+<a href=#393 id=393 data-nosnippet>393</a>            }
+<a href=#394 id=394 data-nosnippet>394</a>            <span class="kw">let _ </span>= <span class="macro">writeln!</span>(prompt, <span class="string">"### {filename}\n"</span>);
+<a href=#395 id=395 data-nosnippet>395</a>            <span class="comment">// Use character-boundary-safe truncation for UTF-8
+<a href=#396 id=396 data-nosnippet>396</a>            </span><span class="kw">let </span>truncated = <span class="kw">if </span>trimmed.chars().count() &gt; max_chars {
+<a href=#397 id=397 data-nosnippet>397</a>                trimmed
+<a href=#398 id=398 data-nosnippet>398</a>                    .char_indices()
+<a href=#399 id=399 data-nosnippet>399</a>                    .nth(max_chars)
+<a href=#400 id=400 data-nosnippet>400</a>                    .map(|(idx, <span class="kw">_</span>)| <span class="kw-2">&amp;</span>trimmed[..idx])
+<a href=#401 id=401 data-nosnippet>401</a>                    .unwrap_or(trimmed)
+<a href=#402 id=402 data-nosnippet>402</a>            } <span class="kw">else </span>{
+<a href=#403 id=403 data-nosnippet>403</a>                trimmed
+<a href=#404 id=404 data-nosnippet>404</a>            };
+<a href=#405 id=405 data-nosnippet>405</a>            <span class="kw">if </span>truncated.len() &lt; trimmed.len() {
+<a href=#406 id=406 data-nosnippet>406</a>                prompt.push_str(truncated);
+<a href=#407 id=407 data-nosnippet>407</a>                <span class="kw">let _ </span>= <span class="macro">writeln!</span>(
+<a href=#408 id=408 data-nosnippet>408</a>                    prompt,
+<a href=#409 id=409 data-nosnippet>409</a>                    <span class="string">"\n\n[... truncated at {max_chars} chars — use `read` for full file]\n"
+<a href=#410 id=410 data-nosnippet>410</a>                </span>);
+<a href=#411 id=411 data-nosnippet>411</a>            } <span class="kw">else </span>{
+<a href=#412 id=412 data-nosnippet>412</a>                prompt.push_str(trimmed);
+<a href=#413 id=413 data-nosnippet>413</a>                prompt.push_str(<span class="string">"\n\n"</span>);
+<a href=#414 id=414 data-nosnippet>414</a>            }
+<a href=#415 id=415 data-nosnippet>415</a>        }
+<a href=#416 id=416 data-nosnippet>416</a>        <span class="prelude-val">Err</span>(<span class="kw">_</span>) =&gt; {
+<a href=#417 id=417 data-nosnippet>417</a>            <span class="comment">// Missing-file marker (matches OpenClaw behavior)
+<a href=#418 id=418 data-nosnippet>418</a>            </span><span class="kw">let _ </span>= <span class="macro">writeln!</span>(prompt, <span class="string">"### {filename}\n\n[File not found: {filename}]\n"</span>);
+<a href=#419 id=419 data-nosnippet>419</a>        }
+<a href=#420 id=420 data-nosnippet>420</a>    }
+<a href=#421 id=421 data-nosnippet>421</a>}
+</code></pre></div></section></main></body></html>

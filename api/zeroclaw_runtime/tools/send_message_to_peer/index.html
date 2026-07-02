@@ -1,0 +1,44 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Agent-loop tool that sends a message to a configured peer on a shared channel."><title>zeroclaw_runtime::tools::send_message_to_peer - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-17e0aaed.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="zeroclaw_runtime" data-themes="" data-resource-suffix="" data-rustdoc-version="1.96.1 (31fca3adb 2026-06-26)" data-channel="1.96.1" data-search-js="search-b5634cc7.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module send_message_to_peer</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../../zeroclaw_runtime/index.html">zeroclaw_<wbr>runtime</a><span class="version">0.8.2</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module send_<wbr>message_<wbr>to_<wbr>peer</a></h2><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="../index.html">In zeroclaw_<wbr>runtime::<wbr>tools</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../../index.html">zeroclaw_runtime</a>::<wbr><a href="../index.html">tools</a></div><h1>Module <span>send_<wbr>message_<wbr>to_<wbr>peer</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Agent-loop tool that sends a message to a configured peer on a
+shared channel.</p>
+<p>Validates the target against <a href="../../peers/struct.ResolvedPeers.html" title="struct zeroclaw_runtime::peers::ResolvedPeers"><code>crate::peers::ResolvedPeers</code></a> for
+the calling agent on the requested channel: peers must mutually
+opt in via a <code>[peer_groups.&lt;name&gt;]</code> block whose <code>agents</code> lists
+both, OR appear on the group’s <code>external_peers</code> list, before this
+tool will deliver. Cross-channel sends from outside the resolver’s
+authorization surface are rejected.</p>
+<p>Delivery splits by target type:</p>
+<ul>
+<li>
+<p><strong>Agent-alias targets</strong> route in-process via
+<a href="../../agent/loop_/fn.process_message.html" title="fn zeroclaw_runtime::agent::loop_::process_message"><code>crate::agent::loop_::process_message</code></a>: alpha calls
+<code>send_message_to_peer(target = "beta", ...)</code> and beta’s agent
+loop runs the message. The two agents share the channel’s bot
+identity, so an outbound to the channel would loop the bot’s
+own handle back through inbound; the in-process path avoids
+that and lets the orchestrator deliver beta’s reply (if any)
+through the same channel beta is configured on.</p>
+<p>This path is fire-and-forget: the recipient runs on a detached
+<code>zeroclaw_spawn::spawn!</code>, so the sender’s <code>ToolResult.success = true</code>
+means “accepted for processing”, not “completed”. Recipient
+errors do NOT surface to the sender; they are emitted via
+<code>tracing::warn!</code> inside the spawned task and via the recipient
+agent’s own observability (audit log, runtime trace, channel
+reply). Observers diagnosing a missing peer message should look
+at the recipient’s spans, not the sender’s tool output.</p>
+</li>
+<li>
+<p><strong>External peers</strong> (humans, external bots) route through
+<a href="../../cron/scheduler/fn.deliver_announcement.html" title="fn zeroclaw_runtime::cron::scheduler::deliver_announcement"><code>crate::cron::scheduler::deliver_announcement</code></a> with the
+external username as the platform target. The channel registry
+the binary registers at startup forwards the send to the live
+channel instance. This path is synchronous: the
+<code>deliver_announcement</code> future resolves before the tool returns,
+so a <code>success = false</code> here genuinely reflects a delivery
+failure.</p>
+</li>
+</ul>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.SendMessageToPeerTool.html" title="struct zeroclaw_runtime::tools::send_message_to_peer::SendMessageToPeerTool">Send<wbr>Message<wbr>ToPeer<wbr>Tool</a></dt><dd>Send a message to a peer on a shared channel. Bound to a single
+calling agent’s alias; the tool validates every send against that
+agent’s resolved peer set.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.render_sender_peer_map_for_channel.html" title="fn zeroclaw_runtime::tools::send_message_to_peer::render_sender_peer_map_for_channel">render_<wbr>sender_<wbr>peer_<wbr>map_<wbr>for_<wbr>channel</a></dt><dd>Render current-channel peer guidance for the channel system prompt.</dd></dl></section></div></main></body></html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["action_key_labels","match_chord","reserved_chords","reserved_reason"],"mod":["actions","overrides"],"struct":["Chord"],"trait":["RebindableActions"]};

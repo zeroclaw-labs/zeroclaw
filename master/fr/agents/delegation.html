@@ -1,0 +1,564 @@
+<!DOCTYPE HTML>
+<html lang="fr" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Délégation et sous-agents - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-10a9b8d5.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="délégation-et-sous-agents"><a class="header" href="#délégation-et-sous-agents">Délégation et sous-agents</a></h1>
+<p>Un SubAgent est une <strong>exécution enfant éphémère</strong> générée par un agent parent dont elle hérite par défaut de l’identité : même alias d’agent, même <code>SecurityPolicy</code>, même liste d’autorisation mémoire, même fournisseur de modèle configuré, même registre d’outils. Auditable en tant qu’enfant via un span de traçage <code>agent.&lt;alias&gt;.subagent.&lt;run_id&gt;</code>.</p>
+<p>Les SubAgents ne sont pas un concept de configuration distinct. Il n’existe pas de bloc <code>[subagents.*]</code> dans le schéma. L’identité de chaque SubAgent correspond au parent dont la boucle d’agent l’a généré.</p>
+<h2 id="quand-utiliser-spawn_subagent-plutôt-que-delegate"><a class="header" href="#quand-utiliser-spawn_subagent-plutôt-que-delegate">Quand utiliser <code>spawn_subagent</code> plutôt que <code>delegate</code></a></h2>
+<p>Deux outils sont situés à proximité. Ils ne sont pas interchangeables.</p>
+<ul>
+<li><strong><code>spawn_subagent</code></strong> : exécute à nouveau le MÊME agent sous sa propre identité pour une sous-tâche ciblée. L’agent enfant voit l’enveloppe complète des permissions du parent, moins toute restriction éventuelle. À utiliser lorsque le parent souhaite isoler une sous-tâche interne de son historique de conversation principal sans changer d’identité.</li>
+<li><strong><code>delegate</code></strong>: hands the request off to a DIFFERENT configured agent (named by alias). The target agent runs under its own identity and model provider, but delegation is gated: the caller’s risk profile must set <code>delegation_policy mode = "allow"</code> (default is <code>"forbidden"</code>), and the target must be reachable as either a same-profile peer or an explicit <code>delegates</code> entry. Explicit entries choose <code>mode = "bounded"</code> or <code>mode = "independent"</code>, which determines whether the caller’s tool ceiling still applies. Use when another configured specialist should own the work. See <a href="#delegation-gating">Delegation gating</a> below.</li>
+</ul>
+<p>Cette page documente <code>spawn_subagent</code> de bout en bout. <code>delegate</code> se trouve dans <code>crates/zeroclaw-runtime/src/tools/delegate.rs</code> et constitue une surface distincte.</p>
+<h2 id="comment-un-subagent-est-instancié"><a class="header" href="#comment-un-subagent-est-instancié">Comment un SubAgent est instancié</a></h2>
+<p>Deux sites de spawn convergent vers <code>SubAgentSpawn</code> (<code>crates/zeroclaw-runtime/src/subagent/mod.rs:97</code>) :</p>
+<ol>
+<li><strong>Depuis une boucle d’agent</strong> : le modèle appelle l’outil <code>spawn_subagent</code> avec une chaîne <code>prompt</code>. L’outil est enregistré comme n’importe quel autre dans le registre (<code>crates/zeroclaw-runtime/src/tools/mod.rs</code>, <code>SpawnSubagentTool::new</code>).</li>
+<li><strong>Depuis cron</strong> : les jobs <code>JobType::Agent</code> s’exécutent via <code>run_agent_job</code> (<code>crates/zeroclaw-runtime/src/cron/scheduler.rs</code>), qui construit le même <code>SubAgentContext</code> mais marque l’enfant comme une exécution de premier niveau (pas un SubAgent), afin qu’il puisse lui-même lancer un niveau de sous-agent.</li>
+</ol>
+<p>Les deux chemins invoquent :</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>SubAgentSpawn::for_agent(config, parent_alias)?     // résoudre l'identité parente
+    .build(SubAgentOverrides::default())?           // valide tout rétrécissement de type
+<span class="boring">}</span></code></pre>
+<p><code>for_agent</code> lit le <code>risk_profile</code> du parent et <code>[agents.&lt;alias&gt;.workspace.read_memory_from]</code> pour construire la liste d’autorisations héritée ; l’alias propre du parent est toujours ajouté afin qu’un SubAgent voie toujours les lignes de mémoire propres à son parent. <code>build</code> applique un rétrécissement facultatif (voir <a href="#permission-inheritance">Héritage des permissions</a> ci-dessous) et renvoie un <code>SubAgentContext</code> validé.</p>
+<h2 id="cycle-de-vie"><a class="header" href="#cycle-de-vie">Cycle de vie</a></h2>
+<p>Synchrone, in-process, runtime tokio unique. Rien ne franchit la limite du processus.</p>
+<ol>
+<li>La boucle d’outils du parent distribue <code>spawn_subagent</code>. L’outil lit son argument <code>prompt</code> et refuse s’il est vide.</li>
+<li>L’outil vérifie deux conditions de protection dans l’ordre :
+<ul>
+<li><strong>Plafond de profondeur 1.</strong> Si l’exécution appelante était elle-même un SubAgent (<code>AgentRunOverrides.is_subagent == true</code>), refuser avec <code>"spawn_subagent: a subagent may not spawn its own subagents (depth-1 cap)"</code>. Les SubAgents ne peuvent pas être récursifs.</li>
+<li><strong>Filtre d’outils du profil de risque.</strong> Si le <code>[risk_profiles.&lt;alias&gt;].allowed_tools</code> du parent n’est pas vide et ne liste pas <code>spawn_subagent</code>, ou si <code>excluded_tools</code> le liste, refusez avec un message indiquant l’alias du parent.</li>
+</ul>
+</li>
+<li>L’outil appelle <code>SubAgentSpawn::for_agent</code> + <code>build</code>. Les échecs (alias parent inconnu, surcharge d’élévation de privilèges) apparaissent sous la forme <code>ToolResult { success: false, error: "subagent spawn failed: ..." }</code>.</li>
+<li>L</li>
+<li>La boucle de l’agent enfant s’exécute jusqu’à son terme. Son registre d’outils est construit à neuf, avec <code>is_subagent_caller: true</code> transmis à son propre <code>SpawnSubagentTool</code>, de sorte que toute tentative de récursion est rejetée à la même barrière de profondeur 1.</li>
+<li>L’enfant retourne <code>Result&lt;String&gt;</code>. L’outil <code>spawn_subagent</code> du parent l’encapsule :
+<ul>
+<li>Succès : <code>ToolResult { success: true, output: &lt;child's final response&gt;, error: None }</code>. Une sortie vide est remplacée par la valeur littérale <code>"subagent completed without output"</code>.</li>
+<li>Échec : <code>ToolResult { success: false, error: Some("subagent run failed: ...") }</code>.</li>
+</ul>
+</li>
+<li>La boucle d’outils du parent se poursuit avec ce <code>ToolResult</code> dans son contexte de conversation. Les tours intermédiaires et les appels d’outils de l’enfant ne sont PAS rejoués dans l’historique du parent ; seule la réponse finale apparaît.</li>
+</ol>
+<h2 id="ce-qui-est-renvoyé-en-amont"><a class="header" href="#ce-qui-est-renvoyé-en-amont">Ce qui est renvoyé en amont</a></h2>
+<p>Une chose : le <strong>message final de l’assistant</strong> de l’enfant, sous forme de chaîne, encapsulé dans <code>ToolResult.output</code>.</p>
+<ul>
+<li>Les appels d’outils de l’enfant, les tours de raisonnement intermédiaires et toutes les écritures en mémoire effectuées par l’enfant sont observables dans les journaux structurés sous la portée de traçage de l’enfant, mais n’entrent pas dans l’historique de conversation du parent.</li>
+<li>La session de l’enfant réside sous le chemin <code>subagent-&lt;uuid&gt;</code> (ou <code>cron-&lt;uuid&gt;</code> pour les exécutions lancées par cron). Il s’agit de la clé d’historique de conversation, et non d’un emplacement dans le système de fichiers ; elle isole l’historique de l’enfant de celui du parent.</li>
+<li>Les écritures en mémoire effectuées par l’enfant sont écrites dans l’identité du parent (même UUID d’agent pour les backends SQL/Postgres ; même répertoire de workspace pour Markdown). Les exécutions lancées par Cron désactivent <code>memory.auto_save</code>, de sorte que les écritures volontaires fonctionnent toujours, mais la mémorisation de routine ne s’accumule pas.</li>
+</ul>
+<p>Il n’existe aucun canal de streaming ou de progression partielle vers le parent. Les SubAgents de longue durée bloquent l’exécution des outils du parent pendant toute leur durée ; il n’y a aucun réglage de délai d’expiration par appel.</p>
+<h3 id="plusieurs-appels-en-un-seul-tour"><a class="header" href="#plusieurs-appels-en-un-seul-tour">Plusieurs appels en un seul tour</a></h3>
+<p>La boucle d’agent applique une protection contre les appels en double par tour : un outil appelé deux fois avec des arguments identiques dans le même tour voit normalement le second appel ignoré. <code>spawn_subagent</code> et <code>delegate</code> sont <strong>exemptés</strong> de cette protection. En lancer plusieurs avec le même prompt (redondance, échantillonnage, fan-out) est un schéma intentionnel, et non une répétition accidentelle, donc chaque appel identique s’exécute et chaque résultat est renvoyé. Sans cette exemption, seul le premier appel identique serait exécuté et seule sa sortie parviendrait au modèle.</p>
+<p>Lorsque l’exécution parallèle des outils est activée (<code>parallel_tools = true</code> dans le profil d’exécution), plusieurs appels <code>spawn_subagent</code> dans un même tour s’exécutent simultanément et la réponse finale de chaque enfant est renvoyée au parent, associée à son propre appel d’outil. <code>delegate</code> dispose de son propre fan-out explicite via l’argument <code>parallel: [...]</code> (voir la section sur les chaînes de sortie) ; ce chemin lance chaque cible dans sa propre tâche et agrège tous les résultats.</p>
+<h2 id="héritage-des-permissions"><a class="header" href="#héritage-des-permissions">Héritage des permissions</a></h2>
+<p>Un SubAgent hérite des permissions du parent à l’identique, sauf si le site de création fournit un <code>SubAgentOverrides</code> restrictif. Aujourd’hui, les deux sites de création in-tree transmettent <code>SubAgentOverrides::default()</code> (tout hériter). La surface de surcharge est livrée et validée ; un futur chemin de restriction fourni par l’appelant peut être intégré sans modification à l’exécution.</p>
+<p>Héritage axe par axe :</p>
+<ol>
+<li><strong><code>SecurityPolicy</code></strong> : hérité par clonage de <code>Arc&lt;SecurityPolicy&gt;</code>. Le chemin de surcharge (<code>SubAgentOverrides::policy = Some(policy)</code>) exécute <code>SecurityPolicy::ensure_no_escalation_beyond</code> (<code>crates/zeroclaw-config/src/policy.rs</code>) et rejette tout champ qui ajoute un privilège que le parent ne possède pas. Les axes validés incluent le niveau d’autonomie, allowed_roots (rw + ro + écriture seule), allowed_commands, workspace_only, forbidden_paths dans le sens parent ⊆ enfant, shell_env_passthrough, <code>max_actions_per_hour</code>, <code>max_cost_per_day_cents</code>, <code>shell_timeout_secs</code>, <code>block_high_risk_commands</code> et <code>require_approval_for_medium_risk</code>. Les rejets chaînent une <code>EscalationViolation</code> précise afin que les diagnostics nomment le champ fautif.</li>
+<li><strong>Budgets d’actions / de coûts</strong> : <code>PerSenderTracker</code> est partagé entre le parent et l’enfant par clone d’<code>Arc</code>. Chemin d’héritage tel quel : l’enfant détient le même <code>Arc&lt;SecurityPolicy&gt;</code>, donc les écritures dans <code>record_action()</code> / <code>record_cost()</code> touchent le même compartiment. Chemin de surcharge : <code>SubAgentSpawn::build</code> copie explicitement le champ <code>tracker</code> du parent dans la politique restreinte de l’enfant. <strong>Un SubAgent ne peut pas contourner <code>max_actions_per_hour</code> ou <code>max_cost_per_day_cents</code> en se dupliquant</strong>, la limite est partagée.</li>
+<li><strong>Registre d’outils</strong> : le registre de l’enfant est construit à neuf par <code>tools::all_tools_with_runtime</code> selon la politique héritée. Le registre passe ensuite par <code>apply_policy_tool_filter</code> (<code>crates/zeroclaw-runtime/src/agent/loop_.rs</code>), qui supprime tout outil dont le nom échoue à l’une ou l’autre des vérifications :
+<ul>
+<li>Les <code>allowed_tools</code> / <code>excluded_tools</code> de la stratégie (provenant du <code>risk_profile</code> du parent).</li>
+<li>L’argument <code>allowed_tools</code> fourni par l’appelant à <code>agent::run</code>. <code>spawn_subagent</code> figure dans le registre, mais son indicateur <code>is_subagent_caller</code> est défini à <code>true</code> pour l’enfant, de sorte que le refus de profondeur 1 se déclenche avant tout travail de spawn. Ce même indicateur <code>is_subagent_caller</code> retire entièrement <code>model_switch</code> du registre de l’enfant : un SubAgent hérite du modèle du parent tel quel (voir l’axe 5) et ne doit pas pouvoir changer le modèle actif à l’insu du parent, donc l’outil ne lui est tout simplement pas proposé.</li>
+</ul>
+</li>
+<li><strong>Liste d’autorisation mémoire</strong> : un <code>HashSet&lt;String&gt;</code> d’<strong>alias</strong> d’agents frères (les clés de configuration <code>[agents.&lt;alias&gt;]</code>). Héritée du <code>workspace.read_memory_from</code> du parent plus l’alias propre du parent. Le chemin de surcharge (<code>SubAgentOverrides::allowed_agent_aliases</code>) est validé comme un sous-ensemble ; tout alias absent de la liste du parent est rejeté par nom. L’alias propre du parent est toujours rajouté afin qu’un SubAgent voie toujours les lignes de son parent.</li>
+<li><strong>Fournisseur de modèle</strong> : hérité de la résolution <code>[agents.&lt;alias&gt;] model_provider</code> du parent. La température provient de l’entrée du fournisseur du parent (<code>config.model_provider_for_agent(parent_alias).and_then(|e| e.temperature)</code>). Cet héritage est imposé, et non un simple comportement par défaut : <code>model_switch</code> est exclu du registre d’outils du SubAgent (voir axe 3), de sorte qu’un SubAgent ne peut pas changer son propre modèle. Pour exécuter une sous-tâche sur un modèle différent, utilisez <code>delegate</code> vers un agent frère dont le <code>model_provider</code> désigne ce modèle.</li>
+<li><strong>Identité au niveau de la couche de données</strong> : même UUID dans la table <code>agents</code> (backends SQL), même répertoire d’espace de travail pour le Markdown, même magasin de secrets. La distinction parent-vs-enfant relève purement de l’observabilité : un span de traçage distinct et une clé de session d’historique de conversation distincte.</li>
+</ol>
+<h2 id="comment-un-utilisateur-en-déclenche-un"><a class="header" href="#comment-un-utilisateur-en-déclenche-un">Comment un utilisateur en déclenche un</a></h2>
+<p>Vous n’appelez pas ces outils vous-même ; c’est le bot qui le fait, depuis l’intérieur de son tour. En tant qu’utilisateur, vous influencez le choix du bot par la façon dont vous formulez votre requête. Il n’y a pas de commande spéciale, pas de syntaxe à barre oblique, ni de JSON que l’utilisateur saisit. Le fait que le modèle choisisse <code>spawn_subagent</code> ou <code>delegate</code> dépend de son prompt système, du texte de <code>description</code> de l’outil (visible par le modèle) et de la formulation de l’utilisateur. <strong>La formulation influence ; elle ne force pas.</strong></p>
+<p>Ce qui PEUT être rendu déterministe, c’est la <strong>disponibilité</strong> : les outils qui ne figurent pas dans le registre de l’agent parent ne peuvent pas être sélectionnés. Le contrôle du profil de risque se trouve dans <code>[risk_profiles.&lt;alias&gt;].allowed_tools</code> et <code>[risk_profiles.&lt;alias&gt;].excluded_tools</code>. Une liste <code>allowed_tools</code> non vide doit inclure <code>spawn_subagent</code> ou <code>delegate</code> pour que le modèle puisse voir cet outil ; une liste <code>allowed_tools</code> vide laisse la disponibilité des outils sans restriction, sauf si <code>excluded_tools</code> nomme l’outil. Redémarrez le démon après avoir modifié la configuration.</p>
+<p>Ce qui est vérifiable de bout en bout :</p>
+<ol>
+<li>Les chaînes de sortie littérales que l’outil renvoie au modèle pour chaque cas (succès, refus, échec). Citées textuellement ci-dessous, issues de <code>tools/spawn_subagent.rs</code> et <code>tools/delegate.rs</code>.</li>
+<li>Les paramètres de configuration concrets qui modifient le comportement (<code>allowed_tools</code>, <code>max_delegation_depth</code>, etc.).</li>
+<li>La forme du span de traçage structuré qui délimite tout ce qui est émis pendant l’exécution enfant.</li>
+</ol>
+<p>Ce qui n’est PAS vérifiable à partir de cette documentation :</p>
+<ol>
+<li>Si votre bot spécifique, sur votre modèle spécifique, avec votre prompt système spécifique, choisira l’outil lorsqu’on lui demande « Spawn a subagent to … ». La formulation a son importance ; les résultats varient. Si le bot ne choisit pas l’outil, le levier le plus fiable consiste à étendre le prompt système du bot avec des instructions explicites (« When asked for a focused subtask, use the <code>spawn_subagent</code> tool »).</li>
+<li>Le texte exact que le bot vous écrit dans sa réponse finale. Le bot lit la sortie de l’outil et <strong>génère sa propre</strong> réponse à partir de celle-ci. Le texte de sortie de l’outil peut être cité, paraphrasé ou résumé.</li>
+</ol>
+<h3 id="spawn_subagent--chaînes-de-refus-que-le-modèle-voit"><a class="header" href="#spawn_subagent--chaînes-de-refus-que-le-modèle-voit"><code>spawn_subagent</code> : chaînes de refus que le modèle voit</a></h3>
+<p>Ceux-ci sont exacts, provenant de <code>crates/zeroclaw-runtime/src/tools/spawn_subagent.rs</code>. Le modèle les reçoit comme chaîne d’erreur de l’outil et y réagit. La réponse du bot visible par l’utilisateur est ce que le modèle écrit ensuite ; elle fait souvent référence au refus ou le reprend.</p>
+<ol>
+<li>Argument <code>prompt</code> vide/manquant : <code>Missing or empty 'prompt' parameter</code></li>
+<li>Caller is itself a SubAgent (depth-1 cap): <code>spawn_subagent: a subagent may not spawn its own subagents (depth-1 cap)</code></li>
+<li>Le contrôle d’outils du profil de risque du parent exclut <code>spawn_subagent</code> : <code>spawn_subagent: refused — agent '&lt;parent_alias&gt;' risk_profile does not list spawn_subagent in allowed_tools</code></li>
+<li>Erreur de l’alias parent inconnu / de l’initialisation du spawn : <code>subagent spawn failed: &lt;wrapped error&gt;</code></li>
+<li>Le sous-traitement enfant a renvoyé une erreur : <code>subagent run failed: &lt;wrapped error&gt;</code></li>
+</ol>
+<p>En cas de succès, la sortie de l’outil EST le texte de la réponse finale de l’enfant. Si l’enfant a renvoyé une chaîne vide, la sortie est le texte indicateur littéral : <code>subagent completed without output</code>. Il n’y a pas de préfixe fixe à rechercher avec grep en cas de succès.</p>
+<h3 id="spawn_subagent--comment-vérifier-quil-sest-réellement-déclenché"><a class="header" href="#spawn_subagent--comment-vérifier-quil-sest-réellement-déclenché"><code>spawn_subagent</code> : comment vérifier qu’il s’est réellement déclenché</a></h3>
+<p>Surveillez votre journal. Le processus enfant généré par l’outil s’exécute dans un <code>scope!</code> qui émet une étendue de traçage nommée <code>zeroclaw_scope</code> (avec la cible <code>zeroclaw_log_internal_scope</code>) portant <code>agent_alias=&lt;parent&gt;</code> et <code>session_key=&lt;uuid&gt;</code>. Chaque ligne de journal émise pendant l’exécution de l’enfant porte ces champs. Le tour du parent possède son propre <code>session_key</code> ; une NOUVELLE valeur de <code>session_key</code> apparaissant en milieu de tour pour le même <code>agent_alias</code> est le signal qu’un SubAgent s’est exécuté. Le chemin de session de l’historique de conversation de l’enfant est <code>subagent-&lt;uuid&gt;</code> (identifiant de type système de fichiers, distinct du champ de traçage).</p>
+<p>Les tâches d’agent lancées par cron utilisent un nom de span différent et plus explicite : <code>subagent</code> (littéral) avec les champs <code>category="cron"</code>, <code>agent_alias=&lt;owning agent&gt;</code>, <code>cron_job_id=&lt;id&gt;</code>, <code>run_id=&lt;uuid&gt;</code>, <code>spawn_site="cron"</code>. Les chemins cron sont trivialement repérables avec grep : <code>grep 'spawn_site="cron"' zeroclaw.log</code>. Notez que les exécutions lancées par cron sont de premier niveau (<code>is_subagent=false</code>) ; elles peuvent elles-mêmes appeler <code>spawn_subagent</code> une seule fois.</p>
+<p>Il s’agit d’un signal limité pour le chemin de spawn de la boucle d’agent. Un enregistrement dédié « subagent started / completed » acheminé via <code>attribution_span!(tool)</code> est suivi comme une tâche de suivi côté code ; une fois que la boucle d’agent enveloppera l’exécution des outils dans un span d’attribution, chaque <code>record!</code> à l’intérieur de l’outil portera automatiquement <code>tool=spawn_subagent</code> et la question se réduira à un simple grep.</p>
+<h3 id="restriction-de-délégation"><a class="header" href="#restriction-de-délégation">Restriction de délégation</a></h3>
+<p><code>delegate</code> applique deux contrôles dans <code>crates/zeroclaw-runtime/src/tools/delegate.rs</code> avant qu’un agent cible ne s’exécute, dans cet ordre :</p>
+<ol>
+<li>
+<p><strong><code>delegation_policy.mode</code></strong> : le profil de risque de l’appelant doit autoriser la délégation. <code>[risk_profiles.&lt;alias&gt;].delegation_policy</code> vaut <code>{ mode = "forbidden" }</code> par défaut ; définissez <code>mode = "allow"</code> pour autoriser la délégation. Lorsqu’elle est interdite, le refus est :</p>
+<pre><code class="language-text">delegation is forbidden for caller "&lt;caller&gt;" by risk profile "&lt;caller_profile&gt;" delegation_policy; set [risk_profiles.&lt;caller_profile&gt;].delegation_policy mode = "allow"
+</code></pre>
+<p>Ceci est modifiable dans le tableau de bord de la passerelle et zerocode dans <strong>Config → Risk profiles → <code>&lt;profile&gt;</code> → <code>delegation_policy.mode</code></strong> (un sélecteur forbidden/allow).</p>
+</li>
+<li>
+<p><strong>Reachability</strong>: the target agent must be in the caller’s reachable set, resolved by <code>Config::reachable_delegate_target_configs</code>. The reachable set is the union of two per-agent sources on <code>[agents.&lt;caller&gt;]</code>, minus the caller itself:</p>
+<ul>
+<li>
+<p><strong>pairs de même profil</strong> : tous les autres agents partageant le profil de risque de l’appelant, inclus tant que <code>delegate_same_risk_profile = true</code> (la valeur par défaut). Définissez-le sur <code>false</code> pour exclure l’appelant de l’autorisation automatique des pairs.</p>
+</li>
+<li>
+<p><strong>explicit roster</strong>: <code>delegates</code>, a possibly-empty list of targets the caller may delegate to even across risk profiles. String entries are convenient for manual editing and stand for bounded targets. Object entries make the mode explicit:</p>
+<pre><code class="language-toml">delegates = [
+  "reviewer",
+  { agent = "sysadmin", mode = "independent" },
+]
+</code></pre>
+<p>When config is saved, every entry is written in object form with <code>mode = "bounded"</code> or <code>mode = "independent"</code>. Do not roll this config shape out before the daemon and UI binaries have been upgraded to a build that supports delegate modes. Older binaries expect <code>delegates</code> to contain only strings; an object entry makes the <code>agents</code> section invalid for that binary and the resilient loader drops the section so the repair surfaces can still start.
+When the target is outside that set, the refusal names the cause. For example:</p>
+</li>
+</ul>
+<pre><code class="language-text">delegate target "&lt;target&gt;" is not reachable from "&lt;caller&gt;": different risk profile (caller uses "&lt;caller_profile&gt;", target uses "&lt;target_profile&gt;"). delegate_same_risk_profile only reaches agents with the same risk profile; add an explicit [agents.&lt;caller&gt;].delegates entry with the intended mode, or change one agent's risk_profile.
+</code></pre>
+<pre><code class="language-text">delegate target "&lt;target&gt;" is not reachable from "&lt;caller&gt;": delegate_same_risk_profile is disabled and the target is not listed in [agents.&lt;caller&gt;].delegates
+</code></pre>
+<pre><code class="language-text">delegate target "&lt;target&gt;" is not reachable from "&lt;caller&gt;": the target agent is disabled
+</code></pre>
+<p>A bounded target inherits the caller’s action/cost tracker. When the bounded target shares the caller’s risk profile, it also inherits the caller’s session workspace boundary. A bounded <strong>cross-profile</strong> target is allowed when it is reachable through the caller’s delegate roster and <code>delegation_policy</code>; it runs under the target’s resolved policy, while agentic tool availability is capped by the caller’s tool registry.</p>
+<p>An independent target is available only when explicitly listed with <code>mode = "independent"</code>. It still requires <code>delegation_policy.mode = "allow"</code> and reachability through <code>delegates</code>, but once selected it resolves the target agent’s own policy without the caller’s non-escalation ceiling, session workspace override, or action/cost tracker.</p>
+</li>
+</ol>
+<p>The advertised roster is included in the <code>agent</code> parameter description in the tool schema. It lists exactly this reachable set, and only when <code>delegation_policy.mode = "allow"</code>. Disabled agents (<code>enabled = false</code>) are never reachable, whether as same-profile peers or explicit <code>delegates</code> entries.</p>
+<p>In bounded agentic delegation the sub-agent’s tools are drawn from the caller’s already-policy-filtered registry, intersected with the target’s own <code>allowed_tools</code>. An <strong>empty</strong> <code>allowed_tools</code> on the target means “inherit”: the sub-agent runs with the caller’s full delegatable registry rather than being rejected. A non-empty list intersects with that registry. Either way the caller’s registry is the ceiling: a bounded cross-profile target whose risk profile names a tool the caller was never granted does not receive it. Bounded delegation is therefore tool-bounded, not a full <code>SecurityPolicy::ensure_no_escalation_beyond</code> check. If that intersection is empty, the target still receives a normal agentic model turn with no tools.</p>
+<p>In independent agentic delegation the sub-agent’s tools are built from the target agent’s own configured policy and runtime registry, like opening a fresh chat with that target. The parent registry is not used as the ceiling. The <code>delegate</code> tool is still removed from the child registry so agentic delegation cannot recurse through another <code>delegate</code> call.</p>
+<p>La profondeur est plafonnée par le <code>runtime_profile.max_delegation_depth</code> du parent. Définissez-la à <code>1</code> pour autoriser l’agent principal à effectuer un seul saut de délégation, sans sous-délégation supplémentaire.</p>
+<h4 id="politique-des-outils-cibles-agentiques"><a class="header" href="#politique-des-outils-cibles-agentiques">Politique des outils cibles agentiques</a></h4>
+<p>If the target agent’s <code>[runtime_profiles.&lt;target&gt;].agentic = true</code>, <code>delegate</code> builds the target sub-loop’s tool registry from either the parent’s available tools (<code>mode = "bounded"</code>) or the target’s own runtime registry (<code>mode = "independent"</code>). The target risk profile then filters that registry:</p>
+<ol>
+<li>A configured empty <code>[risk_profiles.&lt;target_profile&gt;].allowed_tools</code> list leaves the selected registry unrestricted.</li>
+<li>Une liste <code>allowed_tools</code> non vide ne conserve que les noms d’outils correspondant exactement.</li>
+<li><code>[risk_profiles.&lt;target_profile&gt;].excluded_tools</code> est toujours soustrait du résultat.</li>
+<li><code>delegate</code> est toujours supprimé du registre enfant afin que la délégation agentique ne puisse pas se récursiver via un autre appel à <code>delegate</code>.</li>
+</ol>
+<p>This policy lives on the target, not the caller. Same-profile peers use the shared risk profile. Explicit cross-profile delegates use the target’s risk profile after the reachability and delegation-policy gates. Bounded agentic delegates receive only the caller-capped tool registry intersected with the target’s tool policy; independent agentic delegates receive the target-owned tool registry. A missing target risk profile refuses before the sub-loop starts. A configured profile that leaves zero executable child tools still permits a normal model turn with no tools.</p>
+<h3 id="delegate--chaînes-de-sortie-que-le-modèle-voit"><a class="header" href="#delegate--chaînes-de-sortie-que-le-modèle-voit"><code>delegate</code> : chaînes de sortie que le modèle voit</a></h3>
+<p>Exact, provenant de <code>crates/zeroclaw-runtime/src/tools/delegate.rs</code>.</p>
+<ol>
+<li>
+<p>Succès synchrone : la sortie commence par <code>[Agent '&lt;target&gt;' (&lt;provider_type&gt;/&lt;model&gt;)]\n</code> suivie de la réponse de l’agent cible. Si l’agent cible a renvoyé une chaîne vide, le corps est le littéral <code>[Empty response]</code>.</p>
+</li>
+<li>
+<p>Échec synchrone : le champ d’erreur commence par <code>Agent '&lt;target&gt;' failed: &lt;wrapped error&gt;</code>.</p>
+</li>
+<li>
+<p>Délai d’attente synchrone (lorsque le profil d’exécution de la cible définit <code>delegation_timeout_secs</code>) : le champ d’erreur est <code>Agent '&lt;target&gt;' timed out after &lt;N&gt;s</code>.</p>
+</li>
+<li>
+<p>Démarrage en arrière-plan réussi : la sortie correspond au littéral de trois lignes</p>
+<pre><code class="language-text">Background task started for agent '&lt;target&gt;'.
+task_id: &lt;uuid&gt;
+Use action='check_result' with task_id='&lt;uuid&gt;' to retrieve the result.
+</code></pre>
+<p>Le fichier de résultat se trouve à l’emplacement <code>&lt;workspace&gt;/delegate_results/&lt;uuid&gt;.json</code>. Pendant l’exécution, le champ <code>status</code> du fichier est <code>Running</code> ; les états terminaux sont <code>Completed</code>, <code>Failed</code> ou <code>Cancelled</code>.</p>
+</li>
+<li>
+<p><code>action="check_result"</code> avec un identifiant de tâche inconnu : l’erreur est <code>No result found for task_id '&lt;uuid&gt;'</code>.</p>
+</li>
+<li>
+<p>Sortie de répartition parallèle : commence par <code>[Parallel delegation: &lt;N&gt; agents]\n\n</code>, suivie de blocs par agent séparés par <code>\n\n</code>, chaque bloc commençant par <code>--- &lt;target&gt; (success=&lt;bool&gt;) ---\n</code>. En cas d’échec d’un agent, le bloc interne est <code>--- &lt;target&gt; (success=false) ---\nError: &lt;wrapped error&gt;</code>.</p>
+</li>
+<li>
+<p>Agent cible inconnu : l’erreur est <code>Unknown agent '&lt;target&gt;'. Available agents: &lt;comma-separated list&gt;</code>.</p>
+</li>
+<li>
+<p>Profondeur dépassée (contrôlée par le <code>runtime_profile.max_delegation_depth</code> du parent, valeur par défaut 3) : l’erreur est <code>Delegation depth limit reached (&lt;depth&gt;/&lt;max&gt;).</code></p>
+</li>
+<li>
+<p>Action inconnue : l’erreur est <code>Unknown action '&lt;value&gt;'. Use delegate/check_result/list_results/cancel_task.</code></p>
+</li>
+<li>
+<p>Independent target whose risk profile has <code>always_ask</code> entries: error is <code>delegate target "&lt;target&gt;" cannot run in independent mode from "&lt;caller&gt;": risk profile "&lt;profile&gt;" has always_ask entries (&lt;list&gt;). See ZeroClaw docs, "Delegation &amp; SubAgents" &gt; "What's not supported".</code></p>
+</li>
+<li>
+<p>La cible agentique présente un profil de risque manquant : l’erreur est <code>Agent '&lt;target&gt;' is agentic but risk_profile '&lt;target_profile&gt;' is not configured</code>.</p>
+</li>
+<li>
+<p>Agentic target with zero executable child tools: no error is emitted for the empty tool set itself; the target receives a normal model turn without tools.</p>
+</li>
+</ol>
+<h3 id="delegate--comment-vérifier-quil-sest-réellement-déclenché"><a class="header" href="#delegate--comment-vérifier-quil-sest-réellement-déclenché"><code>delegate</code> : comment vérifier qu’il s’est réellement déclenché</a></h3>
+<p><code>delegate</code> n’émet pas aujourd’hui de span de traçage dédié. Le signal est l’apparition dans le journal de la boucle de l’agent <strong>cible</strong>, qui hérite de la portée dans laquelle se trouvait le dispatch d’appel d’outil du parent. Les spawns en mode arrière-plan sont plus faciles à vérifier hors bande : le fichier de résultat <code>&lt;workspace&gt;/delegate_results/&lt;uuid&gt;.json</code> existe sur le disque et contient les champs <code>status</code> + <code>output</code> de l’agent cible ; <code>cat</code> ou <code>jq</code> fonctionne sans toucher au journal du tout.</p>
+<p>(Les tâches d’agent lancées par cron constituent un site de génération distinct et utilisent le span <code>subagent</code> explicite décrit ci-dessus ; <code>delegate</code> et cron ne suivent pas le même chemin.)</p>
+<h3 id="ce-qui-nest-pas-dans-cette-page-intentionnellement"><a class="header" href="#ce-qui-nest-pas-dans-cette-page-intentionnellement">Ce qui n’est pas dans cette page (intentionnellement)</a></h3>
+<ol>
+<li>Exemples de transcriptions de conversations. Tout ce que j’écrirais ici pour décrire « ce que le bot dira » dépendrait du modèle. La réponse du bot découle de la sortie de l’outil, du modèle, du prompt système et de l’état actuel de la conversation, dont aucun n’est contrôlé par cette page. La couche vérifiable est ce que l’outil retourne (ci-dessus) et ce que le journal capture.</li>
+<li>Un marqueur de journal dédié « subagent fired » / « delegate fired ». Suivi comme une tâche de suivi côté code. Aujourd’hui, les opérateurs vérifient via la forme de portée décrite ci-dessus (qui constitue le signal structurel existant) et via le fichier de résultat en mode arrière-plan.</li>
+</ol>
+<h2 id="choisir-entre-spawn_subagent-et-delegate"><a class="header" href="#choisir-entre-spawn_subagent-et-delegate">Choisir entre <code>spawn_subagent</code> et <code>delegate</code></a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th><code>spawn_subagent</code></th><th><code>delegate</code></th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Identité</strong></td><td>Identique au parent (même UUID, même profil de risque)</td><td>Identité de l’agent cible (alias différent ; pair de même profil ou délégué inter-profil explicite)</td></tr>
+<tr><td><strong>Modèle d’autorisation</strong></td><td>Politique du parent telle quelle (ou sous-ensemble restreint)</td><td>Bounded targets run under the target policy with the caller’s agentic tool registry as ceiling; independent targets run under the target policy and target-owned registry</td></tr>
+<tr><td><strong>Fournisseur de modèle</strong></td><td>Parent</td><td>Fournisseur configuré de l’agent cible</td></tr>
+<tr><td><strong>Profondeur de génération</strong></td><td>Limite stricte à 1</td><td>Jusqu’à <code>runtime_profile.max_delegation_depth</code> (3 par défaut)</td></tr>
+<tr><td><strong>Mode arrière-plan</strong></td><td>Non pris en charge</td><td><code>background: true</code> retourne un <code>task_id</code></td></tr>
+<tr><td><strong>Distribution en parallèle</strong></td><td>Aucun argument intégré ; plusieurs appels dans un même tour s’exécutent simultanément lorsque <code>parallel_tools = true</code></td><td><code>parallel: [...]</code> exécute plusieurs cibles simultanément</td></tr>
+<tr><td><strong>Contrôle d’accès</strong></td><td><code>risk_profile.allowed_tools</code> non vide doit lister <code>spawn_subagent</code> ; <code>excluded_tools</code> ne doit pas le lister</td><td>L’attribut <code>risk_profile.allowed_tools</code> non vide de l’appelant doit lister <code>delegate</code> ; <code>excluded_tools</code> ne doit pas le lister ; le <code>delegation_policy mode = "allow"</code> de l’appelant ; et la cible se trouve dans l’ensemble accessible de l’appelant (pair du même profil ou entrée <code>delegates</code> explicite)</td></tr>
+<tr><td><strong>À utiliser quand</strong></td><td>Sous-tâche interne qui doit rester au sein de la même identité</td><td>Want a different configured specialist (different model, different alias) to own the task under bounded or independent delegation</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="ce-qui-nest-pas-pris-en-charge"><a class="header" href="#ce-qui-nest-pas-pris-en-charge">Ce qui n’est pas pris en charge</a></h2>
+<ol>
+<li><strong>Récursivité au-delà du niveau 1.</strong> Un SubAgent ne peut pas générer son propre SubAgent. Cette limite est un refus strict au niveau de l’outil, et non un budget. Les exécutions lancées par cron commencent au niveau 0 et peuvent générer un niveau supplémentaire ; les SubAgents lancés par boucle d’agent se trouvent au niveau 1 et refusent toute génération ultérieure.</li>
+<li><strong>Une identité distincte pour l’enfant.</strong> Les SubAgents partagent l’UUID de l’agent parent. Pour s’exécuter sous une identité différente, utilisez <code>delegate</code> pour déléguer à un agent frère configuré.</li>
+<li><strong>Budget de temps par spawn.</strong> Il n’y a pas d’argument <code>timeout_secs</code>. Le parent est bloqué pendant toute la durée de l’exécution de l’enfant ; l’annulation doit passer par la portée d’interruption plus large.</li>
+<li><strong>Streaming de la progression vers le parent.</strong> Le parent voit la réponse finale de l’enfant comme une chaîne unique après l’achèvement.</li>
+<li><strong>Un bloc de configuration <code>[agents.&lt;alias&gt;].subagent_*</code>.</strong> Le validateur et le type override sont disponibles aujourd’hui ; la surface de configuration côté opérateur qui achemine le narrowing défini par l’appelant n’est pas dans cette version. Les deux sites de spawn passent <code>SubAgentOverrides::default()</code> jusqu’à ce que cette surface arrive.</li>
+<li><strong>Independent <code>delegate</code> targets with <code>always_ask</code>.</strong> Independent delegation is blocked when the target agent’s risk profile has non-empty <code>always_ask</code> entries. The runtime refuses before starting the target, including background and parallel delegation. This blocker remains until approval forwarding for independent child agents is supported by a future ZeroClaw version.</li>
+</ol>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../agents/operating.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../agents/internals.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../agents/operating.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../agents/internals.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["evaluate","integrate","scout"],"struct":["ForgeReport","SkillForge","SkillForgeConfig"]};

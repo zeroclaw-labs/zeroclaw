@@ -1,0 +1,357 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `crates/zeroclaw-runtime/src/subagent/mod.rs`."><title>mod.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-17e0aaed.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="zeroclaw_runtime" data-themes="" data-resource-suffix="" data-rustdoc-version="1.96.0 (ac68faa20 2026-05-25)" data-channel="1.96.0" data-search-js="search-b5634cc7.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../../../static.files/src-script-813739b1.js"></script><script defer src="../../../src-files.js"></script><script defer src="../../../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">zeroclaw_runtime/subagent/</div>mod.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="doccomment">//! Runtime-spawned ephemeral sub-agents that inherit their parent
+<a href=#2 id=2 data-nosnippet>2</a>//! agent's identity by default: same UUID, same `SecurityPolicy`, same
+<a href=#3 id=3 data-nosnippet>3</a>//! memory allowlist. A SubAgent run is auditable as a child of the
+<a href=#4 id=4 data-nosnippet>4</a>//! parent and stays inside the parent's permissions envelope.
+<a href=#5 id=5 data-nosnippet>5</a>//!
+<a href=#6 id=6 data-nosnippet>6</a>//! Two spawn sites converge on [`SubAgentSpawn`]: the agent-loop tool
+<a href=#7 id=7 data-nosnippet>7</a>//! `spawn_subagent` and the cron scheduler's `JobType::Agent` dispatch.
+<a href=#8 id=8 data-nosnippet>8</a>//! Sharing the surface keeps permission inheritance, tracing-span
+<a href=#9 id=9 data-nosnippet>9</a>//! shape, and audit attribution uniform.
+<a href=#10 id=10 data-nosnippet>10</a>//!
+<a href=#11 id=11 data-nosnippet>11</a>//! Power-users may narrow a SubAgent's permissions via
+<a href=#12 id=12 data-nosnippet>12</a>//! [`SubAgentOverrides`]; [`SubAgentSpawn::build`] validates each
+<a href=#13 id=13 data-nosnippet>13</a>//! override as a subset of the parent (using
+<a href=#14 id=14 data-nosnippet>14</a>//! [`SecurityPolicy::ensure_no_escalation_beyond`] for the policy and
+<a href=#15 id=15 data-nosnippet>15</a>//! an alias-set containment check for the memory allowlist) and
+<a href=#16 id=16 data-nosnippet>16</a>//! returns `Err` with the originating violation chained on any
+<a href=#17 id=17 data-nosnippet>17</a>//! escalation.
+<a href=#18 id=18 data-nosnippet>18</a>//!
+<a href=#19 id=19 data-nosnippet>19</a>//! The memory allowlist is carried as a set of agent **aliases** (the
+<a href=#20 id=20 data-nosnippet>20</a>//! `[agents.&lt;alias&gt;]` config keys), not backend storage identifiers.
+<a href=#21 id=21 data-nosnippet>21</a>//! Consumers that build an [`zeroclaw_memory::AgentScopedMemory`] must resolve aliases
+<a href=#22 id=22 data-nosnippet>22</a>//! to backend identifiers via
+<a href=#23 id=23 data-nosnippet>23</a>//! [`zeroclaw_memory::Memory::ensure_agent_uuid`] first — SQL-backed
+<a href=#24 id=24 data-nosnippet>24</a>//! stores use UUIDs from the `agents` table; Markdown / Qdrant / None
+<a href=#25 id=25 data-nosnippet>25</a>//! use the alias verbatim per the trait default. Holding aliases at
+<a href=#26 id=26 data-nosnippet>26</a>//! this layer means [`SubAgentSpawn::for_agent`] does not need a
+<a href=#27 id=27 data-nosnippet>27</a>//! backend handle to construct.
+<a href=#28 id=28 data-nosnippet>28</a>
+<a href=#29 id=29 data-nosnippet>29</a></span><span class="kw">use </span>anyhow::{Context, <span class="prelude-ty">Result</span>};
+<a href=#30 id=30 data-nosnippet>30</a><span class="kw">use </span>std::collections::HashSet;
+<a href=#31 id=31 data-nosnippet>31</a><span class="kw">use </span>std::sync::Arc;
+<a href=#32 id=32 data-nosnippet>32</a>
+<a href=#33 id=33 data-nosnippet>33</a><span class="kw">use </span>zeroclaw_config::policy::SecurityPolicy;
+<a href=#34 id=34 data-nosnippet>34</a><span class="kw">use </span>zeroclaw_config::schema::Config;
+<a href=#35 id=35 data-nosnippet>35</a>
+<a href=#36 id=36 data-nosnippet>36</a><span class="doccomment">/// Optional narrowing applied to a SubAgent at spawn time. `None` on
+<a href=#37 id=37 data-nosnippet>37</a>/// every field means "inherit parent verbatim"; `Some(...)` narrows.
+<a href=#38 id=38 data-nosnippet>38</a>/// Each field is independently validated by [`SubAgentSpawn::build`]
+<a href=#39 id=39 data-nosnippet>39</a>/// to reject any value that escalates beyond the parent.
+<a href=#40 id=40 data-nosnippet>40</a>///
+<a href=#41 id=41 data-nosnippet>41</a>/// The default-everything-inherits model means the common case is
+<a href=#42 id=42 data-nosnippet>42</a>/// `SubAgentOverrides::default()` — a no-op.
+<a href=#43 id=43 data-nosnippet>43</a></span><span class="attr">#[derive(Debug, Clone, Default)]
+<a href=#44 id=44 data-nosnippet>44</a></span><span class="kw">pub struct </span>SubAgentOverrides {
+<a href=#45 id=45 data-nosnippet>45</a>    <span class="doccomment">/// Override the SubAgent's [`SecurityPolicy`]. Validated as a
+<a href=#46 id=46 data-nosnippet>46</a>    /// subset of the parent via
+<a href=#47 id=47 data-nosnippet>47</a>    /// [`SecurityPolicy::ensure_no_escalation_beyond`].
+<a href=#48 id=48 data-nosnippet>48</a>    </span><span class="kw">pub </span>policy: <span class="prelude-ty">Option</span>&lt;SecurityPolicy&gt;,
+<a href=#49 id=49 data-nosnippet>49</a>    <span class="doccomment">/// Override the SubAgent's memory allowlist (the set of sibling
+<a href=#50 id=50 data-nosnippet>50</a>    /// agent **aliases** the SubAgent may recall from, as written in
+<a href=#51 id=51 data-nosnippet>51</a>    /// `[agents.&lt;alias&gt;]` keys). Validated as a subset of the
+<a href=#52 id=52 data-nosnippet>52</a>    /// parent's allowlist; any alias here that is not on the parent's
+<a href=#53 id=53 data-nosnippet>53</a>    /// list is rejected.
+<a href=#54 id=54 data-nosnippet>54</a>    ///
+<a href=#55 id=55 data-nosnippet>55</a>    /// These are config-layer aliases, not backend storage
+<a href=#56 id=56 data-nosnippet>56</a>    /// identifiers. Consumers that build an [`zeroclaw_memory::AgentScopedMemory`]
+<a href=#57 id=57 data-nosnippet>57</a>    /// must resolve aliases to backend identifiers via
+<a href=#58 id=58 data-nosnippet>58</a>    /// [`zeroclaw_memory::Memory::ensure_agent_uuid`] before passing
+<a href=#59 id=59 data-nosnippet>59</a>    /// them to the wrapper (SQL backends use UUIDs; Markdown / Qdrant
+<a href=#60 id=60 data-nosnippet>60</a>    /// / None use the alias verbatim per the trait default). The
+<a href=#61 id=61 data-nosnippet>61</a>    /// in-tree consumer today is `zeroclaw_memory::create_memory_for_agent`,
+<a href=#62 id=62 data-nosnippet>62</a>    /// which performs the resolution.
+<a href=#63 id=63 data-nosnippet>63</a>    </span><span class="kw">pub </span>allowed_agent_aliases: <span class="prelude-ty">Option</span>&lt;HashSet&lt;String&gt;&gt;,
+<a href=#64 id=64 data-nosnippet>64</a>}
+<a href=#65 id=65 data-nosnippet>65</a>
+<a href=#66 id=66 data-nosnippet>66</a><span class="doccomment">/// Constructed SubAgent context: bound parent identity, validated
+<a href=#67 id=67 data-nosnippet>67</a>/// child policy, and the resolved memory allowlist.
+<a href=#68 id=68 data-nosnippet>68</a></span><span class="attr">#[derive(Debug, Clone)]
+<a href=#69 id=69 data-nosnippet>69</a></span><span class="kw">pub struct </span>SubAgentContext {
+<a href=#70 id=70 data-nosnippet>70</a>    <span class="doccomment">/// The parent agent's alias (e.g. `"researcher"`). SubAgents share
+<a href=#71 id=71 data-nosnippet>71</a>    /// the parent's identity at the data layer (no separate row in the
+<a href=#72 id=72 data-nosnippet>72</a>    /// `agents` table); the distinction between parent and sub-run is
+<a href=#73 id=73 data-nosnippet>73</a>    /// captured at the tracing-span level
+<a href=#74 id=74 data-nosnippet>74</a>    /// (`agent.&lt;alias&gt;.subagent.&lt;run_id&gt;`).
+<a href=#75 id=75 data-nosnippet>75</a>    </span><span class="kw">pub </span>parent_alias: String,
+<a href=#76 id=76 data-nosnippet>76</a>    <span class="doccomment">/// The validated [`SecurityPolicy`] this SubAgent operates under.
+<a href=#77 id=77 data-nosnippet>77</a>    /// Identical to the parent's when `SubAgentOverrides::policy` is
+<a href=#78 id=78 data-nosnippet>78</a>    /// `None`; otherwise a narrowed copy that passed
+<a href=#79 id=79 data-nosnippet>79</a>    /// [`SecurityPolicy::ensure_no_escalation_beyond`].
+<a href=#80 id=80 data-nosnippet>80</a>    </span><span class="kw">pub </span>policy: Arc&lt;SecurityPolicy&gt;,
+<a href=#81 id=81 data-nosnippet>81</a>    <span class="doccomment">/// Resolved memory allowlist as a set of agent **aliases**. The
+<a href=#82 id=82 data-nosnippet>82</a>    /// bound `parent_alias` is always included so the SubAgent always
+<a href=#83 id=83 data-nosnippet>83</a>    /// sees the parent's own rows; the rest is either the parent's
+<a href=#84 id=84 data-nosnippet>84</a>    /// allowlist verbatim or a validated subset.
+<a href=#85 id=85 data-nosnippet>85</a>    ///
+<a href=#86 id=86 data-nosnippet>86</a>    /// See [`SubAgentOverrides::allowed_agent_aliases`] for the
+<a href=#87 id=87 data-nosnippet>87</a>    /// alias-vs-backend-identifier distinction; consumers that build
+<a href=#88 id=88 data-nosnippet>88</a>    /// an [`zeroclaw_memory::AgentScopedMemory`] must resolve to backend identifiers
+<a href=#89 id=89 data-nosnippet>89</a>    /// before passing the set to the wrapper.
+<a href=#90 id=90 data-nosnippet>90</a>    </span><span class="kw">pub </span>allowed_agent_aliases: HashSet&lt;String&gt;,
+<a href=#91 id=91 data-nosnippet>91</a>}
+<a href=#92 id=92 data-nosnippet>92</a>
+<a href=#93 id=93 data-nosnippet>93</a><span class="doccomment">/// Builder for a SubAgent spawn. The caller resolves a parent agent
+<a href=#94 id=94 data-nosnippet>94</a>/// from the loaded config; [`Self::build`] applies any narrowing
+<a href=#95 id=95 data-nosnippet>95</a>/// overrides and validates the result.
+<a href=#96 id=96 data-nosnippet>96</a></span><span class="attr">#[derive(Debug)]
+<a href=#97 id=97 data-nosnippet>97</a></span><span class="kw">pub struct </span>SubAgentSpawn {
+<a href=#98 id=98 data-nosnippet>98</a>    <span class="kw">pub </span>parent_alias: String,
+<a href=#99 id=99 data-nosnippet>99</a>    <span class="kw">pub </span>parent_policy: Arc&lt;SecurityPolicy&gt;,
+<a href=#100 id=100 data-nosnippet>100</a>    <span class="kw">pub </span>parent_allowed_agent_aliases: HashSet&lt;String&gt;,
+<a href=#101 id=101 data-nosnippet>101</a>}
+<a href=#102 id=102 data-nosnippet>102</a>
+<a href=#103 id=103 data-nosnippet>103</a><span class="kw">impl </span>SubAgentSpawn {
+<a href=#104 id=104 data-nosnippet>104</a>    <span class="doccomment">/// Resolve a parent's identity from the loaded config and an
+<a href=#105 id=105 data-nosnippet>105</a>    /// agent alias. Returns `Err` when the alias does not name a
+<a href=#106 id=106 data-nosnippet>106</a>    /// configured agent — the spawn site surfaces a structured
+<a href=#107 id=107 data-nosnippet>107</a>    /// failure instead of invoking the agent loop on a nonexistent
+<a href=#108 id=108 data-nosnippet>108</a>    /// identity.
+<a href=#109 id=109 data-nosnippet>109</a>    </span><span class="kw">pub fn </span>for_agent(config: <span class="kw-2">&amp;</span>Config, agent_alias: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Result</span>&lt;<span class="self">Self</span>&gt; {
+<a href=#110 id=110 data-nosnippet>110</a>        <span class="kw">let </span>agent = config
+<a href=#111 id=111 data-nosnippet>111</a>            .agents
+<a href=#112 id=112 data-nosnippet>112</a>            .get(agent_alias)
+<a href=#113 id=113 data-nosnippet>113</a>            .with_context(|| <span class="macro">format!</span>(<span class="string">"no agent configured under alias {agent_alias:?}"</span>))<span class="question-mark">?</span>;
+<a href=#114 id=114 data-nosnippet>114</a>
+<a href=#115 id=115 data-nosnippet>115</a>        <span class="kw">let </span>parent_policy = SecurityPolicy::for_agent(config, agent_alias)
+<a href=#116 id=116 data-nosnippet>116</a>            .map(Arc::new)
+<a href=#117 id=117 data-nosnippet>117</a>            .with_context(|| {
+<a href=#118 id=118 data-nosnippet>118</a>                <span class="macro">format!</span>(<span class="string">"could not resolve security policy for agent {agent_alias:?}"</span>)
+<a href=#119 id=119 data-nosnippet>119</a>            })<span class="question-mark">?</span>;
+<a href=#120 id=120 data-nosnippet>120</a>
+<a href=#121 id=121 data-nosnippet>121</a>        <span class="kw">let </span><span class="kw-2">mut </span>parent_allowed_agent_aliases: HashSet&lt;String&gt; = agent
+<a href=#122 id=122 data-nosnippet>122</a>            .workspace
+<a href=#123 id=123 data-nosnippet>123</a>            .read_memory_from
+<a href=#124 id=124 data-nosnippet>124</a>            .iter()
+<a href=#125 id=125 data-nosnippet>125</a>            .map(|alias| alias.as_str().to_string())
+<a href=#126 id=126 data-nosnippet>126</a>            .collect();
+<a href=#127 id=127 data-nosnippet>127</a>        parent_allowed_agent_aliases.insert(agent_alias.to_string());
+<a href=#128 id=128 data-nosnippet>128</a>
+<a href=#129 id=129 data-nosnippet>129</a>        <span class="prelude-val">Ok</span>(<span class="self">Self </span>{
+<a href=#130 id=130 data-nosnippet>130</a>            parent_alias: agent_alias.to_string(),
+<a href=#131 id=131 data-nosnippet>131</a>            parent_policy,
+<a href=#132 id=132 data-nosnippet>132</a>            parent_allowed_agent_aliases,
+<a href=#133 id=133 data-nosnippet>133</a>        })
+<a href=#134 id=134 data-nosnippet>134</a>    }
+<a href=#135 id=135 data-nosnippet>135</a>
+<a href=#136 id=136 data-nosnippet>136</a>    <span class="doccomment">/// Apply `overrides` to the parent's permissions and return a
+<a href=#137 id=137 data-nosnippet>137</a>    /// validated [`SubAgentContext`]. On any escalation, returns
+<a href=#138 id=138 data-nosnippet>138</a>    /// `Err` with the originating violation in the error chain.
+<a href=#139 id=139 data-nosnippet>139</a>    ///
+<a href=#140 id=140 data-nosnippet>140</a>    /// When the caller supplies a policy override, the child inherits
+<a href=#141 id=141 data-nosnippet>141</a>    /// the parent's `PerSenderTracker` so action and cost budgets are
+<a href=#142 id=142 data-nosnippet>142</a>    /// shared between parent and SubAgent runs. Otherwise a SubAgent
+<a href=#143 id=143 data-nosnippet>143</a>    /// could be spawned to bypass the parent's `max_actions_per_hour`
+<a href=#144 id=144 data-nosnippet>144</a>    /// or `max_cost_per_day_cents` ceiling by consuming from a
+<a href=#145 id=145 data-nosnippet>145</a>    /// fresh-zeroed bucket; the inheritance closes that escape. The
+<a href=#146 id=146 data-nosnippet>146</a>    /// no-override path already shares the bucket via
+<a href=#147 id=147 data-nosnippet>147</a>    /// `Arc&lt;SecurityPolicy&gt;` cloning.
+<a href=#148 id=148 data-nosnippet>148</a>    </span><span class="kw">pub fn </span>build(<span class="self">self</span>, overrides: SubAgentOverrides) -&gt; <span class="prelude-ty">Result</span>&lt;SubAgentContext&gt; {
+<a href=#149 id=149 data-nosnippet>149</a>        <span class="kw">let </span>policy = <span class="kw">if let </span><span class="prelude-val">Some</span>(<span class="kw-2">mut </span>child_policy) = overrides.policy {
+<a href=#150 id=150 data-nosnippet>150</a>            child_policy
+<a href=#151 id=151 data-nosnippet>151</a>                .ensure_no_escalation_beyond(<span class="kw-2">&amp;</span><span class="self">self</span>.parent_policy)
+<a href=#152 id=152 data-nosnippet>152</a>                .map_err(|violation| {
+<a href=#153 id=153 data-nosnippet>153</a>                    <span class="macro">::zeroclaw_log::record!</span>(
+<a href=#154 id=154 data-nosnippet>154</a>                        WARN,
+<a href=#155 id=155 data-nosnippet>155</a>                        ::zeroclaw_log::Event::new(<span class="macro">module_path!</span>(), ::zeroclaw_log::Action::Reject)
+<a href=#156 id=156 data-nosnippet>156</a>                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+<a href=#157 id=157 data-nosnippet>157</a>                            .with_attrs(<span class="macro">::serde_json::json!</span>({
+<a href=#158 id=158 data-nosnippet>158</a>                                <span class="string">"violation"</span>: violation.to_string(),
+<a href=#159 id=159 data-nosnippet>159</a>                            })),
+<a href=#160 id=160 data-nosnippet>160</a>                        <span class="string">"subagent build refused: policy override escalates beyond parent"
+<a href=#161 id=161 data-nosnippet>161</a>                    </span>);
+<a href=#162 id=162 data-nosnippet>162</a>                    anyhow::Error::msg(<span class="macro">format!</span>(
+<a href=#163 id=163 data-nosnippet>163</a>                        <span class="string">"subagent policy override escalates beyond parent: {violation}"
+<a href=#164 id=164 data-nosnippet>164</a>                    </span>))
+<a href=#165 id=165 data-nosnippet>165</a>                })<span class="question-mark">?</span>;
+<a href=#166 id=166 data-nosnippet>166</a>            <span class="comment">// Share the parent's action/cost tracker. `PerSenderTracker`
+<a href=#167 id=167 data-nosnippet>167</a>            // is `Clone` (deep-copy of buckets) but the SubAgent must
+<a href=#168 id=168 data-nosnippet>168</a>            // see the parent's live bucket state, not a frozen
+<a href=#169 id=169 data-nosnippet>169</a>            // snapshot, so steal the parent's tracker by cloning the
+<a href=#170 id=170 data-nosnippet>170</a>            // inner `Arc&lt;SecurityPolicy&gt;` once and assigning the
+<a href=#171 id=171 data-nosnippet>171</a>            // child's `tracker` field from it.
+<a href=#172 id=172 data-nosnippet>172</a>            </span>child_policy.tracker = <span class="self">self</span>.parent_policy.tracker.clone();
+<a href=#173 id=173 data-nosnippet>173</a>            Arc::new(child_policy)
+<a href=#174 id=174 data-nosnippet>174</a>        } <span class="kw">else </span>{
+<a href=#175 id=175 data-nosnippet>175</a>            <span class="self">self</span>.parent_policy.clone()
+<a href=#176 id=176 data-nosnippet>176</a>        };
+<a href=#177 id=177 data-nosnippet>177</a>
+<a href=#178 id=178 data-nosnippet>178</a>        <span class="kw">let </span>allowed_agent_aliases = <span class="kw">if let </span><span class="prelude-val">Some</span>(child_allowed) = overrides.allowed_agent_aliases {
+<a href=#179 id=179 data-nosnippet>179</a>            <span class="kw">for </span>alias <span class="kw">in </span><span class="kw-2">&amp;</span>child_allowed {
+<a href=#180 id=180 data-nosnippet>180</a>                <span class="kw">if </span>!<span class="self">self</span>.parent_allowed_agent_aliases.contains(alias) {
+<a href=#181 id=181 data-nosnippet>181</a>                    <span class="macro">anyhow::bail!</span>(
+<a href=#182 id=182 data-nosnippet>182</a>                        <span class="string">"subagent allowlist override contains alias {alias:?} not present on \
+<a href=#183 id=183 data-nosnippet>183</a>                         parent's memory allowlist; SubAgent overrides may only narrow"
+<a href=#184 id=184 data-nosnippet>184</a>                    </span>);
+<a href=#185 id=185 data-nosnippet>185</a>                }
+<a href=#186 id=186 data-nosnippet>186</a>            }
+<a href=#187 id=187 data-nosnippet>187</a>            <span class="kw">let </span><span class="kw-2">mut </span>resolved = child_allowed;
+<a href=#188 id=188 data-nosnippet>188</a>            resolved.insert(<span class="self">self</span>.parent_alias.clone());
+<a href=#189 id=189 data-nosnippet>189</a>            resolved
+<a href=#190 id=190 data-nosnippet>190</a>        } <span class="kw">else </span>{
+<a href=#191 id=191 data-nosnippet>191</a>            <span class="self">self</span>.parent_allowed_agent_aliases
+<a href=#192 id=192 data-nosnippet>192</a>        };
+<a href=#193 id=193 data-nosnippet>193</a>
+<a href=#194 id=194 data-nosnippet>194</a>        <span class="prelude-val">Ok</span>(SubAgentContext {
+<a href=#195 id=195 data-nosnippet>195</a>            parent_alias: <span class="self">self</span>.parent_alias,
+<a href=#196 id=196 data-nosnippet>196</a>            policy,
+<a href=#197 id=197 data-nosnippet>197</a>            allowed_agent_aliases,
+<a href=#198 id=198 data-nosnippet>198</a>        })
+<a href=#199 id=199 data-nosnippet>199</a>    }
+<a href=#200 id=200 data-nosnippet>200</a>}
+<a href=#201 id=201 data-nosnippet>201</a>
+<a href=#202 id=202 data-nosnippet>202</a><span class="attr">#[cfg(test)]
+<a href=#203 id=203 data-nosnippet>203</a></span><span class="kw">mod </span>tests {
+<a href=#204 id=204 data-nosnippet>204</a>    <span class="kw">use </span>super::<span class="kw-2">*</span>;
+<a href=#205 id=205 data-nosnippet>205</a>    <span class="kw">use </span>std::path::PathBuf;
+<a href=#206 id=206 data-nosnippet>206</a>    <span class="kw">use </span>zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+<a href=#207 id=207 data-nosnippet>207</a>
+<a href=#208 id=208 data-nosnippet>208</a>    <span class="kw">fn </span>config_with_agent(alias: <span class="kw-2">&amp;</span>str) -&gt; Config {
+<a href=#209 id=209 data-nosnippet>209</a>        <span class="kw">let </span><span class="kw-2">mut </span>config = Config::default();
+<a href=#210 id=210 data-nosnippet>210</a>        config
+<a href=#211 id=211 data-nosnippet>211</a>            .risk_profiles
+<a href=#212 id=212 data-nosnippet>212</a>            .insert(<span class="string">"default"</span>.to_string(), RiskProfileConfig::default());
+<a href=#213 id=213 data-nosnippet>213</a>        config.agents.insert(
+<a href=#214 id=214 data-nosnippet>214</a>            alias.to_string(),
+<a href=#215 id=215 data-nosnippet>215</a>            AliasedAgentConfig {
+<a href=#216 id=216 data-nosnippet>216</a>                risk_profile: <span class="string">"default"</span>.to_string(),
+<a href=#217 id=217 data-nosnippet>217</a>                ..AliasedAgentConfig::default()
+<a href=#218 id=218 data-nosnippet>218</a>            },
+<a href=#219 id=219 data-nosnippet>219</a>        );
+<a href=#220 id=220 data-nosnippet>220</a>        config
+<a href=#221 id=221 data-nosnippet>221</a>    }
+<a href=#222 id=222 data-nosnippet>222</a>
+<a href=#223 id=223 data-nosnippet>223</a>    <span class="attr">#[test]
+<a href=#224 id=224 data-nosnippet>224</a>    </span><span class="kw">fn </span>for_agent_resolves_parent_identity_from_config() {
+<a href=#225 id=225 data-nosnippet>225</a>        <span class="kw">let </span>config = config_with_agent(<span class="string">"alpha"</span>);
+<a href=#226 id=226 data-nosnippet>226</a>        <span class="kw">let </span>ctx = SubAgentSpawn::for_agent(<span class="kw-2">&amp;</span>config, <span class="string">"alpha"</span>)
+<a href=#227 id=227 data-nosnippet>227</a>            .expect(<span class="string">"for_agent must succeed for a configured agent"</span>)
+<a href=#228 id=228 data-nosnippet>228</a>            .build(SubAgentOverrides::default())
+<a href=#229 id=229 data-nosnippet>229</a>            .expect(<span class="string">"inherits-verbatim build must succeed"</span>);
+<a href=#230 id=230 data-nosnippet>230</a>        <span class="macro">assert_eq!</span>(ctx.parent_alias, <span class="string">"alpha"</span>);
+<a href=#231 id=231 data-nosnippet>231</a>        <span class="macro">assert!</span>(
+<a href=#232 id=232 data-nosnippet>232</a>            ctx.allowed_agent_aliases.contains(<span class="string">"alpha"</span>),
+<a href=#233 id=233 data-nosnippet>233</a>            <span class="string">"an agent always sees its own rows"
+<a href=#234 id=234 data-nosnippet>234</a>        </span>);
+<a href=#235 id=235 data-nosnippet>235</a>    }
+<a href=#236 id=236 data-nosnippet>236</a>
+<a href=#237 id=237 data-nosnippet>237</a>    <span class="attr">#[test]
+<a href=#238 id=238 data-nosnippet>238</a>    </span><span class="kw">fn </span>for_agent_errors_on_unknown_alias() {
+<a href=#239 id=239 data-nosnippet>239</a>        <span class="kw">let </span>err = SubAgentSpawn::for_agent(<span class="kw-2">&amp;</span>Config::default(), <span class="string">"missing"</span>)
+<a href=#240 id=240 data-nosnippet>240</a>            .expect_err(<span class="string">"unknown alias must error"</span>);
+<a href=#241 id=241 data-nosnippet>241</a>        <span class="macro">assert!</span>(
+<a href=#242 id=242 data-nosnippet>242</a>            err.to_string().contains(<span class="string">"missing"</span>),
+<a href=#243 id=243 data-nosnippet>243</a>            <span class="string">"expected the missing alias in the error, got: {err}"
+<a href=#244 id=244 data-nosnippet>244</a>        </span>);
+<a href=#245 id=245 data-nosnippet>245</a>    }
+<a href=#246 id=246 data-nosnippet>246</a>
+<a href=#247 id=247 data-nosnippet>247</a>    <span class="attr">#[test]
+<a href=#248 id=248 data-nosnippet>248</a>    </span><span class="kw">fn </span>build_inherits_verbatim_when_overrides_are_default() {
+<a href=#249 id=249 data-nosnippet>249</a>        <span class="kw">let </span>config = config_with_agent(<span class="string">"alpha"</span>);
+<a href=#250 id=250 data-nosnippet>250</a>        <span class="kw">let </span>spawn = SubAgentSpawn::for_agent(<span class="kw-2">&amp;</span>config, <span class="string">"alpha"</span>).unwrap();
+<a href=#251 id=251 data-nosnippet>251</a>        <span class="kw">let </span>parent_policy = spawn.parent_policy.clone();
+<a href=#252 id=252 data-nosnippet>252</a>        <span class="kw">let </span>parent_allowlist = spawn.parent_allowed_agent_aliases.clone();
+<a href=#253 id=253 data-nosnippet>253</a>
+<a href=#254 id=254 data-nosnippet>254</a>        <span class="kw">let </span>ctx = spawn.build(SubAgentOverrides::default()).unwrap();
+<a href=#255 id=255 data-nosnippet>255</a>        <span class="macro">assert!</span>(Arc::ptr_eq(<span class="kw-2">&amp;</span>ctx.policy, <span class="kw-2">&amp;</span>parent_policy));
+<a href=#256 id=256 data-nosnippet>256</a>        <span class="macro">assert_eq!</span>(ctx.allowed_agent_aliases, parent_allowlist);
+<a href=#257 id=257 data-nosnippet>257</a>    }
+<a href=#258 id=258 data-nosnippet>258</a>
+<a href=#259 id=259 data-nosnippet>259</a>    <span class="attr">#[test]
+<a href=#260 id=260 data-nosnippet>260</a>    </span><span class="kw">fn </span>build_rejects_policy_override_that_escalates_paths() {
+<a href=#261 id=261 data-nosnippet>261</a>        <span class="kw">let </span>config = config_with_agent(<span class="string">"alpha"</span>);
+<a href=#262 id=262 data-nosnippet>262</a>        <span class="kw">let </span>spawn = SubAgentSpawn::for_agent(<span class="kw-2">&amp;</span>config, <span class="string">"alpha"</span>).unwrap();
+<a href=#263 id=263 data-nosnippet>263</a>
+<a href=#264 id=264 data-nosnippet>264</a>        <span class="kw">let </span><span class="kw-2">mut </span>child_policy = (<span class="kw-2">*</span>spawn.parent_policy).clone();
+<a href=#265 id=265 data-nosnippet>265</a>        <span class="comment">// Add an rw root the parent doesn't have — escalation.
+<a href=#266 id=266 data-nosnippet>266</a>        </span>child_policy.allowed_roots.push(PathBuf::from(<span class="string">"/secrets"</span>));
+<a href=#267 id=267 data-nosnippet>267</a>
+<a href=#268 id=268 data-nosnippet>268</a>        <span class="kw">let </span>err = spawn
+<a href=#269 id=269 data-nosnippet>269</a>            .build(SubAgentOverrides {
+<a href=#270 id=270 data-nosnippet>270</a>                policy: <span class="prelude-val">Some</span>(child_policy),
+<a href=#271 id=271 data-nosnippet>271</a>                ..SubAgentOverrides::default()
+<a href=#272 id=272 data-nosnippet>272</a>            })
+<a href=#273 id=273 data-nosnippet>273</a>            .expect_err(<span class="string">"escalating override must be rejected"</span>);
+<a href=#274 id=274 data-nosnippet>274</a>        <span class="macro">assert!</span>(
+<a href=#275 id=275 data-nosnippet>275</a>            err.to_string().contains(<span class="string">"/secrets"</span>),
+<a href=#276 id=276 data-nosnippet>276</a>            <span class="string">"expected the escalating path in the error chain, got: {err}"
+<a href=#277 id=277 data-nosnippet>277</a>        </span>);
+<a href=#278 id=278 data-nosnippet>278</a>    }
+<a href=#279 id=279 data-nosnippet>279</a>
+<a href=#280 id=280 data-nosnippet>280</a>    <span class="attr">#[test]
+<a href=#281 id=281 data-nosnippet>281</a>    </span><span class="kw">fn </span>build_rejects_allowlist_override_with_alias_not_on_parent() {
+<a href=#282 id=282 data-nosnippet>282</a>        <span class="kw">let </span>config = config_with_agent(<span class="string">"alpha"</span>);
+<a href=#283 id=283 data-nosnippet>283</a>        <span class="kw">let </span>spawn = SubAgentSpawn::for_agent(<span class="kw-2">&amp;</span>config, <span class="string">"alpha"</span>).unwrap();
+<a href=#284 id=284 data-nosnippet>284</a>
+<a href=#285 id=285 data-nosnippet>285</a>        <span class="kw">let </span><span class="kw-2">mut </span>rogue = HashSet::new();
+<a href=#286 id=286 data-nosnippet>286</a>        rogue.insert(<span class="string">"rogue-agent"</span>.to_string());
+<a href=#287 id=287 data-nosnippet>287</a>
+<a href=#288 id=288 data-nosnippet>288</a>        <span class="kw">let </span>err = spawn
+<a href=#289 id=289 data-nosnippet>289</a>            .build(SubAgentOverrides {
+<a href=#290 id=290 data-nosnippet>290</a>                allowed_agent_aliases: <span class="prelude-val">Some</span>(rogue),
+<a href=#291 id=291 data-nosnippet>291</a>                ..SubAgentOverrides::default()
+<a href=#292 id=292 data-nosnippet>292</a>            })
+<a href=#293 id=293 data-nosnippet>293</a>            .expect_err(<span class="string">"allowlist override with foreign alias must be rejected"</span>);
+<a href=#294 id=294 data-nosnippet>294</a>        <span class="macro">assert!</span>(
+<a href=#295 id=295 data-nosnippet>295</a>            err.to_string().contains(<span class="string">"rogue-agent"</span>),
+<a href=#296 id=296 data-nosnippet>296</a>            <span class="string">"expected the rogue alias in the error chain, got: {err}"
+<a href=#297 id=297 data-nosnippet>297</a>        </span>);
+<a href=#298 id=298 data-nosnippet>298</a>    }
+<a href=#299 id=299 data-nosnippet>299</a>
+<a href=#300 id=300 data-nosnippet>300</a>    <span class="attr">#[test]
+<a href=#301 id=301 data-nosnippet>301</a>    </span><span class="kw">fn </span>build_accepts_narrowed_allowlist_subset() {
+<a href=#302 id=302 data-nosnippet>302</a>        <span class="kw">let </span>config = config_with_agent(<span class="string">"alpha"</span>);
+<a href=#303 id=303 data-nosnippet>303</a>        <span class="kw">let </span>spawn = SubAgentSpawn::for_agent(<span class="kw-2">&amp;</span>config, <span class="string">"alpha"</span>).unwrap();
+<a href=#304 id=304 data-nosnippet>304</a>
+<a href=#305 id=305 data-nosnippet>305</a>        <span class="comment">// Empty subset is still allowed; the bound parent alias is added back.
+<a href=#306 id=306 data-nosnippet>306</a>        </span><span class="kw">let </span>ctx = spawn
+<a href=#307 id=307 data-nosnippet>307</a>            .build(SubAgentOverrides {
+<a href=#308 id=308 data-nosnippet>308</a>                allowed_agent_aliases: <span class="prelude-val">Some</span>(HashSet::new()),
+<a href=#309 id=309 data-nosnippet>309</a>                ..SubAgentOverrides::default()
+<a href=#310 id=310 data-nosnippet>310</a>            })
+<a href=#311 id=311 data-nosnippet>311</a>            .expect(<span class="string">"narrowing to {} is a valid subset"</span>);
+<a href=#312 id=312 data-nosnippet>312</a>        <span class="macro">assert_eq!</span>(ctx.allowed_agent_aliases.len(), <span class="number">1</span>);
+<a href=#313 id=313 data-nosnippet>313</a>        <span class="macro">assert!</span>(ctx.allowed_agent_aliases.contains(<span class="string">"alpha"</span>));
+<a href=#314 id=314 data-nosnippet>314</a>    }
+<a href=#315 id=315 data-nosnippet>315</a>
+<a href=#316 id=316 data-nosnippet>316</a>    <span class="attr">#[test]
+<a href=#317 id=317 data-nosnippet>317</a>    </span><span class="kw">fn </span>build_with_override_inherits_parent_action_budget() {
+<a href=#318 id=318 data-nosnippet>318</a>        <span class="comment">// SubAgent runs must consume from the parent's action budget
+<a href=#319 id=319 data-nosnippet>319</a>        // so spawning children cannot bypass `max_actions_per_hour`.
+<a href=#320 id=320 data-nosnippet>320</a>        // The override path (caller-supplied policy) is the one with
+<a href=#321 id=321 data-nosnippet>321</a>        // the bug; the inherit-verbatim path is correct by Arc reuse.
+<a href=#322 id=322 data-nosnippet>322</a>        </span><span class="kw">let </span>config = config_with_agent(<span class="string">"alpha"</span>);
+<a href=#323 id=323 data-nosnippet>323</a>        <span class="kw">let </span>spawn = SubAgentSpawn::for_agent(<span class="kw-2">&amp;</span>config, <span class="string">"alpha"</span>).unwrap();
+<a href=#324 id=324 data-nosnippet>324</a>        <span class="kw">let </span>parent_policy = spawn.parent_policy.clone();
+<a href=#325 id=325 data-nosnippet>325</a>
+<a href=#326 id=326 data-nosnippet>326</a>        <span class="comment">// Burn the parent's action budget right up to the ceiling so
+<a href=#327 id=327 data-nosnippet>327</a>        // the child's first record_action would push past it.
+<a href=#328 id=328 data-nosnippet>328</a>        </span><span class="kw">for _ in </span><span class="number">0</span>..parent_policy.max_actions_per_hour {
+<a href=#329 id=329 data-nosnippet>329</a>            <span class="macro">assert!</span>(
+<a href=#330 id=330 data-nosnippet>330</a>                parent_policy.record_action(),
+<a href=#331 id=331 data-nosnippet>331</a>                <span class="string">"parent budget should accept records up to its ceiling"
+<a href=#332 id=332 data-nosnippet>332</a>            </span>);
+<a href=#333 id=333 data-nosnippet>333</a>        }
+<a href=#334 id=334 data-nosnippet>334</a>
+<a href=#335 id=335 data-nosnippet>335</a>        <span class="comment">// Build a child policy that's a subset of the parent (no
+<a href=#336 id=336 data-nosnippet>336</a>        // escalation) but with the default fresh tracker. The fix
+<a href=#337 id=337 data-nosnippet>337</a>        // copies the parent's tracker into the child so the next
+<a href=#338 id=338 data-nosnippet>338</a>        // record_action sees the parent's exhausted bucket.
+<a href=#339 id=339 data-nosnippet>339</a>        </span><span class="kw">let </span>child_policy = (<span class="kw-2">*</span>parent_policy).clone();
+<a href=#340 id=340 data-nosnippet>340</a>        <span class="kw">let </span>ctx = spawn
+<a href=#341 id=341 data-nosnippet>341</a>            .build(SubAgentOverrides {
+<a href=#342 id=342 data-nosnippet>342</a>                policy: <span class="prelude-val">Some</span>(child_policy),
+<a href=#343 id=343 data-nosnippet>343</a>                ..SubAgentOverrides::default()
+<a href=#344 id=344 data-nosnippet>344</a>            })
+<a href=#345 id=345 data-nosnippet>345</a>            .expect(<span class="string">"inheriting policy as a subset must succeed"</span>);
+<a href=#346 id=346 data-nosnippet>346</a>
+<a href=#347 id=347 data-nosnippet>347</a>        <span class="macro">assert!</span>(
+<a href=#348 id=348 data-nosnippet>348</a>            !ctx.policy.record_action(),
+<a href=#349 id=349 data-nosnippet>349</a>            <span class="string">"child must inherit parent's exhausted action budget; \
+<a href=#350 id=350 data-nosnippet>350</a>             a fresh bucket here means the budget is bypass-able by \
+<a href=#351 id=351 data-nosnippet>351</a>             spawning a SubAgent"
+<a href=#352 id=352 data-nosnippet>352</a>        </span>);
+<a href=#353 id=353 data-nosnippet>353</a>    }
+<a href=#354 id=354 data-nosnippet>354</a>}
+</code></pre></div></section></main></body></html>

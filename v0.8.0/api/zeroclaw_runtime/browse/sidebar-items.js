@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["AGENT_WORKSPACE_READ_CAP"],"enum":["BrowseError"],"fn":["delete_agent_workspace_path","list_agent_workspace","list_directory","make_agent_workspace_directory","make_directory","move_agent_workspace_path","read_agent_workspace_file","remove_directory"],"struct":["BrowseEntry","BrowseResult","FileReadResult"]};

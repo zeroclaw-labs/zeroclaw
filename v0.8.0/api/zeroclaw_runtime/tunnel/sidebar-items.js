@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["create_tunnel","kill_shared","new_shared_process"],"struct":["CloudflareTunnel","CustomTunnel","NgrokTunnel","NoneTunnel","OpenVpnTunnel","PinggyTunnel","TailscaleTunnel","TunnelProcess"],"trait":["Tunnel"],"type":["SharedProcess"]};
