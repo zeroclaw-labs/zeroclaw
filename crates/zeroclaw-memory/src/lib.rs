@@ -570,6 +570,9 @@ pub fn create_memory_with_storage_and_routes(
             config.embedding_cache_size,
             sqlite_open_timeout_secs,
             config.search_mode.clone(),
+            &resolved_embedding.model_provider,
+            &resolved_embedding.model,
+            config.reindex_on_embedding_change,
         )?;
         Ok(mem)
     }

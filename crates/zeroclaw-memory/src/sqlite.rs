@@ -44,6 +44,49 @@ pub struct SqliteMemory {
     keyword_weight: f32,
     cache_max: usize,
     search_mode: SearchMode,
+    /// Resolved embedding provider/endpoint identifier from config resolution
+    /// (e.g. `openai`, `openrouter`, `custom:<url>`, or `none`). The concrete
+    /// embedder impl collapses several distinct endpoints onto one name
+    /// (`OpenAiEmbedding::name()` is always `"openai"`), so the resolved
+    /// configured provider is threaded in here to record the true embedding
+    /// identity in the DB. Without it, a provider/endpoint change that keeps
+    /// the same model and dimensions would go undetected.
+    embedding_provider: String,
+    /// Configured embedding model identifier. The embedder trait exposes
+    /// provider name and dimensions but not the model string, so it is
+    /// threaded in here to record the full embedding identity in the DB.
+    embedding_model: String,
+    /// When true, a startup identity mismatch auto-migrates the store
+    /// (re-embeds from retained content). When false, a mismatch only logs a
+    /// loud warning so a large store is never silently re-embedded on boot.
+    reindex_on_embedding_change: bool,
+}
+
+/// Meta key under which the embedder provider name is persisted.
+const META_EMBEDDING_PROVIDER: &str = "embedding_provider";
+/// Meta key under which the embedder model identifier is persisted.
+const META_EMBEDDING_MODEL: &str = "embedding_model";
+/// Meta key under which the embedder dimension count is persisted.
+const META_EMBEDDING_DIMENSIONS: &str = "embedding_dimensions";
+
+/// The persisted identity of the embedder that produced the stored vectors:
+/// provider, model, and dimensions. A change in any field means the existing
+/// vectors are incompatible (different vector space and/or dimensionality).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EmbeddingIdentity {
+    provider: String,
+    model: String,
+    dimensions: usize,
+}
+
+/// Result of a re-embed pass over rows with NULL vectors. `reembedded` rows
+/// got a fresh vector; `failed` rows could not be embedded (provider error)
+/// and were left NULL. A migration may only advance the stored embedding
+/// identity when `failed == 0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReembedOutcome {
+    reembedded: usize,
+    failed: usize,
 }
 
 impl SqliteMemory {
@@ -57,6 +100,9 @@ impl SqliteMemory {
             10_000,
             None,
             SearchMode::default(),
+            "none",
+            "",
+            false,
         )
     }
 
@@ -90,6 +136,9 @@ impl SqliteMemory {
             keyword_weight: 0.3,
             cache_max: 10_000,
             search_mode: SearchMode::default(),
+            embedding_provider: "none".to_string(),
+            embedding_model: String::new(),
+            reindex_on_embedding_change: false,
         })
     }
 
@@ -98,6 +147,7 @@ impl SqliteMemory {
     /// If `open_timeout_secs` is `Some(n)`, opening the database is limited to `n` seconds
     /// (capped at 300). Useful when the DB file may be locked or on slow storage.
     /// `None` = wait indefinitely (default).
+    #[allow(clippy::too_many_arguments)]
     pub fn with_embedder(
         alias: &str,
         workspace_dir: &Path,
@@ -107,6 +157,9 @@ impl SqliteMemory {
         cache_max: usize,
         open_timeout_secs: Option<u64>,
         search_mode: SearchMode,
+        embedding_provider: &str,
+        embedding_model: &str,
+        reindex_on_embedding_change: bool,
     ) -> anyhow::Result<Self> {
         let db_path = workspace_dir.join("memory").join("brain.db");
         let _startup_guard = acquire_sqlite_startup_lock();
@@ -138,7 +191,7 @@ impl SqliteMemory {
         Self::init_schema(&conn)?;
         zeroclaw_config::schema::v2::migrate_sqlite_memory_to_v3(&db_path, &conn)?;
 
-        Ok(Self {
+        let store = Self {
             alias: alias.to_string(),
             conn: Arc::new(Mutex::new(conn)),
             embedder,
@@ -146,7 +199,18 @@ impl SqliteMemory {
             keyword_weight,
             cache_max,
             search_mode,
-        })
+            embedding_provider: embedding_provider.to_string(),
+            embedding_model: embedding_model.to_string(),
+            reindex_on_embedding_change,
+        };
+
+        // Detect a config-vs-stored embedding-identity mismatch and, if the
+        // gating flag is set, auto-migrate the stored vectors. A first run
+        // (no stored identity) and a Noop embedder are never treated as a
+        // mismatch; both just record/skip the identity below.
+        store.reconcile_embedding_identity_on_open()?;
+
+        Ok(store)
     }
 
     /// Open SQLite connection, optionally with a timeout (for locked/slow storage).
@@ -296,7 +360,16 @@ impl SqliteMemory {
                 created_at   TEXT NOT NULL,
                 accessed_at  TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);",
+            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);
+
+            -- Key/value meta table. Records the embedding identity (provider,
+            -- model, dimensions) that produced the stored vectors so a later
+            -- embedder change can be detected and migrated. Idempotent and
+            -- safe to run on every open.
+            CREATE TABLE IF NOT EXISTS memory_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
         )
         .with_context(|| "SQLite init_schema failed: CREATE base schema")?;
 
@@ -374,6 +447,281 @@ impl SqliteMemory {
                 "Normalized session_id values in memories table to sanitized form"
             );
         }
+
+        Ok(())
+    }
+
+    // ── Meta key/value helpers ───────────────────────────────────────
+
+    /// Read a value from the `memory_meta` table, if present.
+    fn get_meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
+        let mut stmt = conn.prepare("SELECT value FROM memory_meta WHERE key = ?1")?;
+        let value: Option<String> = stmt
+            .query_row(params![key], |row| row.get::<_, String>(0))
+            .ok();
+        Ok(value)
+    }
+
+    /// Upsert a value into the `memory_meta` table.
+    fn set_meta(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
+        conn.execute(
+            "INSERT INTO memory_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    // ── Embedding identity (provider + model + dimensions) ───────────
+
+    /// The embedding identity the current configuration would produce. Returns
+    /// `None` for a Noop embedder (real dimensions == 0): such a store holds no
+    /// vectors, so there is nothing to track or migrate.
+    ///
+    /// The provider is the RESOLVED configured provider/endpoint string, NOT
+    /// `self.embedder.name()`. The production factory collapses `openai`,
+    /// `openrouter`, and every `custom:<url>` endpoint onto a single concrete
+    /// `OpenAiEmbedding`, whose `name()` is always `"openai"`. Using the
+    /// configured string lets a provider/endpoint change that keeps the same
+    /// model and dimensions be detected (a `name()`-based identity would
+    /// collapse them all to `"openai"` and miss the change). The Noop gate
+    /// still keys off the real embedder dimensions.
+    fn current_embedding_identity(&self) -> Option<EmbeddingIdentity> {
+        let dimensions = self.embedder.dimensions();
+        if dimensions == 0 {
+            return None;
+        }
+        Some(EmbeddingIdentity {
+            provider: self.embedding_provider.clone(),
+            model: self.embedding_model.clone(),
+            dimensions,
+        })
+    }
+
+    /// Read the embedding identity previously persisted to the DB, if any. A
+    /// store written before this feature, or one that has only ever used a
+    /// Noop embedder, has no stored identity and returns `None`.
+    fn stored_embedding_identity(conn: &Connection) -> anyhow::Result<Option<EmbeddingIdentity>> {
+        let provider = Self::get_meta(conn, META_EMBEDDING_PROVIDER)?;
+        let model = Self::get_meta(conn, META_EMBEDDING_MODEL)?;
+        let dims = Self::get_meta(conn, META_EMBEDDING_DIMENSIONS)?;
+        match (provider, model, dims) {
+            (Some(provider), Some(model), Some(dims)) => Ok(Some(EmbeddingIdentity {
+                provider,
+                model,
+                dimensions: dims.parse().unwrap_or(0),
+            })),
+            _ => Ok(None),
+        }
+    }
+
+    /// Persist `identity` to the `memory_meta` table.
+    fn write_embedding_identity(
+        conn: &Connection,
+        identity: &EmbeddingIdentity,
+    ) -> anyhow::Result<()> {
+        Self::set_meta(conn, META_EMBEDDING_PROVIDER, &identity.provider)?;
+        Self::set_meta(conn, META_EMBEDDING_MODEL, &identity.model)?;
+        Self::set_meta(
+            conn,
+            META_EMBEDDING_DIMENSIONS,
+            &identity.dimensions.to_string(),
+        )?;
+        Ok(())
+    }
+
+    /// Clear every stored vector and the embedding cache so the next re-embed
+    /// rebuilds them from the retained `content`. Lossless because `content`
+    /// is always retained.
+    fn clear_stored_vectors(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute("UPDATE memories SET embedding = NULL", [])?;
+        conn.execute("DELETE FROM embedding_cache", [])?;
+        Ok(())
+    }
+
+    /// Synchronously re-embed every memory row whose vector is NULL, reusing
+    /// the same content-driven path as `reindex()` Step 2. Runs on a dedicated
+    /// OS thread with its own current-thread runtime so it is safe to call
+    /// from the synchronous constructor without a nested-runtime panic.
+    ///
+    /// A per-row `embed_one` failure does not abort the pass (so one bad row
+    /// never strands the rest), but it IS counted: the returned outcome carries
+    /// both the number of rows re-embedded and the number that failed. The
+    /// caller MUST inspect `failed` and refuse to advance the stored identity
+    /// when it is non-zero, otherwise a partial migration would falsely mark
+    /// the new identity complete while rows remain NULL.
+    fn reembed_null_vectors_blocking(&self) -> anyhow::Result<ReembedOutcome> {
+        let entries: Vec<(String, String)> = {
+            let conn = self.conn.lock();
+            let mut stmt =
+                conn.prepare("SELECT id, content FROM memories WHERE embedding IS NULL")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.filter_map(std::result::Result::ok).collect()
+        };
+
+        if entries.is_empty() {
+            return Ok(ReembedOutcome {
+                reembedded: 0,
+                failed: 0,
+            });
+        }
+
+        let embedder = self.embedder.clone();
+        let conn = self.conn.clone();
+
+        // A fresh current-thread runtime on a plain OS thread: the constructor
+        // is synchronous but may be invoked from within an existing Tokio
+        // runtime, where a nested block_on would panic.
+        let handle = std::thread::Builder::new()
+            .name("memory-embedding-migrate".to_string())
+            .spawn(move || -> anyhow::Result<ReembedOutcome> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("failed to build runtime for embedding migration")?;
+                rt.block_on(async move {
+                    let mut reembedded = 0usize;
+                    let mut failed = 0usize;
+                    for (id, content) in &entries {
+                        match embedder.embed_one(content).await {
+                            Ok(emb) => {
+                                let bytes = vector::vec_to_bytes(&emb);
+                                let conn = conn.lock();
+                                conn.execute(
+                                    "UPDATE memories SET embedding = ?1 WHERE id = ?2",
+                                    params![bytes, id],
+                                )?;
+                                reembedded += 1;
+                            }
+                            Err(_) => {
+                                // Leave the row NULL and keep going; the failure
+                                // is surfaced via the count so the caller can
+                                // refuse to advance the stored identity.
+                                failed += 1;
+                            }
+                        }
+                    }
+                    Ok::<_, anyhow::Error>(ReembedOutcome { reembedded, failed })
+                })
+            })
+            .context("failed to spawn embedding-migration thread")?;
+
+        handle
+            .join()
+            .map_err(|_| anyhow::Error::msg("embedding-migration thread panicked"))?
+    }
+
+    /// On open, reconcile the configured embedding identity against the one
+    /// stored in the DB.
+    ///
+    /// - Noop embedder: nothing is tracked, return.
+    /// - No stored identity (first run with a real embedder): record it.
+    /// - Stored identity matches: no-op.
+    /// - Stored identity differs: always WARN loudly; auto-migrate only when
+    ///   `reindex_on_embedding_change` is set.
+    fn reconcile_embedding_identity_on_open(&self) -> anyhow::Result<()> {
+        let Some(current) = self.current_embedding_identity() else {
+            // Noop embedder: no vectors to track or migrate.
+            return Ok(());
+        };
+
+        let stored = {
+            let conn = self.conn.lock();
+            Self::stored_embedding_identity(&conn)?
+        };
+
+        let Some(stored) = stored else {
+            // First run with a real embedder: record the identity so a later
+            // change can be detected.
+            let conn = self.conn.lock();
+            Self::write_embedding_identity(&conn, &current)?;
+            return Ok(());
+        };
+
+        if stored == current {
+            return Ok(());
+        }
+
+        // Mismatch: the stored vectors were produced by a different embedder
+        // and are incompatible (different vector space and/or dimensionality).
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "old_provider": stored.provider,
+                    "old_model": stored.model,
+                    "old_dimensions": stored.dimensions,
+                    "new_provider": current.provider,
+                    "new_model": current.model,
+                    "new_dimensions": current.dimensions,
+                    "auto_migrate": self.reindex_on_embedding_change,
+                })),
+            "memory: embedding identity changed; stored vectors are incompatible \
+             and semantic recall will degrade. Run `zeroclaw memory reindex` to \
+             re-embed from retained content, or set \
+             `[memory].reindex_on_embedding_change = true` to migrate on startup."
+        );
+
+        if !self.reindex_on_embedding_change {
+            // Gated off: warn only, leave the store untouched. The stored
+            // identity is intentionally NOT updated so the warning keeps firing
+            // until the operator migrates.
+            return Ok(());
+        }
+
+        // Auto-migrate: drop stale vectors, clear the cache, re-embed from
+        // content, then record the new identity ONLY when every row re-embedded
+        // successfully. If any row failed (wrong key / bad model / outage), the
+        // store is left with the OLD identity so the mismatch warning re-fires
+        // on the next open and the operator keeps a recovery signal; advancing
+        // the identity on a partial migration would falsely mark it complete
+        // while rows remain NULL.
+        {
+            let conn = self.conn.lock();
+            Self::clear_stored_vectors(&conn)?;
+        }
+        let outcome = self.reembed_null_vectors_blocking()?;
+
+        if outcome.failed > 0 {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "reembedded": outcome.reembedded,
+                        "failed": outcome.failed,
+                        "provider": current.provider,
+                        "model": current.model,
+                        "dimensions": current.dimensions,
+                    })),
+                "memory: embedding migration incomplete; some rows failed to \
+                 re-embed. Keeping the old stored identity so the warning \
+                 re-fires and the migration is retried on the next open. Run \
+                 `zeroclaw memory reindex` once the embedding provider is healthy."
+            );
+            return Ok(());
+        }
+
+        {
+            let conn = self.conn.lock();
+            Self::write_embedding_identity(&conn, &current)?;
+        }
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "reembedded": outcome.reembedded,
+                    "provider": current.provider,
+                    "model": current.model,
+                    "dimensions": current.dimensions,
+                })
+            ),
+            "memory: auto-migrated stored vectors to the new embedding identity"
+        );
 
         Ok(())
     }
@@ -1353,6 +1701,45 @@ impl Memory for SqliteMemory {
             return Ok(0);
         }
 
+        // Step 1.5: An explicit reindex always migrates. If the stored
+        // embedding identity differs from the configured one, the existing
+        // vectors are incompatible: NULL them and clear the cache so the
+        // re-embed below rebuilds them from retained content. The new identity
+        // is NOT written here: it is recorded AFTER the re-embed loop and only
+        // when every row succeeded. Writing it up front (as this path used to)
+        // would mark the migration complete even if the loop then failed every
+        // row, stranding NULL vectors under a matching identity. (A matching or
+        // absent stored identity needs no clear; a Noop embedder already
+        // returned above.)
+        //
+        // `identity_to_commit` carries the identity that the post-loop write
+        // should persist: a mismatch that was just cleared, or a first-time
+        // recording. A matching stored identity leaves it `None` (nothing to
+        // advance).
+        let identity_to_commit = if let Some(current) = self.current_embedding_identity() {
+            let conn = self.conn.clone();
+            let current_for_blocking = current.clone();
+            let needs_commit = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+                let conn = conn.lock();
+                let stored = Self::stored_embedding_identity(&conn)?;
+                match stored {
+                    Some(stored) if stored != current_for_blocking => {
+                        Self::clear_stored_vectors(&conn)?;
+                        Ok(true)
+                    }
+                    None => {
+                        // First time recording an identity for this store.
+                        Ok(true)
+                    }
+                    Some(_) => Ok(false),
+                }
+            })
+            .await??;
+            needs_commit.then_some(current)
+        } else {
+            None
+        };
+
         let conn = self.conn.clone();
         let entries: Vec<(String, String)> = tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
@@ -1366,22 +1753,66 @@ impl Memory for SqliteMemory {
         .await??;
 
         let mut count = 0;
+        let mut failed = 0usize;
         for (id, content) in &entries {
-            if let Ok(Some(emb)) = self.get_or_compute_embedding(content).await {
-                let bytes = vector::vec_to_bytes(&emb);
-                let conn = self.conn.clone();
-                let id = id.clone();
-                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                    let conn = conn.lock();
-                    conn.execute(
-                        "UPDATE memories SET embedding = ?1 WHERE id = ?2",
-                        params![bytes, id],
-                    )?;
-                    Ok(())
-                })
-                .await??;
-                count += 1;
+            // A real embedder returns Err on provider failure and Ok(None) only
+            // for Noop (already returned above), so anything other than
+            // Ok(Some) here is a re-embed failure that must be counted, not
+            // silently skipped.
+            match self.get_or_compute_embedding(content).await {
+                Ok(Some(emb)) => {
+                    let bytes = vector::vec_to_bytes(&emb);
+                    let conn = self.conn.clone();
+                    let id = id.clone();
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                        let conn = conn.lock();
+                        conn.execute(
+                            "UPDATE memories SET embedding = ?1 WHERE id = ?2",
+                            params![bytes, id],
+                        )?;
+                        Ok(())
+                    })
+                    .await??;
+                    count += 1;
+                }
+                Ok(None) | Err(_) => {
+                    failed += 1;
+                }
             }
+        }
+
+        // Advance the stored identity ONLY after every expected row re-embedded
+        // successfully. If any row failed, keep the old identity so the startup
+        // reconcile keeps warning and the operator retains a recovery signal,
+        // and surface the failure count rather than claiming success.
+        if failed > 0 {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "reembedded": count,
+                        "failed": failed,
+                    })),
+                "memory: reindex re-embed incomplete; some rows failed to \
+                 re-embed. Keeping the old stored embedding identity so the \
+                 mismatch warning re-fires; re-run `zeroclaw memory reindex` \
+                 once the embedding provider is healthy."
+            );
+            return Err(anyhow::Error::msg(format!(
+                "reindex incomplete: {failed} row(s) failed to re-embed; stored \
+                 embedding identity left unchanged"
+            )));
+        }
+
+        if let Some(identity) = identity_to_commit {
+            let conn = self.conn.clone();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let conn = conn.lock();
+                Self::write_embedding_identity(&conn, &identity)?;
+                Ok(())
+            })
+            .await??;
         }
 
         Ok(count)
@@ -2384,6 +2815,9 @@ mod tests {
             1000,
             Some(5),
             SearchMode::default(),
+            "none",
+            "",
+            false,
         );
         assert!(
             mem.is_ok(),
@@ -2404,6 +2838,9 @@ mod tests {
             1000,
             Some(2),
             SearchMode::default(),
+            "none",
+            "",
+            false,
         )
         .unwrap();
         mem.store(
@@ -2450,6 +2887,9 @@ mod tests {
             1000,
             None,
             SearchMode::default(),
+            "failing",
+            "",
+            false,
         )
         .unwrap();
 
@@ -2485,6 +2925,9 @@ mod tests {
             1000,
             None,
             SearchMode::default(),
+            "none",
+            "",
+            false,
         );
         assert!(mem.is_ok());
         assert_eq!(mem.unwrap().name(), "sqlite");
@@ -2590,6 +3033,9 @@ mod tests {
             1000,
             None,
             SearchMode::Embedding,
+            "none",
+            "",
+            false,
         )
         .unwrap();
         mem.store("a1", "fallback wildcard token", MemoryCategory::Core, None)
@@ -2616,6 +3062,9 @@ mod tests {
             1000,
             None,
             SearchMode::Embedding,
+            "none",
+            "",
+            false,
         )
         .unwrap();
         mem.store(
@@ -2903,6 +3352,543 @@ mod tests {
         // Data should still be intact
         let results = mem.recall("reindex", 10, None, None, None).await.unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    // ── Embedding identity persistence and migration ─────────────
+
+    /// A real-dimension embedder that deterministically produces vectors from
+    /// content (no network). Provider name, model, and dimensions are all
+    /// configurable so identity-mismatch scenarios can be exercised.
+    struct RealDimEmbedding {
+        provider: &'static str,
+        dims: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::embeddings::EmbeddingProvider for RealDimEmbedding {
+        fn name(&self) -> &str {
+            self.provider
+        }
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            // Deterministic, content-derived, unit-ish vectors. Good enough to
+            // assert "a vector was produced from content" without a network.
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let seed = t.len() as f32 + 1.0;
+                    (0..self.dims).map(|i| (seed + i as f32) * 0.001).collect()
+                })
+                .collect())
+        }
+    }
+
+    /// Open a store whose identity provider is the RESOLVED configured provider
+    /// (threaded as `embedding_provider`), independent of the concrete embedder
+    /// impl name. `embedder_name` is what the `RealDimEmbedding` reports from
+    /// `name()`; keeping it separate from `provider` lets tests prove the
+    /// persisted identity tracks the configured provider, not `embedder.name()`
+    /// (the BLOCKER 1 collapse).
+    fn open_with_identity_named(
+        path: &Path,
+        provider: &str,
+        embedder_name: &'static str,
+        model: &str,
+        dims: usize,
+        auto_migrate: bool,
+    ) -> SqliteMemory {
+        SqliteMemory::with_embedder(
+            "test",
+            path,
+            Arc::new(RealDimEmbedding {
+                provider: embedder_name,
+                dims,
+            }),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+            provider,
+            model,
+            auto_migrate,
+        )
+        .unwrap()
+    }
+
+    /// Convenience wrapper: the configured provider and the embedder's reported
+    /// name are the same string. Used by the existing identity tests.
+    fn open_with_identity(
+        path: &Path,
+        provider: &'static str,
+        model: &str,
+        dims: usize,
+        auto_migrate: bool,
+    ) -> SqliteMemory {
+        open_with_identity_named(path, provider, provider, model, dims, auto_migrate)
+    }
+
+    fn stored_identity_of(mem: &SqliteMemory) -> Option<EmbeddingIdentity> {
+        let conn = mem.conn.lock();
+        SqliteMemory::stored_embedding_identity(&conn).unwrap()
+    }
+
+    fn null_embedding_count(mem: &SqliteMemory) -> i64 {
+        let conn = mem.conn.lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE embedding IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn cache_count(mem: &SqliteMemory) -> i64 {
+        let conn = mem.conn.lock();
+        conn.query_row("SELECT COUNT(*) FROM embedding_cache", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn identity_persisted_on_init_with_real_embedder() {
+        let tmp = TempDir::new().unwrap();
+        let mem = open_with_identity(tmp.path(), "openai", "text-embedding-3-small", 1536, false);
+
+        let stored = stored_identity_of(&mem).expect("identity must be recorded on first open");
+        assert_eq!(stored.provider, "openai");
+        assert_eq!(stored.model, "text-embedding-3-small");
+        assert_eq!(stored.dimensions, 1536);
+    }
+
+    #[tokio::test]
+    async fn noop_embedder_records_no_identity() {
+        let (_tmp, mem) = temp_sqlite();
+        // A Noop store holds no vectors, so there is no identity to track.
+        assert!(stored_identity_of(&mem).is_none());
+    }
+
+    #[tokio::test]
+    async fn matching_identity_on_reopen_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let mem =
+                open_with_identity(tmp.path(), "openai", "text-embedding-3-small", 1536, false);
+            mem.store("k1", "content one", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+        // The row was embedded on first open.
+        let mem = open_with_identity(tmp.path(), "openai", "text-embedding-3-small", 1536, false);
+        assert_eq!(
+            null_embedding_count(&mem),
+            0,
+            "matching identity must not drop existing vectors"
+        );
+        let stored = stored_identity_of(&mem).unwrap();
+        assert_eq!(stored.model, "text-embedding-3-small");
+    }
+
+    #[tokio::test]
+    async fn mismatched_identity_with_flag_off_warns_only() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let mem =
+                open_with_identity(tmp.path(), "openai", "text-embedding-3-small", 1536, false);
+            mem.store("k1", "alpha content", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+            mem.store("k2", "beta content", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+            assert_eq!(null_embedding_count(&mem), 0, "rows embedded on first open");
+        }
+
+        // Re-open with a DIFFERENT model and the flag OFF: a loud warning is
+        // logged but the store is left untouched (no auto re-embed).
+        let mem = open_with_identity(tmp.path(), "openai", "text-embedding-3-large", 1536, false);
+        assert_eq!(
+            null_embedding_count(&mem),
+            0,
+            "flag off must NOT touch existing vectors at startup"
+        );
+        // Stored identity intentionally stays OLD so the warning keeps firing
+        // until the operator migrates.
+        let stored = stored_identity_of(&mem).unwrap();
+        assert_eq!(stored.model, "text-embedding-3-small");
+
+        // An explicit reindex still migrates regardless of the flag.
+        mem.reindex().await.unwrap();
+        assert_eq!(
+            null_embedding_count(&mem),
+            0,
+            "reindex must re-embed all rows from content"
+        );
+        let stored = stored_identity_of(&mem).unwrap();
+        assert_eq!(
+            stored.model, "text-embedding-3-large",
+            "reindex must record the new identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_dimensions_with_flag_on_auto_migrates() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let mem = open_with_identity(tmp.path(), "openai", "embed-small", 1536, false);
+            mem.store("k1", "content to keep", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+            mem.store("k2", "more content", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+            assert!(
+                cache_count(&mem) > 0,
+                "first open should populate the cache"
+            );
+        }
+
+        // Re-open with DIFFERENT dimensions and the flag ON: auto-migrate.
+        let mem = open_with_identity(tmp.path(), "openai", "embed-small", 3072, true);
+
+        // Stale vectors were dropped, the cache cleared, then every row was
+        // re-embedded from retained content.
+        assert_eq!(
+            null_embedding_count(&mem),
+            0,
+            "auto-migrate must re-embed every row"
+        );
+        // The stale cache entries were cleared during migration. The startup
+        // re-embed writes vectors directly to rows, so the cache stays empty
+        // until the next live recall/store repopulates it.
+        assert_eq!(
+            cache_count(&mem),
+            0,
+            "migration must clear the stale embedding cache"
+        );
+        // Identity updated to the new one.
+        let stored = stored_identity_of(&mem).unwrap();
+        assert_eq!(stored.dimensions, 3072);
+
+        // Content is intact (lossless migration).
+        assert_eq!(
+            mem.get("k1").await.unwrap().unwrap().content,
+            "content to keep"
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_provider_is_detected_and_migrated_via_reindex() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let mem = open_with_identity(tmp.path(), "openai", "embed-v1", 768, false);
+            mem.store("k1", "provider change content", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+        // Different PROVIDER (same model/dims), flag off → detected, not auto-migrated.
+        let mem = open_with_identity(tmp.path(), "custom", "embed-v1", 768, false);
+        let stored = stored_identity_of(&mem).unwrap();
+        assert_eq!(stored.provider, "openai", "flag off leaves old identity");
+
+        // reindex migrates and records the new provider.
+        mem.reindex().await.unwrap();
+        let stored = stored_identity_of(&mem).unwrap();
+        assert_eq!(stored.provider, "custom");
+        assert_eq!(null_embedding_count(&mem), 0);
+    }
+
+    /// Open a store through the PRODUCTION embedding factory
+    /// (`create_embedding_provider`), exactly as `build_sqlite_memory` does:
+    /// the concrete embedder is whatever the factory returns, and the resolved
+    /// configured provider string is threaded in separately as the identity
+    /// provider. No row is stored, so no network embed is ever attempted; only
+    /// the meta identity is read/written.
+    fn open_with_factory_provider(
+        path: &Path,
+        resolved_provider: &str,
+        model: &str,
+        dims: usize,
+    ) -> SqliteMemory {
+        let embedder: Arc<dyn super::super::embeddings::EmbeddingProvider> =
+            Arc::from(super::super::embeddings::create_embedding_provider(
+                resolved_provider,
+                Some("test-key"),
+                model,
+                dims,
+            ));
+        SqliteMemory::with_embedder(
+            "test",
+            path,
+            embedder,
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+            resolved_provider,
+            model,
+            false,
+        )
+        .unwrap()
+    }
+
+    /// BLOCKER 1 regression: a provider change that keeps the same model and
+    /// dimensions must be detected. In the production factory, `openai` and
+    /// `openrouter` both resolve to `OpenAiEmbedding`, whose `name()` is always
+    /// `"openai"`, so an identity built from `embedder.name()` would collapse
+    /// both onto `"openai"` and miss the change. The persisted identity must
+    /// instead carry the RESOLVED configured provider, so the two differ.
+    #[tokio::test]
+    async fn provider_change_same_model_dims_is_detected_via_factory() {
+        // Prove the collapse the old code relied on: both concrete embedders
+        // report the same name from the production factory.
+        let openai_impl =
+            super::super::embeddings::create_embedding_provider("openai", None, "embed-x", 1536);
+        let openrouter_impl = super::super::embeddings::create_embedding_provider(
+            "openrouter",
+            None,
+            "embed-x",
+            1536,
+        );
+        assert_eq!(
+            openai_impl.name(),
+            openrouter_impl.name(),
+            "factory must collapse openai/openrouter to one impl name, \
+             so identity cannot be derived from embedder.name()"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        // First open: provider `openai`, model+dims fixed. Records the identity.
+        {
+            let mem = open_with_factory_provider(tmp.path(), "openai", "embed-x", 1536);
+            let stored = stored_identity_of(&mem).expect("identity recorded on first open");
+            assert_eq!(stored.provider, "openai");
+        }
+
+        // Re-open with provider `openrouter`, SAME model and dimensions. The
+        // configured provider changed, so a mismatch must be detected. With the
+        // flag off the store keeps the old identity (so the warning re-fires),
+        // which proves the change was seen. Under the old `embedder.name()`
+        // identity, both opens would persist/compare `"openai"` and this would
+        // be a silent no-op.
+        let mem = open_with_factory_provider(tmp.path(), "openrouter", "embed-x", 1536);
+        let current = mem
+            .current_embedding_identity()
+            .expect("real embedder has a current identity");
+        assert_eq!(
+            current.provider, "openrouter",
+            "current identity must reflect the resolved configured provider"
+        );
+        let stored = stored_identity_of(&mem).expect("stored identity present");
+        assert_eq!(
+            stored.provider, "openai",
+            "old identity is kept on a detected mismatch (flag off)"
+        );
+        assert_ne!(
+            stored, current,
+            "provider change with same model+dims must be a detected mismatch"
+        );
+    }
+
+    /// A real-dimension embedder that succeeds for the first `ok_calls` embeds
+    /// and then fails. Used to drive a PARTIAL migration: some rows re-embed,
+    /// at least one fails, so the migration must not be marked complete.
+    struct PartiallyFailingEmbedding {
+        calls: std::sync::atomic::AtomicUsize,
+        ok_calls: usize,
+        dims: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::embeddings::EmbeddingProvider for PartiallyFailingEmbedding {
+        fn name(&self) -> &str {
+            "partial"
+        }
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n >= self.ok_calls {
+                anyhow::bail!("simulated embedding outage");
+            }
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let seed = t.len() as f32 + 1.0;
+                    (0..self.dims).map(|i| (seed + i as f32) * 0.001).collect()
+                })
+                .collect())
+        }
+    }
+
+    /// BLOCKER 2 regression (startup auto-migrate path): after an identity
+    /// mismatch, a failing embedder must NOT advance the stored identity. The
+    /// old identity is kept so the mismatch warning re-fires on the next open,
+    /// and the recovery signal (NULL vectors under the old identity) is not
+    /// erased by a false "migration complete".
+    #[tokio::test]
+    async fn failed_auto_migrate_keeps_old_identity_and_refires() {
+        let tmp = TempDir::new().unwrap();
+        // Seed two rows under the original identity.
+        {
+            let mem = open_with_identity(tmp.path(), "openai", "embed-small", 1536, false);
+            mem.store("k1", "first content", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+            mem.store("k2", "second content", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+            assert_eq!(null_embedding_count(&mem), 0, "rows embedded on first open");
+        }
+
+        // Re-open with a DIFFERENT identity (new dims), flag ON, but with an
+        // embedder that fails every embed. Auto-migrate clears the vectors,
+        // re-embed fails for every row, so the new identity must NOT be written.
+        let failing = Arc::new(PartiallyFailingEmbedding {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            ok_calls: 0,
+            dims: 3072,
+        });
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            failing,
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+            "openai",
+            "embed-large",
+            true,
+        )
+        .unwrap();
+
+        // Vectors were cleared but never refilled (the failure surfaced as a
+        // count internally), so rows remain NULL: the recovery signal survives.
+        assert_eq!(
+            null_embedding_count(&mem),
+            2,
+            "failed re-embed must leave rows NULL, not silently complete"
+        );
+        // Stored identity must still be the OLD one.
+        let stored = stored_identity_of(&mem).unwrap();
+        assert_eq!(
+            stored.model, "embed-small",
+            "failed migration must NOT advance the stored identity"
+        );
+        assert_eq!(stored.dimensions, 1536);
+
+        // A subsequent open with the new (still-mismatched) identity, flag OFF,
+        // must still SEE the mismatch: stored is old, current is new.
+        let reopen = open_with_identity(tmp.path(), "openai", "embed-large", 3072, false);
+        let stored = stored_identity_of(&reopen).unwrap();
+        let current = reopen.current_embedding_identity().unwrap();
+        assert_ne!(
+            stored, current,
+            "mismatch must still be detected on the next open (warning re-fires)"
+        );
+    }
+
+    /// BLOCKER 2 regression (`reindex()` path): a failing embedder during an
+    /// explicit reindex must NOT advance the stored identity, must surface the
+    /// failure (the call errors), and a later open must still detect the
+    /// mismatch.
+    #[tokio::test]
+    async fn failed_reindex_keeps_old_identity_and_surfaces_failure() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let mem = open_with_identity(tmp.path(), "openai", "embed-small", 768, false);
+            mem.store("k1", "alpha", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+            mem.store("k2", "beta", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+
+        // Re-open with a mismatched identity, flag OFF (warn only at startup),
+        // with an embedder that fails every embed. Then run an explicit reindex.
+        let failing = Arc::new(PartiallyFailingEmbedding {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            ok_calls: 0,
+            dims: 768,
+        });
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            failing,
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+            "custom:https://example.invalid",
+            "embed-small",
+            false,
+        )
+        .unwrap();
+
+        // Flag off: startup left the store untouched and kept the old identity.
+        let stored = stored_identity_of(&mem).unwrap();
+        assert_eq!(stored.provider, "openai", "startup warn-only keeps old id");
+
+        // reindex clears vectors, fails every re-embed, and MUST surface that.
+        let result = mem.reindex().await;
+        assert!(
+            result.is_err(),
+            "reindex must surface the failure, not claim success"
+        );
+
+        // Identity must NOT have advanced to the new provider.
+        let stored = stored_identity_of(&mem).unwrap();
+        assert_eq!(
+            stored.provider, "openai",
+            "failed reindex must NOT advance the stored identity"
+        );
+
+        // A later open still detects the mismatch.
+        let current = mem.current_embedding_identity().unwrap();
+        assert_ne!(
+            stored, current,
+            "mismatch must persist so the warning keeps firing"
+        );
+    }
+
+    /// Companion to the failure tests: a FULLY successful migration via the
+    /// `reindex()` path DOES advance the stored identity (guards against an
+    /// over-correction that never commits).
+    #[tokio::test]
+    async fn successful_reindex_advances_identity() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let mem = open_with_identity(tmp.path(), "openai", "embed-small", 768, false);
+            mem.store("k1", "alpha", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+            mem.store("k2", "beta", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+        // Mismatched identity, flag off, but a HEALTHY real-dim embedder.
+        let mem = open_with_identity(tmp.path(), "openrouter", "embed-small", 768, false);
+        assert_eq!(
+            stored_identity_of(&mem).unwrap().provider,
+            "openai",
+            "flag off keeps old id until reindex"
+        );
+
+        let count = mem.reindex().await.expect("healthy reindex succeeds");
+        assert_eq!(count, 2, "both rows re-embedded");
+        assert_eq!(null_embedding_count(&mem), 0, "no NULL vectors remain");
+        let stored = stored_identity_of(&mem).unwrap();
+        assert_eq!(
+            stored.provider, "openrouter",
+            "fully successful reindex advances the identity"
+        );
     }
 
     // ── Edge cases: content_hash ─────────────────────────────────
@@ -3619,6 +4605,9 @@ mod tests {
             1000,
             None,
             SearchMode::Bm25,
+            "none",
+            "",
+            false,
         )
         .unwrap();
         mem.store(
@@ -3654,6 +4643,9 @@ mod tests {
             1000,
             None,
             SearchMode::Embedding,
+            "none",
+            "",
+            false,
         )
         .unwrap();
         mem.store(

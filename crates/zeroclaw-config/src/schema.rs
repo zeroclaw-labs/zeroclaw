@@ -10102,6 +10102,9 @@ pub struct MemoryConfig {
     /// Vector width produced by the embedding model — must match the model's native dimension or vectors won't store correctly. Look up the number on the model_provider's model page.
     #[serde(default = "default_embedding_dims")]
     pub embedding_dimensions: usize,
+    /// Auto-migrate stored vectors on startup when the embedding identity (provider, model, or dimensions) changes. The memory DB records which embedder produced its vectors; when the configured embedder differs, the old vectors are incompatible and semantic recall degrades. With this off (the default), a mismatch only logs a loud warning telling you to run `zeroclaw memory reindex`, so a large store is never silently re-embedded (and re-billed) on every boot. Turn this on to re-embed automatically from the retained content at startup. An explicit `zeroclaw memory reindex` always migrates regardless of this flag.
+    #[serde(default = "default_reindex_on_embedding_change")]
+    pub reindex_on_embedding_change: bool,
     /// Optional API key for the embedding endpoint. When set, embedding calls use this key instead of inheriting one from the seed model provider — decoupling embeddings from the chat model. Use it when the chat model runs on a provider that carries no usable embedding credential (e.g. an OAuth-only provider) while embeddings keep hitting an `openai`/`custom:` endpoint with their own key. Leave unset to inherit the seed provider's key (backward-compatible default).
     #[secret]
     #[credential_class = "encrypted_secret"]
@@ -10266,6 +10269,9 @@ fn default_embedding_model() -> String {
 fn default_embedding_dims() -> usize {
     1536
 }
+fn default_reindex_on_embedding_change() -> bool {
+    false
+}
 fn default_vector_weight() -> f64 {
     0.7
 }
@@ -10306,6 +10312,7 @@ impl Default for MemoryConfig {
             embedding_provider: default_embedding_provider(),
             embedding_model: default_embedding_model(),
             embedding_dimensions: default_embedding_dims(),
+            reindex_on_embedding_change: default_reindex_on_embedding_change(),
             embedding_api_key: None,
             vector_weight: default_vector_weight(),
             keyword_weight: default_keyword_weight(),
