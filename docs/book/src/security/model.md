@@ -55,9 +55,9 @@ Docs: [Sandboxing](./sandboxing.md).
 
 ## Tool receipts
 
-Tool receipts provide HMAC evidence that a successful tool call and its result passed through the runtime. When receipts are enabled, successful tool outputs receive an HMAC-SHA256 receipt over the call and result, and the receipt is fed back into the conversation with the tool result.
+When tool receipts are enabled, every successful tool execution produces a signed receipt: an HMAC-SHA256 digest over the call and its result, keyed by an ephemeral per-daemon-process key. Receipts are independent: each one covers only the successful call it was computed for, so they are not chained, and tampering with one does not invalidate the others.
 
-Receipts help catch fabricated tool claims. They are not a chained or durable audit log today: receipt keys are ephemeral, receipts are not cross-signed with the conversation hash, and persistent receipt storage is still future work.
+Receipts are readable and greppable within a daemon session. They do not persist across daemon restarts (the key rotates on every start; a durable audit store is planned).
 
 Docs: [Tool receipts](./tool-receipts.md).
 

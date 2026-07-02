@@ -7,4 +7,4 @@ Each agent runs under a risk profile and a runtime profile it references; see [A
 - [The security model](./model.md): the six enforcement layers, additional gates, failure behavior, and the default posture.
 - [Autonomy levels](./autonomy.md): the coarse-grained ReadOnly / Supervised / Full knob.
 - [Sandboxing](./sandboxing.md): OS-level isolation backends per platform.
-- [Tool receipts](./tool-receipts.md): HMAC evidence for successful tool results, passed back in-band with the conversation.
+- [Tool receipts](./tool-receipts.md): the signed HMAC-SHA256 proof that every successful tool call actually executed.
