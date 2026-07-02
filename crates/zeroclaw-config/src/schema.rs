@@ -14740,6 +14740,12 @@ pub struct LineConfig {
     #[serde(default)]
     pub proxy_url: Option<String>,
 
+    /// Display name shown as the sender in LINE chat bubbles.
+    /// Defaults to `"AI"` when unset or empty.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub sender_name: Option<String>,
+
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
     #[tab(Behavior)]
@@ -26562,6 +26568,7 @@ dm_policy = "pairing"
 group_policy = "mention"
 allowed_users = []
 webhook_port = 8443
+sender_name = "Popcorn"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         let ln = config.channels.line.get("default").unwrap();
@@ -26571,6 +26578,7 @@ webhook_port = 8443
         assert_eq!(ln.group_policy, LineGroupPolicy::Mention);
         assert_eq!(ln.webhook_port, 8443);
         assert!(ln.proxy_url.is_none());
+        assert_eq!(ln.sender_name.as_deref(), Some("Popcorn"));
     }
 
     #[test]
@@ -26596,6 +26604,7 @@ channel_secret = "sec"
         );
         assert_eq!(ln.webhook_port, 8443, "webhook_port default is 8443");
         assert!(ln.proxy_url.is_none());
+        assert!(ln.sender_name.is_none(), "sender_name default is None");
     }
 
     #[test]
