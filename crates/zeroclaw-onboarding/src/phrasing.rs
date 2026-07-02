@@ -15,19 +15,6 @@ pub trait PromptPhraser: Send {
     async fn phrase(&mut self, context: &FieldPhrasingContext) -> TransportResult<String>;
 }
 
-pub struct DescriptionPhraser;
-
-#[async_trait]
-impl PromptPhraser for DescriptionPhraser {
-    async fn phrase(&mut self, context: &FieldPhrasingContext) -> TransportResult<String> {
-        if context.description.is_empty() {
-            Ok(context.prop_path.clone())
-        } else {
-            Ok(context.description.clone())
-        }
-    }
-}
-
 pub struct AgentPhraser<T: AgentTurn> {
     turn: T,
     locale: String,
@@ -121,26 +108,6 @@ mod tests {
             description: docs.to_string(),
             ask_kind: ResponseType::Secret.ask_kind(),
         }
-    }
-
-    #[tokio::test]
-    async fn description_phraser_uses_docs_when_present() {
-        let mut phraser = DescriptionPhraser;
-        let phrased = phraser
-            .phrase(&context("channels.discord.token", "The Discord bot token."))
-            .await
-            .unwrap();
-        assert_eq!(phrased, "The Discord bot token.");
-    }
-
-    #[tokio::test]
-    async fn description_phraser_falls_back_to_path_when_no_docs() {
-        let mut phraser = DescriptionPhraser;
-        let phrased = phraser
-            .phrase(&context("channels.discord.token", ""))
-            .await
-            .unwrap();
-        assert_eq!(phrased, "channels.discord.token");
     }
 
     #[tokio::test]

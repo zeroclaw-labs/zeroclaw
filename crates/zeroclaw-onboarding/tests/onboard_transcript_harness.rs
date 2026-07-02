@@ -12,26 +12,26 @@
 //! `#[ignore]` (operator-run): the CLI-pty cells build the binary from source and
 //! the GUIDED cells need a live provider, so it is not part of the default sweep.
 
+#[path = "common/pty.rs"]
+mod pty;
+#[path = "common/spec.rs"]
+mod spec;
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use spec::{INSTANCE, LAYER, SECTION, matrix_spec};
 use zeroclaw_config::schema::{Config, MatrixConfig};
 use zeroclaw_onboarding::driver::{FlowRequest, run_flow};
-use zeroclaw_onboarding::{FieldScope, LlmResponder, LlmTransport, SecretReader, build_spec};
+use zeroclaw_onboarding::{FieldScope, LlmResponder, LlmTransport, SecretReader};
 use zeroclaw_runtime::flow::{
     FlowTransport, Outcome, Prompt, TransportError, TransportResult, WalkError,
 };
 use zeroclaw_runtime::response_type::{ResponseType, ResponseValue, SecretValue};
-
-const SECTION: &str = "channels.matrix.home";
-const LAYER: &str = "channel";
-const INSTANCE: &str = "home";
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -115,141 +115,22 @@ fn seed_config_copy(into: &Path) -> Config {
     config
 }
 
-fn zeroclaw_binary() -> PathBuf {
-    static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    BINARY
-        .get_or_init(|| {
-            escargot::CargoBuild::new()
-                .package("zeroclawlabs")
-                .bin("zeroclaw")
-                .run()
-                .expect("build the zeroclaw binary from source for the harness")
-                .path()
-                .to_path_buf()
-        })
-        .clone()
-}
-
 /// Drive the real binary's manual CLI walk over a pty, feeding the homeserver
 /// section's prompts and capturing the entire terminal transcript. Locale is
 /// the first prompt, so the registry's first code leads the scripted answers.
 fn drive_pty_manual_happy(config_dir: &Path) -> (String, String) {
-    let binary = zeroclaw_binary();
-    let pty = native_pty_system();
-    let pair = pty
-        .openpty(PtySize {
-            rows: 40,
-            cols: 200,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("open pty");
-
-    let mut cmd = CommandBuilder::new(binary);
-    cmd.arg("--config-dir");
-    cmd.arg(config_dir);
-    cmd.arg("onboard-flow");
-    cmd.arg("--section");
-    cmd.arg(SECTION);
-    cmd.arg("--layer");
-    cmd.arg(LAYER);
-    cmd.arg("--instance");
-    cmd.arg(INSTANCE);
-
-    let mut child = pair.slave.spawn_command(cmd).expect("spawn child");
-    drop(pair.slave);
-
-    let mut reader = pair.master.try_clone_reader().expect("clone reader");
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if tx.send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    let mut writer = pair.master.take_writer().expect("take writer");
-    let mut answers = pty_scripted_answers().into_iter();
-
-    let mut transcript = String::new();
-    let deadline = Instant::now() + Duration::from_secs(40);
-    let mut idle_since = Instant::now();
-    let mut outcome = "incomplete".to_string();
-
-    while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(chunk) => {
-                transcript.push_str(&String::from_utf8_lossy(&chunk));
-                idle_since = Instant::now();
-                if transcript.contains("[completed") {
-                    outcome = "completed".to_string();
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if idle_since.elapsed() >= Duration::from_millis(200) {
-                    if let Some(answer) = answers.next() {
-                        writer
-                            .write_all(format!("{answer}\n").as_bytes())
-                            .expect("write answer");
-                        writer.flush().expect("flush");
-                        idle_since = Instant::now();
-                    } else if transcript.contains("[completed") {
-                        outcome = "completed".to_string();
-                        break;
-                    }
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-
-    let _ = child.wait();
-    (transcript, outcome)
-}
-
-fn pty_scripted_answers() -> Vec<String> {
-    let mut config = Config::default();
-    config
-        .channels
-        .matrix
-        .insert(INSTANCE.to_string(), MatrixConfig::default());
-    let spec = build_spec(
-        config.prop_fields(),
-        SECTION,
-        LAYER,
-        INSTANCE,
-        Outcome::Cancelled,
-    )
-    .expect("matrix section yields a spec");
-    let mut ordered: Vec<_> = spec.nodes.values().collect();
-    ordered.sort_by(|a, b| a.id.0.cmp(&b.id.0));
-    let mut answers = vec![
-        zeroclaw_runtime::i18n::available_locales()
-            .first()
-            .expect("registry lists at least one locale")
-            .code
-            .clone(),
-    ];
-    answers.extend(
-        ordered
-            .into_iter()
-            .map(|node| match &node.prompt.response_type {
-                ResponseType::Secret => "sk-token".to_string(),
-                ResponseType::YesNo => "y".to_string(),
-                ResponseType::Number => "100".to_string(),
-                ResponseType::Choice { options } => options[0].value.clone(),
-                ResponseType::FreeformText => "https://walked.test".to_string(),
-            }),
+    let drive = pty::drive_flow(
+        config_dir,
+        &[],
+        pty::scripted_answers(),
+        Duration::from_secs(40),
     );
-    answers
+    let outcome = if drive.completed {
+        "completed".to_string()
+    } else {
+        "incomplete".to_string()
+    };
+    (drive.transcript, outcome)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -353,16 +234,27 @@ fn outcome_token(outcome: &Outcome) -> String {
     }
 }
 
+fn walk_error_token(error: &WalkError) -> String {
+    match error {
+        WalkError::Transport(_) => "transport-error".to_string(),
+        WalkError::Write(_) => "write-error".to_string(),
+        WalkError::UnknownNode(_) => "unknown-node".to_string(),
+    }
+}
+
+fn walk_token(walk: &Result<Outcome, WalkError>) -> String {
+    match walk {
+        Ok(outcome) => outcome_token(outcome),
+        Err(error) => walk_error_token(error),
+    }
+}
+
 fn driver_error_token(error: &zeroclaw_onboarding::DriverError) -> String {
     use zeroclaw_onboarding::DriverError;
     match error {
         DriverError::EmptySection(_) => "empty-section".to_string(),
         DriverError::AliasCreate { .. } => "alias-create-error".to_string(),
-        DriverError::Walk(walk) => match walk {
-            WalkError::Transport(_) => "transport-error".to_string(),
-            WalkError::Write(_) => "write-error".to_string(),
-            WalkError::UnknownNode(_) => "unknown-node".to_string(),
-        },
+        DriverError::Walk(walk) => walk_error_token(walk),
     }
 }
 
@@ -640,15 +532,8 @@ fn realistic_answer(prop: &str, response_type: &ResponseType) -> String {
 }
 
 impl MemoryScriptedTurn {
-    fn new(config: &Config) -> Self {
-        let spec = build_spec(
-            config.prop_fields(),
-            SECTION,
-            LAYER,
-            INSTANCE,
-            Outcome::Cancelled,
-        )
-        .expect("matrix section yields a spec");
+    fn new() -> Self {
+        let spec = matrix_spec();
         let mut answers = std::collections::VecDeque::new();
         let mut current = Some(spec.start.clone());
         while let Some(id) = current {
@@ -706,19 +591,30 @@ impl SecretReader for ScriptedSecret {
     }
 }
 
-async fn run_guided_offline_cell(base: &Path) {
-    let run_root = base.join("inproc").join("guided").join("happy");
-    std::fs::create_dir_all(&run_root).expect("seed dir");
-    let mut config = seed_config_copy(&run_root);
+struct GuidedWalk {
+    outcome_token: String,
+    transcript: String,
+    config: Config,
+}
+
+/// Run one guided conversational walk of the matrix section into `cell`:
+/// wire the recording responder/operator/secret stack around the given guide
+/// turn and scripted operator replies, walk the spec against a seeded config
+/// copy, and write the transcript into the cell folder.
+async fn run_guided_walk<T: zeroclaw_onboarding::AgentTurn>(
+    cell: &Path,
+    turn: T,
+    operator_replies: Vec<&'static str>,
+) -> GuidedWalk {
+    std::fs::create_dir_all(cell).expect("create guided cell folder");
+    let mut config = seed_config_copy(cell);
 
     let log = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let responder = RecordingResponder {
         inner: zeroclaw_onboarding::AgentResponder::new(
-            MemoryScriptedTurn::new(&config),
+            turn,
             RecordingOperatorIo {
-                inner: VagueScriptedOperator::new(vec![
-                    "oh um, whatever the normal thing is? i just want it to work",
-                ]),
+                inner: VagueScriptedOperator::new(operator_replies),
                 log: std::sync::Arc::clone(&log),
             },
         ),
@@ -731,31 +627,28 @@ async fn run_guided_offline_cell(base: &Path) {
     };
     let mut transport = LlmTransport::new(responder, secret);
 
-    let spec = build_spec(
-        config.prop_fields(),
-        SECTION,
-        LAYER,
-        INSTANCE,
-        Outcome::Completed {
-            configured: vec![zeroclaw_runtime::flow::ConfiguredItem {
-                layer: LAYER.to_string(),
-                instance: INSTANCE.to_string(),
-            }],
-        },
-    )
-    .expect("matrix section yields a spec");
-    let walk = Box::pin(spec.walk(&mut transport, &mut config)).await;
-
-    let outcome_token = match &walk {
-        Ok(outcome) => outcome_token(outcome),
-        Err(error) => match error {
-            WalkError::Transport(_) => "transport-error".to_string(),
-            WalkError::Write(_) => "write-error".to_string(),
-            WalkError::UnknownNode(_) => "unknown-node".to_string(),
-        },
-    };
-
+    let walk = Box::pin(matrix_spec().walk(&mut transport, &mut config)).await;
     let transcript = log.lock().unwrap().clone();
+    std::fs::write(cell.join("transcript.txt"), &transcript).expect("write transcript");
+    GuidedWalk {
+        outcome_token: walk_token(&walk),
+        transcript,
+        config,
+    }
+}
+
+async fn run_guided_offline_cell(base: &Path) {
+    let cell = base.join("inproc").join("guided").join("happy");
+    let GuidedWalk {
+        outcome_token,
+        transcript,
+        config,
+    } = run_guided_walk(
+        &cell,
+        MemoryScriptedTurn::new(),
+        vec!["oh um, whatever the normal thing is? i just want it to work"],
+    )
+    .await;
 
     let walked = config
         .channels
@@ -789,11 +682,8 @@ async fn run_guided_offline_cell(base: &Path) {
         "scripted (offline conversational)".to_string(),
     );
     meta.insert("outcome", outcome_token.clone());
-    let dir = base.join("inproc").join("guided").join("happy");
-    std::fs::create_dir_all(&dir).expect("create guided cell folder");
-    std::fs::write(dir.join("transcript.txt"), &transcript).expect("write transcript");
-    std::fs::write(dir.join("config.toml"), &rendered_config).expect("write walked config");
-    write_meta(&dir, &meta);
+    std::fs::write(cell.join("config.toml"), &rendered_config).expect("write walked config");
+    write_meta(&cell, &meta);
 
     assert_eq!(
         outcome_token, "completed",
@@ -823,22 +713,25 @@ async fn run_guided_live_cell(base: &Path) {
     let Some(dir) = accessible_config_dir() else {
         return;
     };
-    let Some((alias, _provider)) = resolve_agent_provider() else {
+    let Some((alias, provider)) = resolve_agent_provider() else {
         return;
     };
     let Ok(raw) = std::fs::read_to_string(dir.join("config.toml")) else {
         return;
     };
+    let cell = base.join("inproc").join("guided-live").join("happy");
+    let skip = |reason: String| {
+        std::fs::create_dir_all(&cell).expect("create live guided cell");
+        std::fs::write(cell.join("transcript.txt"), format!("skipped: {reason}\n"))
+            .expect("write skip note");
+    };
+
     let accessible: Config = match toml::from_str(&raw) {
         Ok(config) => config,
         Err(error) => {
-            let cell = base.join("inproc").join("guided-live").join("happy");
-            std::fs::create_dir_all(&cell).expect("create live guided cell");
-            std::fs::write(
-                cell.join("transcript.txt"),
-                format!("skipped: accessible config did not parse into Config: {error}\n"),
-            )
-            .expect("write skip note");
+            skip(format!(
+                "accessible config did not parse into Config: {error}"
+            ));
             return;
         }
     };
@@ -848,13 +741,9 @@ async fn run_guided_live_cell(base: &Path) {
         let store = zeroclaw_config::secrets::SecretStore::new(&dir, accessible.secrets.encrypt);
         let mut config = accessible;
         if let Err(error) = config.decrypt_secrets(&store) {
-            let cell = base.join("inproc").join("guided-live").join("happy");
-            std::fs::create_dir_all(&cell).expect("create live guided cell");
-            std::fs::write(
-                cell.join("transcript.txt"),
-                format!("skipped: accessible config secrets did not decrypt: {error}\n"),
-            )
-            .expect("write skip note");
+            skip(format!(
+                "accessible config secrets did not decrypt: {error}"
+            ));
             return;
         }
         config
@@ -868,78 +757,31 @@ async fn run_guided_live_cell(base: &Path) {
     {
         Ok(agent) => agent,
         Err(error) => {
-            let cell = base.join("inproc").join("guided-live").join("happy");
-            std::fs::create_dir_all(&cell).expect("create live guided cell");
-            std::fs::write(
-                cell.join("transcript.txt"),
-                format!("skipped: agent {alias:?} did not build: {error}\n"),
-            )
-            .expect("write skip note");
+            skip(format!("agent {alias:?} did not build: {error}"));
             return;
         }
     };
 
-    let run_root = base.join("inproc").join("guided-live").join("happy");
-    std::fs::create_dir_all(&run_root).expect("seed dir");
-    let mut config = seed_config_copy(&run_root);
-
-    let log = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let responder = RecordingResponder {
-        inner: zeroclaw_onboarding::AgentResponder::new(
-            zeroclaw_onboarding::InProcessAgentTurn::new(agent),
-            RecordingOperatorIo {
-                inner: VagueScriptedOperator::new(vec![
-                    "honestly no clue what that means, whatever you think is best",
-                    "i just want my bot to answer me on matrix",
-                    "the normal one? we use matrix.org i think",
-                    "sure",
-                ]),
-                log: std::sync::Arc::clone(&log),
-            },
-        ),
-        log: std::sync::Arc::clone(&log),
-        turn: 0,
-    };
-    let secret = RecordingSecretReader {
-        inner: ScriptedSecret,
-        log: std::sync::Arc::clone(&log),
-    };
-    let mut transport = LlmTransport::new(responder, secret);
-
-    let spec = build_spec(
-        config.prop_fields(),
-        SECTION,
-        LAYER,
-        INSTANCE,
-        Outcome::Completed {
-            configured: vec![zeroclaw_runtime::flow::ConfiguredItem {
-                layer: LAYER.to_string(),
-                instance: INSTANCE.to_string(),
-            }],
-        },
+    let walk = run_guided_walk(
+        &cell,
+        zeroclaw_onboarding::InProcessAgentTurn::new(agent),
+        vec![
+            "honestly no clue what that means, whatever you think is best",
+            "i just want my bot to answer me on matrix",
+            "the normal one? we use matrix.org i think",
+            "sure",
+        ],
     )
-    .expect("matrix section yields a spec");
-    let walk = Box::pin(spec.walk(&mut transport, &mut config)).await;
+    .await;
 
-    let outcome_token = match &walk {
-        Ok(outcome) => outcome_token(outcome),
-        Err(error) => match error {
-            WalkError::Transport(_) => "transport-error".to_string(),
-            WalkError::Write(_) => "write-error".to_string(),
-            WalkError::UnknownNode(_) => "unknown-node".to_string(),
-        },
-    };
-
-    let transcript = log.lock().unwrap().clone();
-    std::fs::write(run_root.join("transcript.txt"), &transcript).expect("write transcript");
     let mut meta = BTreeMap::new();
     meta.insert("transport", "inproc".to_string());
     meta.insert("mode", "guided-live".to_string());
     meta.insert("path", "happy".to_string());
-    meta.insert("model_provider", _provider);
+    meta.insert("model_provider", provider);
     meta.insert("agent", alias);
-    meta.insert("outcome", outcome_token);
-    write_meta(&run_root, &meta);
+    meta.insert("outcome", walk.outcome_token);
+    write_meta(&cell, &meta);
 }
 
 fn run_pty_manual_cell(base: &Path) {
@@ -1059,14 +901,7 @@ async fn run_personality_cell(base: &Path, choice: &str, folder: &str) {
     let mut transport = PersonalityRecordingTransport::new(choice);
     let walk = Box::pin(spec.walk(&mut transport, &mut config)).await;
 
-    let outcome_token = match &walk {
-        Ok(outcome) => outcome_token(outcome),
-        Err(error) => match error {
-            WalkError::Transport(_) => "transport-error".to_string(),
-            WalkError::Write(_) => "write-error".to_string(),
-            WalkError::UnknownNode(_) => "unknown-node".to_string(),
-        },
-    };
+    let outcome_token = walk_token(&walk);
 
     let dir = base.join("inproc").join("personality").join(folder);
     std::fs::create_dir_all(&dir).expect("create personality cell folder");
@@ -1093,21 +928,7 @@ async fn run_personality_cell(base: &Path, choice: &str, folder: &str) {
 }
 
 fn manual_node_count() -> usize {
-    let mut config = Config::default();
-    config
-        .channels
-        .matrix
-        .insert(INSTANCE.to_string(), MatrixConfig::default());
-    build_spec(
-        config.prop_fields(),
-        SECTION,
-        LAYER,
-        INSTANCE,
-        Outcome::Cancelled,
-    )
-    .expect("matrix section yields a spec")
-    .nodes
-    .len()
+    matrix_spec().nodes.len()
 }
 
 #[tokio::test]

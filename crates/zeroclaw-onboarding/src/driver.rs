@@ -32,6 +32,63 @@ fn family_of(section_prefix: &str, instance: &str) -> String {
         .to_string()
 }
 
+/// Assemble the complete walkable spec for a section request: alias creation,
+/// the scoped field chain, and the peer-group / personality branches. The
+/// single source of truth for what a section flow walks; every transport
+/// (CLI, LLM-guided) builds through here so the shapes can never drift.
+pub fn build_flow_spec(
+    config: &mut Config,
+    request: &FlowRequest<'_>,
+) -> Result<zeroclaw_runtime::flow::Spec, DriverError> {
+    if request.create {
+        let family = family_of(request.section_prefix, request.instance);
+        config
+            .create_map_key(&family, request.instance)
+            .map_err(|reason| DriverError::AliasCreate {
+                family,
+                alias: request.instance.to_string(),
+                reason,
+            })?;
+    }
+    let success = Outcome::Completed {
+        configured: vec![ConfiguredItem {
+            layer: request.layer.to_string(),
+            instance: request.instance.to_string(),
+        }],
+    };
+    let mut spec = build_spec_scoped(
+        config.prop_fields(),
+        request.section_prefix,
+        request.layer,
+        request.instance,
+        success.clone(),
+        request.scope,
+    )
+    .ok_or_else(|| DriverError::EmptySection(request.section_prefix.to_string()))?;
+    if request.create && request.section_prefix.starts_with("channels.") {
+        spec = crate::spec_builder::append_peer_group_branch(
+            spec,
+            request.section_prefix,
+            request.instance,
+            config,
+            success.clone(),
+        );
+    }
+    if request.section_prefix.starts_with("agents.") {
+        let ctx = zeroclaw_runtime::agent::personality_templates::TemplateContext {
+            agent: request.instance.to_string(),
+            ..Default::default()
+        };
+        spec = crate::spec_builder::append_personality_branch(
+            spec,
+            request.instance,
+            &ctx,
+            success.clone(),
+        );
+    }
+    Ok(spec)
+}
+
 const LOCALE_PROMPT_ID: &str = "onboard-flow-locale-prompt";
 
 fn locale_prompt() -> zeroclaw_runtime::flow::Prompt {
@@ -77,48 +134,7 @@ pub async fn run_flow(
     request: &FlowRequest<'_>,
     transport: &mut dyn FlowTransport,
 ) -> Result<Outcome, DriverError> {
-    if request.create {
-        let family = family_of(request.section_prefix, request.instance);
-        config
-            .create_map_key(&family, request.instance)
-            .map_err(|reason| DriverError::AliasCreate {
-                family,
-                alias: request.instance.to_string(),
-                reason,
-            })?;
-    }
-    let success = Outcome::Completed {
-        configured: vec![ConfiguredItem {
-            layer: request.layer.to_string(),
-            instance: request.instance.to_string(),
-        }],
-    };
-    let mut spec = build_spec_scoped(
-        config.prop_fields(),
-        request.section_prefix,
-        request.layer,
-        request.instance,
-        success.clone(),
-        request.scope,
-    )
-    .ok_or_else(|| DriverError::EmptySection(request.section_prefix.to_string()))?;
-    if request.create && request.section_prefix.starts_with("channels.") {
-        spec = crate::spec_builder::append_peer_group_branch(
-            spec,
-            request.section_prefix,
-            request.instance,
-            config,
-            success.clone(),
-        );
-    }
-    if request.section_prefix.starts_with("agents.") {
-        let ctx = zeroclaw_runtime::agent::personality_templates::TemplateContext {
-            agent: request.instance.to_string(),
-            ..Default::default()
-        };
-        spec =
-            crate::spec_builder::append_personality_branch(spec, request.instance, &ctx, success);
-    }
+    let spec = build_flow_spec(config, request)?;
     Ok(spec.walk(transport, config).await?)
 }
 

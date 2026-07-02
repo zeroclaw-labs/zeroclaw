@@ -1,25 +1,17 @@
+#[path = "common/spec.rs"]
+mod spec;
+
 use std::collections::VecDeque;
 use std::io::Cursor;
 
 use async_trait::async_trait;
+use spec::{INSTANCE, SECTION, completed_outcome, matrix_spec};
 use tempfile::TempDir;
 use zeroclaw_config::schema::{Config, MatrixConfig};
 use zeroclaw_onboarding::{
-    CliSecretSource, CliTransport, LlmResponder, LlmTransport, SecretReader, build_spec,
-    section_fields,
+    CliSecretSource, CliTransport, LlmResponder, LlmTransport, SecretReader, section_fields,
 };
-use zeroclaw_runtime::flow::{ConfiguredItem, Outcome};
-
-const SECTION: &str = "channels.matrix.home";
-
-fn completed() -> Outcome {
-    Outcome::Completed {
-        configured: vec![ConfiguredItem {
-            layer: "channel".into(),
-            instance: "home".into(),
-        }],
-    }
-}
+use zeroclaw_runtime::flow::Outcome;
 
 fn fresh_config() -> (TempDir, Config) {
     let tmp = TempDir::new().unwrap();
@@ -30,98 +22,79 @@ fn fresh_config() -> (TempDir, Config) {
     config
         .channels
         .matrix
-        .insert("home".to_string(), MatrixConfig::default());
+        .insert(INSTANCE.to_string(), MatrixConfig::default());
     (tmp, config)
 }
 
-struct ScriptedResponder {
+/// One scripted reply queue wearing all three response-source hats, so the
+/// parity test scripts CLI and LLM walks through the same shape.
+struct Scripted {
     replies: VecDeque<String>,
 }
 
+impl Scripted {
+    fn new(replies: Vec<String>) -> Self {
+        Self {
+            replies: replies.into(),
+        }
+    }
+
+    fn pop(&mut self) -> zeroclaw_runtime::flow::TransportResult<String> {
+        self.replies
+            .pop_front()
+            .ok_or(zeroclaw_runtime::flow::TransportError::Closed)
+    }
+}
+
 #[async_trait]
-impl LlmResponder for ScriptedResponder {
+impl LlmResponder for Scripted {
     async fn respond(
         &mut self,
         _prompt_text: &str,
     ) -> zeroclaw_runtime::flow::TransportResult<String> {
-        self.replies
-            .pop_front()
-            .ok_or(zeroclaw_runtime::flow::TransportError::Closed)
+        self.pop()
     }
 }
 
-struct ScriptedSecretReader {
-    replies: VecDeque<String>,
-}
-
 #[async_trait]
-impl SecretReader for ScriptedSecretReader {
+impl SecretReader for Scripted {
     async fn read_secret(
         &mut self,
         _prompt_text: &str,
     ) -> zeroclaw_runtime::flow::TransportResult<String> {
-        self.replies
-            .pop_front()
-            .ok_or(zeroclaw_runtime::flow::TransportError::Closed)
+        self.pop()
     }
 }
 
-struct ScriptedCliSecretSource {
-    replies: VecDeque<String>,
-}
-
 #[async_trait]
-impl CliSecretSource for ScriptedCliSecretSource {
+impl CliSecretSource for Scripted {
     async fn read_secret(
         &mut self,
         _prompt_text: &str,
     ) -> zeroclaw_runtime::flow::TransportResult<String> {
-        self.replies
-            .pop_front()
-            .ok_or(zeroclaw_runtime::flow::TransportError::Closed)
+        self.pop()
     }
 }
 
-fn ordered_fields(config: &Config) -> Vec<zeroclaw_config::traits::PropFieldInfo> {
+/// The same field-ordered answer script both transports consume: non-secret
+/// answers in walk order plus the secret answers routed to the secret source.
+fn scripts(config: &Config) -> (Vec<String>, Vec<String>) {
     let mut fields = section_fields(config.prop_fields(), SECTION);
     fields.sort_by(|a, b| a.name.cmp(&b.name));
-    fields
-}
-
-fn cli_scripts(config: &Config) -> (String, Vec<String>) {
-    let mut script = String::new();
+    let mut answers = Vec::new();
     let mut secrets = Vec::new();
-    for field in ordered_fields(config) {
-        let answer = answer_for(&field);
+    for field in fields {
         if field.is_secret {
-            secrets.push(answer);
+            secrets.push("sk-secret".to_string());
         } else {
-            script.push_str(&answer);
-            script.push('\n');
+            answers.push(answer_for(&field));
         }
     }
-    (script, secrets)
-}
-
-fn llm_scripts(config: &Config) -> (Vec<String>, Vec<String>) {
-    let mut llm = Vec::new();
-    let mut secrets = Vec::new();
-    for field in ordered_fields(config) {
-        let answer = answer_for(&field);
-        if field.is_secret {
-            secrets.push(answer);
-        } else {
-            llm.push(answer);
-        }
-    }
-    (llm, secrets)
+    (answers, secrets)
 }
 
 fn answer_for(field: &zeroclaw_config::traits::PropFieldInfo) -> String {
     use zeroclaw_config::traits::PropKind;
-    if field.is_secret {
-        return "sk-secret".to_string();
-    }
     match field.kind {
         PropKind::Bool => "yes".to_string(),
         PropKind::Enum => field.display_value.clone(),
@@ -132,43 +105,22 @@ fn answer_for(field: &zeroclaw_config::traits::PropFieldInfo) -> String {
     }
 }
 
-async fn walk_cli(config: &mut Config, script: &str, secrets: Vec<String>) -> Outcome {
-    let spec = build_spec(
-        config.prop_fields(),
-        SECTION,
-        "channel",
-        "home",
-        completed(),
-    )
-    .expect("matrix section yields a spec");
+async fn walk_cli(config: &mut Config, answers: &[String], secrets: Vec<String>) -> Outcome {
+    let spec = matrix_spec();
     let mut output: Vec<u8> = Vec::new();
-    let secret_source = ScriptedCliSecretSource {
-        replies: secrets.into(),
-    };
+    let mut script = answers.join("\n");
+    script.push('\n');
     let mut transport = CliTransport::with_secret_source(
-        Cursor::new(script.as_bytes().to_vec()),
+        Cursor::new(script.into_bytes()),
         &mut output,
-        secret_source,
+        Scripted::new(secrets),
     );
     spec.walk(&mut transport, config).await.unwrap()
 }
 
-async fn walk_llm(config: &mut Config, llm: Vec<String>, secrets: Vec<String>) -> Outcome {
-    let spec = build_spec(
-        config.prop_fields(),
-        SECTION,
-        "channel",
-        "home",
-        completed(),
-    )
-    .expect("matrix section yields a spec");
-    let responder = ScriptedResponder {
-        replies: llm.into(),
-    };
-    let secret_reader = ScriptedSecretReader {
-        replies: secrets.into(),
-    };
-    let mut transport = LlmTransport::new(responder, secret_reader);
+async fn walk_llm(config: &mut Config, answers: Vec<String>, secrets: Vec<String>) -> Outcome {
+    let spec = matrix_spec();
+    let mut transport = LlmTransport::new(Scripted::new(answers), Scripted::new(secrets));
     spec.walk(&mut transport, config).await.unwrap()
 }
 
@@ -176,21 +128,21 @@ async fn walk_llm(config: &mut Config, llm: Vec<String>, secrets: Vec<String>) -
 async fn cli_and_llm_build_identical_config_from_registry_spec() {
     let (_cli_tmp, mut cli_config) = fresh_config();
     let cli_outcome = {
-        let (script, secrets) = cli_scripts(&cli_config);
-        walk_cli(&mut cli_config, &script, secrets).await
+        let (answers, secrets) = scripts(&cli_config);
+        walk_cli(&mut cli_config, &answers, secrets).await
     };
 
     let (_llm_tmp, mut llm_config) = fresh_config();
     let llm_outcome = {
-        let (llm, secrets) = llm_scripts(&llm_config);
-        walk_llm(&mut llm_config, llm, secrets).await
+        let (answers, secrets) = scripts(&llm_config);
+        walk_llm(&mut llm_config, answers, secrets).await
     };
 
     assert_eq!(cli_outcome, llm_outcome);
-    assert_eq!(cli_outcome, completed());
+    assert_eq!(cli_outcome, completed_outcome());
 
-    let matrix_cli = cli_config.channels.matrix.get("home").unwrap();
-    let matrix_llm = llm_config.channels.matrix.get("home").unwrap();
+    let matrix_cli = cli_config.channels.matrix.get(INSTANCE).unwrap();
+    let matrix_llm = llm_config.channels.matrix.get(INSTANCE).unwrap();
     assert_eq!(matrix_cli.homeserver, matrix_llm.homeserver);
     assert_eq!(matrix_cli.mention_only, matrix_llm.mention_only);
     assert_eq!(matrix_cli.access_token, matrix_llm.access_token);

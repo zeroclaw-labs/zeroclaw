@@ -34,15 +34,6 @@ impl CliEditorSession for SystemEditorSession {
     }
 }
 
-pub struct NoSecretSource;
-
-#[async_trait]
-impl CliSecretSource for NoSecretSource {
-    async fn read_secret(&mut self, _prompt_text: &str) -> TransportResult<String> {
-        Err(TransportError::Closed)
-    }
-}
-
 pub struct TtyPasswordSource;
 
 #[async_trait]

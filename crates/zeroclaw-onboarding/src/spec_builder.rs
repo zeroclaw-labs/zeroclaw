@@ -17,14 +17,14 @@ pub fn section_fields(fields: Vec<PropFieldInfo>, section_prefix: &str) -> Vec<P
         .collect()
 }
 
-pub fn required_fields(fields: Vec<PropFieldInfo>, section_prefix: &str) -> Vec<PropFieldInfo> {
+fn required_fields(fields: Vec<PropFieldInfo>, section_prefix: &str) -> Vec<PropFieldInfo> {
     section_fields(fields, section_prefix)
         .into_iter()
         .filter(|field| !field.type_hint.starts_with(OPTION_PREFIX))
         .collect()
 }
 
-pub fn response_type_for(field: &PropFieldInfo) -> ResponseType {
+fn response_type_for(field: &PropFieldInfo) -> ResponseType {
     if field.is_secret {
         return ResponseType::Secret;
     }
@@ -102,7 +102,7 @@ pub fn build_spec(
     )
 }
 
-pub fn build_spec_scoped(
+pub(crate) fn build_spec_scoped(
     fields: Vec<PropFieldInfo>,
     section_prefix: &str,
     layer: &str,

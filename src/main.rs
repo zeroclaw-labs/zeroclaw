@@ -1182,10 +1182,9 @@ async fn run_onboard_flow(
 ) -> anyhow::Result<()> {
     use zeroclaw_onboarding::{
         AgentPhraser, AgentResponder, CliTransport, FieldScope, FlowRequest, InProcessAgentTurn,
-        LlmTransport, TtyOperatorIo, TtyPasswordSource, TtySecretReader, build_spec_scoped,
-        phrase_spec, run_flow,
+        LlmTransport, TtyOperatorIo, TtyPasswordSource, TtySecretReader, phrase_spec, run_flow,
     };
-    use zeroclaw_runtime::flow::{ConfiguredItem, Outcome};
+    use zeroclaw_runtime::flow::Outcome;
 
     let emit_outcome = |outcome: &Outcome| {
         let descriptor = zeroclaw_onboarding::outcome_message::outcome_message(outcome);
@@ -1207,6 +1206,13 @@ async fn run_onboard_flow(
     } else {
         FieldScope::All
     };
+    let request = FlowRequest {
+        section_prefix: section,
+        layer,
+        instance,
+        create,
+        scope,
+    };
 
     let selected_locale = {
         let locale_reader = std::io::BufReader::new(std::io::stdin());
@@ -1216,55 +1222,13 @@ async fn run_onboard_flow(
         zeroclaw_onboarding::driver::select_locale(&mut locale_transport).await?
     };
 
-    if create && use_llm {
-        let family = section
-            .strip_suffix(&format!(".{instance}"))
-            .unwrap_or(section);
-        config
-            .create_map_key(family, instance)
-            .map_err(anyhow::Error::msg)?;
-    }
-
-    let success = Outcome::Completed {
-        configured: vec![ConfiguredItem {
-            layer: layer.to_string(),
-            instance: instance.to_string(),
-        }],
-    };
-
-    if use_llm {
+    let outcome = if use_llm {
+        let mut spec = zeroclaw_onboarding::driver::build_flow_spec(&mut config, &request)?;
         let phrasing_agent = Box::pin(zeroclaw_runtime::agent::Agent::from_config(
             &config,
             agent_alias,
         ))
         .await?;
-        let mut spec = build_spec_scoped(
-            config.prop_fields(),
-            section,
-            layer,
-            instance,
-            success.clone(),
-            scope,
-        )
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!("section '{section}' has no configurable fields"))
-        })?;
-        if create && section.starts_with("channels.") {
-            spec = zeroclaw_onboarding::append_peer_group_branch(
-                spec,
-                section,
-                instance,
-                &config,
-                success.clone(),
-            );
-        }
-        if section.starts_with("agents.") {
-            let ctx = zeroclaw_runtime::agent::personality_templates::TemplateContext {
-                agent: instance.to_string(),
-                ..Default::default()
-            };
-            spec = zeroclaw_onboarding::append_personality_branch(spec, instance, &ctx, success);
-        }
         let mut phraser = AgentPhraser::new(InProcessAgentTurn::new(phrasing_agent))
             .with_locale(selected_locale.clone());
         phrase_spec(&mut spec, &mut phraser).await?;
@@ -1277,25 +1241,15 @@ async fn run_onboard_flow(
         let responder = AgentResponder::new(InProcessAgentTurn::new(walk_agent), TtyOperatorIo)
             .with_locale(selected_locale.clone());
         let mut transport = LlmTransport::new(responder, TtySecretReader);
-        let outcome = Box::pin(spec.walk(&mut transport, &mut config)).await?;
-        Box::pin(config.save()).await?;
-        emit_outcome(&outcome);
-        return Ok(());
-    }
-
-    let reader = std::io::BufReader::new(std::io::stdin());
-    let writer = std::io::stdout();
-    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let mut transport = CliTransport::with_secret_source(reader, writer, TtyPasswordSource)
-        .with_interactive_editor(interactive);
-    let request = FlowRequest {
-        section_prefix: section,
-        layer,
-        instance,
-        create,
-        scope,
+        Box::pin(spec.walk(&mut transport, &mut config)).await?
+    } else {
+        let reader = std::io::BufReader::new(std::io::stdin());
+        let writer = std::io::stdout();
+        let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+        let mut transport = CliTransport::with_secret_source(reader, writer, TtyPasswordSource)
+            .with_interactive_editor(interactive);
+        Box::pin(run_flow(&mut config, &request, &mut transport)).await?
     };
-    let outcome = Box::pin(run_flow(&mut config, &request, &mut transport)).await?;
     Box::pin(config.save()).await?;
     emit_outcome(&outcome);
     Ok(())
