@@ -124,3 +124,58 @@ export function getRunOverlay(name: string, runId: string): Promise<RunOverlay> 
     `/api/sops/${encodeURIComponent(name)}/runs/${encodeURIComponent(runId)}/overlay`,
   );
 }
+
+/// Index a run overlay's node states by step number. Shared by every view
+/// that projects run state onto graph nodes.
+export function overlayStateByStep(
+  overlay: RunOverlay | null | undefined,
+): Map<number, NodeRunState> {
+  const map = new Map<number, NodeRunState>();
+  for (const n of overlay?.nodes ?? []) map.set(n.step, n.state);
+  return map;
+}
+
+/// Semantic tone for a node run state. Single mapping shared by every SOP
+/// surface; each renderer maps the tone onto its own representation
+/// (Tailwind class, SVG stroke, badge variant) without re-deciding which
+/// state means what.
+export type RunStateTone = 'accent' | 'success' | 'error' | 'warning' | 'neutral';
+
+export function runStateTone(state: NodeRunState | undefined): RunStateTone {
+  switch (state) {
+    case 'active':
+      return 'accent';
+    case 'completed':
+      return 'success';
+    case 'failed':
+      return 'error';
+    case 'skipped':
+      return 'warning';
+    default:
+      return 'neutral';
+  }
+}
+
+/// Semantic tone for a graph wire. Same single-mapping rationale as
+/// `runStateTone`.
+export type WireTone = 'data' | 'error' | 'warning' | 'switch' | 'accent' | 'success';
+
+export function flowRoleTone(role: FlowRole | null | undefined): WireTone {
+  switch (role) {
+    case 'failure':
+      return 'error';
+    case 'dependency':
+      return 'warning';
+    case 'switch':
+      return 'switch';
+    case 'trigger':
+      return 'accent';
+    default:
+      return 'success';
+  }
+}
+
+export function wireTone(wire: GraphWire): WireTone {
+  if (wire.class === 'data') return 'data';
+  return flowRoleTone(wire.flow_role);
+}

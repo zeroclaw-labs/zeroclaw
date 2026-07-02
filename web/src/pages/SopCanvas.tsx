@@ -1,7 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Plus } from 'lucide-react';
 import { t } from '@/lib/i18n';
-import type { Sop, SopStep, NodeRunState, SopGraph, GraphNode, GraphWire, FlowRole } from '@/lib/sops';
+import {
+  runStateTone,
+  flowRoleTone,
+  type RunStateTone,
+  type WireTone,
+  type Sop,
+  type SopStep,
+  type NodeRunState,
+  type SopGraph,
+  type GraphNode,
+  type GraphWire,
+  type FlowRole,
+} from '@/lib/sops';
 
 type XY = { x: number; y: number };
 
@@ -10,38 +22,33 @@ const NODE_H = 84;
 const COL_GAP = 130;
 const ROW_GAP = 46;
 
-// Wire and node colors read from the gateway theme's semantic status tokens and
-// accent, so the canvas follows light/dark and the active palette instead of
-// fixed hex. `--color-status-*` are the design system's success/error/warning
-// roles; accent variants carry switch and trigger.
+// Wire and node colors read from the gateway theme's semantic status tokens
+// and accent, so the canvas follows light/dark and the active palette instead
+// of fixed hex. The tone semantics come from the shared `wireTone`/
+// `runStateTone` maps; this file only binds tones to CSS variables.
+const WIRE_STROKE: Record<WireTone, string> = {
+  data: 'var(--color-status-info)',
+  error: 'var(--color-status-error)',
+  warning: 'var(--color-status-warning)',
+  switch: 'var(--pc-accent-light)',
+  accent: 'var(--pc-accent)',
+  success: 'var(--color-status-success)',
+};
+
 function wireStroke(kind: FlowRole): string {
-  switch (kind) {
-    case 'failure':
-      return 'var(--color-status-error)';
-    case 'dependency':
-      return 'var(--color-status-warning)';
-    case 'switch':
-      return 'var(--pc-accent-light)';
-    case 'trigger':
-      return 'var(--pc-accent)';
-    default:
-      return 'var(--color-status-success)';
-  }
+  return WIRE_STROKE[flowRoleTone(kind)];
 }
 
+const NODE_STROKE: Record<RunStateTone, string> = {
+  accent: 'var(--pc-accent)',
+  success: 'var(--color-status-success)',
+  error: 'var(--color-status-error)',
+  warning: 'var(--color-status-warning)',
+  neutral: 'var(--pc-border-strong)',
+};
+
 function nodeStateStroke(state: NodeRunState | undefined): string {
-  switch (state) {
-    case 'active':
-      return 'var(--pc-accent)';
-    case 'completed':
-      return 'var(--color-status-success)';
-    case 'failed':
-      return 'var(--color-status-error)';
-    case 'skipped':
-      return 'var(--color-status-warning)';
-    default:
-      return 'var(--pc-border-strong)';
-  }
+  return NODE_STROKE[runStateTone(state)];
 }
 
 /// Seed positions from the backend layout. The layout (columns/rows walked from

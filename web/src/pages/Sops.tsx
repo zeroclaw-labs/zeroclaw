@@ -16,6 +16,11 @@ import {
   wireDraft,
   graphDraft,
   triggerSources,
+  overlayStateByStep,
+  runStateTone,
+  wireTone,
+  type RunStateTone,
+  type WireTone,
   type WireRole,
   type SopSummary,
   type SopGraph,
@@ -79,32 +84,28 @@ function blankSop(name: string): Sop {
   };
 }
 
+const NODE_TONE_CLASS: Record<RunStateTone, string> = {
+  accent: 'border-pc-accent ring-2 ring-pc-accent animate-pulse',
+  success: 'border-emerald-500',
+  error: 'border-rose-500',
+  warning: 'border-amber-500 opacity-70',
+  neutral: 'border-pc-border',
+};
+
 function nodeStateTone(state: NodeRunState | undefined): string {
-  switch (state) {
-    case 'active':
-      return 'border-pc-accent ring-2 ring-pc-accent animate-pulse';
-    case 'completed':
-      return 'border-emerald-500';
-    case 'failed':
-      return 'border-rose-500';
-    case 'skipped':
-      return 'border-amber-500 opacity-70';
-    default:
-      return 'border-pc-border';
-  }
+  return NODE_TONE_CLASS[runStateTone(state)];
 }
 
+const BADGE_TONE: Record<RunStateTone, 'ok' | 'error' | 'warn' | 'neutral'> = {
+  accent: 'neutral',
+  success: 'ok',
+  error: 'error',
+  warning: 'warn',
+  neutral: 'neutral',
+};
+
 function nodeStateBadgeTone(state: NodeRunState): 'ok' | 'error' | 'warn' | 'neutral' {
-  switch (state) {
-    case 'completed':
-      return 'ok';
-    case 'failed':
-      return 'error';
-    case 'skipped':
-      return 'warn';
-    default:
-      return 'neutral';
-  }
+  return BADGE_TONE[runStateTone(state)];
 }
 
 function pinTypeLabel(pin: GraphPin): string {
@@ -112,16 +113,17 @@ function pinTypeLabel(pin: GraphPin): string {
   return pin.data_type ?? 'any';
 }
 
+const WIRE_TONE_CLASS: Record<WireTone, string> = {
+  data: 'text-sky-500',
+  error: 'text-rose-500',
+  warning: 'text-amber-500',
+  switch: 'text-fuchsia-500',
+  accent: 'text-pc-accent',
+  success: 'text-emerald-500',
+};
+
 function wireRoleTone(wire: GraphWire): string {
-  if (wire.class === 'data') return 'text-sky-500';
-  switch (wire.flow_role) {
-    case 'failure':
-      return 'text-rose-500';
-    case 'dependency':
-      return 'text-amber-500';
-    default:
-      return 'text-emerald-500';
-  }
+  return WIRE_TONE_CLASS[wireTone(wire)];
 }
 
 function wireLabel(wire: GraphWire): string {
@@ -205,11 +207,7 @@ function GraphCanvas({ graph, overlay }: { graph: SopGraph; overlay?: RunOverlay
     () => [...graph.nodes].sort((a, b) => a.step - b.step),
     [graph.nodes],
   );
-  const stateByStep = useMemo(() => {
-    const map = new Map<number, NodeRunState>();
-    for (const n of overlay?.nodes ?? []) map.set(n.step, n.state);
-    return map;
-  }, [overlay]);
+  const stateByStep = useMemo(() => overlayStateByStep(overlay), [overlay]);
   const wiresByFrom = useMemo(() => {
     const map = new Map<number, GraphWire[]>();
     for (const w of graph.wires) {
@@ -262,8 +260,7 @@ function SopFieldList({
   graph: SopGraph;
   overlay?: RunOverlay | null;
 }) {
-  const stateByStep = new Map<number, NodeRunState>();
-  for (const n of overlay?.nodes ?? []) stateByStep.set(n.step, n.state);
+  const stateByStep = overlayStateByStep(overlay);
   return (
     <div className="divide-y divide-pc-border rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface text-sm">
       {graph.nodes.map((node) => {
@@ -591,10 +588,23 @@ function triggerSource(trigger: SopTrigger): string {
   return trigger.type === CHANNEL_SOURCE ? CHANNEL_SOURCE : trigger.type;
 }
 
+/// Blank value for a registry field, shaped by its declared kind. No field
+/// names are consulted: the registry's `kind` is the single authority.
+function blankFieldValue(field: TriggerField): unknown {
+  switch (field.kind) {
+    case 'list':
+      return [];
+    case 'expression':
+      return null;
+    default:
+      return '';
+  }
+}
+
 /// Build a fresh trigger for a chosen source. The registry supplies the field
-/// set; each bound field starts empty and the channel source starts unbound so
-/// the author picks a channel from the walked list. No per-source field logic is
-/// hardcoded beyond the generated union shape.
+/// set; each bound field starts at its kind's blank value and the channel
+/// source starts on the first walked channel kind. No per-source field logic
+/// is hardcoded.
 function blankTrigger(
   source: string,
   registry: TriggerSourceRegistry | null,
@@ -605,72 +615,30 @@ function blankTrigger(
   }
   if (source === MANUAL_SOURCE) return { type: 'manual' };
   const bound = registry?.bound.find((b) => b.source === source);
-  const fields = bound?.fields ?? [];
   const base: Record<string, unknown> = { type: source };
-  for (const field of fields) {
-    base[field.name] =
-      field.multi || field.name === 'calendar_ids'
-        ? []
-        : field.name === 'condition'
-          ? null
-          : '';
+  for (const field of bound?.fields ?? []) {
+    base[field.name] = blankFieldValue(field);
   }
   return base as unknown as SopTrigger;
 }
 
+/// i18n lookup with a fallback: `t()` returns the key itself when no
+/// translation exists, so detect that and fall back instead of leaking keys.
+function tOr(key: string, fallback: string | null): string | null {
+  const value = t(key);
+  return value === key ? fallback : value;
+}
+
 function triggerFieldLabel(field: string): string {
-  switch (field) {
-    case 'path':
-      return t('sops.trigger_path');
-    case 'expression':
-      return t('sops.trigger_expression');
-    case 'topic':
-      return t('sops.trigger_topic');
-    case 'condition':
-      return t('sops.trigger_condition');
-    case 'board':
-      return t('sops.trigger_board');
-    case 'signal':
-      return t('sops.trigger_signal');
-    case 'events':
-      return t('sops.trigger_events');
-    case 'calendar_source':
-      return t('sops.trigger_calendar_source');
-    case 'calendar_ids':
-      return t('sops.trigger_calendar_ids');
-    default:
-      return field;
-  }
+  return tOr(`sops.trigger_${field}`, field) ?? field;
 }
 
 function triggerFieldHint(field: string): string | null {
-  switch (field) {
-    case 'condition':
-      return t('sops.trigger_condition_hint');
-    case 'expression':
-      return t('sops.trigger_expression_hint');
-    case 'path':
-      return t('sops.trigger_path_hint');
-    case 'topic':
-      return t('sops.trigger_topic_hint');
-    default:
-      return null;
-  }
+  return tOr(`sops.trigger_${field}_hint`, null);
 }
 
 function triggerFieldPlaceholder(field: string): string {
-  switch (field) {
-    case 'condition':
-      return t('sops.trigger_condition_placeholder');
-    case 'expression':
-      return t('sops.trigger_expression_placeholder');
-    case 'path':
-      return t('sops.trigger_path_placeholder');
-    case 'topic':
-      return t('sops.trigger_topic_placeholder');
-    default:
-      return '';
-  }
+  return tOr(`sops.trigger_${field}_placeholder`, null) ?? '';
 }
 
 function TriggerFieldInput({
@@ -737,7 +705,8 @@ function TriggerFieldInput({
     );
   }
 
-  const isList = name === 'calendar_ids';
+  const isList = field.kind === 'list';
+  const isExpression = field.kind === 'expression';
   const text = isList
     ? Array.isArray(value)
       ? value.join(', ')
@@ -761,7 +730,7 @@ function TriggerFieldInput({
                 .map((s) => s.trim())
                 .filter((s) => s.length > 0),
             );
-          } else if (name === 'condition') {
+          } else if (isExpression) {
             onChange(raw.length > 0 ? raw : null);
           } else {
             onChange(raw);
@@ -832,7 +801,7 @@ function ChannelTriggerFields({
         </div>
       ) : null}
       <TriggerFieldInput
-        field={{ name: 'condition', options: [], multi: false }}
+        field={{ name: 'condition', options: [], multi: false, kind: 'expression' }}
         value={trigger.condition}
         onChange={(next) => onChange({ condition: (next as string | null) ?? null })}
       />
@@ -1223,9 +1192,6 @@ export default function Sops() {
       });
   }, []);
 
-  const renumber = (steps: SopStep[]): SopStep[] =>
-    steps.map((s, i) => ({ ...s, number: i + 1 }));
-
   const startNew = useCallback(() => {
     setSaveError(null);
     setDraft(blankSop(''));
@@ -1244,12 +1210,13 @@ export default function Sops() {
     setSaving(true);
     setSaveError(null);
     const isNew = !sops.some((s) => s.name === draft.name);
-    const body = { ...draft, steps: renumber(draft.steps) };
-    const op = isNew ? createSop(body) : saveSop(body);
+    // Renumbering and routing-ref remapping are owned by the daemon's
+    // normalize_step_numbers on save; the draft is sent as-is.
+    const op = isNew ? createSop(draft) : saveSop(draft);
     op.then(() => {
       setSaving(false);
       setDraft(null);
-      return refreshList(body.name);
+      return refreshList(draft.name);
     }).catch((e: unknown) => {
       setSaving(false);
       setSaveError(e instanceof Error ? e.message : String(e));
@@ -1335,11 +1302,7 @@ export default function Sops() {
     };
   }, [selected, runId]);
 
-  const runStateByStep = useMemo(() => {
-    const map = new Map<number, NodeRunState>();
-    for (const n of overlay?.nodes ?? []) map.set(n.step, n.state);
-    return map;
-  }, [overlay]);
+  const runStateByStep = useMemo(() => overlayStateByStep(overlay), [overlay]);
 
   const mutateDraft = useCallback((updater: (d: Sop) => Sop) => {
     setSaveError(null);
