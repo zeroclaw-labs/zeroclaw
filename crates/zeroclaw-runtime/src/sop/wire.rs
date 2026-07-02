@@ -4,7 +4,6 @@ use super::graph::FlowRole;
 use super::step_contract::{StepFailure, SwitchRule};
 use super::types::Sop;
 
-/// Whether an edge operation adds or removes the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WireOp {
@@ -12,9 +11,6 @@ pub enum WireOp {
     Disconnect,
 }
 
-/// A single edge mutation request from an authoring surface. `role` is the
-/// canonical edge kind (`FlowRole`); `port` indexes the source step's switch
-/// rule and is required only for `FlowRole::Switch`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireEdit {
     pub op: WireOp,
@@ -25,8 +21,6 @@ pub struct WireEdit {
     pub port: Option<usize>,
 }
 
-/// Why an edge mutation could not be applied. Surfaces render the message; the
-/// SOP is left unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {
     UnknownStep(u32),
@@ -53,10 +47,6 @@ impl std::fmt::Display for WireError {
 
 impl std::error::Error for WireError {}
 
-/// Apply one edge mutation to a SOP in place. This is the single source of
-/// truth for how each `FlowRole` maps onto step routing / failure policy;
-/// every authoring surface routes edge CRUD through here rather than mutating
-/// routing fields itself.
 pub fn apply_wire(sop: &mut Sop, edit: &WireEdit) -> Result<(), WireError> {
     if edit.role == FlowRole::Trigger {
         return Err(WireError::TriggerNotWirable);

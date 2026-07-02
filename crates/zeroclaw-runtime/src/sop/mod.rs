@@ -52,7 +52,6 @@ use zeroclaw_config::schema::SopConfig;
 use zeroclaw_memory::traits::Memory;
 
 /// Build a single shared SopEngine + SopAuditLogger pair.
-///
 /// This is the sole construction site for SOP state within a daemon.
 /// Callers receive `Arc<Mutex<SopEngine>>` and `Arc<SopAuditLogger>`
 /// handles — never call `SopEngine::new` or `SopAuditLogger::new`
@@ -130,8 +129,6 @@ pub fn load_sops(
     load_sops_from_directory(&dir, default_execution_mode)
 }
 
-/// Load a single SOP by name from the configured directory. Lenient: returns
-/// the SOP with any diagnostics resolvable via `validate_sop_strict`.
 pub fn load_sop_by_name(
     sops_dir: &Path,
     name: &str,
@@ -140,7 +137,6 @@ pub fn load_sop_by_name(
     load_sop(&sops_dir.join(name), default_execution_mode)
 }
 
-/// Delete a SOP directory by name. Errors if it does not exist.
 pub fn delete_sop(sops_dir: &Path, name: &str) -> Result<()> {
     let dir = sops_dir.join(name);
     if !dir.exists() {
@@ -150,9 +146,6 @@ pub fn delete_sop(sops_dir: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Create a new SOP: `save_sop` plus an overwrite guard. Single owner of the
-/// "SOP name is its on-disk directory" invariant; both authoring surfaces
-/// route creation through here.
 pub fn create_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
     if sops_dir.join(&sop.name).exists() {
         anyhow::bail!("SOP '{}' already exists", sop.name);
@@ -160,10 +153,6 @@ pub fn create_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
     save_sop(sops_dir, sop)
 }
 
-/// Project a run's live state onto its SOP graph. Shared watch-view
-/// orchestration for the gateway route and the RPC method: locks the engine,
-/// resolves the run, and returns the overlay. Errors are surface-agnostic
-/// strings; callers map them onto their status codes.
 pub fn run_overlay_for(
     sop: &Sop,
     engine: &Arc<Mutex<SopEngine>>,
@@ -179,13 +168,6 @@ pub fn run_overlay_for(
     Ok(RunOverlay::project(&graph, run))
 }
 
-/// Compact steps to contiguous 1-based numbers and remap every routing
-/// reference (`next`, `depends_on`, `switch[].goto`, `on_failure: goto`)
-/// through the old-to-new map. References to dropped steps are removed
-/// (`on_failure` falls back to `Fail`). No-op when step numbers are not
-/// unique: duplicates are ambiguous to remap and must instead be rejected by
-/// strict validation. The single owner of renumber semantics: surfaces send
-/// drafts as-is and never remap client-side.
 pub fn normalize_step_numbers(sop: &mut Sop) {
     let mut seen = std::collections::HashSet::new();
     if !sop.steps.iter().all(|s| seen.insert(s.number)) {
@@ -509,9 +491,6 @@ fn parse_u32_list(value: &str) -> Vec<u32> {
         .collect()
 }
 
-/// Parse a `name>when>goto; name>when>goto` switch bullet. Each segment needs
-/// a non-empty name; an empty `when` field is the catch-all. Segments without
-/// a usable name are dropped.
 fn parse_switch_rules(value: &str) -> Vec<SwitchRule> {
     value
         .split(';')
@@ -600,8 +579,6 @@ pub fn extract_bold_title(text: &str) -> Option<(String, String)> {
     Some((title, rest.to_string()))
 }
 
-// ── Markdown step renderer (inverse of parse_steps) ─────────────
-
 fn render_step_failure(failure: &StepFailure) -> String {
     match failure {
         StepFailure::Fail => "fail".to_string(),
@@ -684,9 +661,6 @@ fn render_step_bullets(step: &SopStep) -> Vec<String> {
     bullets
 }
 
-/// Render procedure steps to SOP.md, the exact inverse of `parse_steps`:
-/// a `## Steps` heading, numbered items with a bold title, optional body,
-/// and the per-step sub-bullets in a stable order.
 pub fn render_steps(steps: &[SopStep]) -> String {
     let mut out = String::from("## Steps\n\n");
     for step in steps {
@@ -705,16 +679,7 @@ pub fn render_steps(steps: &[SopStep]) -> String {
     out
 }
 
-// ── SOP save (round-trip back to disk) ──────────────────────────
-
-/// Serialize a `Sop` to its on-disk pair (`SOP.toml`, `SOP.md`) under
-/// `<sops_dir>/<name>/`. Reuses the manifest serde and the `render_steps`
-/// Markdown projection. No parallel format.
 ///
-/// STRICT: validates first and writes NOTHING if any blocking violation is
-/// present. Warnings do not block. Returns the blocking list on rejection.
-/// Step numbers are normalized (contiguous 1-based, routing refs remapped)
-/// before validation, so surfaces never renumber client-side.
 pub fn save_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
     let mut sop = sop.clone();
     normalize_step_numbers(&mut sop);
@@ -771,10 +736,6 @@ pub fn validate_sop(sop: &Sop) -> Vec<String> {
     warnings
 }
 
-// ── Validation engine (one rule set, two severities) ────────────
-
-/// The outcome of validating a `Sop` against the one rule set. Blocking
-/// violations reject a save; warnings never block.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SopValidation {
     pub blocking: Vec<String>,
@@ -787,15 +748,7 @@ impl SopValidation {
     }
 }
 
-/// Validate a `Sop` with both severities. Folds three sources:
-/// 1. save-only hard constraints (blocking): non-empty name, non-empty step
-///    titles, unique step number (the on-disk routing key).
-/// 2. `SopGraph` structural diagnostics by severity (Error -> blocking,
-///    Warning -> advisory).
-/// 3. `validate_sop` advisory checks (warnings).
 ///
-/// NOTE: dup detection keys on step NUMBER, the current on-disk routing key.
-/// Keying by a title-slug would require a model change and is out of scope.
 pub fn validate_sop_strict(sop: &Sop) -> SopValidation {
     let mut blocking = Vec::new();
 

@@ -262,9 +262,6 @@ impl SopEngine {
             .collect()
     }
 
-    /// Whether any loaded SOP has a trigger fanning in from `source`. A cheap
-    /// gate so a live source (e.g. the channel orchestrator) can skip building
-    /// and screening a `SopEvent` when no SOP would ever match it.
     pub fn wants_source(&self, source: SopTriggerSource) -> bool {
         self.sops
             .iter()
@@ -1988,10 +1985,6 @@ fn trigger_matches(trigger: &SopTrigger, event: &SopEvent) -> bool {
     }
 }
 
-/// Match a channel trigger's `channel`/`alias` against the event topic. The
-/// dispatcher tags channel events with a topic of `<channel_kind>` or
-/// `<channel_kind>/<alias>`. A trigger without an alias matches any instance of
-/// that channel kind; a trigger with an alias must match that exact instance.
 fn channel_trigger_topic_matches(channel: &str, alias: Option<&str>, topic: Option<&str>) -> bool {
     let Some(topic) = topic else {
         return false;

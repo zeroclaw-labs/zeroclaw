@@ -1,12 +1,5 @@
 //! SOP authoring surface for the web node editor.
 //!
-//! `GET /api/sops` lists the on-disk SOPs; `GET /api/sops/:name/graph` returns
-//! the inferred blueprint projection for one SOP. `POST /api/sops` creates,
-//! `PUT /api/sops/:name` saves, `DELETE /api/sops/:name` removes. Every handler
-//! resolves the sops dir from live config and calls the same
-//! `zeroclaw_runtime::sop` functions the local RPC dispatch calls, so no
-//! authoring logic is duplicated: both surfaces are thin skins over one
-//! strict-validated runtime path. Gated by the standard `/api/*` bearer check.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -26,7 +19,6 @@ fn sops_dir_and_mode(
     (dir, mode)
 }
 
-/// GET /api/sops - list every SOP loadable from the configured directory.
 pub async fn handle_sops_list(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
@@ -36,8 +28,6 @@ pub async fn handle_sops_list(State(state): State<AppState>, headers: HeaderMap)
     Json(serde_json::json!({ "sops": sops })).into_response()
 }
 
-/// GET /api/sops/trigger-sources - the trigger-source registry the authoring
-/// surfaces render. Thin skin over `zeroclaw_runtime::sop::registry_from_config`.
 pub async fn handle_sop_trigger_sources(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -52,7 +42,6 @@ pub async fn handle_sop_trigger_sources(
     Json(registry).into_response()
 }
 
-/// GET /api/sops/:name/graph - inferred blueprint projection for one SOP.
 pub async fn handle_sop_graph(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -75,7 +64,6 @@ pub async fn handle_sop_graph(
     }
 }
 
-/// GET /api/sops/:name/runs/:run_id/overlay - run state projected onto the graph.
 pub async fn handle_sop_run_overlay(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -116,9 +104,6 @@ pub async fn handle_sop_run_overlay(
     }
 }
 
-/// GET /api/sops/:name/full - the complete SOP definition for editing. The
-/// graph projection omits step bodies and tools; the editor needs the full
-/// `Sop`. Same load path as the graph route, serializing the SOP itself.
 pub async fn handle_sop_full(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -138,8 +123,6 @@ pub async fn handle_sop_full(
     }
 }
 
-/// POST /api/sops - create a new SOP. Rejects an overwrite via the runtime's
-/// `create_sop` guard. Body is the canonical `Sop` JSON.
 pub async fn handle_sop_create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -163,8 +146,6 @@ pub async fn handle_sop_create(
     }
 }
 
-/// PUT /api/sops/:name - save (create or overwrite) a SOP. The body name is the
-/// authority; the path name is advisory. Strict-validated by `save_sop`.
 pub async fn handle_sop_save(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -185,7 +166,6 @@ pub async fn handle_sop_save(
     }
 }
 
-/// DELETE /api/sops/:name - remove a SOP directory. 404 when absent.
 pub async fn handle_sop_delete(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -205,19 +185,12 @@ pub async fn handle_sop_delete(
     }
 }
 
-/// Request body for `POST /api/sops/wire-draft`: an unsaved SOP draft plus one
-/// edge mutation. The visual editor wires a draft that has not been persisted
-/// yet, so the mutation applies in memory and nothing is written to disk.
 #[derive(serde::Deserialize)]
 pub struct WireDraftRequest {
     pub sop: zeroclaw_runtime::sop::Sop,
     pub edit: zeroclaw_runtime::sop::WireEdit,
 }
 
-/// POST /api/sops/wire-draft - apply one edge mutation to an in-memory SOP
-/// draft and return the mutated draft plus its reprojected graph. Writes
-/// nothing. The edge-kind-to-routing mapping is owned solely by
-/// `zeroclaw_runtime::sop::apply_wire`; this handler only applies and reprojects.
 pub async fn handle_sop_wire_draft(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -238,16 +211,11 @@ pub async fn handle_sop_wire_draft(
     Json(serde_json::json!({ "sop": sop, "graph": graph })).into_response()
 }
 
-/// Request body for `POST /api/sops/graph-draft`: an unsaved SOP draft.
 #[derive(serde::Deserialize)]
 pub struct GraphDraftRequest {
     pub sop: zeroclaw_runtime::sop::Sop,
 }
 
-/// POST /api/sops/graph-draft - reproject an in-memory SOP draft to its graph.
-/// Writes nothing. The read-only counterpart to `wire-draft`: the visual editor
-/// calls it after any non-wire field edit so the canvas reflects trigger
-/// fan-in, data connections, pins, and layout without re-deriving graph shape.
 pub async fn handle_sop_graph_draft(
     State(state): State<AppState>,
     headers: HeaderMap,

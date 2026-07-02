@@ -1,15 +1,10 @@
 //! Blueprint graph projection of a `Sop`.
 //!
-//! The graph is a PROJECTION inferred on demand from the existing `Sop`
-//! model. It is never persisted: surfaces render whatever this yields.
-//! Wires are inferred from routing (flow) and step schemas (data).
 
 use serde::{Deserialize, Serialize};
 
 use super::types::{Sop, SopStep};
 
-/// A pin's data class. Flow pins carry execution order; Data pins carry
-/// typed values between step schemas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -18,27 +13,17 @@ pub enum PinClass {
     Data,
 }
 
-/// The role a flow wire plays, so surfaces can style edges distinctly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FlowRole {
-    /// Normal successor edge (explicit `next` or implicit linear order).
     Sequence,
-    /// A `depends_on` precedence edge.
     Dependency,
-    /// An `on_failure: goto` edge.
     Failure,
-    /// A named switch-port edge. The port label rides in the wire's `from_pin`.
     Switch,
-    /// An edge from a trigger node into the SOP's entry step. Fan-in from every
-    /// declared trigger source (webhook, mqtt, cron, filesystem, ...).
     Trigger,
 }
 
-/// What a projected node represents. Steps are the SOP's own steps; a Trigger
-/// node is one declared `SopTrigger`, projected so a surface can render the
-/// event fan-in the way n8n renders a webhook feeding downstream branches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -47,23 +32,16 @@ pub enum NodeKind {
     Trigger,
 }
 
-/// A typed pin on a node. `data_type` is `None` for flow pins and for data
-/// pins whose schema omits a `type` (treated as `Any`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct GraphPin {
     pub class: PinClass,
     pub name: String,
-    /// JSON Schema `type` for data pins; `None` means Any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_type: Option<String>,
-    /// Required pins must be satisfied by an inbound wire.
     pub required: bool,
 }
 
-/// A single node in the projected graph. One per SOP step, plus one per
-/// declared trigger. `kind` distinguishes the two so surfaces style them
-/// distinctly; trigger nodes carry the trigger's display string in `subtitle`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct GraphNode {
@@ -73,9 +51,6 @@ pub struct GraphNode {
     pub kind: NodeKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle: Option<String>,
-    /// For `Trigger` nodes, the index of this trigger in `sop.triggers`, so a
-    /// surface can bind a canvas click straight to the matching trigger editor
-    /// without recomputing the synthetic id offset. `None` for step nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_index: Option<u32>,
     pub inputs: Vec<GraphPin>,
@@ -86,12 +61,8 @@ fn node_kind_step() -> NodeKind {
     NodeKind::Step
 }
 
-/// Trigger nodes are numbered from this base so their synthetic ids never
-/// collide with real 1-based step numbers.
 pub const TRIGGER_NODE_BASE: u32 = 1_000_000;
 
-/// An inferred connection. Flow wires carry a `FlowRole`; data wires carry
-/// the pin names they connect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct GraphWire {
@@ -106,7 +77,6 @@ pub struct GraphWire {
     pub to_pin: Option<String>,
 }
 
-/// Severity of a graph diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -115,7 +85,6 @@ pub enum GraphSeverity {
     Error,
 }
 
-/// A structural diagnostic carried on the projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct GraphDiagnostic {
@@ -124,10 +93,6 @@ pub struct GraphDiagnostic {
     pub message: String,
 }
 
-/// A node's canonical grid slot in the layered layout. `col` is the layer
-/// index (0 = a root with no predecessors), `row` packs siblings within a
-/// column. Surfaces map these onto pixels or terminal cells; the slot itself
-/// is single-sourced here so no surface reinvents graph shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct NodePosition {
@@ -136,8 +101,6 @@ pub struct NodePosition {
     pub row: u32,
 }
 
-/// The layered layout of a projected graph. `columns`/`rows` are the grid
-/// extents so a surface can size its viewport without re-deriving them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct GraphLayout {
@@ -146,39 +109,26 @@ pub struct GraphLayout {
     pub rows: u32,
 }
 
-/// The full projected graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopGraph {
     pub nodes: Vec<GraphNode>,
     pub wires: Vec<GraphWire>,
     pub diagnostics: Vec<GraphDiagnostic>,
-    /// Layered x/y placement walked from the flow edges. Single source for
-    /// every surface's node-graph editor; never persisted.
     pub layout: GraphLayout,
 }
 
-/// Surfaces render the projection through this trait. The backend owns the
-/// projection; each surface walks `SopGraph` and renders whatever it gets.
 pub trait GraphRender {
     type Output;
     fn render(&self, graph: &SopGraph) -> Self::Output;
 }
 
-/// Text renderers over the projection. Surfaces that want plain text reuse
-/// these instead of hand-walking the graph.
 pub enum TextGraphFormat {
-    /// One line per node with its outbound flow edges.
     Outline,
-    /// `from -> to [role]` adjacency, one edge per line.
     Adjacency,
-    /// Pretty-printed JSON of the whole projection.
     Json,
 }
 
-/// Render the projection to text in the requested format. Diagnostics, when
-/// present, are appended under a `diagnostics:` section (Json embeds them in
-/// the serialized graph instead).
 pub fn render_graph_text(graph: &SopGraph, format: &TextGraphFormat) -> String {
     match format {
         TextGraphFormat::Json => {
@@ -247,8 +197,6 @@ fn append_diagnostics(graph: &SopGraph, out: &mut String) {
     }
 }
 
-/// Extract the JSON Schema `type` string from a schema fragment. A bare
-/// string fragment (the parser's fallback) is treated as that type name.
 fn schema_type(fragment: &serde_json::Value) -> Option<String> {
     match fragment {
         serde_json::Value::String(s) => Some(s.clone()),
@@ -259,9 +207,6 @@ fn schema_type(fragment: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Whether `required` is set on a schema object (defaults to true for data
-/// inputs so missing producers are surfaced; an explicit `required: false`
-/// opts out).
 fn schema_required(fragment: &serde_json::Value) -> bool {
     match fragment {
         serde_json::Value::Object(map) => map
@@ -327,10 +272,6 @@ fn node_for(step: &SopStep) -> GraphNode {
     }
 }
 
-/// Project one declared trigger into a source node. The node has a single flow
-/// output (`event`) and no inputs; its `subtitle` is the trigger's canonical
-/// display string. Its synthetic id is `TRIGGER_NODE_BASE + index` so it never
-/// collides with a real step number.
 fn trigger_node(index: usize, trigger: &super::types::SopTrigger) -> GraphNode {
     let (title, subtitle) = trigger_labels(trigger);
     GraphNode {
@@ -349,8 +290,6 @@ fn trigger_node(index: usize, trigger: &super::types::SopTrigger) -> GraphNode {
     }
 }
 
-/// Human labels for a trigger node: a short kind title and the full display
-/// string. Derived from the `SopTrigger` variant; no surface hardcodes these.
 fn trigger_labels(trigger: &super::types::SopTrigger) -> (String, String) {
     use super::types::SopTrigger;
     let kind = match trigger {
@@ -367,7 +306,6 @@ fn trigger_labels(trigger: &super::types::SopTrigger) -> (String, String) {
     (kind, trigger.to_string())
 }
 
-/// Strict pin type check: identical, or Any on either side. No widening.
 fn types_compatible(from: Option<&str>, to: Option<&str>) -> bool {
     match (from, to) {
         (None, _) | (_, None) => true,
@@ -376,7 +314,6 @@ fn types_compatible(from: Option<&str>, to: Option<&str>) -> bool {
 }
 
 impl SopGraph {
-    /// Project a `Sop` into its graph form. Pure: no I/O, no persistence.
     pub fn from_sop(sop: &Sop) -> Self {
         let mut nodes: Vec<GraphNode> = sop.steps.iter().map(node_for).collect();
         let valid_steps: std::collections::HashSet<u32> =
@@ -386,7 +323,6 @@ impl SopGraph {
         let mut diagnostics = Vec::new();
 
         for (idx, step) in sop.steps.iter().enumerate() {
-            // ── Flow: sequence ──
             match step.routing.next {
                 Some(next) => {
                     if valid_steps.contains(&next) {
@@ -422,7 +358,6 @@ impl SopGraph {
                 }
             }
 
-            // ── Flow: dependencies ──
             for dep in &step.routing.depends_on {
                 if valid_steps.contains(dep) {
                     wires.push(GraphWire {
@@ -442,7 +377,6 @@ impl SopGraph {
                 }
             }
 
-            // ── Flow: failure goto ──
             if let super::step_contract::StepFailure::Goto { step: target } = &step.on_failure {
                 if valid_steps.contains(target) {
                     wires.push(GraphWire {
@@ -462,7 +396,6 @@ impl SopGraph {
                 }
             }
 
-            // ── Flow: switch ports ──
             for rule in &step.routing.switch {
                 match rule.goto {
                     Some(target) if valid_steps.contains(&target) => {
@@ -496,11 +429,6 @@ impl SopGraph {
             }
         }
 
-        // ── Trigger fan-in ──
-        // Every declared trigger becomes a source node wired into the SOP's
-        // entry step(s). An entry step is one with no inbound step-to-step flow
-        // (Sequence/Dependency/Switch/Failure). This mirrors how a webhook feeds
-        // downstream branches in n8n; it is pure projection of `sop.triggers`.
         let has_inbound: std::collections::HashSet<u32> = wires
             .iter()
             .filter(|w| w.class == PinClass::Flow)
@@ -545,12 +473,6 @@ impl SopGraph {
         }
     }
 
-    /// Layered layout walked from the projected flow edges. A node's column is
-    /// `1 + max(col of every flow predecessor)`; roots (no inbound flow) land
-    /// in column 0. Rows pack per column in step order. Cycles are broken by
-    /// treating an already-visited node as column 0 during resolution, so a
-    /// failure-goto back-edge never loops forever. This is the single source of
-    /// node placement: every surface reads it and never re-derives shape.
     fn layout(nodes: &[GraphNode], wires: &[GraphWire]) -> GraphLayout {
         use std::collections::HashMap;
 
@@ -617,9 +539,6 @@ impl SopGraph {
         }
     }
 
-    /// Infer data wires: an upstream node's `output` pin feeds a downstream
-    /// node's `input` pin when the producer precedes the consumer and the
-    /// types are compatible. Required inputs with no producer are flagged.
     fn infer_data_wires(
         nodes: &[GraphNode],
         wires: &mut Vec<GraphWire>,
@@ -675,7 +594,6 @@ impl SopGraph {
         }
     }
 
-    /// Whether the projection carries any `Error`-severity diagnostic.
     pub fn has_errors(&self) -> bool {
         self.diagnostics
             .iter()
@@ -683,25 +601,17 @@ impl SopGraph {
     }
 }
 
-// ── Run overlay projection (slice 8) ─────────────────────────────
-
-/// Per-node execution state, projected from a `SopRun` onto a `SopGraph`.
-/// An immutable snapshot for watching a run progress, like a Blueprint
-/// executing. Inferred on demand; never persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum NodeRunState {
-    /// Not yet reached by the run.
     Pending,
-    /// The step the run is currently on (running, waiting, or paused).
     Active,
     Completed,
     Failed,
     Skipped,
 }
 
-/// Run state for one graph node, keyed by the node's step number.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct NodeRunOverlay {
@@ -709,9 +619,6 @@ pub struct NodeRunOverlay {
     pub state: NodeRunState,
 }
 
-/// The full run overlay: the run-level status plus per-node states. Surfaces
-/// align each entry to its `SopGraph` node by `step` and highlight it. The
-/// `waiting` / `paused` flags let a surface show why an Active node is held.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct RunOverlay {
@@ -726,11 +633,6 @@ pub struct RunOverlay {
 }
 
 impl RunOverlay {
-    /// Project a run onto a graph. Each node's state is derived from the run's
-    /// recorded step results first (terminal states win), then the run's
-    /// current position (the live step is Active while the run is non-terminal),
-    /// then Pending for anything not yet reached. Step results are authoritative
-    /// because a step can be Skipped without advancing `current_step` linearly.
     pub fn project(graph: &SopGraph, run: &super::types::SopRun) -> Self {
         use super::types::{SopRunStatus, SopStepStatus};
 

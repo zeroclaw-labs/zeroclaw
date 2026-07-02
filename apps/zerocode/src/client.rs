@@ -109,7 +109,6 @@ pub mod method {
     pub const QUICKSTART_VALIDATE: &str = "quickstart/validate";
     pub const QUICKSTART_APPLY: &str = "quickstart/apply";
     pub const QUICKSTART_DISMISS: &str = "quickstart/dismiss";
-    // SOP authoring
     pub const SOPS_LIST: &str = "sops/list";
     pub const SOPS_GET: &str = "sops/get";
     pub const SOPS_GRAPH: &str = "sops/graph";
@@ -1193,8 +1192,6 @@ impl RpcClient {
         .await
     }
 
-    // ── SOP authoring methods ────────────────────────────────────
-
     pub async fn sops_list(&self) -> Result<Value> {
         self.call(method::SOPS_LIST, serde_json::json!({})).await
     }
@@ -1209,8 +1206,6 @@ impl RpcClient {
             .await
     }
 
-    /// Typed `sops/graph`: the structured projection the visual node editor
-    /// renders. Deserializes into the `SopGraphView` mirror.
     pub async fn sops_graph_view(&self, name: &str) -> Result<SopGraphView> {
         let value = self.sops_graph(name).await?;
         serde_json::from_value(value).map_err(Into::into)
@@ -1239,9 +1234,6 @@ impl RpcClient {
             .await
     }
 
-    /// Apply one edge mutation to an unsaved SOP draft (`{ sop, edit }`) without
-    /// persisting. Returns the mutated `{ sop, graph }`. The daemon owns the
-    /// edge-to-routing mapping; used while authoring a draft not yet saved.
     pub async fn sops_wire_draft(&self, sop: Value, edit: Value) -> Result<Value> {
         self.call(
             method::SOPS_WIRE_DRAFT,
@@ -1250,8 +1242,6 @@ impl RpcClient {
         .await
     }
 
-    /// Project an unsaved SOP draft to its graph (read-only). Used to refresh
-    /// the visual canvas after non-wire field edits. Returns the `SopGraphView`.
     pub async fn sops_graph_draft(&self, sop: Value) -> Result<SopGraphView> {
         let value = self
             .call(method::SOPS_GRAPH_DRAFT, serde_json::json!({ "sop": sop }))
@@ -1259,9 +1249,6 @@ impl RpcClient {
         serde_json::from_value(value).map_err(Into::into)
     }
 
-    /// Fetch the trigger-source registry: bound sources plus inbound-capable
-    /// channel kinds with configured aliases. Walked from the backend registry;
-    /// the TUI renders whatever it returns and never hardcodes a channel list.
     pub async fn sops_trigger_sources(&self) -> Result<TriggerSourceRegistryView> {
         let value = self
             .call(method::SOPS_TRIGGER_SOURCES, serde_json::json!({}))
@@ -1962,17 +1949,8 @@ pub struct QuickstartDismissResult {
     pub recorded: bool,
 }
 
-// ── SOP authoring types ──────────────────────────────────────────
 //
-// **Mirror** of `zeroclaw_runtime::sop::{Sop, SopStep, StepRouting,
-// StepFailure}`. Same rationale as the quickstart mirrors: the runtime
-// crate is intentionally off the TUI dependency tree, so the wire shape
-// is duplicated here and the SOP drift test enforces equality. Field
-// names and serde attributes match the canonical structs exactly so the
-// daemon's `save_sop` deserializes them without loss; strict validation
-// on the daemon side is the single authority.
 
-/// Mirror of `zeroclaw_runtime::sop::SopStepKind`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SopStepKind {
@@ -1981,7 +1959,6 @@ pub enum SopStepKind {
     Checkpoint,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::NodeRunState` (run-overlay node state).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeRunState {
@@ -1993,7 +1970,6 @@ pub enum NodeRunState {
     Skipped,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::PinClass`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PinClass {
@@ -2001,7 +1977,6 @@ pub enum PinClass {
     Data,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::FlowRole`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowRole {
@@ -2012,7 +1987,6 @@ pub enum FlowRole {
     Trigger,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::NodeKind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeKind {
@@ -2021,7 +1995,6 @@ pub enum NodeKind {
     Trigger,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::GraphPin` (read-only projection pin).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GraphPin {
     pub class: PinClass,
@@ -2031,7 +2004,6 @@ pub struct GraphPin {
     pub required: bool,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::GraphNode`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GraphNode {
     pub step: u32,
@@ -2046,7 +2018,6 @@ pub struct GraphNode {
     pub outputs: Vec<GraphPin>,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::GraphWire`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GraphWire {
     pub class: PinClass,
@@ -2060,7 +2031,6 @@ pub struct GraphWire {
     pub to_pin: Option<String>,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::GraphSeverity`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphSeverity {
@@ -2068,7 +2038,6 @@ pub enum GraphSeverity {
     Error,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::GraphDiagnostic`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GraphDiagnostic {
     pub severity: GraphSeverity,
@@ -2076,8 +2045,6 @@ pub struct GraphDiagnostic {
     pub message: String,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::NodePosition`: a node's grid slot in the
-/// layered layout the backend walks from the projected edges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NodePosition {
     pub step: u32,
@@ -2085,7 +2052,6 @@ pub struct NodePosition {
     pub row: u32,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::GraphLayout`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GraphLayout {
     #[serde(default)]
@@ -2096,8 +2062,6 @@ pub struct GraphLayout {
     pub rows: u32,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::SopGraph`: the structured projection the
-/// visual node editor renders, deserialized straight from `sops/graph`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SopGraphView {
     #[serde(default)]
@@ -2110,7 +2074,6 @@ pub struct SopGraphView {
     pub layout: GraphLayout,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::ChannelAlias`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChannelAliasView {
     pub alias: String,
@@ -2119,7 +2082,6 @@ pub struct ChannelAliasView {
     pub owning_agent: Option<String>,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::ChannelTriggerKind`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChannelTriggerKindView {
     pub channel: String,
@@ -2129,7 +2091,6 @@ pub struct ChannelTriggerKindView {
     pub setup_path: String,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::TriggerFieldKind`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerFieldKindView {
@@ -2139,7 +2100,6 @@ pub enum TriggerFieldKindView {
     Expression,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::TriggerField`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TriggerFieldView {
     pub name: String,
@@ -2151,7 +2111,6 @@ pub struct TriggerFieldView {
     pub kind: TriggerFieldKindView,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::BoundTriggerSource`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BoundTriggerSourceView {
     pub source: String,
@@ -2159,9 +2118,6 @@ pub struct BoundTriggerSourceView {
     pub fields: Vec<TriggerFieldView>,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::TriggerSourceRegistry`: the trigger-source
-/// registry the authoring surfaces render, deserialized from
-/// `sops/trigger-sources`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TriggerSourceRegistryView {
     #[serde(default)]
@@ -2170,7 +2126,6 @@ pub struct TriggerSourceRegistryView {
     pub channels: Vec<ChannelTriggerKindView>,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::step_contract::SwitchRule`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SwitchRule {
     pub name: String,
@@ -2182,7 +2137,6 @@ pub struct SwitchRule {
     pub goto_buf: Option<String>,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::StepRouting`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StepRouting {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2203,7 +2157,6 @@ impl StepRouting {
     }
 }
 
-/// Mirror of `zeroclaw_runtime::sop::StepFailure`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepFailure {
@@ -2223,7 +2176,6 @@ impl StepFailure {
     }
 }
 
-/// Mirror of `zeroclaw_runtime::sop::SopStep` (authoring subset).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SopStep {
     pub number: u32,
@@ -2256,7 +2208,6 @@ impl Default for SopStep {
     }
 }
 
-/// Mirror of `zeroclaw_runtime::sop::Sop` (authoring subset).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SopDraft {
     pub name: String,
@@ -2271,13 +2222,6 @@ pub struct SopDraft {
     pub deterministic: bool,
 }
 
-/// Trigger mirror. The tagged `type` selects the source; the optional bound
-/// fields carry the full source-specific binding union (channel/alias,
-/// path/expression/topic, board/signal, calendar_source/calendar_ids,
-/// routing_key, events, condition). `channel` is the canonical `ChannelKind`
-/// wire string; no parallel channel list is hand-maintained here. Empty
-/// fields are omitted so the daemon fills defaults and TOML stays lossless
-/// for every trigger variant.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SopTriggerDraft {
     #[serde(rename = "type")]

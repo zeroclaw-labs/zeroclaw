@@ -392,14 +392,6 @@ pub fn process_headless_results(results: &[DispatchResult]) {
     }
 }
 
-// ── Untrusted fan-in helper ─────────────────────────────────────
-
-/// Dispatch one untrusted external event through the standard path with the
-/// engine's `untrusted_payload_max_bytes` cap applied to topic and payload.
-/// The single fan-in entry for every external source (channel, MQTT, AMQP,
-/// filesystem, ...): callers hand over raw strings and this owns capping,
-/// truncation logging, event construction, dispatch, and headless result
-/// processing, so no source can forget the cap.
 pub async fn dispatch_untrusted_fan_in(
     engine: &Arc<Mutex<SopEngine>>,
     audit: &SopAuditLogger,

@@ -164,10 +164,6 @@ pub enum SopTrigger {
         #[serde(default)]
         calendar_ids: Vec<String>,
     },
-    /// Inbound message on a configured agent-loop channel (telegram, discord,
-    /// slack, ...). Live: delivered by the channel orchestrator when the
-    /// channel's SOP dispatch mode is enabled. `channel` is a `ChannelKind`
-    /// snake_case value; `alias` optionally scopes to one configured instance.
     Channel {
         channel: String,
         #[serde(default)]
@@ -210,9 +206,6 @@ impl fmt::Display for SopTrigger {
 }
 
 impl SopTrigger {
-    /// The `SopTriggerSource` this trigger fans in from. Single source of truth
-    /// for the trigger-to-source mapping; surfaces and the dispatcher read it
-    /// rather than re-deriving from the variant.
     pub fn source(&self) -> SopTriggerSource {
         match self {
             Self::Mqtt { .. } => SopTriggerSource::Mqtt,
@@ -397,9 +390,6 @@ pub struct SopMeta {
 }
 
 impl SopManifest {
-    /// Build the on-disk manifest from a `Sop`. Inverse of the loader's
-    /// destructure. `execution_mode` is emitted as `Some` so the round-trip
-    /// is faithful; `deterministic` is preserved as-is.
     pub fn from_sop(sop: &Sop) -> Self {
         Self {
             sop: SopMeta {
@@ -642,24 +632,12 @@ pub enum SopRunAction {
 mod tests {
     use super::*;
 
-    /// The zerocode TUI carries a **mirror** of `Sop`/`SopStep`/`StepRouting`/
-    /// `StepFailure` (it is off the runtime dependency tree). This parses the
-    /// exact wire shape that mirror emits into the canonical `Sop`, asserting
-    /// the authoring fields survive. Paired with the zerocode-side
-    /// `draft_serializes_to_canonical_wire` test, any field-name or tagging
-    /// drift between the mirror and this struct fails one side loudly.
     #[test]
     fn priority_display() {
         assert_eq!(SopPriority::Critical.to_string(), "critical");
         assert_eq!(SopPriority::Low.to_string(), "low");
     }
 
-    /// Twin of the zerocode `trigger_draft_round_trips_every_variant_losslessly`
-    /// drift test: every trigger variant's wire shape must round-trip through
-    /// the canonical `SopTrigger` identically, so the mirror and this enum
-    /// cannot diverge without one side failing.
-    /// Overlay node-state wire tokens the zerocode `NodeRunState` mirror also
-    /// parses. Guards the snake_case names against drift.
     #[test]
     fn execution_mode_display() {
         assert_eq!(SopExecutionMode::Auto.to_string(), "auto");

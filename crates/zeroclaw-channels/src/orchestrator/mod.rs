@@ -536,10 +536,6 @@ struct ChannelRuntimeContext {
     /// (append / remove_last / delete_session) for the same sender without
     /// serializing the full message-processing loop.  See #7753.
     persist_locks: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<()>>>>>,
-    /// SOP engine + audit sink for channel-triggered workflows. `Some` only
-    /// when SOPs are active; an inbound message on this channel is projected
-    /// into a `SopEvent { source: Channel, topic: "<kind>[/alias]" }` and
-    /// dispatched so channel-sourced triggers fire. `None` disables the hop.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
@@ -4391,13 +4387,6 @@ async fn process_channel_message_body(
         }
     }
 
-    // ── SOP channel fan-in ───────────────────────────────────────
-    // Fan this inbound message into the SOP engine so channel-sourced
-    // triggers fire. Gated on `wants_source(Channel)` so the untrusted-input
-    // screen and dispatch only run when at least one loaded SOP actually
-    // watches a channel. `topic` is `<kind>[/<alias>]`, matching
-    // `channel_trigger_topic_matches`. Capping, event construction, and
-    // headless result processing live in `dispatch_untrusted_fan_in`.
     if let (Some(engine), Some(audit)) = (ctx.sop_engine.as_ref(), ctx.sop_audit.as_ref()) {
         let wants = engine
             .lock()

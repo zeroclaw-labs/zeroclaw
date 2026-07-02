@@ -145,7 +145,6 @@ pub enum Method {
     QuickstartApply,
     QuickstartDismiss,
 
-    // SOP authoring (read first, then write)
     SopsList,
     SopsGet,
     SopsGraph,
@@ -709,7 +708,6 @@ impl RpcDispatcher {
             Method::QuickstartApply => self.handle_quickstart_apply(&req.params).await,
             Method::QuickstartDismiss => self.handle_quickstart_dismiss(&req.params),
 
-            // SOP authoring
             Method::SopsList => self.handle_sops_list(),
             Method::SopsGet => self.handle_sops_get(&req.params),
             Method::SopsGraph => self.handle_sops_graph(&req.params),
@@ -3870,10 +3868,6 @@ impl RpcDispatcher {
         to_result(body)
     }
 
-    // ── SOP authoring handlers ──────────────────────────────────
-
-    /// Resolve the configured SOPs directory and default execution mode from
-    /// the live config, reusing the runtime's own resolvers.
     fn sops_dir_and_mode(&self) -> (std::path::PathBuf, crate::sop::SopExecutionMode) {
         let config = self.ctx.config.read();
         let workspace = config.shared_workspace_dir();
@@ -3908,10 +3902,6 @@ impl RpcDispatcher {
         to_result(crate::sop::SopGraph::from_sop(&sop))
     }
 
-    /// Project a run's live state onto its SOP graph for a watch view. Loads
-    /// the SOP by name and delegates to the shared `run_overlay_for`
-    /// orchestration. Errors if the SOP subsystem is not enabled or the run is
-    /// unknown.
     fn handle_sops_run_overlay(&self, params: &Value) -> RpcResult {
         let req: SopRunOverlayRequest = parse_params(params)?;
         let (dir, mode) = self.sops_dir_and_mode();
@@ -3934,9 +3924,6 @@ impl RpcDispatcher {
         to_result(overlay)
     }
 
-    /// Validate either a named on-disk SOP (`{ "name": ... }`) or an unsaved
-    /// draft (`{ "sop": ... }`). Returns the two-severity validation result.
-    /// Validation only; writes nothing.
     fn handle_sops_validate(&self, params: &Value) -> RpcResult {
         let sop = if params.get("sop").is_some() {
             let req: SopSaveRequest = parse_params(params)?;
@@ -3963,7 +3950,6 @@ impl RpcDispatcher {
         to_result(serde_json::json!({ "saved": sop.name }))
     }
 
-    /// Create rejects an overwrite via the runtime's `create_sop` guard.
     fn handle_sops_create(&self, params: &Value) -> RpcResult {
         let req: SopSaveRequest = parse_params(params)?;
         let sop = Self::parse_sop(&req.sop)?;
@@ -3980,10 +3966,6 @@ impl RpcDispatcher {
         to_result(serde_json::json!({ "deleted": req.name }))
     }
 
-    /// Apply one edge mutation to an in-memory SOP draft (`{ sop, edit }`) and
-    /// return the mutated draft plus its reprojected graph. Writes nothing. The
-    /// edge-kind-to-routing mapping lives solely in `crate::sop::apply_wire`;
-    /// both authoring surfaces wire their unsaved drafts through here.
     fn handle_sops_wire_draft(&self, params: &Value) -> RpcResult {
         let sop_val = params
             .get("sop")
@@ -4002,9 +3984,6 @@ impl RpcDispatcher {
         }))
     }
 
-    /// Project an in-memory SOP draft (`{ sop }`) to its graph without saving.
-    /// The read-only counterpart to `sops/wire-draft`; the authoring surfaces
-    /// use it to refresh the visual canvas after non-wire field edits.
     fn handle_sops_graph_draft(&self, params: &Value) -> RpcResult {
         let sop_val = params
             .get("sop")
@@ -4013,8 +3992,6 @@ impl RpcDispatcher {
         to_result(crate::sop::SopGraph::from_sop(&sop))
     }
 
-    /// Return the trigger-source registry the authoring surfaces render.
-    /// Thin skin over `crate::sop::registry_from_config`.
     fn handle_sops_trigger_sources(&self) -> RpcResult {
         let registry = {
             let config = self.ctx.config.read();
@@ -7129,6 +7106,4 @@ mod tests {
             "session_end must fire when a real session is closed"
         );
     }
-
-    // ── SOP authoring RPC ────────────────────────────────────────
 }

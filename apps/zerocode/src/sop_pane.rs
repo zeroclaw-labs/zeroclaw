@@ -13,10 +13,6 @@ use crate::client::{
     RpcClient, SopDraft, SopGraphView, SopStep, SopStepKind, StepFailure, SwitchRule,
 };
 
-/// SOP authoring pane: lists SOPs from the daemon and renders the selected
-/// SOP's projected node graph as text. The graph text is produced by the
-/// backend (`sops/graph` returns the projection); this pane only formats
-/// what it receives, never inferring graph shape itself.
 pub(crate) struct SopPane {
     rpc: Arc<RpcClient>,
     names: Vec<String>,
@@ -27,40 +23,21 @@ pub(crate) struct SopPane {
     run_input: Option<String>,
     overlay: Option<RunOverlayView>,
     editor: Option<SopEditorState>,
-    /// Trigger-source registry fetched from `sops/trigger-sources` on editor
-    /// open. Single source for the trigger picker; the pane never hardcodes a
-    /// channel or source list.
     trigger_registry: crate::client::TriggerSourceRegistryView,
     error: Option<String>,
     status: Option<String>,
     animation_origin: std::time::Instant,
     list_row_rects: Vec<Rect>,
     node_rects: Vec<(u32, Rect)>,
-    /// Output-handle click zones captured each render: (source step, role,
-    /// optional switch-port index, rect). Clicking one starts a link of that
-    /// role from that step; the daemon owns the edge-to-routing mapping.
     handle_rects: Vec<(u32, FlowRole, Option<usize>, Rect)>,
-    /// Add-from click zones: (source step, role, optional port, rect). Clicking
-    /// creates a new step and wires it from that output in one draft round trip.
     add_rects: Vec<(u32, FlowRole, Option<usize>, Rect)>,
-    /// Wire-line click zones: (from, to, role, optional port, rect). Clicking
-    /// deletes that edge via the draft-wire RPC.
     wire_rects: Vec<(u32, u32, FlowRole, Option<usize>, Rect)>,
-    /// Active link source while wiring: (from step, role, optional port).
     link_from: Option<(u32, FlowRole, Option<usize>)>,
-    /// Graph projection of the current editor draft, refreshed from the daemon
-    /// on editor open and after each wire edit. Drives the interactive canvas's
-    /// wire lines without the pane reprojecting the graph itself.
     editor_graph: SopGraphView,
-    /// Camera pan offset (cells) into the 2D canvas, so a graph wider or taller
-    /// than the pane can be scrolled. Panned with h/j/k/l while viewing.
     pan_x: u16,
     pan_y: u16,
 }
 
-/// Which rendering layer the SOP surface presents. The visual node-card editor
-/// is canon; the field-list is the togglable fallback. Toggling swaps only the
-/// rendering; the `SopDraft` model and the `save_sop` write path are shared.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum RenderLayer {
     #[default]
@@ -77,11 +54,6 @@ impl RenderLayer {
     }
 }
 
-/// In-pane SOP authoring buffer. `create` distinguishes a new SOP (name still
-/// editable, `sops/create` on save) from an edit of an existing one (`sops/save`
-/// overwrite, name locked). Holds the canonical `SopDraft` directly; `field`
-/// selects which attribute of the focused step the keyboard edits so routing,
-/// failure policy, and kind are all authorable, not just titles.
 struct SopEditorState {
     create: bool,
     draft: SopDraft,
@@ -98,9 +70,6 @@ enum EditorFocus {
     Steps,
 }
 
-/// Which field of the focused step the keyboard edits. Cycled with Tab while
-/// the Steps focus is active. Mirrors the web StepEditor's per-node controls:
-/// title/body/tools/kind, plus routing (depends_on/next/when) and on_failure.
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum StepField {
     Title,
@@ -166,10 +135,6 @@ impl SopEditorState {
         }
     }
 
-    /// Serialize the draft for the daemon. Drops steps with empty titles and
-    /// defaults an empty body to the title. Renumbering and routing-ref
-    /// remapping are owned by the daemon's `normalize_step_numbers` on save;
-    /// no client-side remap.
     fn to_sop_json(&self) -> serde_json::Value {
         let steps: Vec<SopStep> = self
             .draft
@@ -193,8 +158,6 @@ impl SopEditorState {
     }
 }
 
-/// Append a char to a comma-separated string list. A comma finalizes the
-/// current token and starts a new one; other chars extend the last token.
 fn push_csv_char(list: &mut Vec<String>, c: char) {
     if c == ',' {
         list.push(String::new());
@@ -214,7 +177,6 @@ fn pop_csv_char(list: &mut Vec<String>) {
     }
 }
 
-/// Render a numeric list for display, joining with `, `.
 fn num_csv(list: &[u32]) -> String {
     list.iter()
         .map(|n| n.to_string())
@@ -222,8 +184,6 @@ fn num_csv(list: &[u32]) -> String {
         .join(", ")
 }
 
-/// Serialize switch rules to an editable line: `name>when>goto` per rule,
-/// `;`-separated. Empty `when`/`goto` render as blanks between separators.
 fn switch_to_text(rules: &[SwitchRule]) -> String {
     rules
         .iter()
@@ -297,9 +257,6 @@ fn pop_switch_char(rules: &mut Vec<SwitchRule>) {
     }
 }
 
-/// Edit a `Vec<u32>` as digits and commas. Non-digit, non-comma chars are
-/// ignored. Trailing empty slots are represented as a 0 placeholder that the
-/// display suppresses; on submit, zeros are filtered by the remap.
 fn push_num_csv_char(list: &mut Vec<u32>, c: char) {
     if c == ',' {
         list.push(0);
@@ -340,8 +297,6 @@ fn pop_opt_u32_char(v: &mut Option<u32>) {
     }
 }
 
-/// Edit the numeric argument of a `Retry{max}` / `Goto{step}` failure policy.
-/// A no-op for `Fail` (it has no argument).
 fn push_failure_arg_char(f: &mut StepFailure, c: char) {
     let Some(d) = c.to_digit(10) else {
         return;
@@ -361,7 +316,6 @@ fn pop_failure_arg_char(f: &mut StepFailure) {
     }
 }
 
-/// Human-readable label for a failure policy in the editor.
 fn failure_label(f: &StepFailure) -> String {
     match f {
         StepFailure::Fail => "fail".to_string(),
@@ -370,9 +324,6 @@ fn failure_label(f: &StepFailure) -> String {
     }
 }
 
-/// Projected run state the pane overlays onto the graph: per-step states keyed
-/// for marker lookup, plus the run-level status line. The backend produces the
-/// projection (`sops/run-overlay`); this pane only formats what it receives.
 struct RunOverlayView {
     status: String,
     current_step: u64,
@@ -446,8 +397,6 @@ impl SopPane {
         }
     }
 
-    /// Toggle the canon visual node editor against the field-list fallback.
-    /// Rendering only; the draft model and write path are untouched.
     pub(crate) fn toggle_layer(&mut self) {
         self.layer = self.layer.toggled();
     }
@@ -529,12 +478,6 @@ impl SopPane {
         false
     }
 
-    /// Mouse support for the canon visual editor. Left-click a SOP row selects
-    /// and loads it. While the editor is open, the visual layer is interactive:
-    /// clicking an output handle starts a wire of that role, clicking a target
-    /// node completes it, and clicking an existing wire line deletes that edge.
-    /// Outside the editor, clicking a node card opens the editor on that step.
-    /// Scroll moves the list selection. All rects are captured each render.
     pub(crate) async fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
         let (col, row) = (mouse.column, mouse.row);
@@ -549,9 +492,7 @@ impl SopPane {
                     self.load_selected_graph().await;
                     return;
                 }
-                // Interactive wiring only while an editor draft is open.
                 if self.editor.is_some() {
-                    // A link in progress: any node click completes it.
                     if self.link_from.is_some() {
                         if let Some((step, _)) = self
                             .node_rects
@@ -562,12 +503,10 @@ impl SopPane {
                             self.complete_link(step).await;
                             return;
                         }
-                        // Click off any node cancels the pending link.
                         self.link_from = None;
                         self.status = None;
                         return;
                     }
-                    // Add-and-wire a new step from a clicked [+] badge.
                     if let Some((step, role, port, _)) = self
                         .add_rects
                         .iter()
@@ -577,7 +516,6 @@ impl SopPane {
                         self.add_step_from(step, role, port).await;
                         return;
                     }
-                    // Start a link from a clicked output handle.
                     if let Some((step, role, port, _)) = self
                         .handle_rects
                         .iter()
@@ -587,7 +525,6 @@ impl SopPane {
                         self.start_link(step, role, port);
                         return;
                     }
-                    // Delete an edge by clicking its wire line.
                     if let Some((from, to, role, port, _)) = self
                         .wire_rects
                         .iter()
@@ -635,8 +572,6 @@ impl SopPane {
         }
     }
 
-    /// Move the editor's focus to the step whose `number` matches `step`, so a
-    /// click on that node's card in the visual layer selects it for editing.
     fn focus_editor_step(&mut self, step: u32) {
         if let Some(ed) = self.editor.as_mut()
             && let Some(idx) = ed.draft.steps.iter().position(|s| s.number == step)
@@ -646,15 +581,11 @@ impl SopPane {
         }
     }
 
-    /// Open the selected SOP for editing and immediately focus the clicked step.
     async fn open_editor_for_step(&mut self, step: u32) {
         self.open_editor_for_selected().await;
         self.focus_editor_step(step);
     }
 
-    /// Reproject the current editor draft's graph from the daemon so the visual
-    /// canvas reflects field edits (next/depends_on/switch/on_failure typed in
-    /// the field editor) without the pane reprojecting the graph itself.
     async fn refresh_editor_graph(&mut self) {
         let Some(editor) = self.editor.as_ref() else {
             return;
@@ -665,18 +596,12 @@ impl SopPane {
         }
     }
 
-    /// Fetch the trigger-source registry from the daemon so the trigger picker
-    /// renders the walked channel + bound-source list. On failure the previous
-    /// registry is retained; the picker degrades to whatever was last known.
     async fn refresh_trigger_registry(&mut self) {
         if let Ok(reg) = self.rpc.sops_trigger_sources().await {
             self.trigger_registry = reg;
         }
     }
 
-    /// Begin a link from `step`'s output handle of the given `role`/`port`.
-    /// The next node click completes it. Only meaningful while the editor is
-    /// open (wiring mutates the draft).
     fn start_link(&mut self, step: u32, role: FlowRole, port: Option<usize>) {
         if self.editor.is_some() {
             self.link_from = Some((step, role, port));
@@ -684,9 +609,6 @@ impl SopPane {
         }
     }
 
-    /// Complete an in-progress link to `target`, applying a connect edge via the
-    /// draft-wire RPC and replacing the draft with the mutated result. The
-    /// edge-to-routing mapping lives in the daemon, not here.
     async fn complete_link(&mut self, target: u32) {
         let Some((from, role, port)) = self.link_from.take() else {
             return;
@@ -699,17 +621,11 @@ impl SopPane {
             .await;
     }
 
-    /// Delete an existing edge via the draft-wire RPC.
     async fn delete_wire(&mut self, from: u32, to: u32, role: FlowRole, port: Option<usize>) {
         self.apply_wire_edit("disconnect", from, to, role, port)
             .await;
     }
 
-    /// Build the opaque `WireEdit` JSON from a visual interaction and send it to
-    /// the daemon's draft-wire RPC, then swap the editor draft for the returned
-    /// mutated draft and refresh the projected graph. Zerocode carries no
-    /// edge-to-routing logic: it only forwards the interaction and renders the
-    /// daemon's answer.
     async fn apply_wire_edit(
         &mut self,
         op: &str,
@@ -778,15 +694,6 @@ impl SopPane {
         }
     }
 
-    /// Route a key to the active editor. `Tab` advances focus: from the Name
-    /// field into the step field cursor, then cycles through each step field
-    /// (title/body/tools/kind/depends_on/next/when/on_failure/failure_arg) and
-    /// wraps back to Name. `Up`/`Down` move between steps/triggers. `Ctrl+n`
-    /// inserts a step, `Ctrl+s` saves, `Esc` cancels. Text fields take
-    /// char/backspace; `kind`/`on_failure` toggle with any char key. Trigger
-    /// commands (source/channel/alias cycling, add/remove) resolve through
-    /// `SopEditorAction` so they are rebindable and never collide with text
-    /// entry (they are alt-chorded, outside the typed-char set).
     async fn handle_editor_key(&mut self, key: crossterm::event::KeyEvent) {
         use crate::keymap::SopEditorAction;
         use crossterm::event::{KeyCode, KeyModifiers};
@@ -821,9 +728,6 @@ impl SopPane {
             KeyCode::Char(c) if !ctrl && !in_triggers => self.editor_push_char(c), // keyguard: text-entry char input
             _ => {}
         }
-        // Refresh the visual canvas projection after any edit that may have
-        // changed routing (next/depends_on/switch/on_failure). Cheap and keeps
-        // the graph the pane draws in sync with the field editor.
         if self.editor.is_some() {
             self.refresh_editor_graph().await;
         }
@@ -869,10 +773,6 @@ impl SopPane {
         }
     }
 
-    /// Append a new step and wire it from `step`'s output of the given
-    /// `role`/`port` in one draft round trip. The new step's number is the
-    /// appended tail; the connect edit routes through `apply_wire_edit`, so the
-    /// daemon owns the edge-to-routing mapping exactly as an ordinary wire does.
     async fn add_step_from(&mut self, step: u32, role: FlowRole, port: Option<usize>) {
         let target = {
             let Some(editor) = self.editor.as_mut() else {
@@ -936,8 +836,6 @@ impl SopPane {
         }
     }
 
-    /// Append a trigger (defaults to `manual`) and select it. Source and
-    /// binding are then cycled with the trigger key controls.
     fn editor_add_trigger(&mut self) {
         if let Some(ed) = self.editor.as_mut() {
             ed.draft
@@ -947,8 +845,6 @@ impl SopPane {
         }
     }
 
-    /// Remove the focused trigger. A SOP retains at least one trigger, so the
-    /// last one is not deletable (it falls back to `manual` semantics).
     fn editor_remove_trigger(&mut self) {
         if let Some(ed) = self.editor.as_mut()
             && ed.draft.triggers.len() > 1
@@ -959,9 +855,6 @@ impl SopPane {
         }
     }
 
-    /// Cycle the focused trigger's source type across the registry's bound
-    /// sources plus a single `channel` source (the channel kind is then picked
-    /// separately). Walks the fetched registry; no hardcoded source list.
     fn editor_cycle_trigger_source(&mut self, forward: bool) {
         let mut sources: Vec<String> = self
             .trigger_registry
@@ -1004,9 +897,6 @@ impl SopPane {
         }
     }
 
-    /// Cycle the focused channel trigger's channel kind across the walked
-    /// inbound-capable channel list. No-op unless the trigger is a channel
-    /// source. Resets the alias since it is kind-specific.
     fn editor_cycle_trigger_channel(&mut self, forward: bool) {
         let kinds: Vec<String> = self
             .trigger_registry
@@ -1037,9 +927,6 @@ impl SopPane {
         trigger.alias = None;
     }
 
-    /// Cycle the focused channel trigger's alias across the configured aliases
-    /// for its channel kind, including an "any" (None) slot. No-op for
-    /// non-channel triggers.
     fn editor_cycle_trigger_alias(&mut self, forward: bool) {
         let Some(ed) = self.editor.as_ref() else {
             return;
@@ -1250,10 +1137,6 @@ impl SopPane {
         let visual = self.layer == RenderLayer::Visual;
         let title = self.right_title();
 
-        // Visual layer is canon. When viewing, render the projected graph cards.
-        // When editing, render the interactive draft canvas (cards + output
-        // handles + clickable wires) so edges are authorable by click-wiring at
-        // parity with the web canvas. The field editor remains one Toggle away.
         if visual && self.error.is_none() {
             if editing {
                 self.render_editor_canvas(f, cols[1], &title);
@@ -1314,11 +1197,6 @@ impl SopPane {
         }
     }
 
-    /// Canon visual layer: place one node card per graph node at its backend
-    /// col/row (x AND y), and route flow wires between cards. The layout is
-    /// single-sourced from `graph.layout`; this pane maps grid slots to terminal
-    /// cells and draws, it never derives graph shape. Trigger nodes render as
-    /// event sources feeding the entry step, matching the web canvas.
     fn render_nodes(&mut self, f: &mut Frame, area: Rect, title: &str) {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1343,7 +1221,6 @@ impl SopPane {
 
         let slots = layout_slots(&self.graph.layout, inner, self.pan_x, self.pan_y);
 
-        // Draw wires first so cards paint over the line ends cleanly.
         for wire in self
             .graph
             .wires
@@ -1384,10 +1261,6 @@ impl SopPane {
         }
     }
 
-    /// Interactive 2D editor canvas: cards placed at backend col/row, output
-    /// handles on each card's right edge (sequence/dep/fail, or one per switch
-    /// port), clickable wires routed between cards, and an [+] add-and-wire badge
-    /// per handle. Placement is single-sourced from `editor_graph.layout`.
     fn render_editor_canvas(&mut self, frame: &mut Frame, area: Rect, title: &str) {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1429,7 +1302,6 @@ impl SopPane {
             })
             .collect();
 
-        // Wires under cards.
         for wire in self
             .editor_graph
             .wires
@@ -1453,7 +1325,6 @@ impl SopPane {
                 }),
                 _ => None,
             };
-            // Delete-zone marker at the wire midpoint.
             let (mx, my) = wire_midpoint(*from, *to);
             if in_rect(mx, my, inner) {
                 let rect = Rect::new(mx, my, 1, 1);
@@ -1466,7 +1337,6 @@ impl SopPane {
             }
         }
 
-        // Cards + handles.
         for node in &self.editor_graph.nodes {
             let Some(rect) = slots.get(&node.step).copied() else {
                 continue;
@@ -1487,7 +1357,6 @@ impl SopPane {
             render_editor_card(frame, clipped, node, step, selected);
             self.node_rects.push((node.step, clipped));
 
-            // Output handles down the card's right edge.
             let handle_x = rect.x.saturating_add(rect.width.saturating_sub(1));
             let handles: Vec<(FlowRole, Option<usize>, Color)> = match step {
                 Some(s) if !s.routing.switch.is_empty() => s
@@ -1543,10 +1412,6 @@ impl SopPane {
         }
     }
 
-    /// Display lines: the graph lines, prefixed with per-step state markers when
-    /// a run overlay is active, with the run-id prompt appended when entering it.
-    /// The active node's marker cycles through a spinner phase (same cadence as
-    /// `turn_status`) so the live step visibly pulses across the TUI surface.
     fn body_lines(&self) -> Vec<String> {
         let phase =
             (self.animation_origin.elapsed().as_millis() / 200) % ACTIVE_SPINNER.len() as u128;
@@ -1569,9 +1434,6 @@ impl SopPane {
         lines
     }
 
-    /// Render the editor buffer: the name field, then each step expanded into
-    /// its editable fields (title/body/tools/kind/routing/on_failure) with a
-    /// cursor marker on the focused field of the focused step.
     fn editor_lines(&self) -> Vec<String> {
         let Some(ed) = &self.editor else {
             return Vec::new();
@@ -1689,10 +1551,6 @@ impl SopPane {
         lines
     }
 
-    /// Detail suffix for a bound (non-channel) trigger, rendered from the
-    /// registry's field list for the source. The draft is serialized once and
-    /// values read by field key, so new registry fields render here without a
-    /// per-name arm.
     fn bound_trigger_detail(
         &self,
         source: &str,
@@ -1732,12 +1590,8 @@ impl SopPane {
     }
 }
 
-/// Spinner frames for the active node, cycled by `body_lines` at the TUI redraw
-/// cadence to give the live step a visible pulse.
 const ACTIVE_SPINNER: [&str; 4] = ["|>", "/>", "->", "\\>"];
 
-/// State glyph for an overlaid node. The active node is animated: its glyph is
-/// supplied by the caller from the spinner phase. All other states are static.
 fn state_marker(state: NodeRunState, active_frame: &str) -> String {
     match state {
         NodeRunState::Active => active_frame.to_string(),
@@ -1748,18 +1602,15 @@ fn state_marker(state: NodeRunState, active_frame: &str) -> String {
     }
 }
 
-/// The leading step number of a graph line formatted as `N. title ...`.
 fn leading_step(line: &str) -> Option<u64> {
     line.split_once('.')
         .and_then(|(head, _)| head.trim().parse().ok())
 }
 
-/// Point-in-rect test for mouse hit detection.
 fn in_rect(col: u16, row: u16, r: Rect) -> bool {
     col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
 }
 
-/// Row rects inside a bordered list block, one per item, for mouse hit-testing.
 fn list_row_rects(area: Rect, count: usize) -> Vec<Rect> {
     let inner_x = area.x.saturating_add(1);
     let inner_y = area.y.saturating_add(1);
@@ -1772,8 +1623,6 @@ fn list_row_rects(area: Rect, count: usize) -> Vec<Rect> {
         .collect()
 }
 
-/// Colour for a projected pin: flow pins are green, required data pins sky,
-/// optional data pins dim. Matches the web `NodeCard` pin styling.
 fn pin_color(pin: &GraphPin) -> Color {
     match pin.class {
         PinClass::Flow => Color::Green,
@@ -1822,8 +1671,6 @@ fn wire_color(w: &GraphWire) -> Color {
     }
 }
 
-/// State-driven border colour for a node card, at parity with the web
-/// `nodeStateTone`.
 fn node_border_color(state: Option<NodeRunState>) -> Color {
     match state {
         Some(NodeRunState::Active) => Color::Magenta,
@@ -1834,16 +1681,11 @@ fn node_border_color(state: Option<NodeRunState>) -> Color {
     }
 }
 
-/// Terminal-cell geometry for one node card in the 2D canvas.
 const CARD_W: u16 = 22;
 const CARD_H: u16 = 5;
 const COL_GAP: u16 = 6;
 const ROW_GAP: u16 = 2;
 
-/// Map every node's backend grid slot (col/row) to a terminal `Rect`, offset by
-/// the camera pan. Placement is single-sourced from `layout`; this only scales
-/// grid coordinates to cells. Rects may fall partly or wholly outside `inner`;
-/// callers clip and cull.
 fn layout_slots(
     layout: &GraphLayout,
     inner: Rect,
@@ -1865,13 +1707,10 @@ fn layout_slots(
     slots
 }
 
-/// Whether two rects share any cell.
 fn rects_overlap(a: Rect, b: Rect) -> bool {
     a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
 }
 
-/// Intersect `r` with `bounds` so a card that runs past the pane edge paints
-/// only the visible part.
 fn clip_rect(r: Rect, bounds: Rect) -> Rect {
     let x = r.x.max(bounds.x);
     let y = r.y.max(bounds.y);
@@ -1880,8 +1719,6 @@ fn clip_rect(r: Rect, bounds: Rect) -> Rect {
     Rect::new(x, y, right.saturating_sub(x), bottom.saturating_sub(y))
 }
 
-/// The cell where a wire's routed line crosses its horizontal midpoint. Used to
-/// place the clickable delete marker.
 fn wire_midpoint(from: Rect, to: Rect) -> (u16, u16) {
     let x1 = from.x + from.width.saturating_sub(1);
     let y1 = from.y + from.height / 2;
@@ -1890,39 +1727,30 @@ fn wire_midpoint(from: Rect, to: Rect) -> (u16, u16) {
     ((x1 + x2) / 2, (y1 + y2) / 2)
 }
 
-/// Route a flow wire from the right edge of `from` to the left edge of `to`
-/// with an L-shaped path of box-drawing glyphs: horizontal out of the source, a
-/// vertical run at the midpoint column, then horizontal into the target. Every
-/// painted cell is clipped to `inner`.
 fn draw_wire_2d(f: &mut Frame, inner: Rect, from: Rect, to: Rect, color: Color) {
     let x1 = from.x.saturating_add(from.width.saturating_sub(1));
     let y1 = from.y.saturating_add(from.height / 2);
     let x2 = to.x;
     let y2 = to.y.saturating_add(to.height / 2);
     if x2 <= x1 {
-        // Back-edge or same column: draw a short straight nub so it is visible.
         put_cell(f, inner, x1, y1, "─", color);
         return;
     }
     let midx = x1 + (x2 - x1) / 2;
     let style = Style::default().fg(color);
-    // Horizontal from source to the bend column.
     for x in x1..=midx {
         put_cell(f, inner, x, y1, "─", color);
     }
-    // Vertical run at the bend column between the two row centers.
     let (top, bot) = if y1 <= y2 { (y1, y2) } else { (y2, y1) };
     for y in top..=bot {
         put_cell(f, inner, midx, y, "│", color);
     }
-    // Corner glyphs.
     if y1 != y2 {
         let corner_top = if y1 < y2 { "╮" } else { "╯" };
         let corner_bot = if y1 < y2 { "╰" } else { "╭" };
         put_cell(f, inner, midx, y1, corner_top, color);
         put_cell(f, inner, midx, y2, corner_bot, color);
     }
-    // Horizontal from the bend column into the target, arrow at the tip.
     for x in midx..x2 {
         put_cell(f, inner, x, y2, "─", color);
     }
@@ -1940,8 +1768,6 @@ fn put_cell(f: &mut Frame, inner: Rect, x: u16, y: u16, glyph: &str, color: Colo
     );
 }
 
-/// Render a trigger source node: a dashed-accent card with the trigger kind and
-/// its display string, and a single event output handle on the right edge.
 fn render_trigger_card(f: &mut Frame, area: Rect, node: &GraphNode) {
     let header = Line::from(vec![
         Span::styled("⚡ ", Style::default().fg(Color::LightBlue)),
@@ -1967,8 +1793,6 @@ fn render_trigger_card(f: &mut Frame, area: Rect, node: &GraphNode) {
     );
 }
 
-/// Render an editor step card at its 2D slot: step chip + title on the header,
-/// a tools/checkpoint hint line, selected cards get a cyan border.
 fn render_editor_card(
     f: &mut Frame,
     area: Rect,
@@ -2015,8 +1839,6 @@ fn render_editor_card(
     );
 }
 
-/// Render a single node card: a bordered box with the step chip + title +
-/// state badge on the header row, then a pins row (inputs left, outputs right).
 fn render_node_card(
     f: &mut Frame,
     area: Rect,
@@ -2073,7 +1895,6 @@ fn render_node_card(
     f.render_widget(para, area);
 }
 
-/// Parse the `sops/run-overlay` projection into the pane's overlay view.
 fn parse_overlay(value: &serde_json::Value) -> RunOverlayView {
     let states = value
         .get("nodes")
@@ -2115,7 +1936,6 @@ fn parse_overlay(value: &serde_json::Value) -> RunOverlayView {
     }
 }
 
-/// Extract SOP names from the `sops/list` array response.
 fn parse_sop_names(value: &serde_json::Value) -> Vec<String> {
     value
         .as_array()
@@ -2127,8 +1947,6 @@ fn parse_sop_names(value: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Format the `sops/graph` projection into display lines: one line per node
-/// with its outbound flow targets, then a diagnostics block when present.
 fn graph_to_lines(graph: &serde_json::Value) -> Vec<String> {
     let mut lines = Vec::new();
     let nodes = graph.get("nodes").and_then(|n| n.as_array());
