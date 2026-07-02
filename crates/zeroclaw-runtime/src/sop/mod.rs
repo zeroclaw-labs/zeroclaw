@@ -25,9 +25,9 @@ pub use store::{
 };
 #[allow(unused_imports)]
 pub use types::{
-    DeterministicRunState, DeterministicSavings, Sop, SopEvent, SopExecutionMode, SopPriority,
-    SopRun, SopRunAction, SopRunStatus, SopStep, SopStepKind, SopStepResult, SopStepStatus,
-    SopTrigger, SopTriggerSource, StepSchema,
+    DeterministicRunState, DeterministicSavings, FilesystemEventKind, Sop, SopEvent,
+    SopExecutionMode, SopPriority, SopRun, SopRunAction, SopRunStatus, SopStep, SopStepKind,
+    SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource, StepSchema,
 };
 
 use anyhow::Result;
