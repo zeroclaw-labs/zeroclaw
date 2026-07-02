@@ -134,11 +134,12 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
                 "       Permissions: Issues R/W, Pull requests R/W, Metadata R. Webhook: off."
             );
             println!("    2. Generate a private key (.pem) and install the app on your repos");
-            println!("    3. Run: zeroclaw config set channels.github.default.app-id <id>");
+            println!("    3. Run: zeroclaw config set channels.git.default.provider github");
+            println!("       Run: zeroclaw config set channels.git.default.app-id <id>");
             println!(
-                "       Run: zeroclaw config set channels.github.default.private-key-path <path>"
+                "       Run: zeroclaw config set channels.git.default.private-key-path <path>"
             );
-            println!("       Run: zeroclaw config set channels.github.default.enabled true");
+            println!("       Run: zeroclaw config set channels.git.default.enabled true");
             println!("    4. Start: zeroclaw channel start");
         }
         "Browser" => {

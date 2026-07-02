@@ -15682,8 +15682,8 @@ pub struct GitConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
-    /// Git forge provider. Supported: `"github"`, `"gitea"`, and
-    /// `"forgejo"` (Forgejo uses the Gitea-compatible REST provider).
+    /// Git forge provider. Supported: `"github"`. Gitea and Forgejo
+    /// support is added in the follow-on provider slice.
     /// Default: `"github"`.
     #[tab(Connection)]
     #[serde(default = "default_git_provider")]
@@ -15792,7 +15792,7 @@ impl ChannelConfig for GitConfig {
         "Git"
     }
     fn desc() -> &'static str {
-        "Git forge (GitHub, Gitea, Forgejo): issues, PRs & events"
+        "Git forge (GitHub): issues, PRs & events"
     }
 }
 
