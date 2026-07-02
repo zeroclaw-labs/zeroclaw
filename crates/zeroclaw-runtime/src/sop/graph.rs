@@ -118,11 +118,6 @@ pub struct SopGraph {
     pub layout: GraphLayout,
 }
 
-pub trait GraphRender {
-    type Output;
-    fn render(&self, graph: &SopGraph) -> Self::Output;
-}
-
 pub enum TextGraphFormat {
     Outline,
     Adjacency,

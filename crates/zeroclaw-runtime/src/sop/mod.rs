@@ -20,7 +20,7 @@ pub mod wire;
 pub use audit::SopAuditLogger;
 pub use engine::{MaintenanceSummary, SopEngine};
 pub use graph::{
-    FlowRole, GraphDiagnostic, GraphLayout, GraphNode, GraphPin, GraphRender, GraphSeverity,
+    FlowRole, GraphDiagnostic, GraphLayout, GraphNode, GraphPin, GraphSeverity,
     GraphWire, NodeKind, NodePosition, NodeRunOverlay, NodeRunState, PinClass, RunOverlay,
     SopGraph, TRIGGER_NODE_BASE, TextGraphFormat, render_graph_text,
 };
