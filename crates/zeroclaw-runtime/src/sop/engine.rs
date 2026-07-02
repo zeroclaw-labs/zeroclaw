@@ -15,9 +15,9 @@ use super::store::{
     InMemoryRunStore, PersistedRun, RetentionPolicy, SopEventRecord, SopRunStore, StoreError,
 };
 use super::types::{
-    DeterministicRunState, DeterministicSavings, Sop, SopEvent, SopExecutionMode, SopPriority,
-    SopRun, SopRunAction, SopRunStatus, SopStep, SopStepKind, SopStepResult, SopStepStatus,
-    SopTrigger, SopTriggerSource,
+    DeterministicRunState, DeterministicSavings, FilesystemEventKind, Sop, SopEvent,
+    SopExecutionMode, SopPriority, SopRun, SopRunAction, SopRunStatus, SopStep, SopStepKind,
+    SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource,
 };
 use crate::calendar::{CALENDAR_NO_SHOW_TOPIC, CalendarNoShowEvent};
 use crate::security::{ContentSafety, new_marker_id};
@@ -1192,6 +1192,33 @@ impl SopEngine {
         self.dispatch_deterministic_step(&run_id, &sop, 1, serde_json::Value::Null)
     }
 
+    /// Drive a just-started headless deterministic run to a terminal state.
+    ///
+    /// Channel-sourced dispatch (filesystem, MQTT, peripheral, cron) has no
+    /// agent loop to execute steps, so a deterministic run that returns
+    /// `DeterministicStep` would otherwise sit in `active_runs` as `Running`
+    /// forever, consuming its `max_concurrent` slot and blocking every later
+    /// event from the same SOP. Advancing each step here drains the chain to
+    /// `Completed`, which evicts the run via `finish_run` and frees the slot so
+    /// the next matching event can fire. A `CheckpointWait` is intentionally
+    /// left paused (an operator gate, not a stuck run).
+    pub fn drive_headless_deterministic(
+        &mut self,
+        run_id: &str,
+        first_action: SopRunAction,
+    ) -> Result<SopRunAction> {
+        let mut action = first_action;
+        loop {
+            match action {
+                SopRunAction::DeterministicStep { ref input, .. } => {
+                    let piped = input.clone();
+                    action = self.advance_deterministic_step(run_id, piped, None)?;
+                }
+                terminal => return Ok(terminal),
+            }
+        }
+    }
+
     /// Advance a deterministic run with the output of the current step.
     /// The output is piped as input to the next step.
     pub fn advance_deterministic_step(
@@ -1847,6 +1874,26 @@ fn trigger_matches(trigger: &SopTrigger, event: &SopEvent) -> bool {
             }
         }
 
+        (
+            SopTrigger::Amqp {
+                routing_key,
+                condition,
+            },
+            SopTriggerSource::Amqp,
+        ) => {
+            let key_match = event
+                .topic
+                .as_deref()
+                .is_some_and(|t| amqp_routing_key_matches(routing_key, t));
+            if !key_match {
+                return false;
+            }
+            match condition {
+                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
+                None => true,
+            }
+        }
+
         (SopTrigger::Webhook { path }, SopTriggerSource::Webhook) => {
             event.topic.as_deref().is_some_and(|t| t == path)
         }
@@ -1875,6 +1922,30 @@ fn trigger_matches(trigger: &SopTrigger, event: &SopEvent) -> bool {
 
         (SopTrigger::Cron { expression }, SopTriggerSource::Cron) => {
             event.topic.as_deref().is_some_and(|t| t == expression)
+        }
+
+        (
+            SopTrigger::Filesystem {
+                path,
+                events,
+                condition,
+            },
+            SopTriggerSource::Filesystem,
+        ) => {
+            let path_match = event
+                .topic
+                .as_deref()
+                .is_some_and(|t| filesystem_path_matches(path, t));
+            if !path_match {
+                return false;
+            }
+            if !events.is_empty() && !filesystem_event_listed(events, event.payload.as_deref()) {
+                return false;
+            }
+            match condition {
+                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
+                None => true,
+            }
         }
 
         (
@@ -1946,6 +2017,53 @@ fn mqtt_topic_matches(pattern: &str, topic: &str) -> bool {
 
     // Both must be fully consumed (unless pattern ended with #)
     pi == pat_parts.len() && ti == top_parts.len()
+}
+
+/// AMQP topic-exchange routing-key matching. Keys are `.`-delimited words;
+/// `*` matches exactly one word and `#` matches zero or more words. A `#` that
+/// can absorb zero segments is what distinguishes this from MQTT matching.
+fn amqp_routing_key_matches(pattern: &str, key: &str) -> bool {
+    let pat: Vec<&str> = pattern.split('.').collect();
+    let words: Vec<&str> = key.split('.').collect();
+    amqp_match_from(&pat, &words)
+}
+
+fn amqp_match_from(pat: &[&str], words: &[&str]) -> bool {
+    match pat.first() {
+        None => words.is_empty(),
+        Some(&"#") => (0..=words.len()).any(|skip| amqp_match_from(&pat[1..], &words[skip..])),
+        Some(&"*") => !words.is_empty() && amqp_match_from(&pat[1..], &words[1..]),
+        Some(seg) => {
+            !words.is_empty() && *seg == words[0] && amqp_match_from(&pat[1..], &words[1..])
+        }
+    }
+}
+
+/// Glob match a filesystem trigger `pattern` against a normalized `path`,
+/// supporting `*` (single segment) and `**` (recursive) wildcards via the
+/// `glob` crate. A bare directory pattern also matches paths nested beneath it.
+fn filesystem_path_matches(pattern: &str, path: &str) -> bool {
+    if let Ok(compiled) = glob::Pattern::new(pattern)
+        && compiled.matches(path)
+    {
+        return true;
+    }
+    let prefix = pattern.trim_end_matches('/');
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+/// Whether the payload's `event` field names one of the trigger's listed kinds.
+fn filesystem_event_listed(events: &[FilesystemEventKind], payload: Option<&str>) -> bool {
+    let Some(payload) = payload else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    let Some(kind) = value.get("event").and_then(|e| e.as_str()) else {
+        return false;
+    };
+    events.iter().any(|e| e.to_string() == kind)
 }
 
 // ── Execution mode resolution ───────────────────────────────────
@@ -2323,6 +2441,48 @@ mod tests {
         let event = mqtt_event("sensors/temp", "{}");
         let matches = engine.match_trigger(&event);
         assert!(matches.is_empty());
+    }
+
+    fn amqp_event(routing_key: &str, payload: &str) -> SopEvent {
+        SopEvent {
+            source: SopTriggerSource::Amqp,
+            topic: Some(routing_key.into()),
+            payload: Some(payload.into()),
+            timestamp: now_iso8601(),
+        }
+    }
+
+    #[test]
+    fn amqp_routing_key_exact_star_hash() {
+        assert!(amqp_routing_key_matches("a.b.c", "a.b.c"));
+        assert!(!amqp_routing_key_matches("a.b.c", "a.b"));
+        assert!(amqp_routing_key_matches("a.*.c", "a.b.c"));
+        assert!(!amqp_routing_key_matches("a.*.c", "a.b.b.c"));
+        assert!(amqp_routing_key_matches("a.#", "a.b.c.d"));
+        assert!(amqp_routing_key_matches("a.#", "a"));
+        assert!(amqp_routing_key_matches("#", ""));
+        assert!(amqp_routing_key_matches("a.#.d", "a.d"));
+        assert!(amqp_routing_key_matches("a.#.d", "a.b.c.d"));
+        assert!(!amqp_routing_key_matches("a.#.d", "a.b.c"));
+    }
+
+    #[test]
+    fn match_amqp_trigger_wildcard() {
+        let sop = Sop {
+            triggers: vec![SopTrigger::Amqp {
+                routing_key: "org.*.anitya.#".into(),
+                condition: None,
+            }],
+            ..test_sop("anitya-sop", SopExecutionMode::Auto, SopPriority::Normal)
+        };
+        let engine = engine_with_sops(vec![sop]);
+        let hit = engine.match_trigger(&amqp_event(
+            "org.release-monitoring.anitya.project.version.update",
+            "{}",
+        ));
+        assert_eq!(hit.len(), 1);
+        let miss = engine.match_trigger(&amqp_event("org.release-monitoring.fedmsg.x", "{}"));
+        assert!(miss.is_empty());
     }
 
     #[test]
