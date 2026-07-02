@@ -76,6 +76,7 @@ mod tests {
                 alias: "gh".to_string(),
             },
             trust: TrustClass::Untrusted,
+            origin: zeroclaw_api::ingress::TurnOrigin::Channel,
         };
         let policy = IngressPolicy::default();
         assert_eq!(

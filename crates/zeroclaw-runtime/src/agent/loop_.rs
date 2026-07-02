@@ -5870,6 +5870,7 @@ mod tests {
                 alias: "gh".to_string(),
             },
             trust: zeroclaw_api::ingress::TrustClass::Untrusted,
+            origin: zeroclaw_api::ingress::TurnOrigin::Channel,
         })
         .await;
 
