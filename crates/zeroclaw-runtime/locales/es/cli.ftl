@@ -598,6 +598,8 @@ cli-status-model = {"   "}Modelo:         {$model}
 cli-status-observability = 📊 Observabilidad:  {$v}
 cli-status-trace-storage = 🧾 Almacenamiento de trazas:  {$mode} ({$path})
 cli-status-agents = 🛡️  Agentes:        {$v}
+cli-status-agent-risk-profile = {$alias}={$level}
+cli-status-agent-no-risk-profile-summary = {$alias}=<sin risk_profile>
 cli-status-runtime = ⚙️  Entorno de ejecución:       {$v}
 cli-status-heartbeat = 💓 Latido:      {$v}
 cli-status-heartbeat-every-minutes = cada {$minutes}min
@@ -626,6 +628,8 @@ cli-status-word-off = desactivado
 cli-status-word-none = (ninguno)
 cli-status-word-configured = configurado
 cli-status-word-not-configured = no configurado
+cli-status-channel-configured = ✅ {$status}
+cli-status-channel-not-configured = ❌ {$status}
 cli-status-channel-not-compiled = 🚫 configurado, no compilado
 cli-config-all-configured = Todas las secciones ya están configuradas.
 cli-config-schema-current = La configuración ya está en la versión actual del esquema.

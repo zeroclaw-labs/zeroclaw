@@ -597,6 +597,8 @@ cli-status-model = {"   "}模型：         {$model}
 cli-status-observability = 📊 可观测性：  {$v}
 cli-status-trace-storage = 🧾 跟踪存储：  {$mode}（{$path}）
 cli-status-agents = 🛡️  Agents:        {$v}
+cli-status-agent-risk-profile = {$alias}={$level}
+cli-status-agent-no-risk-profile-summary = {$alias}=<无 risk_profile>
 cli-status-runtime = ⚙️  运行时：       {$v}
 cli-status-heartbeat = 💓 心跳：      {$v}
 cli-status-heartbeat-every-minutes = 每 {$minutes} 分钟
@@ -625,6 +627,8 @@ cli-status-word-off = 关闭
 cli-status-word-none = （无）
 cli-status-word-configured = 已配置
 cli-status-word-not-configured = 未配置
+cli-status-channel-configured = ✅ {$status}
+cli-status-channel-not-configured = ❌ {$status}
 cli-status-channel-not-compiled = 🚫 已配置，未编译
 cli-config-all-configured = 所有部分均已配置。
 cli-config-schema-current = 配置已为当前架构版本。
