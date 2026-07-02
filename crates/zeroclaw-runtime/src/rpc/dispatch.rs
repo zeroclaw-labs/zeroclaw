@@ -4156,6 +4156,54 @@ mod tests {
         );
     }
 
+    /// Regression for #8193. Registering `tool_search` is not enough: the TUI
+    /// Chat `session/new` agent must also *advertise* the deferred MCP tools in
+    /// its system prompt so the model knows they exist and to call
+    /// `tool_search`. Before the fix, `agent.rs` pushed `tool_search` but never
+    /// built the deferred-tools section, so the agent reported it had no MCP
+    /// tools / no `tool_search`. This asserts the section (and the concrete
+    /// dotted `<server>__<tool>` stub) reaches the system prompt.
+    #[tokio::test]
+    async fn chat_session_new_advertises_deferred_mcp_section_in_system_prompt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let config = make_mcp_granting_config(&tmp, server.uri(), true);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-deferred-prompt-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-deferred-prompt-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let prompt = agent
+            .system_prompt_for_test()
+            .expect("system prompt must render");
+        assert!(
+            prompt.contains("## Deferred Tools"),
+            "system prompt must include the deferred-tools section; prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("tool_search"),
+            "system prompt must instruct the model to call `tool_search`; prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("remote__domains.list"),
+            "system prompt must advertise the dotted `<server>__<tool>` stub; prompt: {prompt}"
+        );
+    }
+
     #[tokio::test]
     async fn chat_session_new_exposes_prefixed_mcp_tool_in_eager_mode() {
         let tmp = tempfile::TempDir::new().unwrap();
