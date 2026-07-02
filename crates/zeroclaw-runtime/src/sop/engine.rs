@@ -262,6 +262,9 @@ impl SopEngine {
             .collect()
     }
 
+    /// True when any loaded SOP has a trigger of this source. Fan-in
+    /// callers use this as a cheap pre-filter before building and
+    /// dispatching an event.
     pub fn wants_source(&self, source: SopTriggerSource) -> bool {
         self.sops
             .iter()
@@ -1985,6 +1988,10 @@ fn trigger_matches(trigger: &SopTrigger, event: &SopEvent) -> bool {
     }
 }
 
+/// Match a channel trigger against an event topic of the form `channel` or
+/// `channel/alias`. Channel type compares case-insensitively; an aliased
+/// trigger requires an exact alias, an alias-less trigger matches any
+/// instance. No topic fails closed.
 fn channel_trigger_topic_matches(channel: &str, alias: Option<&str>, topic: Option<&str>) -> bool {
     let Some(topic) = topic else {
         return false;

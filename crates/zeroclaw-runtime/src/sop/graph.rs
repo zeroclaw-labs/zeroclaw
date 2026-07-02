@@ -1,5 +1,8 @@
 //! Blueprint graph projection of a `Sop`.
 //!
+//! Projects the linear step list plus routing metadata into a node/wire
+//! graph for visual editors (web node canvas, zerocode SOP pane) and text
+//! renderers. Pure projection: building a graph never mutates the SOP.
 
 use serde::{Deserialize, Serialize};
 
@@ -9,18 +12,27 @@ use super::types::{Sop, SopStep};
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PinClass {
+    /// Execution-order edge: which step runs after which.
     Flow,
+    /// Typed data edge inferred from step input/output schemas.
     Data,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// Why a flow wire exists. Mirrors the `StepRouting`/`StepFailure` field it
+/// was derived from, so an editor can write edits back to the right place.
 #[serde(rename_all = "snake_case")]
 pub enum FlowRole {
+    /// Implicit fallthrough or explicit `routing.next`.
     Sequence,
+    /// `routing.depends_on` fan-in: source must complete before target runs.
     Dependency,
+    /// `on_failure: goto` recovery edge.
     Failure,
+    /// Named conditional port from `routing.switch`.
     Switch,
+    /// Derived from the SOP's triggers; read-only, never hand-wired.
     Trigger,
 }
 
@@ -28,12 +40,16 @@ pub enum FlowRole {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum NodeKind {
+    /// An executable SOP step.
     Step,
+    /// A synthetic entry node representing one of the SOP's triggers.
     Trigger,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// One connection point on a node. Flow pins order execution; data pins
+/// carry the step's declared input/output schema type.
 pub struct GraphPin {
     pub class: PinClass,
     pub name: String,
@@ -44,6 +60,8 @@ pub struct GraphPin {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// A node in the projected graph: one SOP step, or one synthetic trigger
+/// entry (`step >= TRIGGER_NODE_BASE`, `trigger_index` set).
 pub struct GraphNode {
     pub step: u32,
     pub title: String,
@@ -61,10 +79,14 @@ fn node_kind_step() -> NodeKind {
     NodeKind::Step
 }
 
+/// Node-id offset for synthetic trigger nodes, keeping them disjoint from
+/// real step numbers. Trigger `i` gets node id `TRIGGER_NODE_BASE + i`.
 pub const TRIGGER_NODE_BASE: u32 = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// A directed edge between two nodes. `flow_role` is set for flow wires;
+/// data wires carry the producer/consumer pin names instead.
 pub struct GraphWire {
     pub class: PinClass,
     pub from_step: u32,
@@ -87,6 +109,8 @@ pub enum GraphSeverity {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// A validation finding anchored to a step. Errors block saving
+/// (`validate_sop_strict`); warnings render but do not block.
 pub struct GraphDiagnostic {
     pub severity: GraphSeverity,
     pub step: u32,
@@ -95,6 +119,8 @@ pub struct GraphDiagnostic {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// Grid placement for one node: column = longest flow path from an entry,
+/// row = order of insertion within that column.
 pub struct NodePosition {
     pub step: u32,
     pub col: u32,
@@ -103,6 +129,8 @@ pub struct NodePosition {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// Deterministic auto-layout so every surface renders the same picture
+/// without a client-side layout engine.
 pub struct GraphLayout {
     pub positions: Vec<NodePosition>,
     pub columns: u32,
@@ -111,6 +139,8 @@ pub struct GraphLayout {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// The full projected graph: nodes, wires, validation diagnostics, and a
+/// precomputed layout. Serialized as-is over RPC (`sops/graph`) and HTTP.
 pub struct SopGraph {
     pub nodes: Vec<GraphNode>,
     pub wires: Vec<GraphWire>,
@@ -118,12 +148,18 @@ pub struct SopGraph {
     pub layout: GraphLayout,
 }
 
+/// Rendering style for `render_graph_text`.
 pub enum TextGraphFormat {
+    /// Numbered step list with flow successors (`1. Title -> 2, 3`).
     Outline,
+    /// One edge per line with a role label (`1 -> 2 [switch:pr]`).
     Adjacency,
+    /// Pretty-printed JSON of the whole `SopGraph`.
     Json,
 }
 
+/// Render a graph as plain text for CLI output and agent-readable summaries.
+/// Diagnostics are appended as a trailing block in non-JSON formats.
 pub fn render_graph_text(graph: &SopGraph, format: &TextGraphFormat) -> String {
     match format {
         TextGraphFormat::Json => {
@@ -301,6 +337,10 @@ fn types_compatible(from: Option<&str>, to: Option<&str>) -> bool {
 }
 
 impl SopGraph {
+    /// Project a SOP into a graph. Never fails: unresolvable references
+    /// (missing steps, dangling switch ports, unsatisfied required inputs)
+    /// become diagnostics instead of errors, so editors can render and fix
+    /// broken drafts.
     pub fn from_sop(sop: &Sop) -> Self {
         let mut nodes: Vec<GraphNode> = sop.steps.iter().map(node_for).collect();
         let valid_steps: std::collections::HashSet<u32> =
@@ -581,6 +621,8 @@ impl SopGraph {
         }
     }
 
+    /// True when any diagnostic is `Error` severity; such a graph fails
+    /// `validate_sop_strict` and cannot be saved.
     pub fn has_errors(&self) -> bool {
         self.diagnostics
             .iter()
@@ -590,9 +632,12 @@ impl SopGraph {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// Per-node execution state projected from a run's step results.
 #[serde(rename_all = "snake_case")]
 pub enum NodeRunState {
+    /// Not reached yet (or run ended before reaching it).
     Pending,
+    /// The run's current step while the run is live.
     Active,
     Completed,
     Failed,
@@ -601,6 +646,8 @@ pub enum NodeRunState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// Run state for one step node. Trigger nodes carry no run state and are
+/// omitted from overlays.
 pub struct NodeRunOverlay {
     pub step: u32,
     pub state: NodeRunState,
@@ -608,6 +655,8 @@ pub struct NodeRunOverlay {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// Live run state layered over a `SopGraph`, letting a canvas animate an
+/// execution without re-fetching the graph. Served by `sops/run-overlay`.
 pub struct RunOverlay {
     pub run_id: String,
     pub sop_name: String,
@@ -620,6 +669,8 @@ pub struct RunOverlay {
 }
 
 impl RunOverlay {
+    /// Project a run onto a graph. Recorded step results win; the current
+    /// step shows `Active` only while the run is non-terminal.
     pub fn project(graph: &SopGraph, run: &super::types::SopRun) -> Self {
         use super::types::{SopRunStatus, SopStepStatus};
 

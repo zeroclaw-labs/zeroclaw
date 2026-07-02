@@ -1959,6 +1959,15 @@ pub enum SopStepKind {
     Checkpoint,
 }
 
+// ── SOP wire view types ──────────────────────────────────────────
+//
+// Mirrors of the runtime's `sop::graph` / `sop::trigger_registry` wire
+// shapes, copied (not linked) per zerocode's RPC-only boundary. The pinned
+// pairing tests live in `sop_method_tests` here and in
+// `sop::graph::tests::graph_serializes_to_the_pinned_wire_shape` runtime-side;
+// if the daemon evolves the shape, fix both together.
+
+/// Per-node execution state from a `sops/run-overlay` result.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeRunState {
@@ -2062,6 +2071,7 @@ pub struct GraphLayout {
     pub rows: u32,
 }
 
+/// Result shape of `sops/graph` and `sops/graph-draft`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SopGraphView {
     #[serde(default)]
@@ -2118,6 +2128,7 @@ pub struct BoundTriggerSourceView {
     pub fields: Vec<TriggerFieldView>,
 }
 
+/// Result shape of `sops/trigger-sources`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TriggerSourceRegistryView {
     #[serde(default)]

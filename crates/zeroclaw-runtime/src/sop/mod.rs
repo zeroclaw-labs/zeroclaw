@@ -129,6 +129,8 @@ pub fn load_sops(
     load_sops_from_directory(&dir, default_execution_mode)
 }
 
+/// Load a single SOP by directory name from the SOPs root. Errors if the
+/// directory or its `SOP.toml` is missing or malformed.
 pub fn load_sop_by_name(
     sops_dir: &Path,
     name: &str,
@@ -137,6 +139,8 @@ pub fn load_sop_by_name(
     load_sop(&sops_dir.join(name), default_execution_mode)
 }
 
+/// Delete an SOP's directory (manifest, steps, everything). Errors if no
+/// SOP with that name exists.
 pub fn delete_sop(sops_dir: &Path, name: &str) -> Result<()> {
     let dir = sops_dir.join(name);
     if !dir.exists() {
@@ -146,6 +150,8 @@ pub fn delete_sop(sops_dir: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Create a new SOP on disk, refusing to overwrite an existing one. Same
+/// normalization and validation as `save_sop`.
 pub fn create_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
     if sops_dir.join(&sop.name).exists() {
         anyhow::bail!("SOP '{}' already exists", sop.name);
@@ -153,6 +159,8 @@ pub fn create_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
     save_sop(sops_dir, sop)
 }
 
+/// Project the live run state for `run_id` onto `sop`'s graph. Errors if
+/// the run is unknown or the engine lock is poisoned.
 pub fn run_overlay_for(
     sop: &Sop,
     engine: &Arc<Mutex<SopEngine>>,
@@ -168,6 +176,12 @@ pub fn run_overlay_for(
     Ok(RunOverlay::project(&graph, run))
 }
 
+/// Renumber steps to a contiguous 1..=N sequence (positional order wins)
+/// and remap every internal reference: `routing.next`, `depends_on`,
+/// switch `goto` targets, and `on_failure: goto`. References to steps that
+/// no longer exist are dropped (`goto` falls back to `Fail`). No-op when
+/// step numbers are ambiguous (duplicates), since a remap would guess.
+/// Runs automatically inside `save_sop`.
 pub fn normalize_step_numbers(sop: &mut Sop) {
     let mut seen = std::collections::HashSet::new();
     if !sop.steps.iter().all(|s| seen.insert(s.number)) {
@@ -660,6 +674,9 @@ fn render_step_bullets(step: &SopStep) -> Vec<String> {
     bullets
 }
 
+/// Render steps back to `SOP.md` markdown, the inverse of `parse_steps`.
+/// Every contract field (tools, scope, schema, routing, failure policy,
+/// mode) becomes a sub-bullet, so render -> parse is lossless.
 pub fn render_steps(steps: &[SopStep]) -> String {
     let mut out = String::from("## Steps\n\n");
     for step in steps {
@@ -678,6 +695,10 @@ pub fn render_steps(steps: &[SopStep]) -> String {
     out
 }
 
+/// Persist an SOP to `<sops_dir>/<name>/` as `SOP.toml` + `SOP.md`.
+/// Normalizes step numbers first, then rejects the write entirely if
+/// strict validation finds blocking problems; nothing touches disk on
+/// failure.
 pub fn save_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
     let mut sop = sop.clone();
     normalize_step_numbers(&mut sop);
@@ -734,6 +755,8 @@ pub fn validate_sop(sop: &Sop) -> Vec<String> {
     warnings
 }
 
+/// Result of `validate_sop_strict`: `blocking` problems reject a save,
+/// `warnings` surface in editors but do not block.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SopValidation {
     pub blocking: Vec<String>,
@@ -746,6 +769,10 @@ impl SopValidation {
     }
 }
 
+/// Authoring-gate validation: empty name, empty step titles, and duplicate
+/// step numbers block, as do graph projection errors (dangling `next` /
+/// `depends_on` / switch / goto targets, unsatisfiable required inputs).
+/// Graph warnings and the legacy `validate_sop` findings are advisory.
 pub fn validate_sop_strict(sop: &Sop) -> SopValidation {
     let mut blocking = Vec::new();
 

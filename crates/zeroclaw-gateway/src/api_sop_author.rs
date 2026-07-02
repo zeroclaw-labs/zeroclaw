@@ -1,5 +1,10 @@
 //! SOP authoring surface for the web node editor.
 //!
+//! HTTP twin of the daemon's `sops/*` RPC methods, backed by the same
+//! `zeroclaw_runtime::sop` authoring core (load/save/delete, graph
+//! projection, wire edits, trigger registry). All routes require gateway
+//! auth. Draft endpoints (`wire-draft`, `graph-draft`) are pure: they
+//! transform the submitted SOP and never touch disk.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -185,6 +190,7 @@ pub async fn handle_sop_delete(
     }
 }
 
+/// Body for `wire-draft`: a full draft SOP plus one edit to apply.
 #[derive(serde::Deserialize)]
 pub struct WireDraftRequest {
     pub sop: zeroclaw_runtime::sop::Sop,
@@ -211,6 +217,7 @@ pub async fn handle_sop_wire_draft(
     Json(serde_json::json!({ "sop": sop, "graph": graph })).into_response()
 }
 
+/// Body for `graph-draft`: a full draft SOP to project without saving.
 #[derive(serde::Deserialize)]
 pub struct GraphDraftRequest {
     pub sop: zeroclaw_runtime::sop::Sop,

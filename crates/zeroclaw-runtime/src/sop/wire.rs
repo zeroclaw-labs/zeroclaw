@@ -1,3 +1,8 @@
+//! Wire-edit application: translates a visual editor's connect/disconnect
+//! gesture into the corresponding `StepRouting`/`StepFailure` mutation on a
+//! draft `Sop`. The graph is a projection; these edits write back to the
+//! source of truth it was projected from.
+
 use serde::{Deserialize, Serialize};
 
 use super::graph::FlowRole;
@@ -7,26 +12,40 @@ use super::types::Sop;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WireOp {
+    /// Create the edge, overwriting any previous target of the same role.
     Connect,
+    /// Remove the edge only if it currently points at the given target.
     Disconnect,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One editor gesture. `role` picks which routing field is mutated; `port`
+/// is required for `Switch` (index into `routing.switch`) and ignored
+/// otherwise. Accepted over RPC (`sops/wire-draft`) and HTTP.
 pub struct WireEdit {
     pub op: WireOp,
+    /// Source step number (the node the wire leaves).
     pub from: u32,
+    /// Target step number (the node the wire enters).
     pub to: u32,
     pub role: FlowRole,
+    /// Switch port index; grows the port list on connect if needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Why a wire edit was rejected. The draft SOP is left untouched on error.
 pub enum WireError {
+    /// `from` or `to` names a step number not present in the SOP.
     UnknownStep(u32),
+    /// `Switch` edit without a `port` index.
     MissingPort,
+    /// `port` does not exist on the step (disconnect never grows the list).
     PortOutOfRange(usize),
+    /// `from == to`; steps cannot wire to themselves.
     SelfLoop(u32),
+    /// Trigger edges are derived from `sop.triggers`, never hand-wired.
     TriggerNotWirable,
 }
 
@@ -47,6 +66,17 @@ impl std::fmt::Display for WireError {
 
 impl std::error::Error for WireError {}
 
+/// Apply one wire edit to a draft SOP, mutating the routing field the edit's
+/// role maps to. Validates both endpoints first; on `Err` the SOP is
+/// unchanged. Semantics per role:
+///
+/// - `Sequence` connect sets `routing.next` and clears `terminal`;
+///   disconnect clears a matching `next` and sets `terminal` so the implicit
+///   fallthrough edge does not immediately reappear.
+/// - `Dependency` edits `to`'s `depends_on` (connect is idempotent).
+/// - `Failure` sets/clears `on_failure: goto` on `from`.
+/// - `Switch` sets/clears `routing.switch[port].goto` on `from`; connect
+///   grows the port list with default rules up to `port`.
 pub fn apply_wire(sop: &mut Sop, edit: &WireEdit) -> Result<(), WireError> {
     if edit.role == FlowRole::Trigger {
         return Err(WireError::TriggerNotWirable);

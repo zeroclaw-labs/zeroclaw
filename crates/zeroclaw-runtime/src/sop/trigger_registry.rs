@@ -1,5 +1,9 @@
 //! Trigger-source registry projected for the SOP authoring surfaces.
 //!
+//! Walks the backend enums (`SopTriggerSource`, `ChannelKind`,
+//! `FilesystemEventKind`) so editors render whatever the runtime supports
+//! instead of hardcoding option lists. Served via `sops/trigger-sources`
+//! (RPC) and the gateway's SOP authoring routes.
 
 use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
@@ -7,6 +11,7 @@ use zeroclaw_api::attribution::ChannelKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// One configured channel instance an SOP channel trigger can bind to.
 pub struct ChannelAlias {
     pub alias: String,
     pub enabled: bool,
@@ -16,6 +21,8 @@ pub struct ChannelAlias {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// One channel type row: every inbound-capable `ChannelKind` appears,
+/// configured or not, so editors can offer setup for missing ones.
 pub struct ChannelTriggerKind {
     pub channel: String,
     pub aliases: Vec<ChannelAlias>,
@@ -25,16 +32,21 @@ pub struct ChannelTriggerKind {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// Input widget hint for a trigger field.
 #[serde(rename_all = "snake_case")]
 pub enum TriggerFieldKind {
+    /// Free-form single value (topic, path, cron expression, ...).
     #[default]
     Text,
+    /// Multi-value selection; `options` carries the choices when finite.
     List,
+    /// Condition expression evaluated against the trigger payload.
     Expression,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// One editable field of a trigger source (e.g. `topic` for MQTT).
 pub struct TriggerField {
     pub name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -72,6 +84,7 @@ impl TriggerField {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// A non-channel trigger source and the fields needed to configure it.
 pub struct BoundTriggerSource {
     pub source: String,
     pub fields: Vec<TriggerField>,
@@ -79,12 +92,19 @@ pub struct BoundTriggerSource {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// Everything an authoring surface needs to offer trigger configuration:
+/// bound (non-channel) sources with their field shapes, plus per-channel
+/// availability. `Channel` is special-cased into `channels` because its
+/// options depend on live config, not just the enum.
 pub struct TriggerSourceRegistry {
     pub bound: Vec<BoundTriggerSource>,
     pub channels: Vec<ChannelTriggerKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Config-derived channel instance used as input to `build_registry`;
+/// decoupled from `zeroclaw_config` so the walk is testable without a full
+/// `Config`.
 pub struct ConfiguredChannel {
     pub channel_type: String,
     pub alias: String,
@@ -96,6 +116,9 @@ fn setup_path_for(channel: &str) -> String {
     format!("/config/channels/{channel}")
 }
 
+/// Build the registry from live config: collects configured channel aliases
+/// (normalizing `-` to `_` to match `ChannelKind` wire names) and delegates
+/// to `build_registry`.
 #[must_use]
 pub fn registry_from_config(config: &zeroclaw_config::schema::Config) -> TriggerSourceRegistry {
     let configured: Vec<ConfiguredChannel> = config
@@ -111,6 +134,10 @@ pub fn registry_from_config(config: &zeroclaw_config::schema::Config) -> Trigger
     build_registry(&configured)
 }
 
+/// Build the registry by walking the trigger-source and channel enums.
+/// Every `SopTriggerSource` except `Channel` becomes a bound source; every
+/// inbound-capable `ChannelKind` becomes a channel row with whatever
+/// configured aliases match it.
 #[must_use]
 pub fn build_registry(configured: &[ConfiguredChannel]) -> TriggerSourceRegistry {
     use crate::sop::types::SopTriggerSource;

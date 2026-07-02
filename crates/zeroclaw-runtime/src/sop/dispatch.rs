@@ -392,6 +392,12 @@ pub fn process_headless_results(results: &[DispatchResult]) {
     }
 }
 
+/// Headless fan-in chokepoint for untrusted external events (channel
+/// messages, AMQP deliveries, ...): caps oversized topic/payload at the
+/// configured `untrusted_payload_max_bytes` (with an explicit truncation
+/// marker), stamps the event, dispatches it against loaded SOP triggers,
+/// and audits the results. Callers should gate on
+/// `SopEngine::wants_source` first to skip the work when no SOP listens.
 pub async fn dispatch_untrusted_fan_in(
     engine: &Arc<Mutex<SopEngine>>,
     audit: &SopAuditLogger,
