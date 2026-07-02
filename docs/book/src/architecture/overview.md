@@ -88,9 +88,9 @@ sequenceDiagram
 
 Full detail: [Request lifecycle](./request-lifecycle.md).
 
-## Extension points
+## Core traits
 
-Trait-based extension contracts live in `zeroclaw-api`; the trait definitions in `crates/zeroclaw-api/src/` are the source of truth for built-in providers, channels, tools, memory backends, and peripherals. For capabilities that should live outside the core binary, start with the [Plugin Guides](../plugins/index.md). The bullets below point to the closest adjacent docs.
+Trait contracts live in `zeroclaw-api`; the trait definitions in `crates/zeroclaw-api/src/` are the source of truth for built-in providers, channels, tools, memory backends, and peripherals. For capabilities that should live outside the core binary, start with the [plugin guides](../plugins/index.md). The bullets below point to the closest adjacent docs.
 
 - **`ModelProvider`**: use `custom` or an existing provider family for OpenAI-compatible endpoints; implement this trait when adding a new provider family, auth model, capability declaration, or wire protocol. See [Custom providers](../providers/custom.md).
 - **`Channel`**: implement for a new messaging platform. Inbound and outbound are separate hooks. See [Channels overview](../channels/overview.md).

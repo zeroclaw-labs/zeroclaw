@@ -492,7 +492,7 @@ A plugin is a `cdylib` crate that targets the component model. Generate the
 guest bindings from the same `wit/v0` package the host uses, implement the
 exported world, and compile to `wasm32-wasip2`. For the full worked
 walkthroughs from empty crate to installed plugin, see the
-[Plugin Guides](../plugins/index.md); the notes below cover the
+[plugin guides](../plugins/index.md); the notes below cover the
 build and install mechanics.
 
 ### Building

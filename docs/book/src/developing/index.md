@@ -1,7 +1,8 @@
-# Extending & Plugins
+# Plugins
 
-Use these pages when extending ZeroClaw or working on project tooling.
-For step-by-step plugin authoring, see the [Plugin Guides](../plugins/index.md).
+Use these pages when working with ZeroClaw's plugin system or on project
+tooling. For step-by-step plugin authoring, see the
+[Guides](../plugins/index.md).
 
 - [How plugins work](./how-plugins-work.md)
 - [Built-in tool inventory](./tool-inventory.md)

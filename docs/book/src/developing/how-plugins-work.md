@@ -13,7 +13,7 @@ reads the capabilities and permissions it declares, and exposes its tools to
 the agent only when the operator has turned the plugin system on. Nothing about
 a plugin is implicit: a plugin gets exactly the capabilities its manifest
 declares and the operator's policy allows, and nothing else. To build one
-yourself, start with the [Plugin Guides](../plugins/index.md).
+yourself, start with the [plugin guides](../plugins/index.md).
 
 Three properties hold at every layer:
 
