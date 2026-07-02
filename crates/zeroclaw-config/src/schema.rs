@@ -13098,6 +13098,21 @@ fn resolve_slack_token(configured: Option<&str>, kind: &str) -> Option<String> {
     None
 }
 
+/// How the Mattermost channel receives inbound messages.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum MattermostListenMode {
+    /// Poll REST API every 3 seconds. The default — all existing configs
+    /// continue to work without changes.
+    #[default]
+    Polling,
+    /// Connect to `/api/v4/websocket` for near-real-time event delivery.
+    Websocket,
+}
+
 /// Mattermost bot channel configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -13179,6 +13194,13 @@ pub struct MattermostConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub proxy_url: Option<String>,
+
+    /// Listen mode: `"polling"` (REST API every 3s, default) or `"websocket"`
+    /// (persistent WebSocket connection to `/api/v4/websocket` for near-real-time
+    /// event delivery). WebSocket mode reduces server load and delivers events
+    /// faster but requires a WebSocket-capable Mattermost server (v4.0+).
+    #[serde(default)]
+    pub listen_mode: MattermostListenMode,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.

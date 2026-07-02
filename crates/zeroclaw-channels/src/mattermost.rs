@@ -1,11 +1,14 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+pub use zeroclaw_config::schema::MattermostListenMode;
 
 const MAX_MATTERMOST_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 /// Cadence at which auto-discovery re-runs to pick up newly-created DMs
@@ -14,6 +17,22 @@ const DISCOVERY_REFRESH: Duration = Duration::from_secs(60);
 /// Poll interval per discovery iteration. Matches the previous single-channel
 /// cadence so operators see no change in latency.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Application-level ping interval for the Mattermost WebSocket protocol.
+const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
+/// Read timeout for the initial "hello" frame after WebSocket connect.
+const WS_HELLO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Read timeout for the active WebSocket session. If no frame arrives
+/// within this window the peer is considered unresponsive and the
+/// listener exits into the reconnect path. Set to 3× ping interval so
+/// the server can miss two pings before we declare it dead.
+const WS_READ_TIMEOUT: Duration = Duration::from_secs(90);
+/// Initial backoff (seconds) for WebSocket reconnect attempts.
+const WS_RECONNECT_INITIAL_BACKOFF_SECS: u64 = 3;
+/// Maximum backoff (seconds) for WebSocket reconnect attempts.
+const WS_RECONNECT_MAX_BACKOFF_SECS: u64 = 120;
+/// Maximum jitter (ms) added to each reconnect delay.
+const WS_RECONNECT_MAX_JITTER_MS: u64 = 500;
 
 /// One channel the bot will poll. `is_direct` flags DM (`type=D`) and group DM
 /// (`type=G`) channels so the receive path can bypass `mention_only` for them.
@@ -104,6 +123,8 @@ pub struct MattermostChannel {
     proxy_url: Option<String>,
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
+    /// How this channel receives inbound messages. Defaults to `Polling`.
+    listen_mode: MattermostListenMode,
 }
 
 impl MattermostChannel {
@@ -138,6 +159,7 @@ impl MattermostChannel {
             proxy_url: None,
             transcription: None,
             transcription_manager: None,
+            listen_mode: MattermostListenMode::default(),
         }
     }
 
@@ -370,6 +392,12 @@ impl MattermostChannel {
         self
     }
 
+    /// Set the listen mode. Defaults to `Polling` when not called.
+    pub fn with_listen_mode(mut self, listen_mode: MattermostListenMode) -> Self {
+        self.listen_mode = listen_mode;
+        self
+    }
+
     fn http_client(&self) -> reqwest::Client {
         zeroclaw_config::schema::build_channel_proxy_client_with_timeouts(
             "channel.mattermost",
@@ -377,6 +405,28 @@ impl MattermostChannel {
             30,
             10,
         )
+    }
+
+    /// Derive the WebSocket URL from the REST base URL.
+    fn ws_url(&self) -> String {
+        self.base_url
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1)
+            + "/api/v4/websocket"
+    }
+
+    /// Compute an exponential backoff delay with jitter for WebSocket reconnect.
+    fn ws_reconnect_delay(attempt: u32) -> Duration {
+        let jitter_ms = if WS_RECONNECT_MAX_JITTER_MS > 0 {
+            rand::random::<u64>() % (WS_RECONNECT_MAX_JITTER_MS + 1)
+        } else {
+            0
+        };
+        let multiplier = 1u64.checked_shl(attempt).unwrap_or(u64::MAX);
+        let backoff_secs = WS_RECONNECT_INITIAL_BACKOFF_SECS
+            .saturating_mul(multiplier)
+            .min(WS_RECONNECT_MAX_BACKOFF_SECS);
+        Duration::from_secs(backoff_secs) + Duration::from_millis(jitter_ms)
     }
 
     /// Check if a user ID is in the allowlist.
@@ -643,97 +693,9 @@ impl Channel for MattermostChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        // Resolve auth up front so misconfiguration fails fast at listen-time.
-        let initial_token = self.token().await?.to_string();
-        let (bot_user_id, bot_username) = self.get_bot_identity().await;
-
-        let auto_discover = self.scoped_channel_ids().is_none();
-        let mut target_channels = self.list_target_channels().await?;
-        let mut last_discovery = Instant::now();
-        let mut last_create_at_by_channel: HashMap<String, i64> = HashMap::new();
-
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "alias": self.alias,
-                    "channel_count": target_channels.len(),
-                    "auto_discover": auto_discover,
-                    "team_ids": self.team_ids,
-                    "discover_dms": self.discover_dms,
-                })
-            ),
-            "Mattermost channel listening"
-        );
-
-        loop {
-            tokio::time::sleep(POLL_INTERVAL).await;
-
-            if auto_discover && last_discovery.elapsed() >= DISCOVERY_REFRESH {
-                match self.list_target_channels().await {
-                    Ok(refreshed) => {
-                        if refreshed != target_channels {
-                            ::zeroclaw_log::record!(
-                                INFO,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note,
-                                )
-                                .with_attrs(::serde_json::json!({
-                                    "alias": self.alias,
-                                    "before": target_channels.len(),
-                                    "after": refreshed.len(),
-                                })),
-                                "Mattermost auto-discovery refreshed channel list"
-                            );
-                            target_channels = refreshed;
-                        }
-                    }
-                    Err(e) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note,
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({
-                                "alias": self.alias,
-                                "error": format!("{}", e),
-                            })),
-                            "Mattermost auto-discovery refresh failed; keeping previous channel list"
-                        );
-                    }
-                }
-                last_discovery = Instant::now();
-            }
-
-            if target_channels.is_empty() {
-                continue;
-            }
-
-            #[allow(clippy::cast_possible_truncation)]
-            let bootstrap_ms = (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()) as i64;
-
-            for target in target_channels.clone() {
-                if self
-                    .poll_channel(
-                        &target,
-                        &initial_token,
-                        &bot_user_id,
-                        &bot_username,
-                        bootstrap_ms,
-                        &mut last_create_at_by_channel,
-                        &tx,
-                    )
-                    .await
-                {
-                    return Ok(());
-                }
-            }
+        match self.listen_mode {
+            MattermostListenMode::Polling => self.listen_polling(tx).await,
+            MattermostListenMode::Websocket => self.listen_websocket(tx).await,
         }
     }
 
@@ -810,6 +772,657 @@ impl Channel for MattermostChannel {
     }
 }
 
+impl MattermostChannel {
+    async fn listen_polling(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+        // Resolve auth up front so misconfiguration fails fast at listen-time.
+        let initial_token = self.token().await?.to_string();
+        let (bot_user_id, bot_username) = self.get_bot_identity().await;
+
+        let auto_discover = self.scoped_channel_ids().is_none();
+        let mut target_channels = self.list_target_channels().await?;
+        let mut last_discovery = Instant::now();
+        let mut last_create_at_by_channel: HashMap<String, i64> = HashMap::new();
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "alias": self.alias,
+                    "channel_count": target_channels.len(),
+                    "auto_discover": auto_discover,
+                    "team_ids": self.team_ids,
+                    "discover_dms": self.discover_dms,
+                })
+            ),
+            "Mattermost channel listening (polling)"
+        );
+
+        loop {
+            tokio::time::sleep(POLL_INTERVAL).await;
+
+            if auto_discover && last_discovery.elapsed() >= DISCOVERY_REFRESH {
+                match self.list_target_channels().await {
+                    Ok(refreshed) => {
+                        if refreshed != target_channels {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note,
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "alias": self.alias,
+                                    "before": target_channels.len(),
+                                    "after": refreshed.len(),
+                                })),
+                                "Mattermost auto-discovery refreshed channel list"
+                            );
+                            target_channels = refreshed;
+                        }
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note,
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "alias": self.alias,
+                                "error": format!("{}", e),
+                            })),
+                            "Mattermost auto-discovery refresh failed; keeping previous channel list"
+                        );
+                    }
+                }
+                last_discovery = Instant::now();
+            }
+
+            if target_channels.is_empty() {
+                continue;
+            }
+
+            #[allow(clippy::cast_possible_truncation)]
+            let bootstrap_ms = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()) as i64;
+
+            for target in target_channels.clone() {
+                if self
+                    .poll_channel(
+                        &target,
+                        &initial_token,
+                        &bot_user_id,
+                        &bot_username,
+                        bootstrap_ms,
+                        &mut last_create_at_by_channel,
+                        &tx,
+                    )
+                    .await
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    async fn listen_websocket(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+        let token = self.token().await?.to_string();
+        let (bot_user_id, bot_username) = self.get_bot_identity().await;
+
+        let auto_discover = self.scoped_channel_ids().is_none();
+        let mut target_channels = self.list_target_channels().await?;
+
+        let build_map = |chs: &[TargetChannel]| -> HashMap<String, bool> {
+            chs.iter().map(|t| (t.id.clone(), t.is_direct)).collect()
+        };
+        let mut channel_direct_map: HashMap<String, bool> = build_map(&target_channels);
+        let mut last_discovery = Instant::now();
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "alias": self.alias,
+                    "channel_count": target_channels.len(),
+                    "auto_discover": auto_discover,
+                    "mode": "websocket",
+                })
+            ),
+            "Mattermost WebSocket listening"
+        );
+
+        let mut reconnect_attempt: u32 = 0;
+        let mut seq: i64 = 1;
+
+        loop {
+            // Periodic channel re-discovery
+            if auto_discover && last_discovery.elapsed() >= DISCOVERY_REFRESH {
+                match self.list_target_channels().await {
+                    Ok(refreshed) => {
+                        if refreshed != target_channels {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note,
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "alias": self.alias,
+                                    "before": target_channels.len(),
+                                    "after": refreshed.len(),
+                                })),
+                                "Mattermost WS auto-discovery refreshed channel list"
+                            );
+                            target_channels = refreshed;
+                            channel_direct_map = build_map(&target_channels);
+                        }
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note,
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "alias": self.alias,
+                                "error": format!("{}", e),
+                            })),
+                            "Mattermost WS discovery refresh failed; keeping previous"
+                        );
+                    }
+                }
+                last_discovery = Instant::now();
+            }
+
+            let ws_url = self.ws_url();
+            let (ws_stream, _) = match zeroclaw_config::schema::ws_connect_with_proxy(
+                &ws_url,
+                "channel.mattermost",
+                self.proxy_url.as_deref(),
+            )
+            .await
+            {
+                Ok(c) => {
+                    reconnect_attempt = 0;
+                    c
+                }
+                Err(e) => {
+                    let wait = Self::ws_reconnect_delay(reconnect_attempt);
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "alias": self.alias,
+                                "ws_url": &ws_url,
+                                "error": format!("{}", e),
+                                "retry_secs": wait.as_secs(),
+                                "attempt": reconnect_attempt,
+                            })),
+                        "Mattermost WS connect failed, retrying"
+                    );
+                    reconnect_attempt = reconnect_attempt.saturating_add(1);
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            };
+
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "alias": self.alias,
+                        "ws_url": &ws_url,
+                    })),
+                "Mattermost WebSocket connected"
+            );
+
+            let (mut write, mut read) = ws_stream.split();
+
+            // Read the "hello" challenge frame with a deadline so an
+            // unresponsive server does not stall the listener forever.
+            let hello_text = match tokio::time::timeout(WS_HELLO_TIMEOUT, read.next()).await {
+                Ok(Some(Ok(WsMessage::Text(t)))) => t,
+                Ok(Some(Ok(WsMessage::Close(frame)))) => {
+                    let code = frame.as_ref().map(|f| u16::from(f.code));
+                    let reason = frame.as_ref().map(|f| f.reason.as_ref()).unwrap_or("");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "alias": self.alias,
+                                "ws_url": &ws_url,
+                                "code": code,
+                                "reason": reason,
+                            })),
+                        "Mattermost WS closed before hello, reconnecting"
+                    );
+                    let wait = Self::ws_reconnect_delay(reconnect_attempt);
+                    reconnect_attempt = reconnect_attempt.saturating_add(1);
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                Ok(None) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "alias": self.alias,
+                            })),
+                        "Mattermost WS stream ended before hello, reconnecting"
+                    );
+                    let wait = Self::ws_reconnect_delay(reconnect_attempt);
+                    reconnect_attempt = reconnect_attempt.saturating_add(1);
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                Ok(Some(Err(e))) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "alias": self.alias,
+                                "error": format!("{}", e),
+                            })),
+                        "Mattermost WS read error before hello, reconnecting"
+                    );
+                    let wait = Self::ws_reconnect_delay(reconnect_attempt);
+                    reconnect_attempt = reconnect_attempt.saturating_add(1);
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                Ok(_) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "alias": self.alias,
+                            })),
+                        "Mattermost WS unexpected frame before hello, reconnecting"
+                    );
+                    continue;
+                }
+                Err(_elapsed) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "alias": self.alias,
+                                "timeout_secs": WS_HELLO_TIMEOUT.as_secs(),
+                            })),
+                        "Mattermost WS hello timeout, reconnecting"
+                    );
+                    let wait = Self::ws_reconnect_delay(reconnect_attempt);
+                    reconnect_attempt = reconnect_attempt.saturating_add(1);
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            };
+
+            let hello: serde_json::Value = match serde_json::from_str(hello_text.as_ref()) {
+                Ok(v) => v,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "alias": self.alias,
+                                "error": format!("{}", e),
+                            })),
+                        "Mattermost WS hello parse failed, reconnecting"
+                    );
+                    continue;
+                }
+            };
+
+            if hello.get("event") != Some(&serde_json::json!("hello")) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "alias": self.alias,
+                            "event": hello.get("event"),
+                        })),
+                    "Mattermost WS unexpected first event (expected hello), reconnecting"
+                );
+                continue;
+            }
+
+            let server_version = hello
+                .get("data")
+                .and_then(|d| d.get("server_version"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "alias": self.alias,
+                        "server_version": server_version,
+                    })),
+                "Mattermost WS received hello, authenticating"
+            );
+
+            // Send authentication challenge response
+            let auth_msg = serde_json::json!({
+                "seq": seq,
+                "action": "authentication_challenge",
+                "data": { "token": token }
+            });
+            if write
+                .send(WsMessage::Text(auth_msg.to_string().into()))
+                .await
+                .is_err()
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "alias": self.alias,
+                        })),
+                    "Mattermost WS auth send failed, reconnecting"
+                );
+                continue;
+            }
+            seq = seq.wrapping_add(1);
+
+            // Spawn heartbeat pinger
+            let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel::<()>(1);
+            let ping_handle = zeroclaw_spawn::spawn!(async move {
+                let mut interval = tokio::time::interval(WS_PING_INTERVAL);
+                loop {
+                    interval.tick().await;
+                    if ping_tx.send(()).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            // Channel discovery refresh interval inside the active WS session.
+            // Solves the parity gap with polling mode: once connected, a long-lived
+            // healthy socket must still pick up new DMs/channels.
+            let mut discovery_interval = tokio::time::interval(DISCOVERY_REFRESH);
+            discovery_interval.reset(); // skip immediate first tick (already ran above)
+
+            // Inner event loop. Tracks last-frame time so a silent peer
+            // is detected and the listener exits into the reconnect path.
+            let mut last_frame = tokio::time::Instant::now();
+            'inner: loop {
+                let read_deadline = last_frame + WS_READ_TIMEOUT;
+                tokio::select! {
+                    _ = discovery_interval.tick() => {
+                        if auto_discover {
+                            match self.list_target_channels().await {
+                                Ok(refreshed) => {
+                                    if refreshed != target_channels {
+                                        ::zeroclaw_log::record!(
+                                            INFO,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Note,
+                                            )
+                                            .with_attrs(::serde_json::json!({
+                                                "alias": self.alias,
+                                                "before": target_channels.len(),
+                                                "after": refreshed.len(),
+                                            })),
+                                            "Mattermost WS in-session auto-discovery refreshed"
+                                        );
+                                        target_channels = refreshed;
+                                        channel_direct_map = build_map(&target_channels);
+                                    }
+                                }
+                                Err(e) => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note,
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({
+                                            "alias": self.alias,
+                                            "error": format!("{}", e),
+                                        })),
+                                        "Mattermost WS in-session discovery refresh failed"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ = ping_rx.recv() => {
+                        let ping = serde_json::json!({"seq": seq, "action": "ping"});
+                        if write
+                            .send(WsMessage::Text(ping.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({
+                                        "alias": self.alias,
+                                    })),
+                                "Mattermost WS ping send failed, reconnecting"
+                            );
+                            break 'inner;
+                        }
+                        seq = seq.wrapping_add(1);
+                    }
+                    frame = tokio::time::timeout(WS_READ_TIMEOUT, read.next()) => {
+                        let raw = match frame {
+                            Ok(msg) => {
+                                last_frame = tokio::time::Instant::now();
+                                msg
+                            }
+                            Err(_elapsed) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({
+                                            "alias": self.alias,
+                                            "timeout_secs": WS_READ_TIMEOUT.as_secs(),
+                                        })),
+                                    "Mattermost WS read timeout, reconnecting"
+                                );
+                                break 'inner;
+                            }
+                        };
+                        let text = match raw {
+                            Some(Ok(WsMessage::Text(t))) => t,
+                            Some(Ok(WsMessage::Ping(payload))) => {
+                                let _ = write.send(WsMessage::Pong(payload)).await;
+                                continue;
+                            }
+                            Some(Ok(WsMessage::Close(frame))) => {
+                                let code = frame.as_ref().map(|f| u16::from(f.code));
+                                let reason = frame.as_ref().map(|f| f.reason.as_ref()).unwrap_or("");
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({
+                                            "alias": self.alias,
+                                            "code": code,
+                                            "reason": reason,
+                                        })),
+                                    "Mattermost WS closed, reconnecting"
+                                );
+                                break 'inner;
+                            }
+                            None => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({
+                                            "alias": self.alias,
+                                        })),
+                                    "Mattermost WS stream ended, reconnecting"
+                                );
+                                break 'inner;
+                            }
+                            Some(Err(e)) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({
+                                            "alias": self.alias,
+                                            "error": format!("{}", e),
+                                        })),
+                                    "Mattermost WS read error, reconnecting"
+                                );
+                                break 'inner;
+                            }
+                            _ => continue,
+                        };
+
+                        let event: serde_json::Value = match serde_json::from_str(text.as_ref()) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+
+                        let event_type = event
+                            .get("event")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+
+                        match event_type {
+                            "posted" => {
+                                let post_json = event
+                                    .get("data")
+                                    .and_then(|d| d.get("post"));
+                                // The "post" field in the WebSocket event is a JSON
+                                // string that must be parsed. Use as_str() because
+                                // Value::to_string() re-serializes as a quoted JSON
+                                // string literal, which from_str would parse back as
+                                // a Value::String rather than the post object.
+                                let post_str = match post_json.and_then(|v| v.as_str().map(|s| s.to_owned())) {
+                                    Some(s) => s,
+                                    None => continue,
+                                };
+                                let post: serde_json::Value = match serde_json::from_str(&post_str) {
+                                    Ok(v) => v,
+                                    Err(_) => continue,
+                                };
+
+                                let channel_id = post
+                                    .get("channel_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+
+                                if !channel_direct_map.contains_key(channel_id) {
+                                    continue;
+                                }
+
+                                let is_direct = channel_direct_map
+                                    .get(channel_id)
+                                    .copied()
+                                    .unwrap_or(false);
+
+                                let effective_text = if post
+                                    .get("message")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("")
+                                    .trim()
+                                    .is_empty()
+                                    && post_has_audio_attachment(&post)
+                                {
+                                    self.try_transcribe_audio_attachment(&post).await
+                                } else {
+                                    None
+                                };
+
+                                if let Some(channel_msg) = self.parse_mattermost_post(
+                                    &post,
+                                    &bot_user_id,
+                                    &bot_username,
+                                    0, // no cursor needed for live events
+                                    channel_id,
+                                    effective_text.as_deref(),
+                                    is_direct,
+                                ) && tx.send(channel_msg).await.is_err()
+                                {
+                                    ping_handle.abort();
+                                    return Ok(());
+                                }
+                            }
+                            "hello" => {
+                                if let Some(conn_id) = event
+                                    .get("data")
+                                    .and_then(|d| d.get("connection_id"))
+                                    .and_then(|v| v.as_str())
+                                {
+                                    ::zeroclaw_log::record!(
+                                        INFO,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note,
+                                        )
+                                        .with_attrs(::serde_json::json!({
+                                            "alias": self.alias,
+                                            "connection_id": conn_id,
+                                        })),
+                                        "Mattermost WS authenticated"
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ = tokio::time::sleep_until(read_deadline) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "alias": self.alias,
+                                    "timeout_secs": WS_READ_TIMEOUT.as_secs(),
+                                })),
+                            "Mattermost WS idle timeout (no frame received), reconnecting"
+                        );
+                        break 'inner;
+                    }
+                }
+            } // end 'inner
+
+            ping_handle.abort();
+
+            let wait = Self::ws_reconnect_delay(reconnect_attempt);
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "alias": self.alias,
+                        "retry_secs": wait.as_secs(),
+                        "attempt": reconnect_attempt,
+                    })),
+                "Mattermost WS reconnecting after disconnect"
+            );
+            reconnect_attempt = reconnect_attempt.saturating_add(1);
+            tokio::time::sleep(wait).await;
+        }
+    }
+}
+
+// listen_polling and listen_websocket helpers moved out of the Channel
+// trait impl so they can be tested and reviewed in isolation.
 impl MattermostChannel {
     /// Poll one target channel for new posts since its cursor, dispatch each
     /// post through `parse_mattermost_post`, and update the cursor in place.
@@ -2635,5 +3248,285 @@ mod tests {
             assert_eq!(by_id.get("explicit_pub"), Some(&false));
             assert_eq!(targets.len(), 2);
         }
+    }
+
+    #[test]
+    fn test_ws_url_conversion() {
+        let ch = MattermostChannel::new(
+            "https://mm.example.com".into(),
+            Some("token".into()),
+            None,
+            None,
+            vec![],
+            "test",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        assert_eq!(ch.ws_url(), "wss://mm.example.com/api/v4/websocket");
+
+        let ch2 = MattermostChannel::new(
+            "http://localhost:8065".into(),
+            Some("token".into()),
+            None,
+            None,
+            vec![],
+            "test",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        assert_eq!(ch2.ws_url(), "ws://localhost:8065/api/v4/websocket");
+
+        // server URL with path prefix should preserve it
+        let ch3 = MattermostChannel::new(
+            "https://mm.example.com/subpath".into(),
+            Some("token".into()),
+            None,
+            None,
+            vec![],
+            "test",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        assert_eq!(
+            ch3.ws_url(),
+            "wss://mm.example.com/subpath/api/v4/websocket"
+        );
+    }
+
+    #[test]
+    fn test_listen_mode_default_is_polling() {
+        assert_eq!(
+            MattermostListenMode::default(),
+            MattermostListenMode::Polling
+        );
+    }
+
+    #[test]
+    fn test_listen_mode_serde() {
+        // serialize
+        assert_eq!(
+            serde_json::to_string(&MattermostListenMode::Polling).unwrap(),
+            "\"polling\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MattermostListenMode::Websocket).unwrap(),
+            "\"websocket\""
+        );
+
+        // deserialize
+        let polling: MattermostListenMode = serde_json::from_str("\"polling\"").unwrap();
+        assert_eq!(polling, MattermostListenMode::Polling);
+
+        let websocket: MattermostListenMode = serde_json::from_str("\"websocket\"").unwrap();
+        assert_eq!(websocket, MattermostListenMode::Websocket);
+
+        // deserialize unknown variant -> error
+        assert!(serde_json::from_str::<MattermostListenMode>("\"unknown\"").is_err());
+    }
+
+    #[test]
+    fn test_ws_reconnect_delay_bounds() {
+        // attempt 0: should be ~3s
+        let d = MattermostChannel::ws_reconnect_delay(0);
+        assert!(d >= Duration::from_secs(3));
+        assert!(d < Duration::from_secs(4)); // + jitter < 1s
+
+        // attempt 10 should be capped at ~120s
+        let d = MattermostChannel::ws_reconnect_delay(10);
+        assert!(d <= Duration::from_secs(121)); // 120s + jitter < 1s
+        assert!(d >= Duration::from_secs(120));
+
+        // large attempt should not overflow
+        let d = MattermostChannel::ws_reconnect_delay(u32::MAX);
+        assert!(d <= Duration::from_secs(121));
+    }
+
+    #[test]
+    fn test_ws_event_posted_parsing() {
+        let post = json!({
+            "id": "post123",
+            "user_id": "user456",
+            "message": "hello world",
+            "create_at": 1717000000000i64,
+            "root_id": "",
+            "channel_id": "chan789",
+            "type": ""
+        });
+
+        let ch = MattermostChannel::new(
+            "https://mm.example.com".into(),
+            Some("token".into()),
+            None,
+            None,
+            vec![],
+            "test",
+            Arc::new(|| vec!["user456".into()]),
+            false,
+            false,
+        );
+
+        let msg = ch
+            .parse_mattermost_post(&post, "bot_user", "bot_username", 0, "chan789", None, false)
+            .expect("should parse posted event post");
+
+        assert_eq!(msg.id, "mattermost_post123");
+        assert_eq!(msg.sender, "user456");
+        assert_eq!(msg.content, "hello world");
+    }
+
+    #[test]
+    fn test_ws_posted_envelope_post_is_json_string() {
+        // Mattermost sends data.post as a JSON-encoded string, not a nested
+        // object. This test exercises the extraction path the WebSocket listener
+        // uses: Value::String → as_str() → from_str. The old to_string() path
+        // would re-serialize as a quoted literal and silently drop the event.
+        let post_obj = json!({
+            "id": "post789",
+            "user_id": "user999",
+            "message": "ws message",
+            "create_at": 1717000000000i64,
+            "root_id": "",
+            "channel_id": "chan111",
+            "type": ""
+        });
+        let post_str = serde_json::to_string(&post_obj).unwrap();
+
+        let envelope = json!({
+            "event": "posted",
+            "data": {
+                "post": post_str
+            }
+        });
+
+        // Extract post the same way the fixed WebSocket listener does
+        let post_json = envelope.get("data").and_then(|d| d.get("post"));
+        let extracted_str = post_json
+            .and_then(|v| v.as_str().map(|s| s.to_owned()))
+            .expect("post field should be a JSON string");
+        let post: serde_json::Value =
+            serde_json::from_str(&extracted_str).expect("should parse the inner JSON string");
+
+        let ch = MattermostChannel::new(
+            "https://mm.example.com".into(),
+            Some("token".into()),
+            None,
+            None,
+            vec![],
+            "test",
+            Arc::new(|| vec!["user999".into()]),
+            false,
+            false,
+        );
+
+        let msg = ch
+            .parse_mattermost_post(&post, "bot_user", "bot_username", 0, "chan111", None, false)
+            .expect("should parse posted event post from envelope");
+
+        assert_eq!(msg.id, "mattermost_post789");
+        assert_eq!(msg.sender, "user999");
+        assert_eq!(msg.content, "ws message");
+    }
+
+    #[test]
+    fn test_ws_ping_message_format() {
+        // Verify the application-level ping frame the heartbeat pinger sends.
+        let seq = 1i64;
+        let ping = serde_json::json!({"seq": seq, "action": "ping"});
+        assert_eq!(ping["seq"], serde_json::json!(1i64));
+        assert_eq!(ping["action"], serde_json::json!("ping"));
+
+        // Round-trip: the message is a Text frame whose content is the JSON
+        // string. The Mattermost server expects this exact shape.
+        let text = ping.to_string();
+        let roundtripped: serde_json::Value =
+            serde_json::from_str(&text).expect("ping json must round-trip");
+        assert_eq!(roundtripped["action"], serde_json::json!("ping"));
+        assert!(roundtripped["seq"].is_i64());
+    }
+
+    #[test]
+    fn test_ws_auth_challenge_format() {
+        // Verify the authentication_challenge frame sent after hello.
+        let token = "test_bot_token";
+        let seq = 1i64;
+        let auth = serde_json::json!({
+            "seq": seq,
+            "action": "authentication_challenge",
+            "data": { "token": token }
+        });
+        assert_eq!(auth["seq"], serde_json::json!(1i64));
+        assert_eq!(
+            auth["action"],
+            serde_json::json!("authentication_challenge")
+        );
+        assert_eq!(auth["data"]["token"], serde_json::json!("test_bot_token"));
+
+        let text = auth.to_string();
+        let roundtripped: serde_json::Value =
+            serde_json::from_str(&text).expect("auth json must round-trip");
+        assert_eq!(
+            roundtripped["data"]["token"],
+            serde_json::json!("test_bot_token")
+        );
+    }
+
+    #[test]
+    fn test_ws_reconnect_delay_monotonic() {
+        // Backoff must increase across attempts. Because the delay includes
+        // up to 500ms jitter, adjacent attempts can overlap, but the
+        // minimum of attempt n+5 must exceed the maximum of attempt n.
+        let d0_max = MattermostChannel::ws_reconnect_delay(0);
+        // attempt 0: 3s base + jitter, so 3s ≤ d0_max < 4s
+        assert!(d0_max >= Duration::from_secs(3));
+        assert!(d0_max < Duration::from_secs(4));
+
+        let d5_min = MattermostChannel::ws_reconnect_delay(5);
+        // attempt 5: 96s base + jitter, so d5_min ≥ 96s
+        // This is far above d0_max, confirming meaningful backoff growth.
+        assert!(d5_min >= Duration::from_secs(96));
+
+        // The cap at 120s base is enforced: max ≤ 120s + jitter < 121s
+        let d_large = MattermostChannel::ws_reconnect_delay(u32::MAX);
+        assert!(d_large <= Duration::from_secs(121));
+        assert!(d_large >= Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_ws_timeout_constants() {
+        // WS_READ_TIMEOUT must be strictly greater than WS_PING_INTERVAL
+        // so a single missed ping does not trigger a false positive.
+        assert!(
+            WS_READ_TIMEOUT > WS_PING_INTERVAL,
+            "WS_READ_TIMEOUT ({:?}) must exceed WS_PING_INTERVAL ({:?})",
+            WS_READ_TIMEOUT,
+            WS_PING_INTERVAL
+        );
+        // WS_READ_TIMEOUT should be at least 3× ping interval so the
+        // server can miss two pings before the listener reconnects.
+        assert!(
+            WS_READ_TIMEOUT >= WS_PING_INTERVAL.mul_f64(3.0),
+            "WS_READ_TIMEOUT ({:?}) must be ≥ 3× WS_PING_INTERVAL ({:?})",
+            WS_READ_TIMEOUT,
+            WS_PING_INTERVAL
+        );
+        // Hello timeout must not exceed the read timeout.
+        assert!(WS_HELLO_TIMEOUT <= WS_READ_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn test_ws_read_timeout_detects_silent_peer() {
+        // Simulate the pattern used in the inner event loop: wrap a read
+        // future in tokio::time::timeout with WS_READ_TIMEOUT. A pending
+        // future that never resolves must trigger the timeout.
+        let never: std::future::Pending<()> = std::future::pending();
+        let short_timeout = Duration::from_millis(50);
+        let result = tokio::time::timeout(short_timeout, never).await;
+        assert!(
+            result.is_err(),
+            "timeout must fire when the inner future never resolves"
+        );
     }
 }
