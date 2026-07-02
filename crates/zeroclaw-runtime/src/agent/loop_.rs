@@ -528,6 +528,14 @@ pub(crate) fn scrub_for_export(content: &str) -> String {
 /// builds pay no cloning/scrubbing cost. The system message is split into
 /// `system_instructions`; the rest become `input`. Every string passes through
 /// [`scrub_for_export`] (image elision + dual credential scrub).
+///
+/// This function does NOT consult any OTel content policy — it only constructs
+/// a credential-scrubbed snapshot when the `observability-otel` feature is
+/// enabled. Whether that snapshot is actually exported (and at what privacy
+/// level: `off` / `redacted` / `full`) is decided by the owning
+/// `OtelObserver`'s instance content config at the OTel export boundary, not
+/// here. Keeping the policy out of the capture path avoids process-global
+/// mutable state and the cross-observer drift it caused.
 pub(crate) fn capture_llm_messages(
     messages: &[ChatMessage],
     output_text: Option<&str>,
@@ -535,16 +543,6 @@ pub(crate) fn capture_llm_messages(
 ) -> Option<zeroclaw_api::observability_traits::LlmMessageSnapshot> {
     if !cfg!(feature = "observability-otel") {
         return None;
-    }
-
-    #[cfg(feature = "observability-otel")]
-    {
-        use crate::observability::otel_config::otel_content_config;
-
-        let config = otel_content_config();
-        if config.genai_policy == zeroclaw_config::schema::OtelContentPolicy::Off {
-            return None;
-        }
     }
 
     use zeroclaw_api::observability_traits::{

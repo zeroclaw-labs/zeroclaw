@@ -100,6 +100,7 @@ otel_tool_io_max_chars = 1000        # per-field truncation limit
 - Truncation preserves JSON structure for tool arguments (leaf strings truncated).
 - Truncated fields get a `…[truncated {n} of {total} chars]` marker. The marker is metadata and does not count against `max_chars`: the kept content is exactly `max_chars` characters, with the marker appended on top.
 - Default `off` is a privacy-first change from previous behavior (feature-gated but always-on when enabled).
+- The content policy is bound to the observer/config instance, not to the process. There is no process-global OTel content policy: each `OtelObserver` derives an immutable content config from `ObservabilityConfig` at construction and consults it at the OTel export boundary. Multiple observers in the same process keep independent policies: a later observer cannot override or silence an earlier one's privacy setting (no last-writer-wins, no cross-observer drift).
 
 ### LLM request payload capture (`log_llm_request_payload`)
 

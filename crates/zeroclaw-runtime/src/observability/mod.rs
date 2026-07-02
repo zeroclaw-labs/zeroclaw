@@ -17,7 +17,7 @@ pub use self::log::LogObserver;
 #[allow(unused_imports)]
 pub use self::multi::MultiObserver;
 #[cfg(feature = "observability-otel")]
-use self::otel_config::{OtelContentConfig, set_otel_content_config};
+use self::otel_config::OtelContentConfig;
 pub use noop::NoopObserver;
 #[cfg(feature = "observability-otel")]
 pub use otel::OtelObserver;
@@ -201,6 +201,49 @@ impl Observer for TeeObserver {
     }
 }
 
+/// Emit startup warnings for any non-`Off` OTel content policy. Behavior is
+/// unchanged from the pre-isolation inline block: a non-`Off` GenAI or tool
+/// I/O policy surfaces a privacy reminder at observer construction time.
+#[cfg(feature = "observability-otel")]
+fn warn_otel_content_policy(config: OtelContentConfig) {
+    use zeroclaw_config::schema::OtelContentPolicy;
+
+    if config.genai_policy != OtelContentPolicy::Off {
+        let msg = match config.genai_policy {
+            OtelContentPolicy::Redacted => {
+                "otel_genai_content=redacted: OTel GenAI input/output will be captured with sensitive-content processing and per-field truncation. Processed content may still contain information that could lead to leakage. Enable only when necessary."
+            }
+            OtelContentPolicy::Full => {
+                "otel_genai_content=full: OTel GenAI input/output will be captured with sensitive-content processing but WITHOUT truncation. Use only in controlled environments."
+            }
+            _ => unreachable!(),
+        };
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            msg
+        );
+    }
+    if config.tool_io_policy != OtelContentPolicy::Off {
+        let msg = match config.tool_io_policy {
+            OtelContentPolicy::Redacted => {
+                "otel_tool_io=redacted: OTel tool input/output will be captured with sensitive-content processing and per-field truncation. Processed content may still contain information that could lead to leakage. Enable only when necessary."
+            }
+            OtelContentPolicy::Full => {
+                "otel_tool_io=full: OTel tool input/output will be captured with sensitive-content processing but WITHOUT truncation. Use only in controlled environments."
+            }
+            _ => unreachable!(),
+        };
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            msg
+        );
+    }
+}
+
 /// Factory: create the right observer from config
 pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     Box::new(TeeObserver {
@@ -230,93 +273,53 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
         }
         ObservabilityBackend::Otel => {
             #[cfg(feature = "observability-otel")]
-            match OtelObserver::new(
-                config.otel_endpoint.as_deref(),
-                config.otel_service_name.as_deref(),
-                config.otel_headers.clone(),
-            ) {
-                Ok(obs) => {
-                    // Normalize: max_chars == 0 → treat as Off
-                    let genai_policy = if config.otel_genai_content_max_chars == 0 {
-                        zeroclaw_config::schema::OtelContentPolicy::Off
-                    } else {
-                        config.otel_genai_content
-                    };
-                    let tool_io_policy = if config.otel_tool_io_max_chars == 0 {
-                        zeroclaw_config::schema::OtelContentPolicy::Off
-                    } else {
-                        config.otel_tool_io
-                    };
+            {
+                // Derive the per-observer content policy once, at the observer
+                // construction boundary. `ObservabilityConfig` remains the source
+                // of truth; this immutable snapshot is owned by the `OtelObserver`
+                // and consulted at the OTel export boundary. There is no
+                // process-global mutable content policy, so concurrently live
+                // observers with different policies never drift into each other.
+                let content_config = OtelContentConfig::from_observability_config(config);
 
-                    // Emit startup warnings for non-off policies
-                    if genai_policy != zeroclaw_config::schema::OtelContentPolicy::Off {
-                        let msg = match genai_policy {
-                            zeroclaw_config::schema::OtelContentPolicy::Redacted => {
-                                "otel_genai_content=redacted: OTel GenAI input/output will be captured with sensitive-content processing and per-field truncation. Processed content may still contain information that could lead to leakage. Enable only when necessary."
-                            }
-                            zeroclaw_config::schema::OtelContentPolicy::Full => {
-                                "otel_genai_content=full: OTel GenAI input/output will be captured with sensitive-content processing but WITHOUT truncation. Use only in controlled environments."
-                            }
-                            _ => unreachable!(),
-                        };
+                match OtelObserver::new(
+                    config.otel_endpoint.as_deref(),
+                    config.otel_service_name.as_deref(),
+                    config.otel_headers.clone(),
+                    content_config,
+                ) {
+                    Ok(obs) => {
+                        warn_otel_content_policy(content_config);
+
                         ::zeroclaw_log::record!(
-                            WARN,
+                            INFO,
                             ::zeroclaw_log::Event::new(
                                 module_path!(),
                                 ::zeroclaw_log::Action::Note
                             )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                            msg
+                            .with_attrs(
+                                ::serde_json::json!({"endpoint": config
+                                .otel_endpoint
+                                .as_deref()
+                                .unwrap_or("http://localhost:4318")})
+                            ),
+                            "OpenTelemetry observer initialized"
                         );
+                        Box::new(obs)
                     }
-                    if tool_io_policy != zeroclaw_config::schema::OtelContentPolicy::Off {
-                        let msg = match tool_io_policy {
-                            zeroclaw_config::schema::OtelContentPolicy::Redacted => {
-                                "otel_tool_io=redacted: OTel tool input/output will be captured with sensitive-content processing and per-field truncation. Processed content may still contain information that could lead to leakage. Enable only when necessary."
-                            }
-                            zeroclaw_config::schema::OtelContentPolicy::Full => {
-                                "otel_tool_io=full: OTel tool input/output will be captured with sensitive-content processing but WITHOUT truncation. Use only in controlled environments."
-                            }
-                            _ => unreachable!(),
-                        };
+                    Err(e) => {
                         ::zeroclaw_log::record!(
-                            WARN,
+                            ERROR,
                             ::zeroclaw_log::Event::new(
                                 module_path!(),
-                                ::zeroclaw_log::Action::Note
+                                ::zeroclaw_log::Action::Fail
                             )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                            msg
-                        );
-                    }
-
-                    set_otel_content_config(OtelContentConfig {
-                        genai_policy,
-                        genai_max_chars: config.otel_genai_content_max_chars,
-                        tool_io_policy,
-                        tool_io_max_chars: config.otel_tool_io_max_chars,
-                    });
-
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"endpoint": config
-                            .otel_endpoint
-                            .as_deref()
-                            .unwrap_or("http://localhost:4318")})),
-                        "OpenTelemetry observer initialized"
-                    );
-                    Box::new(obs)
-                }
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "Failed to create OTel observer. Falling back to noop."
-                    );
-                    Box::new(NoopObserver)
+                            "Failed to create OTel observer. Falling back to noop."
+                        );
+                        Box::new(NoopObserver)
+                    }
                 }
             }
             #[cfg(not(feature = "observability-otel"))]
