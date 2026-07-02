@@ -50,7 +50,7 @@ flowchart TB
 | `zeroclaw-tools` | Callable tool implementations the agent invokes (browser, HTTP, PDF, hardware probes) |
 | `zeroclaw-tool-call-parser` | Model-side tool-call syntax parsing and normalisation |
 | `zeroclaw-memory` | Conversation memory, embeddings, vector retrieval |
-| `zeroclaw-plugins` | Dynamic plugin loading |
+| `zeroclaw-plugins` | Sandboxed WASM plugin host (WIT component model) |
 | `zeroclaw-hardware` | Hardware abstraction layer (GPIO, I2C, SPI, USB) |
 | `zeroclaw-infra` | Process-level support: SQLite session backend, debouncers, stall watchdog |
 | `zeroclaw-log` | The single log-emission surface: JSONL schema, attribution, `record!`/`scope!` macros, `/api/logs` reader, `Observer` bridge |
