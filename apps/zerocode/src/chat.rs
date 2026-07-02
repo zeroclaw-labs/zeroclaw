@@ -2414,7 +2414,7 @@ impl Chat {
                 MouseEventKind::ScrollUp => state.scroll_up(3),
                 MouseEventKind::ScrollDown => state.scroll_down(3),
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(hit) = state.copy_action_hit_at(col, row) {
+                    if let Some(hit) = state.message_action_hit_at(col, row) {
                         match hit.action {
                             MessageAction::Copy(format) => {
                                 state.copy_entry(hit.entry_index, format)
@@ -3500,10 +3500,7 @@ fn render_tool_entry(
         theme::tool_label_style().add_modifier(sel_mod),
         rail_style,
         sel_mod,
-        &[
-            MessageAction::Copy(CopyFormat::Raw),
-            MessageAction::Copy(CopyFormat::Markdown),
-        ],
+        COPY_MESSAGE_ACTIONS,
     ));
 
     let body_start = lines.len();
@@ -3601,12 +3598,7 @@ fn render_entry_into(
                 theme::user_label_style().add_modifier(sel_mod),
                 rail_style,
                 sel_mod,
-                &[
-                    MessageAction::Copy(CopyFormat::Raw),
-                    MessageAction::Copy(CopyFormat::Markdown),
-                    MessageAction::Retry,
-                    MessageAction::Edit,
-                ],
+                message_actions_for_entry(entry),
             ));
             let body_style = theme::body_style().add_modifier(sel_mod);
             let text_lines: Vec<&str> = text.as_deref().unwrap_or("").split('\n').collect();
@@ -3634,10 +3626,7 @@ fn render_entry_into(
                 theme::agent_label_style().add_modifier(sel_mod),
                 rail_style,
                 sel_mod,
-                &[
-                    MessageAction::Copy(CopyFormat::Raw),
-                    MessageAction::Copy(CopyFormat::Markdown),
-                ],
+                message_actions_for_entry(entry),
             ));
             let body_style = theme::body_style().add_modifier(sel_mod);
             let md_lines = markdown_to_lines(text.as_ref(), width);
@@ -3690,7 +3679,7 @@ fn render_entry_into(
     }
 }
 
-fn copy_action_rects(
+fn message_action_rects(
     body_area: Rect,
     row: u16,
     actions: &[MessageAction],
@@ -3713,16 +3702,10 @@ fn copy_action_rects(
 
 fn message_actions_for_entry(entry: &ChatEntry) -> &'static [MessageAction] {
     match entry {
-        ChatEntry::UserMessage { .. } => &[
-            MessageAction::Copy(CopyFormat::Raw),
-            MessageAction::Copy(CopyFormat::Markdown),
-            MessageAction::Retry,
-            MessageAction::Edit,
-        ],
-        _ => &[
-            MessageAction::Copy(CopyFormat::Raw),
-            MessageAction::Copy(CopyFormat::Markdown),
-        ],
+        ChatEntry::UserMessage { attachments, .. } if attachments.is_empty() => {
+            EDITABLE_USER_MESSAGE_ACTIONS
+        }
+        _ => COPY_MESSAGE_ACTIONS,
     }
 }
 
@@ -3996,7 +3979,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let scrollbar_rect = is_scrollable
         .then(|| scrollbar_hit_rect(body_area))
         .flatten();
-    let copy_action_area = copy_action_body_area(body_area, scrollbar_rect);
+    let message_action_area = message_action_body_area(body_area, scrollbar_rect);
 
     // Project each entry's line range into screen coords. Off-viewport
     // ranges get no rect.
@@ -4005,7 +3988,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let body_w = inner_width;
     let body_h = inner_height;
     state.entry_rects.clear();
-    state.copy_action_hit_regions.clear();
+    state.message_action_hit_regions.clear();
     for &(entry_idx, screen_lo, screen_hi, content_width) in &state.cached_screen_ranges {
         let visible_lo = screen_lo.max(scroll);
         let visible_hi = screen_hi.min(scroll + body_h);
@@ -4028,13 +4011,15 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
                 continue;
             };
             for (action, rect) in
-                copy_action_rects(copy_action_area, y, message_actions_for_entry(entry))
+                message_action_rects(message_action_area, y, message_actions_for_entry(entry))
             {
-                state.copy_action_hit_regions.push(CopyActionHitRegion {
-                    entry_index: entry_idx,
-                    action,
-                    rect,
-                });
+                state
+                    .message_action_hit_regions
+                    .push(MessageActionHitRegion {
+                        entry_index: entry_idx,
+                        action,
+                        rect,
+                    });
             }
         }
     }
@@ -4055,7 +4040,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     state.scrollbar_track_rect = scrollbar_rect;
 }
 
-fn copy_action_body_area(body_area: Rect, scrollbar_rect: Option<Rect>) -> Rect {
+fn message_action_body_area(body_area: Rect, scrollbar_rect: Option<Rect>) -> Rect {
     let Some(scrollbar_rect) = scrollbar_rect else {
         return body_area;
     };
@@ -5012,8 +4997,20 @@ enum MessageAction {
     Edit,
 }
 
+const COPY_MESSAGE_ACTIONS: &[MessageAction] = &[
+    MessageAction::Copy(CopyFormat::Raw),
+    MessageAction::Copy(CopyFormat::Markdown),
+];
+
+const EDITABLE_USER_MESSAGE_ACTIONS: &[MessageAction] = &[
+    MessageAction::Copy(CopyFormat::Raw),
+    MessageAction::Copy(CopyFormat::Markdown),
+    MessageAction::Retry,
+    MessageAction::Edit,
+];
+
 #[derive(Debug, Clone)]
-struct CopyActionHitRegion {
+struct MessageActionHitRegion {
     entry_index: usize,
     action: MessageAction,
     rect: Rect,
@@ -5093,8 +5090,8 @@ pub struct ChatState {
     mouse_down_entry: Option<usize>,
     /// Per-entry hit rects from the last draw.
     entry_rects: Vec<(usize, ratatui::layout::Rect)>,
-    /// Per-message copy action rects from the last draw.
-    copy_action_hit_regions: Vec<CopyActionHitRegion>,
+    /// Per-message action rects from the last draw.
+    message_action_hit_regions: Vec<MessageActionHitRegion>,
     /// Clickable provider/model title spans from the last draw.
     title_hit_rects: Vec<TitleHitRect>,
     /// Scrollbar track rect from the last draw.
@@ -5201,7 +5198,7 @@ impl ChatState {
             highlighted_entry: None,
             mouse_down_entry: None,
             entry_rects: Vec::new(),
-            copy_action_hit_regions: Vec::new(),
+            message_action_hit_regions: Vec::new(),
             title_hit_rects: Vec::new(),
             scrollbar_track_rect: None,
             scrollbar_drag: None,
@@ -5273,8 +5270,8 @@ impl ChatState {
         state.copy_entry(idx, CopyFormat::Raw);
     }
 
-    fn copy_action_hit_at(&self, col: u16, row: u16) -> Option<CopyActionHitRegion> {
-        self.copy_action_hit_regions
+    fn message_action_hit_at(&self, col: u16, row: u16) -> Option<MessageActionHitRegion> {
+        self.message_action_hit_regions
             .iter()
             .find(|hit| mouse::in_rect(col, row, hit.rect))
             .cloned()
@@ -5290,7 +5287,7 @@ impl ChatState {
     }
 
     fn retry_user_entry(&mut self, idx: usize) -> bool {
-        let Some(text) = self.user_entry_text(idx) else {
+        let Some(text) = self.editable_user_entry_text(idx) else {
             return false;
         };
         match self.enqueue_message(text, Vec::new()) {
@@ -5306,10 +5303,10 @@ impl ChatState {
     }
 
     fn edit_user_entry(&mut self, idx: usize) {
-        let Some(text) = self.user_entry_text(idx) else {
+        let Some(text) = self.editable_user_entry_text(idx) else {
             return;
         };
-        if !self.input_bar.input().trim().is_empty() || self.input_bar.has_pending_attachments() {
+        if !self.input_bar.input().is_empty() || self.input_bar.has_pending_attachments() {
             self.set_info_notice(crate::i18n::t("zc-chat-edit-input-busy"));
             return;
         }
@@ -5318,10 +5315,13 @@ impl ChatState {
         self.mark_dirty_full();
     }
 
-    fn user_entry_text(&self, idx: usize) -> Option<String> {
-        let ChatEntry::UserMessage { text, .. } = self.entries.get(idx)? else {
+    fn editable_user_entry_text(&self, idx: usize) -> Option<String> {
+        let ChatEntry::UserMessage { text, attachments } = self.entries.get(idx)? else {
             return None;
         };
+        if !attachments.is_empty() {
+            return None;
+        }
         let text = text.as_deref().unwrap_or_default().to_string();
         (!text.trim().is_empty()).then_some(text)
     }
@@ -6742,15 +6742,8 @@ mod tests {
     }
 
     #[test]
-    fn copy_action_rects_track_label_widths() {
-        let rects = copy_action_rects(
-            Rect::new(10, 0, 80, 10),
-            3,
-            &[
-                MessageAction::Copy(CopyFormat::Raw),
-                MessageAction::Copy(CopyFormat::Markdown),
-            ],
-        );
+    fn message_action_rects_track_label_widths() {
+        let rects = message_action_rects(Rect::new(10, 0, 80, 10), 3, COPY_MESSAGE_ACTIONS);
         assert_eq!(
             rects[0],
             (MessageAction::Copy(CopyFormat::Raw), Rect::new(12, 3, 4, 1))
@@ -6765,15 +6758,8 @@ mod tests {
     }
 
     #[test]
-    fn copy_action_rects_clip_to_body_width() {
-        let rects = copy_action_rects(
-            Rect::new(10, 0, 7, 10),
-            3,
-            &[
-                MessageAction::Copy(CopyFormat::Raw),
-                MessageAction::Copy(CopyFormat::Markdown),
-            ],
-        );
+    fn message_action_rects_clip_to_body_width() {
+        let rects = message_action_rects(Rect::new(10, 0, 7, 10), 3, COPY_MESSAGE_ACTIONS);
         assert_eq!(
             rects,
             vec![(MessageAction::Copy(CopyFormat::Raw), Rect::new(12, 3, 4, 1))]
@@ -6781,15 +6767,43 @@ mod tests {
     }
 
     #[test]
-    fn render_conversation_clears_stale_copy_actions() {
+    fn user_action_rects_include_retry_and_edit_in_order() {
+        let rects =
+            message_action_rects(Rect::new(10, 0, 80, 10), 3, EDITABLE_USER_MESSAGE_ACTIONS);
+        let actions = rects
+            .into_iter()
+            .map(|(action, _)| action)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actions, EDITABLE_USER_MESSAGE_ACTIONS);
+    }
+
+    #[test]
+    fn attached_user_messages_are_copy_only() {
+        let entry = ChatEntry::UserMessage {
+            text: Some(Arc::<str>::from("see file")),
+            attachments: vec![Arc::<str>::from("file.txt")],
+        };
+
+        assert_eq!(message_actions_for_entry(&entry), COPY_MESSAGE_ACTIONS);
+        assert_eq!(
+            rendered_entry(&entry, 80),
+            "  copy  md  You:\n   see file\n   [file.txt]\n"
+        );
+    }
+
+    #[test]
+    fn render_conversation_clears_stale_message_actions() {
         use ratatui::{Terminal, backend::TestBackend};
 
         let mut state = state();
-        state.copy_action_hit_regions.push(CopyActionHitRegion {
-            entry_index: 99,
-            action: MessageAction::Copy(CopyFormat::Raw),
-            rect: Rect::new(1, 1, 4, 1),
-        });
+        state
+            .message_action_hit_regions
+            .push(MessageActionHitRegion {
+                entry_index: 99,
+                action: MessageAction::Copy(CopyFormat::Raw),
+                rect: Rect::new(1, 1, 4, 1),
+            });
 
         let area = Rect::new(0, 0, 80, 12);
         let backend = TestBackend::new(area.width, area.height);
@@ -6800,7 +6814,7 @@ mod tests {
             })
             .expect("draw conversation");
 
-        assert!(state.copy_action_hit_regions.is_empty());
+        assert!(state.message_action_hit_regions.is_empty());
     }
 
     #[test]
@@ -6826,14 +6840,14 @@ mod tests {
     }
 
     #[test]
-    fn copy_action_body_area_excludes_scrollbar_hit_rect() {
+    fn message_action_body_area_excludes_scrollbar_hit_rect() {
         let body_area = Rect::new(10, 0, 20, 10);
         let scrollbar_rect = Some(Rect::new(27, 0, 3, 10));
         assert_eq!(
-            copy_action_body_area(body_area, scrollbar_rect),
+            message_action_body_area(body_area, scrollbar_rect),
             Rect::new(10, 0, 17, 10)
         );
-        assert_eq!(copy_action_body_area(body_area, None), body_area);
+        assert_eq!(message_action_body_area(body_area, None), body_area);
     }
 
     #[test]
@@ -8919,6 +8933,32 @@ mod tests {
         s.edit_user_entry(0);
 
         assert_eq!(s.input_bar.input(), "revise me");
+    }
+
+    #[test]
+    fn retry_user_entry_rejects_attached_messages() {
+        let mut s = state();
+        s.entries.push(ChatEntry::UserMessage {
+            text: Some(Arc::<str>::from("again")),
+            attachments: vec![Arc::<str>::from("file.txt")],
+        });
+
+        assert!(!s.retry_user_entry(0));
+        assert_eq!(s.queue_len(), 0);
+    }
+
+    #[test]
+    fn edit_user_entry_does_not_overwrite_whitespace_input() {
+        let mut s = state();
+        s.input_bar.insert_text("   ");
+        s.entries.push(ChatEntry::UserMessage {
+            text: Some(Arc::<str>::from("revise me")),
+            attachments: vec![],
+        });
+
+        s.edit_user_entry(0);
+
+        assert_eq!(s.input_bar.input(), "   ");
     }
 
     #[test]
