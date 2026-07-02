@@ -96,6 +96,7 @@ struct TurnGuard {
     channel_name: String,
     total_input_tokens: u64,
     total_output_tokens: u64,
+    total_cost_usd: f64,
     saw_usage: bool,
     done: bool,
 }
@@ -116,7 +117,7 @@ impl TurnGuard {
                     output_tokens: self.total_output_tokens,
                 },
             ),
-            cost_usd: None,
+            cost_usd: self.saw_usage.then_some(self.total_cost_usd),
             channel: Some(self.channel_name.clone()),
             agent_alias: self.agent_alias.clone(),
             turn_id: self.turn_id.clone(),
@@ -2245,6 +2246,7 @@ impl Agent {
             channel_name: self.channel_name.clone(),
             total_input_tokens: 0,
             total_output_tokens: 0,
+            total_cost_usd: 0.0,
             saw_usage: false,
             done: false,
         };
@@ -2374,6 +2376,7 @@ impl Agent {
             guard.total_output_tokens = usage.output_tokens;
             guard.saw_usage = true;
         }
+        guard.total_cost_usd = usage.cost_usd;
         // Replay the loop's transcript additions into the conversation
         // history BEFORE propagating any loop error: rounds that already
         // executed carry side effects (tools ran), and the pre-consolidation
@@ -2642,6 +2645,7 @@ impl Agent {
             channel_name: self.channel_name.clone(),
             total_input_tokens: 0,
             total_output_tokens: 0,
+            total_cost_usd: 0.0,
             saw_usage: false,
             done: false,
         };
@@ -2824,6 +2828,7 @@ impl Agent {
                 guard.total_output_tokens = usage.output_tokens;
                 guard.saw_usage = true;
             }
+            guard.total_cost_usd = usage.cost_usd;
 
             // Replay everything the loop appended this round into the
             // conversation history and the persistence capture.
@@ -7499,6 +7504,117 @@ mod tests {
         assert!(
             agent_summary.session_cost_usd > 0.0,
             "agent alias should flow through persisted turn usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_agent_end_reports_cost_usd_when_pricing_is_configured() {
+        use crate::agent::cost::{
+            TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE, ToolLoopCostTrackingContext,
+            TurnUsage,
+        };
+        use crate::cost::CostTracker;
+        use std::collections::HashMap;
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let workspace = tempfile::TempDir::new().expect("temp dir");
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    track_per_agent: true,
+                    ..zeroclaw_config::schema::CostConfig::default()
+                },
+                workspace.path(),
+            )
+            .expect("cost tracker should initialize"),
+        );
+        let pricing = Arc::new(HashMap::from([(
+            "mock-provider".to_string(),
+            HashMap::from([
+                ("test-model.input".to_string(), 3.0),
+                ("test-model.output".to_string(), 15.0),
+            ]),
+        )]));
+        let cost_context = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing)
+            .with_agent_alias("cost-agent");
+        let turn_usage = Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                    text: Some("cost ok".into()),
+                    tool_calls: vec![],
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(500),
+                        cached_input_tokens: None,
+                        output_tokens: Some(100),
+                    }),
+                    reasoning_content: None,
+                }]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("test-model".into())
+            .model_provider_name("mock-provider".into())
+            .agent_alias("cost-agent".into())
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let _response = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(cost_context), agent.turn("hello")),
+            )
+            .await
+            .expect("turn should succeed");
+
+        let events = capturing.events.lock();
+        let (tokens, cost_usd) = events
+            .iter()
+            .find_map(|event| match event {
+                ObserverEvent::AgentEnd {
+                    tokens_used,
+                    cost_usd,
+                    ..
+                } => Some((tokens_used.clone(), *cost_usd)),
+                _ => None,
+            })
+            .expect("AgentEnd must be recorded");
+
+        let tokens = tokens.expect("AgentEnd must carry tokens_used when usage is recorded");
+        assert_eq!(
+            tokens.input_tokens, 500,
+            "input tokens must be reported on AgentEnd"
+        );
+        assert_eq!(
+            tokens.output_tokens, 100,
+            "output tokens must be reported on AgentEnd"
+        );
+
+        let cost = cost_usd.expect("AgentEnd must carry cost_usd when pricing is configured");
+        assert!(
+            cost > 0.0,
+            "cost_usd should be non-zero with configured pricing"
+        );
+
+        // Verify the cost matches expected: 500*3.0/1M + 100*15.0/1M
+        let expected_cost = (500.0 * 3.0 + 100.0 * 15.0) / 1_000_000.0;
+        assert!(
+            (cost - expected_cost).abs() < 1e-12,
+            "cost_usd should match pricing calculation; expected {expected_cost}, got {cost}"
         );
     }
 

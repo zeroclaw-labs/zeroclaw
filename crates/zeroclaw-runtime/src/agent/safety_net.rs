@@ -1113,14 +1113,18 @@ async fn safety_net_agent_turn_agent_end_reports_token_totals() {
         .expect("turn should succeed");
 
     let events = capture.events.lock();
-    let tokens = events
+    let (tokens, cost_usd) = events
         .iter()
         .find_map(|event| match event {
-            ObserverEvent::AgentEnd { tokens_used, .. } => Some(tokens_used.clone()),
+            ObserverEvent::AgentEnd {
+                tokens_used,
+                cost_usd,
+                ..
+            } => Some((tokens_used.clone(), *cost_usd)),
             _ => None,
         })
-        .expect("AgentEnd must be recorded")
-        .expect("AgentEnd must carry tokens_used");
+        .expect("AgentEnd must be recorded");
+    let tokens = tokens.expect("AgentEnd must carry tokens_used");
     assert_eq!(
         tokens.input_tokens, 18,
         "input tokens must sum across all loop iterations"
@@ -1128,6 +1132,10 @@ async fn safety_net_agent_turn_agent_end_reports_token_totals() {
     assert_eq!(
         tokens.output_tokens, 8,
         "output tokens must sum across all loop iterations"
+    );
+    assert!(
+        cost_usd.is_some_and(|c| c == 0.0),
+        "cost_usd should be 0.0 when pricing is not configured but usage was tracked"
     );
 }
 
