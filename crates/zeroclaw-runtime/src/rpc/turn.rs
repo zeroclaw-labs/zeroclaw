@@ -117,7 +117,7 @@ where
         DrainOutcome::Completed => {
             let joined = turn_handle
                 .await
-                .map_err(|e| TurnError::Panicked(format!("{e}")))?;
+                .map_err(|e| TurnError::Panicked(format!("turn task panicked: {e}")))?;
             outcome_from_task_result(joined, accumulated_text)
         }
         DrainOutcome::ExplicitCancel => {
@@ -131,7 +131,7 @@ where
             // only abort if it is genuinely wedged in a non-cooperative call.
             match tokio::time::timeout(CANCEL_GRACE, &mut turn_handle).await {
                 Ok(joined) => outcome_from_task_result(
-                    joined.map_err(|e| TurnError::Panicked(format!("{e}")))?,
+                    joined.map_err(|e| TurnError::Panicked(format!("cancelled turn task panicked: {e}")))?,
                     accumulated_text,
                 ),
                 Err(_) => {
