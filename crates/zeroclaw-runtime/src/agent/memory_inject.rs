@@ -72,6 +72,24 @@ impl Default for MemoryInjectConfig {
     }
 }
 
+/// The per-turn memory half carried on `ToolLoop`: the handle plus the
+/// recall inputs only the entry point knows. Entry points that own a memory
+/// pass `Some`; nested sub-turn sites pass `None`.
+pub struct TurnMemory<'a> {
+    /// The agent's memory backend for this turn.
+    pub handle: &'a dyn Memory,
+    /// The RAW user message to recall against (before any timestamp or
+    /// site-added prefix reaches the history message).
+    pub query: String,
+    /// Session scopes to recall from (multi-scope recalls are key-deduped
+    /// in order). Empty means one unscoped recall.
+    pub sessions: Vec<Option<String>>,
+    /// Spawn-site opt-out (e.g. a cron job with `uses_memory = false`).
+    pub suppress: bool,
+    /// The stable config half (limits, relevance floor, budgets).
+    pub cfg: MemoryInjectConfig,
+}
+
 /// The resolved injection decision for one turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InjectPolicy {

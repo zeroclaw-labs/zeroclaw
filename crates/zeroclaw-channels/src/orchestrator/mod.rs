@@ -5181,6 +5181,7 @@ async fn process_channel_message_body(
                 // Channel-orchestrator dispatch; source/transport/trust stay
                 // phase-1 placeholders. Real channel transport identity is
                 // stamped at the edge in phase 2 (RFC #6971 §4, tracker #8583).
+                memory: None,
                 ingress: zeroclaw_api::ingress::IngressContext::channel(),
                 agent_alias: Some(ctx.agent_alias.as_str()),
                 turn_id: &turn_id,
