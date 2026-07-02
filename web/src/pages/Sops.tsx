@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { AlertTriangle, XCircle, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { Badge, Card, PageHeader } from '@/components/ui';
@@ -166,6 +166,76 @@ function DiagnosticsPanel({ graph }: { graph: SopGraph }) {
   );
 }
 
+const INPUT_CLS = 'w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text';
+
+function Field({ label, hint, children }: { label: string; hint?: string | null; children: ReactNode }) {
+  return (
+    <label className="block text-sm">
+      <span className="mb-1 block text-pc-text-muted">{label}</span>
+      {children}
+      {hint ? <p className="mt-1 text-xs text-pc-text-faint">{hint}</p> : null}
+    </label>
+  );
+}
+
+function TextField({
+  label,
+  value,
+  onChange,
+  placeholder,
+}: {
+  label: string;
+  value: string;
+  onChange: (next: string) => void;
+  placeholder?: string;
+}) {
+  return (
+    <Field label={label}>
+      <input
+        type="text"
+        value={value}
+        placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value)}
+        className={INPUT_CLS}
+      />
+    </Field>
+  );
+}
+
+function SelectField({
+  label,
+  value,
+  onChange,
+  options,
+  disabled,
+  children,
+}: {
+  label: string;
+  value: string;
+  onChange: (next: string) => void;
+  options?: string[];
+  disabled?: boolean;
+  children?: ReactNode;
+}) {
+  return (
+    <Field label={label}>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        disabled={disabled}
+        className={INPUT_CLS}
+      >
+        {children}
+        {(options ?? []).map((opt) => (
+          <option key={opt} value={opt}>
+            {opt}
+          </option>
+        ))}
+      </select>
+    </Field>
+  );
+}
+
 function failureKind(f: StepFailure | undefined): 'fail' | 'retry' | 'goto' {
   if (f === undefined || f === 'fail') return 'fail';
   if ('retry' in f) return 'retry';
@@ -282,25 +352,20 @@ function StepEditor({
         </label>
       </div>
       <div className="grid grid-cols-3 gap-2 border-t border-pc-border pt-2 text-xs">
-        <label className="block">
-          <span className="mb-1 block text-pc-text-muted">{t('sops.routing_depends_on')}</span>
-          <input
-            type="text"
-            value={(routing.depends_on ?? []).join(', ')}
-            onChange={(e) =>
-              setRouting({
-                depends_on: e.target.value
-                  .split(',')
-                  .map((s) => parseInt(s.trim(), 10))
-                  .filter((n) => Number.isFinite(n)),
-              })
-            }
-            placeholder="2, 3"
-            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
-          />
-        </label>
-        <label className="block">
-          <span className="mb-1 block text-pc-text-muted">{t('sops.routing_next')}</span>
+        <TextField
+          label={t('sops.routing_depends_on')}
+          value={(routing.depends_on ?? []).join(', ')}
+          placeholder="2, 3"
+          onChange={(v) =>
+            setRouting({
+              depends_on: v
+                .split(',')
+                .map((s) => parseInt(s.trim(), 10))
+                .filter((n) => Number.isFinite(n)),
+            })
+          }
+        />
+        <Field label={t('sops.routing_next')}>
           <input
             type="number"
             value={routing.next ?? ''}
@@ -308,56 +373,47 @@ function StepEditor({
               setRouting({ next: e.target.value ? parseInt(e.target.value, 10) : undefined })
             }
             placeholder="→"
-            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+            className={INPUT_CLS}
           />
-        </label>
-        <label className="block">
-          <span className="mb-1 block text-pc-text-muted">{t('sops.routing_when')}</span>
-          <input
-            type="text"
-            value={routing.when ?? ''}
-            onChange={(e) => setRouting({ when: e.target.value || undefined })}
-            placeholder="$.value > 85"
-            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
-          />
-        </label>
-        <label className="block">
-          <span className="mb-1 block text-pc-text-muted">{t('sops.on_failure')}</span>
-          <select
-            value={fkind}
-            onChange={(e) => setFailure(e.target.value as 'fail' | 'retry' | 'goto')}
-            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
-          >
-            <option value="fail">{t('sops.failure_fail')}</option>
-            <option value="retry">{t('sops.failure_retry')}</option>
-            <option value="goto">{t('sops.failure_goto')}</option>
-          </select>
-        </label>
+        </Field>
+        <TextField
+          label={t('sops.routing_when')}
+          value={routing.when ?? ''}
+          placeholder="$.value > 85"
+          onChange={(v) => setRouting({ when: v || undefined })}
+        />
+        <SelectField
+          label={t('sops.on_failure')}
+          value={fkind}
+          onChange={(v) => setFailure(v as 'fail' | 'retry' | 'goto')}
+        >
+          <option value="fail">{t('sops.failure_fail')}</option>
+          <option value="retry">{t('sops.failure_retry')}</option>
+          <option value="goto">{t('sops.failure_goto')}</option>
+        </SelectField>
         {fkind === 'retry' && step.on_failure && typeof step.on_failure === 'object' && 'retry' in step.on_failure ? (
-          <label className="block">
-            <span className="mb-1 block text-pc-text-muted">{t('sops.failure_max')}</span>
+          <Field label={t('sops.failure_max')}>
             <input
               type="number"
               value={step.on_failure.retry.max}
               onChange={(e) =>
                 onChange({ on_failure: { retry: { max: parseInt(e.target.value, 10) || 1 } } })
               }
-              className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+              className={INPUT_CLS}
             />
-          </label>
+          </Field>
         ) : null}
         {fkind === 'goto' && step.on_failure && typeof step.on_failure === 'object' && 'goto' in step.on_failure ? (
-          <label className="block">
-            <span className="mb-1 block text-pc-text-muted">{t('sops.failure_goto_step')}</span>
+          <Field label={t('sops.failure_goto_step')}>
             <input
               type="number"
               value={step.on_failure.goto.step}
               onChange={(e) =>
                 onChange({ on_failure: { goto: { step: parseInt(e.target.value, 10) || 1 } } })
               }
-              className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+              className={INPUT_CLS}
             />
-          </label>
+          </Field>
         ) : null}
       </div>
       <div className="mt-2 rounded border border-pc-border p-2">
@@ -531,21 +587,15 @@ function TriggerFieldInput({
     }
     const current = typeof value === 'string' ? value : '';
     return (
-      <label className="block text-sm">
-        <span className="mb-1 block text-pc-text-muted">{triggerFieldLabel(name)}</span>
-        <select
-          value={current}
-          onChange={(e) => onChange(e.target.value)}
-          className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
-        >
+      <Field label={triggerFieldLabel(name)} hint={hint}>
+        <select value={current} onChange={(e) => onChange(e.target.value)} className={INPUT_CLS}>
           {options.map((opt) => (
             <option key={opt} value={opt}>
               {opt}
             </option>
           ))}
         </select>
-        {hint ? <p className="mt-1 text-xs text-pc-text-faint">{hint}</p> : null}
-      </label>
+      </Field>
     );
   }
 
@@ -559,8 +609,7 @@ function TriggerFieldInput({
       ? value
       : '';
   return (
-    <label className="block text-sm">
-      <span className="mb-1 block text-pc-text-muted">{triggerFieldLabel(name)}</span>
+    <Field label={triggerFieldLabel(name)} hint={hint}>
       <input
         type="text"
         value={text}
@@ -580,10 +629,9 @@ function TriggerFieldInput({
             onChange(raw);
           }
         }}
-        className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+        className={INPUT_CLS}
       />
-      {hint ? <p className="mt-1 text-xs text-pc-text-faint">{hint}</p> : null}
-    </label>
+    </Field>
   );
 }
 
@@ -601,36 +649,21 @@ function ChannelTriggerFields({
   return (
     <div className="space-y-2">
       <div className="grid grid-cols-2 gap-3">
-        <label className="text-sm">
-          <span className="mb-1 block text-pc-text-muted">{t('sops.trigger_channel')}</span>
-          <select
-            value={trigger.channel}
-            onChange={(e) => onChange({ channel: e.target.value, alias: null })}
-            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
-          >
-            {channels.map((c) => (
-              <option key={c.channel} value={c.channel}>
-                {c.channel}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="text-sm">
-          <span className="mb-1 block text-pc-text-muted">{t('sops.trigger_alias')}</span>
-          <select
-            value={trigger.alias ?? ''}
-            onChange={(e) => onChange({ alias: e.target.value.length > 0 ? e.target.value : null })}
-            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
-            disabled={!selected?.configured}
-          >
-            <option value="">{t('sops.trigger_alias_any')}</option>
-            {selected?.aliases.map((a) => (
-              <option key={a.alias} value={a.alias}>
-                {a.alias}
-              </option>
-            ))}
-          </select>
-        </label>
+        <SelectField
+          label={t('sops.trigger_channel')}
+          value={trigger.channel}
+          onChange={(v) => onChange({ channel: v, alias: null })}
+          options={channels.map((c) => c.channel)}
+        />
+        <SelectField
+          label={t('sops.trigger_alias')}
+          value={trigger.alias ?? ''}
+          onChange={(v) => onChange({ alias: v.length > 0 ? v : null })}
+          disabled={!selected?.configured}
+          options={(selected?.aliases ?? []).map((a) => a.alias)}
+        >
+          <option value="">{t('sops.trigger_alias_any')}</option>
+        </SelectField>
       </div>
       {selected && !selected.configured ? (
         <div className="flex items-center gap-2 text-xs text-amber-500">
@@ -687,20 +720,14 @@ function TriggerEditor({
       }`}
     >
       <div className="flex items-center justify-between gap-2">
-        <label className="flex-1 text-sm">
-          <span className="mb-1 block text-pc-text-muted">{t('sops.trigger_source')}</span>
-          <select
+        <div className="flex-1">
+          <SelectField
+            label={t('sops.trigger_source')}
             value={source}
-            onChange={(e) => onChange(blankTrigger(e.target.value, registry))}
-            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
-          >
-            {sources.map((s) => (
-              <option key={s} value={s}>
-                {s}
-              </option>
-            ))}
-          </select>
-        </label>
+            onChange={(v) => onChange(blankTrigger(v, registry))}
+            options={sources}
+          />
+        </div>
         <button
           type="button"
           onClick={onRemove}
@@ -806,62 +833,35 @@ function SopEditor({
       </div>
       {saveError ? <div className="text-sm text-rose-500">{saveError}</div> : null}
       <div className="grid grid-cols-2 gap-3">
-        <label className="text-sm">
-          <span className="mb-1 block text-pc-text-muted">{t('sops.field_name')}</span>
-          <input
-            type="text"
-            value={draft.name}
-            onChange={(e) => onField({ name: e.target.value })}
-            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
-          />
-        </label>
-        <label className="text-sm">
-          <span className="mb-1 block text-pc-text-muted">{t('sops.field_version')}</span>
-          <input
-            type="text"
-            value={draft.version}
-            onChange={(e) => onField({ version: e.target.value })}
-            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
-          />
-        </label>
-      </div>
-      <label className="block text-sm">
-        <span className="mb-1 block text-pc-text-muted">{t('sops.field_description')}</span>
-        <input
-          type="text"
-          value={draft.description}
-          onChange={(e) => onField({ description: e.target.value })}
-          className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
+        <TextField
+          label={t('sops.field_name')}
+          value={draft.name}
+          onChange={(v) => onField({ name: v })}
         />
-      </label>
+        <TextField
+          label={t('sops.field_version')}
+          value={draft.version}
+          onChange={(v) => onField({ version: v })}
+        />
+      </div>
+      <TextField
+        label={t('sops.field_description')}
+        value={draft.description}
+        onChange={(v) => onField({ description: v })}
+      />
       <div className="grid grid-cols-2 gap-3">
-        <label className="text-sm">
-          <span className="mb-1 block text-pc-text-muted">{t('sops.field_priority')}</span>
-          <select
-            value={draft.priority}
-            onChange={(e) => onField({ priority: e.target.value as Sop['priority'] })}
-            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
-          >
-            <option value="critical">critical</option>
-            <option value="high">high</option>
-            <option value="normal">normal</option>
-            <option value="low">low</option>
-          </select>
-        </label>
-        <label className="text-sm">
-          <span className="mb-1 block text-pc-text-muted">{t('sops.field_execution_mode')}</span>
-          <select
-            value={draft.execution_mode}
-            onChange={(e) => onField({ execution_mode: e.target.value as Sop['execution_mode'] })}
-            className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text"
-          >
-            <option value="auto">auto</option>
-            <option value="supervised">supervised</option>
-            <option value="step_by_step">step_by_step</option>
-            <option value="priority_based">priority_based</option>
-            <option value="deterministic">deterministic</option>
-          </select>
-        </label>
+        <SelectField
+          label={t('sops.field_priority')}
+          value={draft.priority}
+          onChange={(v) => onField({ priority: v as Sop['priority'] })}
+          options={['critical', 'high', 'normal', 'low']}
+        />
+        <SelectField
+          label={t('sops.field_execution_mode')}
+          value={draft.execution_mode}
+          onChange={(v) => onField({ execution_mode: v as Sop['execution_mode'] })}
+          options={['auto', 'supervised', 'step_by_step', 'priority_based', 'deterministic']}
+        />
       </div>
       <div className="space-y-2">
         <div className="flex items-center justify-between">
