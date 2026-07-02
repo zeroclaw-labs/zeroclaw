@@ -10,7 +10,11 @@ thing easiest to get wrong.
 Everything on this page is checked against the contract source: the
 `tool-plugin` world in `wit/v0/tool.wit`, the host-side call path in
 `crates/zeroclaw-plugins/src/runtime.rs` and `wasm_tool.rs`, and manifest
-validation in `host.rs`.
+validation in `host.rs`. Source paths are citations into the ZeroClaw
+repository for verification; the plugin itself is your own crate in your own
+repository. You never need a ZeroClaw checkout to build one, only the `wit/`
+contract files (fetched in step 1) and an installed `zeroclaw` binary with
+the plugin host compiled in to run it.
 
 ## How a tool call flows
 

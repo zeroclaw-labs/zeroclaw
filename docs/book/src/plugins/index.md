@@ -46,8 +46,8 @@ matches at once:
    constructed without them, so no load path can produce an unsandboxed
    plugin.
 3. **A typed, language-agnostic ABI.** The contract between host and plugin is
-   a set of WIT interface files (`wit/v0/` in the source tree), not a Rust
-   API. The host generates its bindings from those files with wasmtime's
+   a set of WIT interface files (`wit/v0/` in the ZeroClaw repository), not a
+   Rust API. The host generates its bindings from those files with wasmtime's
    `bindgen!`; a plugin generates the mirror-image guest bindings with
    `wit-bindgen` in Rust or the equivalent tooling in any language that
    compiles to a `wasm32-wasip2` component. Records, variants, results, and

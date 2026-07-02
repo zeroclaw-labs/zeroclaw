@@ -244,11 +244,24 @@ permission, `send` has no way to reach the platform at all).
 The host adapter's unit tests in `wasm_channel.rs` are the executable
 specification: they cover the configure jail (a plugin without `config_read`
 receives `{}`, never another channel's secrets), the inbound queue handoff,
-capability-gated dispatch, and poll-health accounting. When your component
-loads under those semantics, write your own contract test the same way:
-instantiate through `WasmChannel::from_wasm` with a test config, enqueue onto
-the `InboundQueue` handle, and assert your `poll-message` drains and
-translates it.
+capability-gated dispatch, and poll-health accounting.
+
+To run your own component under those exact semantics, write an integration
+test that instantiates it through the real host adapter. `zeroclaw-plugins`
+is not published to crates.io, so pull it as a git dev-dependency pinned to
+the tag matching your target host:
+
+```bash
+cargo add --dev zeroclaw-plugins \
+  --git https://github.com/zeroclaw-labs/zeroclaw --tag <host-version> \
+  --no-default-features --features plugins-wasm-cranelift
+```
+
+The test then loads your built component through `WasmChannel::from_wasm`
+with a test config, enqueues onto the `InboundQueue` handle it exposes, and
+asserts your `poll-message` drains and translates the message. That is the
+same code path a production daemon will run; passing it is the strongest
+pre-distribution signal you can get without a live host.
 
 ## Next
 
