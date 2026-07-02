@@ -9,7 +9,7 @@ use pulldown_cmark::{
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
         Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
@@ -3666,15 +3666,18 @@ fn render_entry_into(
     }
 }
 
-fn copy_action_rects(body_x: u16, row: u16) -> [(CopyFormat, Rect); 2] {
+fn copy_action_rects(body_area: Rect, row: u16) -> Vec<(CopyFormat, Rect)> {
     use unicode_width::UnicodeWidthStr;
 
     let copy_label = crate::i18n::t("zc-chat-action-copy");
     let markdown_label = crate::i18n::t("zc-chat-action-copy-md");
     let copy_width = UnicodeWidthStr::width(copy_label.as_str()) as u16;
-    let markdown_x = body_x + 2 + copy_width + 2;
+    let markdown_x = body_area.x + 2 + copy_width + 2;
     [
-        (CopyFormat::Raw, Rect::new(body_x + 2, row, copy_width, 1)),
+        (
+            CopyFormat::Raw,
+            Rect::new(body_area.x + 2, row, copy_width, 1),
+        ),
         (
             CopyFormat::Markdown,
             Rect::new(
@@ -3685,6 +3688,65 @@ fn copy_action_rects(body_x: u16, row: u16) -> [(CopyFormat, Rect); 2] {
             ),
         ),
     ]
+    .into_iter()
+    .filter_map(|(format, rect)| clip_rect_horizontally(rect, body_area).map(|rect| (format, rect)))
+    .collect()
+}
+
+fn clip_rect_horizontally(rect: Rect, bounds: Rect) -> Option<Rect> {
+    let left = rect.x.max(bounds.x);
+    let right = rect
+        .x
+        .saturating_add(rect.width)
+        .min(bounds.x.saturating_add(bounds.width));
+    (right > left).then(|| Rect::new(left, rect.y, right - left, rect.height))
+}
+
+fn rail_span(rail_style: Style, strength: f32) -> Span<'static> {
+    let rail_color = rail_color(rail_style, strength);
+    Span::styled(
+        " ",
+        Style::default()
+            .bg(rail_color)
+            .add_modifier(rail_style.add_modifier),
+    )
+}
+
+fn rail_glow_span(rail_style: Style) -> Span<'static> {
+    let glow_color = rail_color(rail_style, 0.28);
+    Span::styled(
+        " ",
+        Style::default()
+            .bg(glow_color)
+            .add_modifier(rail_style.add_modifier),
+    )
+}
+
+fn rail_prefix(rail_style: Style, body_line: bool) -> Vec<Span<'static>> {
+    let mut spans = vec![rail_span(rail_style, 1.0), rail_glow_span(rail_style)];
+    if body_line {
+        spans.push(Span::raw(" "));
+    }
+    spans
+}
+
+fn rail_color(rail_style: Style, strength: f32) -> Color {
+    let color = rail_style.fg.unwrap_or(Color::Reset);
+    let background = theme::background();
+    match (color, background) {
+        (Color::Rgb(red, green, blue), Color::Rgb(bg_red, bg_green, bg_blue)) => Color::Rgb(
+            blend_channel(red, bg_red, strength),
+            blend_channel(green, bg_green, strength),
+            blend_channel(blue, bg_blue, strength),
+        ),
+        _ => color,
+    }
+}
+
+fn blend_channel(value: u8, background: u8, strength: f32) -> u8 {
+    let strength = strength.clamp(0.0, 1.0);
+    let blended = background as f32 + ((value as f32 - background as f32) * strength);
+    blended.round() as u8
 }
 
 fn action_header_line(
@@ -3695,14 +3757,15 @@ fn action_header_line(
 ) -> Line<'static> {
     let muted = theme::dim_style().add_modifier(selection);
     let action = theme::accent_style().add_modifier(selection | Modifier::BOLD);
-    Line::from(vec![
-        Span::styled("▌ ", rail_style),
+    let mut spans = rail_prefix(rail_style, false);
+    spans.extend([
         Span::styled(crate::i18n::t("zc-chat-action-copy"), action),
         Span::styled("  ", muted),
         Span::styled(crate::i18n::t("zc-chat-action-copy-md"), action),
         Span::styled("  ", muted),
         Span::styled(label.to_string(), label_style),
-    ])
+    ]);
+    Line::from(spans)
 }
 
 fn tool_title(name: &str, input: Option<&serde_json::Value>) -> String {
@@ -3742,22 +3805,20 @@ fn tool_title(name: &str, input: Option<&serde_json::Value>) -> String {
 }
 
 fn indented_line(mut line: Line<'static>, style: Style, rail_style: Style) -> Line<'static> {
-    let mut spans = vec![Span::styled("▌ ".to_string(), rail_style)];
+    let mut spans = rail_prefix(rail_style, true);
     spans.append(&mut line.spans);
     Line::from(spans).style(style)
 }
 
 fn plain_indented_line(text: &str, style: Style, rail_style: Style) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("▌ ", rail_style),
-        Span::styled(text.to_string(), style),
-    ])
+    let mut spans = rail_prefix(rail_style, true);
+    spans.push(Span::styled(text.to_string(), style));
+    Line::from(spans)
 }
 
 fn prepend_rail_to_lines(lines: &mut [Line<'static>], rail_style: Style) {
     for line in lines {
-        line.spans
-            .insert(0, Span::styled("▌ ".to_string(), rail_style));
+        line.spans.splice(0..0, rail_prefix(rail_style, true));
     }
 }
 
@@ -3830,10 +3891,12 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         let mut lines: Vec<Line<'static>> = state.cached_lines.clone();
         if has_stream_text {
             let rail_style = theme::agent_label_style();
-            lines.push(Line::from(vec![
-                Span::styled("▌ ", rail_style),
-                Span::styled(crate::i18n::t("zc-chat-label-agent"), rail_style),
-            ]));
+            let mut header = rail_prefix(rail_style, false);
+            header.push(Span::styled(
+                crate::i18n::t("zc-chat-label-agent"),
+                rail_style,
+            ));
+            lines.push(Line::from(header));
             lines.extend(
                 markdown_to_lines(&state.streaming_text, inner_width)
                     .into_iter()
@@ -3888,6 +3951,11 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     state.last_total_rows = total_rows;
     state.last_inner_height = inner_height;
     state.scroll_offset = scroll;
+    let is_scrollable = total_rows > inner_height;
+    let scrollbar_rect = is_scrollable
+        .then(|| scrollbar_hit_rect(body_area))
+        .flatten();
+    let copy_action_area = copy_action_body_area(body_area, scrollbar_rect);
 
     // Project each entry's line range into screen coords. Off-viewport
     // ranges get no rect.
@@ -3915,7 +3983,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         state.entry_rects.push((entry_idx, rect));
         if screen_lo >= scroll && screen_lo < scroll + body_h {
             let y = body_y + (screen_lo - scroll);
-            for (format, rect) in copy_action_rects(body_x, y) {
+            for (format, rect) in copy_action_rects(copy_action_area, y) {
                 state.copy_action_hit_regions.push(CopyActionHitRegion {
                     entry_index: entry_idx,
                     format,
@@ -3938,7 +4006,19 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
             &mut scrollbar_state,
         );
     }
-    state.scrollbar_track_rect = scrollbar_hit_rect(body_area);
+    state.scrollbar_track_rect = scrollbar_rect;
+}
+
+fn copy_action_body_area(body_area: Rect, scrollbar_rect: Option<Rect>) -> Rect {
+    let Some(scrollbar_rect) = scrollbar_rect else {
+        return body_area;
+    };
+    Rect::new(
+        body_area.x,
+        body_area.y,
+        scrollbar_rect.x.saturating_sub(body_area.x),
+        body_area.height,
+    )
 }
 
 fn scrollbar_hit_rect(body_area: Rect) -> Option<Rect> {
@@ -6512,8 +6592,22 @@ mod tests {
         };
         let agent = ChatEntry::AgentMessage(Arc::<str>::from("world"));
 
-        assert_eq!(rendered_entry(&user, 80), "▌ copy  md  You:\n▌ hello\n");
-        assert_eq!(rendered_entry(&agent, 80), "▌ copy  md  Agent:\n▌ world\n");
+        assert_eq!(rendered_entry(&user, 80), "  copy  md  You:\n   hello\n");
+        assert_eq!(rendered_entry(&agent, 80), "  copy  md  Agent:\n   world\n");
+    }
+
+    #[test]
+    fn message_rails_are_background_cells_not_glyphs() {
+        let entry = ChatEntry::AgentMessage(Arc::<str>::from("world"));
+        let mut lines = Vec::new();
+        render_entry_into(&entry, false, true, 80, &mut lines);
+
+        assert_eq!(lines[0].spans[0].content.as_ref(), " ");
+        assert_eq!(lines[0].spans[1].content.as_ref(), " ");
+        assert!(lines[0].spans[0].style.bg.is_some());
+        assert!(lines[0].spans[1].style.bg.is_some());
+        assert_ne!(lines[0].spans[0].style.bg, lines[0].spans[1].style.bg);
+        assert!(!rendered_entry(&entry, 80).contains('▌'));
     }
 
     #[test]
@@ -6556,9 +6650,15 @@ mod tests {
 
     #[test]
     fn copy_action_rects_track_label_widths() {
-        let rects = copy_action_rects(10, 3);
+        let rects = copy_action_rects(Rect::new(10, 0, 80, 10), 3);
         assert_eq!(rects[0], (CopyFormat::Raw, Rect::new(12, 3, 4, 1)));
         assert_eq!(rects[1], (CopyFormat::Markdown, Rect::new(18, 3, 2, 1)));
+    }
+
+    #[test]
+    fn copy_action_rects_clip_to_body_width() {
+        let rects = copy_action_rects(Rect::new(10, 0, 7, 10), 3);
+        assert_eq!(rects, vec![(CopyFormat::Raw, Rect::new(12, 3, 4, 1))]);
     }
 
     #[test]
@@ -6582,6 +6682,39 @@ mod tests {
             .expect("draw conversation");
 
         assert!(state.copy_action_hit_regions.is_empty());
+    }
+
+    #[test]
+    fn render_conversation_skips_scrollbar_hit_rect_without_overflow() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("short")));
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 80, 12);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_conversation(frame, &mut state, area);
+            })
+            .expect("draw conversation");
+
+        assert_eq!(state.scrollbar_track_rect, None);
+    }
+
+    #[test]
+    fn copy_action_body_area_excludes_scrollbar_hit_rect() {
+        let body_area = Rect::new(10, 0, 20, 10);
+        let scrollbar_rect = Some(Rect::new(27, 0, 3, 10));
+        assert_eq!(
+            copy_action_body_area(body_area, scrollbar_rect),
+            Rect::new(10, 0, 17, 10)
+        );
+        assert_eq!(copy_action_body_area(body_area, None), body_area);
     }
 
     #[test]
