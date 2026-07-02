@@ -166,54 +166,20 @@ impl SopEditorState {
         }
     }
 
-    /// Build the canonical `Sop` JSON. Steps with an empty title are dropped and
-    /// the survivors renumbered 1-based; an empty body falls back to the title so
-    /// `save_sop` strict validation passes. Routing `depends_on`/`next` are
-    /// renumbered against the same index remap so wires stay consistent.
+    /// Serialize the draft for the daemon. Drops steps with empty titles and
+    /// defaults an empty body to the title. Renumbering and routing-ref
+    /// remapping are owned by the daemon's `normalize_step_numbers` on save;
+    /// no client-side remap.
     fn to_sop_json(&self) -> serde_json::Value {
-        let kept: Vec<&SopStep> = self
+        let steps: Vec<SopStep> = self
             .draft
             .steps
             .iter()
             .filter(|s| !s.title.trim().is_empty())
-            .collect();
-        // old step number -> new 1-based number
-        let remap: std::collections::HashMap<u32, u32> = kept
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.number, i as u32 + 1))
-            .collect();
-        let steps: Vec<SopStep> = kept
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let mut out = (*s).clone();
-                out.number = i as u32 + 1;
+            .map(|s| {
+                let mut out = s.clone();
                 if out.body.trim().is_empty() {
                     out.body = out.title.trim().to_string();
-                }
-                out.routing.depends_on = out
-                    .routing
-                    .depends_on
-                    .iter()
-                    .filter_map(|d| remap.get(d).copied())
-                    .collect();
-                out.routing.next = out.routing.next.and_then(|n| remap.get(&n).copied());
-                out.routing.switch = out
-                    .routing
-                    .switch
-                    .iter()
-                    .map(|rule| {
-                        let mut r = rule.clone();
-                        r.goto = r.goto.and_then(|g| remap.get(&g).copied());
-                        r
-                    })
-                    .collect();
-                if let StepFailure::Goto { step } = out.on_failure {
-                    out.on_failure = remap
-                        .get(&step)
-                        .map(|s| StepFailure::Goto { step: *s })
-                        .unwrap_or(StepFailure::Fail);
                 }
                 out
             })
@@ -1648,24 +1614,7 @@ impl SopPane {
                     };
                     format!(" {kind_wire}/{alias}{hint}")
                 }
-                None => match source.as_str() {
-                    "filesystem" => trigger
-                        .path
-                        .clone()
-                        .map(|p| format!(" {p}"))
-                        .unwrap_or_default(),
-                    "cron" => trigger
-                        .expression
-                        .clone()
-                        .map(|e| format!(" {e}"))
-                        .unwrap_or_default(),
-                    "mqtt" => trigger
-                        .topic
-                        .clone()
-                        .map(|t| format!(" {t}"))
-                        .unwrap_or_default(),
-                    _ => String::new(),
-                },
+                None => self.bound_trigger_detail(&source, trigger),
             };
             lines.push(format!("{mark}  {source}{detail}"));
         }
@@ -1738,6 +1687,48 @@ impl SopPane {
             lines.push(String::new());
         }
         lines
+    }
+
+    /// Detail suffix for a bound (non-channel) trigger, rendered from the
+    /// registry's field list for the source. The draft is serialized once and
+    /// values read by field key, so new registry fields render here without a
+    /// per-name arm.
+    fn bound_trigger_detail(
+        &self,
+        source: &str,
+        trigger: &crate::client::SopTriggerDraft,
+    ) -> String {
+        let Some(bound) = self
+            .trigger_registry
+            .bound
+            .iter()
+            .find(|b| b.source == source)
+        else {
+            return String::new();
+        };
+        let Ok(wire) = serde_json::to_value(trigger) else {
+            return String::new();
+        };
+        let parts: Vec<String> = bound
+            .fields
+            .iter()
+            .filter_map(|f| match wire.get(&f.name)? {
+                serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+                serde_json::Value::Array(items) if !items.is_empty() => Some(
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+                _ => None,
+            })
+            .collect();
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", parts.join(" "))
+        }
     }
 }
 
@@ -2191,7 +2182,6 @@ fn graph_to_lines(graph: &serde_json::Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::StepRouting;
     use crate::client::method;
     use crate::jsonrpc::RpcOutbound;
     use std::time::Duration;
@@ -2542,7 +2532,7 @@ mod tests {
     }
 
     #[test]
-    fn editor_to_sop_json_numbers_steps_and_drops_blanks() {
+    fn editor_to_sop_json_drops_blanks_and_preserves_numbers() {
         let mut ed = SopEditorState::new_create();
         ed.draft.name = "demo".into();
         ed.draft.steps = vec![
@@ -2566,49 +2556,26 @@ mod tests {
         assert_eq!(sop["name"], "demo");
         let steps = sop["steps"].as_array().unwrap();
         assert_eq!(steps.len(), 2);
-        assert_eq!(steps[0]["number"], 1);
         assert_eq!(steps[0]["title"], "first");
-        assert_eq!(steps[1]["number"], 2);
         assert_eq!(steps[1]["title"], "third");
+        // Numbers pass through as-is; the daemon's normalize_step_numbers
+        // owns renumbering and routing-ref remapping on save.
+        assert_eq!(steps[0]["number"], 1);
+        assert_eq!(steps[1]["number"], 3);
         assert_eq!(sop["triggers"][0]["type"], "manual");
     }
 
     #[test]
-    fn editor_to_sop_json_remaps_routing_and_failure_after_drop() {
-        // step 2 is blank and dropped; a depends_on/goto that referenced the
-        // surviving steps must renumber, and a reference to the dropped step is
-        // pruned (depends_on) or reset to Fail (goto).
+    fn editor_to_sop_json_defaults_empty_body_to_title() {
         let mut ed = SopEditorState::new_create();
         ed.draft.name = "r".into();
-        ed.draft.steps = vec![
-            SopStep {
-                number: 1,
-                title: "a".into(),
-                routing: StepRouting {
-                    depends_on: vec![3],
-                    ..StepRouting::default()
-                },
-                ..SopStep::default()
-            },
-            SopStep {
-                number: 2,
-                title: "  ".into(),
-                ..SopStep::default()
-            },
-            SopStep {
-                number: 3,
-                title: "c".into(),
-                on_failure: StepFailure::Goto { step: 1 },
-                ..SopStep::default()
-            },
-        ];
+        ed.draft.steps = vec![SopStep {
+            number: 1,
+            title: "a".into(),
+            ..SopStep::default()
+        }];
         let sop = ed.to_sop_json();
-        let steps = sop["steps"].as_array().unwrap();
-        assert_eq!(steps.len(), 2);
-        // old step 3 -> new step 2; step 1 depends_on old 3 -> new 2
-        assert_eq!(steps[0]["routing"]["depends_on"][0], 2);
-        // old step 3's goto old 1 -> new 1
-        assert_eq!(steps[1]["on_failure"]["goto"]["step"], 1);
+        assert_eq!(sop["steps"][0]["body"], "a");
     }
 
     #[test]
@@ -2721,6 +2688,7 @@ mod tests {
                         name: "path".to_string(),
                         options: Vec::new(),
                         multi: false,
+                        kind: crate::client::TriggerFieldKindView::Text,
                     }],
                 },
                 crate::client::BoundTriggerSourceView {
@@ -2729,6 +2697,7 @@ mod tests {
                         name: "expression".to_string(),
                         options: Vec::new(),
                         multi: false,
+                        kind: crate::client::TriggerFieldKindView::Text,
                     }],
                 },
             ],

@@ -2129,6 +2129,16 @@ pub struct ChannelTriggerKindView {
     pub setup_path: String,
 }
 
+/// Mirror of `zeroclaw_runtime::sop::TriggerFieldKind`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerFieldKindView {
+    #[default]
+    Text,
+    List,
+    Expression,
+}
+
 /// Mirror of `zeroclaw_runtime::sop::TriggerField`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TriggerFieldView {
@@ -2137,6 +2147,8 @@ pub struct TriggerFieldView {
     pub options: Vec<String>,
     #[serde(default)]
     pub multi: bool,
+    #[serde(default)]
+    pub kind: TriggerFieldKindView,
 }
 
 /// Mirror of `zeroclaw_runtime::sop::BoundTriggerSource`.
@@ -2158,7 +2170,6 @@ pub struct TriggerSourceRegistryView {
     pub channels: Vec<ChannelTriggerKindView>,
 }
 
-/// Mirror of `zeroclaw_runtime::sop::StepRouting`.
 /// Mirror of `zeroclaw_runtime::sop::step_contract::SwitchRule`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SwitchRule {
@@ -2171,6 +2182,7 @@ pub struct SwitchRule {
     pub goto_buf: Option<String>,
 }
 
+/// Mirror of `zeroclaw_runtime::sop::StepRouting`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StepRouting {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2260,12 +2272,12 @@ pub struct SopDraft {
 }
 
 /// Trigger mirror. The tagged `type` selects the source; the optional bound
-/// fields carry the source-specific binding (channel/alias for a channel
-/// trigger, path/expression/topic for the fixed sources). `channel` is the
-/// canonical `ChannelKind` enum, round-tripped through its strum string form
-/// at the wire boundary so no parallel channel list is hand-maintained here.
-/// Empty fields are omitted so the daemon fills defaults and TOML stays
-/// lossless.
+/// fields carry the full source-specific binding union (channel/alias,
+/// path/expression/topic, board/signal, calendar_source/calendar_ids,
+/// routing_key, events, condition). `channel` is the canonical `ChannelKind`
+/// wire string; no parallel channel list is hand-maintained here. Empty
+/// fields are omitted so the daemon fills defaults and TOML stays lossless
+/// for every trigger variant.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SopTriggerDraft {
     #[serde(rename = "type")]
@@ -2282,6 +2294,18 @@ pub struct SopTriggerDraft {
     pub topic: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub condition: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calendar_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_key: Option<String>,
 }
 
 impl Default for SopTriggerDraft {
@@ -2294,6 +2318,12 @@ impl Default for SopTriggerDraft {
             expression: None,
             topic: None,
             condition: None,
+            events: Vec::new(),
+            board: None,
+            signal: None,
+            calendar_source: None,
+            calendar_ids: Vec::new(),
+            routing_key: None,
         }
     }
 }
@@ -3095,6 +3125,32 @@ mod sop_mirror_tests {
     fn fail_policy_is_bare_string() {
         let v = serde_json::to_value(StepFailure::Fail).unwrap();
         assert_eq!(v, serde_json::json!("fail"));
+    }
+
+    /// The trigger mirror must round-trip every canonical `SopTrigger`
+    /// variant's wire shape without loss. Parses the exact JSON the runtime
+    /// emits for each variant and asserts re-serialization is identical, so a
+    /// field added to any trigger variant fails here instead of being
+    /// silently dropped on edit-save. The runtime side has the matching
+    /// `mirror_wire_shape_is_canonical` test.
+    #[test]
+    fn trigger_draft_round_trips_every_variant_losslessly() {
+        for wire in [
+            serde_json::json!({"type": "manual"}),
+            serde_json::json!({"type": "webhook", "path": "/hook"}),
+            serde_json::json!({"type": "cron", "expression": "0 9 * * *"}),
+            serde_json::json!({"type": "mqtt", "topic": "a/+/b", "condition": "$.x"}),
+            serde_json::json!({"type": "filesystem", "path": "/tmp/w", "events": ["created", "deleted"], "condition": "$.y"}),
+            serde_json::json!({"type": "peripheral", "board": "b0", "signal": "s1", "condition": "$.z"}),
+            serde_json::json!({"type": "calendar", "calendar_source": "google", "calendar_ids": ["primary", "team"]}),
+            serde_json::json!({"type": "channel", "channel": "telegram", "alias": "ops", "condition": "$.text"}),
+            serde_json::json!({"type": "amqp", "routing_key": "orders.#", "condition": "$.total"}),
+        ] {
+            let draft: SopTriggerDraft = serde_json::from_value(wire.clone())
+                .unwrap_or_else(|e| panic!("parse {wire}: {e}"));
+            let back = serde_json::to_value(&draft).unwrap();
+            assert_eq!(back, wire, "lossy round trip for {wire}");
+        }
     }
 
     /// The zerocode overlay carries a `NodeRunState` mirror. Assert each wire
