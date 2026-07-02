@@ -28,6 +28,7 @@ pub mod api_quickstart;
 pub mod api_sections;
 pub mod api_skills;
 pub mod api_sop;
+pub mod api_sop_author;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
 #[cfg(any(
@@ -80,7 +81,7 @@ use axum::{
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -1797,6 +1798,38 @@ pub async fn run_gateway(
                 .options(api_config::handle_options_prop),
         )
         .route("/api/config/list", get(api_config::handle_list))
+        .route(
+            "/api/sops",
+            get(api_sop_author::handle_sops_list).post(api_sop_author::handle_sop_create),
+        )
+        .route(
+            "/api/sops/{name}",
+            put(api_sop_author::handle_sop_save).delete(api_sop_author::handle_sop_delete),
+        )
+        .route(
+            "/api/sops/{name}/graph",
+            get(api_sop_author::handle_sop_graph),
+        )
+        .route(
+            "/api/sops/{name}/full",
+            get(api_sop_author::handle_sop_full),
+        )
+        .route(
+            "/api/sops/wire-draft",
+            post(api_sop_author::handle_sop_wire_draft),
+        )
+        .route(
+            "/api/sops/graph-draft",
+            post(api_sop_author::handle_sop_graph_draft),
+        )
+        .route(
+            "/api/sops/trigger-sources",
+            get(api_sop_author::handle_sop_trigger_sources),
+        )
+        .route(
+            "/api/sops/{name}/runs/{run_id}/overlay",
+            get(api_sop_author::handle_sop_run_overlay),
+        )
         .route("/api/config/drift", get(api_config::handle_drift))
         .route(
             "/api/config/reload-status",

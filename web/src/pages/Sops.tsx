@@ -1,0 +1,1363 @@
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { AlertTriangle, XCircle, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { Badge, Card, PageHeader } from '@/components/ui';
+import SopCanvas from './SopCanvas';
+import ToolPicker from '@/components/ToolPicker';
+import { t } from '@/lib/i18n';
+import {
+  listSops,
+  getSopGraph,
+  getRunOverlay,
+  getSop,
+  createSop,
+  saveSop,
+  deleteSop,
+  wireDraft,
+  graphDraft,
+  triggerSources,
+  overlayStateByStep,
+  runStateTone,
+  type RunStateTone,
+  type WireRole,
+  type SopSummary,
+  type SopGraph,
+  type GraphPin,
+  type RunOverlay,
+  type NodeRunState,
+  type Sop,
+  type SopStep,
+  type SopTrigger,
+  type StepFailure,
+  type TriggerSourceRegistry,
+  type BoundTriggerSource,
+  type TriggerField,
+} from '@/lib/sops';
+
+function blankStep(number: number): SopStep {
+  return {
+    number,
+    title: '',
+    body: '',
+    kind: 'execute',
+    requires_confirmation: false,
+    suggested_tools: [],
+  };
+}
+
+const DRAFT_STORAGE_KEY = 'zeroclaw_sop_draft';
+
+function loadStoredDraft(): Sop | null {
+  try {
+    const raw = sessionStorage.getItem(DRAFT_STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as Sop) : null;
+  } catch {
+    return null;
+  }
+}
+
+function storeDraft(draft: Sop | null): void {
+  try {
+    if (draft) sessionStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(draft));
+    else sessionStorage.removeItem(DRAFT_STORAGE_KEY);
+  } catch {
+    // Storage is best-effort; a failure only loses cross-navigation recovery.
+  }
+}
+
+function blankSop(name: string): Sop {
+  return {
+    name,
+    description: '',
+    version: '1.0.0',
+    priority: 'normal',
+    execution_mode: 'supervised',
+    triggers: [{ type: 'manual' }],
+    steps: [blankStep(1)],
+    cooldown_secs: 0,
+    max_concurrent: 1,
+    deterministic: false,
+  };
+}
+
+const BADGE_TONE: Record<RunStateTone, 'ok' | 'error' | 'warn' | 'neutral'> = {
+  accent: 'neutral',
+  success: 'ok',
+  error: 'error',
+  warning: 'warn',
+  neutral: 'neutral',
+};
+
+function nodeStateBadgeTone(state: NodeRunState): 'ok' | 'error' | 'warn' | 'neutral' {
+  return BADGE_TONE[runStateTone(state)];
+}
+
+function pinTypeLabel(pin: GraphPin): string {
+  if (pin.class === 'flow') return 'flow';
+  return pin.data_type ?? 'any';
+}
+
+function SopFieldList({
+  graph,
+  overlay,
+}: {
+  graph: SopGraph;
+  overlay?: RunOverlay | null;
+}) {
+  const stateByStep = overlayStateByStep(overlay);
+  return (
+    <div className="divide-y divide-pc-border rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface text-sm">
+      {graph.nodes.map((node) => {
+        const state = stateByStep.get(node.step);
+        return (
+          <div key={node.step} className="flex items-start gap-3 px-3 py-2">
+            <span className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded bg-pc-accent-light text-xs font-semibold text-pc-accent">
+              {node.step}
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                <span className="font-medium text-pc-text">{node.title}</span>
+                {state ? (
+                  <Badge tone={nodeStateBadgeTone(state)}>{t(`sops.run_state.${state}`)}</Badge>
+                ) : null}
+              </div>
+              <div className="mt-0.5 text-xs text-pc-text-muted">
+                {t('sops.inputs')}:{' '}
+                {node.inputs.length === 0
+                  ? '—'
+                  : node.inputs.map((p) => `${p.name}:${pinTypeLabel(p)}`).join(', ')}
+                {'  ·  '}
+                {t('sops.outputs')}:{' '}
+                {node.outputs.length === 0
+                  ? '—'
+                  : node.outputs.map((p) => `${p.name}:${pinTypeLabel(p)}`).join(', ')}
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function DiagnosticsPanel({ graph }: { graph: SopGraph }) {
+  if (graph.diagnostics.length === 0) return null;
+  return (
+    <Card className="mt-4">
+      <div className="mb-2 font-medium text-pc-text">{t('sops.diagnostics')}</div>
+      <ul className="space-y-1 text-sm">
+        {graph.diagnostics.map((d, i) => (
+          <li key={i} className="flex items-start gap-2">
+            {d.severity === 'error' ? (
+              <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-500" aria-hidden />
+            ) : (
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" aria-hidden />
+            )}
+            <span className="text-pc-text">
+              <span className="text-pc-text-muted">
+                {t('sops.step')} {d.step}:
+              </span>{' '}
+              {d.message}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </Card>
+  );
+}
+
+const INPUT_CLS = 'w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text';
+
+function Field({ label, hint, children }: { label: string; hint?: string | null; children: ReactNode }) {
+  return (
+    <label className="block text-sm">
+      <span className="mb-1 block text-pc-text-muted">{label}</span>
+      {children}
+      {hint ? <p className="mt-1 text-xs text-pc-text-faint">{hint}</p> : null}
+    </label>
+  );
+}
+
+function TextField({
+  label,
+  value,
+  onChange,
+  placeholder,
+}: {
+  label: string;
+  value: string;
+  onChange: (next: string) => void;
+  placeholder?: string;
+}) {
+  return (
+    <Field label={label}>
+      <input
+        type="text"
+        value={value}
+        placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value)}
+        className={INPUT_CLS}
+      />
+    </Field>
+  );
+}
+
+function SelectField({
+  label,
+  value,
+  onChange,
+  options,
+  disabled,
+  children,
+}: {
+  label: string;
+  value: string;
+  onChange: (next: string) => void;
+  options?: string[];
+  disabled?: boolean;
+  children?: ReactNode;
+}) {
+  return (
+    <Field label={label}>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        disabled={disabled}
+        className={INPUT_CLS}
+      >
+        {children}
+        {(options ?? []).map((opt) => (
+          <option key={opt} value={opt}>
+            {opt}
+          </option>
+        ))}
+      </select>
+    </Field>
+  );
+}
+
+function failureKind(f: StepFailure | undefined): 'fail' | 'retry' | 'goto' {
+  if (f === undefined || f === 'fail') return 'fail';
+  if ('retry' in f) return 'retry';
+  return 'goto';
+}
+
+function StepEditor({
+  step,
+  index,
+  count,
+  selected,
+  onSelect,
+  onChange,
+  onRemove,
+  onMove,
+}: {
+  step: SopStep;
+  index: number;
+  count: number;
+  selected: boolean;
+  onSelect: () => void;
+  onChange: (patch: Partial<SopStep>) => void;
+  onRemove: () => void;
+  onMove: (dir: -1 | 1) => void;
+}) {
+  const rowRef = useRef<HTMLDivElement | null>(null);
+  const routing = step.routing ?? {};
+  const fkind = failureKind(step.on_failure);
+  const setFailure = (kind: 'fail' | 'retry' | 'goto') => {
+    if (kind === 'fail') onChange({ on_failure: 'fail' });
+    else if (kind === 'retry') onChange({ on_failure: { retry: { max: 1 } } });
+    else onChange({ on_failure: { goto: { step: 1 } } });
+  };
+  const setRouting = (patch: Partial<typeof routing>) =>
+    onChange({ routing: { ...routing, ...patch } });
+  return (
+    <div
+      ref={rowRef}
+      onFocusCapture={onSelect}
+      onClick={onSelect}
+      className={`rounded-[var(--radius-lg)] border bg-pc-surface p-3 ${
+        selected ? 'border-pc-accent ring-1 ring-pc-accent' : 'border-pc-border'
+      }`}
+    >
+      <div className="mb-2 flex items-center gap-2">
+        <span className="inline-flex h-6 w-6 items-center justify-center rounded bg-pc-accent-light text-xs font-semibold text-pc-accent">
+          {step.number}
+        </span>
+        <input
+          type="text"
+          value={step.title}
+          onChange={(e) => onChange({ title: e.target.value })}
+          placeholder={t('sops.step_title_placeholder')}
+          className="flex-1 rounded border border-pc-border bg-pc-surface px-2 py-1 text-sm text-pc-text"
+        />
+        <select
+          value={step.kind ?? 'execute'}
+          onChange={(e) => onChange({ kind: e.target.value as SopStep['kind'] })}
+          className="rounded border border-pc-border bg-pc-surface px-1.5 py-1 text-xs text-pc-text"
+          aria-label={t('sops.step_kind')}
+        >
+          <option value="execute">{t('sops.kind_execute')}</option>
+          <option value="checkpoint">{t('sops.kind_checkpoint')}</option>
+        </select>
+        <button
+          type="button"
+          onClick={() => onMove(-1)}
+          disabled={index === 0}
+          className="rounded px-1.5 py-1 text-pc-text-muted hover:bg-pc-elevated disabled:opacity-30"
+          aria-label={t('sops.move_up')}
+        >
+          ↑
+        </button>
+        <button
+          type="button"
+          onClick={() => onMove(1)}
+          disabled={index === count - 1}
+          className="rounded px-1.5 py-1 text-pc-text-muted hover:bg-pc-elevated disabled:opacity-30"
+          aria-label={t('sops.move_down')}
+        >
+          ↓
+        </button>
+        <button
+          type="button"
+          onClick={onRemove}
+          className="rounded px-1.5 py-1 text-rose-500 hover:bg-pc-elevated"
+          aria-label={t('sops.remove_step')}
+        >
+          <Trash2 className="h-4 w-4" aria-hidden />
+        </button>
+      </div>
+      <textarea
+        value={step.body}
+        onChange={(e) => onChange({ body: e.target.value })}
+        placeholder={t('sops.step_body_placeholder')}
+        rows={2}
+        className="mb-2 w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-sm text-pc-text"
+      />
+      <div className="mb-2 space-y-2 text-xs">
+        <div>
+          <span className="mb-1 block text-pc-text-muted">{t('sops.step_tools_label')}</span>
+          <ToolPicker
+            value={step.suggested_tools ?? []}
+            onChange={(next) => onChange({ suggested_tools: next })}
+          />
+        </div>
+        <label className="flex items-center gap-1 text-pc-text-muted">
+          <input
+            type="checkbox"
+            checked={step.requires_confirmation ?? false}
+            onChange={(e) => onChange({ requires_confirmation: e.target.checked })}
+          />
+          {t('sops.requires_confirmation')}
+        </label>
+      </div>
+      <div className="grid grid-cols-3 gap-2 border-t border-pc-border pt-2 text-xs">
+        <TextField
+          label={t('sops.routing_depends_on')}
+          value={(routing.depends_on ?? []).join(', ')}
+          placeholder="2, 3"
+          onChange={(v) =>
+            setRouting({
+              depends_on: v
+                .split(',')
+                .map((s) => parseInt(s.trim(), 10))
+                .filter((n) => Number.isFinite(n)),
+            })
+          }
+        />
+        <Field label={t('sops.routing_next')}>
+          <input
+            type="number"
+            value={routing.next ?? ''}
+            onChange={(e) =>
+              setRouting({ next: e.target.value ? parseInt(e.target.value, 10) : undefined })
+            }
+            placeholder="→"
+            className={INPUT_CLS}
+          />
+        </Field>
+        <TextField
+          label={t('sops.routing_when')}
+          value={routing.when ?? ''}
+          placeholder="$.value > 85"
+          onChange={(v) => setRouting({ when: v || undefined })}
+        />
+        <SelectField
+          label={t('sops.on_failure')}
+          value={fkind}
+          onChange={(v) => setFailure(v as 'fail' | 'retry' | 'goto')}
+        >
+          <option value="fail">{t('sops.failure_fail')}</option>
+          <option value="retry">{t('sops.failure_retry')}</option>
+          <option value="goto">{t('sops.failure_goto')}</option>
+        </SelectField>
+        {fkind === 'retry' && step.on_failure && typeof step.on_failure === 'object' && 'retry' in step.on_failure ? (
+          <Field label={t('sops.failure_max')}>
+            <input
+              type="number"
+              value={step.on_failure.retry.max}
+              onChange={(e) =>
+                onChange({ on_failure: { retry: { max: parseInt(e.target.value, 10) || 1 } } })
+              }
+              className={INPUT_CLS}
+            />
+          </Field>
+        ) : null}
+        {fkind === 'goto' && step.on_failure && typeof step.on_failure === 'object' && 'goto' in step.on_failure ? (
+          <Field label={t('sops.failure_goto_step')}>
+            <input
+              type="number"
+              value={step.on_failure.goto.step}
+              onChange={(e) =>
+                onChange({ on_failure: { goto: { step: parseInt(e.target.value, 10) || 1 } } })
+              }
+              className={INPUT_CLS}
+            />
+          </Field>
+        ) : null}
+      </div>
+      <div className="mt-2 rounded border border-pc-border p-2">
+        <div className="mb-1 flex items-center justify-between">
+          <span className="text-xs font-medium text-pc-text">{t('sops.switch_ports')}</span>
+          <button
+            type="button"
+            onClick={() =>
+              setRouting({
+                switch: [...(routing.switch ?? []), { name: `port ${(routing.switch?.length ?? 0) + 1}`, when: undefined, goto: undefined }],
+              })
+            }
+            className="rounded border border-pc-border px-2 py-0.5 text-xs text-pc-text hover:bg-pc-elevated"
+          >
+            <Plus className="mr-1 inline h-3 w-3" aria-hidden />
+            {t('sops.add_port')}
+          </button>
+        </div>
+        {(routing.switch ?? []).length === 0 ? (
+          <div className="text-xs text-pc-text-faint">{t('sops.no_ports')}</div>
+        ) : (
+          (routing.switch ?? []).map((rule, ri) => {
+            const setRule = (patch: Partial<typeof rule>) => {
+              const rules = [...(routing.switch ?? [])];
+              rules[ri] = { ...rules[ri]!, ...patch };
+              setRouting({ switch: rules });
+            };
+            return (
+              <div key={ri} className="mb-1 grid grid-cols-[1fr_1.4fr_4rem_1.5rem] items-center gap-1">
+                <input
+                  type="text"
+                  value={rule.name}
+                  onChange={(e) => setRule({ name: e.target.value })}
+                  placeholder={t('sops.port_name')}
+                  className="rounded border border-pc-border bg-pc-surface px-1.5 py-0.5 text-xs text-pc-text"
+                />
+                <input
+                  type="text"
+                  value={rule.when ?? ''}
+                  onChange={(e) => setRule({ when: e.target.value || undefined })}
+                  placeholder={t('sops.port_when')}
+                  className="rounded border border-pc-border bg-pc-surface px-1.5 py-0.5 text-xs text-pc-text"
+                />
+                <input
+                  type="number"
+                  value={rule.goto ?? ''}
+                  onChange={(e) => setRule({ goto: e.target.value ? parseInt(e.target.value, 10) : undefined })}
+                  placeholder="→"
+                  className="rounded border border-pc-border bg-pc-surface px-1.5 py-0.5 text-xs text-pc-text"
+                />
+                <button
+                  type="button"
+                  onClick={() => setRouting({ switch: (routing.switch ?? []).filter((_, j) => j !== ri) })}
+                  className="text-rose-500"
+                  aria-label={t('sops.remove_port')}
+                >
+                  <Trash2 className="h-3.5 w-3.5" aria-hidden />
+                </button>
+              </div>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}
+
+const CHANNEL_SOURCE = 'channel';
+const MANUAL_SOURCE = 'manual';
+
+function triggerSource(trigger: SopTrigger): string {
+  return trigger.type === CHANNEL_SOURCE ? CHANNEL_SOURCE : trigger.type;
+}
+
+/// Blank value for a registry field, shaped by its declared kind. No field
+/// names are consulted: the registry's `kind` is the single authority.
+function blankFieldValue(field: TriggerField): unknown {
+  switch (field.kind) {
+    case 'list':
+      return [];
+    case 'expression':
+      return null;
+    default:
+      return '';
+  }
+}
+
+/// Build a fresh trigger for a chosen source. The registry supplies the field
+/// set; each bound field starts at its kind's blank value and the channel
+/// source starts on the first walked channel kind. No per-source field logic
+/// is hardcoded.
+function blankTrigger(
+  source: string,
+  registry: TriggerSourceRegistry | null,
+): SopTrigger {
+  if (source === CHANNEL_SOURCE) {
+    const firstChannel = registry?.channels[0]?.channel ?? '';
+    return { type: 'channel', channel: firstChannel, alias: null, condition: null };
+  }
+  if (source === MANUAL_SOURCE) return { type: 'manual' };
+  const bound = registry?.bound.find((b) => b.source === source);
+  const base: Record<string, unknown> = { type: source };
+  for (const field of bound?.fields ?? []) {
+    base[field.name] = blankFieldValue(field);
+  }
+  return base as unknown as SopTrigger;
+}
+
+/// i18n lookup with a fallback: `t()` returns the key itself when no
+/// translation exists, so detect that and fall back instead of leaking keys.
+function tOr(key: string, fallback: string | null): string | null {
+  const value = t(key);
+  return value === key ? fallback : value;
+}
+
+function triggerFieldLabel(field: string): string {
+  return tOr(`sops.trigger_${field}`, field) ?? field;
+}
+
+function triggerFieldHint(field: string): string | null {
+  return tOr(`sops.trigger_${field}_hint`, null);
+}
+
+function triggerFieldPlaceholder(field: string): string {
+  return tOr(`sops.trigger_${field}_placeholder`, null) ?? '';
+}
+
+function TriggerFieldInput({
+  field,
+  value,
+  onChange,
+}: {
+  field: TriggerField;
+  value: unknown;
+  onChange: (next: unknown) => void;
+}) {
+  const name = field.name;
+  const options = field.options ?? [];
+  const hint = triggerFieldHint(name);
+
+  if (options.length > 0) {
+    if (field.multi) {
+      const selected = new Set(Array.isArray(value) ? (value as string[]) : []);
+      const toggle = (opt: string) => {
+        const next = new Set(selected);
+        if (next.has(opt)) next.delete(opt);
+        else next.add(opt);
+        onChange(options.filter((o) => next.has(o)));
+      };
+      return (
+        <fieldset className="block text-sm">
+          <legend className="mb-1 block text-pc-text-muted">{triggerFieldLabel(name)}</legend>
+          <div className="flex flex-wrap gap-2">
+            {options.map((opt) => (
+              <label
+                key={opt}
+                className="inline-flex items-center gap-1.5 rounded border border-pc-border px-2 py-1 text-xs text-pc-text"
+              >
+                <input
+                  type="checkbox"
+                  checked={selected.has(opt)}
+                  onChange={() => toggle(opt)}
+                />
+                {opt}
+              </label>
+            ))}
+          </div>
+          {hint ? <p className="mt-1 text-xs text-pc-text-faint">{hint}</p> : null}
+        </fieldset>
+      );
+    }
+    const current = typeof value === 'string' ? value : '';
+    return (
+      <Field label={triggerFieldLabel(name)} hint={hint}>
+        <select value={current} onChange={(e) => onChange(e.target.value)} className={INPUT_CLS}>
+          {options.map((opt) => (
+            <option key={opt} value={opt}>
+              {opt}
+            </option>
+          ))}
+        </select>
+      </Field>
+    );
+  }
+
+  const isList = field.kind === 'list';
+  const isExpression = field.kind === 'expression';
+  const text = isList
+    ? Array.isArray(value)
+      ? value.join(', ')
+      : ''
+    : typeof value === 'string'
+      ? value
+      : '';
+  return (
+    <Field label={triggerFieldLabel(name)} hint={hint}>
+      <input
+        type="text"
+        value={text}
+        placeholder={triggerFieldPlaceholder(name)}
+        onChange={(e) => {
+          const raw = e.target.value;
+          if (isList) {
+            onChange(
+              raw
+                .split(',')
+                .map((s) => s.trim())
+                .filter((s) => s.length > 0),
+            );
+          } else if (isExpression) {
+            onChange(raw.length > 0 ? raw : null);
+          } else {
+            onChange(raw);
+          }
+        }}
+        className={INPUT_CLS}
+      />
+    </Field>
+  );
+}
+
+function ChannelTriggerFields({
+  trigger,
+  registry,
+  onChange,
+}: {
+  trigger: Extract<SopTrigger, { type: 'channel' }>;
+  registry: TriggerSourceRegistry | null;
+  onChange: (patch: Partial<Extract<SopTrigger, { type: 'channel' }>>) => void;
+}) {
+  const channels = registry?.channels ?? [];
+  const selected = channels.find((c) => c.channel === trigger.channel);
+  return (
+    <div className="space-y-2">
+      <div className="grid grid-cols-2 gap-3">
+        <SelectField
+          label={t('sops.trigger_channel')}
+          value={trigger.channel}
+          onChange={(v) => onChange({ channel: v, alias: null })}
+          options={channels.map((c) => c.channel)}
+        />
+        <SelectField
+          label={t('sops.trigger_alias')}
+          value={trigger.alias ?? ''}
+          onChange={(v) => onChange({ alias: v.length > 0 ? v : null })}
+          disabled={!selected?.configured}
+          options={(selected?.aliases ?? []).map((a) => a.alias)}
+        >
+          <option value="">{t('sops.trigger_alias_any')}</option>
+        </SelectField>
+      </div>
+      {selected && !selected.configured ? (
+        <div className="flex items-center gap-2 text-xs text-amber-500">
+          <AlertTriangle className="h-3.5 w-3.5" aria-hidden />
+          <span>{t('sops.trigger_unconfigured')}</span>
+          <Link
+            to={selected.setup_path}
+            className="underline hover:text-pc-accent"
+          >
+            {t('sops.trigger_setup_link')}
+          </Link>
+        </div>
+      ) : null}
+      <TriggerFieldInput
+        field={{ name: 'condition', options: [], multi: false, kind: 'expression' }}
+        value={trigger.condition}
+        onChange={(next) => onChange({ condition: (next as string | null) ?? null })}
+      />
+    </div>
+  );
+}
+
+function TriggerEditor({
+  trigger,
+  index,
+  selected,
+  registry,
+  onChange,
+  onRemove,
+}: {
+  trigger: SopTrigger;
+  index: number;
+  selected: boolean;
+  registry: TriggerSourceRegistry | null;
+  onChange: (next: SopTrigger) => void;
+  onRemove: () => void;
+}) {
+  const source = triggerSource(trigger);
+  const bound = registry?.bound ?? [];
+  const boundFields: TriggerField[] =
+    source === CHANNEL_SOURCE || source === MANUAL_SOURCE
+      ? []
+      : (bound.find((b) => b.source === source)?.fields ?? []);
+
+  const sources: string[] = [
+    ...bound.map((b: BoundTriggerSource) => b.source),
+    CHANNEL_SOURCE,
+  ];
+
+  return (
+    <div
+      className={`space-y-2 rounded border bg-pc-surface p-2 ${
+        selected ? 'border-pc-accent' : 'border-pc-border'
+      }`}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex-1">
+          <SelectField
+            label={t('sops.trigger_source')}
+            value={source}
+            onChange={(v) => onChange(blankTrigger(v, registry))}
+            options={sources}
+          />
+        </div>
+        <button
+          type="button"
+          onClick={onRemove}
+          className="mt-5 inline-flex items-center rounded border border-pc-border p-1 text-pc-text-muted hover:bg-pc-elevated"
+          aria-label={t('sops.remove_trigger')}
+        >
+          <Trash2 className="h-3.5 w-3.5" aria-hidden />
+        </button>
+      </div>
+      {trigger.type === CHANNEL_SOURCE ? (
+        <ChannelTriggerFields
+          trigger={trigger}
+          registry={registry}
+          onChange={(patch) => onChange({ ...trigger, ...patch })}
+        />
+      ) : source === MANUAL_SOURCE ? (
+        <p className="text-xs text-pc-text-muted">{t('sops.trigger_manual_hint')}</p>
+      ) : (
+        <div className="space-y-2">
+          {boundFields.map((field) => (
+            <TriggerFieldInput
+              key={field.name}
+              field={field}
+              value={(trigger as unknown as Record<string, unknown>)[field.name]}
+              onChange={(next) =>
+                onChange({
+                  ...(trigger as unknown as Record<string, unknown>),
+                  [field.name]: next,
+                } as unknown as SopTrigger)
+              }
+            />
+          ))}
+        </div>
+      )}
+      <span className="sr-only">{`trigger ${index + 1}`}</span>
+    </div>
+  );
+}
+
+function SopEditor({
+  draft,
+  saving,
+  saveError,
+  selectedStep,
+  selectedTrigger,
+  triggerRegistry,
+  onSelectStep,
+  onField,
+  onTrigger,
+  onAddTrigger,
+  onRemoveTrigger,
+  onStep,
+  onAddStep,
+  onRemoveStep,
+  onMoveStep,
+  onSave,
+  onCancel,
+}: {
+  draft: Sop;
+  saving: boolean;
+  saveError: string | null;
+  selectedStep: number | null;
+  selectedTrigger: number | null;
+  triggerRegistry: TriggerSourceRegistry | null;
+  onSelectStep: (n: number) => void;
+  onField: (patch: Partial<Sop>) => void;
+  onTrigger: (i: number, next: SopTrigger) => void;
+  onAddTrigger: () => void;
+  onRemoveTrigger: (i: number) => void;
+  onStep: (i: number, patch: Partial<SopStep>) => void;
+  onAddStep: () => void;
+  onRemoveStep: (i: number) => void;
+  onMoveStep: (i: number, dir: -1 | 1) => void;
+  onSave: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <Card className="space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="font-medium text-pc-text">{t('sops.editor_title')}</div>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="inline-flex items-center gap-1 rounded border border-pc-border px-2 py-1 text-sm text-pc-text hover:bg-pc-elevated"
+          >
+            <X className="h-4 w-4" aria-hidden /> {t('sops.cancel')}
+          </button>
+          <button
+            type="button"
+            onClick={onSave}
+            disabled={saving}
+            className="inline-flex items-center gap-1 rounded bg-pc-accent px-2 py-1 text-sm text-white disabled:opacity-50"
+          >
+            {saving ? (
+              <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+            ) : (
+              <Save className="h-4 w-4" aria-hidden />
+            )}
+            {t('sops.save')}
+          </button>
+        </div>
+      </div>
+      {saveError ? <div className="text-sm text-rose-500">{saveError}</div> : null}
+      <div className="grid grid-cols-2 gap-3">
+        <TextField
+          label={t('sops.field_name')}
+          value={draft.name}
+          onChange={(v) => onField({ name: v })}
+        />
+        <TextField
+          label={t('sops.field_version')}
+          value={draft.version}
+          onChange={(v) => onField({ version: v })}
+        />
+      </div>
+      <TextField
+        label={t('sops.field_description')}
+        value={draft.description}
+        onChange={(v) => onField({ description: v })}
+      />
+      <div className="grid grid-cols-2 gap-3">
+        <SelectField
+          label={t('sops.field_priority')}
+          value={draft.priority}
+          onChange={(v) => onField({ priority: v as Sop['priority'] })}
+          options={['critical', 'high', 'normal', 'low']}
+        />
+        <SelectField
+          label={t('sops.field_execution_mode')}
+          value={draft.execution_mode}
+          onChange={(v) => onField({ execution_mode: v as Sop['execution_mode'] })}
+          options={['auto', 'supervised', 'step_by_step', 'priority_based', 'deterministic']}
+        />
+      </div>
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="text-sm font-medium text-pc-text">{t('sops.triggers')}</span>
+          <button
+            type="button"
+            onClick={onAddTrigger}
+            className="inline-flex items-center gap-1 rounded border border-pc-border px-2 py-1 text-xs text-pc-text hover:bg-pc-elevated"
+          >
+            <Plus className="h-3.5 w-3.5" aria-hidden /> {t('sops.add_trigger')}
+          </button>
+        </div>
+        {draft.triggers.length === 0 ? (
+          <p className="text-xs text-pc-text-muted">{t('sops.trigger_none')}</p>
+        ) : (
+          draft.triggers.map((trigger, i) => (
+            <TriggerEditor
+              key={i}
+              trigger={trigger}
+              index={i}
+              selected={selectedTrigger === i}
+              registry={triggerRegistry}
+              onChange={(next) => onTrigger(i, next)}
+              onRemove={() => onRemoveTrigger(i)}
+            />
+          ))
+        )}
+      </div>
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="text-sm font-medium text-pc-text">{t('sops.steps')}</span>
+          <button
+            type="button"
+            onClick={onAddStep}
+            className="inline-flex items-center gap-1 rounded border border-pc-border px-2 py-1 text-xs text-pc-text hover:bg-pc-elevated"
+          >
+            <Plus className="h-3.5 w-3.5" aria-hidden /> {t('sops.add_step')}
+          </button>
+        </div>
+        {draft.steps.map((s, i) => (
+          <StepEditor
+            key={i}
+            step={s}
+            index={i}
+            count={draft.steps.length}
+            selected={selectedStep === s.number}
+            onSelect={() => onSelectStep(s.number)}
+            onChange={(patch) => onStep(i, patch)}
+            onRemove={() => onRemoveStep(i)}
+            onMove={(dir) => onMoveStep(i, dir)}
+          />
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+const noop = () => {};
+
+export default function Sops() {
+  const [sops, setSops] = useState<SopSummary[]>([]);
+  const [selected, setSelected] = useState<string>('');
+  const [graph, setGraph] = useState<SopGraph | null>(null);
+  const [viewSop, setViewSop] = useState<Sop | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [graphLoading, setGraphLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [runId, setRunId] = useState('');
+  const [overlay, setOverlay] = useState<RunOverlay | null>(null);
+  const [overlayError, setOverlayError] = useState<string | null>(null);
+  const [draft, setDraft] = useState<Sop | null>(loadStoredDraft);
+  const [draftGraph, setDraftGraph] = useState<SopGraph | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [layer, setLayer] = useState<'visual' | 'fields'>('visual');
+  const [selectedStep, setSelectedStep] = useState<number | null>(null);
+  const [selectedTrigger, setSelectedTrigger] = useState<number | null>(null);
+  const [triggerRegistry, setTriggerRegistry] = useState<TriggerSourceRegistry | null>(null);
+
+  // Mirror the in-progress draft to session storage so navigating away (e.g. to
+  // channel setup for an unconfigured trigger) and back does not lose it, and
+  // warn on a full tab close/reload while a draft is open.
+  useEffect(() => {
+    storeDraft(draft);
+    if (!draft) return;
+    const warn = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [draft]);
+
+  useEffect(() => {
+    let active = true;
+    triggerSources()
+      .then((reg) => {
+        if (active) setTriggerRegistry(reg);
+      })
+      .catch(() => {
+        // Registry is best-effort: the editor still renders bound sources it
+        // knows about and simply omits channel aliases if the fetch failed.
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const onConnect = useCallback(
+    (from: number, to: number, kind: WireRole, portIndex?: number) => {
+      setDraft((d) => {
+        if (!d) return d;
+        wireDraft(d, { op: 'connect', from, to, role: kind, port: portIndex })
+          .then((res) => {
+            setDraft(res.sop);
+            setDraftGraph(res.graph);
+          })
+          .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
+        return d;
+      });
+    },
+    [],
+  );
+
+  const onDisconnect = useCallback(
+    (from: number, to: number, kind: WireRole, portIndex?: number) => {
+      setDraft((d) => {
+        if (!d) return d;
+        wireDraft(d, { op: 'disconnect', from, to, role: kind, port: portIndex })
+          .then((res) => {
+            setDraft(res.sop);
+            setDraftGraph(res.graph);
+          })
+          .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
+        return d;
+      });
+    },
+    [],
+  );
+
+  // Reproject the draft graph from the backend whenever the draft changes so
+  // the canvas reflects trigger fan-in, data wires, pins, and layout without
+  // re-deriving graph shape client-side. Single source: `graphDraft`.
+  useEffect(() => {
+    if (!draft) {
+      setDraftGraph(null);
+      return;
+    }
+    let active = true;
+    graphDraft(draft)
+      .then((g) => {
+        if (active) setDraftGraph(g);
+      })
+      .catch((e: unknown) => {
+        if (active) setSaveError(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      active = false;
+    };
+  }, [draft]);
+
+  const refreshList = useCallback((selectName?: string) => {
+    return listSops()
+      .then((list) => {
+        setSops(list);
+        if (selectName) setSelected(selectName);
+        else if (list.length > 0 && !list.some((s) => s.name === selectName)) {
+          setSelected(list[0]?.name ?? '');
+        }
+        return list;
+      })
+      .catch((e: unknown) => {
+        setError(e instanceof Error ? e.message : String(e));
+        return [];
+      });
+  }, []);
+
+  const startNew = useCallback(() => {
+    setSaveError(null);
+    setDraft(blankSop(''));
+  }, []);
+
+  const startEdit = useCallback(() => {
+    if (!selected) return;
+    setSaveError(null);
+    getSop(selected)
+      .then((full) => setDraft(full))
+      .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
+  }, [selected]);
+
+  const onSaveDraft = useCallback(() => {
+    if (!draft) return;
+    setSaving(true);
+    setSaveError(null);
+    const isNew = !sops.some((s) => s.name === draft.name);
+    // Renumbering and routing-ref remapping are owned by the daemon's
+    // normalize_step_numbers on save; the draft is sent as-is.
+    const op = isNew ? createSop(draft) : saveSop(draft);
+    op.then(() => {
+      setSaving(false);
+      setDraft(null);
+      return refreshList(draft.name);
+    }).catch((e: unknown) => {
+      setSaving(false);
+      setSaveError(e instanceof Error ? e.message : String(e));
+    });
+  }, [draft, sops, refreshList]);
+
+  const onDeleteSelected = useCallback(() => {
+    if (!selected) return;
+    deleteSop(selected)
+      .then(() => refreshList())
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
+  }, [selected, refreshList]);
+
+  useEffect(() => {
+    let active = true;
+    listSops()
+      .then((list) => {
+        if (!active) return;
+        setSops(list);
+        const first = list[0];
+        if (first) setSelected(first.name);
+        setLoading(false);
+      })
+      .catch((e: unknown) => {
+        if (!active) return;
+        setError(e instanceof Error ? e.message : String(e));
+        setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const loadGraph = useCallback((name: string) => {
+    if (!name) return;
+    setGraphLoading(true);
+    Promise.all([getSopGraph(name), getSop(name)])
+      .then(([g, full]) => {
+        setGraph(g);
+        setViewSop(full);
+        setGraphLoading(false);
+      })
+      .catch((e: unknown) => {
+        setError(e instanceof Error ? e.message : String(e));
+        setGraph(null);
+        setViewSop(null);
+        setGraphLoading(false);
+      });
+  }, []);
+
+  useEffect(() => {
+    if (selected) loadGraph(selected);
+  }, [selected, loadGraph]);
+
+  useEffect(() => {
+    setRunId('');
+    setOverlay(null);
+    setOverlayError(null);
+  }, [selected]);
+
+  useEffect(() => {
+    if (!selected || !runId) {
+      setOverlay(null);
+      return;
+    }
+    let active = true;
+    const poll = () => {
+      getRunOverlay(selected, runId)
+        .then((o) => {
+          if (!active) return;
+          setOverlay(o);
+          setOverlayError(null);
+        })
+        .catch((e: unknown) => {
+          if (!active) return;
+          setOverlay(null);
+          setOverlayError(e instanceof Error ? e.message : String(e));
+        });
+    };
+    poll();
+    const id = window.setInterval(poll, 2000);
+    return () => {
+      active = false;
+      window.clearInterval(id);
+    };
+  }, [selected, runId]);
+
+  const runStateByStep = useMemo(() => overlayStateByStep(overlay), [overlay]);
+
+  const mutateDraft = useCallback((updater: (d: Sop) => Sop) => {
+    setSaveError(null);
+    setDraft((d) => (d ? updater(d) : d));
+  }, []);
+
+  const editorHandlers = draft
+    ? {
+        onField: (patch: Partial<Sop>) => mutateDraft((d) => ({ ...d, ...patch })),
+        onTrigger: (i: number, next: SopTrigger) =>
+          mutateDraft((d) => ({
+            ...d,
+            triggers: d.triggers.map((tr, j) => (j === i ? next : tr)),
+          })),
+        onAddTrigger: () =>
+          mutateDraft((d) => ({
+            ...d,
+            triggers: [...d.triggers, blankTrigger(MANUAL_SOURCE, triggerRegistry)],
+          })),
+        onRemoveTrigger: (i: number) =>
+          mutateDraft((d) => ({ ...d, triggers: d.triggers.filter((_, j) => j !== i) })),
+        onStep: (i: number, patch: Partial<SopStep>) =>
+          mutateDraft((d) => ({
+            ...d,
+            steps: d.steps.map((s, j) => (j === i ? { ...s, ...patch } : s)),
+          })),
+        onAddStep: () =>
+          mutateDraft((d) => ({ ...d, steps: [...d.steps, blankStep(d.steps.length + 1)] })),
+        onRemoveStep: (i: number) =>
+          mutateDraft((d) => ({ ...d, steps: d.steps.filter((_, j) => j !== i) })),
+        onMoveStep: (i: number, dir: -1 | 1) =>
+          mutateDraft((d) => {
+            const j = i + dir;
+            if (j < 0 || j >= d.steps.length) return d;
+            const steps = [...d.steps];
+            [steps[i], steps[j]] = [steps[j]!, steps[i]!];
+            return { ...d, steps };
+          }),
+      }
+    : null;
+
+  return (
+    <div className="space-y-4">
+      <PageHeader
+        title={t('sops.title')}
+        description={t('sops.subtitle')}
+        actions={
+          !draft ? (
+            <button
+              type="button"
+              onClick={startNew}
+              className="inline-flex items-center gap-1 rounded bg-pc-accent px-3 py-1.5 text-sm text-white"
+            >
+              <Plus className="h-4 w-4" aria-hidden /> {t('sops.new')}
+            </button>
+          ) : null
+        }
+      />
+      {error ? (
+        <Card>
+          <div className="text-rose-500">{error}</div>
+        </Card>
+      ) : null}
+      {draft && editorHandlers ? (
+        <div className="space-y-4">
+          {draftGraph ? (
+            <SopCanvas
+              draft={draft}
+              graph={draftGraph}
+              selectedStep={selectedStep}
+              runStateByStep={runStateByStep}
+              onSelectStep={setSelectedStep}
+              onSelectTrigger={setSelectedTrigger}
+              onAddStep={editorHandlers.onAddStep}
+              onConnect={onConnect}
+              onDisconnect={onDisconnect}
+            />
+          ) : null}
+          <SopEditor
+            draft={draft}
+            saving={saving}
+            saveError={saveError}
+            selectedStep={selectedStep}
+            selectedTrigger={selectedTrigger}
+            triggerRegistry={triggerRegistry}
+            onSelectStep={setSelectedStep}
+            onField={editorHandlers.onField}
+            onTrigger={editorHandlers.onTrigger}
+            onAddTrigger={editorHandlers.onAddTrigger}
+            onRemoveTrigger={editorHandlers.onRemoveTrigger}
+            onStep={editorHandlers.onStep}
+            onAddStep={editorHandlers.onAddStep}
+            onRemoveStep={editorHandlers.onRemoveStep}
+            onMoveStep={editorHandlers.onMoveStep}
+            onSave={onSaveDraft}
+            onCancel={() => setDraft(null)}
+          />
+        </div>
+      ) : loading ? (
+        <Card>
+          <Loader2 className="h-5 w-5 animate-spin text-pc-text-muted" aria-hidden />
+        </Card>
+      ) : sops.length === 0 ? (
+        <Card>
+          <div className="text-pc-text-muted">{t('sops.empty')}</div>
+        </Card>
+      ) : (
+        <div className="grid grid-cols-[14rem_1fr] gap-4">
+          <Card className="h-fit p-2">
+            <ul className="space-y-1">
+              {sops.map((s) => (
+                <li key={s.name}>
+                  <button
+                    type="button"
+                    onClick={() => setSelected(s.name)}
+                    className={`w-full rounded px-2 py-1.5 text-left text-sm ${
+                      s.name === selected
+                        ? 'bg-pc-accent-light text-pc-accent'
+                        : 'text-pc-text hover:bg-pc-elevated'
+                    }`}
+                  >
+                    <div className="font-medium">{s.name}</div>
+                    {s.description ? (
+                      <div className="truncate text-xs text-pc-text-muted">{s.description}</div>
+                    ) : null}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </Card>
+          <div>
+            <div className="mb-3 flex items-center gap-2">
+              <span className="font-medium text-pc-text">{selected}</span>
+              {graph ? (
+                <Badge tone="neutral">
+                  {graph.nodes.length} {t('sops.steps')}
+                </Badge>
+              ) : null}
+              <div className="ml-auto flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setLayer((l) => (l === 'visual' ? 'fields' : 'visual'))}
+                  disabled={!graph}
+                  className="rounded border border-pc-border px-2 py-1 text-sm text-pc-text hover:bg-pc-elevated disabled:opacity-40"
+                >
+                  {layer === 'visual' ? t('sops.layer_fields') : t('sops.layer_visual')}
+                </button>
+                <button
+                  type="button"
+                  onClick={startEdit}
+                  disabled={!graph}
+                  className="rounded border border-pc-border px-2 py-1 text-sm text-pc-text hover:bg-pc-elevated disabled:opacity-40"
+                >
+                  {t('sops.edit')}
+                </button>
+                <button
+                  type="button"
+                  onClick={onDeleteSelected}
+                  className="inline-flex items-center gap-1 rounded border border-pc-border px-2 py-1 text-sm text-rose-500 hover:bg-pc-elevated"
+                >
+                  <Trash2 className="h-4 w-4" aria-hidden /> {t('sops.delete')}
+                </button>
+              </div>
+            </div>
+            <div className="mb-3 flex items-center gap-2">
+              <input
+                type="text"
+                value={runId}
+                onChange={(e) => setRunId(e.target.value.trim())}
+                placeholder={t('sops.run_id_placeholder')}
+                className="w-64 rounded border border-pc-border bg-pc-surface px-2 py-1 text-sm text-pc-text"
+              />
+              {overlay ? (
+                <Badge tone={overlay.status === 'failed' ? 'error' : 'ok'}>
+                  {t(`sops.run_status.${overlay.status}`)} · {overlay.current_step}/
+                  {overlay.total_steps}
+                </Badge>
+              ) : null}
+              {overlayError ? <span className="text-xs text-rose-500">{overlayError}</span> : null}
+            </div>
+            {graphLoading ? (
+              <Loader2 className="h-5 w-5 animate-spin text-pc-text-muted" aria-hidden />
+            ) : graph ? (
+              <>
+                {layer === 'visual' && viewSop ? (
+                  <SopCanvas
+                    draft={viewSop}
+                    graph={graph}
+                    selectedStep={null}
+                    runStateByStep={runStateByStep}
+                    readOnly
+                    onSelectStep={noop}
+                    onSelectTrigger={noop}
+                    onAddStep={noop}
+                    onConnect={noop}
+                    onDisconnect={noop}
+                  />
+                ) : (
+                  <SopFieldList graph={graph} overlay={overlay} />
+                )}
+                <DiagnosticsPanel graph={graph} />
+              </>
+            ) : null}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

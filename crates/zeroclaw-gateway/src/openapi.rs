@@ -87,6 +87,10 @@ pub fn build_spec() -> serde_json::Value {
             "DriftResponse":    schema_value::<DriftResponse>(),
             "ReloadStatusResponse": schema_value::<ReloadStatusResponse>(),
             "Config":           schema_value::<zeroclaw_config::schema::Config>(),
+            "Sop":              schema_value::<zeroclaw_runtime::sop::Sop>(),
+            "SopGraph":         schema_value::<zeroclaw_runtime::sop::SopGraph>(),
+            "RunOverlay":       schema_value::<zeroclaw_runtime::sop::RunOverlay>(),
+            "TriggerSourceRegistry": schema_value::<zeroclaw_runtime::sop::TriggerSourceRegistry>(),
         },
         "securitySchemes": {
             "bearerAuth": {

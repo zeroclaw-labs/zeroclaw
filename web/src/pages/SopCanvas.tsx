@@ -1,0 +1,547 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Plus } from 'lucide-react';
+import { t } from '@/lib/i18n';
+import {
+  runStateTone,
+  flowRoleTone,
+  type RunStateTone,
+  type WireTone,
+  type Sop,
+  type SopStep,
+  type NodeRunState,
+  type SopGraph,
+  type GraphNode,
+  type GraphWire,
+  type FlowRole,
+} from '@/lib/sops';
+
+type XY = { x: number; y: number };
+
+const NODE_W = 210;
+const NODE_H = 84;
+const COL_GAP = 130;
+const ROW_GAP = 46;
+
+// Wire and node colors read from the gateway theme's semantic status tokens
+// and accent, so the canvas follows light/dark and the active palette instead
+// of fixed hex. The tone semantics come from the shared `wireTone`/
+// `runStateTone` maps; this file only binds tones to CSS variables.
+const WIRE_STROKE: Record<WireTone, string> = {
+  data: 'var(--color-status-info)',
+  error: 'var(--color-status-error)',
+  warning: 'var(--color-status-warning)',
+  switch: 'var(--pc-accent-light)',
+  accent: 'var(--pc-accent)',
+  success: 'var(--color-status-success)',
+};
+
+function wireStroke(kind: FlowRole): string {
+  return WIRE_STROKE[flowRoleTone(kind)];
+}
+
+const NODE_STROKE: Record<RunStateTone, string> = {
+  accent: 'var(--pc-accent)',
+  success: 'var(--color-status-success)',
+  error: 'var(--color-status-error)',
+  warning: 'var(--color-status-warning)',
+  neutral: 'var(--pc-border-strong)',
+};
+
+function nodeStateStroke(state: NodeRunState | undefined): string {
+  return NODE_STROKE[runStateTone(state)];
+}
+
+/// Seed positions from the backend layout. The layout (columns/rows walked from
+/// the projected edges) is the single source of node placement; the canvas only
+/// maps grid slots onto pixels and lets the user drag from there. No layout is
+/// derived client-side.
+function seedPositions(graph: SopGraph): Map<number, XY> {
+  const pos = new Map<number, XY>();
+  for (const p of graph.layout.positions) {
+    pos.set(p.step, {
+      x: 24 + p.col * (NODE_W + COL_GAP),
+      y: 24 + p.row * (NODE_H + ROW_GAP),
+    });
+  }
+  return pos;
+}
+
+function edgePath(a: XY, b: XY, sourceY?: number, targetY?: number): string {
+  const x1 = a.x + NODE_W;
+  const y1 = sourceY ?? a.y + NODE_H / 2;
+  const x2 = b.x;
+  const y2 = targetY ?? b.y + NODE_H / 2;
+  const dx = Math.max(40, Math.abs(x2 - x1) / 2);
+  return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+}
+
+const SWITCH_PORT_TOP = 34;
+const SWITCH_PORT_GAP = 14;
+function switchPortY(nodeY: number, index: number): number {
+  return nodeY + SWITCH_PORT_TOP + index * SWITCH_PORT_GAP;
+}
+
+interface Props {
+  draft: Sop;
+  graph: SopGraph;
+  selectedStep: number | null;
+  runStateByStep: Map<number, NodeRunState>;
+  readOnly?: boolean;
+  onSelectStep: (n: number) => void;
+  onSelectTrigger: (index: number) => void;
+  onAddStep: () => void;
+  onConnect: (from: number, to: number, kind: FlowRole, portIndex?: number) => void;
+  onDisconnect: (from: number, to: number, kind: FlowRole, portIndex?: number) => void;
+}
+
+export default function SopCanvas({
+  draft,
+  graph,
+  selectedStep,
+  runStateByStep,
+  readOnly = false,
+  onSelectStep,
+  onSelectTrigger,
+  onAddStep,
+  onConnect,
+  onDisconnect,
+}: Props) {
+  const [pos, setPos] = useState<Map<number, XY>>(() => seedPositions(graph));
+  const [drag, setDrag] = useState<{ step: number; dx: number; dy: number } | null>(null);
+  const [linkFrom, setLinkFrom] = useState<number | null>(null);
+  const [linkKind, setLinkKind] = useState<FlowRole>('sequence');
+  const [linkPort, setLinkPort] = useState<number | undefined>(undefined);
+  const [cursor, setCursor] = useState<XY | null>(null);
+  const [hoverWire, setHoverWire] = useState<number | null>(null);
+  const svgRef = useRef<SVGSVGElement | null>(null);
+
+  // Reseed from the backend layout when the projection changes, preserving any
+  // positions the user has dragged for nodes that still exist.
+  useEffect(() => {
+    setPos((prev) => {
+      const seeded = seedPositions(graph);
+      const merged = new Map(seeded);
+      for (const [k, v] of prev) if (seeded.has(k)) merged.set(k, v);
+      return merged;
+    });
+  }, [graph]);
+
+  const stepByNum = useMemo(() => new Map(draft.steps.map((s) => [s.number, s])), [draft.steps]);
+  const nodeByStep = useMemo(() => new Map(graph.nodes.map((n) => [n.step, n])), [graph.nodes]);
+
+  // Switch port index per wire, resolved against the source step's rules so the
+  // edge can leave the correct port handle. Backend carries the port label in
+  // `from_pin`; the index is a render concern only.
+  const switchPortIndex = useCallback(
+    (w: GraphWire): number | undefined => {
+      if (w.flow_role !== 'switch' || !w.from_pin) return undefined;
+      const src = stepByNum.get(w.from_step);
+      const idx = src?.routing?.switch?.findIndex((r) => r.name === w.from_pin);
+      return idx !== undefined && idx >= 0 ? idx : undefined;
+    },
+    [stepByNum],
+  );
+
+  const toLocal = useCallback((clientX: number, clientY: number): XY => {
+    const rect = svgRef.current?.getBoundingClientRect();
+    return { x: clientX - (rect?.left ?? 0), y: clientY - (rect?.top ?? 0) };
+  }, []);
+
+  const onPointerMove = useCallback(
+    (e: React.PointerEvent) => {
+      const p = toLocal(e.clientX, e.clientY);
+      if (drag) {
+        setPos((prev) => {
+          const next = new Map(prev);
+          next.set(drag.step, { x: p.x - drag.dx, y: p.y - drag.dy });
+          return next;
+        });
+      }
+      if (linkFrom !== null) setCursor(p);
+    },
+    [drag, linkFrom, toLocal],
+  );
+
+  const endDrag = useCallback(() => setDrag(null), []);
+
+  const startLink = useCallback((step: number, kind: FlowRole, port?: number) => {
+    setLinkKind(kind);
+    setLinkPort(port);
+    setLinkFrom(step);
+  }, []);
+
+  const completeLink = useCallback(
+    (target: number) => {
+      if (linkFrom !== null && linkFrom !== target) onConnect(linkFrom, target, linkKind, linkPort);
+      setLinkFrom(null);
+      setCursor(null);
+    },
+    [linkFrom, linkKind, linkPort, onConnect],
+  );
+
+  const extent = useMemo(() => {
+    let w = 640;
+    let h = 320;
+    for (const p of pos.values()) {
+      w = Math.max(w, p.x + NODE_W + 48);
+      h = Math.max(h, p.y + NODE_H + 48);
+    }
+    return { w, h };
+  }, [pos]);
+
+  return (
+    <div className="relative overflow-auto rounded-[var(--radius-lg)] border border-pc-border bg-pc-bg-base">
+      {readOnly ? null : (
+        <div className="absolute right-2 top-2 z-10 flex gap-1">
+          <button
+            type="button"
+            onClick={onAddStep}
+            className="inline-flex items-center gap-1 rounded bg-pc-accent px-2 py-1 text-xs text-white"
+          >
+            <Plus className="h-3.5 w-3.5" aria-hidden /> {t('sops.add_step')}
+          </button>
+        </div>
+      )}
+      {linkFrom !== null ? (
+        <div className="absolute left-2 top-2 z-10 rounded bg-pc-elevated px-2 py-1 text-xs text-pc-text">
+          {t('sops.linking')}: {linkKind} — {t('sops.link_hint')}
+          <button
+            type="button"
+            onClick={() => {
+              setLinkFrom(null);
+              setCursor(null);
+            }}
+            className="ml-2 text-pc-text-muted underline"
+          >
+            {t('sops.cancel')}
+          </button>
+        </div>
+      ) : null}
+      <svg
+        ref={svgRef}
+        width={extent.w}
+        height={extent.h}
+        onPointerMove={onPointerMove}
+        onPointerUp={endDrag}
+        onPointerLeave={endDrag}
+        className="block touch-none select-none"
+      >
+        <defs>
+          <marker
+            id="sop-arrow"
+            viewBox="0 0 10 10"
+            refX="9"
+            refY="5"
+            markerWidth="7"
+            markerHeight="7"
+            orient="auto-start-reverse"
+          >
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke" />
+          </marker>
+        </defs>
+        {graph.wires
+          .filter((w) => w.class === 'flow')
+          .map((w, i) => {
+            const a = pos.get(w.from_step);
+            const b = pos.get(w.to_step);
+            if (!a || !b) return null;
+            const kind = (w.flow_role ?? 'sequence') as FlowRole;
+            const active = runStateByStep.get(w.to_step) === 'active';
+            const portIndex = switchPortIndex(w);
+            const srcY = portIndex !== undefined ? switchPortY(a.y, portIndex) : undefined;
+            const d = edgePath(a, b, srcY);
+            const hovered = hoverWire === i;
+            const wireLabel = kind === 'trigger' ? nodeByStep.get(w.from_step)?.subtitle : undefined;
+            return (
+              <g key={`wire-${i}`}>
+                <path
+                  d={d}
+                  fill="none"
+                  stroke="transparent"
+                  strokeWidth={14}
+                  pointerEvents="stroke"
+                  className={kind === 'trigger' ? '' : 'cursor-pointer'}
+                  onPointerEnter={() => setHoverWire(i)}
+                  onPointerLeave={() => setHoverWire((h) => (h === i ? null : h))}
+                  onPointerDown={(e) => {
+                    e.stopPropagation();
+                    // Trigger edges are derived from the SOP's triggers; they
+                    // are not hand-wired and cannot be deleted from the canvas.
+                    if (readOnly || kind === 'trigger') return;
+                    onDisconnect(w.from_step, w.to_step, kind, portIndex);
+                  }}
+                >
+                  {kind !== 'trigger' ? <title>{t('sops.wire_delete_hint')}</title> : null}
+                </path>
+                <path
+                  d={d}
+                  fill="none"
+                  stroke={hovered && kind !== 'trigger' ? 'var(--color-status-error)' : wireStroke(kind)}
+                  strokeWidth={active ? 3 : hovered ? 2.5 : 1.75}
+                  strokeDasharray={
+                    hovered && kind !== 'trigger'
+                      ? '6 3'
+                      : kind === 'dependency'
+                        ? '5 4'
+                        : kind === 'trigger'
+                          ? '4 3'
+                          : undefined
+                  }
+                  markerEnd="url(#sop-arrow)"
+                  opacity={active ? 1 : hovered ? 1 : kind === 'trigger' ? 1 : 0.85}
+                  pointerEvents="none"
+                >
+                  {active ? (
+                    <animate
+                      attributeName="stroke-dashoffset"
+                      from="18"
+                      to="0"
+                      dur="0.6s"
+                      repeatCount="indefinite"
+                    />
+                  ) : null}
+                </path>
+                {hovered && kind !== 'trigger' ? (
+                  <g pointerEvents="none">
+                    <circle cx={(a.x + NODE_W + b.x) / 2} cy={(a.y + b.y) / 2 + NODE_H / 2} r={8} fill="var(--color-status-error)" />
+                    <text
+                      x={(a.x + NODE_W + b.x) / 2}
+                      y={(a.y + b.y) / 2 + NODE_H / 2 + 3}
+                      fill="#fff"
+                      fontSize="11"
+                      fontWeight="bold"
+                      textAnchor="middle"
+                    >
+                      ×
+                    </text>
+                  </g>
+                ) : wireLabel ? (
+                  (() => {
+                    const cx = (a.x + NODE_W + b.x) / 2;
+                    const cy = (a.y + b.y) / 2 + NODE_H / 2 - 10;
+                    const label = wireLabel.length > 28 ? `${wireLabel.slice(0, 27)}…` : wireLabel;
+                    const chipW = label.length * 5.6 + 12;
+                    return (
+                      <g pointerEvents="none">
+                        <rect
+                          x={cx - chipW / 2}
+                          y={cy - 10}
+                          width={chipW}
+                          height={15}
+                          rx={4}
+                          fill="var(--pc-bg-base)"
+                          stroke={wireStroke(kind)}
+                          strokeOpacity={0.4}
+                        />
+                        <text
+                          x={cx}
+                          y={cy + 1}
+                          fill={wireStroke(kind)}
+                          fontSize="10"
+                          textAnchor="middle"
+                          dominantBaseline="middle"
+                        >
+                          {label}
+                        </text>
+                      </g>
+                    );
+                  })()
+                ) : null}
+              </g>
+            );
+          })}
+        {linkFrom !== null && cursor && pos.get(linkFrom) ? (
+          <path
+            d={edgePath(pos.get(linkFrom) as XY, { x: cursor.x - NODE_W, y: cursor.y - NODE_H / 2 })}
+            fill="none"
+            stroke={wireStroke(linkKind)}
+            strokeWidth={1.75}
+            strokeDasharray="4 4"
+          />
+        ) : null}
+        {graph.nodes.map((node) => {
+          const p = pos.get(node.step);
+          if (!p) return null;
+          if (node.kind === 'trigger') return renderTrigger(node, p);
+          return renderStep(node);
+        })}
+      </svg>
+    </div>
+  );
+
+  function renderTrigger(node: GraphNode, p: XY) {
+    const idx = node.trigger_index;
+    return (
+      <g
+        key={`trigger-${node.step}`}
+        transform={`translate(${p.x}, ${p.y})`}
+        onClick={() => {
+          if (idx != null) onSelectTrigger(idx);
+        }}
+        className={idx != null ? 'cursor-pointer' : undefined}
+      >
+        <title>{t('sops.trigger_edit_hint')}</title>
+        <rect
+          width={NODE_W}
+          height={NODE_H}
+          rx={12}
+          fill="var(--pc-bg-surface)"
+          stroke={wireStroke('trigger')}
+          strokeWidth={1.5}
+          strokeDasharray="4 3"
+        />
+        <rect width={NODE_W} height={26} rx={12} fill="var(--pc-bg-elevated)" />
+        <rect y={16} width={NODE_W} height={10} fill="var(--pc-bg-elevated)" />
+        <circle cx={16} cy={13} r={9} fill={wireStroke('trigger')} opacity={0.3} />
+        <text x={16} y={17} fontSize="11" textAnchor="middle" fill={wireStroke('trigger')}>
+          ⚡
+        </text>
+        <text x={32} y={17} fontSize="12" fill="var(--pc-text-primary)">
+          {node.title}
+        </text>
+        <text x={12} y={46} fontSize="10" fill="var(--pc-text-muted)">
+          {(node.subtitle ?? '').slice(0, 30)}
+        </text>
+        <circle cx={NODE_W} cy={NODE_H / 2} r={6} fill={wireStroke('trigger')} />
+      </g>
+    );
+  }
+
+  function renderStep(node: GraphNode) {
+    const step: SopStep | undefined = stepByNum.get(node.step);
+    const p = pos.get(node.step);
+    if (!p) return null;
+    const state = runStateByStep.get(node.step);
+    const selected = selectedStep === node.step;
+    const isCheckpoint = step?.kind === 'checkpoint';
+    const switchRules = step?.routing?.switch ?? [];
+    return (
+      <g
+        key={node.step}
+        transform={`translate(${p.x}, ${p.y})`}
+        onPointerDown={(e) => {
+          if (linkFrom !== null) {
+            completeLink(node.step);
+            return;
+          }
+          const local = toLocal(e.clientX, e.clientY);
+          setDrag({ step: node.step, dx: local.x - p.x, dy: local.y - p.y });
+          onSelectStep(node.step);
+        }}
+        className="cursor-grab"
+      >
+        <rect
+          width={NODE_W}
+          height={NODE_H}
+          rx={10}
+          fill="var(--pc-bg-surface)"
+          stroke={nodeStateStroke(state)}
+          strokeWidth={selected ? 2.5 : 1.5}
+        />
+        <rect width={NODE_W} height={26} rx={10} fill="var(--pc-bg-elevated)" />
+        <rect y={16} width={NODE_W} height={10} fill="var(--pc-bg-elevated)" />
+        <circle cx={16} cy={13} r={9} fill="var(--pc-accent-dim)" />
+        <text x={16} y={17} fontSize="11" textAnchor="middle" fill="var(--pc-accent)">
+          {node.step}
+        </text>
+        <text x={32} y={17} fontSize="12" fill="var(--pc-text-primary)">
+          {(node.title || t('sops.untitled')).slice(0, 22)}
+        </text>
+        {isCheckpoint ? (
+          <text x={NODE_W - 10} y={17} fontSize="10" textAnchor="end" fill="var(--color-status-warning)">
+            ⏸ {t('sops.checkpoint')}
+          </text>
+        ) : switchRules.length > 0 ? (
+          <text x={NODE_W - 10} y={17} fontSize="10" textAnchor="end" fill="var(--pc-accent-light)">
+            ⋔ {t('sops.switch')}
+          </text>
+        ) : null}
+        <text x={12} y={46} fontSize="10" fill="var(--pc-text-muted)">
+          {step?.suggested_tools && step.suggested_tools.length > 0
+            ? step.suggested_tools.slice(0, 3).join(', ')
+            : t('sops.no_tools')}
+        </text>
+        {state ? (
+          <text x={12} y={64} fontSize="10" fill={nodeStateStroke(state)}>
+            {t(`sops.run_state.${state}`)}
+          </text>
+        ) : null}
+        {switchRules.length > 0 ? (
+          <g>
+            {switchRules.map((rule, ri) => (
+              <g key={`port-${ri}`}>
+                <text
+                  x={NODE_W - 16}
+                  y={SWITCH_PORT_TOP + ri * SWITCH_PORT_GAP + 3}
+                  fontSize="9"
+                  textAnchor="end"
+                  fill="var(--pc-accent-light)"
+                >
+                  {(rule.name || `port ${ri + 1}`).slice(0, 16)}
+                </text>
+                <circle
+                  cx={NODE_W}
+                  cy={SWITCH_PORT_TOP + ri * SWITCH_PORT_GAP}
+                  r={5}
+                  fill={wireStroke('switch')}
+                  onPointerDown={(e) => {
+                    e.stopPropagation();
+                    if (!readOnly) startLink(node.step, 'switch', ri);
+                  }}
+                  className="cursor-crosshair"
+                >
+                  <title>
+                    {t('sops.handle_switch')}: {rule.name}
+                  </title>
+                </circle>
+              </g>
+            ))}
+          </g>
+        ) : (
+          <g>
+            <circle
+              cx={NODE_W}
+              cy={NODE_H / 2}
+              r={6}
+              fill={wireStroke('sequence')}
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                if (!readOnly) startLink(node.step, 'sequence');
+              }}
+              className="cursor-crosshair"
+            >
+              <title>{t('sops.handle_sequence')}</title>
+            </circle>
+            <circle
+              cx={NODE_W}
+              cy={NODE_H / 2 + 18}
+              r={5}
+              fill={wireStroke('dependency')}
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                if (!readOnly) startLink(node.step, 'dependency');
+              }}
+              className="cursor-crosshair"
+            >
+              <title>{t('sops.handle_dependency')}</title>
+            </circle>
+            <circle
+              cx={NODE_W}
+              cy={NODE_H / 2 - 18}
+              r={5}
+              fill={wireStroke('failure')}
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                if (!readOnly) startLink(node.step, 'failure');
+              }}
+              className="cursor-crosshair"
+            >
+              <title>{t('sops.handle_failure')}</title>
+            </circle>
+          </g>
+        )}
+        <circle cx={0} cy={NODE_H / 2} r={5} fill="var(--pc-border-strong)" />
+      </g>
+    );
+  }
+}

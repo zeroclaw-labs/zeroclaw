@@ -110,6 +110,16 @@ pub mod method {
     pub const QUICKSTART_VALIDATE: &str = "quickstart/validate";
     pub const QUICKSTART_APPLY: &str = "quickstart/apply";
     pub const QUICKSTART_DISMISS: &str = "quickstart/dismiss";
+    pub const SOPS_LIST: &str = "sops/list";
+    pub const SOPS_GET: &str = "sops/get";
+    pub const SOPS_GRAPH: &str = "sops/graph";
+    pub const SOPS_RUN_OVERLAY: &str = "sops/run-overlay";
+    pub const SOPS_SAVE: &str = "sops/save";
+    pub const SOPS_CREATE: &str = "sops/create";
+    pub const SOPS_DELETE: &str = "sops/delete";
+    pub const SOPS_WIRE_DRAFT: &str = "sops/wire-draft";
+    pub const SOPS_GRAPH_DRAFT: &str = "sops/graph-draft";
+    pub const SOPS_TRIGGER_SOURCES: &str = "sops/trigger-sources";
 }
 
 // ── Socket path resolution ───────────────────────────────────────
@@ -1183,6 +1193,70 @@ impl RpcClient {
         .await
     }
 
+    pub async fn sops_list(&self) -> Result<Value> {
+        self.call(method::SOPS_LIST, serde_json::json!({})).await
+    }
+
+    pub async fn sops_get(&self, name: &str) -> Result<Value> {
+        self.call(method::SOPS_GET, serde_json::json!({ "name": name }))
+            .await
+    }
+
+    pub async fn sops_graph(&self, name: &str) -> Result<Value> {
+        self.call(method::SOPS_GRAPH, serde_json::json!({ "name": name }))
+            .await
+    }
+
+    pub async fn sops_graph_view(&self, name: &str) -> Result<SopGraphView> {
+        let value = self.sops_graph(name).await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    pub async fn sops_run_overlay(&self, name: &str, run_id: &str) -> Result<Value> {
+        self.call(
+            method::SOPS_RUN_OVERLAY,
+            serde_json::json!({ "name": name, "run_id": run_id }),
+        )
+        .await
+    }
+
+    pub async fn sops_save(&self, sop: Value) -> Result<Value> {
+        self.call(method::SOPS_SAVE, serde_json::json!({ "sop": sop }))
+            .await
+    }
+
+    pub async fn sops_create(&self, sop: Value) -> Result<Value> {
+        self.call(method::SOPS_CREATE, serde_json::json!({ "sop": sop }))
+            .await
+    }
+
+    pub async fn sops_delete(&self, name: &str) -> Result<Value> {
+        self.call(method::SOPS_DELETE, serde_json::json!({ "name": name }))
+            .await
+    }
+
+    pub async fn sops_wire_draft(&self, sop: Value, edit: Value) -> Result<Value> {
+        self.call(
+            method::SOPS_WIRE_DRAFT,
+            serde_json::json!({ "sop": sop, "edit": edit }),
+        )
+        .await
+    }
+
+    pub async fn sops_graph_draft(&self, sop: Value) -> Result<SopGraphView> {
+        let value = self
+            .call(method::SOPS_GRAPH_DRAFT, serde_json::json!({ "sop": sop }))
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    pub async fn sops_trigger_sources(&self) -> Result<TriggerSourceRegistryView> {
+        let value = self
+            .call(method::SOPS_TRIGGER_SOURCES, serde_json::json!({}))
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
     // ── Session methods ──────────────────────────────────────────
 
     pub async fn session_new(
@@ -1905,6 +1979,363 @@ pub struct QuickstartDismissResult {
     pub recorded: bool,
 }
 
+//
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SopStepKind {
+    #[default]
+    Execute,
+    Checkpoint,
+}
+
+// ── SOP wire view types ──────────────────────────────────────────
+//
+// Mirrors of the runtime's `sop::graph` / `sop::trigger_registry` wire
+// shapes, copied (not linked) per zerocode's RPC-only boundary. The pinned
+// pairing tests live in `sop_method_tests` here and in
+// `sop::graph::tests::graph_serializes_to_the_pinned_wire_shape` runtime-side;
+// if the daemon evolves the shape, fix both together.
+
+/// Per-node execution state from a `sops/run-overlay` result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRunState {
+    #[default]
+    Pending,
+    Active,
+    Completed,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PinClass {
+    Flow,
+    Data,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowRole {
+    Sequence,
+    Dependency,
+    Failure,
+    Switch,
+    Trigger,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeKind {
+    #[default]
+    Step,
+    Trigger,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GraphPin {
+    pub class: PinClass,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_type: Option<String>,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GraphNode {
+    pub step: u32,
+    pub title: String,
+    #[serde(default)]
+    pub kind: NodeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_index: Option<u32>,
+    pub inputs: Vec<GraphPin>,
+    pub outputs: Vec<GraphPin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GraphWire {
+    pub class: PinClass,
+    pub from_step: u32,
+    pub to_step: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_role: Option<FlowRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_pin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_pin: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphSeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GraphDiagnostic {
+    pub severity: GraphSeverity,
+    pub step: u32,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NodePosition {
+    pub step: u32,
+    pub col: u32,
+    pub row: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GraphLayout {
+    #[serde(default)]
+    pub positions: Vec<NodePosition>,
+    #[serde(default)]
+    pub columns: u32,
+    #[serde(default)]
+    pub rows: u32,
+}
+
+/// Result shape of `sops/graph` and `sops/graph-draft`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SopGraphView {
+    #[serde(default)]
+    pub nodes: Vec<GraphNode>,
+    #[serde(default)]
+    pub wires: Vec<GraphWire>,
+    #[serde(default)]
+    pub diagnostics: Vec<GraphDiagnostic>,
+    #[serde(default)]
+    pub layout: GraphLayout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChannelAliasView {
+    pub alias: String,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owning_agent: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChannelTriggerKindView {
+    pub channel: String,
+    #[serde(default)]
+    pub aliases: Vec<ChannelAliasView>,
+    pub configured: bool,
+    pub setup_path: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerFieldKindView {
+    #[default]
+    Text,
+    List,
+    Expression,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TriggerFieldView {
+    pub name: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub multi: bool,
+    #[serde(default)]
+    pub kind: TriggerFieldKindView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BoundTriggerSourceView {
+    pub source: String,
+    #[serde(default)]
+    pub fields: Vec<TriggerFieldView>,
+}
+
+/// Result shape of `sops/trigger-sources`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TriggerSourceRegistryView {
+    #[serde(default)]
+    pub bound: Vec<BoundTriggerSourceView>,
+    #[serde(default)]
+    pub channels: Vec<ChannelTriggerKindView>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SwitchRule {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goto: Option<u32>,
+    #[serde(skip)]
+    pub goto_buf: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StepRouting {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub switch: Vec<SwitchRule>,
+}
+
+impl StepRouting {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepFailure {
+    #[default]
+    Fail,
+    Retry {
+        max: u32,
+    },
+    Goto {
+        step: u32,
+    },
+}
+
+impl StepFailure {
+    pub fn is_fail(&self) -> bool {
+        matches!(self, Self::Fail)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SopStep {
+    pub number: u32,
+    pub title: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggested_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requires_confirmation: bool,
+    #[serde(default)]
+    pub kind: SopStepKind,
+    #[serde(default, skip_serializing_if = "StepRouting::is_default")]
+    pub routing: StepRouting,
+    #[serde(default, skip_serializing_if = "StepFailure::is_fail")]
+    pub on_failure: StepFailure,
+}
+
+impl Default for SopStep {
+    fn default() -> Self {
+        Self {
+            number: 0,
+            title: String::new(),
+            body: String::new(),
+            suggested_tools: Vec::new(),
+            requires_confirmation: false,
+            kind: SopStepKind::Execute,
+            routing: StepRouting::default(),
+            on_failure: StepFailure::Fail,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SopDraft {
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub priority: String,
+    pub execution_mode: String,
+    pub triggers: Vec<SopTriggerDraft>,
+    pub steps: Vec<SopStep>,
+    pub cooldown_secs: u64,
+    pub max_concurrent: u32,
+    pub deterministic: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SopTriggerDraft {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calendar_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_key: Option<String>,
+}
+
+impl Default for SopTriggerDraft {
+    fn default() -> Self {
+        Self {
+            kind: "manual".to_string(),
+            channel: None,
+            alias: None,
+            path: None,
+            expression: None,
+            topic: None,
+            condition: None,
+            events: Vec::new(),
+            board: None,
+            signal: None,
+            calendar_source: None,
+            calendar_ids: Vec::new(),
+            routing_key: None,
+        }
+    }
+}
+
+impl Default for SopDraft {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            version: "1.0.0".to_string(),
+            priority: "normal".to_string(),
+            execution_mode: "supervised".to_string(),
+            triggers: vec![SopTriggerDraft {
+                kind: "manual".to_string(),
+                ..SopTriggerDraft::default()
+            }],
+            steps: vec![SopStep {
+                number: 1,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            deterministic: false,
+        }
+    }
+}
+
 // ── Logs types ───────────────────────────────────────────────────
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -2308,6 +2739,187 @@ pub struct TuiListEntry {
 #[serde(rename_all = "snake_case")]
 pub struct TuiListResult {
     pub tuis: Vec<TuiListEntry>,
+}
+
+#[cfg(test)]
+mod sop_method_tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    fn make_rpc() -> (Arc<RpcOutbound>, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel::<String>(16);
+        (Arc::new(RpcOutbound::new(tx)), rx)
+    }
+
+    /// Wire fixture mirrored by `sop::graph` serialization tests in
+    /// zeroclaw-runtime. If this shape drifts, fix both sides together.
+    fn graph_fixture() -> serde_json::Value {
+        json!({
+            "nodes": [
+                {
+                    "step": 1_000_000,
+                    "title": "manual",
+                    "kind": "trigger",
+                    "subtitle": "manual",
+                    "trigger_index": 0,
+                    "inputs": [],
+                    "outputs": [
+                        {"class": "flow", "name": "event", "required": false}
+                    ]
+                },
+                {
+                    "step": 1,
+                    "title": "First",
+                    "kind": "step",
+                    "inputs": [
+                        {"class": "flow", "name": "in", "required": false},
+                        {"class": "data", "name": "input", "data_type": "object", "required": true}
+                    ],
+                    "outputs": [
+                        {"class": "flow", "name": "pr", "required": false}
+                    ]
+                }
+            ],
+            "wires": [
+                {"class": "flow", "from_step": 1_000_000, "to_step": 1, "flow_role": "trigger", "from_pin": "event"},
+                {"class": "flow", "from_step": 1, "to_step": 1, "flow_role": "switch", "from_pin": "pr"}
+            ],
+            "diagnostics": [
+                {"severity": "error", "step": 1, "message": "required input `input` has no upstream producer of a compatible type"}
+            ],
+            "layout": {
+                "positions": [
+                    {"step": 1, "col": 1, "row": 0},
+                    {"step": 1_000_000, "col": 0, "row": 0}
+                ],
+                "columns": 2,
+                "rows": 1
+            }
+        })
+    }
+
+    #[test]
+    fn graph_view_parses_runtime_wire_shape() {
+        let view: SopGraphView = serde_json::from_value(graph_fixture()).unwrap();
+
+        assert_eq!(view.nodes.len(), 2);
+        let trigger = &view.nodes[0];
+        assert_eq!(trigger.kind, NodeKind::Trigger);
+        assert_eq!(trigger.trigger_index, Some(0));
+        assert_eq!(trigger.outputs[0].class, PinClass::Flow);
+
+        let step = &view.nodes[1];
+        assert_eq!(step.kind, NodeKind::Step);
+        assert_eq!(step.inputs[1].class, PinClass::Data);
+        assert_eq!(step.inputs[1].data_type.as_deref(), Some("object"));
+        assert!(step.inputs[1].required);
+
+        assert_eq!(view.wires[0].flow_role, Some(FlowRole::Trigger));
+        assert_eq!(view.wires[1].flow_role, Some(FlowRole::Switch));
+        assert_eq!(view.wires[1].from_pin.as_deref(), Some("pr"));
+        assert_eq!(view.diagnostics[0].severity, GraphSeverity::Error);
+        assert_eq!(view.layout.columns, 2);
+    }
+
+    #[test]
+    fn graph_view_roundtrips_without_shape_loss() {
+        let view: SopGraphView = serde_json::from_value(graph_fixture()).unwrap();
+        let reparsed: SopGraphView =
+            serde_json::from_value(serde_json::to_value(&view).unwrap()).unwrap();
+        assert_eq!(view, reparsed);
+    }
+
+    #[test]
+    fn trigger_registry_view_parses_runtime_wire_shape() {
+        let view: TriggerSourceRegistryView = serde_json::from_value(json!({
+            "bound": [
+                {"source": "webhook", "fields": [{"name": "path", "kind": "text"}]},
+                {"source": "filesystem", "fields": [
+                    {"name": "path", "kind": "text"},
+                    {"name": "events", "options": ["created", "modified", "deleted", "renamed"], "multi": true, "kind": "list"},
+                    {"name": "condition", "kind": "expression"}
+                ]},
+                {"source": "manual", "fields": []}
+            ],
+            "channels": [
+                {
+                    "channel": "telegram",
+                    "aliases": [{"alias": "prod", "enabled": true, "owning_agent": "main"}],
+                    "configured": true,
+                    "setup_path": "/config/channels/telegram"
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(view.bound.len(), 3);
+        let fs = &view.bound[1];
+        assert_eq!(fs.fields[1].kind, TriggerFieldKindView::List);
+        assert!(fs.fields[1].multi);
+        assert_eq!(fs.fields[2].kind, TriggerFieldKindView::Expression);
+        assert!(view.channels[0].configured);
+        assert_eq!(
+            view.channels[0].aliases[0].owning_agent.as_deref(),
+            Some("main")
+        );
+    }
+
+    #[tokio::test]
+    async fn sops_graph_view_sends_name_and_parses_result() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move { client.sops_graph_view("deploy").await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.sops_graph_view must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "sops/graph");
+        assert_eq!(req["params"]["name"], "deploy");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(&id, Some(graph_fixture()), None);
+
+        let view = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.sops_graph_view must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.nodes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sops_wire_draft_sends_sop_and_edit_envelopes() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let sop = json!({"name": "deploy", "steps": []});
+        let edit = json!({"op": "connect", "from": 1, "to": 2, "role": "sequence"});
+        let task = {
+            let (sop, edit) = (sop.clone(), edit.clone());
+            tokio::spawn(async move { client.sops_wire_draft(sop, edit).await })
+        };
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.sops_wire_draft must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "sops/wire-draft");
+        assert_eq!(req["params"]["sop"], sop);
+        assert_eq!(req["params"]["edit"], edit);
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(&id, Some(json!({"sop": {"name": "deploy"}})), None);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.sops_wire_draft must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
+    }
 }
 
 #[cfg(test)]

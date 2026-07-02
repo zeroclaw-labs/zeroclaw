@@ -11379,6 +11379,8 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "shellexpand",
+ "strum 0.28.0",
+ "strum_macros 0.28.0",
  "sys-locale",
  "tar",
  "tempfile",

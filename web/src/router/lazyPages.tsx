@@ -15,3 +15,4 @@ export const Canvas = lazy(() => import('../pages/Canvas'));
 export const AcpConsole = lazy(() => import('../pages/AcpConsole'));
 export const Quickstart = lazy(() => import('../pages/quickstart/Quickstart'));
 export const Skills = lazy(() => import('../pages/Skills'));
+export const Sops = lazy(() => import('../pages/Sops'));

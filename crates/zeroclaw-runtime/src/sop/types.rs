@@ -10,6 +10,7 @@ use super::step_contract::{StepFailure, StepRouting};
 
 /// SOP priority level, used for execution mode resolution and scheduling.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum SopPriority {
     Low,
@@ -67,9 +68,21 @@ impl fmt::Display for SopExecutionMode {
 // ── Filesystem event kind ───────────────────────────────────────
 
 /// A normalized filesystem change kind reported by the watcher.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum_macros::EnumIter,
+    strum_macros::IntoStaticStr,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub enum FilesystemEventKind {
     Created,
     Modified,
@@ -151,6 +164,19 @@ pub enum SopTrigger {
         #[serde(default)]
         calendar_ids: Vec<String>,
     },
+    /// Inbound message on a configured agent-loop channel (telegram, discord,
+    /// slack, ...). Live: delivered by the channel orchestrator when the
+    /// channel's SOP dispatch mode is enabled.
+    Channel {
+        /// `ChannelKind` snake_case value naming the channel type.
+        channel: String,
+        /// Optional configured-instance alias; unset matches every instance.
+        #[serde(default)]
+        alias: Option<String>,
+        /// Optional expression evaluated against the message payload.
+        #[serde(default)]
+        condition: Option<String>,
+    },
     /// Agent-initiated run via the `sop_execute` tool. Not an external fan-in.
     Manual,
     /// AMQP delivery. Live: delivered by the AMQP consumer in a SOP dispatch mode.
@@ -175,8 +201,28 @@ impl fmt::Display for SopTrigger {
             Self::Calendar {
                 calendar_source, ..
             } => write!(f, "calendar:{calendar_source}"),
+            Self::Channel { channel, alias, .. } => match alias {
+                Some(a) => write!(f, "channel:{channel}/{a}"),
+                None => write!(f, "channel:{channel}"),
+            },
             Self::Manual => write!(f, "manual"),
             Self::Amqp { routing_key, .. } => write!(f, "amqp:{routing_key}"),
+        }
+    }
+}
+
+impl SopTrigger {
+    pub fn source(&self) -> SopTriggerSource {
+        match self {
+            Self::Mqtt { .. } => SopTriggerSource::Mqtt,
+            Self::Webhook { .. } => SopTriggerSource::Webhook,
+            Self::Cron { .. } => SopTriggerSource::Cron,
+            Self::Peripheral { .. } => SopTriggerSource::Peripheral,
+            Self::Filesystem { .. } => SopTriggerSource::Filesystem,
+            Self::Calendar { .. } => SopTriggerSource::Calendar,
+            Self::Channel { .. } => SopTriggerSource::Channel,
+            Self::Manual => SopTriggerSource::Manual,
+            Self::Amqp { .. } => SopTriggerSource::Amqp,
         }
     }
 }
@@ -185,6 +231,7 @@ impl fmt::Display for SopTrigger {
 
 /// The kind of a workflow step.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SopStepKind {
     /// Normal step — executed by the agent (or deterministic handler).
@@ -210,6 +257,7 @@ impl fmt::Display for SopStepKind {
 /// Stored as a raw `serde_json::Value` so callers can validate without
 /// pulling in a full JSON Schema library.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct StepSchema {
     /// JSON Schema object describing expected input shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,6 +271,7 @@ pub struct StepSchema {
 
 /// A single step in an SOP procedure, parsed from SOP.md.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopStep {
     pub number: u32,
     pub title: String,
@@ -286,6 +335,7 @@ impl SopStep {
 
 /// A complete Standard Operating Procedure definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct Sop {
     pub name: String,
     pub description: String,
@@ -299,6 +349,7 @@ pub struct Sop {
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: u32,
     #[serde(skip)]
+    #[cfg_attr(feature = "schema-export", schemars(skip))]
     pub location: Option<PathBuf>,
     /// When true, sets execution_mode to Deterministic.
     /// Steps execute sequentially without LLM round-trips.
@@ -317,15 +368,15 @@ fn default_max_concurrent() -> u32 {
 // ── TOML manifest (internal parse target) ───────────────────────
 
 /// Top-level SOP.toml structure.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SopManifest {
     pub sop: SopMeta,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub triggers: Vec<SopTrigger>,
 }
 
 /// The `[sop]` table in SOP.toml.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SopMeta {
     pub name: String,
     pub description: String,
@@ -333,7 +384,7 @@ pub struct SopMeta {
     pub version: String,
     #[serde(default)]
     pub priority: SopPriority,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_mode: Option<SopExecutionMode>,
     #[serde(default = "default_cooldown_secs")]
     pub cooldown_secs: u64,
@@ -344,6 +395,24 @@ pub struct SopMeta {
     pub deterministic: bool,
 }
 
+impl SopManifest {
+    pub fn from_sop(sop: &Sop) -> Self {
+        Self {
+            sop: SopMeta {
+                name: sop.name.clone(),
+                description: sop.description.clone(),
+                version: sop.version.clone(),
+                priority: sop.priority,
+                execution_mode: Some(sop.execution_mode),
+                cooldown_secs: sop.cooldown_secs,
+                max_concurrent: sop.max_concurrent,
+                deterministic: sop.deterministic,
+            },
+            triggers: sop.triggers.clone(),
+        }
+    }
+}
+
 fn default_sop_version() -> String {
     "0.1.0".to_string()
 }
@@ -351,8 +420,21 @@ fn default_sop_version() -> String {
 // ── Event ────────────────────────────────────────────────────────
 
 /// The source type of an incoming event that may trigger an SOP.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum_macros::EnumIter,
+    strum_macros::IntoStaticStr,
+    strum_macros::Display,
+)]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub enum SopTriggerSource {
     Mqtt,
     Webhook,
@@ -360,23 +442,9 @@ pub enum SopTriggerSource {
     Peripheral,
     Filesystem,
     Calendar,
+    Channel,
     Manual,
     Amqp,
-}
-
-impl fmt::Display for SopTriggerSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Mqtt => write!(f, "mqtt"),
-            Self::Webhook => write!(f, "webhook"),
-            Self::Cron => write!(f, "cron"),
-            Self::Peripheral => write!(f, "peripheral"),
-            Self::Filesystem => write!(f, "filesystem"),
-            Self::Calendar => write!(f, "calendar"),
-            Self::Manual => write!(f, "manual"),
-            Self::Amqp => write!(f, "amqp"),
-        }
-    }
 }
 
 /// An incoming event that may trigger one or more SOPs.
@@ -397,6 +465,7 @@ pub struct SopEvent {
 
 /// Status of an SOP execution run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SopRunStatus {
     Pending,

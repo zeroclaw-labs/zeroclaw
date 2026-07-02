@@ -317,7 +317,7 @@ use config::Config;
 pub use zeroclaw::{
     AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, GatewayCommands,
     HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands, ProvidersCommands,
-    ServiceCommands, SkillBundleCommands, SkillCommands, SopCommands,
+    ServiceCommands, SkillBundleCommands, SkillCommands, SopCommands, SopGraphFormat,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]

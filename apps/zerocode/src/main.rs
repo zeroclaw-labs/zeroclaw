@@ -39,6 +39,7 @@ mod keymap;
 mod logs;
 mod mouse;
 mod quickstart_pane;
+mod sop_pane;
 mod theme;
 mod turn_status;
 mod widgets;

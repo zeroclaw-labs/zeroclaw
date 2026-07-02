@@ -5,6 +5,7 @@ zc-pane-code = Code
 zc-pane-chat = Discussion
 zc-pane-logs = Journaux
 zc-pane-quickstart = Démarrage rapide
+zc-pane-sop = SOPs
 zc-app-help-cycle-mode = Changer de mode
 zc-app-help-reload = Recharger le démon
 zc-app-help-quit = Quitter

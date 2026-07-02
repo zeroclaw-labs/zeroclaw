@@ -5,6 +5,7 @@ zc-pane-code = Code
 zc-pane-chat = Chat
 zc-pane-logs = Logs
 zc-pane-quickstart = Quickstart
+zc-pane-sop = SOPs
 
 zc-app-help-cycle-mode = Cycle mode
 zc-app-help-reload = Reload daemon

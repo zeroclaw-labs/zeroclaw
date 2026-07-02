@@ -1904,7 +1904,7 @@ pub async fn handle_claude_code_hook(
 pub(crate) use tests::test_state;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{AppState, GatewayRateLimiter, IdempotencyStore, nodes};
     use async_trait::async_trait;

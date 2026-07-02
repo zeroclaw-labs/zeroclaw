@@ -5,6 +5,7 @@ pub mod condition;
 pub mod dispatch;
 pub mod engine;
 pub mod executor;
+pub mod graph;
 pub mod metrics;
 pub mod route;
 pub mod rundata;
@@ -12,16 +13,27 @@ pub mod schema;
 pub mod scope;
 pub mod step_contract;
 pub mod store;
+pub mod trigger_registry;
 pub mod types;
+pub mod wire;
 
 pub use audit::SopAuditLogger;
 pub use engine::{MaintenanceSummary, SopEngine};
+pub use graph::{
+    FlowRole, GraphDiagnostic, GraphLayout, GraphNode, GraphPin, GraphSeverity, GraphWire,
+    NodeKind, NodePosition, NodeRunOverlay, NodeRunState, PinClass, RunOverlay, SopGraph,
+    TRIGGER_NODE_BASE, TextGraphFormat, render_graph_text,
+};
 pub use metrics::SopMetricsCollector;
 pub use scope::StepToolScope;
-pub use step_contract::{StepFailure, StepRouting};
+pub use step_contract::{StepFailure, StepRouting, SwitchRule};
 pub use store::{
     ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, SopEventRecord, SopRunStore,
     SqliteRunStore, StoreError, build_run_store,
+};
+pub use trigger_registry::{
+    BoundTriggerSource, ChannelAlias, ChannelTriggerKind, ConfiguredChannel, TriggerField,
+    TriggerFieldKind, TriggerSourceRegistry, build_registry, registry_from_config,
 };
 #[allow(unused_imports)]
 pub use types::{
@@ -29,6 +41,7 @@ pub use types::{
     SopExecutionMode, SopPriority, SopRun, SopRunAction, SopRunStatus, SopStep, SopStepKind,
     SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource, StepSchema,
 };
+pub use wire::{WireEdit, WireError, WireOp, apply_wire};
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -39,7 +52,6 @@ use zeroclaw_config::schema::SopConfig;
 use zeroclaw_memory::traits::Memory;
 
 /// Build a single shared SopEngine + SopAuditLogger pair.
-///
 /// This is the sole construction site for SOP state within a daemon.
 /// Callers receive `Arc<Mutex<SopEngine>>` and `Arc<SopAuditLogger>`
 /// handles — never call `SopEngine::new` or `SopAuditLogger::new`
@@ -115,6 +127,96 @@ pub fn load_sops(
 ) -> Vec<Sop> {
     let dir = resolve_sops_dir(workspace_dir, config_dir);
     load_sops_from_directory(&dir, default_execution_mode)
+}
+
+/// Load a single SOP by directory name from the SOPs root. Errors if the
+/// directory or its `SOP.toml` is missing or malformed.
+pub fn load_sop_by_name(
+    sops_dir: &Path,
+    name: &str,
+    default_execution_mode: SopExecutionMode,
+) -> Result<Sop> {
+    load_sop(&sops_dir.join(name), default_execution_mode)
+}
+
+/// Delete an SOP's directory (manifest, steps, everything). Errors if no
+/// SOP with that name exists.
+pub fn delete_sop(sops_dir: &Path, name: &str) -> Result<()> {
+    let dir = sops_dir.join(name);
+    if !dir.exists() {
+        anyhow::bail!("SOP '{name}' not found");
+    }
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+/// Create a new SOP on disk, refusing to overwrite an existing one. Same
+/// normalization and validation as `save_sop`.
+pub fn create_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
+    if sops_dir.join(&sop.name).exists() {
+        anyhow::bail!("SOP '{}' already exists", sop.name);
+    }
+    save_sop(sops_dir, sop)
+}
+
+/// Project the live run state for `run_id` onto `sop`'s graph. Errors if
+/// the run is unknown or the engine lock is poisoned.
+pub fn run_overlay_for(
+    sop: &Sop,
+    engine: &Arc<Mutex<SopEngine>>,
+    run_id: &str,
+) -> Result<RunOverlay> {
+    let guard = engine
+        .lock()
+        .map_err(|_| anyhow::Error::msg("SOP engine lock poisoned"))?;
+    let run = guard
+        .get_run(run_id)
+        .ok_or_else(|| anyhow::Error::msg(format!("run '{run_id}' not found")))?;
+    let graph = SopGraph::from_sop(sop);
+    Ok(RunOverlay::project(&graph, run))
+}
+
+/// Renumber steps to a contiguous 1..=N sequence (positional order wins)
+/// and remap every internal reference: `routing.next`, `depends_on`,
+/// switch `goto` targets, and `on_failure: goto`. References to steps that
+/// no longer exist are dropped (`goto` falls back to `Fail`). No-op when
+/// step numbers are ambiguous (duplicates), since a remap would guess.
+/// Runs automatically inside `save_sop`.
+pub fn normalize_step_numbers(sop: &mut Sop) {
+    let mut seen = std::collections::HashSet::new();
+    if !sop.steps.iter().all(|s| seen.insert(s.number)) {
+        return;
+    }
+    let remap: std::collections::HashMap<u32, u32> = sop
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            (
+                s.number,
+                u32::try_from(i).unwrap_or(u32::MAX).saturating_add(1),
+            )
+        })
+        .collect();
+    for (i, step) in sop.steps.iter_mut().enumerate() {
+        step.number = u32::try_from(i).unwrap_or(u32::MAX).saturating_add(1);
+        step.routing.next = step.routing.next.and_then(|n| remap.get(&n).copied());
+        step.routing.depends_on = step
+            .routing
+            .depends_on
+            .iter()
+            .filter_map(|d| remap.get(d).copied())
+            .collect();
+        for rule in &mut step.routing.switch {
+            rule.goto = rule.goto.and_then(|g| remap.get(&g).copied());
+        }
+        if let StepFailure::Goto { step: target } = step.on_failure {
+            step.on_failure = remap
+                .get(&target)
+                .map(|s| StepFailure::Goto { step: *s })
+                .unwrap_or(StepFailure::Fail);
+        }
+    }
 }
 
 /// Load SOPs from a specific directory. Each subdirectory may contain
@@ -212,7 +314,6 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
 // ── Markdown step parser ────────────────────────────────────────
 
 /// Parse procedure steps from SOP.md content.
-///
 /// Expects a `## Steps` heading followed by numbered items (`1.`, `2.`, …).
 /// Each item's first bold text (`**...**`) is the step title; the rest is body.
 /// Sub-bullets parse execution hints and dark per-step contract metadata.
@@ -303,11 +404,15 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
                 }
             } else if let Some(val) = bullet.strip_prefix("next:") {
                 current.routing.next = val.trim().parse::<u32>().ok();
+            } else if let Some(val) = bullet.strip_prefix("terminal:") {
+                current.routing.terminal = val.trim().eq_ignore_ascii_case("true");
             } else if let Some(val) = bullet
                 .strip_prefix("depends_on:")
                 .or_else(|| bullet.strip_prefix("depends-on:"))
             {
                 current.routing.depends_on = parse_u32_list(val);
+            } else if let Some(val) = bullet.strip_prefix("switch:") {
+                current.routing.switch = parse_switch_rules(val);
             } else if let Some(val) = bullet
                 .strip_prefix("on_failure:")
                 .or_else(|| bullet.strip_prefix("on-failure:"))
@@ -399,6 +504,26 @@ fn parse_u32_list(value: &str) -> Vec<u32> {
         .collect()
 }
 
+fn parse_switch_rules(value: &str) -> Vec<SwitchRule> {
+    value
+        .split(';')
+        .filter_map(|seg| {
+            let mut parts = seg.splitn(3, '>');
+            let name = parts.next().unwrap_or("").trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let when = parts.next().unwrap_or("").trim();
+            let goto = parts.next().unwrap_or("").trim();
+            Some(SwitchRule {
+                name,
+                when: (!when.is_empty()).then(|| when.to_string()),
+                goto: goto.parse::<u32>().ok(),
+            })
+        })
+        .collect()
+}
+
 fn parse_schema_fragment(value: &str) -> serde_json::Value {
     serde_json::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.into()))
 }
@@ -467,6 +592,133 @@ pub fn extract_bold_title(text: &str) -> Option<(String, String)> {
     Some((title, rest.to_string()))
 }
 
+fn render_step_failure(failure: &StepFailure) -> String {
+    match failure {
+        StepFailure::Fail => "fail".to_string(),
+        StepFailure::Retry { max } => format!("retry: {max}"),
+        StepFailure::Goto { step } => format!("goto: {step}"),
+    }
+}
+
+fn render_step_bullets(step: &SopStep) -> Vec<String> {
+    let mut bullets = Vec::new();
+
+    if !step.suggested_tools.is_empty() {
+        bullets.push(format!("tools: {}", step.suggested_tools.join(", ")));
+    }
+    if let Some(scope) = &step.scope {
+        if let Some(allow) = &scope.allow {
+            bullets.push(format!("allow-tools: {}", allow.join(", ")));
+        }
+        if !scope.deny.is_empty() {
+            bullets.push(format!("deny-tools: {}", scope.deny.join(", ")));
+        }
+    }
+    if step.requires_confirmation {
+        bullets.push("requires_confirmation: true".to_string());
+    }
+    if step.kind == SopStepKind::Checkpoint {
+        bullets.push("kind: checkpoint".to_string());
+    }
+    if let Some(schema) = &step.schema {
+        if let Some(input) = &schema.input {
+            bullets.push(format!("input: {input}"));
+        }
+        if let Some(output) = &schema.output {
+            bullets.push(format!("output: {output}"));
+        }
+    }
+    if let Some(when) = &step.routing.when {
+        bullets.push(format!("when: {when}"));
+    }
+    if let Some(next) = step.routing.next {
+        bullets.push(format!("next: {next}"));
+    }
+    if step.routing.terminal {
+        bullets.push("terminal: true".to_string());
+    }
+    if !step.routing.depends_on.is_empty() {
+        let csv = step
+            .routing
+            .depends_on
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        bullets.push(format!("depends_on: {csv}"));
+    }
+    if !step.routing.switch.is_empty() {
+        let rendered = step
+            .routing
+            .switch
+            .iter()
+            .map(|rule| {
+                let when = rule.when.as_deref().unwrap_or("");
+                let goto = rule.goto.map(|g| g.to_string()).unwrap_or_default();
+                format!("{}>{}>{}", rule.name, when, goto)
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        bullets.push(format!("switch: {rendered}"));
+    }
+    if !step.on_failure.is_fail() {
+        bullets.push(format!(
+            "on_failure: {}",
+            render_step_failure(&step.on_failure)
+        ));
+    }
+    if let Some(mode) = step.mode {
+        bullets.push(format!("mode: {mode}"));
+    }
+
+    bullets
+}
+
+/// Render steps back to `SOP.md` markdown, the inverse of `parse_steps`.
+/// Every contract field (tools, scope, schema, routing, failure policy,
+/// mode) becomes a sub-bullet, so render -> parse is lossless.
+pub fn render_steps(steps: &[SopStep]) -> String {
+    let mut out = String::from("## Steps\n\n");
+    for step in steps {
+        if step.body.is_empty() {
+            out.push_str(&format!("{}. **{}**\n", step.number, step.title));
+        } else {
+            out.push_str(&format!(
+                "{}. **{}** - {}\n",
+                step.number, step.title, step.body
+            ));
+        }
+        for bullet in render_step_bullets(step) {
+            out.push_str(&format!("   - {bullet}\n"));
+        }
+    }
+    out
+}
+
+/// Persist an SOP to `<sops_dir>/<name>/` as `SOP.toml` + `SOP.md`.
+/// Normalizes step numbers first, then rejects the write entirely if
+/// strict validation finds blocking problems; nothing touches disk on
+/// failure.
+pub fn save_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
+    let mut sop = sop.clone();
+    normalize_step_numbers(&mut sop);
+    let sop = &sop;
+    let validation = validate_sop_strict(sop);
+    if !validation.is_ok() {
+        anyhow::bail!("SOP rejected: {}", validation.blocking.join("; "));
+    }
+
+    let sop_dir = sops_dir.join(&sop.name);
+    std::fs::create_dir_all(&sop_dir)?;
+
+    let manifest = SopManifest::from_sop(sop);
+    let toml_content = toml::to_string_pretty(&manifest)?;
+    std::fs::write(sop_dir.join("SOP.toml"), toml_content)?;
+    std::fs::write(sop_dir.join("SOP.md"), render_steps(&sop.steps))?;
+
+    Ok(())
+}
+
 // ── Validation ──────────────────────────────────────────────────
 
 /// Validate a loaded SOP and return a list of warnings.
@@ -503,11 +755,228 @@ pub fn validate_sop(sop: &Sop) -> Vec<String> {
     warnings
 }
 
+/// Result of `validate_sop_strict`: `blocking` problems reject a save,
+/// `warnings` surface in editors but do not block.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SopValidation {
+    pub blocking: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl SopValidation {
+    pub fn is_ok(&self) -> bool {
+        self.blocking.is_empty()
+    }
+}
+
+/// Authoring-gate validation: empty name, empty step titles, and duplicate
+/// step numbers block, as do graph projection errors (dangling `next` /
+/// `depends_on` / switch / goto targets, unsatisfiable required inputs).
+/// Graph warnings and the legacy `validate_sop` findings are advisory.
+pub fn validate_sop_strict(sop: &Sop) -> SopValidation {
+    let mut blocking = Vec::new();
+
+    if sop.name.trim().is_empty() {
+        blocking.push("SOP name is empty".into());
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for step in &sop.steps {
+        if step.title.trim().is_empty() {
+            blocking.push(format!("Step {} has an empty title", step.number));
+        }
+        if !seen.insert(step.number) {
+            blocking.push(format!("Duplicate step number {}", step.number));
+        }
+    }
+
+    let graph = SopGraph::from_sop(sop);
+    let mut warnings = Vec::new();
+    for diag in &graph.diagnostics {
+        match diag.severity {
+            GraphSeverity::Error => {
+                blocking.push(format!("Step {}: {}", diag.step, diag.message));
+            }
+            GraphSeverity::Warning => {
+                warnings.push(format!("Step {}: {}", diag.step, diag.message));
+            }
+        }
+    }
+
+    warnings.extend(validate_sop(sop));
+
+    SopValidation { blocking, warnings }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn authoring_sop(steps: Vec<SopStep>) -> Sop {
+        Sop {
+            name: "authoring".into(),
+            description: "test".into(),
+            version: "0.1.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Auto,
+            triggers: vec![SopTrigger::Manual],
+            steps,
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+        }
+    }
+
+    fn titled_step(number: u32, title: &str) -> SopStep {
+        SopStep {
+            number,
+            title: title.to_string(),
+            ..SopStep::default()
+        }
+    }
+
+    #[test]
+    fn normalize_step_numbers_remaps_all_references() {
+        let mut s3 = titled_step(30, "c");
+        s3.routing.next = Some(10);
+        s3.routing.depends_on = vec![20, 99];
+        s3.routing.switch = vec![SwitchRule {
+            name: "port".into(),
+            when: None,
+            goto: Some(20),
+        }];
+        s3.on_failure = StepFailure::Goto { step: 10 };
+        let mut sop = authoring_sop(vec![titled_step(10, "a"), titled_step(20, "b"), s3]);
+
+        normalize_step_numbers(&mut sop);
+
+        let numbers: Vec<u32> = sop.steps.iter().map(|s| s.number).collect();
+        assert_eq!(numbers, vec![1, 2, 3]);
+        assert_eq!(sop.steps[2].routing.next, Some(1));
+        assert_eq!(
+            sop.steps[2].routing.depends_on,
+            vec![2],
+            "dangling ref 99 dropped"
+        );
+        assert_eq!(sop.steps[2].routing.switch[0].goto, Some(2));
+        assert_eq!(sop.steps[2].on_failure, StepFailure::Goto { step: 1 });
+    }
+
+    #[test]
+    fn normalize_step_numbers_refuses_duplicate_numbers() {
+        let mut sop = authoring_sop(vec![titled_step(1, "a"), titled_step(1, "b")]);
+        let before = sop.steps.clone();
+        normalize_step_numbers(&mut sop);
+        assert_eq!(
+            sop.steps, before,
+            "ambiguous numbering must not be remapped"
+        );
+    }
+
+    #[test]
+    fn normalize_dangling_failure_goto_falls_back_to_fail() {
+        let mut s1 = titled_step(1, "a");
+        s1.on_failure = StepFailure::Goto { step: 99 };
+        let mut sop = authoring_sop(vec![s1]);
+        normalize_step_numbers(&mut sop);
+        assert_eq!(sop.steps[0].on_failure, StepFailure::Fail);
+    }
+
+    #[test]
+    fn render_parse_roundtrip_preserves_full_step_contract() {
+        let mut step = titled_step(1, "Collect");
+        step.body = "Gather context.".into();
+        step.suggested_tools = vec!["read_file".into(), "shell".into()];
+        step.requires_confirmation = true;
+        step.kind = SopStepKind::Checkpoint;
+        step.schema = Some(StepSchema {
+            input: Some(json!({"type": "object", "required": ["ticket"]})),
+            output: Some(json!({"type": "boolean"})),
+        });
+        step.scope = Some(crate::sop::scope::StepToolScope {
+            allow: Some(vec!["fs".into()]),
+            deny: vec!["shell".into()],
+        });
+        step.routing = StepRouting {
+            when: Some("$.steps.1.ok == true".into()),
+            next: Some(2),
+            terminal: false,
+            depends_on: vec![2],
+            switch: vec![
+                SwitchRule {
+                    name: "pr".into(),
+                    when: Some("$.event".into()),
+                    goto: Some(2),
+                },
+                SwitchRule {
+                    name: "catch_all".into(),
+                    when: None,
+                    goto: None,
+                },
+            ],
+        };
+        step.on_failure = StepFailure::Retry { max: 2 };
+        step.mode = Some(SopExecutionMode::Auto);
+
+        let mut terminal = titled_step(2, "Done");
+        terminal.routing.terminal = true;
+
+        let rendered = render_steps(&[step.clone(), terminal.clone()]);
+        let parsed = parse_steps(&rendered);
+
+        assert_eq!(parsed, vec![step, terminal]);
+    }
+
+    #[test]
+    fn save_sop_rejects_blocking_validation_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let sop = authoring_sop(vec![titled_step(1, "")]);
+        let err = save_sop(dir.path(), &sop).unwrap_err();
+        assert!(err.to_string().contains("SOP rejected"));
+        assert!(!dir.path().join("authoring").exists());
+    }
+
+    #[test]
+    fn save_then_load_roundtrips_via_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s1 = titled_step(1, "First");
+        s1.body = "Do the thing.".into();
+        s1.routing.next = Some(2);
+        let sop = authoring_sop(vec![s1, titled_step(2, "Second")]);
+
+        save_sop(dir.path(), &sop).unwrap();
+
+        let loaded =
+            load_sop_by_name(dir.path(), "authoring", SopExecutionMode::Supervised).unwrap();
+        assert_eq!(loaded.name, sop.name);
+        assert_eq!(loaded.execution_mode, SopExecutionMode::Auto);
+        assert_eq!(loaded.triggers, sop.triggers);
+        assert_eq!(loaded.steps, sop.steps);
+
+        delete_sop(dir.path(), "authoring").unwrap();
+        assert!(load_sop_by_name(dir.path(), "authoring", SopExecutionMode::Supervised).is_err());
+    }
+
+    #[test]
+    fn validate_sop_strict_blocks_graph_errors_and_duplicates() {
+        let mut s1 = titled_step(1, "a");
+        s1.routing.next = Some(99);
+        let validation = validate_sop_strict(&authoring_sop(vec![s1, titled_step(1, "b")]));
+        assert!(!validation.is_ok());
+        assert!(
+            validation
+                .blocking
+                .iter()
+                .any(|b| b.contains("Duplicate step number 1"))
+        );
+        assert!(validation.blocking.iter().any(|b| b.contains("step 99")));
+
+        let ok = validate_sop_strict(&authoring_sop(vec![titled_step(1, "a")]));
+        assert!(ok.is_ok());
+    }
 
     #[test]
     fn parse_steps_keeps_legacy_tools_hint() {
@@ -546,6 +1015,7 @@ mod tests {
    - when: $.steps.1.ok == true
    - next: 3
    - depends_on: 1, 2
+   - switch: pull_request>$.event>3; catch_all>>2
    - on_failure: retry:2
    - mode: auto
 "#,
@@ -573,6 +1043,21 @@ mod tests {
         assert_eq!(step.routing.when.as_deref(), Some("$.steps.1.ok == true"));
         assert_eq!(step.routing.next, Some(3));
         assert_eq!(step.routing.depends_on, vec![1, 2]);
+        assert_eq!(
+            step.routing.switch,
+            vec![
+                SwitchRule {
+                    name: "pull_request".into(),
+                    when: Some("$.event".into()),
+                    goto: Some(3),
+                },
+                SwitchRule {
+                    name: "catch_all".into(),
+                    when: None,
+                    goto: Some(2),
+                },
+            ]
+        );
         assert_eq!(step.on_failure, StepFailure::Retry { max: 2 });
         assert_eq!(step.mode, Some(SopExecutionMode::Auto));
     }

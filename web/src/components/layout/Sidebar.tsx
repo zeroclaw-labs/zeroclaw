@@ -12,6 +12,7 @@ import {
   Smartphone,
   Stethoscope,
   Terminal,
+  Workflow,
   Wrench,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
@@ -49,6 +50,7 @@ const navGroups: NavGroup[] = [
       { to: '/config', icon: Settings, labelKey: 'nav.config' },
       { to: '/config/agents', icon: Bot, labelKey: 'nav.agent' },
       { to: '/tools', icon: Wrench, labelKey: 'nav.tools' },
+      { to: '/sops', icon: Workflow, labelKey: 'nav.sops' },
       { to: '/integrations', icon: Puzzle, labelKey: 'nav.integrations' },
       { to: '/cron', icon: Clock, labelKey: 'nav.cron' },
     ],

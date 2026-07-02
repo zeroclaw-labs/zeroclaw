@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    RpcOutbound,
+    RpcOutbound, SopRunOverlayRequest, SopSaveRequest, SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ChatMessage;
 
@@ -144,6 +144,18 @@ pub enum Method {
     QuickstartValidate,
     QuickstartApply,
     QuickstartDismiss,
+
+    SopsList,
+    SopsGet,
+    SopsGraph,
+    SopsRunOverlay,
+    SopsValidate,
+    SopsSave,
+    SopsCreate,
+    SopsDelete,
+    SopsWireDraft,
+    SopsGraphDraft,
+    SopsTriggerSources,
 }
 
 impl Method {
@@ -238,6 +250,17 @@ impl Method {
         (Method::QuickstartValidate, "quickstart/validate"),
         (Method::QuickstartApply, "quickstart/apply"),
         (Method::QuickstartDismiss, "quickstart/dismiss"),
+        (Method::SopsList, "sops/list"),
+        (Method::SopsGet, "sops/get"),
+        (Method::SopsGraph, "sops/graph"),
+        (Method::SopsRunOverlay, "sops/run-overlay"),
+        (Method::SopsValidate, "sops/validate"),
+        (Method::SopsSave, "sops/save"),
+        (Method::SopsCreate, "sops/create"),
+        (Method::SopsDelete, "sops/delete"),
+        (Method::SopsWireDraft, "sops/wire-draft"),
+        (Method::SopsGraphDraft, "sops/graph-draft"),
+        (Method::SopsTriggerSources, "sops/trigger-sources"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -684,6 +707,18 @@ impl RpcDispatcher {
             Method::QuickstartValidate => self.handle_quickstart_validate(&req.params),
             Method::QuickstartApply => self.handle_quickstart_apply(&req.params).await,
             Method::QuickstartDismiss => self.handle_quickstart_dismiss(&req.params),
+
+            Method::SopsList => self.handle_sops_list(),
+            Method::SopsGet => self.handle_sops_get(&req.params),
+            Method::SopsGraph => self.handle_sops_graph(&req.params),
+            Method::SopsRunOverlay => self.handle_sops_run_overlay(&req.params),
+            Method::SopsValidate => self.handle_sops_validate(&req.params),
+            Method::SopsSave => self.handle_sops_save(&req.params),
+            Method::SopsCreate => self.handle_sops_create(&req.params),
+            Method::SopsDelete => self.handle_sops_delete(&req.params),
+            Method::SopsWireDraft => self.handle_sops_wire_draft(&req.params),
+            Method::SopsGraphDraft => self.handle_sops_graph_draft(&req.params),
+            Method::SopsTriggerSources => self.handle_sops_trigger_sources(),
         };
 
         if is_notification {
@@ -3831,6 +3866,138 @@ impl RpcDispatcher {
             Err(errors) => QuickstartValidateResult::Errors { errors },
         };
         to_result(body)
+    }
+
+    fn sops_dir_and_mode(&self) -> (std::path::PathBuf, crate::sop::SopExecutionMode) {
+        let config = self.ctx.config.read();
+        let workspace = config.shared_workspace_dir();
+        let dir = crate::sop::resolve_sops_dir(&workspace, config.sop.sops_dir.as_deref());
+        let mode = crate::sop::parse_execution_mode(&config.sop.default_execution_mode);
+        (dir, mode)
+    }
+
+    fn parse_sop(value: &Value) -> Result<crate::sop::Sop, JsonRpcError> {
+        serde_json::from_value(value.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))
+    }
+
+    fn handle_sops_list(&self) -> RpcResult {
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sops = crate::sop::load_sops_from_directory(&dir, mode);
+        to_result(sops)
+    }
+
+    fn handle_sops_get(&self, params: &Value) -> RpcResult {
+        let req: SopSelectRequest = parse_params(params)?;
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+        to_result(sop)
+    }
+
+    fn handle_sops_graph(&self, params: &Value) -> RpcResult {
+        let req: SopSelectRequest = parse_params(params)?;
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+        to_result(crate::sop::SopGraph::from_sop(&sop))
+    }
+
+    fn handle_sops_run_overlay(&self, params: &Value) -> RpcResult {
+        let req: SopRunOverlayRequest = parse_params(params)?;
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+        let engine = self
+            .ctx
+            .sop_engine
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+        let overlay = crate::sop::run_overlay_for(&sop, engine, &req.run_id).map_err(|e| {
+            let msg = e.to_string();
+            let code = if msg.contains("not found") {
+                INVALID_PARAMS
+            } else {
+                INTERNAL_ERROR
+            };
+            rpc_err(code, msg)
+        })?;
+        to_result(overlay)
+    }
+
+    fn handle_sops_validate(&self, params: &Value) -> RpcResult {
+        let sop = if params.get("sop").is_some() {
+            let req: SopSaveRequest = parse_params(params)?;
+            Self::parse_sop(&req.sop)?
+        } else {
+            let req: SopSelectRequest = parse_params(params)?;
+            let (dir, mode) = self.sops_dir_and_mode();
+            crate::sop::load_sop_by_name(&dir, &req.name, mode)
+                .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?
+        };
+        let v = crate::sop::validate_sop_strict(&sop);
+        to_result(serde_json::json!({
+            "blocking": v.blocking,
+            "warnings": v.warnings,
+            "ok": v.is_ok(),
+        }))
+    }
+
+    fn handle_sops_save(&self, params: &Value) -> RpcResult {
+        let req: SopSaveRequest = parse_params(params)?;
+        let sop = Self::parse_sop(&req.sop)?;
+        let (dir, _mode) = self.sops_dir_and_mode();
+        crate::sop::save_sop(&dir, &sop).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        to_result(serde_json::json!({ "saved": sop.name }))
+    }
+
+    fn handle_sops_create(&self, params: &Value) -> RpcResult {
+        let req: SopSaveRequest = parse_params(params)?;
+        let sop = Self::parse_sop(&req.sop)?;
+        let (dir, _mode) = self.sops_dir_and_mode();
+        crate::sop::create_sop(&dir, &sop).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        to_result(serde_json::json!({ "created": sop.name }))
+    }
+
+    fn handle_sops_delete(&self, params: &Value) -> RpcResult {
+        let req: SopSelectRequest = parse_params(params)?;
+        let (dir, _mode) = self.sops_dir_and_mode();
+        crate::sop::delete_sop(&dir, &req.name)
+            .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        to_result(serde_json::json!({ "deleted": req.name }))
+    }
+
+    fn handle_sops_wire_draft(&self, params: &Value) -> RpcResult {
+        let sop_val = params
+            .get("sop")
+            .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing 'sop'"))?;
+        let edit_val = params
+            .get("edit")
+            .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing 'edit'"))?;
+        let mut sop = Self::parse_sop(sop_val)?;
+        let edit: crate::sop::WireEdit = serde_json::from_value(edit_val.clone())
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("invalid wire edit: {e}")))?;
+        crate::sop::apply_wire(&mut sop, &edit)
+            .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        to_result(serde_json::json!({
+            "sop": sop,
+            "graph": crate::sop::SopGraph::from_sop(&sop),
+        }))
+    }
+
+    fn handle_sops_graph_draft(&self, params: &Value) -> RpcResult {
+        let sop_val = params
+            .get("sop")
+            .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing 'sop'"))?;
+        let sop = Self::parse_sop(sop_val)?;
+        to_result(crate::sop::SopGraph::from_sop(&sop))
+    }
+
+    fn handle_sops_trigger_sources(&self) -> RpcResult {
+        let registry = {
+            let config = self.ctx.config.read();
+            crate::sop::registry_from_config(&config)
+        };
+        to_result(registry)
     }
 
     async fn handle_quickstart_apply(&self, params: &Value) -> RpcResult {

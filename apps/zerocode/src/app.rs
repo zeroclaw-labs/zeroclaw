@@ -22,6 +22,7 @@ use crate::keymap::{GlobalAction, ModalAction};
 use crate::logs;
 use crate::mouse;
 use crate::quickstart_pane;
+use crate::sop_pane;
 use crate::theme;
 use crate::widgets::{CtxBar, HelpContext, HelpEntry, HelpNode};
 
@@ -49,7 +50,7 @@ pub type SharedReconnectState = Arc<Mutex<CrossReconnectState>>;
 const TICK: Duration = Duration::from_millis(200);
 
 /// Mode bar entries. Shared between drawing and click detection.
-const MODES: [Mode; 7] = [
+const MODES: [Mode; 8] = [
     Mode::Dashboard,
     Mode::Config,
     Mode::Acp,
@@ -57,6 +58,7 @@ const MODES: [Mode; 7] = [
     Mode::Logs,
     Mode::Doctor,
     Mode::Quickstart,
+    Mode::Sop,
 ];
 
 // ── Mode enum ────────────────────────────────────────────────────
@@ -70,6 +72,7 @@ enum Mode {
     Chat,
     Logs,
     Quickstart,
+    Sop,
 }
 
 impl Mode {
@@ -82,6 +85,7 @@ impl Mode {
             Mode::Chat => "zc-pane-chat",
             Mode::Logs => "zc-pane-logs",
             Mode::Quickstart => "zc-pane-quickstart",
+            Mode::Sop => "zc-pane-sop",
         }
     }
 
@@ -103,6 +107,7 @@ async fn switch_mode(
     quickstart: &mut quickstart_pane::QuickstartPane,
     acp_pane: &mut acp::Acp,
     chat_pane: &mut chat::Chat,
+    sop_pane: &mut sop_pane::SopPane,
 ) {
     if *mode == Mode::Quickstart && next != Mode::Quickstart {
         quickstart.dismiss_beacon().await;
@@ -111,6 +116,7 @@ async fn switch_mode(
         match next {
             Mode::Acp => acp_pane.refresh_if_inactive().await,
             Mode::Chat => chat_pane.refresh_if_inactive().await,
+            Mode::Sop => sop_pane.refresh().await,
             _ => {}
         }
     }
@@ -230,6 +236,7 @@ pub async fn run(
                 let mut quickstart =
                     quickstart_pane::QuickstartPane::new(rpc.clone(), Arc::clone(&reconnect_state));
                 quickstart.init().await?;
+                let sop_pane = sop_pane::SopPane::new(rpc.clone());
                 if let Some(alias) = pending_start_chat {
                     chat_pane.focus_agent(&alias).await;
                     mode = Mode::Chat;
@@ -242,6 +249,7 @@ pub async fn run(
                     chat_pane,
                     logs_pane,
                     quickstart,
+                    sop_pane,
                 ))
             }
             .await
@@ -256,6 +264,7 @@ pub async fn run(
         mut chat_pane,
         mut logs_pane,
         mut quickstart,
+        mut sop_pane,
     ) = build_panes!(
         (None::<String>, None::<String>),
         (None::<String>, None::<String>)
@@ -334,6 +343,7 @@ pub async fn run(
                 Mode::Chat => chat_pane.draw(frame, chunks[1]),
                 Mode::Logs => logs_pane.draw(frame, chunks[1]),
                 Mode::Quickstart => quickstart.draw(frame, chunks[1]),
+                Mode::Sop => sop_pane.render(frame, chunks[1]),
             }
 
             let status_idx = if has_info {
@@ -401,6 +411,7 @@ pub async fn run(
                     Mode::Chat => chat_pane.help_context(),
                     Mode::Logs => logs_pane.help_context(),
                     Mode::Quickstart => quickstart.help_context(),
+                    Mode::Sop => sop_pane.help_context(),
                 };
                 node.children.push(pane_node);
                 draw_help_modal(frame, frame.area(), &node);
@@ -495,6 +506,7 @@ pub async fn run(
                                 chat_pane = panes.4;
                                 logs_pane = panes.5;
                                 quickstart = panes.6;
+                                sop_pane = panes.7;
                                 reconnect_last_attempt = None;
                                 ephemeral_respawn_done = false;
                                 needs_intervention = false;
@@ -548,6 +560,7 @@ pub async fn run(
                     Mode::Chat => chat_pane.wants_text_input(),
                     Mode::Logs => logs_pane.wants_text_input(),
                     Mode::Quickstart => quickstart.wants_text_input(),
+                    Mode::Sop => false,
                 };
                 let global = GlobalAction::from_chord(&key);
 
@@ -639,6 +652,7 @@ pub async fn run(
                         &mut quickstart,
                         &mut acp_pane,
                         &mut chat_pane,
+                        &mut sop_pane,
                     )
                     .await;
                     continue;
@@ -664,6 +678,7 @@ pub async fn run(
                     Mode::Chat => chat_pane.handle_key(key, term).await,
                     Mode::Logs => logs_pane.handle_key(key).await,
                     Mode::Quickstart => quickstart.handle_key(key).await,
+                    Mode::Sop => sop_pane.handle_key(key).await,
                 };
                 if quit {
                     break;
@@ -676,6 +691,7 @@ pub async fn run(
                         &mut quickstart,
                         &mut acp_pane,
                         &mut chat_pane,
+                        &mut sop_pane,
                     )
                     .await;
                 }
@@ -708,6 +724,7 @@ pub async fn run(
                             &mut quickstart,
                             &mut acp_pane,
                             &mut chat_pane,
+                            &mut sop_pane,
                         )
                         .await;
                         continue;
@@ -737,6 +754,7 @@ pub async fn run(
                                             &mut quickstart,
                                             &mut acp_pane,
                                             &mut chat_pane,
+                                            &mut sop_pane,
                                         )
                                         .await;
                                     }
@@ -761,6 +779,9 @@ pub async fn run(
                         Mode::Quickstart => {
                             quickstart.handle_mouse(mouse, content_area).await;
                         }
+                        Mode::Sop => {
+                            sop_pane.handle_mouse(mouse).await;
+                        }
                     }
                     consume_immediate_start_chat(&reconnect_state, &mut mode, &mut chat_pane).await;
                 }
@@ -774,6 +795,7 @@ pub async fn run(
                     Mode::Quickstart => quickstart.handle_paste(&text),
                     Mode::Dashboard => dashboard_pane.handle_paste(&text),
                     Mode::Logs => logs_pane.handle_paste(&text),
+                    Mode::Sop => {}
                 }
             }
             _ => {} // Resize, etc. — just redraw on next iteration
