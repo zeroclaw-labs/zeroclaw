@@ -71,7 +71,7 @@ or `some(list<string>)` (restrict to the listed agent IDs). The runtime maps
 its Rust `&[&str]` slice as empty-slice-means-`all`, so treat `some([])` as
 matching nothing, not everything.
 
-## Capability flags: the 11 optional methods
+## Capability flags: the {{#include ../_snippets/plugin-memory-flag-count.md}} optional methods
 
 Same mechanism as channels: the host reads `get-memory-capabilities` once,
 and for each unset flag it uses the Rust trait default instead of calling

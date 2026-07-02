@@ -119,7 +119,7 @@ accordingly: assume everything before install is untrusted transport.
    `SKILL.md` (discovery enforces `name` and `description`).
 3. Sign: generate or load your Ed25519 key, sign the canonical manifest
    bytes, embed `signature` and `publisher_key`.
-4. Zip the plugin directory (one manifest, no path tricks, under 50 MiB).
+4. Zip the plugin directory (one manifest, no path tricks, under {{#include ../_snippets/plugin-archive-max-mib.md}} MiB).
 5. Compute the zip's SHA-256 and publish the registry entry with the digest.
 6. Publish your public key hex somewhere operators can verify independently
    of the registry (your repository, your site). The key, not the registry,

@@ -3,8 +3,10 @@
 A channel plugin is a messaging-platform integration: it delivers the agent's
 responses to a platform and surfaces the platform's messages to the agent. It
 is the most involved plugin kind, because a channel is long-lived, stateful,
-and interacts with the runtime through a 27-function surface of which only
-five are mandatory.
+and interacts with the runtime through a
+{{#include ../_snippets/plugin-channel-func-count.md}}-function surface of
+which only {{#include ../_snippets/plugin-channel-required-count.md}} are
+mandatory.
 
 This guide assumes you have built the [tool plugin](./writing-a-tool-plugin.md)
 and understand crate setup, the `__config` rule, logging, and install. It is
@@ -90,7 +92,7 @@ flags declaration, which is the source of truth. In summary, the groups:
 | Moderation | `add-reaction`, `remove-reaction`, `pin-message`, `unpin-message`, `redact-message` | Emoji reactions, pinning, message deletion. |
 | Interaction | `request-approval`, `request-choice`, `supports-free-form-ask` | Tool-call approval prompts and multiple-choice questions presented natively on the platform. |
 
-Start with the required five plus `health-check`, and add groups as the
+Start with the required {{#include ../_snippets/plugin-channel-required-count.md}} plus `health-check`, and add groups as the
 platform supports them. Advertising a flag you have not implemented is worse
 than omitting it: the host will call your export and trust the answer.
 

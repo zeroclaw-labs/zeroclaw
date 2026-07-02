@@ -95,8 +95,8 @@ plus its primary interface:
 | World | Exports | Store lifecycle |
 |-------|---------|-----------------|
 | `tool-plugin` | `tool`: name, description, parameters-schema, execute | Fresh store per `execute`; nothing persists between calls |
-| `channel-plugin` | `channel`: configure, send, poll-message, plus 22 capability-gated methods | Warm store behind an async mutex, refueled per call; also imports `inbound` |
-| `memory-plugin` | `memory`: store, recall, get, forget, plus 11 capability-gated methods | Warm store behind an async mutex, refueled per call |
+| `channel-plugin` | `channel`: configure, send, poll-message, plus {{#include ../_snippets/plugin-channel-flag-count.md}} capability-gated methods | Warm store behind an async mutex, refueled per call; also imports `inbound` |
+| `memory-plugin` | `memory`: store, recall, get, forget, plus {{#include ../_snippets/plugin-memory-flag-count.md}} capability-gated methods | Warm store behind an async mutex, refueled per call |
 
 The channel and memory worlds use **capability flags**: a bitmask the host
 reads once at load time (`get-channel-capabilities` /
