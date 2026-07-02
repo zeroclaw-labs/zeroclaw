@@ -3158,6 +3158,95 @@ mod registry_tests {
         assert!(!dest.exists(), "dest must not be created for rejected zip");
     }
 
+    /// Regression: an entry whose central directory understates the real
+    /// uncompressed size must be rejected during extraction, not silently
+    /// truncated on disk.
+    #[test]
+    fn test_extract_zip_secure_rejects_lying_declared_size() {
+        // 60 MiB payload, but we patch the central directory to claim 1 byte.
+        let payload = vec![b'a'; 60 * 1024 * 1024];
+        let mut buf = make_skill_zip(&[("big.bin", &payload)], zip::CompressionMethod::Stored);
+        patch_zip_central_directory_uncompressed_size(&mut buf, 1);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES)
+            .expect_err("lying declared size must be rejected during extraction");
+        assert!(
+            err.to_string().contains("too large"),
+            "expected size error, got: {err}"
+        );
+        assert!(
+            !dest.exists(),
+            "dest must not be created when lying declared size is rejected"
+        );
+    }
+
+    /// Regression: multiple entries can each declare a small uncompressed size
+    /// while their actual payloads collectively exceed the cap. The cumulative
+    /// guard must count bytes actually extracted, not declared sizes.
+    #[test]
+    fn test_extract_zip_secure_rejects_multi_entry_lying_declared_size() {
+        const ENTRY_SIZE: usize = 10 * 1024 * 1024; // 10 MiB each
+        const ENTRY_COUNT: usize = 6; // 60 MiB total > 50 MiB cap
+        const LIED_SIZE: u32 = 8 * 1024 * 1024; // 48 MiB declared total < 50 MiB cap
+
+        let mut entries = Vec::new();
+        for i in 0..ENTRY_COUNT {
+            entries.push((format!("big{i}.bin"), vec![b'a'; ENTRY_SIZE]));
+        }
+        let entry_refs: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(name, body)| (name.as_str(), body.as_slice()))
+            .collect();
+        let mut buf = make_skill_zip(&entry_refs, zip::CompressionMethod::Stored);
+        patch_all_zip_central_directory_uncompressed_sizes(&mut buf, LIED_SIZE);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES)
+            .expect_err("multi-entry lying declared sizes must be rejected");
+        assert!(
+            err.to_string().contains("too large"),
+            "expected size error, got: {err}"
+        );
+        assert!(
+            !dest.exists(),
+            "dest must not be created when archive cap is exceeded"
+        );
+    }
+
+    /// Overwrite the uncompressed-size field in the first central-directory
+    /// header of a zip file.
+    fn patch_zip_central_directory_uncompressed_size(zip: &mut [u8], new_size: u32) {
+        const CDH_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+        for i in 0..zip.len().saturating_sub(CDH_SIGNATURE.len()) {
+            if zip[i..i + CDH_SIGNATURE.len()] == CDH_SIGNATURE {
+                let start = i + 24;
+                zip[start..start + 4].copy_from_slice(&new_size.to_le_bytes());
+                return;
+            }
+        }
+        panic!("central directory signature not found in test zip");
+    }
+
+    /// Overwrite the uncompressed-size field in every central-directory header
+    /// of a zip file.
+    fn patch_all_zip_central_directory_uncompressed_sizes(zip: &mut [u8], new_size: u32) {
+        const CDH_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+        let mut patched = 0;
+        for i in 0..zip.len().saturating_sub(CDH_SIGNATURE.len()) {
+            if zip[i..i + CDH_SIGNATURE.len()] == CDH_SIGNATURE {
+                let start = i + 24;
+                zip[start..start + 4].copy_from_slice(&new_size.to_le_bytes());
+                patched += 1;
+            }
+        }
+        if patched == 0 {
+            panic!("central directory signature not found in test zip");
+        }
+    }
+
     #[test]
     fn test_install_extra_registry_unknown_name_errors() {
         let tmp = tempfile::tempdir().unwrap();
