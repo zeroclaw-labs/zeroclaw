@@ -130,6 +130,7 @@ Scoped path labels do not guarantee a same-prefix base label. Because `pr-path-l
 | `security:pairing` | pairing security, gateway pairing API, and web pairing page |
 | `security:policy` | runtime security policy, IAM policy, and config policy files |
 | `security:secrets` | runtime and config secrets handling |
+| `memory:backend` | memory backend selection and storage implementation files |
 
 Do not apply legacy `observability: runtime_trace` to new issues or PRs. Use `observability:otel` when the work is about OpenTelemetry tracing, add base `observability` only when the issue or PR also matches that base surface, and decide any future runtime-trace-specific canonical label in a separate create/migrate packet.
 
@@ -151,6 +152,7 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 | `channel:imessage` | `imessage.rs` |
 | `channel:irc` | `irc.rs` |
 | `channel:lark` | `lark.rs` |
+| `channel:line` | `line.rs`, `channels/line.md` |
 | `channel:linq` | `linq.rs` |
 | `channel:matrix` | `matrix.rs` |
 | `channel:mattermost` | `mattermost.rs` |

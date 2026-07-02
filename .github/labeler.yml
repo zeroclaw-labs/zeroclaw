@@ -113,6 +113,12 @@
           - "src/channels/lark.rs"
           - "crates/zeroclaw-channels/src/lark.rs"
 
+"channel:line":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-channels/src/line.rs"
+          - "docs/book/src/channels/line.md"
+
 "channel:linq":
   - changed-files:
       - any-glob-to-any-file:
@@ -279,6 +285,18 @@
       - any-glob-to-any-file:
           - "src/memory/**"
           - "crates/zeroclaw-memory/src/**"
+
+"memory:backend":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/memory/cli.rs"
+          - "crates/zeroclaw-memory/src/backend.rs"
+          - "crates/zeroclaw-memory/src/lucid.rs"
+          - "crates/zeroclaw-memory/src/markdown.rs"
+          - "crates/zeroclaw-memory/src/none.rs"
+          - "crates/zeroclaw-memory/src/postgres.rs"
+          - "crates/zeroclaw-memory/src/qdrant.rs"
+          - "crates/zeroclaw-memory/src/sqlite.rs"
 
 "security":
   - changed-files:
