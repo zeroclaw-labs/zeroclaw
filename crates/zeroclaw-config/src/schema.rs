@@ -4739,6 +4739,13 @@ pub struct McpServerConfig {
     /// Optional per-call timeout in seconds (hard capped in validation).
     #[serde(default)]
     pub tool_timeout_secs: Option<u64>,
+    /// Resource URIs to read once at agent startup and inject into the system
+    /// prompt as untrusted, server-origin context. Each is read via
+    /// `resources/read` on this server; pins on a server that does not advertise
+    /// resources, or that the agent's tool policy denies, are skipped with a
+    /// warning. Read once per run (not refreshed; no subscriptions).
+    #[serde(default)]
+    pub pinned_resources: Vec<String>,
 }
 
 /// External MCP client configuration (`[mcp]` section).
@@ -20714,6 +20721,20 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[::core::prelude::v1::test]
+    fn mcp_server_config_pinned_resources_defaults_empty_and_round_trips() {
+        // Absent field defaults to empty.
+        let cfg: McpServerConfig = serde_json::from_str(r#"{"name":"s","command":"x"}"#).unwrap();
+        assert!(cfg.pinned_resources.is_empty());
+
+        // Present field round-trips.
+        let cfg: McpServerConfig = serde_json::from_str(
+            r#"{"name":"s","command":"x","pinned_resources":["file:///a","file:///b"]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.pinned_resources, vec!["file:///a", "file:///b"]);
+    }
 
     #[::core::prelude::v1::test]
     fn skill_bundle_admits_skill_honors_include_and_exclude() {

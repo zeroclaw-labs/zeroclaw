@@ -5561,39 +5561,74 @@ async fn process_channel_message_body(
             };
 
             if let Some(channel) = target_channel.as_ref() {
-                if let Some(ref draft_id) = draft_message_id {
-                    if let Err(e) = channel
+                let reply_delivered = if let Some(ref draft_id) = draft_message_id {
+                    match channel
                         .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
                         .await
                     {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                            "Failed to finalize draft; sending as new message"
-                        );
-                        let _ = channel
-                            .send(&SendMessage::reply_to(&msg, &delivered_response))
-                            .await;
+                        Ok(()) => true,
+                        Err(e) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                "Failed to finalize draft; sending as new message"
+                            );
+                            match channel
+                                .send(&SendMessage::reply_to(&msg, &delivered_response))
+                                .await
+                            {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    ::zeroclaw_log::record!(
+                                        ERROR,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Fail
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(
+                                            ::serde_json::json!({"error": format!("{}", e)}),
+                                        ),
+                                        "failed to reply"
+                                    );
+                                    false
+                                }
+                            }
+                        }
                     }
-                } else if let Err(e) = channel
-                    .send(
-                        &SendMessage::reply_to(&msg, &delivered_response)
-                            .with_cancellation(cancellation_token.clone()),
-                    )
-                    .await
-                {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "failed to reply"
-                    );
+                } else {
+                    match channel
+                        .send(
+                            &SendMessage::reply_to(&msg, &delivered_response)
+                                .with_cancellation(cancellation_token.clone()),
+                        )
+                        .await
+                    {
+                        Ok(()) => true,
+                        Err(e) => {
+                            ::zeroclaw_log::record!(
+                                ERROR,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Fail
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                "failed to reply"
+                            );
+                            false
+                        }
+                    }
+                };
+                if reply_delivered && let Some(hooks) = ctx.hooks.as_ref() {
+                    hooks
+                        .fire_message_sent(&msg.channel, &msg.reply_target, &delivered_response)
+                        .await;
                 }
                 // Send tool receipts as a separate message in the same thread.
                 // The block is the operator-facing audit surface for the feature,
@@ -12552,6 +12587,36 @@ api_key = "anthropic-key"
     }
 
     #[derive(Default)]
+    struct FailingSendChannel {
+        send_calls: AtomicUsize,
+    }
+
+    struct DraftRecordingChannel {
+        finalize_should_fail: bool,
+        fallback_send_should_fail: bool,
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+        draft_messages: tokio::sync::Mutex<Vec<String>>,
+        finalized_messages: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl DraftRecordingChannel {
+        fn new(finalize_should_fail: bool, fallback_send_should_fail: bool) -> Self {
+            Self {
+                finalize_should_fail,
+                fallback_send_should_fail,
+                sent_messages: tokio::sync::Mutex::new(Vec::new()),
+                draft_messages: tokio::sync::Mutex::new(Vec::new()),
+                finalized_messages: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingMessageSentHook {
+        events: Arc<tokio::sync::Mutex<Vec<(String, String, String)>>>,
+    }
+
+    #[derive(Default)]
     struct TelegramRecordingChannel {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
     }
@@ -12700,6 +12765,115 @@ api_key = "anthropic-key"
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for FailingSendChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for DraftRecordingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for FailingSendChannel {
+        fn name(&self) -> &str {
+            "test-channel"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            self.send_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("send boom")
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for DraftRecordingChannel {
+        fn name(&self) -> &str {
+            "test-channel"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            if self.fallback_send_should_fail {
+                anyhow::bail!("fallback send boom")
+            }
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn supports_draft_updates(&self) -> bool {
+            true
+        }
+
+        async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+            self.draft_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(Some("draft-1".to_string()))
+        }
+
+        async fn finalize_draft(
+            &self,
+            recipient: &str,
+            message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<()> {
+            if self.finalize_should_fail {
+                anyhow::bail!("finalize boom")
+            }
+            self.finalized_messages
+                .lock()
+                .await
+                .push(format!("{recipient}:{message_id}:{text}"));
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_runtime::hooks::HookHandler for RecordingMessageSentHook {
+        fn name(&self) -> &str {
+            "recording-message-sent"
+        }
+
+        async fn on_message_sent(&self, channel: &str, recipient: &str, content: &str) {
+            self.events.lock().await.push((
+                channel.to_string(),
+                recipient.to_string(),
+                content.to_string(),
+            ));
+        }
+    }
+
     #[async_trait::async_trait]
     impl Channel for RecordingChannel {
         fn name(&self) -> &str {
@@ -12766,6 +12940,7 @@ api_key = "anthropic-key"
         prompt_config: zeroclaw_config::schema::Config,
         agent_cfg: zeroclaw_config::schema::AliasedAgentConfig,
         model_provider_ref: &str,
+        hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
     ) -> Arc<ChannelRuntimeContext> {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
@@ -12817,7 +12992,7 @@ api_key = "anthropic-key"
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
-            hooks: None,
+            hooks,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
@@ -12843,6 +13018,210 @@ api_key = "anthropic-key"
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
+    }
+
+    type MessageSentEvents = Arc<tokio::sync::Mutex<Vec<(String, String, String)>>>;
+
+    fn recording_message_sent_runner()
+    -> (MessageSentEvents, Arc<zeroclaw_runtime::hooks::HookRunner>) {
+        let hook_events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let mut hook_runner = zeroclaw_runtime::hooks::HookRunner::new();
+        hook_runner.register(Box::new(RecordingMessageSentHook {
+            events: Arc::clone(&hook_events),
+        }));
+        (hook_events, Arc::new(hook_runner))
+    }
+
+    fn message_sent_hook_test_message() -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            id: "msg-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-42".to_string(),
+            content: "hello".to_string(),
+            channel: "test-channel".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_fires_message_sent_hook_after_reply_delivery() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (hook_events, hook_runner) = recording_message_sent_runner();
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            Some(hook_runner),
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.as_slice(), ["chat-42:ok"]);
+
+        let events = hook_events.lock().await;
+        assert_eq!(
+            events.as_slice(),
+            [(
+                "test-channel".to_string(),
+                "chat-42".to_string(),
+                "ok".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_skips_message_sent_hook_when_reply_delivery_fails() {
+        let channel_impl = Arc::new(FailingSendChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (hook_events, hook_runner) = recording_message_sent_runner();
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            Some(hook_runner),
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(channel_impl.send_calls.load(Ordering::SeqCst), 1);
+        assert!(hook_events.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_fires_message_sent_hook_after_draft_finalize() {
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (hook_events, hook_runner) = recording_message_sent_runner();
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            Some(hook_runner),
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            channel_impl.draft_messages.lock().await.as_slice(),
+            ["chat-42:..."]
+        );
+        assert_eq!(
+            channel_impl.finalized_messages.lock().await.as_slice(),
+            ["chat-42:draft-1:ok"]
+        );
+        assert!(channel_impl.sent_messages.lock().await.is_empty());
+        assert_eq!(
+            hook_events.lock().await.as_slice(),
+            [(
+                "test-channel".to_string(),
+                "chat-42".to_string(),
+                "ok".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_fires_message_sent_hook_after_draft_fallback_send() {
+        let channel_impl = Arc::new(DraftRecordingChannel::new(true, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (hook_events, hook_runner) = recording_message_sent_runner();
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            Some(hook_runner),
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            channel_impl.draft_messages.lock().await.as_slice(),
+            ["chat-42:..."]
+        );
+        assert!(channel_impl.finalized_messages.lock().await.is_empty());
+        assert_eq!(
+            channel_impl.sent_messages.lock().await.as_slice(),
+            ["chat-42:ok"]
+        );
+        assert_eq!(
+            hook_events.lock().await.as_slice(),
+            [(
+                "test-channel".to_string(),
+                "chat-42".to_string(),
+                "ok".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_skips_message_sent_hook_when_draft_fallback_send_fails() {
+        let channel_impl = Arc::new(DraftRecordingChannel::new(true, true));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (hook_events, hook_runner) = recording_message_sent_runner();
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            Some(hook_runner),
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            channel_impl.draft_messages.lock().await.as_slice(),
+            ["chat-42:..."]
+        );
+        assert!(channel_impl.finalized_messages.lock().await.is_empty());
+        assert!(channel_impl.sent_messages.lock().await.is_empty());
+        assert!(hook_events.lock().await.is_empty());
     }
 
     struct SlowModelProvider {
@@ -13213,6 +13592,7 @@ BTC is currently around $65,000 based on latest tool output."#
             zeroclaw_config::schema::Config::default(),
             zeroclaw_config::schema::AliasedAgentConfig::default(),
             "test-provider",
+            None,
         );
 
         let passive_msg = zeroclaw_api::channel::ChannelMessage {
@@ -15034,6 +15414,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config,
             agent_cfg,
             "test-provider",
+            None,
         );
         runtime_ctx
             .provider_cache
