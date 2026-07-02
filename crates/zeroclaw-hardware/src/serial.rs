@@ -124,7 +124,9 @@ impl Transport for HardwareSerialTransport {
             do_send(&self.port_path, self.baud_rate, &json),
         )
         .await
-        .map_err(|_| TransportError::Timeout(SEND_TIMEOUT_SECS))?
+        .map_err(|e| {
+            TransportError::Other(format!("send timed out after {SEND_TIMEOUT_SECS}s: {e}"))
+        })?
     }
 
     fn kind(&self) -> TransportKind {
