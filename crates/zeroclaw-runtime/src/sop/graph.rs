@@ -291,17 +291,9 @@ fn trigger_node(index: usize, trigger: &super::types::SopTrigger) -> GraphNode {
 }
 
 fn trigger_labels(trigger: &super::types::SopTrigger) -> (String, String) {
-    use super::types::SopTrigger;
     let kind = match trigger {
-        SopTrigger::Mqtt { .. } => "mqtt".to_string(),
-        SopTrigger::Webhook { .. } => "webhook".to_string(),
-        SopTrigger::Cron { .. } => "cron".to_string(),
-        SopTrigger::Peripheral { .. } => "peripheral".to_string(),
-        SopTrigger::Filesystem { .. } => "filesystem".to_string(),
-        SopTrigger::Calendar { .. } => "calendar".to_string(),
-        SopTrigger::Channel { channel, .. } => channel.clone(),
-        SopTrigger::Manual => "manual".to_string(),
-        SopTrigger::Amqp { .. } => "amqp".to_string(),
+        super::types::SopTrigger::Channel { channel, .. } => channel.clone(),
+        other => other.source().to_string(),
     };
     (kind, trigger.to_string())
 }

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, XCircle, Loader2, ArrowDown, Plus, Save, Trash2, X } from 'lucide-react';
+import { AlertTriangle, XCircle, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { Badge, Card, PageHeader } from '@/components/ui';
 import SopCanvas from './SopCanvas';
@@ -18,15 +18,11 @@ import {
   triggerSources,
   overlayStateByStep,
   runStateTone,
-  wireTone,
   type RunStateTone,
-  type WireTone,
   type WireRole,
   type SopSummary,
   type SopGraph,
-  type GraphNode,
   type GraphPin,
-  type GraphWire,
   type RunOverlay,
   type NodeRunState,
   type Sop,
@@ -84,18 +80,6 @@ function blankSop(name: string): Sop {
   };
 }
 
-const NODE_TONE_CLASS: Record<RunStateTone, string> = {
-  accent: 'border-pc-accent ring-2 ring-pc-accent animate-pulse',
-  success: 'border-emerald-500',
-  error: 'border-rose-500',
-  warning: 'border-amber-500 opacity-70',
-  neutral: 'border-pc-border',
-};
-
-function nodeStateTone(state: NodeRunState | undefined): string {
-  return NODE_TONE_CLASS[runStateTone(state)];
-}
-
 const BADGE_TONE: Record<RunStateTone, 'ok' | 'error' | 'warn' | 'neutral'> = {
   accent: 'neutral',
   success: 'ok',
@@ -111,146 +95,6 @@ function nodeStateBadgeTone(state: NodeRunState): 'ok' | 'error' | 'warn' | 'neu
 function pinTypeLabel(pin: GraphPin): string {
   if (pin.class === 'flow') return 'flow';
   return pin.data_type ?? 'any';
-}
-
-const WIRE_TONE_CLASS: Record<WireTone, string> = {
-  data: 'text-sky-500',
-  error: 'text-rose-500',
-  warning: 'text-amber-500',
-  switch: 'text-fuchsia-500',
-  accent: 'text-pc-accent',
-  success: 'text-emerald-500',
-};
-
-function wireRoleTone(wire: GraphWire): string {
-  return WIRE_TONE_CLASS[wireTone(wire)];
-}
-
-function wireLabel(wire: GraphWire): string {
-  if (wire.class === 'data') {
-    return `${wire.from_pin ?? '?'} → ${wire.to_pin ?? '?'}`;
-  }
-  return wire.flow_role ?? 'sequence';
-}
-
-function NodeCard({ node, state }: { node: GraphNode; state?: NodeRunState }) {
-  return (
-    <div
-      className={`w-full max-w-xl rounded-[var(--radius-lg)] border bg-pc-surface shadow-sm ${nodeStateTone(state)}`}
-    >
-      <div className="flex items-center gap-2 border-b border-pc-border px-3 py-2">
-        <span className="inline-flex h-6 w-6 items-center justify-center rounded bg-pc-accent-light text-xs font-semibold text-pc-accent">
-          {node.step}
-        </span>
-        <span className="font-medium text-pc-text">{node.title}</span>
-        {state ? (
-          <span className="ml-auto">
-            <Badge tone={nodeStateBadgeTone(state)}>{t(`sops.run_state.${state}`)}</Badge>
-          </span>
-        ) : null}
-      </div>
-      <div className="grid grid-cols-2 gap-3 px-3 py-2 text-xs">
-        <div>
-          <div className="mb-1 uppercase tracking-wide text-pc-text-muted">{t('sops.inputs')}</div>
-          {node.inputs.length === 0 ? (
-            <div className="text-pc-text-faint">—</div>
-          ) : (
-            node.inputs.map((pin) => (
-              <div key={`in-${pin.name}`} className="flex items-center gap-1">
-                <span
-                  className={
-                    pin.class === 'flow'
-                      ? 'text-emerald-500'
-                      : pin.required
-                        ? 'text-sky-500'
-                        : 'text-pc-text-faint'
-                  }
-                  aria-hidden
-                >
-                  ●
-                </span>
-                <span className="text-pc-text">{pin.name}</span>
-                <span className="text-pc-text-muted">: {pinTypeLabel(pin)}</span>
-                {pin.required && pin.class === 'data' ? (
-                  <span className="text-rose-500">*</span>
-                ) : null}
-              </div>
-            ))
-          )}
-        </div>
-        <div className="text-right">
-          <div className="mb-1 uppercase tracking-wide text-pc-text-muted">{t('sops.outputs')}</div>
-          {node.outputs.length === 0 ? (
-            <div className="text-pc-text-faint">—</div>
-          ) : (
-            node.outputs.map((pin) => (
-              <div key={`out-${pin.name}`} className="flex items-center justify-end gap-1">
-                <span className="text-pc-text">{pin.name}</span>
-                <span className="text-pc-text-muted">: {pinTypeLabel(pin)}</span>
-                <span
-                  className={pin.class === 'flow' ? 'text-emerald-500' : 'text-sky-500'}
-                  aria-hidden
-                >
-                  ●
-                </span>
-              </div>
-            ))
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function GraphCanvas({ graph, overlay }: { graph: SopGraph; overlay?: RunOverlay | null }) {
-  const ordered = useMemo(
-    () => [...graph.nodes].sort((a, b) => a.step - b.step),
-    [graph.nodes],
-  );
-  const stateByStep = useMemo(() => overlayStateByStep(overlay), [overlay]);
-  const wiresByFrom = useMemo(() => {
-    const map = new Map<number, GraphWire[]>();
-    for (const w of graph.wires) {
-      const list = map.get(w.from_step) ?? [];
-      list.push(w);
-      map.set(w.from_step, list);
-    }
-    return map;
-  }, [graph.wires]);
-
-  if (ordered.length === 0) {
-    return <div className="text-pc-text-muted">{t('sops.empty_graph')}</div>;
-  }
-
-  return (
-    <div className="flex flex-col items-center gap-1">
-      {ordered.map((node, idx) => {
-        const outbound = wiresByFrom.get(node.step) ?? [];
-        const nextStep = ordered[idx + 1]?.step;
-        const flowsToActive =
-          outbound.some((w) => stateByStep.get(w.to_step) === 'active') ||
-          (nextStep !== undefined && stateByStep.get(nextStep) === 'active');
-        return (
-          <div key={node.step} className="flex w-full flex-col items-center">
-            <NodeCard node={node} state={stateByStep.get(node.step)} />
-            {idx < ordered.length - 1 || outbound.length > 0 ? (
-              <div className="flex flex-col items-center py-1">
-                <ArrowDown
-                  className={`h-4 w-4 ${flowsToActive ? 'animate-bounce text-pc-accent' : 'text-pc-text-muted'}`}
-                  aria-hidden
-                />
-                {outbound.map((w, i) => (
-                  <span key={`w-${node.step}-${i}`} className={`text-[10px] ${wireRoleTone(w)}`}>
-                    {node.step} → {w.to_step} [{wireLabel(w)}]
-                  </span>
-                ))}
-              </div>
-            ) : null}
-          </div>
-        );
-      })}
-    </div>
-  );
 }
 
 function SopFieldList({
@@ -1075,10 +919,13 @@ function SopEditor({
   );
 }
 
+const noop = () => {};
+
 export default function Sops() {
   const [sops, setSops] = useState<SopSummary[]>([]);
   const [selected, setSelected] = useState<string>('');
   const [graph, setGraph] = useState<SopGraph | null>(null);
+  const [viewSop, setViewSop] = useState<Sop | null>(null);
   const [loading, setLoading] = useState(true);
   const [graphLoading, setGraphLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1253,14 +1100,16 @@ export default function Sops() {
   const loadGraph = useCallback((name: string) => {
     if (!name) return;
     setGraphLoading(true);
-    getSopGraph(name)
-      .then((g) => {
+    Promise.all([getSopGraph(name), getSop(name)])
+      .then(([g, full]) => {
         setGraph(g);
+        setViewSop(full);
         setGraphLoading(false);
       })
       .catch((e: unknown) => {
         setError(e instanceof Error ? e.message : String(e));
         setGraph(null);
+        setViewSop(null);
         setGraphLoading(false);
       });
   }, []);
@@ -1487,8 +1336,19 @@ export default function Sops() {
               <Loader2 className="h-5 w-5 animate-spin text-pc-text-muted" aria-hidden />
             ) : graph ? (
               <>
-                {layer === 'visual' ? (
-                  <GraphCanvas graph={graph} overlay={overlay} />
+                {layer === 'visual' && viewSop ? (
+                  <SopCanvas
+                    draft={viewSop}
+                    graph={graph}
+                    selectedStep={null}
+                    runStateByStep={runStateByStep}
+                    readOnly
+                    onSelectStep={noop}
+                    onSelectTrigger={noop}
+                    onAddStep={noop}
+                    onConnect={noop}
+                    onDisconnect={noop}
+                  />
                 ) : (
                   <SopFieldList graph={graph} overlay={overlay} />
                 )}

@@ -86,6 +86,7 @@ interface Props {
   graph: SopGraph;
   selectedStep: number | null;
   runStateByStep: Map<number, NodeRunState>;
+  readOnly?: boolean;
   onSelectStep: (n: number) => void;
   onSelectTrigger: (index: number) => void;
   onAddStep: () => void;
@@ -98,6 +99,7 @@ export default function SopCanvas({
   graph,
   selectedStep,
   runStateByStep,
+  readOnly = false,
   onSelectStep,
   onSelectTrigger,
   onAddStep,
@@ -189,15 +191,17 @@ export default function SopCanvas({
 
   return (
     <div className="relative overflow-auto rounded-[var(--radius-lg)] border border-pc-border bg-pc-bg-base">
-      <div className="absolute right-2 top-2 z-10 flex gap-1">
-        <button
-          type="button"
-          onClick={onAddStep}
-          className="inline-flex items-center gap-1 rounded bg-pc-accent px-2 py-1 text-xs text-white"
-        >
-          <Plus className="h-3.5 w-3.5" aria-hidden /> {t('sops.add_step')}
-        </button>
-      </div>
+      {readOnly ? null : (
+        <div className="absolute right-2 top-2 z-10 flex gap-1">
+          <button
+            type="button"
+            onClick={onAddStep}
+            className="inline-flex items-center gap-1 rounded bg-pc-accent px-2 py-1 text-xs text-white"
+          >
+            <Plus className="h-3.5 w-3.5" aria-hidden /> {t('sops.add_step')}
+          </button>
+        </div>
+      )}
       {linkFrom !== null ? (
         <div className="absolute left-2 top-2 z-10 rounded bg-pc-elevated px-2 py-1 text-xs text-pc-text">
           {t('sops.linking')}: {linkKind} — {t('sops.link_hint')}
@@ -263,7 +267,7 @@ export default function SopCanvas({
                     e.stopPropagation();
                     // Trigger edges are derived from the SOP's triggers; they
                     // are not hand-wired and cannot be deleted from the canvas.
-                    if (kind === 'trigger') return;
+                    if (readOnly || kind === 'trigger') return;
                     onDisconnect(w.from_step, w.to_step, kind, portIndex);
                   }}
                 >
@@ -482,7 +486,7 @@ export default function SopCanvas({
                   fill={wireStroke('switch')}
                   onPointerDown={(e) => {
                     e.stopPropagation();
-                    startLink(node.step, 'switch', ri);
+                    if (!readOnly) startLink(node.step, 'switch', ri);
                   }}
                   className="cursor-crosshair"
                 >
@@ -502,7 +506,7 @@ export default function SopCanvas({
               fill={wireStroke('sequence')}
               onPointerDown={(e) => {
                 e.stopPropagation();
-                startLink(node.step, 'sequence');
+                if (!readOnly) startLink(node.step, 'sequence');
               }}
               className="cursor-crosshair"
             >
@@ -515,7 +519,7 @@ export default function SopCanvas({
               fill={wireStroke('dependency')}
               onPointerDown={(e) => {
                 e.stopPropagation();
-                startLink(node.step, 'dependency');
+                if (!readOnly) startLink(node.step, 'dependency');
               }}
               className="cursor-crosshair"
             >
@@ -528,7 +532,7 @@ export default function SopCanvas({
               fill={wireStroke('failure')}
               onPointerDown={(e) => {
                 e.stopPropagation();
-                startLink(node.step, 'failure');
+                if (!readOnly) startLink(node.step, 'failure');
               }}
               className="cursor-crosshair"
             >

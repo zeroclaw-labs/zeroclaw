@@ -17,7 +17,6 @@ pub(crate) struct SopPane {
     rpc: Arc<RpcClient>,
     names: Vec<String>,
     list_state: ListState,
-    graph_lines: Vec<String>,
     graph: SopGraphView,
     layer: RenderLayer,
     run_input: Option<String>,
@@ -324,13 +323,31 @@ fn failure_label(f: &StepFailure) -> String {
     }
 }
 
+#[derive(Default, serde::Deserialize)]
+struct OverlayNodeView {
+    step: u64,
+    state: NodeRunState,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
 struct RunOverlayView {
     status: String,
     current_step: u64,
     total_steps: u64,
     waiting: bool,
     paused: bool,
-    states: std::collections::HashMap<u64, NodeRunState>,
+    #[serde(rename = "nodes")]
+    node_states: Vec<OverlayNodeView>,
+}
+
+impl RunOverlayView {
+    fn state_of(&self, step: u64) -> Option<NodeRunState> {
+        self.node_states
+            .iter()
+            .find(|n| n.step == step)
+            .map(|n| n.state)
+    }
 }
 
 impl SopPane {
@@ -339,7 +356,6 @@ impl SopPane {
             rpc,
             names: Vec::new(),
             list_state: ListState::default(),
-            graph_lines: Vec::new(),
             graph: SopGraphView::default(),
             layer: RenderLayer::default(),
             run_input: None,
@@ -371,7 +387,13 @@ impl SopPane {
     pub(crate) async fn refresh(&mut self) {
         match self.rpc.sops_list().await {
             Ok(value) => {
-                self.names = parse_sop_names(&value);
+                #[derive(serde::Deserialize)]
+                struct Named {
+                    name: String,
+                }
+                self.names = serde_json::from_value::<Vec<Named>>(value)
+                    .map(|v| v.into_iter().map(|n| n.name).collect())
+                    .unwrap_or_default();
                 self.error = None;
                 if self.list_state.selected().is_none() && !self.names.is_empty() {
                     self.list_state.select(Some(0));
@@ -387,8 +409,6 @@ impl SopPane {
         };
         match self.rpc.sops_graph_view(&name).await {
             Ok(view) => {
-                self.graph_lines =
-                    graph_to_lines(&serde_json::to_value(&view).unwrap_or(serde_json::Value::Null));
                 self.graph = view;
                 self.overlay = None;
                 self.error = None;
@@ -407,7 +427,7 @@ impl SopPane {
         };
         match self.rpc.sops_run_overlay(&name, run_id).await {
             Ok(value) => {
-                self.overlay = Some(parse_overlay(&value));
+                self.overlay = serde_json::from_value(value).ok();
                 self.error = None;
             }
             Err(e) => self.error = Some(e.to_string()),
@@ -685,7 +705,6 @@ impl SopPane {
         match self.rpc.sops_delete(&name).await {
             Ok(_) => {
                 self.status = Some(format!("deleted {name}"));
-                self.graph_lines.clear();
                 self.overlay = None;
                 self.list_state.select(None);
                 self.refresh().await;
@@ -1255,7 +1274,7 @@ impl SopPane {
             let state = self
                 .overlay
                 .as_ref()
-                .and_then(|o| o.states.get(&(node.step as u64)).copied());
+                .and_then(|o| o.state_of(node.step as u64));
             render_node_card(f, clipped, node, state, active_frame);
             self.node_rects.push((node.step, clipped));
         }
@@ -1417,16 +1436,43 @@ impl SopPane {
             (self.animation_origin.elapsed().as_millis() / 200) % ACTIVE_SPINNER.len() as u128;
         let active = ACTIVE_SPINNER[phase as usize];
         let mut lines: Vec<String> = self
-            .graph_lines
+            .graph
+            .nodes
             .iter()
-            .map(|line| match &self.overlay {
-                Some(o) => match leading_step(line).and_then(|s| o.states.get(&s)) {
-                    Some(state) => format!("{} {line}", state_marker(*state, active)),
-                    None => format!("  {line}"),
-                },
-                None => line.clone(),
+            .map(|node| {
+                let outs: Vec<String> = self
+                    .graph
+                    .wires
+                    .iter()
+                    .filter(|w| w.class == PinClass::Flow && w.from_step == node.step)
+                    .map(|w| w.to_step.to_string())
+                    .collect();
+                let line = if outs.is_empty() {
+                    format!("{}. {}", node.step, node.title)
+                } else {
+                    format!("{}. {} -> {}", node.step, node.title, outs.join(", "))
+                };
+                match self
+                    .overlay
+                    .as_ref()
+                    .and_then(|o| o.state_of(node.step as u64))
+                {
+                    Some(state) => format!("{} {line}", state_marker(state, active)),
+                    None if self.overlay.is_some() => format!("  {line}"),
+                    None => line,
+                }
             })
             .collect();
+        if !self.graph.diagnostics.is_empty() {
+            lines.push(String::new());
+            lines.push("diagnostics:".to_string());
+            for d in &self.graph.diagnostics {
+                lines.push(format!(
+                    "  [{:?}] step {}: {}",
+                    d.severity, d.step, d.message
+                ));
+            }
+        }
         if let Some(buf) = &self.run_input {
             lines.push(String::new());
             lines.push(format!("run id: {buf}_"));
@@ -1600,11 +1646,6 @@ fn state_marker(state: NodeRunState, active_frame: &str) -> String {
         NodeRunState::Skipped => "--".to_string(),
         NodeRunState::Pending => "..".to_string(),
     }
-}
-
-fn leading_step(line: &str) -> Option<u64> {
-    line.split_once('.')
-        .and_then(|(head, _)| head.trim().parse().ok())
 }
 
 fn in_rect(col: u16, row: u16, r: Rect) -> bool {
@@ -1893,106 +1934,4 @@ fn render_node_card(
         .block(block)
         .wrap(Wrap { trim: false });
     f.render_widget(para, area);
-}
-
-fn parse_overlay(value: &serde_json::Value) -> RunOverlayView {
-    let states = value
-        .get("nodes")
-        .and_then(|n| n.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|node| {
-                    let step = node.get("step").and_then(serde_json::Value::as_u64)?;
-                    let state: NodeRunState =
-                        serde_json::from_value(node.get("state")?.clone()).ok()?;
-                    Some((step, state))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    RunOverlayView {
-        status: value
-            .get("status")
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_string(),
-        current_step: value
-            .get("current_step")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-        total_steps: value
-            .get("total_steps")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-        waiting: value
-            .get("waiting")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        paused: value
-            .get("paused")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        states,
-    }
-}
-
-fn parse_sop_names(value: &serde_json::Value) -> Vec<String> {
-    value
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|s| s.get("name").and_then(|n| n.as_str()).map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn graph_to_lines(graph: &serde_json::Value) -> Vec<String> {
-    let mut lines = Vec::new();
-    let nodes = graph.get("nodes").and_then(|n| n.as_array());
-    let wires = graph.get("wires").and_then(|w| w.as_array());
-
-    if let Some(nodes) = nodes {
-        for node in nodes {
-            let step = node.get("step").and_then(serde_json::Value::as_u64);
-            let title = node.get("title").and_then(|t| t.as_str()).unwrap_or("");
-            let outs: Vec<String> = wires
-                .map(|ws| {
-                    ws.iter()
-                        .filter(|w| {
-                            w.get("class").and_then(|c| c.as_str()) == Some("flow")
-                                && w.get("from_step").and_then(serde_json::Value::as_u64) == step
-                        })
-                        .filter_map(|w| {
-                            w.get("to_step")
-                                .and_then(serde_json::Value::as_u64)
-                                .map(|t| t.to_string())
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            match step {
-                Some(s) if outs.is_empty() => lines.push(format!("{s}. {title}")),
-                Some(s) => lines.push(format!("{s}. {title} -> {}", outs.join(", "))),
-                None => {}
-            }
-        }
-    }
-
-    if let Some(diags) = graph.get("diagnostics").and_then(|d| d.as_array())
-        && !diags.is_empty()
-    {
-        lines.push(String::new());
-        lines.push("diagnostics:".to_string());
-        for d in diags {
-            let sev = d.get("severity").and_then(|s| s.as_str()).unwrap_or("");
-            let step = d
-                .get("step")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            let msg = d.get("message").and_then(|m| m.as_str()).unwrap_or("");
-            lines.push(format!("  [{sev}] step {step}: {msg}"));
-        }
-    }
-    lines
 }
