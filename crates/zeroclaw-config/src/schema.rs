@@ -20556,6 +20556,12 @@ pub struct SopConfig {
     /// Intended to converge with the shared B/F redaction switch once those consumers land.
     #[serde(default = "default_sop_untrusted_outbound_redact")]
     pub untrusted_outbound_redact: bool,
+
+    /// Enable SOP procedural-memory proposal tooling. Default false keeps
+    /// self-modifying SOP write-back opt-in while the SOP subsystem is
+    /// Experimental.
+    #[serde(default)]
+    pub procedural_memory_enabled: bool,
 }
 
 fn default_sop_execution_mode() -> String {
@@ -20694,6 +20700,7 @@ impl Default for SopConfig {
             untrusted_guard_sensitivity: default_sop_untrusted_guard_sensitivity(),
             untrusted_frame_warning: default_sop_untrusted_frame_warning(),
             untrusted_outbound_redact: default_sop_untrusted_outbound_redact(),
+            procedural_memory_enabled: false,
         }
     }
 }
