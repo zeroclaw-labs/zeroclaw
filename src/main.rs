@@ -5611,6 +5611,11 @@ async fn main() -> Result<()> {
             PluginCommands::Search { query, registry } => {
                 let registry_url = plugin_registry::registry_url(registry.as_deref());
                 let index = plugin_registry::fetch_registry_index(&registry_url).await?;
+                zeroclaw::plugins::registry::write_cached_registry_index(
+                    &config.data_dir,
+                    &registry_url,
+                    &index,
+                )?;
                 let matches = plugin_registry::search_entries(&index, &query);
                 if matches.is_empty() {
                     println!(
@@ -5682,8 +5687,12 @@ async fn main() -> Result<()> {
                             "Resolving plugin from registry..."
                         )
                     );
-                    let downloaded =
-                        plugin_registry::download_registry_plugin(&registry_url, &source).await?;
+                    let downloaded = plugin_registry::download_registry_plugin(
+                        &registry_url,
+                        &source,
+                        Some(&config.data_dir),
+                    )
+                    .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
                     host.install(&plugin_dir)?;
                     println!(
