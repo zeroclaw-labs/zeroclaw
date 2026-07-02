@@ -147,3 +147,181 @@ fn apply_switch(sop: &mut Sop, edit: &WireEdit) -> Result<(), WireError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sop::step_contract::StepRouting;
+    use crate::sop::types::{Sop, SopExecutionMode, SopPriority, SopStep};
+
+    fn sop2() -> Sop {
+        Sop {
+            name: "w".into(),
+            description: String::new(),
+            version: "0.1.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Auto,
+            triggers: Vec::new(),
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "a".into(),
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "b".into(),
+                    ..SopStep::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+        }
+    }
+
+    fn edit(op: WireOp, from: u32, to: u32, role: FlowRole, port: Option<usize>) -> WireEdit {
+        WireEdit {
+            op,
+            from,
+            to,
+            role,
+            port,
+        }
+    }
+
+    fn step(sop: &Sop, n: u32) -> &SopStep {
+        sop.steps.iter().find(|s| s.number == n).unwrap()
+    }
+
+    #[test]
+    fn sequence_connect_sets_next_and_clears_terminal() {
+        let mut s = sop2();
+        s.steps[0].routing.terminal = true;
+        apply_wire(
+            &mut s,
+            &edit(WireOp::Connect, 1, 2, FlowRole::Sequence, None),
+        )
+        .unwrap();
+        assert_eq!(step(&s, 1).routing.next, Some(2));
+        assert!(!step(&s, 1).routing.terminal);
+    }
+
+    #[test]
+    fn sequence_disconnect_clears_matching_next_and_marks_terminal() {
+        let mut s = sop2();
+        s.steps[0].routing.next = Some(2);
+        apply_wire(
+            &mut s,
+            &edit(WireOp::Disconnect, 1, 2, FlowRole::Sequence, None),
+        )
+        .unwrap();
+        assert_eq!(step(&s, 1).routing.next, None);
+        assert!(
+            step(&s, 1).routing.terminal,
+            "disconnect must suppress implicit fallthrough, not just clear next"
+        );
+    }
+
+    #[test]
+    fn dependency_connect_is_idempotent_and_disconnect_removes() {
+        let mut s = sop2();
+        let e = edit(WireOp::Connect, 1, 2, FlowRole::Dependency, None);
+        apply_wire(&mut s, &e).unwrap();
+        apply_wire(&mut s, &e).unwrap();
+        assert_eq!(step(&s, 2).routing.depends_on, vec![1]);
+
+        apply_wire(
+            &mut s,
+            &edit(WireOp::Disconnect, 1, 2, FlowRole::Dependency, None),
+        )
+        .unwrap();
+        assert!(step(&s, 2).routing.depends_on.is_empty());
+    }
+
+    #[test]
+    fn failure_disconnect_only_clears_matching_target() {
+        let mut s = sop2();
+        s.steps[0].on_failure = StepFailure::Goto { step: 2 };
+        // Disconnecting an edge to a different target must not touch it. Step 1
+        // exists as `to`, so validation passes but the goto doesn't match.
+        apply_wire(
+            &mut s,
+            &edit(WireOp::Disconnect, 2, 1, FlowRole::Failure, None),
+        )
+        .unwrap();
+        assert_eq!(step(&s, 1).on_failure, StepFailure::Goto { step: 2 });
+
+        apply_wire(
+            &mut s,
+            &edit(WireOp::Disconnect, 1, 2, FlowRole::Failure, None),
+        )
+        .unwrap();
+        assert_eq!(step(&s, 1).on_failure, StepFailure::Fail);
+    }
+
+    #[test]
+    fn switch_connect_grows_ports_and_requires_port_index() {
+        let mut s = sop2();
+        assert_eq!(
+            apply_wire(&mut s, &edit(WireOp::Connect, 1, 2, FlowRole::Switch, None)),
+            Err(WireError::MissingPort)
+        );
+
+        apply_wire(
+            &mut s,
+            &edit(WireOp::Connect, 1, 2, FlowRole::Switch, Some(1)),
+        )
+        .unwrap();
+        assert_eq!(step(&s, 1).routing.switch.len(), 2);
+        assert_eq!(step(&s, 1).routing.switch[1].goto, Some(2));
+        assert_eq!(step(&s, 1).routing.switch[0].goto, None);
+    }
+
+    #[test]
+    fn switch_disconnect_out_of_range_port_errors() {
+        let mut s = sop2();
+        assert_eq!(
+            apply_wire(
+                &mut s,
+                &edit(WireOp::Disconnect, 1, 2, FlowRole::Switch, Some(3))
+            ),
+            Err(WireError::PortOutOfRange(3))
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_steps_self_loops_and_trigger_edges() {
+        let mut s = sop2();
+        assert_eq!(
+            apply_wire(
+                &mut s,
+                &edit(WireOp::Connect, 9, 2, FlowRole::Sequence, None)
+            ),
+            Err(WireError::UnknownStep(9))
+        );
+        assert_eq!(
+            apply_wire(
+                &mut s,
+                &edit(WireOp::Connect, 1, 9, FlowRole::Sequence, None)
+            ),
+            Err(WireError::UnknownStep(9))
+        );
+        assert_eq!(
+            apply_wire(
+                &mut s,
+                &edit(WireOp::Connect, 1, 1, FlowRole::Sequence, None)
+            ),
+            Err(WireError::SelfLoop(1))
+        );
+        assert_eq!(
+            apply_wire(
+                &mut s,
+                &edit(WireOp::Connect, 1, 2, FlowRole::Trigger, None)
+            ),
+            Err(WireError::TriggerNotWirable)
+        );
+        assert_eq!(step(&s, 1).routing, StepRouting::default());
+    }
+}

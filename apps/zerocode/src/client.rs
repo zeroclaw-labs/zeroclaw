@@ -2663,6 +2663,187 @@ pub struct TuiListResult {
 }
 
 #[cfg(test)]
+mod sop_method_tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    fn make_rpc() -> (Arc<RpcOutbound>, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel::<String>(16);
+        (Arc::new(RpcOutbound::new(tx)), rx)
+    }
+
+    /// Wire fixture mirrored by `sop::graph` serialization tests in
+    /// zeroclaw-runtime. If this shape drifts, fix both sides together.
+    fn graph_fixture() -> serde_json::Value {
+        json!({
+            "nodes": [
+                {
+                    "step": 1_000_000,
+                    "title": "manual",
+                    "kind": "trigger",
+                    "subtitle": "manual",
+                    "trigger_index": 0,
+                    "inputs": [],
+                    "outputs": [
+                        {"class": "flow", "name": "event", "required": false}
+                    ]
+                },
+                {
+                    "step": 1,
+                    "title": "First",
+                    "kind": "step",
+                    "inputs": [
+                        {"class": "flow", "name": "in", "required": false},
+                        {"class": "data", "name": "input", "data_type": "object", "required": true}
+                    ],
+                    "outputs": [
+                        {"class": "flow", "name": "pr", "required": false}
+                    ]
+                }
+            ],
+            "wires": [
+                {"class": "flow", "from_step": 1_000_000, "to_step": 1, "flow_role": "trigger", "from_pin": "event"},
+                {"class": "flow", "from_step": 1, "to_step": 1, "flow_role": "switch", "from_pin": "pr"}
+            ],
+            "diagnostics": [
+                {"severity": "error", "step": 1, "message": "required input `input` has no upstream producer of a compatible type"}
+            ],
+            "layout": {
+                "positions": [
+                    {"step": 1, "col": 1, "row": 0},
+                    {"step": 1_000_000, "col": 0, "row": 0}
+                ],
+                "columns": 2,
+                "rows": 1
+            }
+        })
+    }
+
+    #[test]
+    fn graph_view_parses_runtime_wire_shape() {
+        let view: SopGraphView = serde_json::from_value(graph_fixture()).unwrap();
+
+        assert_eq!(view.nodes.len(), 2);
+        let trigger = &view.nodes[0];
+        assert_eq!(trigger.kind, NodeKind::Trigger);
+        assert_eq!(trigger.trigger_index, Some(0));
+        assert_eq!(trigger.outputs[0].class, PinClass::Flow);
+
+        let step = &view.nodes[1];
+        assert_eq!(step.kind, NodeKind::Step);
+        assert_eq!(step.inputs[1].class, PinClass::Data);
+        assert_eq!(step.inputs[1].data_type.as_deref(), Some("object"));
+        assert!(step.inputs[1].required);
+
+        assert_eq!(view.wires[0].flow_role, Some(FlowRole::Trigger));
+        assert_eq!(view.wires[1].flow_role, Some(FlowRole::Switch));
+        assert_eq!(view.wires[1].from_pin.as_deref(), Some("pr"));
+        assert_eq!(view.diagnostics[0].severity, GraphSeverity::Error);
+        assert_eq!(view.layout.columns, 2);
+    }
+
+    #[test]
+    fn graph_view_roundtrips_without_shape_loss() {
+        let view: SopGraphView = serde_json::from_value(graph_fixture()).unwrap();
+        let reparsed: SopGraphView =
+            serde_json::from_value(serde_json::to_value(&view).unwrap()).unwrap();
+        assert_eq!(view, reparsed);
+    }
+
+    #[test]
+    fn trigger_registry_view_parses_runtime_wire_shape() {
+        let view: TriggerSourceRegistryView = serde_json::from_value(json!({
+            "bound": [
+                {"source": "webhook", "fields": [{"name": "path", "kind": "text"}]},
+                {"source": "filesystem", "fields": [
+                    {"name": "path", "kind": "text"},
+                    {"name": "events", "options": ["created", "modified", "deleted", "renamed"], "multi": true, "kind": "list"},
+                    {"name": "condition", "kind": "expression"}
+                ]},
+                {"source": "manual", "fields": []}
+            ],
+            "channels": [
+                {
+                    "channel": "telegram",
+                    "aliases": [{"alias": "prod", "enabled": true, "owning_agent": "main"}],
+                    "configured": true,
+                    "setup_path": "/config/channels/telegram"
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(view.bound.len(), 3);
+        let fs = &view.bound[1];
+        assert_eq!(fs.fields[1].kind, TriggerFieldKindView::List);
+        assert!(fs.fields[1].multi);
+        assert_eq!(fs.fields[2].kind, TriggerFieldKindView::Expression);
+        assert!(view.channels[0].configured);
+        assert_eq!(
+            view.channels[0].aliases[0].owning_agent.as_deref(),
+            Some("main")
+        );
+    }
+
+    #[tokio::test]
+    async fn sops_graph_view_sends_name_and_parses_result() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move { client.sops_graph_view("deploy").await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.sops_graph_view must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "sops/graph");
+        assert_eq!(req["params"]["name"], "deploy");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(&id, Some(graph_fixture()), None);
+
+        let view = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.sops_graph_view must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.nodes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sops_wire_draft_sends_sop_and_edit_envelopes() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let sop = json!({"name": "deploy", "steps": []});
+        let edit = json!({"op": "connect", "from": 1, "to": 2, "role": "sequence"});
+        let task = {
+            let (sop, edit) = (sop.clone(), edit.clone());
+            tokio::spawn(async move { client.sops_wire_draft(sop, edit).await })
+        };
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.sops_wire_draft must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "sops/wire-draft");
+        assert_eq!(req["params"]["sop"], sop);
+        assert_eq!(req["params"]["edit"], edit);
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(&id, Some(json!({"sop": {"name": "deploy"}})), None);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.sops_wire_draft must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
 mod session_method_tests {
     use super::*;
     use serde_json::json;

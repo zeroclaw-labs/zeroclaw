@@ -188,3 +188,103 @@ pub fn build_registry(configured: &[ConfiguredChannel]) -> TriggerSourceRegistry
 
     TriggerSourceRegistry { bound, channels }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sop::types::SopTriggerSource;
+    use strum::IntoEnumIterator;
+
+    fn configured(channel_type: &str, alias: &str, enabled: bool) -> ConfiguredChannel {
+        ConfiguredChannel {
+            channel_type: channel_type.to_string(),
+            alias: alias.to_string(),
+            enabled,
+            owning_agent: None,
+        }
+    }
+
+    #[test]
+    fn every_non_channel_trigger_source_is_bound() {
+        let registry = build_registry(&[]);
+        let bound: Vec<&str> = registry.bound.iter().map(|b| b.source.as_str()).collect();
+        for source in SopTriggerSource::iter() {
+            if source == SopTriggerSource::Channel {
+                assert!(!bound.contains(&source.to_string().as_str()));
+            } else {
+                assert!(
+                    bound.contains(&source.to_string().as_str()),
+                    "trigger source {source} missing from registry"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn filesystem_events_field_walks_the_kind_enum() {
+        let registry = build_registry(&[]);
+        let fs = registry
+            .bound
+            .iter()
+            .find(|b| b.source == "filesystem")
+            .unwrap();
+        let events = fs.fields.iter().find(|f| f.name == "events").unwrap();
+        assert!(events.multi);
+        assert_eq!(events.kind, TriggerFieldKind::List);
+        let expected: Vec<String> = crate::sop::types::FilesystemEventKind::iter()
+            .map(|k| <&'static str>::from(k).to_string())
+            .collect();
+        assert_eq!(events.options, expected);
+    }
+
+    #[test]
+    fn channels_walk_inbound_capable_kinds_only() {
+        let registry = build_registry(&[]);
+        assert!(!registry.channels.is_empty());
+        for kind in ChannelKind::iter() {
+            let name: &'static str = kind.into();
+            let present = registry.channels.iter().any(|c| c.channel == name);
+            assert_eq!(
+                present,
+                kind.inbound_capable(),
+                "channel {name} presence must match inbound_capable"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_aliases_attach_to_their_channel_kind() {
+        let registry = build_registry(&[
+            configured("telegram", "prod", true),
+            configured("telegram", "backup", false),
+        ]);
+        let telegram = registry
+            .channels
+            .iter()
+            .find(|c| c.channel == "telegram")
+            .unwrap();
+        assert!(telegram.configured);
+        assert_eq!(telegram.aliases.len(), 2);
+        assert!(
+            telegram
+                .aliases
+                .iter()
+                .any(|a| a.alias == "prod" && a.enabled)
+        );
+        assert!(
+            telegram
+                .aliases
+                .iter()
+                .any(|a| a.alias == "backup" && !a.enabled)
+        );
+
+        let discord = registry
+            .channels
+            .iter()
+            .find(|c| c.channel == "discord")
+            .unwrap();
+        assert!(!discord.configured);
+        assert!(discord.aliases.is_empty());
+        assert_eq!(discord.setup_path, "/config/channels/discord");
+    }
+}

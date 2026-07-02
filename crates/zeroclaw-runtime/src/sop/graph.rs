@@ -668,3 +668,378 @@ impl RunOverlay {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sop::step_contract::{StepFailure, SwitchRule};
+    use crate::sop::types::{
+        Sop, SopEvent, SopExecutionMode, SopPriority, SopRun, SopRunStatus, SopStepResult,
+        SopStepStatus, SopTrigger, SopTriggerSource, StepSchema,
+    };
+
+    fn step(number: u32, title: &str) -> SopStep {
+        SopStep {
+            number,
+            title: title.to_string(),
+            ..SopStep::default()
+        }
+    }
+
+    fn sop(steps: Vec<SopStep>) -> Sop {
+        Sop {
+            name: "g".into(),
+            description: String::new(),
+            version: "0.1.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Auto,
+            triggers: Vec::new(),
+            steps,
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+        }
+    }
+
+    fn flow_wires(graph: &SopGraph, role: FlowRole) -> Vec<(u32, u32)> {
+        graph
+            .wires
+            .iter()
+            .filter(|w| w.flow_role == Some(role))
+            .map(|w| (w.from_step, w.to_step))
+            .collect()
+    }
+
+    #[test]
+    fn linear_steps_get_implicit_sequence_wires() {
+        let graph = SopGraph::from_sop(&sop(vec![step(1, "a"), step(2, "b"), step(3, "c")]));
+        assert_eq!(flow_wires(&graph, FlowRole::Sequence), vec![(1, 2), (2, 3)]);
+        assert!(graph.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn terminal_step_suppresses_fallthrough() {
+        let mut s1 = step(1, "a");
+        s1.routing.terminal = true;
+        let graph = SopGraph::from_sop(&sop(vec![s1, step(2, "b")]));
+        assert!(flow_wires(&graph, FlowRole::Sequence).is_empty());
+    }
+
+    #[test]
+    fn explicit_next_overrides_fallthrough_and_missing_target_is_error() {
+        let mut s1 = step(1, "a");
+        s1.routing.next = Some(3);
+        let mut s2 = step(2, "b");
+        s2.routing.next = Some(9);
+        let graph = SopGraph::from_sop(&sop(vec![s1, s2, step(3, "c")]));
+        assert_eq!(flow_wires(&graph, FlowRole::Sequence), vec![(1, 3)]);
+        assert!(graph.has_errors());
+        assert!(graph.diagnostics[0].message.contains("step 9"));
+    }
+
+    #[test]
+    fn depends_on_produces_dependency_wire_and_bad_dep_is_error() {
+        let mut s2 = step(2, "b");
+        s2.routing.depends_on = vec![1, 7];
+        let graph = SopGraph::from_sop(&sop(vec![step(1, "a"), s2]));
+        assert_eq!(flow_wires(&graph, FlowRole::Dependency), vec![(1, 2)]);
+        assert!(graph.has_errors());
+    }
+
+    #[test]
+    fn on_failure_goto_produces_failure_wire() {
+        let mut s1 = step(1, "a");
+        s1.on_failure = StepFailure::Goto { step: 2 };
+        let graph = SopGraph::from_sop(&sop(vec![s1, step(2, "b")]));
+        assert_eq!(flow_wires(&graph, FlowRole::Failure), vec![(1, 2)]);
+    }
+
+    #[test]
+    fn switch_ports_replace_default_out_pin_and_carry_port_name() {
+        let mut s1 = step(1, "a");
+        s1.routing.switch = vec![
+            SwitchRule {
+                name: "pr".into(),
+                when: Some("$.event == \"pull_request\"".into()),
+                goto: Some(2),
+            },
+            SwitchRule {
+                name: "dangling".into(),
+                when: None,
+                goto: None,
+            },
+            SwitchRule {
+                name: "bad".into(),
+                when: None,
+                goto: Some(9),
+            },
+        ];
+        let graph = SopGraph::from_sop(&sop(vec![s1, step(2, "b")]));
+
+        let node = graph.nodes.iter().find(|n| n.step == 1).unwrap();
+        let out_names: Vec<&str> = node.outputs.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(out_names, vec!["pr", "dangling", "bad"]);
+
+        let switch: Vec<_> = graph
+            .wires
+            .iter()
+            .filter(|w| w.flow_role == Some(FlowRole::Switch))
+            .collect();
+        assert_eq!(switch.len(), 1);
+        assert_eq!(switch[0].from_pin.as_deref(), Some("pr"));
+
+        assert!(
+            graph
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == GraphSeverity::Warning && d.message.contains("'dangling'"))
+        );
+        assert!(
+            graph
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == GraphSeverity::Error && d.message.contains("'bad'"))
+        );
+    }
+
+    #[test]
+    fn triggers_become_nodes_wired_to_entry_steps() {
+        let mut s = sop(vec![step(1, "a"), step(2, "b")]);
+        s.triggers = vec![
+            SopTrigger::Manual,
+            SopTrigger::Webhook {
+                path: "/hook".into(),
+            },
+        ];
+        let graph = SopGraph::from_sop(&s);
+
+        let trigger_nodes: Vec<&GraphNode> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Trigger)
+            .collect();
+        assert_eq!(trigger_nodes.len(), 2);
+        assert_eq!(trigger_nodes[0].step, TRIGGER_NODE_BASE);
+        assert_eq!(trigger_nodes[1].step, TRIGGER_NODE_BASE + 1);
+        assert_eq!(trigger_nodes[1].subtitle.as_deref(), Some("webhook:/hook"));
+
+        // Only step 1 has no inbound flow, so both triggers wire to it alone.
+        assert_eq!(
+            flow_wires(&graph, FlowRole::Trigger),
+            vec![(TRIGGER_NODE_BASE, 1), (TRIGGER_NODE_BASE + 1, 1)]
+        );
+    }
+
+    #[test]
+    fn data_pins_wire_by_type_and_unsatisfied_required_input_is_error() {
+        let mut producer = step(1, "a");
+        producer.schema = Some(StepSchema {
+            input: None,
+            output: Some(serde_json::json!({"type": "object"})),
+        });
+        let mut ok_consumer = step(2, "b");
+        ok_consumer.schema = Some(StepSchema {
+            input: Some(serde_json::json!({"type": "object"})),
+            output: None,
+        });
+        let mut orphan = step(3, "c");
+        orphan.schema = Some(StepSchema {
+            input: Some(serde_json::json!({"type": "string", "required": true})),
+            output: None,
+        });
+        let graph = SopGraph::from_sop(&sop(vec![producer, ok_consumer, orphan]));
+
+        let data: Vec<_> = graph
+            .wires
+            .iter()
+            .filter(|w| w.class == PinClass::Data)
+            .collect();
+        assert_eq!(data.len(), 1);
+        assert_eq!((data[0].from_step, data[0].to_step), (1, 2));
+
+        assert!(graph.diagnostics.iter().any(|d| {
+            d.severity == GraphSeverity::Error
+                && d.step == 3
+                && d.message.contains("no upstream producer")
+        }));
+    }
+
+    #[test]
+    fn layout_assigns_columns_by_longest_path() {
+        let mut s3 = step(3, "join");
+        s3.routing.depends_on = vec![1, 2];
+        let graph = SopGraph::from_sop(&sop(vec![step(1, "a"), step(2, "b"), s3]));
+        let col_of = |n: u32| {
+            graph
+                .layout
+                .positions
+                .iter()
+                .find(|p| p.step == n)
+                .unwrap()
+                .col
+        };
+        assert_eq!(col_of(1), 0);
+        assert_eq!(col_of(2), 1);
+        assert_eq!(col_of(3), 2);
+        assert_eq!(graph.layout.columns, 3);
+    }
+
+    fn run(status: SopRunStatus, current: u32, results: Vec<SopStepResult>) -> SopRun {
+        SopRun {
+            run_id: "r1".into(),
+            sop_name: "g".into(),
+            trigger_event: SopEvent {
+                source: SopTriggerSource::Manual,
+                topic: None,
+                payload: None,
+                timestamp: "2026-01-01T00:00:00Z".into(),
+            },
+            frame_marker_id: String::new(),
+            status,
+            current_step: current,
+            total_steps: 3,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            completed_at: None,
+            step_results: results,
+            waiting_since: None,
+            llm_calls_saved: 0,
+        }
+    }
+
+    fn result(step: u32, status: SopStepStatus) -> SopStepResult {
+        SopStepResult {
+            step_number: step,
+            status,
+            output: String::new(),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn run_overlay_projects_step_states_and_skips_trigger_nodes() {
+        let mut s = sop(vec![step(1, "a"), step(2, "b"), step(3, "c")]);
+        s.triggers = vec![SopTrigger::Manual];
+        let graph = SopGraph::from_sop(&s);
+        let overlay = RunOverlay::project(
+            &graph,
+            &run(
+                SopRunStatus::Running,
+                2,
+                vec![result(1, SopStepStatus::Completed)],
+            ),
+        );
+
+        assert_eq!(overlay.nodes.len(), 3, "trigger nodes carry no run state");
+        let state_of = |n: u32| overlay.nodes.iter().find(|o| o.step == n).unwrap().state;
+        assert_eq!(state_of(1), NodeRunState::Completed);
+        assert_eq!(state_of(2), NodeRunState::Active);
+        assert_eq!(state_of(3), NodeRunState::Pending);
+        assert!(!overlay.waiting);
+        assert!(!overlay.paused);
+    }
+
+    #[test]
+    fn run_overlay_terminal_run_has_no_active_node() {
+        let graph = SopGraph::from_sop(&sop(vec![step(1, "a"), step(2, "b")]));
+        let overlay = RunOverlay::project(
+            &graph,
+            &run(
+                SopRunStatus::Failed,
+                2,
+                vec![result(1, SopStepStatus::Completed)],
+            ),
+        );
+        let state_of = |n: u32| overlay.nodes.iter().find(|o| o.step == n).unwrap().state;
+        assert_eq!(state_of(1), NodeRunState::Completed);
+        assert_eq!(state_of(2), NodeRunState::Pending);
+    }
+
+    /// Pins the JSON wire shape consumed by zerocode's `SopGraphView` mirror
+    /// (`apps/zerocode/src/client.rs`, mod sop_method_tests). If this changes,
+    /// fix both sides together.
+    #[test]
+    fn graph_serializes_to_the_pinned_wire_shape() {
+        let mut s1 = step(1, "First");
+        s1.schema = Some(StepSchema {
+            input: Some(serde_json::json!({"type": "object"})),
+            output: None,
+        });
+        s1.routing.switch = vec![SwitchRule {
+            name: "pr".into(),
+            when: None,
+            goto: None,
+        }];
+        let mut s = sop(vec![s1]);
+        s.triggers = vec![SopTrigger::Manual];
+        let graph = SopGraph::from_sop(&s);
+
+        let value = serde_json::to_value(&graph).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "nodes": [
+                    {
+                        "step": 1,
+                        "title": "First",
+                        "kind": "step",
+                        "inputs": [
+                            {"class": "flow", "name": "in", "required": false},
+                            {"class": "data", "name": "input", "data_type": "object", "required": true}
+                        ],
+                        "outputs": [
+                            {"class": "flow", "name": "pr", "required": false}
+                        ]
+                    },
+                    {
+                        "step": TRIGGER_NODE_BASE,
+                        "title": "manual",
+                        "kind": "trigger",
+                        "subtitle": "manual",
+                        "trigger_index": 0,
+                        "inputs": [],
+                        "outputs": [
+                            {"class": "flow", "name": "event", "required": false}
+                        ]
+                    }
+                ],
+                "wires": [
+                    {"class": "flow", "from_step": TRIGGER_NODE_BASE, "to_step": 1, "flow_role": "trigger", "from_pin": "event"}
+                ],
+                "diagnostics": [
+                    {"severity": "warning", "step": 1, "message": "switch port 'pr' has no target"},
+                    {"severity": "error", "step": 1, "message": "required input `input` has no upstream producer of a compatible type"}
+                ],
+                "layout": {
+                    "positions": [
+                        {"step": 1, "col": 1, "row": 0},
+                        {"step": TRIGGER_NODE_BASE, "col": 0, "row": 0}
+                    ],
+                    "columns": 2,
+                    "rows": 1
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn render_graph_text_covers_all_formats() {
+        let mut s1 = step(1, "First");
+        s1.routing.switch = vec![SwitchRule {
+            name: "pr".into(),
+            when: None,
+            goto: Some(2),
+        }];
+        let graph = SopGraph::from_sop(&sop(vec![s1, step(2, "Second"), step(9, "Ghost")]));
+
+        let outline = render_graph_text(&graph, &TextGraphFormat::Outline);
+        assert!(outline.contains("1. First -> 2"));
+
+        let adjacency = render_graph_text(&graph, &TextGraphFormat::Adjacency);
+        assert!(adjacency.contains("1 -> 2 [switch:pr]"));
+
+        let json = render_graph_text(&graph, &TextGraphFormat::Json);
+        assert!(serde_json::from_str::<SopGraph>(&json).is_ok());
+    }
+}

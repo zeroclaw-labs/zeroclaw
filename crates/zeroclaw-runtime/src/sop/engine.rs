@@ -2483,6 +2483,119 @@ mod tests {
         assert!(matches.is_empty());
     }
 
+    fn channel_event(topic: &str, payload: &str) -> SopEvent {
+        SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some(topic.into()),
+            payload: Some(payload.into()),
+            timestamp: now_iso8601(),
+        }
+    }
+
+    fn channel_sop(name: &str, alias: Option<&str>, condition: Option<&str>) -> Sop {
+        let mut sop = test_sop(name, SopExecutionMode::Auto, SopPriority::Normal);
+        sop.triggers = vec![SopTrigger::Channel {
+            channel: "telegram".into(),
+            alias: alias.map(str::to_string),
+            condition: condition.map(str::to_string),
+        }];
+        sop
+    }
+
+    #[test]
+    fn channel_trigger_matches_channel_type_case_insensitive() {
+        let engine = engine_with_sops(vec![channel_sop("s1", None, None)]);
+        assert_eq!(
+            engine.match_trigger(&channel_event("telegram", "{}")).len(),
+            1
+        );
+        assert_eq!(
+            engine.match_trigger(&channel_event("Telegram", "{}")).len(),
+            1
+        );
+        assert!(
+            engine
+                .match_trigger(&channel_event("discord", "{}"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn channel_trigger_without_alias_matches_any_instance() {
+        let engine = engine_with_sops(vec![channel_sop("s1", None, None)]);
+        assert_eq!(
+            engine
+                .match_trigger(&channel_event("telegram/prod", "{}"))
+                .len(),
+            1
+        );
+        assert_eq!(
+            engine.match_trigger(&channel_event("telegram", "{}")).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn channel_trigger_with_alias_requires_exact_alias() {
+        let engine = engine_with_sops(vec![channel_sop("s1", Some("prod"), None)]);
+        assert_eq!(
+            engine
+                .match_trigger(&channel_event("telegram/prod", "{}"))
+                .len(),
+            1
+        );
+        assert!(
+            engine
+                .match_trigger(&channel_event("telegram/backup", "{}"))
+                .is_empty()
+        );
+        assert!(
+            engine
+                .match_trigger(&channel_event("telegram", "{}"))
+                .is_empty(),
+            "aliased trigger must not match an alias-less topic"
+        );
+    }
+
+    #[test]
+    fn channel_trigger_without_topic_fails_closed() {
+        let engine = engine_with_sops(vec![channel_sop("s1", None, None)]);
+        let event = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: None,
+            payload: None,
+            timestamp: now_iso8601(),
+        };
+        assert!(engine.match_trigger(&event).is_empty());
+    }
+
+    #[test]
+    fn channel_trigger_condition_filters_by_payload() {
+        let engine = engine_with_sops(vec![channel_sop("s1", None, Some("$.kind == \"deploy\""))]);
+        assert_eq!(
+            engine
+                .match_trigger(&channel_event("telegram", "{\"kind\":\"deploy\"}"))
+                .len(),
+            1
+        );
+        assert!(
+            engine
+                .match_trigger(&channel_event("telegram", "{\"kind\":\"chat\"}"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn wants_source_reflects_loaded_trigger_sources() {
+        let engine = engine_with_sops(vec![channel_sop("s1", None, None)]);
+        assert!(engine.wants_source(SopTriggerSource::Channel));
+        assert!(!engine.wants_source(SopTriggerSource::Mqtt));
+        assert!(!engine.wants_source(SopTriggerSource::Amqp));
+
+        let empty = engine_with_sops(vec![]);
+        assert!(!empty.wants_source(SopTriggerSource::Channel));
+    }
+
     fn amqp_event(routing_key: &str, payload: &str) -> SopEvent {
         SopEvent {
             source: SopTriggerSource::Amqp,
