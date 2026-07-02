@@ -2408,6 +2408,8 @@ impl Channel for WeChatChannel {
         recipient: &str,
         _draft_id: &str,
         content: &str,
+        // WeChat iLink has no voice delivery; nothing to suppress.
+        _suppress_voice: bool,
     ) -> anyhow::Result<()> {
         // Send the final accumulated response
         let result = self
