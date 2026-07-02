@@ -129,8 +129,18 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
         }
         "GitHub" => {
             println!("  Setup:");
-            println!("    1. Create a personal access token at https://github.com/settings/tokens");
-            println!("    2. Add to config: [integrations.github] token = \"ghp_...\"");
+            println!("    1. Create a GitHub App (Settings → Developer settings → GitHub Apps)");
+            println!(
+                "       Permissions: Issues R/W, Pull requests R/W, Metadata R. Webhook: off."
+            );
+            println!("    2. Generate a private key (.pem) and install the app on your repos");
+            println!("    3. Run: zeroclaw config set channels.git.default.provider github");
+            println!("       Run: zeroclaw config set channels.git.default.app-id <id>");
+            println!(
+                "       Run: zeroclaw config set channels.git.default.private-key-path <path>"
+            );
+            println!("       Run: zeroclaw config set channels.git.default.enabled true");
+            println!("    4. Start: zeroclaw channel start");
         }
         "Browser" => {
             println!("  Built-in:");
