@@ -6251,16 +6251,28 @@ mod tests {
     }
 
     /// A live chat session holds its own per-agent memory backend, separate
-    /// from `ctx.memory`. A provider-profile `config/set` must refresh that
-    /// handle too (#8359) — otherwise an in-flight session keeps embedding
-    /// against the stale endpoint/key. Drives the agent-refresh pass over a
-    /// registered session whose agent memory is `AgentScopedMemory(SQLite)`.
+    /// from `ctx.memory`. Drives the FULL `handle_config_set` path (parse →
+    /// gate → resolve → spawn) with a registered session whose agent memory is
+    /// `AgentScopedMemory(SQLite)`, and waits for the spawned refresh to reach
+    /// it — otherwise an in-flight session keeps embedding against the stale
+    /// endpoint/key (#8359).
     #[tokio::test]
     async fn config_set_refreshes_live_agent_session_memory() {
         use zeroclaw_api::memory_traits::Memory;
         use zeroclaw_infra::session_queue::SessionActorQueue;
 
         let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        cfg.create_map_key("providers.models.openai", "default")
+            .expect("create openai.default");
+        cfg.memory.embedding_provider = "openai.default".into();
+        cfg.memory.embedding_model = "text-embedding-3-small".into();
+        cfg.memory.embedding_dimensions = 1536;
+
         // The agent's memory: AgentScopedMemory wrapping a concrete SQLite
         // backend (Noop, dims 0) — the stale state config/set must repair.
         let sqlite = Arc::new(zeroclaw_memory::SqliteMemory::new("agent", tmp.path()).unwrap());
@@ -6296,24 +6308,33 @@ mod tests {
             .await
             .unwrap();
 
-        let ctx = RpcContext::minimal(
-            zeroclaw_config::schema::Config::default(),
-            Arc::clone(&sessions),
-        );
-        let resolved = zeroclaw_memory::EmbeddingSettings {
-            model_provider: "openai".into(),
-            model: "text-embedding-3-small".into(),
-            dimensions: 1536,
-            api_key: Some("sk-test".into()),
-        };
+        let ctx = RpcContext::minimal(cfg, Arc::clone(&sessions));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.authenticated = true;
 
-        RpcDispatcher::refresh_live_agent_memory(ctx, resolved).await;
+        // Full RPC path: this schedules the live-agent memory refresh.
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.default.api_key",
+                "value": "sk-rotated"
+            }))
+            .await;
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
 
+        // The agent refresh is spawned; wait (bounded) for it to land.
+        let mut dims = 0;
+        for _ in 0..200 {
+            dims = sqlite.embedder_dimensions();
+            if dims == 1536 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert_eq!(
-            sqlite.embedder_dimensions(),
-            1536,
-            "a live session's per-agent memory embedder must refresh, through the \
-             AgentScopedMemory wrapper, on a provider-profile config/set (#8359)"
+            dims, 1536,
+            "config/set must refresh the live session's per-agent memory embedder \
+             through the AgentScopedMemory wrapper (#8359)"
         );
     }
 
