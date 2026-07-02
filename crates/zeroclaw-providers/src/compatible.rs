@@ -1230,6 +1230,11 @@ struct NativeMessage {
     /// See #6584.
     #[serde(skip_serializing_if = "Option::is_none", rename = "reasoning")]
     reasoning: Option<String>,
+    /// Tool name for `role: "tool"` messages. Groq native tool calling
+    /// requires this field on every tool-result message; omitting it causes
+    /// HTTP 400 "Tools should have a name!". See #7896 / #5531.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 // ---------------------------------------------------------------
@@ -2054,6 +2059,7 @@ impl OpenAiCompatibleModelProvider {
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let mut tool_call_id_map = std::collections::HashMap::new();
         let mut last_assistant_tool_call_ids: Vec<String> = Vec::new();
+        let mut tool_name_map = std::collections::HashMap::new();
 
         messages
             .iter()
@@ -2066,27 +2072,32 @@ impl OpenAiCompatibleModelProvider {
                 {
                     let tool_calls = parsed_calls
                         .into_iter()
-                        .map(|tc| ToolCall {
-                            id: Some({
-                                let normalized_id = reserve_tool_call_id_for_contract(
-                                    targets_mistral_tool_call_contract,
-                                    Some(tc.id.clone()),
-                                    &mut used_tool_call_ids,
-                                );
-                                tool_call_id_map.insert(tc.id, normalized_id.clone());
-                                normalized_id
-                            }),
-                            kind: Some("function".to_string()),
-                            function: Some(Function {
-                                name: Some(tc.name),
-                                arguments: Some(tc.arguments),
-                            }),
-                            name: None,
-                            arguments: None,
-                            parameters: None,
-                            // Round-trip extra_content (e.g. Gemini
-                            // thoughtSignature) — dropping it here was the bug.
-                            extra_content: tc.extra_content,
+                        .map(|tc| {
+                            let tc_id = tc.id.clone();
+                            let tc_name = tc.name.clone();
+                            tool_name_map.insert(tc_id, tc_name);
+                            ToolCall {
+                                id: Some({
+                                    let normalized_id = reserve_tool_call_id_for_contract(
+                                        targets_mistral_tool_call_contract,
+                                        Some(tc.id.clone()),
+                                        &mut used_tool_call_ids,
+                                    );
+                                    tool_call_id_map.insert(tc.id.clone(), normalized_id.clone());
+                                    normalized_id
+                                }),
+                                kind: Some("function".to_string()),
+                                function: Some(Function {
+                                    name: Some(tc.name),
+                                    arguments: Some(tc.arguments),
+                                }),
+                                name: None,
+                                arguments: None,
+                                parameters: None,
+                                // Round-trip extra_content (e.g. Gemini
+                                // thoughtSignature) — dropping it here was the bug.
+                                extra_content: tc.extra_content,
+                            }
                         })
                         .collect::<Vec<_>>();
 
@@ -2113,6 +2124,7 @@ impl OpenAiCompatibleModelProvider {
                         tool_calls: Some(tool_calls),
                         reasoning_content,
                         reasoning,
+                        name: None,
                     };
                 }
 
@@ -2149,6 +2161,7 @@ impl OpenAiCompatibleModelProvider {
                         tool_calls: None,
                         reasoning_content,
                         reasoning,
+                        name: None,
                     };
                 }
 
@@ -2196,6 +2209,21 @@ impl OpenAiCompatibleModelProvider {
                         })
                         .or_else(|| Some(MessageContent::Text(message.content.clone())));
 
+                    // Groq native tool calling requires the tool `name` on
+                    // every role-tool message; look it up from the paired
+                    // assistant tool-call, falling back to any name carried
+                    // in the tool message content itself. See #7896 / #5531.
+                    let tool_name = value
+                        .get("tool_call_id")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|raw_id| tool_name_map.get(raw_id).cloned())
+                        .or_else(|| {
+                            value
+                                .get("name")
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToString::to_string)
+                        });
+
                     return NativeMessage {
                         role: "tool".to_string(),
                         content,
@@ -2203,6 +2231,7 @@ impl OpenAiCompatibleModelProvider {
                         tool_calls: None,
                         reasoning_content: None,
                         reasoning: None,
+                        name: tool_name,
                     };
                 }
 
@@ -2217,6 +2246,7 @@ impl OpenAiCompatibleModelProvider {
                     tool_calls: None,
                     reasoning_content: None,
                     reasoning: None,
+                    name: None,
                 }
             })
             .collect()
@@ -3618,6 +3648,7 @@ mod tests {
                 tool_calls: None,
                 reasoning_content: None,
                 reasoning: None,
+                name: None,
             }],
             temperature: Some(0.7),
             stream: Some(true),
@@ -4310,6 +4341,40 @@ mod tests {
     }
 
     #[test]
+    fn convert_messages_for_native_tool_result_resolves_name_from_tool_name_map() {
+        let history_json = serde_json::json!({
+            "content": "",
+            "tool_calls": [{
+                "id": "call_abc",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"pwd\"}"
+            }]
+        });
+        let messages = vec![
+            ChatMessage::assistant(history_json.to_string()),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "call_abc",
+                    "content": "done"
+                })
+                .to_string(),
+            ),
+        ];
+
+        let provider = make_model_provider("test", "https://example.com", None);
+        let native = provider.convert_messages_for_native(&messages, true);
+        assert_eq!(native.len(), 2);
+        assert_eq!(native[0].role, "assistant");
+        let tool_msg = &native[1];
+        assert_eq!(tool_msg.role, "tool");
+        assert_eq!(
+            tool_msg.name.as_deref(),
+            Some("shell"),
+            "tool name should resolve from paired assistant tool-call"
+        );
+    }
+
+    #[test]
     fn convert_messages_for_native_keeps_tool_result_image_markers_as_text_when_disabled() {
         // Models that don't accept structured image parts (the same gate that
         // keeps user image markers as text) must keep tool-result markers
@@ -4327,6 +4392,80 @@ mod tests {
             Some(MessageContent::Text(value))
                 if value == "snapshot captured\n\n[IMAGE:data:image/jpeg;base64,/9j/4AAQ]"
         ));
+    }
+
+    #[test]
+    fn convert_messages_for_native_tool_result_falls_back_to_content_name() {
+        // When there is no paired assistant tool-call, the tool message's
+        // own "name" field should be used as a fallback.
+        let messages = vec![ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "call_xyz",
+                "name": "read",
+                "content": "file contents"
+            })
+            .to_string(),
+        )];
+
+        let provider = make_model_provider("test", "https://example.com", None);
+        let native = provider.convert_messages_for_native(&messages, true);
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].role, "tool");
+        assert_eq!(
+            native[0].name.as_deref(),
+            Some("read"),
+            "tool name should fall back to the content name field"
+        );
+    }
+
+    #[test]
+    fn native_message_name_serialized_only_when_present() {
+        // Role "tool" messages must include `name` when set; non-tool
+        // messages and tool messages without a name must omit the key.
+        let tool_with_name = NativeMessage {
+            role: "tool".to_string(),
+            content: Some(MessageContent::Text("result".to_string())),
+            tool_call_id: Some("call_1".to_string()),
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+            name: Some("shell".to_string()),
+        };
+        let json = serde_json::to_string(&tool_with_name).unwrap();
+        assert!(
+            json.contains("\"name\":\"shell\""),
+            "name should be present when Some for tool messages"
+        );
+
+        let tool_without_name = NativeMessage {
+            role: "tool".to_string(),
+            content: Some(MessageContent::Text("result".to_string())),
+            tool_call_id: Some("call_2".to_string()),
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+            name: None,
+        };
+        let json = serde_json::to_string(&tool_without_name).unwrap();
+        assert!(
+            !json.contains("\"name\""),
+            "name should be omitted when None"
+        );
+
+        let assistant_msg = NativeMessage {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Text("hello".to_string())),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+            name: None,
+        };
+        let json = serde_json::to_string(&assistant_msg).unwrap();
+        assert!(
+            !json.contains("\"name\""),
+            "name should be omitted for non-tool messages"
+        );
     }
 
     #[test]
@@ -5941,6 +6080,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
+            name: None,
         };
         let json = serde_json::to_string(&msg_without).unwrap();
         assert!(
@@ -5955,6 +6095,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: Some("thinking...".to_string()),
             reasoning: None,
+            name: None,
         };
         let json = serde_json::to_string(&msg_with).unwrap();
         assert!(
