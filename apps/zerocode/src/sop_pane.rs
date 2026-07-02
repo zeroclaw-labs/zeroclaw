@@ -315,6 +315,19 @@ fn pop_failure_arg_char(f: &mut StepFailure) {
     }
 }
 
+fn cycle_pick<T: Clone + PartialEq>(items: &[T], cur: &T, forward: bool) -> Option<T> {
+    if items.is_empty() {
+        return None;
+    }
+    let idx = items.iter().position(|s| s == cur).unwrap_or(0);
+    let next = if forward {
+        (idx + 1) % items.len()
+    } else {
+        (idx + items.len() - 1) % items.len()
+    };
+    items.get(next).cloned()
+}
+
 fn failure_label(f: &StepFailure) -> String {
     match f {
         StepFailure::Fail => "fail".to_string(),
@@ -882,9 +895,6 @@ impl SopPane {
             .map(|b| b.source.clone())
             .collect();
         sources.push("channel".to_string());
-        if sources.is_empty() {
-            return;
-        }
         let Some(ed) = self.editor.as_mut() else {
             return;
         };
@@ -896,13 +906,9 @@ impl SopPane {
         } else {
             trigger.kind.clone()
         };
-        let idx = sources.iter().position(|s| *s == cur).unwrap_or(0);
-        let next = if forward {
-            (idx + 1) % sources.len()
-        } else {
-            (idx + sources.len() - 1) % sources.len()
+        let Some(picked) = cycle_pick(&sources, &cur, forward) else {
+            return;
         };
-        let picked = sources[next].clone();
         *trigger = crate::client::SopTriggerDraft::default();
         if picked == "channel" {
             trigger.kind = "channel".to_string();
@@ -923,9 +929,6 @@ impl SopPane {
             .iter()
             .map(|c| c.channel.clone())
             .collect();
-        if kinds.is_empty() {
-            return;
-        }
         let Some(ed) = self.editor.as_mut() else {
             return;
         };
@@ -936,13 +939,10 @@ impl SopPane {
             return;
         }
         let cur = trigger.channel.clone().unwrap_or_default();
-        let idx = kinds.iter().position(|s| *s == cur).unwrap_or(0);
-        let next = if forward {
-            (idx + 1) % kinds.len()
-        } else {
-            (idx + kinds.len() - 1) % kinds.len()
+        let Some(picked) = cycle_pick(&kinds, &cur, forward) else {
+            return;
         };
-        trigger.channel = Some(kinds[next].clone());
+        trigger.channel = Some(picked);
         trigger.alias = None;
     }
 
@@ -966,13 +966,9 @@ impl SopPane {
             aliases.extend(entry.aliases.iter().map(|a| Some(a.alias.clone())));
         }
         let cur = trigger.alias.clone();
-        let idx = aliases.iter().position(|a| *a == cur).unwrap_or(0);
-        let next = if forward {
-            (idx + 1) % aliases.len()
-        } else {
-            (idx + aliases.len() - 1) % aliases.len()
+        let Some(picked) = cycle_pick(&aliases, &cur, forward) else {
+            return;
         };
-        let picked = aliases[next].clone();
         if let Some(ed) = self.editor.as_mut()
             && let Some(trigger) = ed.draft.triggers.get_mut(ed.trigger_cursor)
         {
