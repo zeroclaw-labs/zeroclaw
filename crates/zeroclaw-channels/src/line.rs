@@ -2401,8 +2401,7 @@ mod tests {
         let reqs = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
         assert_eq!(
-            body["messages"][0]["sender"]["name"],
-            "AI",
+            body["messages"][0]["sender"]["name"], "AI",
             "sender name must fall back to AI when no resolver is configured"
         );
     }
