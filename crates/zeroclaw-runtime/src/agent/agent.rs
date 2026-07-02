@@ -1564,12 +1564,20 @@ impl Agent {
                                 .map(|stub| stub.prefixed_name.as_str()),
                             mcp_policy.as_ref(),
                         );
+                        // Centralized single source of truth for
+                        // the deferred-MCP tool set — see the
+                        // matching comment in `loop_.rs`. The same
+                        // `filtered_deferred` drives the prompt
+                        // section and the `ToolSearchTool` so a
+                        // denied tool cannot leak into either
+                        // (issue #8054 Surface 1(b)).
+                        let filtered_deferred = deferred_set.filter_by_policy(mcp_policy.as_ref());
                         if allowed_stub_count > 0 {
                             let activated =
                                 Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
                             activated_tools = Some(Arc::clone(&activated));
                             let mut tool_search =
-                                tools::ToolSearchTool::new(deferred_set, activated);
+                                tools::ToolSearchTool::new(filtered_deferred, activated);
                             if let Some(policy) = mcp_policy {
                                 tool_search = tool_search.with_access_policy(policy);
                             }

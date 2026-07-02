@@ -528,8 +528,9 @@ async fn append_scoped_mcp_tools(
                         let activated = std::sync::Arc::new(std::sync::Mutex::new(
                             tools::ActivatedToolSet::new(),
                         ));
+                        let filtered_deferred = deferred_set.filter_by_policy(mcp_policy.as_ref());
                         let mut tool_search =
-                            tools::ToolSearchTool::new(deferred_set, activated);
+                            tools::ToolSearchTool::new(filtered_deferred, activated);
                         if let Some(policy) = mcp_policy {
                             tool_search = tool_search.with_access_policy(policy);
                         }

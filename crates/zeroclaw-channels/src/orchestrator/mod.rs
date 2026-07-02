@@ -9546,9 +9546,20 @@ pub async fn start_channels(
                                         registry.server_count()
                                     )
                                 );
+                                // Centralized single source of truth
+                                // for the deferred-MCP tool set — see
+                                // the matching comment in
+                                // `loop_.rs`. The same
+                                // `filtered_deferred` drives the
+                                // prompt section and the
+                                // `ToolSearchTool` so a denied tool
+                                // cannot leak into either (issue
+                                // #8054 Surface 1(b)).
+                                let filtered_deferred = deferred_set
+                                    .filter_by_policy(mcp_policy.as_ref());
                                 deferred_section =
                                     zeroclaw_runtime::tools::build_deferred_tools_section_filtered(
-                                        &deferred_set,
+                                        &filtered_deferred,
                                         mcp_policy.as_ref(),
                                     );
                                 let activated = std::sync::Arc::new(std::sync::Mutex::new(
@@ -9557,7 +9568,7 @@ pub async fn start_channels(
                                 ch_activated_handle = Some(std::sync::Arc::clone(&activated));
                                 let mut tool_search =
                                     zeroclaw_runtime::tools::ToolSearchTool::new(
-                                        deferred_set,
+                                        filtered_deferred,
                                         activated,
                                     );
                                 if let Some(policy) = mcp_policy {

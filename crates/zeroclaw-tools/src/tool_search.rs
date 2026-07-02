@@ -401,7 +401,9 @@ impl ToolSearchTool {
 mod tests {
     use super::*;
     use crate::mcp_client::McpRegistry;
-    use crate::mcp_deferred::DeferredMcpToolStub;
+    use crate::mcp_deferred::{
+        DeferredMcpToolStub, build_deferred_tools_section, build_deferred_tools_section_filtered,
+    };
     use crate::mcp_protocol::McpToolDef;
 
     async fn make_deferred_set(stubs: Vec<DeferredMcpToolStub>) -> DeferredMcpToolSet {
@@ -744,6 +746,90 @@ mod tests {
         assert!(result.output.contains("srv__allowed_tool"));
         assert!(!result.output.contains("srv__denied_tool"));
         assert!(activated.lock().unwrap().is_activated("srv__allowed_tool"));
+    }
+
+    #[tokio::test]
+    async fn prompt_section_and_tool_search_see_same_filtered_set() {
+        // Regression for #8054 Surface 1(b): the prompt-side
+        // `build_deferred_tools_section_filtered` and the runtime
+        // `ToolSearchTool` constructor (built from the same
+        // `filtered_deferred` value, the centralized single source of
+        // truth) must agree on which tools are visible. Before this
+        // fix, the prompt and the search tool could each apply the
+        // access policy independently, and a denied tool could leak
+        // through one of them.
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let set = make_deferred_set(vec![
+            make_stub("srv__visible", "Visible tool"),
+            make_stub("srv__hidden", "Hidden tool"),
+        ])
+        .await;
+        let policy = ToolAccessPolicy {
+            denied: Some(vec!["srv__hidden".into()]),
+            ..ToolAccessPolicy::default()
+        };
+
+        // Single source of truth: build the filtered set once and
+        // feed it to both consumers.
+        let filtered = set.filter_by_policy(Some(&policy));
+
+        // Prompt-side: the section must not mention the denied tool.
+        let section = build_deferred_tools_section_filtered(&filtered, Some(&policy));
+        assert!(section.contains("srv__visible"));
+        assert!(!section.contains("srv__hidden"));
+
+        // Runtime-side: the search tool must not return the denied
+        // tool's schema on a keyword match.
+        let tool = ToolSearchTool::new(filtered, Arc::clone(&activated)).with_access_policy(policy);
+        let result = tool
+            .execute(serde_json::json!({"query": "tool"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("srv__visible"));
+        assert!(!result.output.contains("srv__hidden"));
+        assert!(!activated.lock().unwrap().is_activated("srv__hidden"));
+    }
+
+    #[tokio::test]
+    async fn omission_safety_pre_filtered_set_suffices_without_reapplied_policy() {
+        // Regression for #8054 Surface 1(b): prove that the centralized
+        // `filter_by_policy` helper alone (the single source of truth) is
+        // sufficient to keep a denied tool schema out of both consumers,
+        // even when the policy is NOT reapplied at the consumer level.
+        // This validates the PR-body claim that a missed `with_access_policy`
+        // builder step on `ToolSearchTool` is no longer load-bearing.
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let set = make_deferred_set(vec![
+            make_stub("srv__visible", "Visible tool"),
+            make_stub("srv__hidden", "Hidden tool"),
+        ])
+        .await;
+        let policy = ToolAccessPolicy {
+            denied: Some(vec!["srv__hidden".into()]),
+            ..ToolAccessPolicy::default()
+        };
+
+        // Single source of truth: build the filtered set once.
+        let filtered = set.filter_by_policy(Some(&policy));
+
+        // Prompt-side: use the UNFILTERED prompt builder — the pre-filtered
+        // set alone must keep the denied tool out. No policy re-applied.
+        let section = build_deferred_tools_section(&filtered);
+        assert!(section.contains("srv__visible"));
+        assert!(!section.contains("srv__hidden"));
+
+        // Runtime-side: construct ToolSearchTool WITHOUT with_access_policy.
+        // The pre-filtered stub set alone must keep the denied schema out.
+        let tool = ToolSearchTool::new(filtered, Arc::clone(&activated));
+        let result = tool
+            .execute(serde_json::json!({"query": "tool"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("srv__visible"));
+        assert!(!result.output.contains("srv__hidden"));
+        assert!(!activated.lock().unwrap().is_activated("srv__hidden"));
     }
 
     #[tokio::test]
