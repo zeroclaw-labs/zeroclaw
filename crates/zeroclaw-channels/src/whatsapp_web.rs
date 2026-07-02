@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::select;
 use waproto::whatsapp::device_props::PlatformType;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{Channel, ChannelConversationScope, ChannelMessage, SendMessage};
 #[cfg(feature = "whatsapp-web")]
 use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_runtime::i18n;
@@ -75,6 +75,9 @@ pub struct WhatsAppWebChannel {
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     /// When true, only respond to messages that @-mention the bot in groups
     mention_only: bool,
+    /// When true, allowed unaddressed group messages become context-only
+    /// history entries instead of being dropped.
+    passive_group_context: bool,
     /// Bot phone number (digits only), resolved from pair_phone or device identity at runtime
     bot_phone: Arc<Mutex<Option<String>>>,
     /// Bot LID number (digits only), resolved from device identity at runtime
@@ -143,6 +146,7 @@ impl WhatsAppWebChannel {
         let pair_code = config.pair_code.clone();
         let ws_url = config.ws_url.clone();
         let mention_only = config.mention_only;
+        let passive_group_context = config.passive_group_context;
         let mode = config.mode.clone();
         let dm_policy = config.dm_policy.clone();
         let group_policy = config.group_policy.clone();
@@ -173,6 +177,7 @@ impl WhatsAppWebChannel {
             alias: alias.into(),
             peer_resolver,
             mention_only,
+            passive_group_context,
             bot_phone: Arc::new(Mutex::new(bot_phone)),
             bot_lid: Arc::new(Mutex::new(None)),
             mode,
@@ -854,6 +859,68 @@ impl WhatsAppWebChannel {
         }
 
         String::new()
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn group_context_scope(
+        passive_group_context: bool,
+        is_group: bool,
+    ) -> ChannelConversationScope {
+        if passive_group_context && is_group {
+            ChannelConversationScope::ReplyTarget
+        } else {
+            ChannelConversationScope::Sender
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn should_record_passive_group_context(
+        passive_group_context: bool,
+        is_group: bool,
+        addressed_to_bot: bool,
+    ) -> bool {
+        passive_group_context && is_group && !addressed_to_bot
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_inbound_channel_message(
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        alias: &str,
+        sender: &str,
+        reply_target: String,
+        content: String,
+        attachments: Vec<MediaAttachment>,
+        passive_context: bool,
+        conversation_scope: ChannelConversationScope,
+    ) {
+        if let Err(e) = tx
+            .send(ChannelMessage {
+                id: uuid::Uuid::new_v4().to_string(),
+                channel: "whatsapp".to_string(),
+                channel_alias: Some(alias.to_string()),
+                sender: sender.to_string(),
+                // Reply to the originating chat JID (DM or group), passed
+                // through unchanged (library handles LID addressing internally).
+                reply_target,
+                content,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments,
+                subject: None,
+                passive_context,
+                conversation_scope,
+            })
+            .await
+        {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "failed to send message to channel"
+            );
+        }
     }
 
     /// Synthesize text to speech and send as a WhatsApp voice note (static version for spawned tasks).
@@ -1800,6 +1867,7 @@ impl Channel for WhatsAppWebChannel {
             let wa_group_policy = self.group_policy.clone();
             let wa_self_chat_mode = self.self_chat_mode;
             let mention_only = self.mention_only;
+            let passive_group_context = self.passive_group_context;
             let bot_phone_clone = self.bot_phone.clone();
             let bot_lid_clone = self.bot_lid.clone();
             let wa_dm_mention_patterns = self.dm_mention_patterns.clone();
@@ -1837,6 +1905,7 @@ impl Channel for WhatsAppWebChannel {
                     let wa_mode = wa_mode.clone();
                     let wa_dm_policy = wa_dm_policy.clone();
                     let wa_group_policy = wa_group_policy.clone();
+                    let passive_group_context = passive_group_context;
                     let bot_phone_inner = bot_phone_clone.clone();
                     let bot_lid_inner = bot_lid_clone.clone();
                     let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
@@ -1982,6 +2051,87 @@ impl Channel for WhatsAppWebChannel {
                                 }
 
                                 let normalized = normalized.unwrap_or_else(|| sender.clone());
+                                let conversation_scope =
+                                    Self::group_context_scope(passive_group_context, is_group);
+                                let mut passive_context = false;
+                                let text_content = msg.text_content().unwrap_or("").trim().to_string();
+                                let mut content = Self::media_fallback_content(text_content, msg);
+
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message received (sender_len={}, chat_len={}, content_len={})", sender.len(), chat.len(), content.len()));
+                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message content: {}", content));
+
+                                // mention_only: group messages without a bot mention can become
+                                // passive context when explicitly enabled; otherwise they keep
+                                // the existing drop behavior. This runs before STT/media
+                                // downloads so passive messages have no provider/tool side effects.
+                                if mention_only && is_group {
+                                    let bot_phone = bot_phone_inner.lock();
+                                    let bot_lid = bot_lid_inner.lock();
+                                    if bot_phone.is_some() || bot_lid.is_some() {
+                                        let bp = bot_phone.as_deref().unwrap_or("");
+                                        let bl = bot_lid.as_deref();
+                                        let addressed =
+                                            Self::is_message_addressed_to_bot(msg, &content, bp, bl);
+                                        if Self::should_record_passive_group_context(
+                                            passive_group_context,
+                                            is_group,
+                                            addressed,
+                                        ) {
+                                            passive_context = true;
+                                        } else if !addressed {
+                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring group message not addressed to bot");
+                                            return;
+                                        }
+                                    } else {
+                                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "mention_only active but bot identity unknown, skipping group msg");
+                                        return;
+                                    }
+                                }
+
+                                // ── Mention-pattern gating ──
+                                // If passive group context could record a no-match group message,
+                                // apply group mention gating before STT/media downloads so a
+                                // passive message has no provider/tool side effects. Otherwise,
+                                // defer gating until after STT to preserve the existing active
+                                // voice-note behavior.
+                                let passive_from_mention_gating_possible =
+                                    Self::should_record_passive_group_context(
+                                        passive_group_context,
+                                        is_group,
+                                        false,
+                                    );
+                                if !passive_context && passive_from_mention_gating_possible {
+                                    match super::whatsapp::WhatsAppChannel::apply_mention_gating(
+                                        &wa_dm_mention_patterns,
+                                        &wa_group_mention_patterns,
+                                        &content,
+                                        is_group,
+                                    ) {
+                                        Some(c) => content = c,
+                                        None => {
+                                            passive_context = true;
+                                        }
+                                    }
+                                }
+
+                                if passive_context {
+                                    if content.is_empty() {
+                                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("ignoring empty passive group context from {}", normalized));
+                                        return;
+                                    }
+                                    Self::send_inbound_channel_message(
+                                        &tx_inner,
+                                        alias.as_ref(),
+                                        &normalized,
+                                        reply_target,
+                                        content,
+                                        Vec::new(),
+                                        true,
+                                        conversation_scope,
+                                    )
+                                    .await;
+                                    return;
+                                }
 
                                 // Attempt voice note transcription (ptt = push-to-talk = voice note).
                                 // When `transcribe_non_ptt_audio` is enabled in the transcription
@@ -2009,53 +2159,23 @@ impl Channel for WhatsAppWebChannel {
 
                                 // Use transcribed voice text, or fall back to text content.
                                 // Track whether this chat used a voice note so we reply in kind.
-                                let content = if let Some(ref vt) = voice_text {
+                                if let Some(ref vt) = voice_text {
                                     if let Ok(mut vs) = voice_chats.lock() {
                                         vs.insert(reply_target.clone());
                                     }
-                                    format!("[Voice] {vt}")
-                                } else {
-                                    if let Ok(mut vs) = voice_chats.lock() {
-                                        vs.remove(&reply_target);
-                                    }
-                                    let text = msg.text_content().unwrap_or("");
-                                    text.trim().to_string()
-                                };
-                                let content = Self::media_fallback_content(content, msg);
-
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message received (sender_len={}, chat_len={}, content_len={})", sender.len(), chat.len(), content.len()));
-                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message content: {}", content));
+                                    content = format!("[Voice] {vt}");
+                                } else if let Ok(mut vs) = voice_chats.lock() {
+                                    vs.remove(&reply_target);
+                                }
+                                content = Self::media_fallback_content(content, msg);
 
                                 if content.is_empty() {
                                     ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("ignoring empty or non-text message from {}", normalized));
                                     return;
                                 }
 
-                                // mention_only: skip group messages without a bot mention
-                                if mention_only && is_group {
-                                    let bot_phone = bot_phone_inner.lock();
-                                    let bot_lid = bot_lid_inner.lock();
-                                    if bot_phone.is_some() || bot_lid.is_some() {
-                                        let bp = bot_phone.as_deref().unwrap_or("");
-                                        let bl = bot_lid.as_deref();
-                                        if !Self::is_message_addressed_to_bot(msg, &content, bp, bl) {
-                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring group message not addressed to bot");
-                                            return;
-                                        }
-                                    } else {
-                                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "mention_only active but bot identity unknown, skipping group msg");
-                                        return;
-                                    }
-                                }
-
-                                // ── Mention-pattern gating ──
-                                // Apply dm_mention_patterns for DMs and
-                                // group_mention_patterns for group chats.
-                                // When the applicable pattern set is non-empty,
-                                // messages without a match are dropped and
-                                // matched fragments are stripped.
-                                let content =
-                                    match super::whatsapp::WhatsAppChannel::apply_mention_gating(
+                                if !passive_from_mention_gating_possible {
+                                    content = match super::whatsapp::WhatsAppChannel::apply_mention_gating(
                                         &wa_dm_mention_patterns,
                                         &wa_group_mention_patterns,
                                         &content,
@@ -2067,6 +2187,7 @@ impl Channel for WhatsAppWebChannel {
                                             return;
                                         }
                                     };
+                                }
 
                                 let mut attachments = Vec::new();
                                 Self::collect_media_attachments(
@@ -2088,27 +2209,17 @@ impl Channel for WhatsAppWebChannel {
                                     .await;
                                 }
 
-                                if let Err(e) = tx_inner
-                                    .send(ChannelMessage {
-                                        id: uuid::Uuid::new_v4().to_string(),
-                                        channel: "whatsapp".to_string(),
-                                        channel_alias: Some((*alias).clone()),
-                                        sender: normalized.clone(),
-                                        // Reply to the originating chat JID (DM or group),
-                                        // passed through unchanged (library handles
-                                        // LID addressing internally).
-                                        reply_target,
-                                        content,
-                                        timestamp: chrono::Utc::now().timestamp() as u64,
-                                        thread_ts: None,
-                                        interruption_scope_id: None,
-                                        attachments,
-                                        subject: None,
-                                    })
-                                    .await
-                                {
-                                    ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "failed to send message to channel");
-                                }
+                                Self::send_inbound_channel_message(
+                                    &tx_inner,
+                                    alias.as_ref(),
+                                    &normalized,
+                                    reply_target,
+                                    content,
+                                    attachments,
+                                    false,
+                                    conversation_scope,
+                                )
+                                .await;
                             }
                             Event::Connected(_) => {
                                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "connected successfully");
@@ -2625,6 +2736,40 @@ mod tests {
         let dm_jid = "987654321098765@s.whatsapp.net";
         let admitted = !is_group || super::is_group_chat_allowed(dm_jid, &groups);
         assert!(admitted);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn passive_group_context_is_default_off_and_group_only() {
+        assert!(!WhatsAppWebChannel::should_record_passive_group_context(
+            false, true, false
+        ));
+        assert!(!WhatsAppWebChannel::should_record_passive_group_context(
+            true, false, false
+        ));
+        assert!(!WhatsAppWebChannel::should_record_passive_group_context(
+            true, true, true
+        ));
+        assert!(WhatsAppWebChannel::should_record_passive_group_context(
+            true, true, false
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn passive_group_context_uses_reply_target_scope_for_groups() {
+        assert_eq!(
+            WhatsAppWebChannel::group_context_scope(false, true),
+            ChannelConversationScope::Sender
+        );
+        assert_eq!(
+            WhatsAppWebChannel::group_context_scope(true, false),
+            ChannelConversationScope::Sender
+        );
+        assert_eq!(
+            WhatsAppWebChannel::group_context_scope(true, true),
+            ChannelConversationScope::ReplyTarget
+        );
     }
 
     #[test]

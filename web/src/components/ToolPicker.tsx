@@ -30,6 +30,10 @@ export interface ToolPickerProps {
   disabled?: boolean;
   /** DOM id for the search input so a `<label htmlFor>` can target it. */
   id?: string;
+  /** Scope the agent-tools catalog to this agent (its built-ins plus its
+   * `mcp_bundles` MCP tools) via `/api/tools?agent=`. Omit for the gateway's
+   * default-agent listing. CLI tools are always included (not agent-scoped). */
+  agent?: string;
 }
 
 /** A flattened, group-tagged catalog entry. */
@@ -40,10 +44,14 @@ interface CatalogEntry {
 }
 
 // Process-wide cache so re-mounting the picker (e.g. reopening the Cron
-// modal, or switching config sections) doesn't re-hit the network. The
-// catalog is effectively static for the daemon's lifetime.
-let catalogCache: CatalogEntry[] | null = null;
-let catalogPromise: Promise<CatalogEntry[]> | null = null;
+// modal, or switching config sections) doesn't re-hit the network. Keyed by
+// agent alias (`'' `= the gateway's default-agent listing): the agent-tools
+// half is `getTools(agent)`, so a picker bound to a specific agent (e.g. a
+// channel's owning agent) caches that agent's real scoped catalog separately
+// from the default. Each per-agent catalog is effectively static for the
+// daemon's lifetime.
+const catalogCache = new Map<string, CatalogEntry[]>();
+const catalogInflight = new Map<string, Promise<CatalogEntry[]>>();
 
 function cliDescription(tool: CliTool): string {
   // CliTool has no `description`; synthesize a short one from category/path
@@ -54,12 +62,15 @@ function cliDescription(tool: CliTool): string {
   return parts || tool.path;
 }
 
-function loadCatalog(): Promise<CatalogEntry[]> {
-  if (catalogCache) return Promise.resolve(catalogCache);
-  if (catalogPromise) return catalogPromise;
-  catalogPromise = Promise.all([getTools(), getCliTools()])
+function loadCatalog(agent?: string): Promise<CatalogEntry[]> {
+  const key = agent ?? '';
+  const cached = catalogCache.get(key);
+  if (cached) return Promise.resolve(cached);
+  const inflight = catalogInflight.get(key);
+  if (inflight) return inflight;
+  const promise = Promise.all([getTools(agent), getCliTools()])
     .then(([tools, cliTools]) => {
-      const agent: CatalogEntry[] = tools.map((tnt: ToolSpec) => ({
+      const agentEntries: CatalogEntry[] = tools.map((tnt: ToolSpec) => ({
         name: tnt.name,
         description: tnt.description,
         group: 'agent' as const,
@@ -69,13 +80,15 @@ function loadCatalog(): Promise<CatalogEntry[]> {
         description: cliDescription(c),
         group: 'cli' as const,
       }));
-      catalogCache = [...agent, ...cli];
-      return catalogCache;
+      const entries = [...agentEntries, ...cli];
+      catalogCache.set(key, entries);
+      return entries;
     })
     .finally(() => {
-      catalogPromise = null;
+      catalogInflight.delete(key);
     });
-  return catalogPromise;
+  catalogInflight.set(key, promise);
+  return promise;
 }
 
 function truncate(text: string, max = 110): string {
@@ -88,22 +101,31 @@ export default function ToolPicker({
   onChange,
   disabled = false,
   id,
+  agent,
 }: ToolPickerProps) {
-  const [catalog, setCatalog] = useState<CatalogEntry[] | null>(catalogCache);
-  const [loading, setLoading] = useState(catalogCache === null);
+  const cacheKey = agent ?? '';
+  const [catalog, setCatalog] = useState<CatalogEntry[] | null>(
+    () => catalogCache.get(cacheKey) ?? null,
+  );
+  const [loading, setLoading] = useState(() => !catalogCache.has(cacheKey));
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
 
+  // Reload when the bound agent changes so the catalog reflects that agent's
+  // scoped tools (cached per agent, so switching back is instant).
   useEffect(() => {
-    if (catalogCache) {
-      setCatalog(catalogCache);
+    const cached = catalogCache.get(cacheKey);
+    if (cached) {
+      setCatalog(cached);
       setLoading(false);
+      setError(null);
       return;
     }
     let cancelled = false;
     setLoading(true);
     setError(null);
-    loadCatalog()
+    setCatalog(null);
+    loadCatalog(agent)
       .then((entries) => {
         if (!cancelled) {
           setCatalog(entries);
@@ -119,7 +141,7 @@ export default function ToolPicker({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [agent, cacheKey]);
 
   // Fast membership lookups for the catalog and the current selection.
   const byName = useMemo(() => {
@@ -147,6 +169,24 @@ export default function ToolPicker({
     onChange(value.filter((n) => n !== name));
   };
 
+  // Bulk toggle for a group's currently-displayed entries. If every displayed
+  // entry is already selected, deselect them all; otherwise add the missing
+  // ones. Operates on the filtered list so it honors an active search, and
+  // matches the count shown in the group header.
+  const toggleAll = (entries: CatalogEntry[]) => {
+    if (disabled || entries.length === 0) return;
+    const names = entries.map((e) => e.name);
+    const allSelected = names.every((n) => selectedSet.has(n));
+    if (allSelected) {
+      const drop = new Set(names);
+      onChange(value.filter((n) => !drop.has(n)));
+    } else {
+      const next = [...value];
+      for (const n of names) if (!next.includes(n)) next.push(n);
+      onChange(next);
+    }
+  };
+
   // Search filter over name + description (case-insensitive).
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -167,6 +207,11 @@ export default function ToolPicker({
     () => filtered.filter((e) => e.group === 'cli'),
     [filtered],
   );
+
+  const agentAllSelected =
+    agentEntries.length > 0 && agentEntries.every((e) => selectedSet.has(e.name));
+  const cliAllSelected =
+    cliEntries.length > 0 && cliEntries.every((e) => selectedSet.has(e.name));
 
   // Selected names that aren't in the catalog (unknown / removed tools).
   // Surface them as chips so nothing is silently dropped on save.
@@ -287,6 +332,52 @@ export default function ToolPicker({
           className="w-full h-9 pl-9 pr-3 text-sm rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 disabled:opacity-50 disabled:cursor-not-allowed"
         />
       </div>
+
+      {/* Per-group bulk-select toolbar. Rendered OUTSIDE the role="listbox"
+          below so the controls are valid ARIA (a listbox may only contain
+          option/group descendants) and reachable in the natural Tab order with
+          native button Enter/Space activation. Each button acts on its group's
+          currently-displayed (filtered) entries and flips Select all/Deselect
+          all to match. Hidden when the picker is disabled or the group is empty. */}
+      {!loading && error === null && !disabled &&
+        (agentEntries.length > 0 || cliEntries.length > 0) && (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-0.5">
+            {agentEntries.length > 0 && (
+              <button
+                type="button"
+                onClick={() => toggleAll(agentEntries)}
+                aria-label={`${
+                  agentAllSelected
+                    ? t('tool_picker.deselect_all_aria_prefix')
+                    : t('tool_picker.select_all_aria_prefix')
+                }${t('tool_picker.group_agent')}`}
+                className="text-[10px] font-medium text-pc-accent hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]/40 rounded cursor-pointer"
+              >
+                {agentAllSelected
+                  ? t('tool_picker.deselect_all')
+                  : t('tool_picker.select_all')}{' '}
+                {t('tool_picker.group_agent')}
+              </button>
+            )}
+            {cliEntries.length > 0 && (
+              <button
+                type="button"
+                onClick={() => toggleAll(cliEntries)}
+                aria-label={`${
+                  cliAllSelected
+                    ? t('tool_picker.deselect_all_aria_prefix')
+                    : t('tool_picker.select_all_aria_prefix')
+                }${t('tool_picker.group_cli')}`}
+                className="text-[10px] font-medium text-pc-accent hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]/40 rounded cursor-pointer"
+              >
+                {cliAllSelected
+                  ? t('tool_picker.deselect_all')
+                  : t('tool_picker.select_all')}{' '}
+                {t('tool_picker.group_cli')}
+              </button>
+            )}
+          </div>
+        )}
 
       {/* Catalog list */}
       {loading ? (

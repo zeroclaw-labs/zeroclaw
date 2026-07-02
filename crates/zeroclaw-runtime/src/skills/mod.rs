@@ -5,7 +5,7 @@ use directories::UserDirs;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -33,7 +33,8 @@ pub use frontmatter::SkillFrontmatter;
 pub use reference::{SkillRef, SkillRefError};
 pub use scaffold::{ScaffoldError, ScaffoldOptions};
 pub use service::{
-    EffectiveSkill, RemoveMode, ServiceError, SkillOrigin, SkillSummary, SkillsService,
+    EffectiveSkill, EffectiveSkillSet, RemoveMode, ServiceError, SkillOrigin, SkillSummary,
+    SkillsService,
 };
 pub(crate) use suggestions::render_missing_skill_install_suggestion;
 
@@ -45,7 +46,9 @@ const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
 const CLAWHUB_DOMAIN: &str = "clawhub.ai";
 const CLAWHUB_WWW_DOMAIN: &str = "www.clawhub.ai";
 const CLAWHUB_DOWNLOAD_API: &str = "https://clawhub.ai/api/v1/download";
-const MAX_CLAWHUB_ZIP_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
+const MAX_SKILL_ZIP_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_SKILL_ZIP_ENTRIES: usize = 500;
+const MAX_SKILL_ZIP_EXPANSION_RATIO: u64 = 10;
 
 // ─── Skills registry (zeroclaw-skills) ────────────────────────────────────────
 const SKILLS_REGISTRY_REPO_URL: &str = "https://github.com/zeroclaw-labs/zeroclaw-skills";
@@ -88,6 +91,45 @@ pub struct Skill {
     pub slash_options: Vec<SkillSlashOption>,
     #[serde(skip)]
     pub location: Option<PathBuf>,
+}
+
+/// Why the audited resolver dropped a candidate skill directory/file.
+/// Carries the human-readable detail the loader already logs, so the
+/// dashboard can show the same reason without re-running the audit. (#7963)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SkillDropReason {
+    /// `audit_*` returned Ok(report) with findings; String = report.summary().
+    AuditFindings(String),
+    /// `audit_*` returned Err (unauditable); String = error message.
+    AuditError(String),
+    /// Audit passed but SKILL.toml/manifest.toml failed to parse.
+    ManifestParseError(String),
+}
+
+/// A candidate skill the resolver loaded-then-dropped. Name is inferred from
+/// the directory/file stem (the manifest may be unreadable). `location` is the
+/// on-disk path for operator debugging. `origin_hint` mirrors the loader that
+/// produced it (workspace/open-skills/plugin/bundle) — a *string tag*, not the
+/// `SkillOrigin` enum, because a dropped skill has no resolved `location`-based
+/// origin to derive from. (#7963)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DroppedSkill {
+    pub name: String,
+    /// `"workspace"` | `"open-skills"` | `"plugin"` | `"bundle"`.
+    pub origin_hint: String,
+    pub reason: SkillDropReason,
+    pub location: Option<PathBuf>,
+}
+
+/// One lower-precedence skill that lost its name to an earlier (higher-priority)
+/// source during the agent's effective-skill dedup. Recorded for the dashboard
+/// so operators can see why an assigned bundle skill is being overridden. (#7963)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShadowedSkill {
+    /// The name shared with (and won by) the higher-precedence skill.
+    pub name: String,
+    /// Origin of the LOSER: `"open-skills"` | `"plugin"` | `"bundle"`.
+    pub origin_hint: String,
 }
 
 /// A typed option a `slash`-tagged skill exposes on its slash command. Shaped
@@ -442,9 +484,17 @@ fn warn_metadata_drift(skill_dir: &Path, toml_skill: &Skill, md_path: &Path) {
     }
 }
 
+/// Infer the directory/file stem a dropped/loaded skill is named after when its
+/// manifest can't be (or wasn't) read.
+fn dir_stem(path: &Path) -> String {
+    path.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
-    load_skills_with_open_skills_config(workspace_dir, None, None, None)
+    load_skills_with_open_skills_config(workspace_dir, None, None, None).0
 }
 
 /// Load skills using runtime config values (preferred at runtime).
@@ -452,8 +502,17 @@ pub fn load_skills_with_config(
     workspace_dir: &Path,
     config: &zeroclaw_config::schema::Config,
 ) -> Vec<Skill> {
+    load_skills_with_config_audited(workspace_dir, config).0
+}
+
+/// Like [`load_skills_with_config`] but also returns the audit-dropped
+/// candidates the resolver skipped, so the dashboard can surface them (#7963).
+pub fn load_skills_with_config_audited(
+    workspace_dir: &Path,
+    config: &zeroclaw_config::schema::Config,
+) -> (Vec<Skill>, Vec<DroppedSkill>) {
     #[allow(unused_mut)]
-    let mut skills = load_skills_with_open_skills_config(
+    let (mut skills, mut dropped) = load_skills_with_open_skills_config(
         workspace_dir,
         Some(config.skills.open_skills_enabled),
         config.skills.open_skills_dir.as_deref(),
@@ -461,9 +520,13 @@ pub fn load_skills_with_config(
     );
 
     #[cfg(feature = "plugins-wasm")]
-    skills.extend(load_plugin_skills_from_config(config));
+    {
+        let (plugin_skills, plugin_dropped) = load_plugin_skills_from_config(config);
+        skills.extend(plugin_skills);
+        dropped.extend(plugin_dropped);
+    }
 
-    skills
+    (skills, dropped)
 }
 
 /// Per-agent skill discovery. Walks `[agents.<agent_alias>].skill_bundles`,
@@ -479,17 +542,56 @@ pub fn load_skills_for_agent(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
 ) -> Vec<Skill> {
-    let mut skills = load_skills_with_config(workspace_dir, config);
+    load_skills_for_agent_audited(workspace_dir, config, agent_alias).0
+}
+
+/// Origin tag for a pre-bundle skill, mirroring [`super::service`]'s
+/// `derive_origin` discriminators minus the bundle-dir match (a pre-bundle
+/// skill is never bundle-origin). Used to seed the dedup winner map so the
+/// shadow record can name the winner's source. (#7963)
+///
+/// This is a best-effort, display-only attribution for the shadow badge: the
+/// tag-based heuristic can misclassify a workspace skill whose `tags` happen to
+/// contain `"open-skills"` (or a `plugin:`-prefixed tag). That is acceptable
+/// because the hint never affects which skills load or their precedence — it
+/// only labels the source that already won the dedup. Not an authoritative
+/// origin resolver; use [`super::service`]'s `derive_origin` for that.
+fn origin_hint_of(skill: &Skill) -> &'static str {
+    if skill.tags.iter().any(|t| t == "open-skills") {
+        "open-skills"
+    } else if skill.name.starts_with("plugin:")
+        || skill.tags.iter().any(|t| t.starts_with("plugin:"))
+    {
+        "plugin"
+    } else {
+        "workspace"
+    }
+}
+
+/// [`load_skills_for_agent`] plus the audit-dropped and shadowed candidates the
+/// resolver skipped, so the dashboard can surface them without re-auditing or
+/// re-walking (#7963).
+pub fn load_skills_for_agent_audited(
+    workspace_dir: &Path,
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> (Vec<Skill>, Vec<DroppedSkill>, Vec<ShadowedSkill>) {
+    let (mut skills, mut dropped) = load_skills_with_config_audited(workspace_dir, config);
+    let mut shadows: Vec<ShadowedSkill> = Vec::new();
     let Some(agent) = config.agent(agent_alias) else {
-        return skills;
+        return (skills, dropped, shadows);
     };
     if agent.skill_bundles.is_empty() {
-        return skills;
+        return (skills, dropped, shadows);
     }
     let install_root = config.install_root_dir();
     let allow_scripts = config.skills.allow_scripts;
-    let mut seen: std::collections::HashSet<String> =
-        skills.iter().map(|s| s.name.clone()).collect();
+    // name → origin_hint of the winner already in `skills`, so a shadowed
+    // bundle skill can be attributed to the source that beat it.
+    let mut seen: std::collections::HashMap<String, &'static str> = skills
+        .iter()
+        .map(|s| (s.name.clone(), origin_hint_of(s)))
+        .collect();
     for bundle_alias in &agent.skill_bundles {
         let bundle = match config.skill_bundles.get(bundle_alias) {
             Some(b) => b,
@@ -509,19 +611,33 @@ pub fn load_skills_for_agent(
                 continue;
             }
         };
-        for skill in load_skills_from_directory(&dir, allow_scripts) {
+        let (bundle_skills, bundle_dropped) = load_skills_from_directory(&dir, allow_scripts);
+        dropped.extend(bundle_dropped.into_iter().map(|mut d| {
+            d.origin_hint = "bundle".into();
+            d
+        }));
+        for skill in bundle_skills {
             if !bundle.admits_skill(&skill.name) {
                 continue;
             }
             // First-write wins so workspace skills override bundle skills
             // with the same name (legacy agents who edited a workspace
             // copy keep their override after a bundle is assigned).
-            if seen.insert(skill.name.clone()) {
+            if seen.contains_key(&skill.name) {
+                // This bundle skill lost the name to an earlier source.
+                // Record the loser keyed to the winner's name so the
+                // dashboard can badge the winning skill. (#7963)
+                shadows.push(ShadowedSkill {
+                    name: skill.name.clone(),
+                    origin_hint: "bundle".into(),
+                });
+            } else {
+                seen.insert(skill.name.clone(), "bundle");
                 skills.push(skill);
             }
         }
     }
-    skills
+    (skills, dropped, shadows)
 }
 
 /// Production helper: loads skills for an agent using the correct per-agent
@@ -536,7 +652,17 @@ pub fn load_skills_for_agent_from_config(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
 ) -> Vec<Skill> {
-    load_skills_for_agent(
+    load_skills_for_agent_from_config_audited(config, agent_alias).0
+}
+
+/// [`load_skills_for_agent_from_config`] plus the audit-dropped and shadowed
+/// candidates the resolver skipped — the dashboard's source for the
+/// skipped-audit banner and shadow badges (#7963).
+pub fn load_skills_for_agent_from_config_audited(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> (Vec<Skill>, Vec<DroppedSkill>, Vec<ShadowedSkill>) {
+    load_skills_for_agent_audited(
         &config.agent_workspace_dir(agent_alias),
         config,
         agent_alias,
@@ -556,6 +682,7 @@ pub fn load_skills_with_open_skills_settings(
         open_skills_dir,
         Some(allow_scripts),
     )
+    .0
 }
 
 fn load_skills_with_open_skills_config(
@@ -563,40 +690,56 @@ fn load_skills_with_open_skills_config(
     config_open_skills_enabled: Option<bool>,
     config_open_skills_dir: Option<&str>,
     config_allow_scripts: Option<bool>,
-) -> Vec<Skill> {
+) -> (Vec<Skill>, Vec<DroppedSkill>) {
     let mut skills = Vec::new();
+    let mut dropped = Vec::new();
     let allow_scripts = config_allow_scripts.unwrap_or(false);
 
     if let Some(open_skills_dir) =
         ensure_open_skills_repo(config_open_skills_enabled, config_open_skills_dir)
     {
-        skills.extend(load_open_skills(&open_skills_dir, allow_scripts));
+        let (os_skills, os_dropped) = load_open_skills(&open_skills_dir, allow_scripts);
+        skills.extend(os_skills);
+        dropped.extend(os_dropped);
     }
 
-    skills.extend(load_workspace_skills(workspace_dir, allow_scripts));
-    skills
+    let (ws_skills, ws_dropped) = load_workspace_skills(workspace_dir, allow_scripts);
+    skills.extend(ws_skills);
+    dropped.extend(ws_dropped);
+    (skills, dropped)
 }
 
-fn load_workspace_skills(workspace_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+fn load_workspace_skills(
+    workspace_dir: &Path,
+    allow_scripts: bool,
+) -> (Vec<Skill>, Vec<DroppedSkill>) {
     let skills_dir = workspace_dir.join("skills");
     load_skills_from_directory(&skills_dir, allow_scripts)
 }
 
-pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
-    cache::cached_load(skills_dir, allow_scripts, "workspace", || {
-        load_skills_from_directory_uncached(skills_dir, allow_scripts)
-    })
+pub fn load_skills_from_directory(
+    skills_dir: &Path,
+    allow_scripts: bool,
+) -> (Vec<Skill>, Vec<DroppedSkill>) {
+    let out = cache::cached_load(skills_dir, allow_scripts, "workspace", || {
+        let (skills, dropped) = load_skills_from_directory_uncached(skills_dir, allow_scripts);
+        cache::LoadOutput { skills, dropped }
+    });
+    (out.skills, out.dropped)
 }
 
-fn load_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+fn load_skills_from_directory_uncached(
+    skills_dir: &Path,
+    allow_scripts: bool,
+) -> (Vec<Skill>, Vec<DroppedSkill>) {
+    let mut skills = Vec::new();
+    let mut dropped = Vec::new();
     if !skills_dir.exists() {
-        return Vec::new();
+        return (skills, dropped);
     }
 
-    let mut skills = Vec::new();
-
     let Ok(entries) = std::fs::read_dir(skills_dir) else {
-        return skills;
+        return (skills, dropped);
     };
 
     for entry in entries.flatten() {
@@ -613,6 +756,12 @@ fn load_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -
             Ok(report) => {
                 let summary = report.summary();
                 warn_skipped_skill(&path, &summary, allow_scripts);
+                dropped.push(DroppedSkill {
+                    name: dir_stem(&path),
+                    origin_hint: "workspace".into(),
+                    reason: SkillDropReason::AuditFindings(summary),
+                    location: Some(path.clone()),
+                });
                 continue;
             }
             Err(err) => {
@@ -625,6 +774,12 @@ fn load_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -
                         path.display().to_string()
                     )
                 );
+                dropped.push(DroppedSkill {
+                    name: dir_stem(&path),
+                    origin_hint: "workspace".into(),
+                    reason: SkillDropReason::AuditError(err.to_string()),
+                    location: Some(path.clone()),
+                });
                 continue;
             }
         }
@@ -659,6 +814,12 @@ fn load_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -
                             })),
                         "failed to load SKILL.toml — skill directory skipped"
                     );
+                    dropped.push(DroppedSkill {
+                        name: dir_stem(&path),
+                        origin_hint: "workspace".into(),
+                        reason: SkillDropReason::ManifestParseError(format!("{e}")),
+                        location: Some(path.clone()),
+                    });
                 }
             }
         } else if md_path.exists()
@@ -668,7 +829,7 @@ fn load_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -
         }
     }
 
-    skills
+    (skills, dropped)
 }
 
 fn finalize_open_skill(mut skill: Skill) -> Skill {
@@ -681,21 +842,29 @@ fn finalize_open_skill(mut skill: Skill) -> Skill {
     skill
 }
 
-fn load_open_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
-    cache::cached_load(skills_dir, allow_scripts, "open-skills", || {
-        load_open_skills_from_directory_uncached(skills_dir, allow_scripts)
-    })
+fn load_open_skills_from_directory(
+    skills_dir: &Path,
+    allow_scripts: bool,
+) -> (Vec<Skill>, Vec<DroppedSkill>) {
+    let out = cache::cached_load(skills_dir, allow_scripts, "open-skills", || {
+        let (skills, dropped) = load_open_skills_from_directory_uncached(skills_dir, allow_scripts);
+        cache::LoadOutput { skills, dropped }
+    });
+    (out.skills, out.dropped)
 }
 
-fn load_open_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+fn load_open_skills_from_directory_uncached(
+    skills_dir: &Path,
+    allow_scripts: bool,
+) -> (Vec<Skill>, Vec<DroppedSkill>) {
+    let mut skills = Vec::new();
+    let mut dropped = Vec::new();
     if !skills_dir.exists() {
-        return Vec::new();
+        return (skills, dropped);
     }
 
-    let mut skills = Vec::new();
-
     let Ok(entries) = std::fs::read_dir(skills_dir) else {
-        return skills;
+        return (skills, dropped);
     };
 
     for entry in entries.flatten() {
@@ -712,6 +881,12 @@ fn load_open_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bo
             Ok(report) => {
                 let summary = report.summary();
                 warn_skipped_skill(&path, &summary, allow_scripts);
+                dropped.push(DroppedSkill {
+                    name: dir_stem(&path),
+                    origin_hint: "open-skills".into(),
+                    reason: SkillDropReason::AuditFindings(summary),
+                    location: Some(path.clone()),
+                });
                 continue;
             }
             Err(err) => {
@@ -724,6 +899,12 @@ fn load_open_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bo
                         path.display().to_string()
                     )
                 );
+                dropped.push(DroppedSkill {
+                    name: dir_stem(&path),
+                    origin_hint: "open-skills".into(),
+                    reason: SkillDropReason::AuditError(err.to_string()),
+                    location: Some(path.clone()),
+                });
                 continue;
             }
         }
@@ -757,6 +938,12 @@ fn load_open_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bo
                             })),
                         "failed to load SKILL.toml — skill directory skipped"
                     );
+                    dropped.push(DroppedSkill {
+                        name: dir_stem(&path),
+                        origin_hint: "open-skills".into(),
+                        reason: SkillDropReason::ManifestParseError(format!("{e}")),
+                        location: Some(path.clone()),
+                    });
                 }
             }
         } else if md_path.exists()
@@ -766,10 +953,10 @@ fn load_open_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bo
         }
     }
 
-    skills
+    (skills, dropped)
 }
 
-fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> (Vec<Skill>, Vec<DroppedSkill>) {
     // Modern open-skills layout stores skill packages in `skills/<name>/SKILL.md`.
     // Prefer that structure to avoid treating repository docs (e.g. CONTRIBUTING.md)
     // as executable skills.
@@ -779,9 +966,10 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
     }
 
     let mut skills = Vec::new();
+    let mut dropped = Vec::new();
 
     let Ok(entries) = std::fs::read_dir(repo_dir) else {
-        return skills;
+        return (skills, dropped);
     };
 
     for entry in entries.flatten() {
@@ -809,6 +997,7 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
         match audit::audit_open_skill_markdown(&path, repo_dir) {
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
+                let summary = report.summary();
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -816,9 +1005,15 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
                     &format!(
                         "skipping insecure open-skill file {}: {}",
                         path.display().to_string(),
-                        report.summary()
+                        summary
                     )
                 );
+                dropped.push(DroppedSkill {
+                    name: dir_stem(&path),
+                    origin_hint: "open-skills".into(),
+                    reason: SkillDropReason::AuditFindings(summary),
+                    location: Some(path.clone()),
+                });
                 continue;
             }
             Err(err) => {
@@ -831,6 +1026,12 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
                         path.display().to_string()
                     )
                 );
+                dropped.push(DroppedSkill {
+                    name: dir_stem(&path),
+                    origin_hint: "open-skills".into(),
+                    reason: SkillDropReason::AuditError(err.to_string()),
+                    location: Some(path.clone()),
+                });
                 continue;
             }
         }
@@ -840,7 +1041,7 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
         }
     }
 
-    skills
+    (skills, dropped)
 }
 
 fn parse_open_skills_enabled(raw: &str) -> Option<bool> {
@@ -1996,34 +2197,171 @@ fn is_unsafe_zip_entry_name(raw_name: &str) -> bool {
         || raw_name.contains(':')
 }
 
-/// Securely extract a downloaded skill zip into `dest`.
-///
-/// Rejects archives larger than `max_bytes` and any entry whose path could
-/// escape `dest`. On a rejected entry the partially-created `dest` is removed
-/// before returning. Shared by the ClawHub installer and unit-tested directly.
+fn checked_zip_size_add(total: u64, next: u64, label: &str) -> Result<u64> {
+    total
+        .checked_add(next)
+        .with_context(|| format!("skill zip rejected: {label} size overflow"))
+}
+
+fn append_skill_zip_chunk(bytes: &mut Vec<u8>, chunk: &[u8], max_bytes: u64) -> Result<()> {
+    let current_len = u64::try_from(bytes.len()).context("skill zip buffer length overflow")?;
+    let chunk_len = u64::try_from(chunk.len()).context("skill zip chunk length overflow")?;
+    let next_len = checked_zip_size_add(current_len, chunk_len, "downloaded")?;
+    if next_len > max_bytes {
+        anyhow::bail!("skill zip rejected: too large ({next_len} bytes > {max_bytes})");
+    }
+    bytes.extend_from_slice(chunk);
+    Ok(())
+}
+
+async fn download_skill_zip_bytes(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
+    if let Some(len) = response.content_length()
+        && len > max_bytes
+    {
+        anyhow::bail!("skill zip rejected: too large ({len} bytes > {max_bytes})");
+    }
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read skill zip response body")?
+    {
+        append_skill_zip_chunk(&mut bytes, &chunk, max_bytes)?;
+    }
+    Ok(bytes)
+}
+
+fn exceeds_skill_zip_ratio(uncompressed_bytes: u64, compressed_bytes: u64) -> bool {
+    compressed_bytes > 0
+        && uncompressed_bytes > compressed_bytes.saturating_mul(MAX_SKILL_ZIP_EXPANSION_RATIO)
+}
+
+fn validate_skill_zip_limits<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    max_bytes: u64,
+) -> Result<u64> {
+    let entry_count = archive.len();
+    if entry_count > MAX_SKILL_ZIP_ENTRIES {
+        anyhow::bail!(
+            "skill zip rejected: too many entries ({} > {})",
+            entry_count,
+            MAX_SKILL_ZIP_ENTRIES
+        );
+    }
+
+    let mut compressed_bytes = 0_u64;
+    let mut uncompressed_bytes = 0_u64;
+    for i in 0..entry_count {
+        let entry = archive.by_index(i)?;
+        let raw_name = entry.name().to_string();
+        if is_unsafe_zip_entry_name(&raw_name) {
+            anyhow::bail!("zip entry contains unsafe path: {raw_name}");
+        }
+
+        let entry_compressed_bytes = entry.compressed_size();
+        let entry_uncompressed_bytes = entry.size();
+        if entry_uncompressed_bytes > 0 && entry_compressed_bytes == 0 {
+            anyhow::bail!(
+                "skill zip rejected: entry '{}' has invalid compression ratio",
+                raw_name
+            );
+        }
+
+        compressed_bytes =
+            checked_zip_size_add(compressed_bytes, entry_compressed_bytes, "compressed")?;
+        uncompressed_bytes =
+            checked_zip_size_add(uncompressed_bytes, entry_uncompressed_bytes, "uncompressed")?;
+
+        if uncompressed_bytes > max_bytes {
+            anyhow::bail!(
+                "skill zip rejected: extracted size too large ({} bytes > {})",
+                uncompressed_bytes,
+                max_bytes
+            );
+        }
+        if exceeds_skill_zip_ratio(uncompressed_bytes, compressed_bytes) {
+            anyhow::bail!(
+                "skill zip rejected: expansion ratio exceeds {}x",
+                MAX_SKILL_ZIP_EXPANSION_RATIO
+            );
+        }
+    }
+
+    Ok(compressed_bytes)
+}
+
 fn extract_zip_secure(bytes: Vec<u8>, dest: &Path, max_bytes: u64) -> Result<()> {
-    if bytes.len() as u64 > max_bytes {
+    let archive_len = u64::try_from(bytes.len()).context("skill zip buffer length overflow")?;
+    if archive_len > max_bytes {
         anyhow::bail!(
             "skill zip rejected: too large ({} bytes > {})",
-            bytes.len(),
+            archive_len,
             max_bytes
         );
     }
 
-    std::fs::create_dir_all(dest)?;
-
     let cursor = Cursor::new(bytes);
     let mut archive = ZipArchive::new(cursor).context("downloaded content is not a valid zip")?;
+    let compressed_bytes = validate_skill_zip_limits(&mut archive, max_bytes)?;
 
+    std::fs::create_dir_all(dest)?;
+    let result = extract_validated_skill_zip(&mut archive, dest, max_bytes, compressed_bytes);
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(dest);
+    }
+    result
+}
+
+fn copy_zip_entry_bounded<R: Read, W: Write>(
+    entry: &mut R,
+    output: &mut W,
+    extracted_bytes: &mut u64,
+    max_bytes: u64,
+    compressed_bytes: u64,
+) -> Result<()> {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read_bytes = entry.read(&mut buffer)?;
+        if read_bytes == 0 {
+            return Ok(());
+        }
+
+        let read_bytes = u64::try_from(read_bytes).context("skill zip read length overflow")?;
+        let next_extracted = checked_zip_size_add(*extracted_bytes, read_bytes, "extracted")?;
+        if next_extracted > max_bytes {
+            anyhow::bail!(
+                "skill zip rejected: extracted size too large ({} bytes > {})",
+                next_extracted,
+                max_bytes
+            );
+        }
+        if exceeds_skill_zip_ratio(next_extracted, compressed_bytes) {
+            anyhow::bail!(
+                "skill zip rejected: expansion ratio exceeds {}x",
+                MAX_SKILL_ZIP_EXPANSION_RATIO
+            );
+        }
+
+        let read_len = usize::try_from(read_bytes).context("skill zip write length overflow")?;
+        output.write_all(&buffer[..read_len])?;
+        *extracted_bytes = next_extracted;
+    }
+}
+
+fn extract_validated_skill_zip<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    dest: &Path,
+    max_bytes: u64,
+    compressed_bytes: u64,
+) -> Result<()> {
+    let mut extracted_bytes = 0_u64;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         let raw_name = entry.name().to_string();
-
-        if is_unsafe_zip_entry_name(&raw_name) {
-            let _ = std::fs::remove_dir_all(dest);
-            anyhow::bail!("zip entry contains unsafe path: {raw_name}");
-        }
-
         let out_path = dest.join(&raw_name);
         if entry.is_dir() {
             std::fs::create_dir_all(&out_path)?;
@@ -2040,7 +2378,13 @@ fn extract_zip_secure(bytes: Vec<u8>, dest: &Path, max_bytes: u64) -> Result<()>
                 out_path.display().to_string()
             )
         })?;
-        std::io::copy(&mut entry, &mut out_file)?;
+        copy_zip_entry_bounded(
+            &mut entry,
+            &mut out_file,
+            &mut extracted_bytes,
+            max_bytes,
+            compressed_bytes,
+        )?;
     }
 
     Ok(())
@@ -2079,8 +2423,8 @@ pub async fn install_clawhub_skill_source(
         anyhow::bail!("ClawHub download failed (HTTP {})", resp.status());
     }
 
-    let bytes = resp.bytes().await?.to_vec();
-    extract_zip_secure(bytes, &installed_dir, MAX_CLAWHUB_ZIP_BYTES)?;
+    let bytes = download_skill_zip_bytes(resp, MAX_SKILL_ZIP_BYTES).await?;
+    extract_zip_secure(bytes, &installed_dir, MAX_SKILL_ZIP_BYTES)?;
 
     let has_manifest = installed_dir.join("SKILL.md").exists()
         || installed_dir.join("SKILL.toml").exists()
@@ -2435,14 +2779,16 @@ pub fn install_extra_registry_skill_source(
 /// collisions with user-authored skills and between bundles. The `plugin:<name>`
 /// tag is also added so prompts can distinguish plugin skills.
 #[cfg(feature = "plugins-wasm")]
-pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) -> Vec<Skill> {
+pub fn load_plugin_skills_from_config(
+    config: &zeroclaw_config::schema::Config,
+) -> (Vec<Skill>, Vec<DroppedSkill>) {
     if !config.plugins.enabled {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let plugins_dir = config.plugins.resolved_plugins_dir();
 
-    let signature_mode = zeroclaw_plugins::host::PluginHost::parse_signature_mode(
+    let signature_mode = zeroclaw_plugins::host::PluginHost::resolve_signature_mode(
         &config.plugins.security.signature_mode,
     );
     let trusted_keys = config.plugins.security.trusted_publisher_keys.clone();
@@ -2461,18 +2807,25 @@ pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) 
                     .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
                 "failed to discover plugin skills"
             );
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
     };
 
     let allow_scripts = config.skills.allow_scripts;
     let mut skills = Vec::new();
+    let mut dropped = Vec::new();
     for (manifest, skills_dir) in host.skill_plugin_details() {
-        for raw in load_skills_from_directory(&skills_dir, allow_scripts) {
+        let (raw_skills, raw_dropped) = load_skills_from_directory(&skills_dir, allow_scripts);
+        for raw in raw_skills {
             skills.push(namespace_plugin_skill(&manifest.name, raw));
         }
+        // Retag the workspace-loader's drops as plugin-origin.
+        dropped.extend(raw_dropped.into_iter().map(|mut d| {
+            d.origin_hint = "plugin".into();
+            d
+        }));
     }
-    skills
+    (skills, dropped)
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -2489,6 +2842,53 @@ fn namespace_plugin_skill(plugin_name: &str, mut skill: Skill) -> Skill {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+    use std::io::{self, Write};
+
+    struct CountingWriter {
+        written: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.written += buffer.len();
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ChunkReader {
+        chunks: Vec<Vec<u8>>,
+        index: usize,
+    }
+
+    impl Read for ChunkReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let Some(chunk) = self.chunks.get(self.index) else {
+                return Ok(0);
+            };
+            let copied = chunk.len().min(buffer.len());
+            buffer[..copied].copy_from_slice(&chunk[..copied]);
+            self.index += 1;
+            Ok(copied)
+        }
+    }
+
+    fn make_skill_zip(entries: &[(&str, &[u8])], method: zip::CompressionMethod) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default().compression_method(method);
+            for (name, body) in entries {
+                writer.start_file(*name, opts).unwrap();
+                writer.write_all(body).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buf
+    }
 
     #[test]
     fn parse_simple_frontmatter_keeps_blank_line_in_block_scalar() {
@@ -2622,23 +3022,31 @@ mod registry_tests {
     }
 
     #[test]
+    fn test_append_skill_zip_chunk_accepts_within_limit() {
+        let mut bytes = b"abc".to_vec();
+        append_skill_zip_chunk(&mut bytes, b"def", 6).unwrap();
+        assert_eq!(bytes, b"abcdef");
+    }
+
+    #[test]
+    fn test_append_skill_zip_chunk_rejects_oversize() {
+        let mut bytes = b"abc".to_vec();
+        let err = append_skill_zip_chunk(&mut bytes, b"defg", 6)
+            .expect_err("oversize chunk must be rejected");
+        assert!(err.to_string().contains("too large"), "got: {err}");
+        assert_eq!(bytes, b"abc");
+    }
+
+    #[test]
     fn test_extract_zip_secure_happy_path() {
-        use std::io::Write;
-        let mut buf = Vec::new();
-        {
-            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            w.start_file("SKILL.md", opts).unwrap();
-            w.write_all(b"# demo").unwrap();
-            w.start_file("scripts/run.txt", opts).unwrap();
-            w.write_all(b"echo hi").unwrap();
-            w.finish().unwrap();
-        }
+        let buf = make_skill_zip(
+            &[("SKILL.md", b"# demo"), ("scripts/run.txt", b"echo hi")],
+            zip::CompressionMethod::Stored,
+        );
 
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("skill");
-        extract_zip_secure(buf, &dest, MAX_CLAWHUB_ZIP_BYTES).unwrap();
+        extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(dest.join("SKILL.md")).unwrap(),
@@ -2651,17 +3059,8 @@ mod registry_tests {
     }
 
     #[test]
-    fn test_extract_zip_secure_rejects_oversize() {
-        use std::io::Write;
-        let mut buf = Vec::new();
-        {
-            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            w.start_file("SKILL.md", opts).unwrap();
-            w.write_all(b"# demo").unwrap();
-            w.finish().unwrap();
-        }
+    fn test_extract_zip_secure_rejects_oversize_archive() {
+        let buf = make_skill_zip(&[("SKILL.md", b"# demo")], zip::CompressionMethod::Stored);
 
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("skill");
@@ -2671,6 +3070,92 @@ mod registry_tests {
             !dest.exists(),
             "dest must not be created when the zip is rejected for size"
         );
+    }
+
+    #[test]
+    fn test_extract_zip_secure_rejects_too_many_entries() {
+        let entries: Vec<(String, Vec<u8>)> = (0..=MAX_SKILL_ZIP_ENTRIES)
+            .map(|index| (format!("files/{index}.txt"), b"x".to_vec()))
+            .collect();
+        let entry_refs: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(name, body)| (name.as_str(), body.as_slice()))
+            .collect();
+        let buf = make_skill_zip(&entry_refs, zip::CompressionMethod::Stored);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES)
+            .expect_err("zip with too many entries must be rejected");
+        assert!(err.to_string().contains("too many entries"), "got: {err}");
+        assert!(!dest.exists(), "dest must not be created for rejected zip");
+    }
+
+    #[test]
+    fn test_copy_zip_entry_bounded_stops_before_limit_overwrite() {
+        let payload = vec![b'a'; 1024];
+        let mut reader = Cursor::new(payload);
+        let mut writer = CountingWriter { written: 0 };
+        let mut extracted_bytes = 0;
+
+        let err = copy_zip_entry_bounded(&mut reader, &mut writer, &mut extracted_bytes, 500, 1024)
+            .expect_err("bounded copy must reject before writing over the cap");
+
+        assert!(
+            err.to_string().contains("extracted size too large"),
+            "got: {err}"
+        );
+        assert_eq!(writer.written, 0);
+        assert_eq!(extracted_bytes, 0);
+    }
+
+    #[test]
+    fn test_copy_zip_entry_bounded_preserves_prior_valid_write() {
+        let mut reader = ChunkReader {
+            chunks: vec![vec![b'a'; 400], vec![b'b'; 200]],
+            index: 0,
+        };
+        let mut writer = CountingWriter { written: 0 };
+        let mut extracted_bytes = 0;
+
+        let err = copy_zip_entry_bounded(&mut reader, &mut writer, &mut extracted_bytes, 500, 1024)
+            .expect_err("bounded copy must reject the chunk that crosses the cap");
+
+        assert!(
+            err.to_string().contains("extracted size too large"),
+            "got: {err}"
+        );
+        assert_eq!(writer.written, 400);
+        assert_eq!(extracted_bytes, 400);
+    }
+
+    #[test]
+    fn test_extract_zip_secure_rejects_extracted_size_limit() {
+        let payload = vec![b'a'; 1024];
+        let buf = make_skill_zip(&[("SKILL.md", &payload)], zip::CompressionMethod::Deflated);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, 500)
+            .expect_err("zip exceeding extracted size limit must be rejected");
+        assert!(
+            err.to_string().contains("extracted size too large"),
+            "got: {err}"
+        );
+        assert!(!dest.exists(), "dest must not be created for rejected zip");
+    }
+
+    #[test]
+    fn test_extract_zip_secure_rejects_expansion_ratio() {
+        let payload = vec![b'a'; 1024];
+        let buf = make_skill_zip(&[("SKILL.md", &payload)], zip::CompressionMethod::Deflated);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES)
+            .expect_err("zip exceeding expansion ratio must be rejected");
+        assert!(err.to_string().contains("expansion ratio"), "got: {err}");
+        assert!(!dest.exists(), "dest must not be created for rejected zip");
     }
 
     #[test]
@@ -3309,7 +3794,7 @@ description = "fine"
         )
         .unwrap();
 
-        let skills = load_skills_from_directory(&skills_dir, false);
+        let (skills, dropped) = load_skills_from_directory(&skills_dir, false);
         // The bad skill is skipped (not panicked-on). The good skill loads.
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         assert!(
@@ -3320,6 +3805,13 @@ description = "fine"
             !names.contains(&"bad"),
             "bad skill must be skipped, not silently accepted; got: {names:?}"
         );
+        // #7963: the skipped skill is surfaced as an audit drop, not silently lost.
+        assert_eq!(dropped.len(), 1, "the bad TOML skill must be reported");
+        assert_eq!(dropped[0].origin_hint, "workspace");
+        assert!(matches!(
+            dropped[0].reason,
+            SkillDropReason::ManifestParseError(_)
+        ));
     }
 
     /// Behavioral assertion for the open-skills swallow-site fix.
@@ -3356,8 +3848,10 @@ description = "fine"
         )
         .unwrap();
 
-        let skills = load_open_skills_from_directory(&skills_dir, false);
+        let (skills, dropped) = load_open_skills_from_directory(&skills_dir, false);
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(dropped.len(), 1, "the bad open-skill TOML must be reported");
+        assert_eq!(dropped[0].origin_hint, "open-skills");
         assert!(
             names.contains(&"good-open"),
             "good open-skill must load; got: {names:?}"
@@ -3469,6 +3963,47 @@ version = "0.1.0"
             ),
         )
         .unwrap();
+    }
+
+    /// #7963: `load_skills_for_agent_from_config_audited` returns the loaded
+    /// skills *and* the audit-dropped candidates, so the dashboard can surface
+    /// the latter. One clean + one parse-broken workspace skill → 1 + 1.
+    #[test]
+    fn load_skills_for_agent_from_config_audited_returns_dropped() {
+        let install_root = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let agent_workspace = TempDir::new().unwrap();
+        let agent_alias = "audit-agent";
+
+        write_test_skill(agent_workspace.path(), "clean-skill");
+        // A broken-manifest skill in the same workspace.
+        let broken = agent_workspace.path().join("skills").join("broken-skill");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(
+            broken.join("SKILL.toml"),
+            "[skill]\nname = \"broken-skill\"\ndescription = \"d\"\nbogus = true\n",
+        )
+        .unwrap();
+
+        let config = make_config_with_agent_workspace(
+            install_root.path(),
+            data_dir.path(),
+            agent_alias,
+            agent_workspace.path().to_path_buf(),
+        );
+
+        cache::invalidate();
+        let (skills, dropped, _shadows) =
+            load_skills_for_agent_from_config_audited(&config, agent_alias);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"clean-skill"), "got: {names:?}");
+        assert!(!names.contains(&"broken-skill"), "got: {names:?}");
+        assert_eq!(dropped.len(), 1, "the broken skill must be reported");
+        assert_eq!(dropped[0].origin_hint, "workspace");
+        assert!(matches!(
+            dropped[0].reason,
+            SkillDropReason::ManifestParseError(_)
+        ));
     }
 
     /// Regression test for #7236: `load_skills_for_agent_from_config` must

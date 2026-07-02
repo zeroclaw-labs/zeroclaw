@@ -1449,6 +1449,16 @@ impl ::zeroclaw_api::attribution::Attributable for WeComWsChannel {
 
 #[async_trait]
 impl Channel for WeComWsChannel {
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator endpoint in the WeCom WS API.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator endpoint in the WeCom WS API.
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "wecom_ws"
     }
@@ -1738,7 +1748,13 @@ impl Channel for WeComWsChannel {
         Ok(())
     }
 
-    async fn finalize_draft(&self, recipient: &str, message_id: &str, content: &str) -> Result<()> {
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        content: &str,
+        _suppress_voice: bool,
+    ) -> Result<()> {
         let req_id = self
             .req_id_map
             .lock()
@@ -3102,7 +3118,7 @@ mod tests {
             .insert("stream-1".to_string(), "req-finalize".to_string());
 
         let result = channel
-            .finalize_draft("user--zeroclaw_user", "stream-1", "final")
+            .finalize_draft("user--zeroclaw_user", "stream-1", "final", false)
             .await;
 
         assert!(result.is_err());

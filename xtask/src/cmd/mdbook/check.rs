@@ -1,3 +1,4 @@
+use super::protected::{contains_generated_toml_block, missing_protected_literal};
 use crate::util::*;
 use std::collections::HashMap;
 use std::process::Command;
@@ -42,9 +43,16 @@ pub fn run() -> anyhow::Result<()> {
             );
             failed = true;
         }
-        for (entry, reason) in audit_protected_literals(&po_entries) {
+        for (entry, literal) in audit_protected_literals(&po_entries) {
             eprintln!(
-                "FAIL: {locale}:{}: protected-literal translation ({reason}) at {}",
+                "FAIL: {locale}:{}: protected-literal translation ({}) missing {:?} at {}",
+                entry.msgstr_line, literal.reason, literal.text, entry.reference
+            );
+            failed = true;
+        }
+        for (entry, path) in audit_local_path_leaks(&po_entries) {
+            eprintln!(
+                "FAIL: {locale}:{}: local-path-leak translation ({path}) at {}",
                 entry.msgstr_line, entry.reference
             );
             failed = true;
@@ -53,7 +61,7 @@ pub fn run() -> anyhow::Result<()> {
 
     if failed {
         anyhow::bail!(
-            "one or more .po files have format, generated-response, or protected-literal errors"
+            "one or more .po files have format, generated-response, protected-literal, or local-path-leak errors"
         );
     }
     println!("All .po files OK.");
@@ -67,10 +75,23 @@ fn audit_generated_responses(entries: &[PoEntry]) -> Vec<(&PoEntry, &'static str
         .collect()
 }
 
-fn audit_protected_literals(entries: &[PoEntry]) -> Vec<(&PoEntry, &'static str)> {
+fn audit_protected_literals(
+    entries: &[PoEntry],
+) -> Vec<(&PoEntry, super::protected::ProtectedLiteral)> {
     entries
         .iter()
-        .filter_map(|entry| protected_literal_reason(entry).map(|reason| (entry, reason)))
+        .filter_map(|entry| {
+            missing_protected_literal(&entry.msgid, &entry.msgstr).map(|literal| (entry, literal))
+        })
+        .collect()
+}
+
+fn audit_local_path_leaks(entries: &[PoEntry]) -> Vec<(&PoEntry, String)> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            introduced_local_absolute_path(&entry.msgid, &entry.msgstr).map(|path| (entry, path))
+        })
         .collect()
 }
 
@@ -234,6 +255,9 @@ fn generated_response_reason(entry: &PoEntry) -> Option<&'static str> {
     {
         return Some("assistant-response phrase");
     }
+    if contains_generated_toml_block(&entry.msgid, &entry.msgstr) {
+        return Some("generated TOML block");
+    }
     if translation_len > (source_len * 4).max(300)
         && has_markdown_heading_outside_code(&entry.msgstr)
         && !has_markdown_heading_outside_code(&entry.msgid)
@@ -255,167 +279,136 @@ fn generated_response_reason(entry: &PoEntry) -> Option<&'static str> {
     None
 }
 
+#[cfg(test)]
 fn protected_literal_reason(entry: &PoEntry) -> Option<&'static str> {
-    if entry.msgstr.trim().is_empty() {
+    missing_protected_literal(&entry.msgid, &entry.msgstr).map(|literal| literal.reason)
+}
+
+const LOCAL_POSIX_PATH_ROOTS: &[&str] = &[
+    "/Users",
+    "/home",
+    "/private/tmp",
+    "/private/var/folders",
+    "/tmp",
+    "/var/folders",
+    "/var/tmp",
+    "/Volumes",
+];
+
+pub fn introduced_local_absolute_path(source: &str, translation: &str) -> Option<String> {
+    let translation_paths = local_absolute_paths(translation);
+    if translation_paths.is_empty() {
         return None;
     }
 
-    for phrase in PROTECTED_PHRASES {
-        if entry.msgid.contains(phrase) && !entry.msgstr.contains(phrase) {
-            return Some("protected product/protocol name changed");
-        }
-    }
-
-    for literal in protected_code_literals(&entry.msgid) {
-        if !entry.msgstr.contains(&literal) {
-            return Some("machine-facing code literal changed");
-        }
-    }
-
-    None
+    let source_paths = local_absolute_paths(source);
+    translation_paths
+        .into_iter()
+        .find(|path| !source_paths.contains(path))
 }
 
-const PROTECTED_PHRASES: &[&str] = &["ZeroClaw Maturity Framework"];
-
-fn protected_code_literals(text: &str) -> Vec<String> {
-    let mut literals = Vec::new();
-    collect_inline_code_literals(text, &mut literals);
-    collect_fenced_code_literals(text, &mut literals);
-    literals.sort();
-    literals.dedup();
-    literals
+fn local_absolute_paths(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for (idx, _) in text.char_indices() {
+        if (starts_local_posix_path(text, idx) || starts_windows_absolute_path(text, idx))
+            && let Some(path) = extract_path_at(text, idx)
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
-fn collect_inline_code_literals(text: &str, literals: &mut Vec<String>) {
-    let mut rest = text;
-    while let Some(start) = rest.find('`') {
-        rest = &rest[start + 1..];
-        if rest.starts_with("``") {
+fn starts_local_posix_path(text: &str, idx: usize) -> bool {
+    path_boundary_before(text, idx)
+        && LOCAL_POSIX_PATH_ROOTS.iter().any(|root| {
+            text[idx..].strip_prefix(root).is_some_and(|rest| {
+                rest.is_empty() || rest.starts_with('/') || path_boundary_after_root(rest)
+            })
+        })
+}
+
+fn starts_windows_absolute_path(text: &str, idx: usize) -> bool {
+    let bytes = text.as_bytes();
+    path_boundary_before(text, idx)
+        && idx + 2 < bytes.len()
+        && bytes[idx].is_ascii_alphabetic()
+        && bytes[idx + 1] == b':'
+        && matches!(bytes[idx + 2], b'\\' | b'/')
+        && !matches!(bytes.get(idx + 3), Some(b'\\' | b'/'))
+}
+
+fn path_boundary_before(text: &str, idx: usize) -> bool {
+    idx == 0
+        || text[..idx].chars().next_back().is_some_and(|c| {
+            c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '(' | '[' | '{')
+        })
+}
+
+fn path_boundary_after_root(rest: &str) -> bool {
+    rest.chars().next().is_some_and(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\''
+                    | '`'
+                    | '<'
+                    | '>'
+                    | ')'
+                    | ']'
+                    | '}'
+                    | '.'
+                    | ','
+                    | ';'
+                    | ':'
+                    | '!'
+                    | '?'
+                    | '。'
+                    | '，'
+                    | '；'
+                    | '：'
+                    | '！'
+                    | '？'
+            )
+    })
+}
+
+fn extract_path_at(text: &str, start: usize) -> Option<String> {
+    let mut end = text.len();
+    for (offset, c) in text[start..].char_indices() {
+        if offset == 0 {
             continue;
         }
-        let Some(end) = rest.find('`') else {
+        if c.is_whitespace() {
+            let rest = &text[start + offset + c.len_utf8()..];
+            if path_continues_after_space(rest) {
+                continue;
+            }
+            end = start + offset;
             break;
-        };
-        let literal = &rest[..end];
-        rest = &rest[end + 1..];
-        if is_protected_command_literal(literal) {
-            literals.push(literal.to_string());
+        }
+        if matches!(c, '"' | '\'' | '`' | '<' | '>' | ')' | ']' | '}') {
+            end = start + offset;
+            break;
         }
     }
+    let path = text[start..end].trim_end_matches([
+        '.', ',', ';', ':', '!', '?', '。', '，', '；', '：', '！', '？',
+    ]);
+    (!path.is_empty()).then(|| path.to_string())
 }
 
-fn collect_fenced_code_literals(text: &str, literals: &mut Vec<String>) {
-    let mut fence_language: Option<String> = None;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
-            if fence_language.is_some() {
-                fence_language = None;
-            } else {
-                fence_language = Some(
-                    trimmed
-                        .trim_start_matches('`')
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or_default()
-                        .to_ascii_lowercase(),
-                );
-            }
-            continue;
-        }
-        let Some(language) = fence_language.as_deref() else {
-            continue;
-        };
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if is_protected_command_literal(trimmed) {
-            literals.push(trimmed.to_string());
-        }
-        if language != "toml" {
-            continue;
-        }
-
-        if is_toml_section(trimmed) {
-            literals.push(trimmed.to_string());
-        } else if let Some((key, _)) = trimmed.split_once('=') {
-            let key = key.trim();
-            if is_config_key(key) {
-                literals.push(key.to_string());
-            }
-        }
-    }
-}
-
-fn is_protected_command_literal(text: &str) -> bool {
-    let trimmed = text.trim();
-    trimmed == "zeroclaw daemon" || trimmed.starts_with("zeroclaw daemon ")
-}
-
-fn is_config_key(text: &str) -> bool {
-    is_toml_key_path(text)
-}
-
-fn is_toml_section(text: &str) -> bool {
-    let text = text.trim();
-    let section = if text.starts_with("[[") && text.ends_with("]]") {
-        &text[2..text.len() - 2]
-    } else if text.starts_with('[') && text.ends_with(']') {
-        &text[1..text.len() - 1]
-    } else {
-        return false;
-    };
-    is_toml_key_path(section.trim())
-}
-
-fn is_toml_key_path(text: &str) -> bool {
-    let text = text.trim();
-    if text.is_empty() {
-        return false;
-    }
-
-    let mut start = 0;
-    let mut quote = None;
-    for (idx, c) in text.char_indices() {
-        if let Some(active_quote) = quote {
-            if c == active_quote {
-                quote = None;
-            }
-            continue;
-        }
-
-        match c {
-            '"' | '\'' => quote = Some(c),
-            '.' => {
-                if !is_toml_key_segment(&text[start..idx]) {
-                    return false;
-                }
-                start = idx + c.len_utf8();
-            }
-            _ => {}
-        }
-    }
-
-    quote.is_none() && is_toml_key_segment(&text[start..])
-}
-
-fn is_toml_key_segment(text: &str) -> bool {
-    let text = text.trim();
-    is_bare_toml_key(text) || is_quoted_toml_key(text)
-}
-
-fn is_bare_toml_key(text: &str) -> bool {
-    !text.is_empty()
-        && text
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
-fn is_quoted_toml_key(text: &str) -> bool {
-    text.len() >= 2
-        && ((text.starts_with('"') && text.ends_with('"'))
-            || (text.starts_with('\'') && text.ends_with('\'')))
+fn path_continues_after_space(rest: &str) -> bool {
+    let token = rest
+        .trim_start()
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>' | ')' | ']' | '}')
+        })
+        .next()
+        .unwrap_or_default();
+    token.contains('/') || token.contains('\\')
 }
 
 fn contains_assistant_response_phrase(text: &str) -> bool {
@@ -570,6 +563,39 @@ mod tests {
     }
 
     #[test]
+    fn flags_generated_toml_fence_in_translation() {
+        let issue = entry(
+            "Configure the gateway before exposing it.",
+            "在公开之前配置网关。\n\n```toml\n[gateway]\nhost = \"0.0.0.0\"\nport = 42617\n```",
+        );
+        assert_eq!(
+            generated_response_reason(&issue),
+            Some("generated TOML block")
+        );
+    }
+
+    #[test]
+    fn flags_generated_toml_like_block_in_translation() {
+        let issue = entry(
+            "Set the model provider in config.",
+            "[providers.models.openai.default]\napi_key = \"...\"\nmodel = \"gpt-5\"",
+        );
+        assert_eq!(
+            generated_response_reason(&issue),
+            Some("generated TOML block")
+        );
+    }
+
+    #[test]
+    fn allows_source_toml_blocks() {
+        let clean = entry(
+            "```toml\n[gateway]\nhost = \"127.0.0.1\"\nport = 42617\n```",
+            "```toml\n[gateway]\nhost = \"127.0.0.1\"\nport = 42617\n```",
+        );
+        assert_eq!(generated_response_reason(&clean), None);
+    }
+
+    #[test]
     fn flags_translated_command_literal_for_6407() {
         let issue = entry(
             "[`zeroclaw daemon`↴](#zeroclaw-daemon)",
@@ -652,6 +678,104 @@ mod tests {
             "**Uso:** `zeroclaw [OPCIONES] <COMANDO>`",
         );
         assert_eq!(protected_literal_reason(&clean), None);
+    }
+
+    #[test]
+    fn flags_translation_introduced_posix_local_path() {
+        let issue = entry(
+            "The failure log is next to the catalog.",
+            "Le journal est dans /Users/alice/zeroclaw/docs/book/po/fr.failures.log.",
+        );
+        let entries = vec![issue];
+        let leaks = audit_local_path_leaks(&entries);
+        assert_eq!(
+            leaks[0].1.as_str(),
+            "/Users/alice/zeroclaw/docs/book/po/fr.failures.log"
+        );
+    }
+
+    #[test]
+    fn flags_translation_introduced_private_tmp_and_volume_paths() {
+        let private_tmp = entry(
+            "The failure log is next to the catalog.",
+            "日志位于 /private/tmp/zeroclaw/zh-CN.failures.log。",
+        );
+        assert_eq!(
+            introduced_local_absolute_path(&private_tmp.msgid, &private_tmp.msgstr).as_deref(),
+            Some("/private/tmp/zeroclaw/zh-CN.failures.log")
+        );
+
+        let volume = entry(
+            "The failure log is next to the catalog.",
+            "ログは /Volumes/Example Disk/zeroclaw/ja.failures.log にあります。",
+        );
+        assert_eq!(
+            introduced_local_absolute_path(&volume.msgid, &volume.msgstr).as_deref(),
+            Some("/Volumes/Example Disk/zeroclaw/ja.failures.log")
+        );
+    }
+
+    #[test]
+    fn flags_translation_introduced_windows_local_path() {
+        let issue = entry(
+            "The failure log is next to the catalog.",
+            r#"El registro está en C:\Users\Alice\zeroclaw\docs\book\po\es.failures.log."#,
+        );
+        assert_eq!(
+            introduced_local_absolute_path(&issue.msgid, &issue.msgstr).as_deref(),
+            Some(r#"C:\Users\Alice\zeroclaw\docs\book\po\es.failures.log"#)
+        );
+    }
+
+    #[test]
+    fn allows_source_preserved_absolute_path() {
+        let clean = entry(
+            "Write `/home/alice/zeroclaw/web/dist` instead of `~/zeroclaw/web/dist`.",
+            "Escriba `/home/alice/zeroclaw/web/dist` en lugar de `~/zeroclaw/web/dist`.",
+        );
+        assert_eq!(protected_literal_reason(&clean), None);
+        assert_eq!(
+            introduced_local_absolute_path(&clean.msgid, &clean.msgstr),
+            None
+        );
+    }
+
+    #[test]
+    fn allows_urls_without_treating_them_as_local_paths() {
+        let clean = entry(
+            "Open https://example.com/docs for details.",
+            "詳細は https://example.com/docs を開いてください。",
+        );
+        assert_eq!(
+            introduced_local_absolute_path(&clean.msgid, &clean.msgstr),
+            None
+        );
+    }
+
+    #[test]
+    fn allows_translation_introduced_urls() {
+        let clean = entry(
+            "Open the public docs site for details.",
+            "詳細は https://example.com/docs を開いてください。",
+        );
+        assert_eq!(
+            introduced_local_absolute_path(&clean.msgid, &clean.msgstr),
+            None
+        );
+    }
+
+    #[test]
+    fn flags_translation_introduced_bare_local_temp_dirs() {
+        for path in ["/tmp", "/var/tmp", "/private/tmp"] {
+            let issue = entry(
+                "The failure log is next to the catalog.",
+                &format!("See `{path}` for the generated log."),
+            );
+            assert_eq!(
+                introduced_local_absolute_path(&issue.msgid, &issue.msgstr).as_deref(),
+                Some(path)
+            );
+        }
     }
 
     #[test]
