@@ -4774,6 +4774,15 @@ async fn process_channel_message_body(
             compose_outgoing_user_turn_with_context(&preamble, &memory_context, &raw_content);
     }
 
+    let context_compression_notice_pending = ctx
+        .agent_cfg
+        .resolved
+        .context_compression
+        .notify_on_compression
+        && ctx.context_token_budget > 0
+        && zeroclaw_runtime::agent::history::estimate_history_tokens(&history)
+            > ctx.context_token_budget;
+
     // ── Reply-intent precheck ────────────────────────────────────────
     let explicit_channel_address =
         is_explicitly_addressed_channel_message(&msg.channel, &msg.content);
@@ -4910,6 +4919,18 @@ async fn process_channel_message_body(
             "channel_message_no_reply"
         );
         return;
+    }
+
+    if context_compression_notice_pending && let Some(channel) = target_channel.as_ref() {
+        let notice = "I condensed our earlier conversation to stay within context; continuing now.";
+        if let Err(e) = channel.send(&SendMessage::reply_to(&msg, notice)).await {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Failed to send context compression notice"
+            );
+        }
     }
 
     let use_draft_streaming = target_channel
@@ -12942,6 +12963,24 @@ api_key = "anthropic-key"
         model_provider_ref: &str,
         hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
     ) -> Arc<ChannelRuntimeContext> {
+        test_runtime_ctx_with_config_agent_provider_ref_and_context_budget(
+            channel,
+            model_provider,
+            prompt_config,
+            agent_cfg,
+            model_provider_ref,
+            0,
+        )
+    }
+
+    fn test_runtime_ctx_with_config_agent_provider_ref_and_context_budget(
+        channel: Arc<dyn Channel>,
+        model_provider: Arc<dyn ModelProvider>,
+        prompt_config: zeroclaw_config::schema::Config,
+        agent_cfg: zeroclaw_config::schema::AliasedAgentConfig,
+        model_provider_ref: &str,
+        context_token_budget: usize,
+    ) -> Arc<ChannelRuntimeContext> {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
@@ -13008,7 +13047,7 @@ api_key = "anthropic-key"
             cost_tracking: None,
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
-            context_token_budget: 0,
+            context_token_budget,
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
@@ -13783,6 +13822,7 @@ BTC is currently around $65,000 based on latest tool output."#
         precheck_calls: AtomicUsize,
         main_calls: AtomicUsize,
         models: std::sync::Mutex<Vec<String>>,
+        reply_to_precheck: bool,
     }
 
     #[async_trait::async_trait]
@@ -13801,6 +13841,9 @@ BTC is currently around $65,000 based on latest tool output."#
 
             if message.starts_with("Decide whether the assistant should send any visible reply") {
                 self.precheck_calls.fetch_add(1, Ordering::SeqCst);
+                if self.reply_to_precheck {
+                    return Ok("REPLY".to_string());
+                }
                 return Ok("NO_REPLY[INFO]: background chatter".to_string());
             }
 
@@ -15465,6 +15508,208 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             sent_messages.is_empty(),
             "provider returns NO_REPLY from precheck, so no visible reply should be sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_does_not_send_compression_notice_for_no_reply_turn() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let main_provider_impl = Arc::new(PrecheckProbeModelProvider::default());
+        let main_provider: Arc<dyn ModelProvider> = main_provider_impl.clone();
+        let classifier_provider_impl = Arc::new(PrecheckProbeModelProvider::default());
+        let classifier_provider: Arc<dyn ModelProvider> = classifier_provider_impl.clone();
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        prompt_config.providers.models.openai.insert(
+            "my-classifier".to_string(),
+            zeroclaw_config::schema::OpenAIModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("fast-intent".to_string()),
+                    temperature: Some(0.0),
+                    ..Default::default()
+                },
+            },
+        );
+        let compression = zeroclaw_config::scattered_types::ContextCompressionConfig {
+            enabled: true,
+            threshold_ratio: 0.0,
+            protect_first_n: 1,
+            protect_last_n: 1,
+            max_passes: 1,
+            notify_on_compression: true,
+            ..Default::default()
+        };
+        let agent_cfg = zeroclaw_config::schema::AliasedAgentConfig {
+            classifier_provider: zeroclaw_config::providers::ModelProviderRef::from(
+                "openai.my-classifier",
+            ),
+            resolved: zeroclaw_config::schema::ResolvedRuntime {
+                context_compression: compression,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let runtime_ctx = test_runtime_ctx_with_config_agent_provider_ref_and_context_budget(
+            channel,
+            main_provider,
+            prompt_config,
+            agent_cfg,
+            "test-provider",
+            1,
+        );
+        runtime_ctx
+            .provider_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("openai.my-classifier".to_string(), classifier_provider);
+
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "msg-no-reply-compression".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-precheck".to_string(),
+            content: "background chatter".to_string(),
+            channel: "test-channel".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        };
+        let history_key = conversation_history_key(&msg);
+        runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .put(
+                history_key,
+                vec![
+                    ChatMessage::user("old user context ".repeat(200)),
+                    ChatMessage::assistant("old assistant context ".repeat(200)),
+                    ChatMessage::user("more old context ".repeat(200)),
+                ],
+            );
+
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        assert_eq!(
+            classifier_provider_impl
+                .precheck_calls
+                .load(Ordering::SeqCst),
+            1
+        );
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent_messages.is_empty(),
+            "NO_REPLY turns must not emit a compression notice or any other visible message: {sent_messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_sends_compression_notice_for_reply_turn() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let main_provider_impl = Arc::new(PrecheckProbeModelProvider::default());
+        let main_provider: Arc<dyn ModelProvider> = main_provider_impl.clone();
+        let classifier_provider_impl = Arc::new(PrecheckProbeModelProvider {
+            reply_to_precheck: true,
+            ..Default::default()
+        });
+        let classifier_provider: Arc<dyn ModelProvider> = classifier_provider_impl.clone();
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        prompt_config.providers.models.openai.insert(
+            "my-classifier".to_string(),
+            zeroclaw_config::schema::OpenAIModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("fast-intent".to_string()),
+                    temperature: Some(0.0),
+                    ..Default::default()
+                },
+            },
+        );
+        let compression = zeroclaw_config::scattered_types::ContextCompressionConfig {
+            enabled: true,
+            threshold_ratio: 0.0,
+            protect_first_n: 1,
+            protect_last_n: 1,
+            max_passes: 1,
+            notify_on_compression: true,
+            ..Default::default()
+        };
+        let agent_cfg = zeroclaw_config::schema::AliasedAgentConfig {
+            classifier_provider: zeroclaw_config::providers::ModelProviderRef::from(
+                "openai.my-classifier",
+            ),
+            resolved: zeroclaw_config::schema::ResolvedRuntime {
+                context_compression: compression,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let runtime_ctx = test_runtime_ctx_with_config_agent_provider_ref_and_context_budget(
+            channel,
+            main_provider,
+            prompt_config,
+            agent_cfg,
+            "test-provider",
+            1,
+        );
+        runtime_ctx
+            .provider_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("openai.my-classifier".to_string(), classifier_provider);
+
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "msg-reply-compression".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-precheck".to_string(),
+            content: "please handle this".to_string(),
+            channel: "test-channel".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        };
+        let history_key = conversation_history_key(&msg);
+        runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .put(
+                history_key,
+                vec![
+                    ChatMessage::user("old user context ".repeat(200)),
+                    ChatMessage::assistant("old assistant context ".repeat(200)),
+                    ChatMessage::user("more old context ".repeat(200)),
+                ],
+            );
+
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        assert_eq!(
+            classifier_provider_impl
+                .precheck_calls
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(main_provider_impl.main_calls.load(Ordering::SeqCst), 1);
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent_messages.iter().any(|message| message.ends_with(
+                "I condensed our earlier conversation to stay within context; continuing now."
+            )),
+            "reply-eligible compressed turns should emit the compression notice: {sent_messages:?}"
+        );
+        assert!(
+            sent_messages
+                .iter()
+                .any(|message| message.ends_with("visible reply")),
+            "reply-eligible turn should still send the normal model reply: {sent_messages:?}"
         );
     }
 
