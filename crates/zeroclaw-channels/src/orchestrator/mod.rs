@@ -9238,6 +9238,14 @@ pub async fn start_channels(
         return Ok(());
     }
 
+    // Start the live model-pricing refresher (once per process; idempotent and
+    // a no-op unless some provider sets `live_pricing = true`). Each call
+    // re-binds the refresher's config handle, so reload iterations that
+    // re-instantiate the config Arc (or toggle `live_pricing`) are honored
+    // without a restart. Fills cost rates for models the operator hasn't
+    // priced in `[cost.rates]`.
+    zeroclaw_providers::pricing::spawn_refresher(config_arc.clone());
+
     // Every `[channels.<type>.<alias>]` block is owned by exactly one agent
     // (declared via `agents.<alias>.channels = [...]`). One
     // `ChannelRuntimeContext` per enabled agent; `AgentRouter::multi` resolves

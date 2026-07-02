@@ -204,9 +204,12 @@ fn normalize_models_with_pricing(
 }
 
 /// Convert models.dev IDs into `ModelInfo` entries without pricing.
-/// The models.dev catalog does not serve pricing data, so this function
-/// documents the intentional data-loss contract: callers should expect
-/// `pricing: None` on every returned entry.
+/// The models.dev catalog does serve per-1M-token cost data, but this listing
+/// surface intentionally does not carry it (`ModelPricing` is per-token
+/// strings; converting here would change what onboarding and the rates editor
+/// display): callers should expect `pricing: None` on every returned entry.
+/// Cost tracking consumes the catalog's `cost` block separately via
+/// `models_dev::pricing_from_catalog` (see `pricing.rs`).
 fn models_dev_to_model_info(ids: Vec<String>) -> Vec<zeroclaw_api::model_provider::ModelInfo> {
     use zeroclaw_api::model_provider::ModelInfo;
     ids.into_iter()

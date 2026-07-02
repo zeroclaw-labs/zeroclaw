@@ -854,6 +854,20 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_assistant_reasoning: Option<bool>,
+    /// Pull live token prices for this provider's models from its own
+    /// OpenAI-compatible `/models` listing (the gateway is the source of truth
+    /// for its prices), filling cost-tracking rates for models the operator
+    /// has NOT priced under `[cost.rates]` / `pricing`. Models the gateway does
+    /// not price (or providers with no HTTP `/models` listing at all, such as
+    /// a subprocess gateway like `kilocli`) fall back to the public models.dev
+    /// catalog. Configured rates always win; live prices only fill gaps. A
+    /// background task refreshes the price snapshot hourly; the cost-recording
+    /// path reads the cached snapshot and never blocks on the network. Default
+    /// `false`: off means no fetching and behavior identical to a build
+    /// without the feature.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub live_pricing: bool,
     /// Override the provider's default for native tool calling.
     /// `None` (default) honors the provider's built-in choice. `Some(true)`
     /// forces native tool calls on, `Some(false)` forces text-fallback.
