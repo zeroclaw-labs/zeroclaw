@@ -424,8 +424,21 @@ fn default_sop_version() -> String {
 // ── Event ────────────────────────────────────────────────────────
 
 /// The source type of an incoming event that may trigger an SOP.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum_macros::EnumIter,
+    strum_macros::IntoStaticStr,
+    strum_macros::Display,
+)]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub enum SopTriggerSource {
     Mqtt,
     Webhook,
@@ -436,22 +449,6 @@ pub enum SopTriggerSource {
     Channel,
     Manual,
     Amqp,
-}
-
-impl fmt::Display for SopTriggerSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Mqtt => write!(f, "mqtt"),
-            Self::Webhook => write!(f, "webhook"),
-            Self::Cron => write!(f, "cron"),
-            Self::Peripheral => write!(f, "peripheral"),
-            Self::Filesystem => write!(f, "filesystem"),
-            Self::Calendar => write!(f, "calendar"),
-            Self::Channel => write!(f, "channel"),
-            Self::Manual => write!(f, "manual"),
-            Self::Amqp => write!(f, "amqp"),
-        }
-    }
 }
 
 /// An incoming event that may trigger one or more SOPs.
@@ -710,6 +707,30 @@ mod tests {
     fn priority_display() {
         assert_eq!(SopPriority::Critical.to_string(), "critical");
         assert_eq!(SopPriority::Low.to_string(), "low");
+    }
+
+    /// Twin of the zerocode `trigger_draft_round_trips_every_variant_losslessly`
+    /// drift test: every trigger variant's wire shape must round-trip through
+    /// the canonical `SopTrigger` identically, so the mirror and this enum
+    /// cannot diverge without one side failing.
+    #[test]
+    fn trigger_wire_shapes_round_trip_every_variant() {
+        for wire in [
+            serde_json::json!({"type": "manual"}),
+            serde_json::json!({"type": "webhook", "path": "/hook"}),
+            serde_json::json!({"type": "cron", "expression": "0 9 * * *"}),
+            serde_json::json!({"type": "mqtt", "topic": "a/+/b", "condition": "$.x"}),
+            serde_json::json!({"type": "filesystem", "path": "/tmp/w", "events": ["created", "deleted"], "condition": "$.y"}),
+            serde_json::json!({"type": "peripheral", "board": "b0", "signal": "s1", "condition": "$.z"}),
+            serde_json::json!({"type": "calendar", "calendar_source": "google", "calendar_ids": ["primary", "team"]}),
+            serde_json::json!({"type": "channel", "channel": "telegram", "alias": "ops", "condition": "$.text"}),
+            serde_json::json!({"type": "amqp", "routing_key": "orders.#", "condition": "$.total"}),
+        ] {
+            let trigger: SopTrigger = serde_json::from_value(wire.clone())
+                .unwrap_or_else(|e| panic!("parse {wire}: {e}"));
+            let back = serde_json::to_value(&trigger).unwrap();
+            assert_eq!(back, wire, "lossy round trip for {wire}");
+        }
     }
 
     /// Overlay node-state wire tokens the zerocode `NodeRunState` mirror also

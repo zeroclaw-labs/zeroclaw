@@ -37,10 +37,26 @@ pub struct ChannelTriggerKind {
     pub setup_path: String,
 }
 
+/// How a trigger field's value is shaped. Surfaces branch on this kind, never
+/// on the field's name, so registry additions render correctly everywhere
+/// without per-surface special cases.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerFieldKind {
+    /// Single free-text value; empty string when unset.
+    #[default]
+    Text,
+    /// List of string values (comma-separated in text UIs).
+    List,
+    /// Optional boolean expression over the event payload; null when unset.
+    Expression,
+}
+
 /// A single bindable field on a trigger source. Surfaces render an input for
-/// each: a select when `options` is non-empty, otherwise a free-text field.
-/// `multi` marks a field that accepts a list of the option values (rendered as
-/// a multi-select) rather than a single value.
+/// each: a select when `options` is non-empty, otherwise an input shaped by
+/// `kind`. `multi` marks a field that accepts a list of the option values
+/// (rendered as a multi-select) rather than a single value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct TriggerField {
@@ -52,6 +68,9 @@ pub struct TriggerField {
     /// Whether the field accepts multiple option values.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub multi: bool,
+    /// Value shape the surface should render and serialize.
+    #[serde(default)]
+    pub kind: TriggerFieldKind,
 }
 
 impl TriggerField {
@@ -60,6 +79,21 @@ impl TriggerField {
             name: name.to_string(),
             options: Vec::new(),
             multi: false,
+            kind: TriggerFieldKind::Text,
+        }
+    }
+
+    fn list(name: &str) -> Self {
+        Self {
+            kind: TriggerFieldKind::List,
+            ..Self::text(name)
+        }
+    }
+
+    fn expression(name: &str) -> Self {
+        Self {
+            kind: TriggerFieldKind::Expression,
+            ..Self::text(name)
         }
     }
 }
@@ -82,9 +116,9 @@ pub struct TriggerSourceRegistry {
     pub channels: Vec<ChannelTriggerKind>,
 }
 
-/// One configured channel instance, passed in from config so this module does
-/// not depend on the config crate. The gateway/RPC layer maps
-/// `Config::channels_by_alias()` into this shape.
+/// One configured channel instance, decoupled from the config schema shape.
+/// `registry_from_config` maps `Config::channels_by_alias()` into this; tests
+/// construct it directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfiguredChannel {
     pub channel_type: String,
@@ -97,10 +131,34 @@ fn setup_path_for(channel: &str) -> String {
     format!("/config/channels/{channel}")
 }
 
+/// Build the registry straight from live config. Single owner of the
+/// `ChannelAliasInfo` mapping, including the kebab-to-snake channel-type
+/// fixup (schema emits kebab; `ChannelKind` wire form is snake_case), so
+/// the gateway and RPC surfaces cannot drift on the conversion.
+#[must_use]
+pub fn registry_from_config(config: &zeroclaw_config::schema::Config) -> TriggerSourceRegistry {
+    let configured: Vec<ConfiguredChannel> = config
+        .channels_by_alias()
+        .into_iter()
+        .map(|info| ConfiguredChannel {
+            channel_type: info.channel_type.replace('-', "_"),
+            alias: info.alias,
+            enabled: info.enabled,
+            owning_agent: info.owning_agent,
+        })
+        .collect();
+    build_registry(&configured)
+}
+
 /// Build the registry. `configured` is every declaratively configured channel
-/// instance (from `Config::channels_by_alias()`); the bound sources are fixed.
+/// instance (from `Config::channels_by_alias()`). The bound list is walked
+/// from `SopTriggerSource` with an exhaustive match, so adding a trigger
+/// source without deciding its registry shape is a compile error, not silent
+/// drift.
 #[must_use]
 pub fn build_registry(configured: &[ConfiguredChannel]) -> TriggerSourceRegistry {
+    use crate::sop::types::SopTriggerSource;
+
     let filesystem_events: Vec<String> = crate::sop::types::FilesystemEventKind::iter()
         .map(|k| {
             let s: &'static str = k.into();
@@ -108,51 +166,48 @@ pub fn build_registry(configured: &[ConfiguredChannel]) -> TriggerSourceRegistry
         })
         .collect();
 
-    let bound = vec![
-        BoundTriggerSource {
-            source: "webhook".to_string(),
-            fields: vec![TriggerField::text("path")],
-        },
-        BoundTriggerSource {
-            source: "cron".to_string(),
-            fields: vec![TriggerField::text("expression")],
-        },
-        BoundTriggerSource {
-            source: "mqtt".to_string(),
-            fields: vec![TriggerField::text("topic"), TriggerField::text("condition")],
-        },
-        BoundTriggerSource {
-            source: "filesystem".to_string(),
-            fields: vec![
-                TriggerField::text("path"),
-                TriggerField {
-                    name: "events".to_string(),
-                    options: filesystem_events,
-                    multi: true,
-                },
-                TriggerField::text("condition"),
-            ],
-        },
-        BoundTriggerSource {
-            source: "peripheral".to_string(),
-            fields: vec![
-                TriggerField::text("board"),
-                TriggerField::text("signal"),
-                TriggerField::text("condition"),
-            ],
-        },
-        BoundTriggerSource {
-            source: "calendar".to_string(),
-            fields: vec![
-                TriggerField::text("calendar_source"),
-                TriggerField::text("calendar_ids"),
-            ],
-        },
-        BoundTriggerSource {
-            source: "manual".to_string(),
-            fields: vec![],
-        },
-    ];
+    let bound = SopTriggerSource::iter()
+        .filter_map(|source| {
+            let fields = match source {
+                // Channel is not a bound source: it is the walked list below.
+                SopTriggerSource::Channel => return None,
+                SopTriggerSource::Webhook => vec![TriggerField::text("path")],
+                SopTriggerSource::Cron => vec![TriggerField::text("expression")],
+                SopTriggerSource::Mqtt => vec![
+                    TriggerField::text("topic"),
+                    TriggerField::expression("condition"),
+                ],
+                SopTriggerSource::Filesystem => vec![
+                    TriggerField::text("path"),
+                    TriggerField {
+                        name: "events".to_string(),
+                        options: filesystem_events.clone(),
+                        multi: true,
+                        kind: TriggerFieldKind::List,
+                    },
+                    TriggerField::expression("condition"),
+                ],
+                SopTriggerSource::Peripheral => vec![
+                    TriggerField::text("board"),
+                    TriggerField::text("signal"),
+                    TriggerField::expression("condition"),
+                ],
+                SopTriggerSource::Calendar => vec![
+                    TriggerField::text("calendar_source"),
+                    TriggerField::list("calendar_ids"),
+                ],
+                SopTriggerSource::Amqp => vec![
+                    TriggerField::text("routing_key"),
+                    TriggerField::expression("condition"),
+                ],
+                SopTriggerSource::Manual => vec![],
+            };
+            Some(BoundTriggerSource {
+                source: source.to_string(),
+                fields,
+            })
+        })
+        .collect();
 
     let channels = ChannelKind::iter()
         .filter(|k| k.inbound_capable())
@@ -192,6 +247,33 @@ mod tests {
         assert!(names.contains(&"discord"));
         assert!(!names.contains(&"cli"));
         assert!(!names.contains(&"plugin"));
+    }
+
+    #[test]
+    fn bound_sources_cover_every_non_channel_trigger_source() {
+        let reg = build_registry(&[]);
+        let bound: Vec<&str> = reg.bound.iter().map(|b| b.source.as_str()).collect();
+        for source in crate::sop::types::SopTriggerSource::iter() {
+            if source == crate::sop::types::SopTriggerSource::Channel {
+                continue;
+            }
+            assert!(
+                bound.contains(&source.to_string().as_str()),
+                "missing bound source: {source}"
+            );
+        }
+        let amqp = reg
+            .bound
+            .iter()
+            .find(|b| b.source == "amqp")
+            .expect("amqp bound source");
+        assert_eq!(
+            amqp.fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["routing_key", "condition"]
+        );
     }
 
     #[test]
