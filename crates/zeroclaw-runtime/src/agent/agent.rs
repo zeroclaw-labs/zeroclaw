@@ -358,6 +358,11 @@ pub struct Agent {
     /// When MCP deferred loading is enabled, tools are activated via `tool_search`
     /// and stored here for lookup during tool execution.
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    /// Pre-rendered MCP pinned-resource system-prompt section, read once at
+    /// construction from each server's `pinned_resources` and provenance-wrapped
+    /// (`trust="untrusted-external"`). Empty when no pins are configured or all
+    /// were skipped. Appended to the system prompt in `build_system_prompt`.
+    mcp_pinned_section: String,
     /// Hook runner for tool-call auditing and lifecycle side effects.
     /// See issue #5462.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
@@ -499,6 +504,7 @@ pub struct AgentBuilder {
     autonomy_level: Option<crate::security::AutonomyLevel>,
     approval_route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    mcp_pinned_section: Option<String>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     approval_manager: Option<Arc<ApprovalManager>>,
     agent_alias: Option<String>,
@@ -545,6 +551,7 @@ impl AgentBuilder {
             autonomy_level: None,
             approval_route: None,
             activated_tools: None,
+            mcp_pinned_section: None,
             hook_runner: None,
             approval_manager: None,
             agent_alias: None,
@@ -716,6 +723,11 @@ impl AgentBuilder {
         activated: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>>,
     ) -> Self {
         self.activated_tools = activated;
+        self
+    }
+
+    pub fn mcp_pinned_section(mut self, section: Option<String>) -> Self {
+        self.mcp_pinned_section = section;
         self
     }
 
@@ -896,6 +908,7 @@ impl AgentBuilder {
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
+            mcp_pinned_section: self.mcp_pinned_section.unwrap_or_default(),
             hook_runner: self.hook_runner,
             approval_manager: self.approval_manager,
             agent_alias: self.agent_alias.unwrap_or_default(),
@@ -1481,6 +1494,9 @@ impl Agent {
         // and webhook paths (loop_.rs) so that the WebSocket/daemon UI
         // path also has access to MCP tools.
         let mut activated_tools: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>> = None;
+        // Provenance-wrapped MCP pinned-resource system-prompt section, read
+        // once at construction (capability- and policy-gated).
+        let mut mcp_pinned_section = String::new();
         // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
         let mut mcp_elevation_arcs: Vec<Arc<dyn tools::Tool>> = Vec::new();
         // Secure by default: only the MCP servers granted by this agent's
@@ -1517,6 +1533,12 @@ impl Agent {
                             mcp_policy.as_ref(),
                         );
                     }
+                    mcp_pinned_section = tools::mcp_context::build_pinned_resources_section(
+                        &registry,
+                        &agent_mcp_servers,
+                        mcp_policy.as_ref(),
+                    )
+                    .await;
                     if config.mcp.deferred_loading {
                         let deferred_set = tools::DeferredMcpToolSet::from_registry(
                             std::sync::Arc::clone(&registry),
@@ -1738,6 +1760,7 @@ impl Agent {
             .autonomy_level(risk_profile.level)
             .approval_route(risk_profile.approval_route.clone())
             .activated_tools(activated_tools)
+            .mcp_pinned_section(Some(mcp_pinned_section))
             .hook_runner(if config.hooks.enabled {
                 Some(Arc::new(crate::hooks::HookRunner::from_config(
                     &config.hooks,
@@ -1965,6 +1988,10 @@ impl Agent {
         let receipts = &self.config.resolved.tool_receipts;
         if receipts.enabled && receipts.inject_system_prompt {
             prompt.push_str(crate::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
+        }
+        if !self.mcp_pinned_section.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&self.mcp_pinned_section);
         }
         Ok(prompt)
     }
