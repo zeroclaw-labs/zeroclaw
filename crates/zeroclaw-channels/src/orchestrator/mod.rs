@@ -126,11 +126,12 @@ use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
-    LoopKnobs, ResolvedAgentExecution, ResolvedModelAccess, ToolLoop, apply_policy_tool_filter,
-    apply_text_tool_prompt_policy, build_tool_instructions_for_names, clear_model_switch_request,
-    eager_mcp_tool_allowed, get_model_switch_state, is_model_switch_requested,
-    mcp_tool_access_policy, register_eager_mcp_tool_if_allowed, run_tool_call_loop,
-    scope_session_key, scope_thread_id, scrub_credentials,
+    LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+    ToolLoop, apply_policy_tool_filter, apply_text_tool_prompt_policy,
+    build_tool_instructions_for_names, clear_model_switch_request, eager_mcp_tool_allowed,
+    get_model_switch_state, is_model_switch_requested, mcp_tool_access_policy,
+    register_eager_mcp_tool_if_allowed, run_tool_call_loop, scope_session_key, scope_thread_id,
+    scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -5134,38 +5135,42 @@ async fn process_channel_message_body(
                     ctx.non_cli_excluded_tools.as_ref()
                 };
             let tool_loop = run_tool_call_loop(ToolLoop {
-                exec: ResolvedAgentExecution {
-                    model_access: ResolvedModelAccess {
+                exec: ResolvedAgentExecution::resolve(
+                    ResolvedModelAccess {
                         model_provider: active_model_provider.as_ref(),
                         provider_name: route.model_provider.as_str(),
                         model: route.model.as_str(),
                         temperature: thinking.effective_temperature,
                     },
-                    tools_registry: ctx.tools_registry.as_ref(),
-                    observer: notify_observer.as_ref() as &dyn Observer,
-                    silent: true,
-                    approval: Some(&*ctx.approval_manager),
-                    multimodal_config: &ctx.multimodal,
-                    max_tool_iterations: ctx.max_tool_iterations,
-                    hooks: ctx.hooks.as_deref(),
-                    excluded_tools,
-                    dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
-                    activated_tools: ctx.activated_tools.as_ref(),
-                    model_switch_callback: Some(model_switch_callback.clone()),
-                    pacing: &ctx.pacing,
-                    strict_tool_parsing: ctx
-                        .prompt_config
-                        .agent(ctx.agent_alias.as_str())
-                        .is_some_and(|agent| agent.resolved.strict_tool_parsing),
-                    parallel_tools: ctx
-                        .prompt_config
-                        .agent(ctx.agent_alias.as_str())
-                        .is_some_and(|agent| agent.resolved.parallel_tools),
-                    max_tool_result_chars: ctx.max_tool_result_chars,
-                    context_token_budget: ctx.context_token_budget,
-                    receipt_generator: ctx.receipt_generator.as_ref(),
-                    knobs: &loop_knobs,
-                },
+                    ResolvedIo {
+                        tools_registry: ctx.tools_registry.as_ref(),
+                        observer: notify_observer.as_ref() as &dyn Observer,
+                        silent: true,
+                        approval: Some(&*ctx.approval_manager),
+                        multimodal_config: &ctx.multimodal,
+                        hooks: ctx.hooks.as_deref(),
+                        activated_tools: ctx.activated_tools.as_ref(),
+                        model_switch_callback: Some(model_switch_callback.clone()),
+                        receipt_generator: ctx.receipt_generator.as_ref(),
+                    },
+                    ResolvedRuntimeKnobs {
+                        max_tool_iterations: ctx.max_tool_iterations,
+                        excluded_tools,
+                        dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
+                        pacing: &ctx.pacing,
+                        strict_tool_parsing: ctx
+                            .prompt_config
+                            .agent(ctx.agent_alias.as_str())
+                            .is_some_and(|agent| agent.resolved.strict_tool_parsing),
+                        parallel_tools: ctx
+                            .prompt_config
+                            .agent(ctx.agent_alias.as_str())
+                            .is_some_and(|agent| agent.resolved.parallel_tools),
+                        max_tool_result_chars: ctx.max_tool_result_chars,
+                        context_token_budget: ctx.context_token_budget,
+                        knobs: &loop_knobs,
+                    },
+                ),
                 history: &mut history,
                 channel_name: msg.channel.as_str(),
                 channel_reply_target: Some(msg.reply_target.as_str()),
