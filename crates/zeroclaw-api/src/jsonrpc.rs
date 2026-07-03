@@ -106,6 +106,7 @@ pub mod error_codes {
     pub const SESSION_NOT_OWNED: i32 = -32003;
     pub const AUTH_REQUIRED: i32 = -32010;
     pub const VERSION_MISMATCH: i32 = -32011;
+    pub const FORBIDDEN: i32 = -32012;
 
     // Filesystem RPC errors (internal numeric codes; wire uses string codes e.g. "fs.not_found")
     pub const FS_NOT_FOUND: i32 = 4001;

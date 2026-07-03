@@ -19,6 +19,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+use zeroclaw_api::grants::{Resource, Verb};
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
@@ -256,6 +257,90 @@ impl Method {
             .find(|(m, _)| *m == self)
             .map(|(_, wire)| *wire)
             .expect("every variant is in ALL")
+    }
+
+    /// The grant required to dispatch this method, as a (resource, verb)
+    /// pair checked against the caller's [`ResolvedGrants`]. Exhaustive:
+    /// a new method fails to compile until it is classified here.
+    /// `Initialize` is the auth handshake itself and carries no grant.
+    ///
+    /// Config writes and session/agent binding additionally pass through
+    /// the deep checks (`may_write_config`, `may_use_agent`) inside their
+    /// handlers; this table is the coarse resource-verb gate.
+    pub fn required_grant(self) -> Option<(Resource, Verb)> {
+        use Method as M;
+        Some(match self {
+            M::Initialize => return None,
+            M::Status | M::Health => (Resource::System, Verb::Read),
+            M::DoctorRun => (Resource::System, Verb::Execute),
+
+            M::SessionNew => (Resource::Sessions, Verb::Create),
+            M::SessionPrompt | M::SessionConfigure | M::SessionApprove => {
+                (Resource::Sessions, Verb::Update)
+            }
+            M::SessionList | M::SessionListAcp | M::SessionMessages | M::SessionState => {
+                (Resource::Sessions, Verb::Read)
+            }
+            M::SessionClose | M::SessionCancel | M::SessionDelete | M::SessionKill => {
+                (Resource::Sessions, Verb::Delete)
+            }
+            M::SessionGitBranch => (Resource::Sessions, Verb::Read),
+
+            M::MemoryList | M::MemorySearch | M::MemoryGet => (Resource::Memory, Verb::Read),
+            M::MemoryStore => (Resource::Memory, Verb::Create),
+            M::MemoryDelete => (Resource::Memory, Verb::Delete),
+
+            M::CronList | M::CronGet | M::CronRuns | M::CronSettings => {
+                (Resource::Cron, Verb::Read)
+            }
+            M::CronAdd => (Resource::Cron, Verb::Create),
+            M::CronPatch => (Resource::Cron, Verb::Update),
+            M::CronDelete => (Resource::Cron, Verb::Delete),
+            M::CronTrigger => (Resource::Cron, Verb::Execute),
+
+            M::ConfigGet
+            | M::ConfigValidate
+            | M::ConfigList
+            | M::ConfigMapKeys
+            | M::ConfigResolveAliasSource
+            | M::ConfigTemplates
+            | M::ConfigSections
+            | M::ConfigStatus
+            | M::ConfigCatalog
+            | M::ConfigCatalogModels => (Resource::Config, Verb::Read),
+            M::ConfigSet | M::ConfigReload | M::ConfigMapKeyRename => {
+                (Resource::Config, Verb::Update)
+            }
+            M::ConfigMapKeyCreate => (Resource::Config, Verb::Create),
+            M::ConfigDelete | M::ConfigMapKeyDelete => (Resource::Config, Verb::Delete),
+
+            M::AgentsList | M::AgentsStatus => (Resource::Agents, Verb::Read),
+
+            M::CostQuery | M::CostOrg => (Resource::Cost, Verb::Read),
+
+            M::SkillsBundles | M::SkillsList | M::SkillsRead => (Resource::Skills, Verb::Read),
+            M::SkillsWrite => (Resource::Skills, Verb::Update),
+            M::SkillsDelete => (Resource::Skills, Verb::Delete),
+
+            M::PersonalityList | M::PersonalityGet | M::PersonalityTemplates => {
+                (Resource::Personality, Verb::Read)
+            }
+            M::PersonalityPut => (Resource::Personality, Verb::Update),
+
+            M::LogsSubscribe | M::LogsQuery | M::LogsGet => (Resource::Logs, Verb::Read),
+
+            M::TuiList => (Resource::Tui, Verb::Read),
+
+            M::FileAttach => (Resource::Files, Verb::Create),
+            M::FsListDir => (Resource::Files, Verb::Read),
+
+            M::LocalesList | M::LocalesFetch => (Resource::Locales, Verb::Read),
+
+            M::QuickstartState | M::QuickstartFields => (Resource::Quickstart, Verb::Read),
+            M::QuickstartValidate => (Resource::Quickstart, Verb::Read),
+            M::QuickstartApply => (Resource::Quickstart, Verb::Execute),
+            M::QuickstartDismiss => (Resource::Quickstart, Verb::Update),
+        })
     }
 }
 
@@ -588,6 +673,31 @@ impl RpcDispatcher {
                     .await;
             }
             return;
+        }
+
+        // Grant enforcement (RFC #7141): every non-Initialize method carries
+        // a (resource, verb) requirement checked against the principal's
+        // resolved grants. Deny-by-default; the shared-operator sentinel
+        // resolves everything, so legacy single-user setups are unaffected.
+        if let Some((resource, verb)) = method.required_grant() {
+            let permitted = self
+                .principal
+                .as_ref()
+                .is_some_and(|p| p.grants.permits(resource, verb));
+            if !permitted {
+                if !is_notification {
+                    self.send_error(
+                        id,
+                        FORBIDDEN,
+                        &format!(
+                            "{}: principal lacks grant {resource}:{verb}",
+                            method.wire_name()
+                        ),
+                    )
+                    .await;
+                }
+                return;
+            }
         }
 
         // Exhaustive match — compiler enforces every Method has a handler.
@@ -946,8 +1056,33 @@ impl RpcDispatcher {
         self.process_line(line).await;
     }
 
+    /// Deep check for config-mutating handlers: the coarse `config:update`
+    /// grant admits the method, this admits the specific dotted path.
+    fn authorize_config_write(&self, path: &str) -> Result<(), JsonRpcError> {
+        if let Some(p) = self.principal.as_ref()
+            && !p.grants.may_write_config(path)
+        {
+            return Err(rpc_err(
+                FORBIDDEN,
+                format!("principal lacks config-write grant for {path:?}"),
+            ));
+        }
+        Ok(())
+    }
+
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
+        if let Some(p) = self.principal.as_ref()
+            && !p.grants.may_use_agent(&req.agent_alias)
+        {
+            return Err(rpc_err(
+                FORBIDDEN,
+                format!(
+                    "session/new: principal lacks grant for agent {:?}",
+                    req.agent_alias
+                ),
+            ));
+        }
         let resuming = req.session_id.is_some();
         let session_id = req
             .session_id
@@ -2662,6 +2797,7 @@ impl RpcDispatcher {
 
     async fn handle_config_set(&self, params: &Value) -> RpcResult {
         let req: ConfigSetParams = parse_params(params)?;
+        self.authorize_config_write(&req.prop)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         {
             let mut config = self.ctx.config.write();
@@ -2906,6 +3042,7 @@ impl RpcDispatcher {
 
     async fn handle_config_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigDeleteParams = parse_params(params)?;
+        self.authorize_config_write(&req.prop)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         {
             let mut config = self.ctx.config.write();
@@ -2950,6 +3087,7 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_create(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyCreateParams = parse_params(params)?;
+        self.authorize_config_write(&format!("{}.{}", req.path, req.key))?;
         let created = {
             let mut config = self.ctx.config.write();
             // Shared guarded boundary: enforces the reserved-agent rule (the
@@ -2978,6 +3116,7 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyDeleteParams = parse_params(params)?;
+        self.authorize_config_write(&format!("{}.{}", req.path, req.key))?;
         let deleted = {
             let mut config = self.ctx.config.write();
             let deleted = config
@@ -3003,6 +3142,12 @@ impl RpcDispatcher {
             Ok(req) => req,
             Err(err) => return Box::pin(std::future::ready(Err(err))),
         };
+        if let Err(err) = self
+            .authorize_config_write(&format!("{}.{}", req.path, req.from))
+            .and_then(|()| self.authorize_config_write(&format!("{}.{}", req.path, req.to)))
+        {
+            return Box::pin(std::future::ready(Err(err)));
+        }
         if let Some(kind) = zeroclaw_config::alias_refs::alias_kind_for_map_path(&req.path) {
             return self.handle_config_alias_rename(req, kind);
         }
@@ -5193,6 +5338,150 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Grant enforcement at dispatch (RFC #7141)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn every_method_is_classified_and_only_initialize_is_exempt() {
+        for (method, wire) in Method::ALL {
+            if *method == Method::Initialize {
+                assert!(method.required_grant().is_none(), "{wire} must be exempt");
+            } else {
+                assert!(
+                    method.required_grant().is_some(),
+                    "{wire} must carry a grant requirement"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_denies_method_outside_principal_grants() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(zeroclaw_config::schema::Config::default(), sessions);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.authenticated = true;
+        let mut principal = zeroclaw_api::principal::Principal::shared_operator();
+        principal.grants = zeroclaw_api::grants::ResolvedGrants::none();
+        principal.grants.resources.insert(
+            Resource::System,
+            std::collections::BTreeSet::from([Verb::Read]),
+        );
+        dispatcher.principal = Some(principal);
+
+        // Granted: status (system:read) reaches the handler.
+        dispatcher
+            .process_line_for_test(r#"{"jsonrpc":"2.0","id":1,"method":"status"}"#)
+            .await;
+        let reply: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert!(reply.get("result").is_some(), "status permitted: {reply}");
+
+        // Denied: cron/list needs cron:read.
+        dispatcher
+            .process_line_for_test(r#"{"jsonrpc":"2.0","id":2,"method":"cron/list"}"#)
+            .await;
+        let reply: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            reply["error"]["code"], FORBIDDEN,
+            "cron/list denied: {reply}"
+        );
+
+        // Denied: config/set needs config:update.
+        dispatcher
+            .process_line_for_test(
+                r#"{"jsonrpc":"2.0","id":3,"method":"config/set","params":{"path":"default_temperature","value":0.5}}"#,
+            )
+            .await;
+        let reply: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            reply["error"]["code"], FORBIDDEN,
+            "config/set denied: {reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_denies_everything_without_principal() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(zeroclaw_config::schema::Config::default(), sessions);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.authenticated = true;
+        dispatcher.principal = None;
+        dispatcher
+            .process_line_for_test(r#"{"jsonrpc":"2.0","id":1,"method":"status"}"#)
+            .await;
+        let reply: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(reply["error"]["code"], FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn config_write_deep_check_scopes_dotted_paths() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(zeroclaw_config::schema::Config::default(), sessions);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.authenticated = true;
+        let mut principal = zeroclaw_api::principal::Principal::shared_operator();
+        principal.grants = zeroclaw_api::grants::ResolvedGrants::none();
+        principal.grants.resources.insert(
+            Resource::Config,
+            std::collections::BTreeSet::from([Verb::Update]),
+        );
+        principal.grants.config_write_paths = vec!["gateway.port".into()];
+        dispatcher.principal = Some(principal);
+
+        // In scope: exact path grant.
+        dispatcher
+            .process_line_for_test(
+                r#"{"jsonrpc":"2.0","id":1,"method":"config/set","params":{"prop":"gateway.port","value":"8080"}}"#,
+            )
+            .await;
+        let reply: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert!(
+            reply.get("result").is_some(),
+            "granted path must pass the deep check: {reply}"
+        );
+
+        // Out of scope: coarse config:update grant present, path grant absent.
+        dispatcher
+            .process_line_for_test(
+                r#"{"jsonrpc":"2.0","id":2,"method":"config/set","params":{"prop":"gateway.host","value":"0.0.0.0"}}"#,
+            )
+            .await;
+        let reply: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            reply["error"]["code"], FORBIDDEN,
+            "ungranted path must fail the deep check: {reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_denies_ungranted_agent_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, _sessions) = make_acp_test_dispatcher(config);
+        dispatcher.authenticated = true;
+        let mut principal = zeroclaw_api::principal::Principal::shared_operator();
+        principal.grants = zeroclaw_api::grants::ResolvedGrants::all();
+        principal.grants.admin = false;
+        principal.grants.allowed_agents =
+            vec![zeroclaw_api::principal::AgentAlias("other-agent".into())];
+        dispatcher.principal = Some(principal);
+        let params = serde_json::json!({ "agent_alias": "test-agent" });
+        let err = dispatcher.handle_session_new(&params).await.unwrap_err();
+        assert_eq!(err.code, FORBIDDEN);
+    }
+
+    // -----------------------------------------------------------------------
     // ACP session/new — memory-tool exclusion
     // -----------------------------------------------------------------------
     //
@@ -6177,6 +6466,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
         dispatcher.authenticated = true;
+        dispatcher.principal = Some(zeroclaw_api::principal::Principal::shared_operator());
         dispatcher
     }
 
