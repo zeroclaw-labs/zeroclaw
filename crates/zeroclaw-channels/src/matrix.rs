@@ -2559,8 +2559,13 @@ mod outbound {
 
     /// Validate an outbound marker target against the trust boundary policy:
     ///
-    /// * `http`/`https` URLs are accepted (their fetch is then bounded by
-    ///   `MAX_MARKER_BYTES` and `MARKER_HTTP_TIMEOUT` in `fetch_http`).
+    /// * `http`/`https` URLs are accepted only when the host is a public
+    ///   globally-routable address — IP-literal loopback / RFC 1918 / link-local
+    ///   / cloud-metadata addresses and `localhost` / `*.local` names are
+    ///   refused (parser-level SSRF guard). DNS-rebind is **not** mitigated
+    ///   here; that would require a synchronous resolve inside the validator
+    ///   and is tracked as a follow-up. The fetch is also bounded by
+    ///   `MAX_MARKER_BYTES` and `MARKER_HTTP_TIMEOUT` in `fetch_http`.
     /// * Schemes other than `http`/`https` (`file:`, `data:`, anything with
     ///   `://`) are refused outright.
     /// * Local paths are canonicalised and must live inside `workspace_dir`.
@@ -2579,6 +2584,32 @@ mod outbound {
             let url = reqwest::Url::parse(target)
                 .with_context(|| format!("parse marker URL {target}"))
                 .map_err(ValidateError::Refused)?;
+            // Parser-level SSRF guard: refuse markers whose host is an
+            // IP-literal private/loopback/link-local/cloud-metadata address
+            // or a `localhost` / `*.local` name. Mirrors the userinfo reject
+            // in `skill_http` (PR #8637) and the IP-allowlist in `text_browser`
+            // (PR #8635) — closes the gap where an LLM-emitted
+            // `[image:http://169.254.169.254/...]` marker would be fetched
+            // and uploaded to the room. The same is_private_or_local_host
+            // primitive is used by web_fetch / http_request / browser tools.
+            let host_str = url.host_str().unwrap_or("");
+            if zeroclaw_tools::helpers::domain_guard::is_private_or_local_host(host_str) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "target": target,
+                            "host": host_str,
+                            "reason": "ssrf_private_host",
+                        })),
+                    "matrix: marker target points to a private/local host"
+                );
+                return Err(ValidateError::Refused(anyhow::Error::msg(format!(
+                    "matrix: marker target {target} resolves to a private or local host ({host_str}); refusing for SSRF safety. \
+                     Use a public URL or attach the file from workspace_dir directly."
+                ))));
+            }
             return Ok(MarkerTarget::Http(url));
         }
         if target.contains("://") {
@@ -5847,6 +5878,122 @@ mod tests {
             // even when workspace_dir is None.
             let result = validate_marker_target("https://example.com/x.jpg", None);
             assert!(matches!(result, Ok(MarkerTarget::Http(_))));
+        }
+
+        // ── SSRF guards (audit-zeroclaw-2026-07-03.md follow-up finding) ──
+        //
+        // The marker target string comes from agent text (LLM-emitted
+        // `[image:URL]`, `[file:URL]`, `[audio:URL]`), which is untrusted.
+        // Pre-fix, `validate_marker_target` accepted any `http(s)://` URL
+        // and `fetch_http` would then issue the request, so a marker like
+        // `[image:http://169.254.169.254/latest/meta-data/iam/security-credentials/]`
+        // would exfiltrate cloud metadata into the Matrix room. The fix is a
+        // parser-level IP guard in `validate_marker_target` (string-level +
+        // IP-literal check; DNS-rebind is a known follow-up). These tests
+        // verify the SSRF guard fires for every IP-literal and name-form
+        // class the shared `is_private_or_local_host` covers.
+
+        fn assert_ssr_refused(target: &str) {
+            let workspace = TempDir::new().unwrap();
+            let result = validate_marker_target(target, Some(workspace.path()));
+            let msg = result
+                .expect_err(&format!("expected SSRF refusal for {target}"))
+                .to_string();
+            assert!(
+                msg.contains("private or local host"),
+                "expected SSRF refusal message for {target}, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn ssrf_refuses_loopback_v4() {
+            assert_ssr_refused("http://127.0.0.1/admin");
+        }
+
+        #[test]
+        fn ssrf_refuses_loopback_v6() {
+            assert_ssr_refused("http://[::1]/admin");
+        }
+
+        #[test]
+        fn ssrf_refuses_rfc1918_v4() {
+            for h in ["10.0.0.5", "172.16.0.1", "192.168.1.1"] {
+                assert_ssr_refused(&format!("http://{h}/internal"));
+            }
+        }
+
+        #[test]
+        fn ssrf_refuses_link_local_v4() {
+            // AWS / GCP / Azure cloud-metadata endpoint.
+            assert_ssr_refused("http://169.254.169.254/latest/meta-data/");
+        }
+
+        #[test]
+        fn ssrf_refuses_cgnat_v4() {
+            // RFC 6598 shared address space (100.64.0.0/10).
+            assert_ssr_refused("http://100.64.0.1/api");
+        }
+
+        #[test]
+        fn ssrf_refuses_ipv4_mapped_loopback() {
+            // ::ffff:127.0.0.1 — IPv4-mapped loopback, often missed by
+            // naive IP-literal checks.
+            assert_ssr_refused("http://[::ffff:127.0.0.1]/admin");
+        }
+
+        #[test]
+        fn ssrf_refuses_localhost_name() {
+            assert_ssr_refused("http://localhost/admin");
+            assert_ssr_refused("http://foo.localhost/admin");
+        }
+
+        #[test]
+        fn ssrf_refuses_local_suffix_name() {
+            assert_ssr_refused("http://printer.local/");
+        }
+
+        #[test]
+        fn ssrf_refuses_ipv6_unique_local() {
+            // fc00::/7 — RFC 4193 unique local addresses.
+            assert_ssr_refused("http://[fd00::1]/");
+        }
+
+        #[test]
+        fn ssrf_refuses_ipv6_link_local() {
+            // fe80::/10 — link-local.
+            assert_ssr_refused("http://[fe80::1]/");
+        }
+
+        #[test]
+        fn ssrf_refuses_https_same_as_http() {
+            // The guard is scheme-agnostic; the same private host is
+            // refused over https:// too.
+            assert_ssr_refused("https://10.0.0.5/secret");
+            assert_ssr_refused("https://[::1]/secret");
+        }
+
+        #[test]
+        fn ssrf_refuses_with_userinfo_attempt() {
+            // An attacker who controls the host string might smuggle a
+            // private host through userinfo syntax; the SSRF guard fires
+            // on the host portion regardless.
+            assert_ssr_refused("http://attacker@127.0.0.1/");
+        }
+
+        #[test]
+        fn accepts_public_host() {
+            // Sanity: a normal public-looking host must still pass through.
+            for h in ["example.com", "cdn.example.com", "1.1.1.1", "8.8.8.8"] {
+                let workspace = TempDir::new().unwrap();
+                let result = validate_marker_target(
+                    &format!("https://{h}/photo.jpg"),
+                    Some(workspace.path()),
+                );
+                assert!(
+                    matches!(result, Ok(MarkerTarget::Http(_))),
+                    "public host {h} must be accepted, got: {result:?}"
+                );
+            }
         }
     }
 
