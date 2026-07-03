@@ -112,9 +112,24 @@ impl std::str::FromStr for FilesystemEventKind {
 // ── Trigger ─────────────────────────────────────────────────────
 
 /// What event can activate an SOP.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, strum_macros::EnumDiscriminants)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "lowercase")]
+#[strum_discriminants(
+    name(SopTriggerSource),
+    derive(
+        Hash,
+        Serialize,
+        Deserialize,
+        strum_macros::EnumIter,
+        strum_macros::IntoStaticStr,
+        strum_macros::Display
+    ),
+    serde(rename_all = "lowercase"),
+    strum(serialize_all = "lowercase"),
+    doc = "The source type of an incoming event that may trigger an SOP. \
+           Derived from `SopTrigger`; one discriminant per trigger variant."
+)]
 pub enum SopTrigger {
     /// MQTT message arrival. Live: delivered by the MQTT listener.
     Mqtt {
@@ -213,17 +228,7 @@ impl fmt::Display for SopTrigger {
 
 impl SopTrigger {
     pub fn source(&self) -> SopTriggerSource {
-        match self {
-            Self::Mqtt { .. } => SopTriggerSource::Mqtt,
-            Self::Webhook { .. } => SopTriggerSource::Webhook,
-            Self::Cron { .. } => SopTriggerSource::Cron,
-            Self::Peripheral { .. } => SopTriggerSource::Peripheral,
-            Self::Filesystem { .. } => SopTriggerSource::Filesystem,
-            Self::Calendar { .. } => SopTriggerSource::Calendar,
-            Self::Channel { .. } => SopTriggerSource::Channel,
-            Self::Manual => SopTriggerSource::Manual,
-            Self::Amqp { .. } => SopTriggerSource::Amqp,
-        }
+        SopTriggerSource::from(self)
     }
 }
 
@@ -441,34 +446,6 @@ fn default_sop_version() -> String {
 }
 
 // ── Event ────────────────────────────────────────────────────────
-
-/// The source type of an incoming event that may trigger an SOP.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    Serialize,
-    Deserialize,
-    strum_macros::EnumIter,
-    strum_macros::IntoStaticStr,
-    strum_macros::Display,
-)]
-#[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase")]
-pub enum SopTriggerSource {
-    Mqtt,
-    Webhook,
-    Cron,
-    Peripheral,
-    Filesystem,
-    Calendar,
-    Channel,
-    Manual,
-    Amqp,
-}
 
 /// An incoming event that may trigger one or more SOPs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
