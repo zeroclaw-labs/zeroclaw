@@ -275,11 +275,7 @@ impl HttpRequestTool {
             .filter(|secret| !secret.is_empty())
             .ok_or_else(|| anyhow::Error::msg(format!("auth_secret '{secret_name}' not found")))?;
 
-        if let Some(secret) = resolve_env_backed_auth_secret(secret_name, raw_secret)? {
-            return Ok(secret);
-        }
-
-        if zeroclaw_config::secrets::SecretStore::is_encrypted(raw_secret) {
+        let secret = if zeroclaw_config::secrets::SecretStore::is_encrypted(raw_secret) {
             let zeroclaw_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
             let store =
                 zeroclaw_config::secrets::SecretStore::new(zeroclaw_dir, self.secrets_encrypt);
@@ -287,9 +283,15 @@ impl HttpRequestTool {
             if plaintext.is_empty() {
                 anyhow::bail!("auth_secret '{secret_name}' is empty after decryption");
             }
-            Ok(plaintext)
+            plaintext
         } else {
-            Ok(raw_secret.clone())
+            raw_secret.clone()
+        };
+
+        if let Some(env_secret) = resolve_env_backed_auth_secret(secret_name, &secret)? {
+            Ok(env_secret)
+        } else {
+            Ok(secret)
         }
     }
 
@@ -946,6 +948,44 @@ api_token = "{encrypted}"
         assert_eq!(
             headers.get(AUTHORIZATION).unwrap(),
             "Bearer encrypted-secret"
+        );
+    }
+
+    #[test]
+    fn auth_secret_resolves_encrypted_env_backed_config_value() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let store = zeroclaw_config::secrets::SecretStore::new(tmp.path(), true);
+        let encrypted = store
+            .encrypt("${ZEROCLAW_TEST_HTTP_REQUEST_ENCRYPTED_SECRET}")
+            .unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[http_request.secrets]
+api_token = "{encrypted}"
+"#
+            ),
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var(
+                "ZEROCLAW_TEST_HTTP_REQUEST_ENCRYPTED_SECRET",
+                "Bearer encrypted-env",
+            );
+        }
+        scopeguard::defer! {
+            unsafe {
+                std::env::remove_var("ZEROCLAW_TEST_HTTP_REQUEST_ENCRYPTED_SECRET");
+            }
+        }
+
+        let tool = test_tool_with_auth_config(config_path, true);
+
+        assert_eq!(
+            tool.resolve_auth_secret("api_token").unwrap(),
+            "Bearer encrypted-env"
         );
     }
 
