@@ -155,6 +155,7 @@ pub use sop_execute::SopExecuteTool;
 pub use sop_list::SopListTool;
 pub use sop_status::SopStatusTool;
 pub use spawn_subagent::SpawnSubagentTool;
+pub use todo_write::TodoWriteTool;
 pub use verifiable_intent::VerifiableIntentTool;
 
 /// Re-entrant agent-spawning tools that must never be collapsed by the
@@ -673,6 +674,7 @@ pub fn all_tools_with_runtime(
         Arc::new(CalculatorTool::new()),
         Arc::new(WeatherTool::new()),
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
+        Arc::new(TodoWriteTool::new()),
     ];
 
     // A SubAgent runs as an ephemeral clone of its parent and inherits the
@@ -2573,5 +2575,14 @@ mod tests {
             !subagent.iter().any(|n| n == ModelSwitchTool::NAME),
             "subagent must not be able to switch the inherited model"
         );
+    }
+}
+
+#[cfg(test)]
+mod todo_registration_tests {
+    #[test]
+    fn todo_write_tool_name_is_stable() {
+        use zeroclaw_api::tool::Tool;
+        assert_eq!(super::todo_write::TodoWriteTool::new().name(), "TodoWrite");
     }
 }
