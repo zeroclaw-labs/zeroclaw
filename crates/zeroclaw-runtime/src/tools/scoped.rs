@@ -329,7 +329,7 @@ impl ScopedToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::ToolResult;
+    use crate::tools::{ToolOutput, ToolResult};
     use async_trait::async_trait;
 
     struct MockTool(&'static str);
@@ -357,7 +357,7 @@ mod tests {
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
             Ok(ToolResult {
                 success: true,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: None,
             })
         }
