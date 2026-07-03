@@ -786,19 +786,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             return Ok(accumulated_display_text);
         }
 
-        // ── Progress: LLM responded ─────────────────────────────
-        if let Some(ref tx) = on_delta {
-            let llm_secs = llm_started_at.elapsed().as_secs();
-            if !tool_calls.is_empty() {
-                let _ = tx
-                    .send(StreamDelta::Status(format!(
-                        "\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
-                        tool_calls.len()
-                    )))
-                    .await;
-            }
-        }
-
         if tool_calls.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
@@ -872,6 +859,21 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 eprint!("{display_text}");
                 let _ = std::io::stderr().flush();
             }
+        }
+
+        // ── Progress: LLM responded ─────────────────────────────
+        // Emitted AFTER the narration relay above: draft updaters flush on
+        // Status boundaries, and flushing before the turn's narration Text is
+        // queued would deliver the pre-tool message a boundary late (#8445
+        // multi_message).
+        if let Some(ref tx) = on_delta {
+            let llm_secs = llm_started_at.elapsed().as_secs();
+            let _ = tx
+                .send(StreamDelta::Status(format!(
+                    "\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
+                    tool_calls.len()
+                )))
+                .await;
         }
 
         // When multiple tool calls are present and interactive CLI approval is not needed, run
