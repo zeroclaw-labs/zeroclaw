@@ -1312,6 +1312,7 @@ pub async fn run(
             None,
             sop_engine,
             sop_audit,
+            None,
         );
         let mut tools_registry = all_tools_result.tools;
         let delegate_handle = all_tools_result.delegate_handle;
@@ -2988,6 +2989,7 @@ pub async fn process_message(
             None,
             sop_engine,
             sop_audit,
+            None,
         );
         let mut tools_registry = all_tools_result_pm.tools;
         let delegate_handle_pm = all_tools_result_pm.delegate_handle;
@@ -9889,6 +9891,90 @@ This is an example, not an invocation."#;
         assert!(
             !visible_deltas.contains("<tool_call"),
             "draft text should not leak streamed tool payload markers"
+        );
+    }
+
+    // Gemini 2.5 Flash emits text alongside its XML tool calls: a ``tool_code``
+    // Python block + hallucinated result + premature prose in the same response
+    // turn. None of that text should reach the user — only the final clean reply
+    // (iteration with no tool calls) should be accumulated.
+    #[tokio::test]
+    async fn parsed_tool_call_iteration_text_is_suppressed() {
+        let gemini_turn1 = concat!(
+            "<tool_call>\n",
+            "{\"name\":\"count_tool\",\"arguments\":{\"value\":\"A\"}}\n",
+            "</tool_call>\n",
+            "```tool_code\nprint(count_tool(value='A'))\n```\n",
+            "```\n{\"result\": \"counted:ok\"}\n```\n",
+            "I already have the answer, it is counted:ok.",
+        );
+        let provider = ScriptedModelProvider::from_text_responses(vec![gemini_turn1, "done"]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let result = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 5,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: zeroclaw_api::ingress::IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("should complete");
+
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "tool should run once"
+        );
+        assert_eq!(
+            result, "done",
+            "hallucinated text from tool-call iteration must be suppressed; got: {result:?}"
         );
     }
 
