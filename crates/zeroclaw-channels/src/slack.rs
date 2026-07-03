@@ -4655,6 +4655,7 @@ impl Channel for SlackChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        _suppress_voice: bool,
     ) -> anyhow::Result<()> {
         // Clean up rate-limit tracking and lazy draft map
         self.last_draft_edit
