@@ -86,24 +86,30 @@ struct ParityRow {
 const MATRIX: &[ParityRow] = &[
     ParityRow {
         surface: "A",
-        setting: "built-in allowed_tools/excluded_tools filter applied on every path",
+        setting: "built-in filter minted through the one assemble() seam on every path",
         owner_epic: "A",
-        tracking: "#8640",
-        // The one open gap is the gateway listing path (no built-in filter on
-        // master). It is a cross-crate boot path with no single seam to assert
-        // against from this crate, so it is carried as a tracked record rather
-        // than a per-path verdict; #8640 closes it and ships its own gateway
-        // tests. Deliberately NOT encoded as a cell that would read stale once
-        // #8640 lands.
+        tracking: "#8640 merged (gateway); remaining sites cut over one PR at a time",
+        // Every construction path DOES apply the built-in filter today - the
+        // former gateway-listings gap (ledger A1) was closed by #8640, now
+        // merged. What is not yet uniform is that only the gateway mints its
+        // registry through the `assemble()` seam; loop_ run / process_message,
+        // Agent::from_config, the orchestrator, and the delegate independent-
+        // target builder still hand-roll the same filter call (verified present,
+        // by convention). Until those cut-overs land - and the engine field
+        // seals to ScopedToolRegistry - cross-path uniformity is enforced by
+        // discipline, not by a single seam, so there is nothing to assert green
+        // here yet. A cross-crate boot path with no in-file seam; each cut-over
+        // PR carries its own site test.
         status: RowStatus::TrackedDivergence,
-        evidence: "tracked in #8640 (gateway assemble() cut-over) + ledger A1/A2; \
-                   no in-file test - the gap is a cross-crate gateway boot path",
+        evidence: "gateway routes through assemble() as of #8640 (merged); \
+                   loop_/from_config/orchestrator/delegate still hand-roll the same \
+                   filter, tracked by the remaining Epic A cut-overs + the seal",
     },
     ParityRow {
         surface: "A",
         setting: "built-in filter semantic uniform (safe-defaults admit)",
         owner_epic: "A",
-        tracking: "#8640 (residual-divergence note)",
+        tracking: "#8640 (merged; residual-divergence note) + ledger A4",
         // process_message admits the canonical read-only defaults past
         // allowed_tools at non-Full autonomy; the plain policy filter does not.
         // This IS backed by an in-file test pair, so it changes only loudly.
