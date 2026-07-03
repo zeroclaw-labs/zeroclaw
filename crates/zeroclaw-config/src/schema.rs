@@ -15667,10 +15667,10 @@ impl ChannelConfig for BlueskyConfig {
 ///
 /// A `provider` selects the forge. GitHub authenticates as a GitHub App:
 /// a short-lived RS256 JWT signed with the app's private key is exchanged
-/// for per-installation access tokens. Gitea and Forgejo use a personal
-/// access token against the instance's `/api/v1` endpoint. Inbound issue/PR
-/// comments are polled from the forge REST API, so the daemon needs no
-/// inbound network exposure.
+/// for per-installation access tokens. Gitea/Forgejo support (personal
+/// access token against the instance's `/api/v1` endpoint) is added in the
+/// follow-on provider slice. Inbound issue/PR comments are polled from the
+/// forge REST API, so the daemon needs no inbound network exposure.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.git"]
