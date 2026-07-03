@@ -541,12 +541,13 @@ mod tests {
                 ("error", "simulated write failure"),
             ][..],
         )];
-        for (source, locale) in [
+        for pair in [
             (include_str!("../locales/en/cli.ftl"), "en"),
             (include_str!("../locales/ja/cli.ftl"), "ja"),
         ] {
+            let (locale_source, locale) = (pair.0, pair.1);
             for (key, args) in cases {
-                let value = format_ftl_message(source.0, source.1, key, args)
+                let value = format_ftl_message(locale_source, locale, key, args)
                     .unwrap_or_else(|| panic!("{key} should format in {locale}"));
                 assert!(
                     value.contains("groq.alias2"),
