@@ -82,8 +82,8 @@ impl ConnectionSection {
 pub(crate) struct WssSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
-    /// Bearer presented as `auth_token` in the initialize handshake when the
-    /// daemon has `wss.require_auth` on (RFC #7141 `native` provider). The
+    /// Bearer presented as `auth_token` in the initialize handshake (RFC
+    /// #7141 `native` provider; WSS daemons require auth). The
     /// `ZEROCLAW_AUTH_TOKEN` environment variable overrides this value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,

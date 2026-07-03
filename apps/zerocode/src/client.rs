@@ -629,9 +629,9 @@ impl RpcClient {
     /// Same handshake and reconnect semantics as [`Self::connect`] — pass
     /// previous `tui_id`/`tui_sig` to reclaim identity on reconnect.
     ///
-    /// `auth_token` is presented in the initialize handshake for daemons with
-    /// `wss.require_auth` enabled (RFC #7141). `None` preserves the legacy
-    /// unauthenticated handshake.
+    /// `auth_token` is presented in the initialize handshake; WSS daemons
+    /// require it (RFC #7141). `None` only works against daemons without a
+    /// provider registry.
     ///
     /// When `tls_skip_verify` is true, certificate verification is
     /// disabled — required for self-signed certs on remote hosts.

@@ -65,7 +65,7 @@ rpc_type! {
         pub tui_sig: Option<String>,
         /// RFC #7141 auth credential: a bearer token resolved by the daemon's
         /// auth provider registry (e.g. the gateway pairing token for the
-        /// `native` provider). Required on WSS when `wss.require_auth` is on;
+        /// `native` provider, or an OIDC access token). Required on WSS;
         /// ignored when the daemon has no provider registry configured.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub auth_token: Option<String>,

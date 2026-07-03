@@ -631,17 +631,18 @@ pub async fn run(
             None
         };
 
-        // RFC #7141: build the inbound auth provider registry when WSS auth
-        // is opted in. `peercred` authenticates same-uid local-socket peers;
-        // `native` authenticates the persisted gateway pairing bearer over
-        // WSS. Registry stays `None` when not opted in, preserving legacy
-        // initialize behaviour on both transports.
         let auth_registry: Option<
             std::sync::Arc<crate::security::auth_provider::ProviderRegistry>,
-        > = if config.wss.enabled && config.wss.require_auth {
+        > = if config.wss.enabled {
             use crate::security::auth_provider::{
                 NativeAuthProvider, PeercredAuthProvider, ProviderRegistry,
             };
+            if config.gateway.paired_tokens.is_empty() {
+                anyhow::bail!(
+                    "wss is enabled but no auth provider can resolve a remote credential: \
+                     no gateway pairing token exists. Pair a client first or disable [wss]."
+                );
+            }
             let mut registry = ProviderRegistry::new();
             registry.register(std::sync::Arc::new(
                 PeercredAuthProvider::for_current_process(),
@@ -653,7 +654,7 @@ pub async fn run(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({"providers": registry.names()})),
-                "RPC auth provider registry enabled (wss.require_auth)"
+                "RPC auth provider registry enabled (wss configured)"
             );
             Some(std::sync::Arc::new(registry))
         } else {
