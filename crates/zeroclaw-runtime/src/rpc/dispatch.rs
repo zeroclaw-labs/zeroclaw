@@ -1114,6 +1114,48 @@ impl RpcDispatcher {
         Ok(())
     }
 
+    /// The isolation scope for session/memory reads (RFC #7141). `Some(id)`
+    /// when a real non-admin principal is bound: rows visible to this
+    /// connection are restricted to that principal's own. `None` for the
+    /// shared-operator sentinel and admin-granted principals (full
+    /// visibility, today's behaviour).
+    fn principal_scope(&self) -> Option<&str> {
+        self.principal
+            .as_ref()
+            .filter(|p| p.is_authenticated() && !p.grants.admin)
+            .map(|p| p.id.as_str())
+    }
+
+    /// Deep check for session-scoped reads/mutations: admits the session
+    /// when unscoped, when the row carries this principal's id, or when the
+    /// row predates principal-keying (NULL column ⇒ legacy/shared row is
+    /// only visible to unscoped connections). Fail-closed on scoped access
+    /// to another principal's session.
+    fn authorize_session_access(
+        &self,
+        session_key_candidates: &[String],
+    ) -> Result<(), JsonRpcError> {
+        let Some(scope) = self.principal_scope() else {
+            return Ok(());
+        };
+        let Some(ref backend) = self.ctx.session_backend else {
+            return Ok(());
+        };
+        for key in session_key_candidates {
+            if let Some(meta) = backend.get_session_metadata(key) {
+                return match meta.principal_id.as_deref() {
+                    Some(owner) if owner == scope => Ok(()),
+                    _ => Err(rpc_err(
+                        FORBIDDEN,
+                        "session is not owned by the authenticated principal",
+                    )),
+                };
+            }
+        }
+        // Unknown session: nothing to protect yet (creation stamps ownership).
+        Ok(())
+    }
+
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
         if let Some(p) = self.principal.as_ref()
@@ -1131,6 +1173,13 @@ impl RpcDispatcher {
         let session_id = req
             .session_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        if resuming {
+            self.authorize_session_access(&[
+                session_id.clone(),
+                format!("rpc_{session_id}"),
+                format!("gw_{session_id}"),
+            ])?;
+        }
 
         let config = self.ctx.config.read().clone();
         let chat_mode = req
@@ -1372,6 +1421,9 @@ impl RpcDispatcher {
                 if let Some(ref backend) = self.ctx.session_backend {
                     let session_key = format!("rpc_{session_id}");
                     let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
+                    if let Some(scope) = self.principal_scope() {
+                        let _ = backend.set_session_principal(&session_key, scope);
+                    }
                     let stored = backend.load(&session_key);
                     if !stored.is_empty() {
                         self.ctx.sessions.seed_history(&session_id, &stored).await;
@@ -2331,6 +2383,10 @@ impl RpcDispatcher {
         let sessions: Vec<SessionEntry> = all
             .into_iter()
             .filter(|meta| meta.agent_alias.is_some() || meta.channel_id.is_some())
+            .filter(|meta| match self.principal_scope() {
+                Some(scope) => meta.principal_id.as_deref() == Some(scope),
+                None => true,
+            })
             .map(|meta| {
                 let agent_alias = meta.agent_alias.clone().or_else(|| {
                     meta.channel_id
@@ -2410,6 +2466,7 @@ impl RpcDispatcher {
             format!("rpc_{}", req.session_id),
             format!("gw_{}", req.session_id),
         ];
+        self.authorize_session_access(&candidates)?;
         let mut raw: Vec<zeroclaw_api::model_provider::ChatMessage> = Vec::new();
         for key in &candidates {
             let loaded = backend.load(key);
@@ -2523,6 +2580,7 @@ impl RpcDispatcher {
             format!("rpc_{}", req.session_id),
             format!("gw_{}", req.session_id),
         ];
+        self.authorize_session_access(&candidates)?;
         for key in &candidates {
             match backend.get_session_state(key) {
                 Ok(Some(ss)) => {
@@ -2547,6 +2605,11 @@ impl RpcDispatcher {
 
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        self.authorize_session_access(&[
+            req.session_id.clone(),
+            format!("rpc_{}", req.session_id),
+            format!("gw_{}", req.session_id),
+        ])?;
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -2611,6 +2674,13 @@ impl RpcDispatcher {
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryListParams = parse_params(params)?;
+        if let Some(ref sid) = req.session_id {
+            self.authorize_session_access(&[
+                sid.clone(),
+                format!("rpc_{sid}"),
+                format!("gw_{sid}"),
+            ])?;
+        }
         let category = req
             .category
             .as_deref()
@@ -6623,6 +6693,187 @@ mod tests {
             Some("test-agent"),
             "Chat session must stamp its agent_alias in session_backend (got: {:?})",
             entry.agent_alias
+        );
+    }
+
+    // ── principal-keyed session isolation (RFC #7141 layer 8) ─────
+
+    fn scoped_principal(id: &str) -> zeroclaw_api::principal::Principal {
+        let mut p = zeroclaw_api::principal::Principal::new(
+            id,
+            id,
+            zeroclaw_api::principal::AuthMethod::Oidc,
+        );
+        p.grants = zeroclaw_api::grants::ResolvedGrants::all();
+        p.grants.admin = false;
+        p.grants.allowed_agents = vec![zeroclaw_api::principal::AgentAlias("test-agent".into())];
+        p
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_session_new_stamps_principal_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, _sessions, chat_backend, _acp) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        dispatcher.principal = Some(scoped_principal("alice"));
+
+        let sid = "principal-stamp-001";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should succeed");
+
+        let meta = chat_backend
+            .get_session_metadata(&format!("rpc_{sid}"))
+            .expect("metadata row must exist");
+        assert_eq!(
+            meta.principal_id.as_deref(),
+            Some("alice"),
+            "scoped principal must be stamped on the session row"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_operator_session_new_leaves_principal_null() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, _sessions, chat_backend, _acp) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        dispatcher.principal = Some(zeroclaw_api::principal::Principal::shared_operator());
+
+        let sid = "principal-null-001";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should succeed");
+
+        let meta = chat_backend
+            .get_session_metadata(&format!("rpc_{sid}"))
+            .expect("metadata row must exist");
+        assert!(
+            meta.principal_id.is_none(),
+            "shared-operator sessions must not carry a principal id"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_cannot_read_or_delete_foreign_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, _sessions, chat_backend, _acp) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        // Alice creates a session with history.
+        dispatcher.principal = Some(scoped_principal("alice"));
+        let sid = "isolation-001";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should succeed");
+        chat_backend
+            .append(&format!("rpc_{sid}"), &ChatMessage::user("alice secret"))
+            .unwrap();
+
+        // Mallory (different principal) is denied on read, resume, and delete.
+        dispatcher.principal = Some(scoped_principal("mallory"));
+        let read = dispatcher
+            .handle_session_messages(&json!({ "session_id": sid }))
+            .await;
+        assert_eq!(read.unwrap_err().code, FORBIDDEN, "foreign read must deny");
+        let resume = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await;
+        assert_eq!(
+            resume.unwrap_err().code,
+            FORBIDDEN,
+            "foreign resume must deny"
+        );
+        let delete = dispatcher
+            .handle_session_delete(&json!({ "session_id": sid }))
+            .await;
+        assert_eq!(
+            delete.unwrap_err().code,
+            FORBIDDEN,
+            "foreign delete must deny"
+        );
+
+        // Owner and admin both pass.
+        dispatcher.principal = Some(scoped_principal("alice"));
+        assert!(
+            dispatcher
+                .handle_session_messages(&json!({ "session_id": sid }))
+                .await
+                .is_ok(),
+            "owner read must pass"
+        );
+        dispatcher.principal = Some(zeroclaw_api::principal::Principal::shared_operator());
+        assert!(
+            dispatcher
+                .handle_session_messages(&json!({ "session_id": sid }))
+                .await
+                .is_ok(),
+            "admin/shared-operator read must pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_session_list_shows_only_own_rows() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, _sessions, _chat_backend, _acp) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        dispatcher.principal = Some(scoped_principal("alice"));
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "list-alice-001",
+            }))
+            .await
+            .unwrap();
+        dispatcher.principal = Some(scoped_principal("bob"));
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "list-bob-001",
+            }))
+            .await
+            .unwrap();
+
+        // Bob sees only his own session.
+        let result = dispatcher.handle_session_list(&json!({})).await.unwrap();
+        let listed: Vec<String> = result["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["session_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(listed, vec!["list-bob-001".to_string()]);
+
+        // Shared operator sees both.
+        dispatcher.principal = Some(zeroclaw_api::principal::Principal::shared_operator());
+        let result = dispatcher.handle_session_list(&json!({})).await.unwrap();
+        assert_eq!(
+            result["sessions"].as_array().unwrap().len(),
+            2,
+            "unscoped connection must see all sessions"
         );
     }
 
