@@ -153,6 +153,7 @@ impl Tool for SopAdvanceTool {
                 output: output.to_string(),
                 started_at: now.clone(),
                 completed_at: Some(now),
+                tool_calls: Vec::new(),
             };
             let step_result_clone = step_result.clone();
 

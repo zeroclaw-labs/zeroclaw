@@ -47,6 +47,64 @@ pub async fn handle_sop_trigger_sources(
     Json(registry).into_response()
 }
 
+/// Body for `POST /api/tools/param-options`: resolve selectable values
+/// for a domain-typed tool parameter. `args` carries sibling arguments
+/// already chosen so cascading domains (e.g. peer targets narrowing on
+/// a channel) can filter.
+#[derive(serde::Deserialize)]
+pub struct ParamOptionsBody {
+    pub domain: zeroclaw_api::tool::OptionDomain,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub args: serde_json::Value,
+}
+
+pub async fn handle_tools_param_options(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ParamOptionsBody>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let config = state.config.read();
+    let agent_alias = body
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .map(str::to_string)
+        .or_else(|| config.agents.keys().min().cloned())
+        .unwrap_or_default();
+
+    let entries = if body.domain == zeroclaw_api::tool::OptionDomain::ToolNames {
+        let security = std::sync::Arc::new(
+            zeroclaw_config::policy::SecurityPolicy::for_agent(&config, &agent_alias)
+                .unwrap_or_default(),
+        );
+        let tools = zeroclaw_runtime::tools::default_tools(security);
+        let refs: Vec<&dyn zeroclaw_api::tool::Tool> =
+            tools.iter().map(std::convert::AsRef::as_ref).collect();
+        zeroclaw_runtime::tools::param_options::resolve_options(
+            body.domain,
+            &config,
+            &agent_alias,
+            &body.args,
+            &refs,
+        )
+    } else {
+        zeroclaw_runtime::tools::param_options::resolve_options(
+            body.domain,
+            &config,
+            &agent_alias,
+            &body.args,
+            &[],
+        )
+    };
+    Json(serde_json::json!({ "options": entries })).into_response()
+}
+
 pub async fn handle_sop_graph(
     State(state): State<AppState>,
     headers: HeaderMap,

@@ -511,6 +511,30 @@ impl fmt::Display for SopStepStatus {
     }
 }
 
+/// One tool invocation captured during a step's execution. A step may
+/// make any number of calls (including the same tool repeatedly);
+/// `index` preserves invocation order so authoring surfaces can replay
+/// the sequence and map data between calls.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepToolCall {
+    /// Zero-based invocation order within the step.
+    pub index: u32,
+    pub tool: String,
+    /// Arguments the tool actually received.
+    pub args: serde_json::Value,
+    pub success: bool,
+    /// Display text of the tool output.
+    pub output: String,
+    /// Structured output when the tool declared one (`ToolOutput::data`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_data: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Wall-clock duration in milliseconds.
+    #[serde(default)]
+    pub duration_ms: u64,
+}
+
 /// Result of executing a single SOP step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SopStepResult {
@@ -519,6 +543,10 @@ pub struct SopStepResult {
     pub output: String,
     pub started_at: String,
     pub completed_at: Option<String>,
+    /// Ordered tool invocations made while executing this step. Empty
+    /// for checkpoint steps and legacy records persisted before capture.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<StepToolCall>,
 }
 
 /// A full SOP execution run (from trigger to completion).
@@ -964,6 +992,7 @@ path = "/sop/test"
                 output: "Step 1 done".into(),
                 started_at: "2026-02-19T12:00:00Z".into(),
                 completed_at: Some("2026-02-19T12:00:05Z".into()),
+                tool_calls: Vec::new(),
             }],
             waiting_since: None,
             llm_calls_saved: 0,

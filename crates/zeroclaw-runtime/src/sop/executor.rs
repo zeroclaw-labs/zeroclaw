@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 
 use super::audit::SopAuditLogger;
 use super::engine::SopEngine;
-use super::types::{SopRun, SopRunAction, SopStepResult};
+use super::types::{SopRun, SopRunAction, SopStepResult, StepToolCall};
 
 /// Live SOP action captured by SOP tools while they run inside an agent turn.
 #[derive(Clone)]
@@ -26,8 +26,13 @@ pub(crate) struct QueuedSopAction {
 
 pub(crate) type LiveActionQueue = Arc<Mutex<VecDeque<QueuedSopAction>>>;
 
+/// Ordered tool invocations captured while a live SOP step's nested tool
+/// loop runs. Scoped per step so concurrent runs never interleave.
+pub(crate) type StepCallSink = Arc<Mutex<Vec<StepToolCall>>>;
+
 tokio::task_local! {
     static LIVE_SOP_ACTION_QUEUE: Option<LiveActionQueue>;
+    static LIVE_STEP_CALL_SINK: Option<StepCallSink>;
 }
 
 pub(crate) fn new_live_action_queue() -> LiveActionQueue {
@@ -39,6 +44,56 @@ pub(crate) async fn scope_live_action_queue<T>(
     future: impl Future<Output = T>,
 ) -> T {
     LIVE_SOP_ACTION_QUEUE.scope(Some(queue), future).await
+}
+
+pub(crate) fn new_step_call_sink() -> StepCallSink {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+pub(crate) async fn scope_step_call_sink<T>(
+    sink: StepCallSink,
+    future: impl Future<Output = T>,
+) -> T {
+    LIVE_STEP_CALL_SINK.scope(Some(sink), future).await
+}
+
+/// Record one executed tool call into the innermost active step sink.
+/// No-op outside a live SOP step scope, so the turn loop can call this
+/// unconditionally.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_step_tool_call(
+    tool: &str,
+    args: &serde_json::Value,
+    success: bool,
+    output: String,
+    output_data: Option<serde_json::Value>,
+    error: Option<&str>,
+    duration_ms: u64,
+) {
+    let _ = LIVE_STEP_CALL_SINK.try_with(|sink| {
+        if let Some(sink) = sink
+            && let Ok(mut calls) = sink.lock()
+        {
+            let index = u32::try_from(calls.len()).unwrap_or(u32::MAX);
+            calls.push(StepToolCall {
+                index,
+                tool: tool.to_string(),
+                args: args.clone(),
+                success,
+                output,
+                output_data,
+                error: error.map(str::to_string),
+                duration_ms,
+            });
+        }
+    });
+}
+
+pub(crate) fn drain_step_calls(sink: &StepCallSink) -> Vec<StepToolCall> {
+    match sink.lock() {
+        Ok(mut calls) => std::mem::take(&mut *calls),
+        Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+    }
 }
 
 /// Queue a live action when the current tool call is running inside an agent
@@ -193,6 +248,7 @@ mod tests {
                 output: "ok".to_string(),
                 started_at: "2026-06-28T00:00:00Z".to_string(),
                 completed_at: Some("2026-06-28T00:00:01Z".to_string()),
+                tool_calls: Vec::new(),
             },
         )
         .unwrap();
@@ -207,5 +263,75 @@ mod tests {
             collector.get_metric_value("sop.live-once.runs_completed"),
             Some(json!(1u64))
         );
+    }
+
+    #[tokio::test]
+    async fn step_call_sink_captures_in_order_and_only_inside_scope() {
+        // Outside any scope: silently dropped.
+        record_step_tool_call(
+            "shell",
+            &json!({"command": "ls"}),
+            true,
+            "x".into(),
+            None,
+            None,
+            1,
+        );
+
+        let sink = new_step_call_sink();
+        scope_step_call_sink(sink.clone(), async {
+            record_step_tool_call(
+                "http_request",
+                &json!({"url": "https://example.com"}),
+                true,
+                "200 OK".into(),
+                Some(json!({"status": 200})),
+                None,
+                42,
+            );
+            record_step_tool_call(
+                "calculator",
+                &json!({"function": "add", "values": [1, 2]}),
+                false,
+                "bad args".into(),
+                None,
+                Some("bad args"),
+                3,
+            );
+        })
+        .await;
+
+        let calls = drain_step_calls(&sink);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].index, 0);
+        assert_eq!(calls[0].tool, "http_request");
+        assert_eq!(calls[0].output_data, Some(json!({"status": 200})));
+        assert_eq!(calls[1].index, 1);
+        assert!(!calls[1].success);
+        assert_eq!(calls[1].error.as_deref(), Some("bad args"));
+        assert_eq!(calls[1].duration_ms, 3);
+        // Drain empties the sink.
+        assert!(drain_step_calls(&sink).is_empty());
+    }
+
+    #[tokio::test]
+    async fn nested_step_call_scopes_do_not_leak_into_outer_sink() {
+        let outer = new_step_call_sink();
+        let inner = new_step_call_sink();
+        scope_step_call_sink(outer.clone(), async {
+            record_step_tool_call("shell", &json!({}), true, "outer".into(), None, None, 1);
+            scope_step_call_sink(inner.clone(), async {
+                record_step_tool_call("shell", &json!({}), true, "inner".into(), None, None, 1);
+            })
+            .await;
+        })
+        .await;
+
+        let outer_calls = drain_step_calls(&outer);
+        let inner_calls = drain_step_calls(&inner);
+        assert_eq!(outer_calls.len(), 1);
+        assert_eq!(outer_calls[0].output, "outer");
+        assert_eq!(inner_calls.len(), 1);
+        assert_eq!(inner_calls[0].output, "inner");
     }
 }

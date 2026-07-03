@@ -909,6 +909,7 @@ impl SopEngine {
                     output: reason.clone(),
                     started_at: now.clone(),
                     completed_at: Some(now.clone()),
+                    tool_calls: Vec::new(),
                 });
             }
         }
@@ -1307,6 +1308,7 @@ impl SopEngine {
             output: step_output.to_string(),
             started_at,
             completed_at,
+            tool_calls: Vec::new(),
         };
         let retry_input = retry_input_value(run, current_step.number);
         run.step_results.push(step_result);
@@ -1409,6 +1411,7 @@ impl SopEngine {
                     output: output.to_string(),
                     started_at: state.persisted_at.clone(),
                     completed_at: Some(state.persisted_at.clone()),
+                    tool_calls: Vec::new(),
                 });
             }
         }
@@ -3106,6 +3109,7 @@ mod tests {
                     output: "done".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3123,6 +3127,7 @@ mod tests {
                     output: "done".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3151,6 +3156,7 @@ mod tests {
                     output: "valve stuck".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3212,6 +3218,7 @@ mod tests {
                     output: "{}".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3253,6 +3260,7 @@ mod tests {
                     output: "{}".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3284,6 +3292,7 @@ mod tests {
                     output: r#"{"ok":true}"#.into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3318,6 +3327,7 @@ mod tests {
                     output: "first failure".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3341,6 +3351,7 @@ mod tests {
                     output: "second failure".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3360,6 +3371,7 @@ mod tests {
                     output: "third failure".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3387,6 +3399,7 @@ mod tests {
                     output: "needs compensation".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3412,6 +3425,7 @@ mod tests {
                     output: r#"{"ok":true}"#.into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3456,6 +3470,7 @@ mod tests {
                     output: "{}".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3474,6 +3489,7 @@ mod tests {
                     output: r#"{"ok":true}"#.into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3553,6 +3569,7 @@ mod tests {
                     output: "ok".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3565,6 +3582,7 @@ mod tests {
                     output: "ok".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3624,6 +3642,7 @@ mod tests {
                     output: "ok".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3800,6 +3819,7 @@ mod tests {
                     output: "ok".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -3812,6 +3832,7 @@ mod tests {
                     output: "ok".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -4123,6 +4144,7 @@ mod tests {
                         output: "ok".into(),
                         started_at: now_iso8601(),
                         completed_at: Some(now_iso8601()),
+                        tool_calls: Vec::new(),
                     },
                 )
                 .unwrap();
@@ -4164,6 +4186,7 @@ mod tests {
                         output: "ok".into(),
                         started_at: now_iso8601(),
                         completed_at: Some(now_iso8601()),
+                        tool_calls: Vec::new(),
                     },
                 )
                 .unwrap();
@@ -4465,6 +4488,7 @@ type = "manual"
                     output: "step1-output".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -4482,6 +4506,7 @@ type = "manual"
                     output: "step2-output".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -4575,6 +4600,7 @@ type = "manual"
                     output: "boom".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -4623,6 +4649,7 @@ type = "manual"
                     output: "step1-output".into(),
                     started_at: started.clone(),
                     completed_at: Some(completed.clone()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();
@@ -4675,6 +4702,7 @@ type = "manual"
                     output: "s3-out".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();

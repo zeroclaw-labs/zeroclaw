@@ -82,6 +82,17 @@ pub(crate) async fn record_executed_outcomes(
             let _ = tx.send(StreamDelta::Status(progress_msg)).await;
         }
 
+        // Capture into the innermost live SOP step scope (no-op otherwise).
+        crate::sop::executor::record_step_tool_call(
+            &call.name,
+            &call.arguments,
+            outcome.success,
+            outcome.output.clone(),
+            outcome.output_data.clone(),
+            outcome.error_reason.as_deref(),
+            u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX),
+        );
+
         ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
     }
 }

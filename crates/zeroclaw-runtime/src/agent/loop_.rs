@@ -9907,11 +9907,11 @@ This is an example, not an invocation."#;
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec {
-                name: "count_tool".to_string(),
-                description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
-            }]),
+            Some(&[crate::tools::ToolSpec::new(
+                "count_tool".to_string(),
+                "Count values".to_string(),
+                serde_json::json!({"type": "object"}),
+            )]),
             "mock-model",
             Some(0.0),
             None,
@@ -9993,11 +9993,11 @@ This is an example, not an invocation."#;
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec {
-                name: "count_tool".to_string(),
-                description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
-            }]),
+            Some(&[crate::tools::ToolSpec::new(
+                "count_tool".to_string(),
+                "Count values".to_string(),
+                serde_json::json!({"type": "object"}),
+            )]),
             "mock-model",
             Some(0.0),
             None,
@@ -10070,11 +10070,11 @@ This is an example, not an invocation."#;
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec {
-                name: "count_tool".to_string(),
-                description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
-            }]),
+            Some(&[crate::tools::ToolSpec::new(
+                "count_tool".to_string(),
+                "Count values".to_string(),
+                serde_json::json!({"type": "object"}),
+            )]),
             "mock-model",
             Some(0.0),
             None,
@@ -10110,11 +10110,11 @@ This is an example, not an invocation."#;
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec {
-                name: "count_tool".to_string(),
-                description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
-            }]),
+            Some(&[crate::tools::ToolSpec::new(
+                "count_tool".to_string(),
+                "Count values".to_string(),
+                serde_json::json!({"type": "object"}),
+            )]),
             "mock-model",
             Some(0.0),
             None,
@@ -10449,11 +10449,11 @@ This is an example, not an invocation."#;
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec {
-                name: "count_tool".to_string(),
-                description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
-            }]),
+            Some(&[crate::tools::ToolSpec::new(
+                "count_tool".to_string(),
+                "Count values".to_string(),
+                serde_json::json!({"type": "object"}),
+            )]),
             "mock-model",
             Some(0.0),
             None,
@@ -11055,11 +11055,11 @@ This is an example, not an invocation."#;
                 ],
             )]);
         let messages = vec![ChatMessage::user("hi")];
-        let tools = [crate::tools::ToolSpec {
-            name: "count_tool".to_string(),
-            description: "Count values".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
-        }];
+        let tools = [crate::tools::ToolSpec::new(
+            "count_tool".to_string(),
+            "Count values".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
         let outcome = consume_provider_streaming_response(
@@ -13094,11 +13094,7 @@ Let me check the result."#;
     // ── filter_tool_specs_for_turn tests ──────────────────────────────────────
 
     fn make_spec(name: &str) -> crate::tools::ToolSpec {
-        crate::tools::ToolSpec {
-            name: name.to_string(),
-            description: String::new(),
-            parameters: serde_json::json!({}),
-        }
+        crate::tools::ToolSpec::new(name.to_string(), String::new(), serde_json::json!({}))
     }
 
     #[test]

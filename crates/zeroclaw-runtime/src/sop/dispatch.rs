@@ -890,6 +890,7 @@ mod tests {
                     output: "done".into(),
                     started_at: now_iso8601(),
                     completed_at: Some(now_iso8601()),
+                    tool_calls: Vec::new(),
                 },
             )
             .unwrap();

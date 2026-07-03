@@ -965,6 +965,7 @@ mod tests {
             output: String::new(),
             started_at: "2026-01-01T00:00:00Z".into(),
             completed_at: None,
+            tool_calls: Vec::new(),
         }
     }
 
