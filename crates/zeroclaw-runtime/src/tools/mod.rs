@@ -26,6 +26,7 @@ pub mod cron_update;
 pub mod delegate;
 pub mod file_read;
 pub mod model_switch;
+pub mod param_options;
 pub mod read_skill;
 pub mod schedule;
 pub mod security_ops;
@@ -199,6 +200,14 @@ impl Tool for ArcToolRef {
         self.0.parameters_schema()
     }
 
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        self.0.output_schema()
+    }
+
+    fn param_domains(&self) -> Vec<(&'static str, ::zeroclaw_api::tool::OptionDomain)> {
+        self.0.param_domains()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.0.execute(args).await
     }
@@ -236,6 +245,14 @@ impl Tool for ArcDelegatingTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         self.inner.parameters_schema()
+    }
+
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        self.inner.output_schema()
+    }
+
+    fn param_domains(&self) -> Vec<(&'static str, ::zeroclaw_api::tool::OptionDomain)> {
+        self.inner.param_domains()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -2296,11 +2313,7 @@ mod tests {
 
     #[test]
     fn tool_spec_serde() {
-        let spec = ToolSpec {
-            name: "test".into(),
-            description: "A test tool".into(),
-            parameters: serde_json::json!({"type": "object"}),
-        };
+        let spec = ToolSpec::new("test", "A test tool", serde_json::json!({"type": "object"}));
         let json = serde_json::to_string(&spec).unwrap();
         let parsed: ToolSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.name, "test");

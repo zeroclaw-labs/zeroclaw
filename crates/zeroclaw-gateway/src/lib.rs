@@ -1825,6 +1825,10 @@ pub async fn run_gateway(
             get(api_sop_author::handle_sop_trigger_sources),
         )
         .route(
+            "/api/tools/param-options",
+            post(api_sop_author::handle_tools_param_options),
+        )
+        .route(
             "/api/sops/{name}/runs/{run_id}/overlay",
             get(api_sop_author::handle_sop_run_overlay),
         )

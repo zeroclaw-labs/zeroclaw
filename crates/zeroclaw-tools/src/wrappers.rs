@@ -92,6 +92,14 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
         self.inner.parameters_schema()
     }
 
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        self.inner.output_schema()
+    }
+
+    fn param_domains(&self) -> Vec<(&'static str, zeroclaw_api::tool::OptionDomain)> {
+        self.inner.param_domains()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
@@ -192,6 +200,14 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
 
     fn parameters_schema(&self) -> serde_json::Value {
         self.inner.parameters_schema()
+    }
+
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        self.inner.output_schema()
+    }
+
+    fn param_domains(&self) -> Vec<(&'static str, zeroclaw_api::tool::OptionDomain)> {
+        self.inner.param_domains()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {

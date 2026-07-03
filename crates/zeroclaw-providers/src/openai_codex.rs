@@ -2387,10 +2387,10 @@ data: [DONE]
 
     #[test]
     fn convert_tools_opts_out_of_responses_strict_mode() {
-        let tools = vec![ToolSpec {
-            name: "jira".to_string(),
-            description: "Interact with Jira".to_string(),
-            parameters: serde_json::json!({
+        let tools = vec![ToolSpec::new(
+            "jira",
+            "Interact with Jira",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": { "type": "string" },
@@ -2398,7 +2398,7 @@ data: [DONE]
                 },
                 "required": ["action"]
             }),
-        }];
+        )];
 
         let converted = convert_tools(Some(&tools)).expect("tool should convert");
         let value = serde_json::to_value(&converted[0]).expect("tool should serialize");

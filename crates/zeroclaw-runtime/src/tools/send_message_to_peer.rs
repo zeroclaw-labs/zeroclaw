@@ -97,6 +97,14 @@ impl Tool for SendMessageToPeerTool {
         })
     }
 
+    fn param_domains(&self) -> Vec<(&'static str, zeroclaw_api::tool::OptionDomain)> {
+        use zeroclaw_api::tool::OptionDomain;
+        vec![
+            ("channel", OptionDomain::ChannelRefs),
+            ("target", OptionDomain::PeerTargets),
+        ]
+    }
+
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
         let channel = args
             .get("channel")

@@ -156,6 +156,7 @@ pub enum Method {
     SopsWireDraft,
     SopsGraphDraft,
     SopsTriggerSources,
+    ToolsParamOptions,
 }
 
 impl Method {
@@ -261,6 +262,7 @@ impl Method {
         (Method::SopsWireDraft, "sops/wire-draft"),
         (Method::SopsGraphDraft, "sops/graph-draft"),
         (Method::SopsTriggerSources, "sops/trigger-sources"),
+        (Method::ToolsParamOptions, "tools/param-options"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -719,6 +721,7 @@ impl RpcDispatcher {
             Method::SopsWireDraft => self.handle_sops_wire_draft(&req.params),
             Method::SopsGraphDraft => self.handle_sops_graph_draft(&req.params),
             Method::SopsTriggerSources => self.handle_sops_trigger_sources(),
+            Method::ToolsParamOptions => self.handle_tools_param_options(&req.params),
         };
 
         if is_notification {
@@ -3998,6 +4001,58 @@ impl RpcDispatcher {
             crate::sop::registry_from_config(&config)
         };
         to_result(registry)
+    }
+
+    /// Resolve selectable values for a domain-typed tool parameter.
+    /// Params: `{ domain, agent?, args? }`. `domain` is an
+    /// `OptionDomain` wire name (e.g. `peer_targets`); `agent` scopes
+    /// agent-relative domains; `args` carries sibling arguments already
+    /// chosen so cascading domains can narrow.
+    fn handle_tools_param_options(&self, params: &Value) -> RpcResult {
+        #[derive(serde::Deserialize)]
+        struct ParamOptionsParams {
+            domain: zeroclaw_api::tool::OptionDomain,
+            #[serde(default)]
+            agent: Option<String>,
+            #[serde(default)]
+            args: Value,
+        }
+        let req: ParamOptionsParams = parse_params(params)?;
+        let config = self.ctx.config.read();
+        let agent_alias = req
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(str::to_string)
+            .or_else(|| config.agents.keys().min().cloned())
+            .unwrap_or_default();
+
+        let entries = if req.domain == zeroclaw_api::tool::OptionDomain::ToolNames {
+            let security = std::sync::Arc::new(
+                zeroclaw_config::policy::SecurityPolicy::for_agent(&config, &agent_alias)
+                    .unwrap_or_default(),
+            );
+            let tools = crate::tools::default_tools(security);
+            let refs: Vec<&dyn zeroclaw_api::tool::Tool> =
+                tools.iter().map(std::convert::AsRef::as_ref).collect();
+            crate::tools::param_options::resolve_options(
+                req.domain,
+                &config,
+                &agent_alias,
+                &req.args,
+                &refs,
+            )
+        } else {
+            crate::tools::param_options::resolve_options(
+                req.domain,
+                &config,
+                &agent_alias,
+                &req.args,
+                &[],
+            )
+        };
+        to_result(serde_json::json!({ "options": entries }))
     }
 
     async fn handle_quickstart_apply(&self, params: &Value) -> RpcResult {
