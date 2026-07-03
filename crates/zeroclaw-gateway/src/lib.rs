@@ -2029,37 +2029,56 @@ pub async fn run_gateway(
         ));
 
     let inner = inner.merge(long_running_router);
-    // ── OpenAI bridge channel (opt-in via [channels.openai.<alias>] enabled = true) ──
-    let inner = if let Some(cfg) = config.channels.openai.values().find(|c| c.enabled) {
-        tracing::info!("OpenAI bridge enabled: /openai/v1/chat/completions, /openai/v1/models");
+    // ── OpenAI bridge channel — one route set per enabled alias ──────────────
+    // Routes: /openai/{alias}/v1/models  and  /openai/{alias}/v1/chat/completions
+    // The public URL is always derived from the gateway config (host, port, path_prefix).
+    let prefix_str = config
+        .gateway
+        .path_prefix
+        .as_deref()
+        .unwrap_or("")
+        .trim_end_matches('/');
+    let mut inner = inner;
+    for (alias, cfg) in config.channels.openai.iter().filter(|(_, c)| c.enabled) {
+        let public_url = format!(
+            "http://{}:{}{}/openai/{}/v1",
+            config.gateway.host, config.gateway.port, prefix_str, alias
+        );
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"alias": alias, "endpoint": public_url})),
+            "OpenAI bridge enabled"
+        );
         // Validate system_prompt_mode at startup to catch typos early.
         const VALID_MODES: &[&str] = &["zeroclaw", "merge", "caller"];
         if !VALID_MODES.contains(&cfg.system_prompt_mode.as_str()) {
-            tracing::warn!(
-                mode = %cfg.system_prompt_mode,
-                valid = ?VALID_MODES,
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"alias": alias, "mode": cfg.system_prompt_mode, "valid": VALID_MODES})),
                 "channels.openai.<alias>.system_prompt_mode is invalid, falling back to 'zeroclaw'"
             );
         }
-        let openai_router = Router::new()
+        let openai_router: Router<AppState> = Router::new()
             .route(
-                "/openai/v1/models",
+                &format!("/openai/{alias}/v1/models"),
                 get(openai_channel::handle_openai_models),
             )
             .route(
-                "/openai/v1/chat/completions",
+                &format!("/openai/{alias}/v1/chat/completions"),
                 post(openai_channel::handle_openai_chat_completion_stream),
-            )
+            );
+        let openai_router: Router = openai_router
             .with_state(state.clone())
             .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
             .layer(TimeoutLayer::with_status_code(
                 StatusCode::REQUEST_TIMEOUT,
                 Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
             ));
-        inner.merge(openai_router)
-    } else {
-        inner
-    };
+        inner = inner.merge(openai_router);
+    }
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"

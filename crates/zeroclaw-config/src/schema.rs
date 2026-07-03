@@ -12881,6 +12881,12 @@ impl ChannelsConfig {
                 desc: "HTTP endpoint",
                 configured: !self.webhook.is_empty(),
             },
+            ChannelInfo {
+                kind: "openai",
+                name: "OpenAI",
+                desc: "OpenAI-compatible HTTP bridge (/openai/v1)",
+                configured: !self.openai.is_empty(),
+            },
         ]
     }
 
@@ -13790,12 +13796,19 @@ pub struct OpenaiChannelConfig {
     ///   (or insert if the caller sent none).
     /// - `"caller"` — pass the caller's system prompt through unchanged;
     ///   skip ZeroClaw soul entirely.
-    #[serde(default = "default_system_prompt_mode")]
+    #[serde(
+        default = "default_system_prompt_mode",
+        skip_serializing_if = "is_default_system_prompt_mode"
+    )]
     pub system_prompt_mode: String,
 }
 
 fn default_system_prompt_mode() -> String {
     "zeroclaw".to_string()
+}
+
+fn is_default_system_prompt_mode(v: &String) -> bool {
+    v == "zeroclaw"
 }
 
 impl ChannelConfig for OpenaiChannelConfig {

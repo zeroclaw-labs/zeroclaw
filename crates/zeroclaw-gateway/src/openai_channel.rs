@@ -1,4 +1,5 @@
 use crate::AppState;
+use axum::extract::Path;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event, Sse};
 use axum::{Json, extract::State, response::IntoResponse};
@@ -214,11 +215,12 @@ fn make_stop_chunk(id: &str, created: u64, model: &str) -> Event {
 }
 
 // ---------------------------------------------------------------------------
-// GET /openai/v1/models
+// GET /openai/{alias}/v1/models
 // ---------------------------------------------------------------------------
 
 pub async fn handle_openai_models(
     State(state): State<AppState>,
+    Path(_alias): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Err(e) = check_auth(&state, &headers) {
@@ -239,11 +241,12 @@ pub async fn handle_openai_models(
 }
 
 // ---------------------------------------------------------------------------
-// POST /openai/v1/chat/completions
+// POST /openai/{alias}/v1/chat/completions
 // ---------------------------------------------------------------------------
 
 pub async fn handle_openai_chat_completion_stream(
     State(state): State<AppState>,
+    Path(alias): Path<String>,
     headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
@@ -274,12 +277,13 @@ pub async fn handle_openai_chat_completion_stream(
         }
     };
 
-    // Derive a stable session_id from the optional `user` field.
+    // Derive a stable session_id from the optional `user` field, namespaced by alias.
     let session_id = req
         .user
         .as_deref()
         .filter(|u| !u.is_empty())
-        .map(|u| format!("openai-bridge:{u}"));
+        .map(|u| format!("openai-bridge:{alias}:{u}"))
+        .or_else(|| Some(format!("openai-bridge:{alias}")));
 
     let id = completion_id();
     let created = unix_now();
@@ -287,12 +291,41 @@ pub async fn handle_openai_chat_completion_stream(
     let streaming = req.stream.unwrap_or(false);
 
     // ── Build agent from config (soul/identity + tools injected automatically) ──
-    let config = state.config.lock().clone();
-    let mut agent =
-        match zeroclaw_runtime::agent::Agent::from_config_with_session_cwd(&config, None).await {
+    let config = state.config.read().clone();
+    let Some(agent_alias) = config.resolved_runtime_agent_alias().map(str::to_owned) else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "OpenAI bridge rejected: no configured [agents.<alias>] entry"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "OpenAI bridge requires at least one configured [agents.<alias>] entry",
+                    "type": "invalid_request_error"
+                }
+            })),
+        )
+            .into_response();
+    };
+    let mut agent = match zeroclaw_runtime::agent::Agent::from_config_with_session_cwd(
+        &config,
+        &agent_alias,
+        None,
+    )
+    .await
+    {
             Ok(a) => a,
             Err(e) => {
-                tracing::error!("OpenAI bridge: agent init failed: {e}");
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string(), "agent_alias": agent_alias})),
+                    "OpenAI bridge: agent init failed"
+                );
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
@@ -314,7 +347,13 @@ pub async fn handle_openai_chat_completion_stream(
 
     tokio::spawn(async move {
         if let Err(e) = agent.turn_streamed(&prompt, event_tx, None).await {
-            tracing::error!("OpenAI bridge: turn_streamed error: {e}");
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                "OpenAI bridge: turn_streamed error"
+            );
         }
     });
 
@@ -342,7 +381,11 @@ pub async fn handle_openai_chat_completion_stream(
                             make_sse_chunk(&id_clone, created, &model_clone, &delta)
                         );
                     }
-                    TurnEvent::Thinking { .. } | TurnEvent::ToolResult { .. } | TurnEvent::ApprovalRequest { .. } | TurnEvent::Usage { .. } => {
+                    TurnEvent::Thinking { .. }
+                    | TurnEvent::ToolResult { .. }
+                    | TurnEvent::ApprovalRequest { .. }
+                    | TurnEvent::Usage { .. }
+                    | TurnEvent::HistoryTrimmed { .. } => {
                         // Not forwarded to the client.
                     }
                 }
@@ -513,5 +556,67 @@ mod tests {
         let json = serde_json::to_string(&chunk).unwrap();
         assert!(json.contains("\"finish_reason\":\"stop\""));
         assert!(!json.contains("\"content\""));
+    }
+
+    // ── session_id namespacing by alias ──────────────────────────────────────
+
+    #[test]
+    fn session_id_includes_alias_and_user() {
+        let alias = "home-assistant";
+        let user = "user42";
+        let session_id = format!("openai-bridge:{alias}:{user}");
+        assert_eq!(session_id, "openai-bridge:home-assistant:user42");
+    }
+
+    #[test]
+    fn session_id_alias_only_when_no_user() {
+        let alias = "open-webui";
+        let req_user: Option<&str> = None;
+        let session_id = req_user
+            .filter(|u| !u.is_empty())
+            .map(|u| format!("openai-bridge:{alias}:{u}"))
+            .unwrap_or_else(|| format!("openai-bridge:{alias}"));
+        assert_eq!(session_id, "openai-bridge:open-webui");
+    }
+
+    #[test]
+    fn session_id_alias_only_when_user_is_empty_string() {
+        let alias = "my-alias";
+        let req_user: Option<&str> = Some("");
+        let session_id = req_user
+            .filter(|u| !u.is_empty())
+            .map(|u| format!("openai-bridge:{alias}:{u}"))
+            .unwrap_or_else(|| format!("openai-bridge:{alias}"));
+        assert_eq!(session_id, "openai-bridge:my-alias");
+    }
+
+    #[test]
+    fn different_aliases_produce_distinct_session_ids() {
+        let user = "alice";
+        let id_a = format!("openai-bridge:alias-a:{user}");
+        let id_b = format!("openai-bridge:alias-b:{user}");
+        assert_ne!(id_a, id_b);
+    }
+
+    // ── URL derivation from gateway config ───────────────────────────────────
+
+    #[test]
+    fn public_url_derived_from_gateway_host_port_alias() {
+        let host = "127.0.0.1";
+        let port: u16 = 42617;
+        let alias = "default";
+        let prefix = "";
+        let url = format!("http://{host}:{port}{prefix}/openai/{alias}/v1");
+        assert_eq!(url, "http://127.0.0.1:42617/openai/default/v1");
+    }
+
+    #[test]
+    fn public_url_includes_path_prefix_when_set() {
+        let host = "127.0.0.1";
+        let port: u16 = 42617;
+        let alias = "prod";
+        let prefix = "/zc";
+        let url = format!("http://{host}:{port}{prefix}/openai/{alias}/v1");
+        assert_eq!(url, "http://127.0.0.1:42617/zc/openai/prod/v1");
     }
 }
