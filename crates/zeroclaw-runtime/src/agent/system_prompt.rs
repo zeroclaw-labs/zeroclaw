@@ -9,8 +9,8 @@ use crate::skills::Skill;
 
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 pub const BOOTSTRAP_MAX_CHARS: usize = 20_000;
-pub(crate) const NO_TOOLS_TASK_FRAMING: &str = "No tools are available for this turn";
-pub(crate) const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when the request requires action";
+pub const NO_TOOLS_TASK_FRAMING: &str = "No tools are available for this turn";
+pub const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when the request requires action";
 
 fn load_openclaw_bootstrap_files(
     prompt: &mut String,

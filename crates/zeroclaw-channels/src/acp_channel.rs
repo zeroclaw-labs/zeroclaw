@@ -15,7 +15,7 @@
 //!   it falls back to the legacy `session/request_permission` overload
 //!   for backward compatibility with clients that haven't yet shipped
 //!   the [elicitation RFD][rfd]
-//!   (https://agentclientprotocol.com/rfds/elicitation).
+//!   (<https://agentclientprotocol.com/rfds/elicitation>).
 //! - `request_multi_choice` issues an `elicitation/create` request
 //!   with a `type: array` / `anyOf` schema. There is no legacy
 //!   fallback for multi-select — callers receive `Ok(None)` when the
@@ -71,7 +71,7 @@ pub struct AcpChannel {
     /// block. Drives the capability gate in `request_choice`: if
     /// `client_caps.form` is true we emit `elicitation/create`; otherwise
     /// we fall back to the legacy `session/request_permission` path.
-    /// See the ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation.
+    /// See the ACP elicitation RFD: <https://agentclientprotocol.com/rfds/elicitation>.
     client_caps: ElicitationCapabilities,
 }
 
