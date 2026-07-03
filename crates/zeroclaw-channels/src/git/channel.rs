@@ -62,21 +62,21 @@ fn build_provider(cfg: &GitConfig) -> anyhow::Result<Box<dyn GitProvider>> {
                 // attaches `access_token` as a bearer credential, so guessing
                 // a default host would send the token to an endpoint the
                 // operator never named (e.g. a Forgejo PAT to gitea.com).
-                let api_base_url = cfg
+                let Some(api_base_url) = cfg
                     .api_base_url
                     .as_deref()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "git channel provider `{provider}` requires \
-                             channels.git.<alias>.api_base_url - the instance's API base \
-                             URL including /api/v1, e.g. `https://git.example.org/api/v1` \
-                             (or `https://gitea.com/api/v1` for the public Gitea service). \
-                             No default host is assumed because API requests carry the \
-                             access token"
-                        )
-                    })?;
+                else {
+                    anyhow::bail!(
+                        "git channel provider `{provider}` requires \
+                         channels.git.<alias>.api_base_url - the instance's API base \
+                         URL including /api/v1, e.g. `https://git.example.org/api/v1` \
+                         (or `https://gitea.com/api/v1` for the public Gitea service). \
+                         No default host is assumed because API requests carry the \
+                         access token"
+                    );
+                };
                 Ok(Box::new(super::providers::gitea::GiteaProvider::new(
                     api_base_url.to_string(),
                     cfg.access_token.clone(),
