@@ -427,6 +427,19 @@ impl Tool for HttpRequestTool {
         })
     }
 
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        Some(json!({
+            "type": "object",
+            "properties": {
+                "status": { "type": "integer", "description": "HTTP status code" },
+                "reason": { "type": "string", "description": "Canonical status reason" },
+                "headers": { "type": "string", "description": "Response headers (sensitive values redacted)" },
+                "body": { "description": "Response body: parsed JSON when the body is JSON, raw string otherwise" }
+            },
+            "required": ["status", "reason", "headers", "body"]
+        }))
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let url = args.get("url").and_then(|v| v.as_str()).ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -543,9 +556,20 @@ impl Tool for HttpRequestTool {
                     response_text
                 );
 
+                // Structured mirror of the display text; body is parsed
+                // JSON when it parses, raw string otherwise.
+                let body_value = serde_json::from_str::<serde_json::Value>(&response_text)
+                    .unwrap_or_else(|_| serde_json::Value::String(response_text.clone()));
+                let data = json!({
+                    "status": status_code,
+                    "reason": status.canonical_reason().unwrap_or("Unknown"),
+                    "headers": headers_text,
+                    "body": body_value,
+                });
+
                 Ok(ToolResult {
                     success: status.is_success(),
-                    output: output.into(),
+                    output: ToolOutput::json_with_text(data, output),
                     error: if status.is_client_error() || status.is_server_error() {
                         Some(format!("HTTP {}", status_code))
                     } else {
