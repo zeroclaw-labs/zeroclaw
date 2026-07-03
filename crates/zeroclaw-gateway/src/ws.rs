@@ -1284,6 +1284,10 @@ async fn process_chat_message(
                             "kept_turns": kept_turns,
                             "reason": reason,
                         }),
+                        TurnEvent::Plan { entries } => serde_json::json!({
+                            "type": "plan",
+                            "entries": entries,
+                        }),
                     };
                     let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
                 }
