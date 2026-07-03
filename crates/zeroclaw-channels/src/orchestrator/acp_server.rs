@@ -3219,8 +3219,8 @@ mod tests {
                 },
             ],
         };
-        let notif = notification_for_turn_event("sess_abc", &event)
-            .expect("plan yields a notification");
+        let notif =
+            notification_for_turn_event("sess_abc", &event).expect("plan yields a notification");
         let v = serde_json::to_value(&notif).unwrap();
 
         assert_eq!(v["method"], "session/update");
@@ -3228,7 +3228,10 @@ mod tests {
         assert_eq!(v["params"]["update"]["sessionUpdate"], "plan");
         let entries = v["params"]["update"]["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0]["content"], "Analyze the existing codebase structure");
+        assert_eq!(
+            entries[0]["content"],
+            "Analyze the existing codebase structure"
+        );
         assert_eq!(entries[0]["priority"], "high");
         assert_eq!(entries[0]["status"], "pending");
         // ACP-required fields always present on every entry:

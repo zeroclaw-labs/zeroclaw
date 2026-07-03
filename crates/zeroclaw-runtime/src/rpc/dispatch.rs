@@ -1648,13 +1648,8 @@ impl RpcDispatcher {
                     // store) before its notification goes out, so a racing
                     // reconnect — or a later resume — reads a consistent list.
                     // No-op for every other event.
-                    persist_plan_if_any(
-                        &sessions_for_plan,
-                        acp_token_store.as_ref(),
-                        &sid,
-                        &event,
-                    )
-                    .await;
+                    persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
+                        .await;
                     if let Some(n) = notification_for_turn_event(&sid, &event, max_ctx) {
                         let _ = rpc.send_raw(n).await;
                     }
@@ -4014,7 +4009,10 @@ async fn persist_plan_if_any(
 /// `None` when the plan is empty (nothing to show). Reuses the same
 /// `TurnEvent::Plan` → notification mapping as the live path so the wire
 /// shape can never drift between live and replay.
-fn plan_replay_notification(session_id: &str, entries: &[zeroclaw_api::plan::PlanEntry]) -> Option<String> {
+fn plan_replay_notification(
+    session_id: &str,
+    entries: &[zeroclaw_api::plan::PlanEntry],
+) -> Option<String> {
     if entries.is_empty() {
         return None;
     }
@@ -4895,14 +4893,17 @@ mod tests {
         assert_eq!(v["params"]["entries"][0]["content"], "Analyze codebase");
         assert_eq!(v["params"]["entries"][0]["status"], "in_progress");
         assert_eq!(v["params"]["entries"][0]["priority"], "high");
-        assert_eq!(v["params"]["entries"][0]["activeForm"], "Analyzing codebase");
+        assert_eq!(
+            v["params"]["entries"][0]["activeForm"],
+            "Analyzing codebase"
+        );
     }
 
     #[test]
     fn empty_plan_turn_event_maps_to_empty_entries() {
         let event = TurnEvent::Plan { entries: vec![] };
-        let json = notification_for_turn_event("sess-2", &event, None)
-            .expect("empty plan still notifies");
+        let json =
+            notification_for_turn_event("sess-2", &event, None).expect("empty plan still notifies");
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "plan");
         assert!(v["params"]["entries"].as_array().unwrap().is_empty());
@@ -4976,15 +4977,7 @@ mod tests {
     async fn non_plan_event_does_not_touch_stored_plan() {
         let sid = "no-touch-sess";
         let store = store_with_one_session(sid).await;
-        persist_plan_if_any(
-            &store,
-            None,
-            sid,
-            &TurnEvent::Chunk {
-                delta: "hi".into(),
-            },
-        )
-        .await;
+        persist_plan_if_any(&store, None, sid, &TurnEvent::Chunk { delta: "hi".into() }).await;
         assert!(store.get_plan(sid).await.unwrap().is_empty());
     }
 
@@ -4995,9 +4988,8 @@ mod tests {
         let sessions = store_with_one_session(sid).await;
 
         let tmp = tempfile::TempDir::new().unwrap();
-        let acp = Arc::new(
-            zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap(),
-        );
+        let acp =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
         acp.create_session(sid, "alpha", tmp.path().to_str().unwrap())
             .unwrap();
 

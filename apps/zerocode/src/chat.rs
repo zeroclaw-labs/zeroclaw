@@ -2588,10 +2588,7 @@ fn draw_error(frame: &mut Frame, area: Rect, msg: &str, tab_title: &str) {
 /// bottom strip grows with the plan up to a cap, clamped to at most half
 /// the pane height. Returns `None` for the tracker area when it wants no
 /// space — the body then gets the whole area (existing layout untouched).
-fn carve_todo_area(
-    tracker: &crate::todo_tracker::TodoTracker,
-    area: Rect,
-) -> (Rect, Option<Rect>) {
+fn carve_todo_area(tracker: &crate::todo_tracker::TodoTracker, area: Rect) -> (Rect, Option<Rect>) {
     // Config-driven width/height land in a later task; sensible defaults here.
     const SIDE_WIDTH: u16 = 32;
     const BOTTOM_MAX_HEIGHT: u16 = 5;
@@ -2609,7 +2606,12 @@ fn carve_todo_area(
         crate::todo_tracker::TodoLocation::Left => {
             let w = SIDE_WIDTH.min(area.width / 2);
             let panel = Rect::new(area.x, area.y, w, area.height);
-            let body = Rect::new(area.x + w, area.y, area.width.saturating_sub(w), area.height);
+            let body = Rect::new(
+                area.x + w,
+                area.y,
+                area.width.saturating_sub(w),
+                area.height,
+            );
             (body, Some(panel))
         }
         crate::todo_tracker::TodoLocation::Bottom => {

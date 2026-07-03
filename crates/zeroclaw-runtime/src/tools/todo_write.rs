@@ -189,7 +189,8 @@ mod tests {
 
     #[test]
     fn coerces_unknown_priority_to_medium() {
-        let args = json!({ "todos": [ { "content": "A", "status": "pending", "priority": "urgent" } ] });
+        let args =
+            json!({ "todos": [ { "content": "A", "status": "pending", "priority": "urgent" } ] });
         let entries = parse_entries(&args).expect("unknown priority coerced");
         assert_eq!(entries[0].priority, PlanPriority::Medium);
     }

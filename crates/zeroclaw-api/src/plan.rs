@@ -81,7 +81,10 @@ mod tests {
             active_form: None,
         };
         let v = serde_json::to_value(&entry).unwrap();
-        assert!(v.get("activeForm").is_none(), "activeForm must be omitted when None");
+        assert!(
+            v.get("activeForm").is_none(),
+            "activeForm must be omitted when None"
+        );
         assert_eq!(v["status"], "pending");
         assert_eq!(v["priority"], "medium");
     }

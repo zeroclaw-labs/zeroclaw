@@ -310,8 +310,7 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
         }),
         "plan" => {
             let entries = params.get("entries")?.clone();
-            let entries: Vec<crate::wire::PlanEntry> =
-                serde_json::from_value(entries).ok()?;
+            let entries: Vec<crate::wire::PlanEntry> = serde_json::from_value(entries).ok()?;
             Some(SessionUpdate::Plan {
                 session_id: sid,
                 entries,
@@ -2649,7 +2648,10 @@ mod plan_parse_tests {
         });
         let update = parse_session_update(&params).expect("plan parses");
         match update {
-            SessionUpdate::Plan { session_id, entries } => {
+            SessionUpdate::Plan {
+                session_id,
+                entries,
+            } => {
                 assert_eq!(session_id, "sess-1");
                 assert_eq!(entries.len(), 2);
                 assert_eq!(entries[0].status, crate::wire::PlanStatus::Completed);

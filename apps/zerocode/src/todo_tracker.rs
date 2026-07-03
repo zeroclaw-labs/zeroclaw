@@ -99,7 +99,12 @@ impl TodoTracker {
         use ratatui::text::{Line, Span};
         use ratatui::widgets::{Block, Borders, Paragraph};
 
-        let title = format!("Plan ({}) — {}/{} done", self.total(), self.done(), self.total());
+        let title = format!(
+            "Plan ({}) — {}/{} done",
+            self.total(),
+            self.done(),
+            self.total()
+        );
         let block = Block::default().borders(Borders::ALL).title(title);
 
         if self.entries.is_empty() {
@@ -184,7 +189,10 @@ mod tests {
     #[test]
     fn set_plan_replaces_wholesale() {
         let mut t = TodoTracker::new(TodoLocation::Right, true, true);
-        t.set_plan(vec![entry("A", PlanStatus::Pending), entry("B", PlanStatus::Pending)]);
+        t.set_plan(vec![
+            entry("A", PlanStatus::Pending),
+            entry("B", PlanStatus::Pending),
+        ]);
         t.set_plan(vec![entry("C", PlanStatus::Completed)]);
         assert_eq!(t.entries().len(), 1);
         assert_eq!(t.entries()[0].content, "C");
@@ -249,7 +257,10 @@ mod tests {
             active_form: Some("Wiring ACP".to_string()),
         }]);
         let out = render_to_string(&t, 30, 6);
-        assert!(out.contains("Wiring ACP"), "active_form shown for in_progress");
+        assert!(
+            out.contains("Wiring ACP"),
+            "active_form shown for in_progress"
+        );
     }
 
     #[test]
