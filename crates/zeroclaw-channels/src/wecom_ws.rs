@@ -1748,7 +1748,13 @@ impl Channel for WeComWsChannel {
         Ok(())
     }
 
-    async fn finalize_draft(&self, recipient: &str, message_id: &str, content: &str) -> Result<()> {
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        content: &str,
+        _suppress_voice: bool,
+    ) -> Result<()> {
         let req_id = self
             .req_id_map
             .lock()
@@ -3112,7 +3118,7 @@ mod tests {
             .insert("stream-1".to_string(), "req-finalize".to_string());
 
         let result = channel
-            .finalize_draft("user--zeroclaw_user", "stream-1", "final")
+            .finalize_draft("user--zeroclaw_user", "stream-1", "final", false)
             .await;
 
         assert!(result.is_err());
