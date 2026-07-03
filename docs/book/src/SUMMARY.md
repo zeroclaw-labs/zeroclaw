@@ -84,6 +84,7 @@
   - [MCP (Model Context Protocol)](./tools/mcp.md)
   - [Browser automation](./tools/browser.md)
   - [Relationship memory](./tools/relationship-memory.md)
+    - [Using relationship memory from skills](./tools/relationship-memory-skill-template.md)
   - [Skills](./tools/skills.md)
   - [Python skills](./tools/python-skills.md)
 - [Security & Autonomy](./security/overview.md)

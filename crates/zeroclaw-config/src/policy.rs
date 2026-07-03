@@ -203,6 +203,13 @@ pub struct SecurityPolicy {
     /// Whether and to which agents this profile may delegate.
     pub delegation_policy: crate::autonomy::DelegationPolicy,
     pub workspace_dir: PathBuf,
+    /// Absolute path to the active `config.toml`. Used to protect the
+    /// runtime config from agent self-modification regardless of how
+    /// deeply the per-agent workspace is nested under the install root
+    /// (the config lives at the install root, not at
+    /// `workspace_dir.parent()`). `None` falls back to the legacy
+    /// `workspace_dir.parent()` location.
+    pub config_path: Option<PathBuf>,
     pub workspace_only: bool,
     pub allowed_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
@@ -540,6 +547,7 @@ impl Default for SecurityPolicy {
             risk_profile_name: String::new(),
             delegation_policy: crate::autonomy::DelegationPolicy::default(),
             workspace_dir: PathBuf::from("."),
+            config_path: None,
             workspace_only: true,
             allowed_commands: default_allowed_commands(),
             forbidden_paths: default_forbidden_paths(),
@@ -2050,33 +2058,44 @@ impl SecurityPolicy {
         false
     }
 
-    fn runtime_config_dir(&self) -> Option<PathBuf> {
-        let parent = self.workspace_dir.parent()?;
-        Some(
-            parent
-                .canonicalize()
-                .unwrap_or_else(|_| parent.to_path_buf()),
-        )
+    /// Directories whose `config.toml`-family files are protected from
+    /// agent self-modification. Includes the real config directory (the
+    /// parent of `config_path`, i.e. the install root) and, for
+    /// backward compatibility with the legacy flat layout, the parent of
+    /// `workspace_dir`. The two differ once per-agent workspaces nest
+    /// under `<install>/agents/<alias>/workspace/`: the config lives at
+    /// the install root, which is no longer `workspace_dir.parent()`.
+    fn runtime_config_dirs(&self) -> Vec<PathBuf> {
+        let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(parent) = self.config_path.as_deref().and_then(Path::parent) {
+            dirs.push(canon(parent));
+        }
+        if let Some(parent) = self.workspace_dir.parent() {
+            let dir = canon(parent);
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+        dirs
     }
 
     pub fn is_runtime_config_path(&self, resolved: &Path) -> bool {
-        let Some(config_dir) = self.runtime_config_dir() else {
-            return false;
-        };
-        if !resolved.starts_with(&config_dir) {
-            return false;
-        }
-        if resolved.parent() != Some(config_dir.as_path()) {
-            return false;
-        }
-
         let Some(file_name) = resolved.file_name().and_then(|value| value.to_str()) else {
             return false;
         };
-
-        file_name == "config.toml"
+        let is_config_name = file_name == "config.toml"
             || file_name == "config.toml.bak"
-            || file_name.starts_with(".config.toml.tmp-")
+            || file_name.starts_with(".config.toml.tmp-");
+        if !is_config_name {
+            return false;
+        }
+        let Some(parent) = resolved.parent() else {
+            return false;
+        };
+        self.runtime_config_dirs()
+            .iter()
+            .any(|dir| parent == dir.as_path())
     }
 
     pub fn runtime_config_violation_message(&self, resolved: &Path) -> String {
@@ -2401,6 +2420,9 @@ impl SecurityPolicy {
             risk_profile_name: String::new(),
             delegation_policy: risk_profile.delegation_policy.clone(),
             workspace_dir: workspace_dir.to_path_buf(),
+            // Set by `for_agent` once the install root is known; the
+            // profile-only constructor has no config path.
+            config_path: None,
             workspace_only: effective_workspace_only,
             allowed_commands: risk_profile.allowed_commands.clone(),
             forbidden_paths: risk_profile.forbidden_paths.clone(),
@@ -2492,6 +2514,12 @@ impl SecurityPolicy {
         if let Some(agent_cfg) = config.agents.get(agent_alias) {
             policy.risk_profile_name = agent_cfg.risk_profile.trim().to_string();
         }
+        // Protect the active runtime config from agent self-modification.
+        // The per-agent workspace nests several levels under the install
+        // root, so `workspace_dir.parent()` alone no longer points at the
+        // directory holding `config.toml`. Record the real config path so
+        // `is_runtime_config_path` guards it directly.
+        policy.config_path = Some(config.config_path.clone());
 
         // Shared skills directory: every agent reads from
         // `<install>/shared/skills/` so the `read_skills` tool resolves
@@ -5450,6 +5478,46 @@ mod tests {
 
         assert!(!policy.is_runtime_config_path(&workspace.join("notes.txt")));
         assert!(!policy.is_runtime_config_path(&nested_dir.join("config.toml")));
+    }
+
+    #[test]
+    fn is_runtime_config_path_protects_install_root_for_nested_agent_layout() {
+        // Real per-agent layout: `<install>/agents/<alias>/workspace`, with
+        // the active config.toml at the install root, two levels above
+        // `workspace_dir.parent()`. Regression guard: the old check only
+        // looked at `workspace_dir.parent()`, leaving the install-root
+        // config.toml unprotected for nested agent workspaces.
+        let install_root = PathBuf::from("/tmp/zeroclaw-install-nested");
+        let workspace = install_root
+            .join("agents")
+            .join("agent-alpha")
+            .join("workspace");
+        let config_path = install_root.join("config.toml");
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            config_path: Some(config_path.clone()),
+            ..SecurityPolicy::default()
+        };
+
+        // The real config at the install root is now protected.
+        assert!(policy.is_runtime_config_path(&config_path));
+        assert!(policy.is_runtime_config_path(&install_root.join("config.toml.bak")));
+        assert!(policy.is_runtime_config_path(&install_root.join(".config.toml.tmp-42")));
+
+        // Legacy fallback (config_path = None) only guards
+        // `workspace.parent()`, so it misses the nested install-root
+        // config. This is exactly the gap the config_path field closes.
+        let legacy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        assert!(!legacy.is_runtime_config_path(&config_path));
+
+        // A config.toml inside the agent workspace is still not a runtime
+        // config path under either policy.
+        assert!(!policy.is_runtime_config_path(&workspace.join("config.toml")));
+        assert!(!legacy.is_runtime_config_path(&workspace.join("config.toml")));
     }
 
     // ── prompt_summary ──────────────────────────────────────
