@@ -451,19 +451,19 @@ pub struct Config {
     /// OIDC trust relationships (`[oidc.<alias>]`). Each entry names one
     /// issuer whose tokens this daemon accepts; incoming tokens are routed
     /// to the matching entry by their `iss` claim. Any standards-compliant
-    /// IdP works — there is no per-vendor configuration.
+    /// IdP works; there is no per-vendor configuration.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub oidc: HashMap<String, OidcConfig>,
 
     /// Local user roster (`[users.<name>]`) for the `ssh-key` and `peercred`
-    /// auth providers. OIDC-authenticated users are NOT listed here — their
+    /// auth providers. OIDC-authenticated users are NOT listed here; their
     /// identity and grants come from the IdP token.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub users: HashMap<String, UserConfig>,
 
-    /// Named permission profiles (`[permission_profiles.<alias>]`) — the
+    /// Named permission profiles (`[permission_profiles.<alias>]`): the
     /// grant sets that OIDC role mappings and user roster entries resolve
     /// to. Deny-by-default: anything a profile does not grant is refused.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -10868,7 +10868,7 @@ pub struct OidcConfig {
     #[serde(default)]
     pub validation: OidcValidation,
     /// Dotted path to the claim holding this deployment's role/group values
-    /// (e.g. `realm_access.roles`, `groups`). Must be set explicitly — the
+    /// (e.g. `realm_access.roles`, `groups`). Must be set explicitly: the
     /// daemon refuses to start when empty, rather than guessing where
     /// grants live in a token.
     #[serde(default)]
@@ -10979,7 +10979,7 @@ pub struct UserConfig {
     /// Unset means this user cannot authenticate via peer credential.
     pub uid: Option<u32>,
     /// The `[permission_profiles.<alias>]` entry granting this user's
-    /// permissions. Required — a user with no profile cannot authenticate.
+    /// permissions. Required; a user with no profile cannot authenticate.
     pub permission_profile: String,
 }
 
@@ -11015,7 +11015,7 @@ impl UserConfig {
 ///
 /// Profiles are the single authorization vocabulary: OIDC `role_map` values
 /// and `[users.<name>].permission_profile` both resolve here. A profile
-/// grants exactly what it lists — everything else is denied.
+/// grants exactly what it lists; everything else is denied.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "permission_profile"]
