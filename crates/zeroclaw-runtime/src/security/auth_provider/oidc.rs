@@ -309,7 +309,8 @@ impl OidcAuthProvider {
             .with_roles(roles)
             .with_scopes(scopes)
             .with_mfa_verified(mfa_verified)
-            .with_expires_at(claims.exp.unwrap_or(0));
+            .with_expires_at(claims.exp.unwrap_or(0))
+            .with_auth_provider(self.alias.clone());
         principal.grants = grants;
         AuthOutcome::Authenticated(principal)
     }
@@ -573,6 +574,7 @@ mod tests {
         assert!(p.grants.permits(Resource::System, Verb::Read));
         assert!(!p.grants.permits(Resource::Config, Verb::Update));
         assert!(p.is_authenticated());
+        assert_eq!(p.auth_provider_label(), "oidc.test");
     }
 
     #[tokio::test]

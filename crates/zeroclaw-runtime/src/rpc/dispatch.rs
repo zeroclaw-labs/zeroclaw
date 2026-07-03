@@ -639,6 +639,23 @@ impl RpcDispatcher {
     }
 
     async fn process_line(&mut self, line: &str) {
+        // Attribution chokepoint (RFC #7141): every record! emitted while a
+        // request is processed inherits the bound principal's identity. The
+        // span is rebuilt per line because initialize rebinds the principal.
+        let span = match self.principal.as_ref() {
+            Some(p) => ::zeroclaw_log::info_span!(
+                target: "zeroclaw_log_internal_scope",
+                "zeroclaw_scope",
+                principal_id = %p.id.as_str(),
+                auth_provider = %p.auth_provider_label(),
+            ),
+            None => ::zeroclaw_log::Span::none(),
+        };
+        use ::zeroclaw_log::Instrument as _;
+        self.dispatch_line(line).instrument(span).await;
+    }
+
+    async fn dispatch_line(&mut self, line: &str) {
         let req: JsonRpcRequest = match serde_json::from_str(line) {
             Ok(r) => r,
             Err(e) => {
@@ -691,7 +708,30 @@ impl RpcDispatcher {
                 .principal
                 .as_ref()
                 .is_some_and(|p| p.grants.permits(resource, verb));
-            if !permitted {
+            let decision_attrs = ::serde_json::json!({
+                "method": method.wire_name(),
+                "resource": resource.to_string(),
+                "verb": verb.to_string(),
+                "verdict": if permitted { "allow" } else { "deny" },
+            });
+            if permitted {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Resolve)
+                        .with_category(::zeroclaw_log::EventCategory::System)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                        .with_attrs(decision_attrs),
+                    "authorization decision"
+                );
+            } else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_category(::zeroclaw_log::EventCategory::System)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(decision_attrs),
+                    "authorization decision"
+                );
                 if !is_notification {
                     self.send_error(
                         id,

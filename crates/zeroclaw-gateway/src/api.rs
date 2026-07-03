@@ -73,7 +73,21 @@ pub(crate) async fn require_auth_middleware(
     }
     match require_auth(&state, req.headers()) {
         Ok(()) => next.run(req).await,
-        Err(e) => e.into_response(),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_category(::zeroclaw_log::EventCategory::System)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "method": req.method().as_str(),
+                        "path": req.uri().path(),
+                        "verdict": "deny",
+                    })),
+                "gateway authorization decision"
+            );
+            e.into_response()
+        }
     }
 }
 

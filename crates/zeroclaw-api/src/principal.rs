@@ -104,6 +104,22 @@ pub enum AuthMethod {
     Native,
 }
 
+impl AuthMethod {
+    /// Wire/audit label for the method — the `<type>` half of the
+    /// `<type>.<alias>` `auth_provider` attribution composite.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::SharedOperator => "shared_operator",
+            Self::Oidc => "oidc",
+            Self::SshKey => "ssh-key",
+            Self::Peercred => "peercred",
+            Self::Native => "native",
+        }
+    }
+}
+
 /// The single authenticated subject, produced by an auth provider and consumed by
 /// every dispatch/authz/audit/isolation surface.
 ///
@@ -157,6 +173,11 @@ pub struct Principal {
     /// [`crate::grants::ResolvedGrants::none`] permits nothing.
     #[serde(default)]
     pub grants: crate::grants::ResolvedGrants,
+    /// The `<type>.<alias>` label of the configured provider entry that
+    /// authenticated this principal (e.g. `oidc.corp`). `None` for providers
+    /// with no config alias; audit falls back to [`AuthMethod::as_str`].
+    #[serde(default)]
+    pub auth_provider: Option<String>,
 }
 
 impl Principal {
@@ -177,6 +198,7 @@ impl Principal {
             expires_at: 0,
             allowed_aliases: Vec::new(),
             grants: crate::grants::ResolvedGrants::all(),
+            auth_provider: None,
         }
     }
 
@@ -200,6 +222,7 @@ impl Principal {
             expires_at: 0,
             allowed_aliases: Vec::new(),
             grants: crate::grants::ResolvedGrants::none(),
+            auth_provider: None,
         }
     }
 
@@ -236,6 +259,23 @@ impl Principal {
     pub fn with_allowed_aliases(mut self, allowed_aliases: Vec<AgentAlias>) -> Self {
         self.allowed_aliases = allowed_aliases;
         self
+    }
+
+    /// Attach the `<type>.<alias>` label of the configured provider entry
+    /// that authenticated this principal.
+    #[must_use]
+    pub fn with_auth_provider(mut self, auth_provider: impl Into<String>) -> Self {
+        self.auth_provider = Some(auth_provider.into());
+        self
+    }
+
+    /// The audit label for how this principal authenticated: the configured
+    /// `<type>.<alias>` when present, else the bare [`AuthMethod::as_str`].
+    #[must_use]
+    pub fn auth_provider_label(&self) -> String {
+        self.auth_provider
+            .clone()
+            .unwrap_or_else(|| self.auth_method.as_str().to_owned())
     }
 
     /// `true` once a *distinct* identity source authenticated this principal —
@@ -329,8 +369,18 @@ mod tests {
             expires_at: 0,
             allowed_aliases: vec![AgentAlias("main".to_owned())],
             grants: crate::grants::ResolvedGrants::none(),
+            auth_provider: None,
         };
         assert!(p.is_authenticated());
+    }
+
+    #[test]
+    fn auth_provider_label_prefers_configured_alias() {
+        let labeled =
+            Principal::new("alice", "alice", AuthMethod::Oidc).with_auth_provider("oidc.corp");
+        assert_eq!(labeled.auth_provider_label(), "oidc.corp");
+        let bare = Principal::new("bob", "bob", AuthMethod::SshKey);
+        assert_eq!(bare.auth_provider_label(), "ssh-key");
     }
 
     #[test]
