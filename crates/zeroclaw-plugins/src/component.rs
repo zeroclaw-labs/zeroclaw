@@ -68,17 +68,9 @@ impl InboundQueue {
     }
 }
 
-/// Resolved per-call execution limits applied to a plugin store. The host
-/// builds this from `[plugins.limits]` config and hands it to `new_store`.
-/// There is deliberately no `Default`: limits always come from the config
-/// registry so no code path can construct an unsandboxed store by accident.
-#[derive(Debug, Clone, Copy)]
-pub struct PluginLimits {
-    pub call_fuel: u64,
-    pub max_memory_bytes: usize,
-    pub max_table_elements: usize,
-    pub max_instances: usize,
-}
+/// Re-export: limits are defined in `execution` (ungated) so the subprocess
+/// protocol and the wasmtime store builder share one type.
+pub use crate::execution::PluginLimits;
 
 pub mod bindings {
     pub mod tool {

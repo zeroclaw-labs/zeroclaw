@@ -19,7 +19,7 @@ zeroclaw-channels = { workspace = true, default-features = false, features = ["c
 zeroclaw-runtime.workspace = true
 zeroclaw-tools.workspace = true
 zeroclaw-hardware.workspace = true
-zeroclaw-plugins = { workspace = true, optional = true }
+zeroclaw-plugins = { workspace = true, optional = true, features = ["plugins-wit-v0", "host"] }
 
 # HTTP server
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"] }

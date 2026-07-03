@@ -566,14 +566,23 @@ The plugin host is a compile-time opt-in. The binary-level features in the
 workspace `Cargo.toml` select whether plugins are built in at all and which
 execution backend ships:
 
-- `plugins-wasm` is the umbrella that pulls the plugin host and its runtime
-  integration into the binary.
-- `plugins-wasm-runtime-only` is the smallest and fastest to start: no JIT, so
-  components are deserialized from a precompiled `.cwasm`.
-- `plugins-wasm-cranelift` adds the Cranelift JIT, so a `.wasm` component is
-  compiled on load.
-- `plugins-wasm-pulley` is the most portable, supporting compilation on targets
-  Cranelift does not cover.
+- `plugins-wasm` pulls in the plugin host and its runtime integration (CLI,
+  discovery, manifests, signatures, tool registration) with **no wasmtime
+  dependency**: execution is delegated to the `zeroclaw-plugin-host` sidecar
+  binary over a line-delimited JSON stdio protocol. This is what release
+  binaries ship; the sidecar is a separate release asset installed next to
+  `zeroclaw` and carries all the JIT weight.
+- `plugins-wasm-runtime-only` opts into in-process execution, smallest and
+  fastest to start: no JIT, so components are deserialized from a precompiled
+  `.cwasm`.
+- `plugins-wasm-cranelift` adds the in-process Cranelift JIT, so a `.wasm`
+  component is compiled on load.
+- `plugins-wasm-pulley` is the most portable in-process backend, supporting
+  compilation on targets Cranelift does not cover.
+
+The sidecar is located via `ZEROCLAW_PLUGIN_HOST`, then as a sibling of the
+running executable, then on `PATH`. Its protocol is versioned; a mismatch
+after an update produces a hard error naming both versions.
 
 These delegate to the `zeroclaw-plugins` crate features
 (`plugins-wasmtime`, `plugins-wasm-cranelift`, `plugins-wasm-pulley`) that wire

@@ -25,12 +25,13 @@ die() {
 bold() { printf "${BOLD}%s${RESET}" "$*"; }
 
 TUI_BIN_NAME="zerocode"
+PLUGIN_HOST_BIN_NAME="zeroclaw-plugin-host"
 
 # Apps installed by default (the rest are discovered and listed but off
 # until selected via --apps or the interactive picker). Intentionally a
 # fixed list: Tauri-based apps need the Tauri toolchain + webview deps,
 # so they ship off-by-default.
-DEFAULT_APPS="zerocode"
+DEFAULT_APPS="zerocode zeroclaw-plugin-host"
 
 # ── Parse Cargo.toml (source of truth) ────────────────────────────
 
@@ -306,6 +307,7 @@ install_prebuilt() {
     info "[dry-run] Would download $asset_url"
     info "[dry-run] Would install to $CARGO_HOME/bin/zeroclaw"
     info "[dry-run] Would install $TUI_BIN_NAME to $CARGO_HOME/bin/$TUI_BIN_NAME (if in tarball)"
+    info "[dry-run] Would install $PLUGIN_HOST_BIN_NAME to $CARGO_HOME/bin/$PLUGIN_HOST_BIN_NAME (if in tarball)"
     info "[dry-run] Would install web dashboard to $web_data_dir"
     return 0
   fi
@@ -358,6 +360,11 @@ install_prebuilt() {
   install -m 755 "$tmp_dir/zeroclaw" "$CARGO_HOME/bin/zeroclaw"
   if [ -f "$tmp_dir/$TUI_BIN_NAME" ]; then
     install -m 755 "$tmp_dir/$TUI_BIN_NAME" "$CARGO_HOME/bin/$TUI_BIN_NAME"
+  fi
+  # Plugin execution sidecar: carries the WASM JIT the main binary omits.
+  # Installed next to zeroclaw so the runtime's sibling lookup finds it.
+  if [ -f "$tmp_dir/$PLUGIN_HOST_BIN_NAME" ]; then
+    install -m 755 "$tmp_dir/$PLUGIN_HOST_BIN_NAME" "$CARGO_HOME/bin/$PLUGIN_HOST_BIN_NAME"
   fi
 
   # Install web dashboard assets bundled in the release tarball

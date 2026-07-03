@@ -7,26 +7,38 @@ description = "WASM plugin system for ZeroClaw — host, manifests, signatures, 
 publish = false
 
 [features]
-default = ["plugins-wit-v0"]
+default = ["plugins-wit-v0", "host"]
 plugins-wit-v0 = []
+# Host-side integration: discovery, manifests, signatures, registry, and the
+# Tool/Channel/Memory trait adapters. The `zeroclaw-plugin-host` sidecar turns
+# this OFF so its dependency tree is just the WASM engine, the wire protocol,
+# and the log pipeline plugins record through.
+host = [
+  "dep:zeroclaw-api",
+  "dep:zeroclaw-spawn",
+  "dep:async-trait",
+  "dep:base64",
+  "dep:ring",
+  "dep:thiserror",
+  "dep:toml",
+]
 plugins-wasmtime = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http"]
 plugins-wasm-cranelift = ["plugins-wasmtime", "wasmtime/cranelift"]
 plugins-wasm-pulley = ["plugins-wasmtime", "wasmtime/pulley"]
 
 [dependencies]
 zeroclaw-log.workspace = true
-zeroclaw-api.workspace = true
-zeroclaw-infra.workspace = true
-zeroclaw-spawn.workspace = true
+zeroclaw-api = { workspace = true, optional = true }
+zeroclaw-spawn = { workspace = true, optional = true }
 anyhow = "1.0"
-async-trait = "0.1"
-base64 = "0.22"
-ring = "0.17"
+async-trait = { version = "0.1", optional = true }
+base64 = { version = "0.22", optional = true }
+ring = { version = "0.17", optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
-thiserror = "2.0"
-tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "rt", "time"] }
-toml = "1.0"
+thiserror = { version = "2.0", optional = true }
+tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "rt", "time", "process", "io-util"] }
+toml = { version = "1.0", optional = true }
 wasmtime = { version = "43", default-features = false, features = [
   "component-model",
   "runtime",

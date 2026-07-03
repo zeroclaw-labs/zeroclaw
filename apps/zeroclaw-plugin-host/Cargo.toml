@@ -1,0 +1,21 @@
+[package]
+name = "zeroclaw-plugin-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Out-of-process WASM plugin execution sidecar for ZeroClaw."
+publish = false
+
+[features]
+# Cranelift JIT by default; `backend-pulley` for targets Cranelift cannot
+# generate code for (e.g. ARM32). The same backend split the in-process
+# `plugins-wasm-*` features expose on the main binary.
+default = ["backend-cranelift"]
+backend-cranelift = ["zeroclaw-plugins/plugins-wasm-cranelift"]
+backend-pulley = ["zeroclaw-plugins/plugins-wasm-pulley"]
+
+[dependencies]
+anyhow = "1.0"
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
+zeroclaw-plugins = { workspace = true, default-features = false, features = ["plugins-wit-v0"] }

@@ -11244,6 +11244,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-plugin-host"
+version = "0.8.2"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "tokio",
+ "zeroclaw-plugins",
+]
+
+[[package]]
 name = "zeroclaw-plugins"
 version = "0.8.2"
 dependencies = [
@@ -11262,7 +11272,6 @@ dependencies = [
  "wasmtime-wasi-http",
  "zeroclaw-api",
  "zeroclaw-config",
- "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-spawn",
 ]

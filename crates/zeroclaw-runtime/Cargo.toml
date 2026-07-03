@@ -15,7 +15,7 @@ zeroclaw-log.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-tools.workspace = true
-zeroclaw-plugins = { workspace = true, optional = true }
+zeroclaw-plugins = { workspace = true, optional = true, features = ["plugins-wit-v0", "host"] }
 zeroclaw-tool-call-parser.workspace = true
 fluent = "0.16"
 anyhow = "1.0"
@@ -101,7 +101,7 @@ schema-export = ["dep:schemars", "zeroclaw-config/schema-export"]
 
 browser-native = []
 rag-pdf = ["dep:pdf-extract"]
-plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
+plugins-wasm = ["dep:zeroclaw-plugins"]
 webauthn = []
 sandbox-bubblewrap = []
 

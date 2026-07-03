@@ -1,8 +1,11 @@
 //! Bridge between WASM plugins and the Tool trait.
+//!
+//! Backend-agnostic: all execution goes through [`crate::execution`], which is
+//! in-process wasmtime when built with `plugins-wasmtime` and the
+//! `zeroclaw-plugin-host` sidecar subprocess otherwise.
 
 use crate::PluginPermission;
-use crate::component::PluginLimits;
-use crate::runtime;
+use crate::execution::{self, PluginLimits};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -58,10 +61,9 @@ impl WasmTool {
         let probe = {
             let wasm_path = wasm_path.clone();
             let permissions = permissions.clone();
-            block_probe(async move {
-                let mut plugin = runtime::create_plugin(&wasm_path, &permissions, limits).await?;
-                runtime::call_tool_metadata(&mut plugin).await
-            })
+            block_probe(
+                async move { execution::tool_metadata(&wasm_path, &permissions, limits).await },
+            )
         };
         let (name, description, schema) = match probe {
             Ok(meta) => (meta.name, meta.description, meta.parameters_schema),
@@ -147,10 +149,19 @@ impl Tool for WasmTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let args_json = serde_json::to_vec(&args)?;
-        let mut plugin =
-            runtime::create_plugin(&self.wasm_path, &self.permissions, self.limits).await?;
-        runtime::call_execute(&mut plugin, &args_json, &self.config, &self.permissions).await
+        let wire = execution::tool_execute(
+            &self.wasm_path,
+            &self.permissions,
+            self.limits,
+            args,
+            &self.config,
+        )
+        .await?;
+        Ok(ToolResult {
+            success: wire.success,
+            output: wire.output,
+            error: wire.error,
+        })
     }
 }
 

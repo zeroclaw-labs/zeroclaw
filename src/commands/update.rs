@@ -277,6 +277,7 @@ pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
         Ok(()) => {
             // Cleanup backup on success
             let _ = tokio::fs::remove_file(&backup_path).await;
+            install_plugin_host_sidecar(&download_path, &current_exe).await;
             println!("{}", update_success_message(&update_info.latest_version));
             println!("{}", prebuilt_channel_note_message());
             Ok(())
@@ -399,6 +400,16 @@ fn should_install(is_newer: bool, force: bool) -> bool {
     is_newer || force
 }
 
+/// Sidecar binary shipped in release archives alongside `zeroclaw`. Installed
+/// next to the main binary so the runtime's sibling lookup finds it. Missing
+/// from an archive is fine (older releases); a failed install is a warning,
+/// not an update failure.
+const PLUGIN_HOST_BIN: &str = "zeroclaw-plugin-host";
+#[cfg(windows)]
+const PLUGIN_HOST_BIN_FILE: &str = "zeroclaw-plugin-host.exe";
+#[cfg(not(windows))]
+const PLUGIN_HOST_BIN_FILE: &str = "zeroclaw-plugin-host";
+
 async fn download_binary(url: &str, sha256sums_url: Option<&str>, dest: &Path) -> Result<()> {
     let client = reqwest::Client::builder()
         .user_agent(format!("zeroclaw/{}", env!("CARGO_PKG_VERSION")))
@@ -430,10 +441,13 @@ async fn download_binary(url: &str, sha256sums_url: Option<&str>, dest: &Path) -
     // Release assets are .tar.gz archives (universal) or .zip archives
     // (Windows) containing the `zeroclaw` (or `zeroclaw.exe`) binary.
     // Extract the binary from the archive instead of writing raw bytes.
+    let host_dest = dest.with_file_name(PLUGIN_HOST_BIN_FILE);
     if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
         extract_tar_gz(&bytes, dest).context("failed to extract binary from tar.gz archive")?;
+        let _ = extract_tar_gz_named(&bytes, &host_dest, &[PLUGIN_HOST_BIN]);
     } else if url.ends_with(".zip") {
         extract_zip(&bytes, dest).context("failed to extract binary from zip archive")?;
+        let _ = extract_zip_named(&bytes, &host_dest, &[PLUGIN_HOST_BIN_FILE]);
     } else {
         tokio::fs::write(dest, &bytes)
             .await
@@ -446,9 +460,43 @@ async fn download_binary(url: &str, sha256sums_url: Option<&str>, dest: &Path) -
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o755);
         tokio::fs::set_permissions(dest, perms).await?;
+        if host_dest.exists() {
+            let perms = std::fs::Permissions::from_mode(0o755);
+            tokio::fs::set_permissions(&host_dest, perms).await?;
+        }
     }
 
     Ok(())
+}
+
+/// Install the plugin-host sidecar extracted next to `download_path` (if the
+/// release archive carried one) beside the main binary. Best-effort: the main
+/// update has already succeeded, so failures here only warn.
+async fn install_plugin_host_sidecar(download_path: &Path, current_exe: &Path) {
+    let extracted = download_path.with_file_name(PLUGIN_HOST_BIN_FILE);
+    if !extracted.exists() {
+        return;
+    }
+    let target = current_exe.with_file_name(PLUGIN_HOST_BIN_FILE);
+    match tokio::fs::copy(&extracted, &target).await {
+        Ok(_) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"path": target.display().to_string()})),
+                "Updated zeroclaw-plugin-host sidecar"
+            );
+        }
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Failed to update zeroclaw-plugin-host sidecar; plugin execution may version-mismatch until it is reinstalled"
+            );
+        }
+    }
 }
 
 async fn verify_download_checksum(
@@ -538,6 +586,11 @@ fn is_sha256_hex(value: &str) -> bool {
 
 /// Extract the `zeroclaw` binary from a `.tar.gz` archive.
 fn extract_tar_gz(archive_bytes: &[u8], dest: &Path) -> Result<()> {
+    extract_tar_gz_named(archive_bytes, dest, &["zeroclaw", "zeroclaw.exe"])
+}
+
+/// Extract the first archive entry whose file name matches one of `names`.
+fn extract_tar_gz_named(archive_bytes: &[u8], dest: &Path, names: &[&str]) -> Result<()> {
     use flate2::read::GzDecoder;
     use std::io::Read;
     use tar::Archive;
@@ -549,10 +602,9 @@ fn extract_tar_gz(archive_bytes: &[u8], dest: &Path) -> Result<()> {
         let mut entry = entry.context("failed to read tar entry")?;
         let path = entry.path().context("failed to read entry path")?;
 
-        // The archive contains a single binary named "zeroclaw" (or "zeroclaw.exe" on Windows).
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-        if file_name == "zeroclaw" || file_name == "zeroclaw.exe" {
+        if names.contains(&file_name) {
             let mut buf = Vec::new();
             entry
                 .read_to_end(&mut buf)
@@ -562,11 +614,16 @@ fn extract_tar_gz(archive_bytes: &[u8], dest: &Path) -> Result<()> {
         }
     }
 
-    bail!("archive does not contain a 'zeroclaw' binary")
+    bail!("archive does not contain any of {names:?}")
 }
 
 /// Extract the `zeroclaw.exe` binary from a `.zip` archive (Windows).
 fn extract_zip(archive_bytes: &[u8], dest: &Path) -> Result<()> {
+    extract_zip_named(archive_bytes, dest, &["zeroclaw.exe"])
+}
+
+/// Extract the first zip entry whose file name matches one of `names`.
+fn extract_zip_named(archive_bytes: &[u8], dest: &Path, names: &[&str]) -> Result<()> {
     use std::io::Read;
 
     let cursor = std::io::Cursor::new(archive_bytes);
@@ -575,7 +632,7 @@ fn extract_zip(archive_bytes: &[u8], dest: &Path) -> Result<()> {
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).context("failed to read zip entry")?;
         let file_name = entry.name().rsplit(&['/', '\\']).next().unwrap_or("");
-        if file_name == "zeroclaw.exe" {
+        if names.contains(&file_name) {
             let mut buf = Vec::new();
             entry
                 .read_to_end(&mut buf)
@@ -585,7 +642,7 @@ fn extract_zip(archive_bytes: &[u8], dest: &Path) -> Result<()> {
         }
     }
 
-    bail!("zip archive does not contain a 'zeroclaw.exe' binary")
+    bail!("zip archive does not contain any of {names:?}")
 }
 
 async fn validate_binary(path: &Path) -> Result<()> {

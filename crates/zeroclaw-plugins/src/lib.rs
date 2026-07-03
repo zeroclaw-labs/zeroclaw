@@ -7,17 +7,23 @@
 pub mod component;
 #[cfg(feature = "plugins-wasmtime")]
 mod component_logging;
+#[cfg(feature = "host")]
 pub mod error;
+pub mod execution;
+#[cfg(feature = "host")]
 pub mod host;
+#[cfg(feature = "host")]
 pub mod registry;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod runtime;
+#[cfg(feature = "host")]
 pub mod signature;
-#[cfg(feature = "plugins-wasmtime")]
+pub mod subprocess;
+#[cfg(all(feature = "host", feature = "plugins-wasmtime"))]
 pub mod wasm_channel;
-#[cfg(feature = "plugins-wasmtime")]
+#[cfg(all(feature = "host", feature = "plugins-wasmtime"))]
 pub mod wasm_memory;
-#[cfg(feature = "plugins-wasmtime")]
+#[cfg(feature = "host")]
 pub mod wasm_tool;
 
 use serde::{Deserialize, Serialize};

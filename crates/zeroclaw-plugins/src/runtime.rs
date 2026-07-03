@@ -5,6 +5,7 @@ use crate::PluginPermission;
 use crate::component::bindings::tool::ToolPlugin;
 use crate::component::bindings::tool::exports::zeroclaw::plugin::tool::ToolResult as WitToolResult;
 use crate::component::{PluginState, call_plugin, engine, load_component, wt};
+use crate::subprocess::WireToolResult as ToolResult;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
@@ -13,15 +14,8 @@ use std::sync::OnceLock;
 use tokio::sync::Mutex;
 use wasmtime::Store;
 use wasmtime::component::Linker;
-use zeroclaw_api::tool::ToolResult;
 
-/// Tool metadata read from a plugin's exported `tool` interface.
-#[derive(Debug)]
-pub struct ToolMetadata {
-    pub name: String,
-    pub description: String,
-    pub parameters_schema: serde_json::Value,
-}
+pub use crate::execution::ToolMetadata;
 
 /// A warm tool plugin: store and bindings created once, reused per call.
 pub struct Plugin {

@@ -1488,7 +1488,7 @@ pub fn all_tools_with_runtime(
                 Ok(host) => {
                     let details = host.tool_plugin_details();
                     let count = details.len();
-                    let plugin_limits = zeroclaw_plugins::component::PluginLimits {
+                    let plugin_limits = zeroclaw_plugins::execution::PluginLimits {
                         call_fuel: config.plugins.limits.call_fuel,
                         max_memory_bytes: config
                             .plugins

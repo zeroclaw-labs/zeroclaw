@@ -43,7 +43,7 @@
         # >>> generated:flake-packages by `cargo generate installers` - do not edit <<<
         # Default feature set: canonical Dist (all channels, no heavyweight).
         # Override with `packages.zeroclaw.override { features = [ ... ]; }`.
-        zeroclawDefaultFeatures = [ "acp-bridge" "agent-runtime" "channel-acp-server" "channel-amqp" "channel-bluesky" "channel-clawdtalk" "channel-dingtalk" "channel-discord" "channel-email" "channel-filesystem" "channel-imessage" "channel-irc" "channel-lark" "channel-linq" "channel-mattermost" "channel-mochat" "channel-mqtt" "channel-nextcloud" "channel-notion" "channel-qq" "channel-reddit" "channel-signal" "channel-slack" "channel-telegram" "channel-twitch" "channel-twitter" "channel-voice-call" "channel-wati" "channel-webhook" "channel-wecom" "channel-wecom-ws" "channel-whatsapp-cloud" "gateway" "observability-prometheus" "schema-export" ];
+        zeroclawDefaultFeatures = [ "acp-bridge" "agent-runtime" "channel-acp-server" "channel-amqp" "channel-bluesky" "channel-clawdtalk" "channel-dingtalk" "channel-discord" "channel-email" "channel-filesystem" "channel-imessage" "channel-irc" "channel-lark" "channel-linq" "channel-mattermost" "channel-mochat" "channel-mqtt" "channel-nextcloud" "channel-notion" "channel-qq" "channel-reddit" "channel-signal" "channel-slack" "channel-telegram" "channel-twitch" "channel-twitter" "channel-voice-call" "channel-wati" "channel-webhook" "channel-wecom" "channel-wecom-ws" "channel-whatsapp-cloud" "gateway" "observability-prometheus" "plugins-wasm" "schema-export" ];
         buildZeroclaw = { pname, cargoPkg, features ? zeroclawDefaultFeatures }:
           (pkgs.makeRustPlatform {
             cargo = rustToolchain;
@@ -67,6 +67,7 @@
       in {
         packages.zeroclaw = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclawlabs"; };
         packages.zerocode = buildZeroclaw { pname = "zerocode"; cargoPkg = "zerocode"; };
+        packages.zeroclaw-plugin-host = buildZeroclaw { pname = "zeroclaw-plugin-host"; cargoPkg = "zeroclaw-plugin-host"; features = [ "backend-cranelift" ]; };
         packages.default = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclawlabs"; };
         checks = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           nixos-module-eval = pkgs.writeText "zeroclaw-nixos-module-eval" (

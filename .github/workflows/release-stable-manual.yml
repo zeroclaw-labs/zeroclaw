@@ -234,6 +234,7 @@ jobs:
             target: armv7-unknown-linux-gnueabihf
             artifact: zeroclaw
             ext: tar.gz
+            plugin_host_pulley: true
             cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
@@ -242,6 +243,7 @@ jobs:
             target: arm-unknown-linux-gnueabihf
             artifact: zeroclaw
             ext: tar.gz
+            plugin_host_pulley: true
             cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
@@ -330,6 +332,15 @@ jobs:
             BUILD_CMD="cargo build"
           fi
           $BUILD_CMD --release --locked --no-default-features --features "${FEATURES}" --target ${{ matrix.target }}
+          # Build the plugin execution sidecar. It carries the wasmtime JIT
+          # weight the main binary deliberately omits (`plugins-wasm` in the
+          # dist set delegates execution to this binary over stdio). ARM32
+          # cannot host Cranelift, so those targets use the Pulley backend.
+          if [ "${{ matrix.plugin_host_pulley || 'false' }}" = "true" ]; then
+            $BUILD_CMD --release --locked -p zeroclaw-plugin-host --no-default-features --features backend-pulley --target ${{ matrix.target }}
+          else
+            $BUILD_CMD --release --locked -p zeroclaw-plugin-host --target ${{ matrix.target }}
+          fi
           # Build the zerocode TUI alongside the main binary so it ships in the
           # release archive. Skipped on Android, which lacks the terminal deps.
           if [ "${{ matrix.target }}" != "aarch64-linux-android" ]; then
@@ -352,6 +363,10 @@ jobs:
             cp target/${{ matrix.target }}/release/zerocode staging/
             extra="zerocode"
           fi
+          if [ -f target/${{ matrix.target }}/release/zeroclaw-plugin-host ]; then
+            cp target/${{ matrix.target }}/release/zeroclaw-plugin-host staging/
+            extra="$extra zeroclaw-plugin-host"
+          fi
           cp -r web/dist staging/web/dist
           cd staging
           tar czf ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} $extra web/dist
@@ -366,6 +381,10 @@ jobs:
           if [ -f target/${{ matrix.target }}/release/zerocode.exe ]; then
             cp target/${{ matrix.target }}/release/zerocode.exe staging/
             extra="zerocode.exe"
+          fi
+          if [ -f target/${{ matrix.target }}/release/zeroclaw-plugin-host.exe ]; then
+            cp target/${{ matrix.target }}/release/zeroclaw-plugin-host.exe staging/
+            extra="$extra zeroclaw-plugin-host.exe"
           fi
           cp -r web/dist staging/web/dist
           cd staging
