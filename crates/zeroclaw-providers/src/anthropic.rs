@@ -893,11 +893,6 @@ impl AnthropicModelProvider {
         let mut cached_input_tokens: Option<u64> = None;
         let mut cache_creation_input_tokens: Option<u64> = None;
 
-        // EOF is only a clean end when the model already reported how it
-        // stopped (message_delta stop_reason; message_stop returns directly).
-        // A socket that closes before then is a truncated response and must
-        // surface an error so the runtime can retry, not a Final that the
-        // agent loop mistakes for an empty completed turn.
         let mut saw_stop_reason = false;
 
         loop {
@@ -1147,38 +1142,7 @@ impl AnthropicModelProvider {
             }
         }
 
-        if !saw_stop_reason {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_category(::zeroclaw_log::EventCategory::Provider)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                    })),
-                "stream: SSE connection closed before message_stop — truncated response, surfacing error"
-            );
-            let _ = tx
-                .send(Err(StreamError::Http(
-                    "SSE stream closed before message_stop: response truncated".to_string(),
-                )))
-                .await;
-            return;
-        }
-
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                .with_category(::zeroclaw_log::EventCategory::Provider)
-                .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                .with_attrs(::serde_json::json!({
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                })),
-            "stream: SSE parser reached end of stream, emitting Final"
-        );
-        let _ = tx.send(Ok(StreamEvent::Final)).await;
+        crate::stream_guard::finish_sse_stream(tx, saw_stop_reason, "message_stop").await;
     }
 }
 
