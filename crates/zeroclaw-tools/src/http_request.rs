@@ -275,6 +275,10 @@ impl HttpRequestTool {
             .filter(|secret| !secret.is_empty())
             .ok_or_else(|| anyhow::Error::msg(format!("auth_secret '{secret_name}' not found")))?;
 
+        if let Some(secret) = resolve_env_backed_auth_secret(secret_name, raw_secret)? {
+            return Ok(secret);
+        }
+
         if zeroclaw_config::secrets::SecretStore::is_encrypted(raw_secret) {
             let zeroclaw_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
             let store =
@@ -385,6 +389,48 @@ impl HttpRequestTool {
     }
 }
 
+fn resolve_env_backed_auth_secret(
+    secret_name: &str,
+    raw_secret: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some(env_name) = env_secret_reference(raw_secret)? else {
+        return Ok(None);
+    };
+
+    let value = std::env::var(env_name).map_err(|e| {
+        anyhow::Error::msg(format!(
+            "auth_secret '{secret_name}' references environment variable '{env_name}', but it could not be read: {e}"
+        ))
+    })?;
+    if value.is_empty() {
+        anyhow::bail!(
+            "auth_secret '{secret_name}' references environment variable '{env_name}', but it is empty"
+        );
+    }
+    Ok(Some(value))
+}
+
+fn env_secret_reference(raw_secret: &str) -> anyhow::Result<Option<&str>> {
+    let Some(inner) = raw_secret
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+    else {
+        return Ok(None);
+    };
+
+    if inner.is_empty() {
+        anyhow::bail!(
+            "environment-backed auth_secret references an empty environment variable name"
+        );
+    }
+    if !inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        anyhow::bail!(
+            "environment-backed auth_secret '{inner}' must contain only ASCII letters, numbers, or underscores"
+        );
+    }
+    Ok(Some(inner))
+}
+
 #[async_trait]
 impl Tool for HttpRequestTool {
     fn name(&self) -> &str {
@@ -416,7 +462,7 @@ impl Tool for HttpRequestTool {
                 },
                 "auth_secret": {
                     "type": "string",
-                    "description": "Name of a secret in [http_request.secrets] to send as the Authorization header. Overrides any literal Authorization header."
+                    "description": "Name of a secret in [http_request.secrets] to send as the Authorization header. Secret entries may be literal, encrypted, or environment-backed as ${ENV_VAR}. Overrides any literal Authorization header."
                 },
                 "body": {
                     "type": "string",
@@ -788,6 +834,73 @@ api_token = "Bearer from-disk"
         assert_eq!(
             tool.resolve_auth_secret("api_token").unwrap(),
             "Bearer from-disk"
+        );
+    }
+
+    #[test]
+    fn auth_secret_resolves_env_backed_config_value() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[http_request.secrets]
+api_token = "${ZEROCLAW_TEST_HTTP_REQUEST_SECRET}"
+"#,
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("ZEROCLAW_TEST_HTTP_REQUEST_SECRET", "Bearer from-env");
+        }
+        scopeguard::defer! {
+            unsafe {
+                std::env::remove_var("ZEROCLAW_TEST_HTTP_REQUEST_SECRET");
+            }
+        }
+
+        let tool = test_tool_with_auth_config(config_path, false);
+
+        assert_eq!(
+            tool.resolve_auth_secret("api_token").unwrap(),
+            "Bearer from-env"
+        );
+    }
+
+    #[test]
+    fn auth_secret_reports_missing_env_backed_config_value() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[http_request.secrets]
+api_token = "${ZEROCLAW_TEST_HTTP_REQUEST_MISSING_SECRET}"
+"#,
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("ZEROCLAW_TEST_HTTP_REQUEST_MISSING_SECRET");
+        }
+
+        let tool = test_tool_with_auth_config(config_path, false);
+        let err = tool
+            .resolve_auth_secret("api_token")
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("ZEROCLAW_TEST_HTTP_REQUEST_MISSING_SECRET"),
+            "missing env-backed secret should name the missing variable: {err}"
+        );
+    }
+
+    #[test]
+    fn auth_secret_rejects_invalid_env_reference_name() {
+        let err = env_secret_reference("${BAD-NAME}").unwrap_err().to_string();
+
+        assert!(
+            err.contains("ASCII letters, numbers, or underscores"),
+            "invalid env-backed secret name should fail clearly: {err}"
         );
     }
 
