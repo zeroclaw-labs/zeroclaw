@@ -1054,6 +1054,26 @@ impl RpcDispatcher {
                             .sessions
                             .seed_conversation_history(&session_id, data.messages)
                             .await;
+                        // Restore the durable TodoWrite plan into the fresh
+                        // in-memory session and re-emit it so the resuming /
+                        // reconnecting client's tracker repopulates without a
+                        // model round-trip. Robust against tmux detach, socket
+                        // drop, suspend/resume, and daemon restart.
+                        if let Some(ref store) = self.ctx.acp_session_store {
+                            let store = store.clone();
+                            let sid = session_id.clone();
+                            let plan = tokio::task::spawn_blocking(move || {
+                                store.get_plan(&sid).unwrap_or_default()
+                            })
+                            .await
+                            .unwrap_or_default();
+                            if !plan.is_empty() {
+                                self.ctx.sessions.set_plan(&session_id, plan.clone()).await;
+                                if let Some(n) = plan_replay_notification(&session_id, &plan) {
+                                    let _ = self.rpc.send_raw(n).await;
+                                }
+                            }
+                        }
                     }
                     Ok(Ok(AcpSessionNewLoad::Created)) => {}
                     Ok(Ok(AcpSessionNewLoad::Killed)) => {
@@ -3989,6 +4009,21 @@ async fn persist_plan_if_any(
     }
 }
 
+/// Build the `session/update` `plan` notification used to repopulate a
+/// resuming/reconnecting client's tracker from stored state. Returns
+/// `None` when the plan is empty (nothing to show). Reuses the same
+/// `TurnEvent::Plan` → notification mapping as the live path so the wire
+/// shape can never drift between live and replay.
+fn plan_replay_notification(session_id: &str, entries: &[zeroclaw_api::plan::PlanEntry]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let event = TurnEvent::Plan {
+        entries: entries.to_vec(),
+    };
+    notification_for_turn_event(session_id, &event, None)
+}
+
 fn notification_for_turn_event(
     session_id: &str,
     event: &TurnEvent,
@@ -4871,6 +4906,28 @@ mod tests {
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "plan");
         assert!(v["params"]["entries"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resume_plan_notification_built_for_nonempty_plan() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+        let entries = vec![PlanEntry {
+            content: "Resume me".to_string(),
+            status: PlanStatus::Pending,
+            priority: PlanPriority::Medium,
+            active_form: None,
+        }];
+        let json = plan_replay_notification("sess-9", &entries).expect("nonempty plan replays");
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "plan");
+        assert_eq!(v["params"]["session_id"], "sess-9");
+        assert_eq!(v["params"]["entries"][0]["content"], "Resume me");
+    }
+
+    #[test]
+    fn resume_plan_notification_absent_for_empty_plan() {
+        assert!(plan_replay_notification("sess-9", &[]).is_none());
     }
 
     async fn store_with_one_session(sid: &str) -> Arc<crate::rpc::session::SessionStore> {
