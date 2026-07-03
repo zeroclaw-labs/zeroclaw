@@ -159,6 +159,7 @@ Tiers are promoted, never demoted, through deliberate team decision.
 - `apps/zerocode/` — TUI onboarding wizard
 - `crates/zeroclaw-plugins/` — WASM plugin system
 - `crates/zeroclaw-tool-call-parser/` — tool call parsing
+- `apps/tauri/` — Tauri-based desktop GUI
 - `docs/` — topic-based documentation (setup-guides, reference, ops, security, hardware, contributing, maintainers)
 - `.github/` — CI, templates, automation workflows
 
