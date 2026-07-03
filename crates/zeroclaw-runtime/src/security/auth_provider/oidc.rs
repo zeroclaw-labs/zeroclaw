@@ -219,6 +219,9 @@ fn claim_values(rest: &serde_json::Map<String, serde_json::Value>, path: &str) -
             .into_iter()
             .filter_map(|v| v.as_str().map(str::to_owned))
             .collect(),
+        // Zitadel-style role claims are objects keyed by role name
+        // (`urn:zitadel:iam:org:project:roles`); the keys are the values.
+        serde_json::Value::Object(map) => map.keys().cloned().collect(),
         _ => Vec::new(),
     }
 }
@@ -756,5 +759,19 @@ mod tests {
         assert_eq!(claim_values(&claims.rest, "groups"), vec!["g1"]);
         assert_eq!(claim_values(&claims.rest, "plan"), vec!["pro"]);
         assert!(claim_values(&claims.rest, "missing.path").is_empty());
+    }
+
+    #[test]
+    fn claim_path_extracts_object_keys_for_zitadel_role_shape() {
+        let claims: Claims = serde_json::from_value(serde_json::json!({
+            "urn:zitadel:iam:org:project:roles": {
+                "zeroclaw-admin": {"276...": "org.example.com"},
+                "zeroclaw-operator": {"276...": "org.example.com"},
+            },
+        }))
+        .unwrap();
+        let mut roles = claim_values(&claims.rest, "urn:zitadel:iam:org:project:roles");
+        roles.sort();
+        assert_eq!(roles, vec!["zeroclaw-admin", "zeroclaw-operator"]);
     }
 }

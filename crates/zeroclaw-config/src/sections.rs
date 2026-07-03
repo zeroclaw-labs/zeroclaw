@@ -166,6 +166,7 @@ pub fn humanize_section_key(key: &str) -> String {
         "providers.models" => return "Model providers".to_string(),
         "providers.tts" => return "TTS providers".to_string(),
         "providers.transcription" => return "Transcription providers".to_string(),
+        "oidc" => return "OIDC".to_string(),
         _ => {}
     }
     let mut s = key.replace(['_', '-', '.'], " ");
