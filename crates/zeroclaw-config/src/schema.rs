@@ -114,6 +114,11 @@ pub struct Config {
     /// instance until repaired. Never serialized — a load-time signal.
     #[serde(skip)]
     pub degraded_security: Vec<String>,
+    /// Non-security sections the resilient loader reset to `Default` because
+    /// the on-disk block was malformed. Surfaced on stderr at CLI startup so
+    /// a bad section is impossible to miss without `-v`. Never serialized.
+    #[serde(skip)]
+    pub degraded_sections: Vec<String>,
     /// Config file schema version.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
@@ -16205,6 +16210,7 @@ impl Default for Config {
             onepassword_reference_snapshots: std::collections::HashMap::new(),
             dirty_paths: std::collections::HashSet::new(),
             degraded_security: Vec::new(),
+            degraded_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::Providers::default(),
             model_routes: Vec::new(),
@@ -17226,6 +17232,7 @@ impl Config {
             let salvage = crate::migration::migrate_to_current_salvaged(&contents);
             let mut config: Config = salvage.config;
             config.degraded_security = salvage.dropped_security;
+            config.degraded_sections = salvage.dropped;
             if let Some(from_version) = stale_version {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -22356,6 +22363,7 @@ auto_save = true
         let config = Config {
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             degraded_security: Vec::new(),
+            degraded_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: {
                 let mut p = crate::providers::Providers::default();
@@ -23133,6 +23141,7 @@ default_temperature = 0.7
         let config = Config {
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             degraded_security: Vec::new(),
+            degraded_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
             model_routes: Vec::new(),

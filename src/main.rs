@@ -2606,6 +2606,49 @@ fn plugin_host_with_configured_security(
     )
 }
 
+/// Seed an empty `plugins.entries` entry named after a freshly installed
+/// plugin so `zeroclaw config set plugins.entries.<name>.config.<key>` works
+/// without hand-editing the config file. Natural-key path routing only
+/// matches keys already present in live config, so a missing entry makes the
+/// plugin unconfigurable through standard surfaces.
+#[cfg(feature = "plugins-wasm")]
+async fn seed_plugin_entry(config: &mut crate::config::schema::Config, name: &str) -> Result<()> {
+    if config.plugins.entries.iter().any(|e| e.name == name) {
+        return Ok(());
+    }
+    config
+        .plugins
+        .entries
+        .push(crate::config::schema::PluginEntryConfig {
+            name: name.to_string(),
+            config: std::collections::HashMap::new(),
+        });
+    config.mark_dirty(&format!("plugins.entries.{name}"));
+    Box::pin(config.save_dirty()).await?;
+    Ok(())
+}
+
+/// Print unmissable stderr warnings for config sections the resilient loader
+/// reset to defaults. The salvage machinery records WARN/ERROR events, but the
+/// terminal fmt layer is muted without `-v`, so a malformed section (e.g.
+/// `[plugins.entries]` instead of `[[plugins.entries]]`) previously vanished
+/// silently: `config get` showed defaults while the file said otherwise. See
+/// zeroclaw-labs/zeroclaw#8636.
+fn warn_degraded_config_sections(config: &Config) {
+    for path in &config.degraded_sections {
+        eprintln!(
+            "warning: config section `[{path}]` in {} is malformed and was ignored; the values shown/used are DEFAULTS, not what the file says. Run `zeroclaw config migrate` to see the parse error.",
+            config.config_path.display()
+        );
+    }
+    for path in &config.degraded_security {
+        eprintln!(
+            "error: SECURITY-CRITICAL config section `{path}` in {} is malformed and was reset to defaults; the running posture may be weaker than intended. Run `zeroclaw config migrate` to see the parse error.",
+            config.config_path.display()
+        );
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum ConfigCommands {
     /// Dump the full configuration JSON Schema to stdout. With `--path`, returns
@@ -3290,6 +3333,7 @@ async fn main() -> Result<()> {
 
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
+    warn_degraded_config_sections(&config);
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
     #[cfg(feature = "agent-runtime")]
@@ -5668,7 +5712,8 @@ async fn main() -> Result<()> {
                 }
                 let mut host = plugin_host_with_configured_security(&config)?;
                 if plugin_registry::is_local_plugin_source(&source) {
-                    host.install(&source)?;
+                    let name = host.install(&source)?;
+                    seed_plugin_entry(&mut config, &name).await?;
                     println!(
                         "{}",
                         ta(
@@ -5694,7 +5739,8 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
-                    host.install(&plugin_dir)?;
+                    let name = host.install(&plugin_dir)?;
+                    seed_plugin_entry(&mut config, &name).await?;
                     println!(
                         "{}",
                         ta(

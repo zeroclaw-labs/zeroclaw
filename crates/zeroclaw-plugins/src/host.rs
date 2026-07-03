@@ -200,8 +200,9 @@ impl PluginHost {
         self.loaded.get(name).map(plugin_info_from_loaded)
     }
 
-    /// Install a plugin from a directory path.
-    pub fn install(&mut self, source: &str) -> Result<(), PluginError> {
+    /// Install a plugin from a directory path. Returns the installed plugin's
+    /// manifest name so callers can seed config surfaces keyed by it.
+    pub fn install(&mut self, source: &str) -> Result<String, PluginError> {
         let source_path = PathBuf::from(source);
         let manifest_path = if source_path.is_dir() {
             source_path.join("manifest.toml")
@@ -271,8 +272,9 @@ impl PluginHost {
             }
         }
 
+        let name = manifest.name.clone();
         self.loaded.insert(
-            manifest.name.clone(),
+            name.clone(),
             LoadedPlugin {
                 manifest,
                 plugin_dir: dest_dir,
@@ -281,7 +283,7 @@ impl PluginHost {
             },
         );
 
-        Ok(())
+        Ok(name)
     }
 
     /// Remove a plugin by name.
