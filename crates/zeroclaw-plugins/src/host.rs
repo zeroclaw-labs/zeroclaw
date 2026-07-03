@@ -327,6 +327,19 @@ impl PluginHost {
             .collect()
     }
 
+    /// Get channel-capable plugins with their resolved WASM file paths.
+    /// Returns `(manifest, resolved_wasm_path)` tuples for building
+    /// `WasmChannel`s, mirroring [`Self::tool_plugin_details`]. Channel plugins
+    /// without a `wasm_path` are skipped, so a manifest that declares the
+    /// capability but ships no component is never registered as a live channel.
+    pub fn channel_plugin_details(&self) -> Vec<(&PluginManifest, &Path)> {
+        self.loaded
+            .values()
+            .filter(|p| p.manifest.capabilities.contains(&PluginCapability::Channel))
+            .filter_map(|p| p.wasm_path.as_deref().map(|wp| (&p.manifest, wp)))
+            .collect()
+    }
+
     /// Get skill-capable plugins.
     pub fn skill_plugins(&self) -> Vec<&PluginManifest> {
         self.loaded
@@ -963,6 +976,44 @@ capabilities = ["tool"]
         )
         .unwrap();
         std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
+    }
+
+    fn write_channel_plugin(plugins_dir: &Path, name: &str, with_wasm: bool) {
+        let plugin_dir = plugins_dir.join(name);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let wasm_line = if with_wasm {
+            "wasm_path = \"plugin.wasm\"\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            format!(
+                "name = \"{name}\"\nversion = \"0.1.0\"\ncapabilities = [\"channel\"]\n{wasm_line}"
+            ),
+        )
+        .unwrap();
+        if with_wasm {
+            std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
+        }
+    }
+
+    #[test]
+    fn channel_plugin_details_yields_only_wasm_backed_channels() {
+        let dir = tempdir().unwrap();
+        let plugins_base = dir.path().join("plugins");
+        write_channel_plugin(&plugins_base, "with-wasm", true);
+        write_channel_plugin(&plugins_base, "no-wasm", false);
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        let details = host.channel_plugin_details();
+        assert_eq!(
+            details.len(),
+            1,
+            "a channel manifest with no wasm_path is not registrable as a live channel"
+        );
+        assert_eq!(details[0].0.name, "with-wasm");
+        assert!(details[0].1.ends_with("plugin.wasm"));
     }
 
     #[test]

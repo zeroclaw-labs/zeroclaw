@@ -1,9 +1,11 @@
 use crate::helpers::domain_guard;
 use async_trait::async_trait;
 use serde_json::json;
-use std::sync::Arc;
+use std::{process::Stdio, sync::Arc, time::Duration};
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
+
+const BROWSER_OPEN_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Open approved HTTP/HTTPS URLs in the system default browser (no scraping, no DOM automation).
 pub struct BrowserOpenTool {
@@ -157,32 +159,47 @@ impl Tool for BrowserOpenTool {
     }
 }
 
+async fn run_browser_launcher(command: tokio::process::Command, label: &str) -> Result<(), String> {
+    run_browser_launcher_with_timeout(command, label, BROWSER_OPEN_LAUNCH_TIMEOUT).await
+}
+
+async fn run_browser_launcher_with_timeout(
+    mut command: tokio::process::Command,
+    label: &str,
+    deadline: Duration,
+) -> Result<(), String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+
+    match tokio::time::timeout(deadline, command.status()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => Err(format!("{label} exited with status {status}")),
+        Ok(Err(error)) => Err(format!("{label} not runnable: {error}")),
+        Err(_) => Err(format!("{label} timed out after {deadline:?}")),
+    }
+}
+
 async fn open_in_system_browser(url: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let primary_error = match tokio::process::Command::new("open").arg(url).status().await {
-            Ok(status) if status.success() => return Ok(()),
-            Ok(status) => format!("open exited with status {status}"),
-            Err(error) => format!("open not runnable: {error}"),
+        let mut command = tokio::process::Command::new("open");
+        command.arg(url);
+        let primary_error = match run_browser_launcher(command, "open").await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
         };
 
         // TODO(compat): remove Brave fallback after default-browser launch has been stable across macOS environments.
         let mut brave_error = String::new();
         for app in ["Brave Browser", "Brave"] {
-            match tokio::process::Command::new("open")
-                .arg("-a")
-                .arg(app)
-                .arg(url)
-                .status()
-                .await
-            {
-                Ok(status) if status.success() => return Ok(()),
-                Ok(status) => {
-                    brave_error = format!("open -a '{app}' exited with status {status}");
-                }
-                Err(error) => {
-                    brave_error = format!("open -a '{app}' not runnable: {error}");
-                }
+            let mut command = tokio::process::Command::new("open");
+            command.arg("-a").arg(app).arg(url);
+            match run_browser_launcher(command, &format!("open -a '{app}'")).await {
+                Ok(()) => return Ok(()),
+                Err(error) => brave_error = error,
             }
         }
 
@@ -206,14 +223,10 @@ async fn open_in_system_browser(url: &str) -> anyhow::Result<()> {
                 command.arg("open");
             }
             command.arg(url);
-            match command.status().await {
-                Ok(status) if status.success() => return Ok(()),
-                Ok(status) => {
-                    last_error = format!("{cmd} exited with status {status}");
-                }
-                Err(error) => {
-                    last_error = format!("{cmd} not runnable: {error}");
-                }
+            let label = if cmd == "gio" { "gio open" } else { cmd };
+            match run_browser_launcher(command, label).await {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = error,
             }
         }
 
@@ -227,28 +240,22 @@ async fn open_in_system_browser(url: &str) -> anyhow::Result<()> {
     {
         // Use direct process invocation (not `cmd /C start`) to avoid shell
         // metacharacter interpretation in URLs (e.g. `&` in query strings).
-        let primary_error = match tokio::process::Command::new("rundll32")
-            .arg("url.dll,FileProtocolHandler")
-            .arg(url)
-            .status()
-            .await
-        {
-            Ok(status) if status.success() => return Ok(()),
-            Ok(status) => format!("rundll32 default-browser launcher exited with status {status}"),
-            Err(error) => format!("rundll32 default-browser launcher not runnable: {error}"),
-        };
+        let mut command = tokio::process::Command::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler").arg(url);
+        let primary_error =
+            match run_browser_launcher(command, "rundll32 default-browser launcher").await {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            };
 
         // TODO(compat): remove Brave fallback after default-browser launch has been stable across Windows environments.
         let mut brave_error = String::new();
         for cmd in ["brave", "brave.exe"] {
-            match tokio::process::Command::new(cmd).arg(url).status().await {
-                Ok(status) if status.success() => return Ok(()),
-                Ok(status) => {
-                    brave_error = format!("{cmd} exited with status {status}");
-                }
-                Err(error) => {
-                    brave_error = format!("{cmd} not runnable: {error}");
-                }
+            let mut command = tokio::process::Command::new(cmd);
+            command.arg(url);
+            match run_browser_launcher(command, cmd).await {
+                Ok(()) => return Ok(()),
+                Err(error) => brave_error = error,
             }
         }
 
@@ -511,6 +518,36 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("rate limit"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launcher_helper_times_out_stalled_process() {
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("60");
+
+        let started = std::time::Instant::now();
+        let error =
+            run_browser_launcher_with_timeout(command, "test launcher", Duration::from_millis(20))
+                .await
+                .unwrap_err();
+
+        assert!(error.contains("timed out"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout helper waited too long: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launcher_helper_allows_successful_process() {
+        let command = tokio::process::Command::new("true");
+
+        run_browser_launcher_with_timeout(command, "test launcher", Duration::from_secs(1))
+            .await
+            .unwrap();
     }
 
     // ── allowed_private_hosts opt-in tests ──────────────────────

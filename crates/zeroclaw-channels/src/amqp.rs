@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use portable_atomic::{AtomicU64, Ordering};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use futures_util::StreamExt;
@@ -12,6 +12,11 @@ use lapin::{
     types::FieldTable,
 };
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_config::schema::AmqpDispatch;
+use zeroclaw_runtime::sop::audit::SopAuditLogger;
+use zeroclaw_runtime::sop::dispatch::{dispatch_sop_event, process_headless_results};
+use zeroclaw_runtime::sop::engine::{SopEngine, now_iso8601};
+use zeroclaw_runtime::sop::types::{SopEvent, SopTriggerSource};
 
 static MSG_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -20,6 +25,8 @@ static MSG_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Binds a queue to an exchange, consumes deliveries, and lifts each JSON
 /// body into a `ChannelMessage` driving the agent loop. The body-to-message
 /// mapping is config-driven so a new publisher is onboarded by configuration.
+/// When `dispatch` selects a SOP mode, each delivery also (or instead) becomes
+/// an `amqp` `SopEvent` routed to the SOP engine by routing key.
 pub struct AmqpChannel {
     amqp_url: String,
     exchange: String,
@@ -32,6 +39,9 @@ pub struct AmqpChannel {
     content_template: String,
     thread_id_field: String,
     durable_ack: bool,
+    dispatch: AmqpDispatch,
+    engine: Option<Arc<Mutex<SopEngine>>>,
+    audit: Option<Arc<SopAuditLogger>>,
     alias: String,
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 }
@@ -49,13 +59,36 @@ pub struct AmqpChannelConfig {
     pub content_template: String,
     pub thread_id_field: String,
     pub durable_ack: bool,
+    pub dispatch: AmqpDispatch,
+    pub engine: Option<Arc<Mutex<SopEngine>>>,
+    pub audit: Option<Arc<SopAuditLogger>>,
     pub alias: String,
     pub peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryOutcome {
+    Processed,
+    ReceiverGone,
+}
+
 impl AmqpChannel {
-    pub fn new(cfg: AmqpChannelConfig) -> Self {
-        Self {
+    pub fn new(cfg: AmqpChannelConfig) -> anyhow::Result<Self> {
+        let routes_sop = matches!(
+            cfg.dispatch,
+            AmqpDispatch::Sop | AmqpDispatch::SopAndAgentLoop
+        );
+        if routes_sop && (cfg.engine.is_none() || cfg.audit.is_none()) {
+            anyhow::bail!(
+                "amqp.{}: dispatch = {:?} routes to the SOP engine but no SOP \
+                 engine/audit handles are available; refusing to start a \
+                 channel that would acknowledge deliveries without dispatching \
+                 them",
+                cfg.alias,
+                cfg.dispatch
+            );
+        }
+        Ok(Self {
             amqp_url: cfg.amqp_url,
             exchange: cfg.exchange,
             routing_keys: cfg.routing_keys,
@@ -67,9 +100,12 @@ impl AmqpChannel {
             content_template: cfg.content_template,
             thread_id_field: cfg.thread_id_field,
             durable_ack: cfg.durable_ack,
+            dispatch: cfg.dispatch,
+            engine: cfg.engine,
+            audit: cfg.audit,
             alias: cfg.alias,
             peer_resolver: cfg.peer_resolver,
-        }
+        })
     }
 
     pub fn alias(&self) -> &str {
@@ -96,6 +132,69 @@ impl AmqpChannel {
         };
 
         (content, thread_ts)
+    }
+
+    /// Route a single consumed delivery. For combined `sop_and_agent_loop`
+    /// the agent-loop handoff is attempted first and the SOP side only runs
+    /// once the runtime receiver has accepted the delivery, so a closed
+    /// receiver (reload/shutdown/supervisor restart) fails closed before any
+    /// SOP side effect rather than running a SOP and then leaving the broker
+    /// to redeliver the same logical work.
+    async fn route_delivery(
+        &self,
+        routing_key: &str,
+        data: &[u8],
+        tx: &mpsc::Sender<ChannelMessage>,
+    ) -> DeliveryOutcome {
+        let routes_sop = matches!(
+            self.dispatch,
+            AmqpDispatch::Sop | AmqpDispatch::SopAndAgentLoop
+        );
+        let routes_agent = matches!(
+            self.dispatch,
+            AmqpDispatch::AgentLoop | AmqpDispatch::SopAndAgentLoop
+        );
+
+        if routes_agent {
+            let (content, thread_ts) = self.map_delivery(data);
+            let seq = MSG_SEQ.fetch_add(1, Ordering::Relaxed);
+
+            let channel_msg = ChannelMessage {
+                id: format!("amqp_{}_{seq}", chrono::Utc::now().timestamp_millis()),
+                sender: self.sender_label.clone(),
+                reply_target: self.sender_label.clone(),
+                content,
+                channel: "amqp".to_string(),
+                channel_alias: Some(self.alias.clone()),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                thread_ts,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            };
+
+            if tx.send(channel_msg).await.is_err() {
+                return DeliveryOutcome::ReceiverGone;
+            }
+        }
+
+        if routes_sop && let (Some(engine), Some(audit)) = (&self.engine, &self.audit) {
+            let event = SopEvent {
+                source: SopTriggerSource::Amqp,
+                topic: Some(routing_key.to_string()),
+                payload: Some(String::from_utf8_lossy(data).to_string()),
+                timestamp: now_iso8601(),
+            };
+            let results = dispatch_sop_event(engine, audit, event).await;
+            process_headless_results(&results);
+        }
+
+        DeliveryOutcome::Processed
     }
 
     /// Establish a lapin connection on the existing tokio runtime, declaring
@@ -308,34 +407,14 @@ impl Channel for AmqpChannel {
                 continue;
             };
 
-            let (content, thread_ts) = self.map_delivery(&delivery.data);
-            let seq = MSG_SEQ.fetch_add(1, Ordering::Relaxed);
-
-            let channel_msg = ChannelMessage {
-                id: format!("amqp_{}_{seq}", chrono::Utc::now().timestamp_millis()),
-                sender: self.sender_label.clone(),
-                reply_target: self.sender_label.clone(),
-                content,
-                channel: "amqp".to_string(),
-                channel_alias: Some(self.alias.clone()),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                thread_ts,
-                interruption_scope_id: None,
-                attachments: vec![],
-                subject: None,
-
-                ..Default::default()
-            };
-
-            if tx.send(channel_msg).await.is_err() {
-                return Ok(());
-            }
-
-            if self.durable_ack {
-                delivery.acker.ack(BasicAckOptions::default()).await?;
+            let routing_key = delivery.routing_key.as_str().to_string();
+            match self.route_delivery(&routing_key, &delivery.data, &tx).await {
+                DeliveryOutcome::Processed => {
+                    if self.durable_ack {
+                        delivery.acker.ack(BasicAckOptions::default()).await?;
+                    }
+                }
+                DeliveryOutcome::ReceiverGone => return Ok(()),
             }
         }
 
@@ -418,7 +497,13 @@ fn str_of_value(value: &serde_json::Value) -> String {
 mod tests {
     use super::*;
 
-    fn channel_with(content_template: &str, thread_id_field: &str) -> AmqpChannel {
+    fn try_channel_with(
+        content_template: &str,
+        thread_id_field: &str,
+        dispatch: AmqpDispatch,
+        engine: Option<Arc<Mutex<SopEngine>>>,
+        audit: Option<Arc<SopAuditLogger>>,
+    ) -> anyhow::Result<AmqpChannel> {
         AmqpChannel::new(AmqpChannelConfig {
             amqp_url: "amqp://localhost:5672".into(),
             exchange: "amq.topic".into(),
@@ -431,9 +516,23 @@ mod tests {
             content_template: content_template.into(),
             thread_id_field: thread_id_field.into(),
             durable_ack: true,
+            dispatch,
+            engine,
+            audit,
             alias: "stagex".into(),
             peer_resolver: Arc::new(Vec::new),
         })
+    }
+
+    fn channel_with(content_template: &str, thread_id_field: &str) -> AmqpChannel {
+        try_channel_with(
+            content_template,
+            thread_id_field,
+            AmqpDispatch::AgentLoop,
+            None,
+            None,
+        )
+        .expect("agent-loop dispatch needs no SOP handles")
     }
 
     #[test]
@@ -577,5 +676,81 @@ tr7J6RKtO4OsZS/2KoYL8M+o
     fn build_client_identity_none_without_cert() {
         let ch = channel_with("", "");
         assert!(ch.build_client_identity().expect("no client tls").is_none());
+    }
+
+    fn sop_handles() -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
+        use zeroclaw_config::schema::SopConfig;
+        use zeroclaw_memory::NoneMemory;
+        let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
+        let audit = Arc::new(SopAuditLogger::new(Arc::new(NoneMemory::new("none"))));
+        (engine, audit)
+    }
+
+    #[test]
+    fn new_rejects_sop_dispatch_without_handles() {
+        for dispatch in [AmqpDispatch::Sop, AmqpDispatch::SopAndAgentLoop] {
+            let result = try_channel_with("", "", dispatch, None, None);
+            let Err(err) = result else {
+                panic!("SOP dispatch without engine/audit must fail closed");
+            };
+            assert!(
+                err.to_string().contains("SOP engine"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_accepts_agent_loop_without_handles() {
+        assert!(try_channel_with("", "", AmqpDispatch::AgentLoop, None, None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn combined_route_fails_closed_when_receiver_gone() {
+        let (engine, audit) = sop_handles();
+        let ch = try_channel_with(
+            "{name}",
+            "name",
+            AmqpDispatch::SopAndAgentLoop,
+            Some(engine),
+            Some(audit),
+        )
+        .expect("sop_and_agent_loop with handles constructs");
+
+        let (tx, rx) = mpsc::channel::<ChannelMessage>(1);
+        drop(rx);
+
+        let outcome = ch
+            .route_delivery("anitya.update", br#"{"name":"curl"}"#, &tx)
+            .await;
+
+        assert_eq!(
+            outcome,
+            DeliveryOutcome::ReceiverGone,
+            "a closed receiver must short-circuit before SOP dispatch so the \
+             delivery is left unacked for broker redelivery, not run as a SOP"
+        );
+    }
+
+    #[tokio::test]
+    async fn combined_route_dispatches_agent_when_receiver_open() {
+        let (engine, audit) = sop_handles();
+        let ch = try_channel_with(
+            "{name}",
+            "name",
+            AmqpDispatch::SopAndAgentLoop,
+            Some(engine),
+            Some(audit),
+        )
+        .expect("sop_and_agent_loop with handles constructs");
+
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
+        let outcome = ch
+            .route_delivery("anitya.update", br#"{"name":"curl"}"#, &tx)
+            .await;
+
+        assert_eq!(outcome, DeliveryOutcome::Processed);
+        let msg = rx.recv().await.expect("agent-loop message delivered");
+        assert_eq!(msg.content, "curl");
     }
 }
