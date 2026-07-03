@@ -726,6 +726,7 @@ impl DelegateTool {
             None,
             None,
             None,
+            None,
         )
         .tools;
 

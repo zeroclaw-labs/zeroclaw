@@ -75,6 +75,34 @@ fn record_provider_fallback(
 // the retry loop continues, falls back to the next model_provider, or aborts
 // immediately — avoiding wasted latency on errors that cannot self-heal.
 
+/// Return a short user-facing string for transient provider errors, or `None`
+/// for errors that warrant showing the technical detail to the user.
+///
+/// Callers should use this instead of forwarding raw error strings so that
+/// transient overloads and rate-limits produce a brief, friendly reply rather
+/// than a multi-line technical dump.
+pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
+    let msg = err.to_string();
+    // 503 / service unavailable / high demand (Gemini, OpenAI, etc.)
+    if msg.contains("503")
+        || msg.to_ascii_lowercase().contains("unavailable")
+        || msg.to_ascii_lowercase().contains("high demand")
+        || msg.to_ascii_lowercase().contains("overloaded")
+    {
+        return Some(
+            "I'm temporarily unable to reach my AI backend — please try again in a moment.",
+        );
+    }
+    // 429 / quota / rate limit
+    if msg.contains("429")
+        || msg.to_ascii_lowercase().contains("rate limit")
+        || msg.to_ascii_lowercase().contains("quota")
+    {
+        return Some("I've hit a usage limit — please try again shortly.");
+    }
+    None
+}
+
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 pub fn is_non_retryable(err: &anyhow::Error) -> bool {
     // Context window errors are NOT non-retryable — they can be recovered

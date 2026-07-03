@@ -182,6 +182,25 @@ mod tests {
         }
     }
 
+    fn wttr_in_weather_tool() -> SkillTool {
+        let mut args = HashMap::new();
+        args.insert(
+            "location".to_string(),
+            "Location to get weather for".to_string(),
+        );
+
+        SkillTool {
+            name: "weather_lookup".to_string(),
+            description: "Fetch weather from wttr.in".to_string(),
+            kind: "http".to_string(),
+            command: "https://wttr.in/{{location}}?format=j1".to_string(),
+            args,
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: None,
+        }
+    }
+
     #[test]
     fn skill_http_tool_name_is_prefixed() {
         let tool = SkillHttpTool::new("weather_skill", &sample_http_tool());
@@ -209,6 +228,32 @@ mod tests {
         let tool = SkillHttpTool::new("weather_skill", &sample_http_tool());
         let result = tool.substitute_args(&serde_json::json!({"city": "London"}));
         assert_eq!(result, "https://api.example.com/weather?city=London");
+    }
+
+    #[test]
+    fn skill_http_can_model_minimal_wttr_weather_lookup() {
+        let tool = SkillHttpTool::new("weather_skill", &wttr_in_weather_tool());
+
+        assert_eq!(tool.name(), "weather_skill__weather_lookup");
+        assert_eq!(tool.description(), "Fetch weather from wttr.in");
+
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["location"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["location"]["description"],
+            "Location to get weather for"
+        );
+        assert!(
+            schema["required"]
+                .as_array()
+                .expect("required array")
+                .iter()
+                .any(|name| name == "location")
+        );
+
+        let url = tool.substitute_args(&serde_json::json!({"location": "London"}));
+        assert_eq!(url, "https://wttr.in/London?format=j1");
     }
 
     #[test]

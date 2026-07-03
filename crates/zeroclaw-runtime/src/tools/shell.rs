@@ -636,6 +636,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     fn unrestricted_shell_test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Full,

@@ -286,6 +286,13 @@ cli-skills-install-suggestion =
 
     一致した機能: {$matched}
     次: `{$install_command}` を実行してインストールしてください。
+
+cli-plugin-install-suggestion =
+    このリクエストには `{$name}` プラグインが必要なようですが、インストールされていません。
+
+    一致した機能: {$matched}
+    次: `{$install_command}` を実行してインストールしてください。
+
 cli-completions-long-about =
     `zeroclaw` のシェル補完スクリプトを生成します。
 

@@ -2,7 +2,7 @@
 //!
 //! Implements the subset of the ACP `elicitation/create` RFD that
 //! ZeroClaw uses for multiple-choice prompts. See the ACP elicitation
-//! RFD: https://agentclientprotocol.com/rfds/elicitation
+//! RFD: <https://agentclientprotocol.com/rfds/elicitation>
 //! for the design rationale.
 
 use serde::{Deserialize, Serialize};
