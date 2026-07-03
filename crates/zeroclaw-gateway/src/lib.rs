@@ -146,9 +146,6 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 use zeroclaw_providers::{self, ModelProvider};
-use zeroclaw_runtime::agent::loop_::{
-    eager_mcp_tool_allowed, mcp_tool_access_policy, register_eager_mcp_tool_if_allowed,
-};
 use zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy;
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::i18n;
@@ -156,6 +153,7 @@ use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
 use zeroclaw_runtime::tools;
 use zeroclaw_runtime::tools::CanvasStore;
+use zeroclaw_runtime::tools::scoped;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -463,135 +461,6 @@ fn default_agent_alias(config: &Config) -> Option<String> {
         .filter(|(_, a)| a.enabled)
         .map(|(alias, _)| alias.clone())
         .min()
-}
-
-/// Connect the MCP servers granted to `agent_alias` by its `mcp_bundles` and
-/// append the resulting tools to `gw_tools`, gated by the agent's tool-access
-/// policy. Shared by the dashboard-agent seed and the per-agent
-/// `/api/tools` registry builder so both surfaces scope MCP identically
-/// (omission is not a grant; deny wins). A no-op when MCP is disabled or the
-/// agent's bundles grant no servers, and non-fatal on connect failure so the
-/// gateway still boots.
-async fn append_scoped_mcp_tools(
-    config: &Config,
-    agent_alias: &str,
-    security: &Arc<SecurityPolicy>,
-    gw_tools: &mut Vec<Box<dyn tools::Tool>>,
-    gw_delegate: Option<&tools::DelegateParentToolsHandle>,
-) {
-    let agent_mcp_servers = if config.mcp.enabled {
-        config.mcp_servers_for_agent(agent_alias)
-    } else {
-        Vec::new()
-    };
-    if agent_mcp_servers.is_empty() {
-        return;
-    }
-    use ::zeroclaw_log::Instrument;
-    let mcp_policy = mcp_tool_access_policy(security, None);
-    let mcp_model_provider = config
-        .agents
-        .get(agent_alias)
-        .map(|a| a.model_provider.as_str().to_string())
-        .unwrap_or_default();
-    let mcp_model = config
-        .model_provider_for_agent(agent_alias)
-        .and_then(|p| p.model.clone())
-        .unwrap_or_default();
-    let attribution_span =
-        ::zeroclaw_log::attribution_span!(&zeroclaw_runtime::agent::AgentAttribution(agent_alias));
-    ::zeroclaw_log::scope!(
-        model_provider: mcp_model_provider,
-        model: mcp_model,
-        =>
-        async {
-            match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
-                Ok(registry) => {
-                    let registry = std::sync::Arc::new(registry);
-                    if config.mcp.deferred_loading {
-                        let deferred_set = tools::DeferredMcpToolSet::from_registry(
-                            std::sync::Arc::clone(&registry),
-                        )
-                        .await;
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
-                            &format!(
-                                "Gateway MCP deferred_loading: {} tool stub(s) from {} server(s)",
-                                deferred_set.len(),
-                                registry.server_count()
-                            )
-                        );
-                        let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                            tools::ActivatedToolSet::new(),
-                        ));
-                        let mut tool_search =
-                            tools::ToolSearchTool::new(deferred_set, activated);
-                        if let Some(policy) = mcp_policy {
-                            tool_search = tool_search.with_access_policy(policy);
-                        }
-                        gw_tools.push(Box::new(tool_search));
-                    } else {
-                        let names = registry.tool_names();
-                        let mut registered = 0usize;
-                        let mut skipped = 0usize;
-                        for name in names {
-                            if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
-                                skipped += 1;
-                                continue;
-                            }
-                            if let Some(def) = registry.get_tool_def(&name).await {
-                                let wrapper: std::sync::Arc<dyn tools::Tool> =
-                                    std::sync::Arc::new(tools::McpToolWrapper::new(
-                                        name,
-                                        def,
-                                        std::sync::Arc::clone(&registry),
-                                    ));
-                                if register_eager_mcp_tool_if_allowed(
-                                    wrapper,
-                                    gw_tools,
-                                    gw_delegate,
-                                    mcp_policy.as_ref(),
-                                ) {
-                                    registered += 1;
-                                }
-                            }
-                        }
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"skipped": skipped})),
-                            &format!(
-                                "Gateway MCP: {} tool(s) registered from {} server(s)",
-                                registered,
-                                registry.server_count()
-                            )
-                        );
-                    }
-                }
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(
-                            module_path!(),
-                            ::zeroclaw_log::Action::Fail
-                        )
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "Gateway MCP registry failed to initialize"
-                    );
-                }
-            }
-        }
-    )
-    .instrument(attribution_span)
-    .await;
 }
 
 /// Shared state for all axum handlers
@@ -1013,19 +882,43 @@ pub async fn run_gateway(
                 sop_audit.clone(),
                 None,
             );
+            // Mint the registry through the gated seam: the built-in
+            // allow/deny filter and MCP scope+gate (omission is not a grant)
+            // run inside `assemble`, shared with every other path routed
+            // through it. The gateway previously applied only the MCP step,
+            // so its /api/tools listings showed unfiltered built-ins the
+            // agent's policy denies.
+            let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+                config: &config,
+                agent_alias,
+                security: &security,
+                built: all_tools_result,
+                // The gateway registers no skills today; unifying the two
+                // skill loaders through this seam is the Epic F follow-up.
+                skills: &[],
+                runtime: Arc::clone(&runtime),
+                caller_allowed: None,
+                connect_mcp: true,
+                // Listing-only registry: loading peripherals physically opens
+                // hardware (exclusive serial holds) that the live turn paths
+                // need. Never connect them for a registry no turn runs against.
+                connect_peripherals: false,
+                exclude_memory: false,
+            })
+            .await;
             // Wire channel-driven tool handles so the dashboard agent can
             // deliver messages to configured channels (same pattern as
             // orchestrator::start_channels).
-            // reaction_handle_gw is PerToolChannelHandle (not Option);
+            // reaction_handle is PerToolChannelHandle (not Option);
             // register_channels_for_tools expects &Option for all handles.
-            let reaction_handle_gw_opt = Some(all_tools_result.reaction_handle.clone());
+            let reaction_handle_gw_opt = Some(assembled.reaction_handle.clone());
             let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
                 &config,
-                &all_tools_result.ask_user_handle,
-                &all_tools_result.channel_room_handle,
+                &assembled.ask_user_handle,
+                &assembled.channel_room_handle,
                 &reaction_handle_gw_opt,
-                &all_tools_result.poll_handle,
-                &all_tools_result.escalate_handle,
+                &assembled.poll_handle,
+                &assembled.escalate_handle,
             );
             if !channel_names.is_empty() {
                 ::zeroclaw_log::record!(
@@ -1038,22 +931,11 @@ pub async fn run_gateway(
                     ),
                 );
             }
-            let mut gw_tools = all_tools_result.tools;
-            let gw_delegate = all_tools_result.delegate_handle;
-            // MCP tools, scoped to this agent's `mcp_bundles` and gated by its
-            // tool policy (parity with the orchestrator + runtime paths;
-            // omission is not a grant). Factored into `append_scoped_mcp_tools`
-            // so the per-agent registry below scopes MCP identically; a gateway
-            // with no resolved agent gets no MCP servers.
-            append_scoped_mcp_tools(
-                &config,
-                agent_alias,
-                &security,
-                &mut gw_tools,
-                gw_delegate.as_ref(),
-            )
-            .await;
-            (gw_tools, gw_delegate)
+            // Listing-only registry: no turn runs against it, so the
+            // deferred-MCP prompt section and activation handle returned by
+            // `assemble` have no consumer here (live gateway chat resolves
+            // its tools inside process_message).
+            (assembled.registry.into_inner(), assembled.delegate_handle)
         }
         (Some(_), None) => {
             // Agent existed but its config failed to resolve. Warned
@@ -1148,17 +1030,29 @@ pub async fn run_gateway(
             sop_audit.clone(),
             None,
         );
-        let mut agent_tools = agent_tools_result.tools;
-        let agent_delegate = agent_tools_result.delegate_handle;
-        append_scoped_mcp_tools(
-            &config,
-            &alias,
-            &security,
-            &mut agent_tools,
-            agent_delegate.as_ref(),
-        )
+        // Same gated seam as the dashboard seed above, so this listing shows
+        // the agent's policy-filtered set (filter + MCP). The tools are only
+        // enumerated for their specs, never invoked, so the returned channel
+        // handles, deferred section, and activation handle are unused.
+        let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+            config: &config,
+            agent_alias: &alias,
+            security: &security,
+            built: agent_tools_result,
+            // Same divergence note as the dashboard seed: no skills on the
+            // gateway until Epic F unifies the loaders.
+            skills: &[],
+            runtime: Arc::clone(&runtime),
+            caller_allowed: None,
+            connect_mcp: true,
+            // Same as the seed: never open hardware for a listing (and
+            // `config.peripherals` is global - N per-agent opens of the same
+            // boards would fail against the first holder anyway).
+            connect_peripherals: false,
+            exclude_memory: false,
+        })
         .await;
-        let specs: Vec<ToolSpec> = agent_tools.iter().map(|t| t.spec()).collect();
+        let specs: Vec<ToolSpec> = assembled.registry.iter().map(|t| t.spec()).collect();
         tools_registry_by_agent.insert(alias, Arc::new(specs));
     }
     let tools_registry_by_agent: Arc<HashMap<String, Arc<Vec<ToolSpec>>>> =
@@ -4422,6 +4316,9 @@ mod tests {
     use zeroclaw_api::channel::ChannelMessage;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use zeroclaw_providers::ModelProvider;
+    use zeroclaw_runtime::agent::loop_::{
+        mcp_tool_access_policy, register_eager_mcp_tool_if_allowed,
+    };
 
     #[test]
     fn default_agent_alias_picks_smallest_enabled_and_is_deterministic() {
@@ -4482,82 +4379,6 @@ mod tests {
                 error: None,
             })
         }
-    }
-
-    /// Regression test for #7733 at the gateway MCP wiring site.
-    /// `append_scoped_mcp_tools` must early-return without mutating
-    /// `gw_tools` when the agent has no `mcp_bundles` grant, even if
-    /// `[[mcp.servers]]` is non-empty.
-    ///
-    /// Note: this is a behavior-pinning test, not a mutation-discriminating
-    /// one. The configured stdio server (`/usr/bin/mcp-fs`) is unlikely
-    /// to exist on the test host, so a hypothetical regression that
-    /// reverted to `&config.mcp.servers` would also produce zero
-    /// registered tools (the stdio connect fails non-fatally). The
-    /// stronger guard against that regression is
-    /// `crates/zeroclaw-channels/tests/orchestrator_mcp_scope.rs` plus
-    /// the resolver-level pins in `zeroclaw-config`. This test still
-    /// adds value by exercising the `append_scoped_mcp_tools` call
-    /// surface and ensuring it does not hang or panic for an unscoped
-    /// agent.
-    #[tokio::test]
-    async fn append_scoped_mcp_tools_is_a_noop_for_agent_without_bundles() {
-        use std::sync::Arc;
-        use zeroclaw_config::schema::{
-            AliasedAgentConfig, McpServerConfig, McpTransport, RiskProfileConfig,
-        };
-
-        let mut config = Config::default();
-        config.mcp.enabled = true;
-        config.mcp.servers = vec![McpServerConfig {
-            name: "fs".into(),
-            transport: McpTransport::Stdio,
-            command: "/usr/bin/mcp-fs".into(),
-            ..Default::default()
-        }];
-        // Critically: NO mcp_bundles configured and NO agent grants.
-        config
-            .risk_profiles
-            .insert("test-profile".into(), RiskProfileConfig::default());
-        config.agents.insert(
-            "unscoped".into(),
-            AliasedAgentConfig {
-                enabled: true,
-                model_provider: "openai.test-provider".into(),
-                risk_profile: "test-profile".into(),
-                mcp_bundles: Vec::new(),
-                ..Default::default()
-            },
-        );
-
-        let security: Arc<SecurityPolicy> = Arc::new(SecurityPolicy {
-            workspace_dir: std::env::temp_dir(),
-            ..SecurityPolicy::default()
-        });
-
-        let mut gw_tools: Vec<Box<dyn tools::Tool>> = Vec::new();
-        let initial_len = gw_tools.len();
-
-        // Bound the call with a short timeout: if the no-bundle branch
-        // ever stops being an early-return and tries to spawn an stdio
-        // MCP child, we'd rather see a timeout failure here than a
-        // hanging CI job.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            super::append_scoped_mcp_tools(&config, "unscoped", &security, &mut gw_tools, None),
-        )
-        .await
-        .expect("append_scoped_mcp_tools must not hang for an unscoped agent");
-
-        assert_eq!(
-            gw_tools.len(),
-            initial_len,
-            "append_scoped_mcp_tools must not push any tool when the \
-             agent has no mcp_bundles grant; gw_tools went from {} \
-             to {}",
-            initial_len,
-            gw_tools.len()
-        );
     }
 
     /// Gateway parity with the channel path: the gateway now scopes MCP servers
