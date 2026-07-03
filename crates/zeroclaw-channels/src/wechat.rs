@@ -974,6 +974,54 @@ impl WeChatChannel {
         )
     }
 
+    /// Resolve `candidate` (already lexically inside `workspace_dir`) to its
+    /// real on-disk path and verify that the canonical target still lives
+    /// under the canonical workspace. Closes the symlink-escape hole that a
+    /// purely-lexical `resolve_under` leaves open: a workspace entry such as
+    /// `outside -> /etc` would otherwise pass lexical containment and let an
+    /// incoming marker like `[DOCUMENT:/workspace/outside/passwd]` read
+    /// `/etc/passwd` once `tokio::fs::read` follows the link.
+    ///
+    /// When `candidate` does not exist (and therefore cannot be canonicalized),
+    /// the lexical result is returned unchanged: a non-existent path cannot
+    /// resolve through a symlink. The lexical check is the safety net for
+    /// non-existent targets.
+    fn canonicalize_within_workspace(
+        candidate: &Path,
+        workspace_dir: &Path,
+        raw_target: &str,
+    ) -> anyhow::Result<PathBuf> {
+        let Ok(candidate_canon) = std::fs::canonicalize(candidate) else {
+            return Ok(candidate.to_path_buf());
+        };
+        let workspace_canon = std::fs::canonicalize(workspace_dir).with_context(|| {
+            format!(
+                "workspace_dir {} could not be canonicalized",
+                workspace_dir.display()
+            )
+        })?;
+        if !candidate_canon.starts_with(&workspace_canon) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "attachment path {} canonicalizes to {} which escapes workspace {}",
+                    raw_target,
+                    candidate_canon.display(),
+                    workspace_canon.display(),
+                )
+            );
+            anyhow::bail!(
+                "attachment path {} canonicalizes to {} which escapes workspace {}",
+                raw_target,
+                candidate_canon.display(),
+                workspace_canon.display(),
+            );
+        }
+        Ok(candidate_canon)
+    }
+
     fn resolve_local_attachment_path(&self, target: &str) -> anyhow::Result<PathBuf> {
         let workspace_dir = self.workspace_dir.as_deref().ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -994,13 +1042,14 @@ impl WeChatChannel {
 
         // `/workspace/...` is interpreted as relative to the workspace root.
         if let Some(rel) = target.strip_prefix("/workspace/") {
-            return resolve_under(workspace_dir, rel).with_context(|| {
+            let resolved = resolve_under(workspace_dir, rel).with_context(|| {
                 format!(
                     "attachment path {} escapes workspace {}",
                     target,
                     workspace_dir.display()
                 )
-            });
+            })?;
+            return Self::canonicalize_within_workspace(&resolved, workspace_dir, target);
         }
 
         // Absolute paths are allowed only if they are already inside the workspace.
@@ -1024,17 +1073,18 @@ impl WeChatChannel {
                     workspace_dir.display()
                 );
             }
-            return Ok(normalized);
+            return Self::canonicalize_within_workspace(&normalized, workspace_dir, target);
         }
 
         // Relative paths are resolved under the workspace root.
-        resolve_under(workspace_dir, target).with_context(|| {
+        let resolved = resolve_under(workspace_dir, target).with_context(|| {
             format!(
                 "attachment path {} escapes workspace {}",
                 target,
                 workspace_dir.display()
             )
-        })
+        })?;
+        Self::canonicalize_within_workspace(&resolved, workspace_dir, target)
     }
 
     fn remote_file_name(
@@ -2796,6 +2846,71 @@ mod tests {
                 .is_err(),
             "file URI outside workspace should be rejected"
         );
+    }
+
+    #[test]
+    fn resolve_local_attachment_path_rejects_symlink_escaping_workspace() {
+        // Workspace contains `outside -> /tmp/.../outside-target`, where the
+        // target dir lives outside the workspace. Lexical normalization
+        // (which `resolve_under` does) is not enough — the symlink must be
+        // resolved and the canonical target must be re-checked against the
+        // canonical workspace, otherwise `[DOCUMENT:outside/file.txt]` would
+        // read the file the symlink points at.
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let outside_dir = temp.path().join("outside-target");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let outside_file = outside_dir.join("secret.txt");
+        std::fs::write(&outside_file, "top secret").unwrap();
+        std::os::unix::fs::symlink(&outside_dir, workspace.join("outside")).unwrap();
+
+        let ch = test_wechat_channel_with_workspace(&workspace);
+        let err = ch
+            .resolve_local_attachment_path("/workspace/outside/secret.txt")
+            .expect_err("symlink that escapes workspace must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("canonicalizes to") && msg.contains("escapes workspace"),
+            "expected canonical-escape error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_local_attachment_path_accepts_symlink_within_workspace() {
+        // Workspace-internal symlinks are legitimate aliases (e.g. a
+        // `latest -> 2026-07-03` link inside an attachments directory).
+        // They must still resolve cleanly so the upload sees the real file.
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let real_dir = workspace.join("attachments").join("2026-07-03");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real_file = real_dir.join("report.pdf");
+        std::fs::write(&real_file, b"%PDF-1.4\n").unwrap();
+        std::os::unix::fs::symlink(&real_dir, workspace.join("latest")).unwrap();
+
+        let ch = test_wechat_channel_with_workspace(&workspace);
+        let resolved = ch
+            .resolve_local_attachment_path("/workspace/latest/report.pdf")
+            .expect("workspace-internal symlink alias must be accepted");
+        let real_canon = std::fs::canonicalize(&real_file).unwrap();
+        assert_eq!(resolved, real_canon);
+    }
+
+    #[test]
+    fn resolve_local_attachment_path_allows_nonexistent_lexical_target() {
+        // Non-existent paths must still pass (a future-write path, or a
+        // target the agent has not created yet). The canonical-containment
+        // check is skipped because canonicalize() would fail.
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ch = test_wechat_channel_with_workspace(&workspace);
+        let resolved = ch
+            .resolve_local_attachment_path("/workspace/not-yet-created.png")
+            .expect("non-existent path under workspace is allowed (lexical only)");
+        assert_eq!(resolved, workspace.join("not-yet-created.png"));
     }
 
     #[tokio::test]
