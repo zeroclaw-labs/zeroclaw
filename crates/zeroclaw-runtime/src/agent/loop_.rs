@@ -1205,7 +1205,7 @@ pub async fn run(
         let eff_max_history_messages = agent.resolved.max_history_messages;
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
-        let eff_max_context_tokens = agent.resolved.model_context_window;
+        let eff_model_context_window = agent.resolved.model_context_window;
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -2730,7 +2730,7 @@ pub async fn run(
                                 let taken = std::mem::take(&mut history);
                                 let result = crate::agent::history_trim::trim_to_recent_turns(
                                     taken,
-                                    eff_max_context_tokens,
+                                    eff_model_context_window,
                                 );
                                 if result.trimmed {
                                     let mut trimmed = result.history;
@@ -2817,7 +2817,7 @@ pub async fn run(
                 if let Some(ref ctx) = cost_tracking_context {
                     let usage = ctx.snapshot_turn_usage();
                     if usage.input_tokens > 0 || usage.output_tokens > 0 {
-                        let max_ctx = eff_max_context_tokens as u64;
+                        let max_ctx = eff_model_context_window as u64;
                         let pct = if max_ctx > 0 {
                             (usage.input_tokens as f64 / max_ctx as f64 * 100.0).min(100.0)
                         } else {

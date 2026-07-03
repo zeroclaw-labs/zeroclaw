@@ -3281,7 +3281,8 @@ pub struct ResolvedRuntime {
     pub compact_context: bool,
     pub max_tool_iterations: usize,
     pub max_history_messages: usize,
-    /// Output budget: max tokens to send per request (from runtime profile).
+    /// Token budget for preemptive context/history trimming (from runtime profile).
+    /// NOT the provider `max_tokens` output limit.
     pub max_context_tokens: usize,
     /// Model's context window (max input tokens) — from provider config.
     pub model_context_window: usize,
@@ -3925,9 +3926,8 @@ impl Config {
 
     #[must_use]
     pub fn effective_max_context_tokens(&self, agent_alias: &str) -> usize {
-        // Output budget: max tokens to send per request (runtime profile override).
-        // This is the max_tokens sent to the model provider per request.
-        // NOT the model's context window.
+        // Token budget for preemptive context/history trimming (runtime profile override).
+        // This is NOT the provider max_tokens output limit and NOT the model's context window.
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_context_tokens)
             .unwrap_or(32_000)
@@ -4026,7 +4026,7 @@ impl Config {
         let mut resolved = ResolvedRuntime {
             max_tool_iterations: self.effective_max_tool_iterations(agent_alias),
             max_history_messages: self.effective_max_history_messages(agent_alias),
-            // Output budget (max tokens per request) — from runtime profile
+            // Token budget for context/history trimming — from runtime profile
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
             // Model's context window (max input tokens) — from provider config
             model_context_window: self.effective_model_context_window(agent_alias),

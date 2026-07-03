@@ -533,6 +533,34 @@ mod tests {
     }
 
     #[test]
+    fn doctor_ctxwin_write_failed_formats_in_english_and_japanese() {
+        let cases = [(
+            "cli-doctor-ctxwin-write-failed",
+            &[
+                ("provider_ref", "groq.alias2"),
+                ("error", "simulated write failure"),
+            ][..],
+        )];
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+        ] {
+            for (key, args) in cases {
+                let value = format_ftl_message(source.0, source.1, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                assert!(
+                    value.contains("groq.alias2"),
+                    "{key} in {locale} should inline provider_ref; got: {value:?}"
+                );
+                assert!(
+                    value.contains("simulated write failure"),
+                    "{key} in {locale} should inline error; got: {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn channel_compile_guidance_cli_strings_format_from_fluent() {
         let cases = [
             (

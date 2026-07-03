@@ -591,16 +591,12 @@ pub async fn update_context_windows(
                             println!(
                                 "{}",
                                 crate::i18n::get_required_cli_string_with_args(
-                                    "cli-doctor-ctxwin-not-found",
-                                    &[("provider_ref", provider_ref.as_str())],
+                                    "cli-doctor-ctxwin-write-failed",
+                                    &[
+                                        ("provider_ref", provider_ref.as_str()),
+                                        ("error", &e.to_string()),
+                                    ],
                                 )
-                            );
-                            crate::i18n::get_required_cli_string_with_args(
-                                "cli-doctor-ctxwin-write-failed",
-                                &[
-                                    ("provider_ref", provider_ref.as_str()),
-                                    ("error", &e.to_string()),
-                                ],
                             );
                         }
                     }
