@@ -473,7 +473,7 @@ fn compute_excluded_mcp_tools(
         .collect()
 }
 
-fn native_tool_specs_present_for_turn(
+pub fn native_tool_specs_present_for_turn(
     model_provider: &dyn ModelProvider,
     tools_registry: &[Box<dyn Tool>],
     excluded_tools: &[String],
