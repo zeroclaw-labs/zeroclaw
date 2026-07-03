@@ -78,6 +78,59 @@ impl TodoTracker {
             .filter(|e| e.status == PlanStatus::Completed)
             .count()
     }
+
+    /// Whether the tracker should be allocated layout space right now.
+    /// Side panels always claim space when visible (placeholder when
+    /// empty); the bottom strip claims space only when it has entries
+    /// (terminal row height is precious).
+    pub(crate) fn wants_space(&self) -> bool {
+        if !self.is_visible() {
+            return false;
+        }
+        match self.location {
+            TodoLocation::Left | TodoLocation::Right => true,
+            TodoLocation::Bottom => !self.entries.is_empty(),
+        }
+    }
+
+    pub(crate) fn render(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        use ratatui::style::{Modifier, Style};
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Paragraph};
+
+        let title = format!("Plan ({}) — {}/{} done", self.total(), self.done(), self.total());
+        let block = Block::default().borders(Borders::ALL).title(title);
+
+        if self.entries.is_empty() {
+            let placeholder = Paragraph::new("No active plan").block(block);
+            frame.render_widget(placeholder, area);
+            return;
+        }
+
+        let mut lines: Vec<Line> = Vec::with_capacity(self.entries.len());
+        for e in &self.entries {
+            let (glyph, style, label): (&str, Style, &str) = match e.status {
+                PlanStatus::Completed => (
+                    "✔",
+                    Style::default().add_modifier(Modifier::DIM),
+                    e.content.as_str(),
+                ),
+                PlanStatus::InProgress => (
+                    "▶",
+                    Style::default().add_modifier(Modifier::BOLD),
+                    e.active_form.as_deref().unwrap_or(&e.content),
+                ),
+                PlanStatus::Pending => ("○", Style::default(), e.content.as_str()),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{glyph} "), style),
+                Span::styled(label.to_string(), style),
+            ]));
+        }
+
+        let para = Paragraph::new(lines).block(block);
+        frame.render_widget(para, area);
+    }
 }
 
 #[cfg(test)]
@@ -155,5 +208,67 @@ mod tests {
         ]);
         assert_eq!(t.total(), 3);
         assert_eq!(t.done(), 1);
+    }
+
+    // ── rendering tests ────────────────────────────────────────────────────
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+
+    fn render_to_string(t: &TodoTracker, w: u16, h: u16) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| t.render(f, Rect::new(0, 0, w, h))).unwrap();
+        let buf = term.backend().buffer().clone();
+        buf.content().iter().map(|c| c.symbol()).collect::<String>()
+    }
+
+    #[test]
+    fn renders_entries_with_status_glyphs() {
+        let mut t = TodoTracker::new(TodoLocation::Right, true, true);
+        t.set_plan(vec![
+            entry("Alpha", PlanStatus::Completed),
+            entry("Beta", PlanStatus::InProgress),
+            entry("Gamma", PlanStatus::Pending),
+        ]);
+        let out = render_to_string(&t, 30, 8);
+        assert!(out.contains("Alpha"));
+        assert!(out.contains("Beta"));
+        assert!(out.contains("Gamma"));
+    }
+
+    #[test]
+    fn in_progress_uses_active_form_when_present() {
+        let mut t = TodoTracker::new(TodoLocation::Right, true, true);
+        t.set_plan(vec![PlanEntry {
+            content: "Wire ACP".to_string(),
+            status: PlanStatus::InProgress,
+            priority: PlanPriority::Medium,
+            active_form: Some("Wiring ACP".to_string()),
+        }]);
+        let out = render_to_string(&t, 30, 6);
+        assert!(out.contains("Wiring ACP"), "active_form shown for in_progress");
+    }
+
+    #[test]
+    fn side_panel_shows_placeholder_when_empty() {
+        let t = TodoTracker::new(TodoLocation::Right, true, true);
+        assert!(t.wants_space());
+        let out = render_to_string(&t, 24, 5);
+        assert!(out.contains("No active plan"));
+    }
+
+    #[test]
+    fn bottom_strip_wants_no_space_when_empty() {
+        let t = TodoTracker::new(TodoLocation::Bottom, true, true);
+        assert!(!t.wants_space(), "empty bottom strip claims zero rows");
+    }
+
+    #[test]
+    fn bottom_strip_wants_space_with_entries() {
+        let mut t = TodoTracker::new(TodoLocation::Bottom, true, true);
+        t.set_plan(vec![entry("A", PlanStatus::Pending)]);
+        assert!(t.wants_space());
     }
 }
