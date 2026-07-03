@@ -2084,10 +2084,19 @@ impl SecurityPolicy {
         let Some(file_name) = resolved.file_name().and_then(|value| value.to_str()) else {
             return false;
         };
-        let is_config_name = file_name == "config.toml"
+        let is_protected_name = file_name == "config.toml"
             || file_name == "config.toml.bak"
-            || file_name.starts_with(".config.toml.tmp-");
-        if !is_config_name {
+            || file_name.starts_with(".config.toml.tmp-")
+            // Emergency-stop state file. Without this, a compromised or
+            // prompt-injected agent with `file_write` access to the config
+            // directory can reset estop (write `{}`) and lift the freeze
+            // the operator applied. The same pattern applies to WebAuthn
+            // and OTP credential stores — both contain ciphertext that
+            // should never be overwritten by an in-loop agent.
+            || file_name == "estop-state.json"
+            || file_name == "webauthn_credentials.json"
+            || file_name == "otp-state.json";
+        if !is_protected_name {
             return false;
         }
         let Some(parent) = resolved.parent() else {
@@ -5465,6 +5474,37 @@ mod tests {
         // [workspace] block; protection is no longer required and not
         // claimed.
         assert!(!policy.is_runtime_config_path(&config_dir.join("active_workspace.toml")));
+    }
+
+    #[test]
+    fn runtime_state_files_in_config_dir_are_protected() {
+        // Regression test for audit-zeroclaw-2026-07-03.md finding H1:
+        // a compromised or prompt-injected agent with `file_write` access
+        // to the config directory could reset estop state (write `{}` to
+        // `estop-state.json`) or overwrite WebAuthn / OTP credential
+        // blobs. The predicate must refuse writes to these files inside
+        // the runtime config dirs.
+        let workspace = PathBuf::from("/tmp/zeroclaw-profile/workspace");
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        let config_dir = workspace.parent().unwrap();
+
+        // The state files are protected when they live in a runtime config dir.
+        assert!(policy.is_runtime_config_path(&config_dir.join("estop-state.json")));
+        assert!(policy.is_runtime_config_path(&config_dir.join("webauthn_credentials.json")));
+        assert!(policy.is_runtime_config_path(&config_dir.join("otp-state.json")));
+
+        // Same names inside the workspace itself are NOT protected — those
+        // are user-owned files; only the runtime-state files at config_dir
+        // are sensitive.
+        assert!(!policy.is_runtime_config_path(&workspace.join("estop-state.json")));
+        assert!(!policy.is_runtime_config_path(&workspace.join("webauthn_credentials.json")));
+
+        // Unrelated filenames are unaffected.
+        assert!(!policy.is_runtime_config_path(&config_dir.join("notes.md")));
+        assert!(!policy.is_runtime_config_path(&config_dir.join("agent-state.json")));
     }
 
     #[test]
