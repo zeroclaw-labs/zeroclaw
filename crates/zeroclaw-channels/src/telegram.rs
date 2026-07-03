@@ -951,7 +951,7 @@ impl TelegramChannel {
         let text = strip_tool_call_tags(text);
         let (chat_id, parsed_thread) = Self::parse_reply_target(recipient);
 
-        self.try_queue_voice_reply(recipient, &text, true);
+        self.try_queue_voice_reply(recipient, &text, true, false);
 
         let key = Self::multi_draft_key(recipient, message_id);
         let flush_lock = {
@@ -5188,7 +5188,7 @@ mod tests {
             .await
             .unwrap();
 
-        ch.finalize_draft("123", &draft_id, "Here is the answer.")
+        ch.finalize_draft("123", &draft_id, "Here is the answer.", false)
             .await
             .expect("finalize must send the full final turn, not slice by flushed offset");
     }
@@ -5393,7 +5393,7 @@ mod tests {
             .unwrap()
             .expect("draft id");
 
-        ch.finalize_draft("123", &draft_id, "Final answer")
+        ch.finalize_draft("123", &draft_id, "Final answer", false)
             .await
             .expect("finalize sends unsent remainder");
     }
