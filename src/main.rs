@@ -2620,8 +2620,15 @@ async fn seed_plugin_config_entry(
     // A degraded [plugins] block means the on-disk section is malformed and
     // the in-memory view is defaults. save_dirty cannot write through the
     // broken shape (verified: it silently no-ops), so seeding would print a
-    // success message while persisting nothing. Refuse honestly instead.
-    if config.degraded_sections.iter().any(|s| s == "plugins") {
+    // success message while persisting nothing. The whole-config sentinel
+    // (unparseable TOML) is worse: save_dirty hard-fails parsing the file
+    // and would turn a successful install into a command error. Refuse
+    // honestly in both cases.
+    let whole_config_degraded = config
+        .degraded_security
+        .iter()
+        .any(|s| s == crate::config::migration::WHOLE_CONFIG_SENTINEL);
+    if whole_config_degraded || config.degraded_sections.iter().any(|s| s == "plugins") {
         eprintln!(
             "{}",
             ta(
@@ -2631,6 +2638,25 @@ async fn seed_plugin_config_entry(
                  [plugins] section on disk is malformed. Repair it, add \
                  `[[plugins.entries]]` with the plugin name, then set values \
                  with `zeroclaw config set plugins.entries.<name>.config.<key>`."
+            )
+        );
+        return Ok(());
+    }
+    // Dotted-path routing splits on `.`, so a plugin name containing a dot
+    // (or an empty name) can never be addressed by
+    // `config set plugins.entries.<name>...`, and the per-entry dirty path
+    // `plugins.entries.<name>` cannot round-trip through the natural-key
+    // writer either: save_dirty silently no-ops while the success message
+    // claims otherwise (verified). Skip honestly.
+    if plugin_name.is_empty() || plugin_name.contains('.') {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-plugin-config-entry-seed-unaddressable",
+                &[("name", plugin_name)],
+                "warning: skipped seeding the plugin config entry: the plugin \
+                 name cannot be addressed by a dotted config path. Add a \
+                 `[[plugins.entries]]` block to the config file by hand."
             )
         );
         return Ok(());
