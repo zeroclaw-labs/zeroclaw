@@ -5095,7 +5095,8 @@ impl ChatState {
             | SessionUpdate::ToolResult { session_id, .. }
             | SessionUpdate::ApprovalRequest { session_id, .. }
             | SessionUpdate::ContextUsage { session_id, .. }
-            | SessionUpdate::TurnComplete { session_id, .. } => session_id.as_str(),
+            | SessionUpdate::TurnComplete { session_id, .. }
+            | SessionUpdate::Plan { session_id, .. } => session_id.as_str(),
         };
         if update_sid != self.session_id {
             return;
@@ -5238,6 +5239,8 @@ impl ChatState {
                     }
                 }
             }
+            // Plan updates are wired here in a follow-up task.
+            SessionUpdate::Plan { .. } => {}
         }
     }
 
