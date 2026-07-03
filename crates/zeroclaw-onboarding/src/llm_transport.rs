@@ -114,6 +114,32 @@ fn empty_response_for(prompt: &Prompt) -> ResponseValue {
 /// (model never produces a parseable value) fails fast instead of hanging.
 const MAX_REASK_PER_PROMPT: usize = 6;
 
+/// The machine contract for the `ANSWER:` value, appended to every prompt the
+/// guide receives. Without it the guide cannot know a choice field's valid
+/// values and answers with a paraphrase (`on`, `none`), which parses to
+/// nothing; the walk then re-asks the identical text until the turn budget
+/// aborts the whole flow.
+fn answer_contract(prompt: &Prompt) -> String {
+    let mut contract = match &prompt.response_type {
+        ResponseType::Choice { options } => {
+            let mut text = String::from(
+                "\nThe ANSWER line must be exactly one of these values (the person sees your words, not these tokens):",
+            );
+            for option in options {
+                text.push_str(&format!("\n- `{}` = {}", option.value, option.label));
+            }
+            text
+        }
+        ResponseType::YesNo => "\nThe ANSWER line must be exactly `yes` or `no`.".to_string(),
+        ResponseType::Number => "\nThe ANSWER line must be a bare number.".to_string(),
+        ResponseType::FreeformText | ResponseType::Secret => String::new(),
+    };
+    if prompt.optional {
+        contract.push_str("\nThis field is optional: `ANSWER: none` leaves it unset.");
+    }
+    contract
+}
+
 #[async_trait]
 impl<L: LlmResponder, S: SecretReader> FlowTransport for LlmTransport<L, S> {
     async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
@@ -126,14 +152,20 @@ impl<L: LlmResponder, S: SecretReader> FlowTransport for LlmTransport<L, S> {
                 }
             }
         }
+        let contract = answer_contract(prompt);
+        let mut message = format!("{prompt_text}{contract}");
         for _ in 0..MAX_REASK_PER_PROMPT {
-            let raw = self.responder.respond(&prompt_text).await?;
+            let raw = self.responder.respond(&message).await?;
             if prompt.optional && is_skip_sentinel(&raw) {
                 return Ok(empty_response_for(prompt));
             }
             if let Some(value) = Self::parse_non_secret(prompt, &raw) {
                 return Ok(value);
             }
+            message = format!(
+                "Your `ANSWER: {raw}` was not accepted for this field.{contract}\n\
+                 Reply with an ANSWER line carrying exactly one accepted value."
+            );
         }
         Err(zeroclaw_runtime::flow::TransportError::Agent {
             reason: format!(
@@ -329,6 +361,62 @@ mod tests {
         assert!(
             matches!(error, TransportError::Agent { .. }),
             "a non-progressing walk must surface a bounded Agent error, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn choice_prompt_carries_the_accepted_values_to_the_llm() {
+        let mut responder = ScriptedResponder::new(vec!["skip"]);
+        let mut transport = LlmTransport::new(responder, PanicSecretReader);
+        let prompt = Prompt::new(
+            "Bind this channel into a peer group?",
+            ResponseType::Choice {
+                options: vec![
+                    ChoiceOption {
+                        value: "skip".into(),
+                        label: "Skip peer-group binding".into(),
+                    },
+                    ChoiceOption {
+                        value: "new".into(),
+                        label: "Create a new peer group".into(),
+                    },
+                ],
+            },
+        );
+        transport.ask(&prompt).await.unwrap();
+        responder = transport.into_responder();
+        let sent = &responder.calls[0];
+        assert!(
+            sent.contains("`skip`") && sent.contains("`new`"),
+            "the guide never saw the accepted choice values: {sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_reply_gets_corrective_feedback_instead_of_the_same_prompt() {
+        let mut responder = ScriptedResponder::new(vec!["none", "skip"]);
+        let mut transport = LlmTransport::new(responder, PanicSecretReader);
+        let prompt = Prompt::new(
+            "Bind this channel into a peer group?",
+            ResponseType::Choice {
+                options: vec![ChoiceOption {
+                    value: "skip".into(),
+                    label: "Skip peer-group binding".into(),
+                }],
+            },
+        );
+        let value = transport.ask(&prompt).await.unwrap();
+        assert_eq!(value, ResponseValue::Choice("skip".into()));
+        responder = transport.into_responder();
+        assert!(
+            responder.calls[1].contains("was not accepted"),
+            "the re-ask must tell the guide its value was rejected: {}",
+            responder.calls[1]
+        );
+        assert!(
+            responder.calls[1].contains("`skip`"),
+            "the re-ask must restate the accepted values: {}",
+            responder.calls[1]
         );
     }
 }
