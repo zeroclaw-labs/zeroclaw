@@ -740,6 +740,7 @@ impl InputBarState {
         self.load_for_edit(text, self.pending_attachments.clone());
     }
 
+    #[cfg(test)]
     pub fn prompt_history_len(&self) -> usize {
         self.prompt_history.len()
     }
@@ -749,6 +750,7 @@ impl InputBarState {
         self.history_cursor
     }
 
+    #[cfg(test)]
     pub fn draft_stash_len(&self) -> usize {
         self.draft_stash.len()
     }
