@@ -265,6 +265,9 @@ pub enum DenyReason {
     MfaRequired,
     /// The principal is not entitled to the requested agent alias.
     AliasNotEntitled,
+    /// The credential authenticated but its claims map to no permission
+    /// profile, so the principal holds no grants at all.
+    NotEntitled,
     /// The provider/config is misconfigured (fail closed, do not allow).
     Misconfigured,
 }

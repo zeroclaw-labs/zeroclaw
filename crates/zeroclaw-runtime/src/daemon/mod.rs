@@ -635,21 +635,40 @@ pub async fn run(
             std::sync::Arc<crate::security::auth_provider::ProviderRegistry>,
         > = if config.wss.enabled {
             use crate::security::auth_provider::{
-                NativeAuthProvider, PeercredAuthProvider, ProviderRegistry,
+                NativeAuthProvider, OidcAuthProvider, PeercredAuthProvider, ProviderRegistry,
             };
-            if config.gateway.paired_tokens.is_empty() {
+            if config.gateway.paired_tokens.is_empty() && config.oidc.is_empty() {
                 anyhow::bail!(
                     "wss is enabled but no auth provider can resolve a remote credential: \
-                     no gateway pairing token exists. Pair a client first or disable [wss]."
+                     no gateway pairing token exists and no [oidc.<alias>] issuer is \
+                     configured. Pair a client, configure an OIDC issuer, or disable [wss]."
                 );
             }
+            let profiles: std::sync::Arc<
+                std::collections::HashMap<String, zeroclaw_api::grants::ResolvedGrants>,
+            > = std::sync::Arc::new(
+                config
+                    .permission_profiles
+                    .iter()
+                    .map(|(alias, profile)| (alias.clone(), profile.resolve()))
+                    .collect(),
+            );
             let mut registry = ProviderRegistry::new();
             registry.register(std::sync::Arc::new(
                 PeercredAuthProvider::for_current_process(),
             ));
-            registry.register(std::sync::Arc::new(NativeAuthProvider::from_paired_tokens(
-                &config.gateway.paired_tokens,
-            )));
+            for (alias, oidc_config) in &config.oidc {
+                registry.register(std::sync::Arc::new(OidcAuthProvider::new(
+                    format!("oidc.{alias}"),
+                    oidc_config.clone(),
+                    profiles.clone(),
+                )?));
+            }
+            if !config.gateway.paired_tokens.is_empty() {
+                registry.register(std::sync::Arc::new(NativeAuthProvider::from_paired_tokens(
+                    &config.gateway.paired_tokens,
+                )));
+            }
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
