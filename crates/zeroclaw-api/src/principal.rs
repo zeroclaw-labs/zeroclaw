@@ -151,6 +151,12 @@ pub struct Principal {
     /// today's behaviour).
     #[serde(default)]
     pub allowed_aliases: Vec<AgentAlias>,
+    /// The resolved ZeroClaw authorization grants for this principal, computed
+    /// by the grant resolver from the identity source's claims through the
+    /// configured permission profiles. Deny-by-default:
+    /// [`crate::grants::ResolvedGrants::none`] permits nothing.
+    #[serde(default)]
+    pub grants: crate::grants::ResolvedGrants,
 }
 
 impl Principal {
@@ -170,6 +176,7 @@ impl Principal {
             mfa_verified: false,
             expires_at: 0,
             allowed_aliases: Vec::new(),
+            grants: crate::grants::ResolvedGrants::all(),
         }
     }
 
@@ -192,6 +199,7 @@ impl Principal {
             mfa_verified: false,
             expires_at: 0,
             allowed_aliases: Vec::new(),
+            grants: crate::grants::ResolvedGrants::none(),
         }
     }
 
@@ -317,6 +325,7 @@ mod tests {
             mfa_verified: true,
             expires_at: 0,
             allowed_aliases: vec![AgentAlias("main".to_owned())],
+            grants: crate::grants::ResolvedGrants::none(),
         };
         assert!(p.is_authenticated());
     }
