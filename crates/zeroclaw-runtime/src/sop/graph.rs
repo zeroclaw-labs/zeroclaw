@@ -651,6 +651,10 @@ pub enum NodeRunState {
 pub struct NodeRunOverlay {
     pub step: u32,
     pub state: NodeRunState,
+    /// Tool invocations captured while the step executed. Empty for
+    /// unreached steps and runs recorded before capture landed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<super::types::StepToolCall>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -686,16 +690,12 @@ impl RunOverlay {
             .iter()
             .filter(|node| node.kind == NodeKind::Step)
             .map(|node| {
-                let recorded = run
-                    .step_results
-                    .iter()
-                    .find(|r| r.step_number == node.step)
-                    .map(|r| match r.status {
-                        SopStepStatus::Completed => NodeRunState::Completed,
-                        SopStepStatus::Failed => NodeRunState::Failed,
-                        SopStepStatus::Skipped => NodeRunState::Skipped,
-                    });
-                let state = match recorded {
+                let recorded = run.step_results.iter().find(|r| r.step_number == node.step);
+                let state = match recorded.map(|r| match r.status {
+                    SopStepStatus::Completed => NodeRunState::Completed,
+                    SopStepStatus::Failed => NodeRunState::Failed,
+                    SopStepStatus::Skipped => NodeRunState::Skipped,
+                }) {
                     Some(s) => s,
                     None if !terminal_run && node.step == run.current_step => NodeRunState::Active,
                     None => NodeRunState::Pending,
@@ -703,6 +703,7 @@ impl RunOverlay {
                 NodeRunOverlay {
                     step: node.step,
                     state,
+                    tool_calls: recorded.map(|r| r.tool_calls.clone()).unwrap_or_default(),
                 }
             })
             .collect();
@@ -1006,6 +1007,29 @@ mod tests {
         let state_of = |n: u32| overlay.nodes.iter().find(|o| o.step == n).unwrap().state;
         assert_eq!(state_of(1), NodeRunState::Completed);
         assert_eq!(state_of(2), NodeRunState::Pending);
+    }
+
+    #[test]
+    fn run_overlay_carries_captured_tool_calls() {
+        use super::super::types::StepToolCall;
+        let graph = SopGraph::from_sop(&sop(vec![step(1, "a"), step(2, "b")]));
+        let mut r1 = result(1, SopStepStatus::Completed);
+        r1.tool_calls = vec![StepToolCall {
+            index: 0,
+            tool: "calculator".into(),
+            args: serde_json::json!({"function": "add"}),
+            success: true,
+            output: "3".into(),
+            output_data: Some(serde_json::json!({"value": 3})),
+            error: None,
+            duration_ms: 5,
+        }];
+        let overlay = RunOverlay::project(&graph, &run(SopRunStatus::Running, 2, vec![r1]));
+
+        let node = |n: u32| overlay.nodes.iter().find(|o| o.step == n).unwrap();
+        assert_eq!(node(1).tool_calls.len(), 1);
+        assert_eq!(node(1).tool_calls[0].tool, "calculator");
+        assert!(node(2).tool_calls.is_empty(), "unreached step has no calls");
     }
 
     /// Pins the JSON wire shape consumed by zerocode's `SopGraphView` mirror

@@ -538,7 +538,8 @@ impl fmt::Display for SopStepStatus {
 /// make any number of calls (including the same tool repeatedly);
 /// `index` preserves invocation order so authoring surfaces can replay
 /// the sequence and map data between calls.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct StepToolCall {
     /// Zero-based invocation order within the step.
     pub index: u32,
