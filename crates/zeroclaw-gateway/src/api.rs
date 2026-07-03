@@ -58,6 +58,25 @@ pub(crate) fn require_auth(
     }
 }
 
+/// Route-layer auth gate (#6250): the same pairing/bearer check as
+/// [`require_auth`], enforced structurally via `Router::route_layer` so a
+/// handler added to a protected route group cannot forget it. OPTIONS is
+/// exempt: CORS preflight never carries `Authorization` and the OPTIONS
+/// handlers on this surface are read-only schema/CORS responders.
+pub(crate) async fn require_auth_middleware(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if req.method() == axum::http::Method::OPTIONS {
+        return next.run(req).await;
+    }
+    match require_auth(&state, req.headers()) {
+        Ok(()) => next.run(req).await,
+        Err(e) => e.into_response(),
+    }
+}
+
 // ── Query parameters ─────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -218,13 +237,8 @@ pub struct StatusQuery {
 /// GET /api/status — system status overview
 pub async fn handle_api_status(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(query): Query<StatusQuery>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let config = state.config.read().clone();
     let health = zeroclaw_runtime::health::snapshot();
 
@@ -320,13 +334,8 @@ pub struct ToolsQuery {
 /// GET /api/tools - list registered tool specs, optionally scoped to `?agent=`
 pub async fn handle_api_tools(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(query): Query<ToolsQuery>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let registry = query
         .agent
         .as_deref()
@@ -350,14 +359,7 @@ pub async fn handle_api_tools(
 }
 
 /// GET /api/cron — list cron jobs
-pub async fn handle_api_cron_list(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
+pub async fn handle_api_cron_list(State(state): State<AppState>) -> impl IntoResponse {
     let config = state.config.read().clone();
     match zeroclaw_runtime::cron::list_jobs(&config) {
         Ok(jobs) => Json(serde_json::json!({"jobs": jobs})).into_response(),
@@ -372,13 +374,8 @@ pub async fn handle_api_cron_list(
 /// POST /api/cron — add a new cron job
 pub async fn handle_api_cron_add(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<CronAddBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let CronAddBody {
         agent: agent_alias,
         name,
@@ -492,14 +489,9 @@ pub async fn handle_api_cron_add(
 /// GET /api/cron/:id/runs — list recent runs for a cron job
 pub async fn handle_api_cron_runs(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<CronRunsQuery>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let limit = params.limit.unwrap_or(20).clamp(1, 100) as usize;
     let config = state.config.read().clone();
 
@@ -541,13 +533,8 @@ pub async fn handle_api_cron_runs(
 /// POST /api/cron/:id/run — trigger a cron job manually
 pub async fn handle_api_cron_run(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let config = state.config.read().clone();
 
     let job = match zeroclaw_runtime::cron::get_job(&config, &id) {
@@ -585,14 +572,9 @@ pub async fn handle_api_cron_run(
 /// PATCH /api/cron/:id — update an existing cron job
 pub async fn handle_api_cron_patch(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<CronPatchBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let config = state.config.read().clone();
     let agent_alias = body.agent.clone();
     let CronPatchBody {
@@ -708,13 +690,8 @@ pub async fn handle_api_cron_patch(
 /// DELETE /api/cron/:id — remove a cron job
 pub async fn handle_api_cron_delete(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let config = state.config.read().clone();
     match zeroclaw_runtime::cron::remove_job(&config, &id) {
         Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
@@ -727,14 +704,7 @@ pub async fn handle_api_cron_delete(
 }
 
 /// GET /api/cron/settings — return cron subsystem settings
-pub async fn handle_api_cron_settings_get(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
+pub async fn handle_api_cron_settings_get(State(state): State<AppState>) -> impl IntoResponse {
     let config = state.config.read().clone();
     Json(serde_json::json!({
         "enabled": config.scheduler.enabled,
@@ -747,13 +717,8 @@ pub async fn handle_api_cron_settings_get(
 /// PATCH /api/cron/settings — update cron subsystem settings
 pub async fn handle_api_cron_settings_patch(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let mut config = state.config.read().clone();
 
     if let Some(v) = body.get("enabled").and_then(|v| v.as_bool()) {
@@ -789,14 +754,7 @@ pub async fn handle_api_cron_settings_patch(
 }
 
 /// GET /api/integrations — list all integrations with status
-pub async fn handle_api_integrations(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
+pub async fn handle_api_integrations(State(state): State<AppState>) -> impl IntoResponse {
     let config = state.config.read().clone();
     let entries = zeroclaw_runtime::integrations::registry::all_integrations(&config);
 
@@ -806,14 +764,7 @@ pub async fn handle_api_integrations(
 }
 
 /// GET /api/integrations/settings — return per-integration settings (enabled + category)
-pub async fn handle_api_integrations_settings(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
+pub async fn handle_api_integrations_settings(State(state): State<AppState>) -> impl IntoResponse {
     let config = state.config.read().clone();
     let entries = zeroclaw_runtime::integrations::registry::all_integrations(&config);
 
@@ -837,14 +788,7 @@ pub async fn handle_api_integrations_settings(
 }
 
 /// POST /api/doctor — run diagnostics
-pub async fn handle_api_doctor(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
+pub async fn handle_api_doctor(State(state): State<AppState>) -> impl IntoResponse {
     let config = state.config.read().clone();
     let results = zeroclaw_runtime::doctor::diagnose(&config);
 
@@ -913,13 +857,8 @@ async fn resolve_memory_handle(
 /// GET /api/memory — list or search memory entries
 pub async fn handle_api_memory_list(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(params): Query<MemoryQuery>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let mem = match resolve_memory_handle(&state, params.agent.as_deref()).await {
         Ok(m) => m,
         Err(e) => return e.into_response(),
@@ -1007,13 +946,8 @@ fn truncate_with_ellipsis_total_chars(mut s: String) -> String {
 /// POST /api/memory — store a memory entry
 pub async fn handle_api_memory_store(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<MemoryStoreBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let category = body
         .category
         .as_deref()
@@ -1043,14 +977,9 @@ pub async fn handle_api_memory_store(
 /// DELETE /api/memory/:key — delete a memory entry
 pub async fn handle_api_memory_delete(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(key): Path<String>,
     Query(query): Query<MemoryDeleteQuery>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let mem = match resolve_memory_handle(&state, query.agent.as_deref()).await {
         Ok(m) => m,
         Err(e) => return e.into_response(),
@@ -1089,13 +1018,8 @@ pub struct CostQuery {
 /// rollup.
 pub async fn handle_api_cost(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(query): Query<CostQuery>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let parse_bound = |s: &str| {
         chrono::DateTime::parse_from_rfc3339(s)
             .ok()
@@ -1134,14 +1058,7 @@ pub async fn handle_api_cost(
 }
 
 /// GET /api/cli-tools — discovered CLI tools
-pub async fn handle_api_cli_tools(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
+pub async fn handle_api_cli_tools(State(_state): State<AppState>) -> impl IntoResponse {
     // `discover_cli_tools` spawns child processes and blocks; keep it off the
     // async executor so a slow PATH scan can't stall other gateway requests.
     let tools = match tokio::task::spawn_blocking(|| {
@@ -1168,14 +1085,7 @@ pub async fn handle_api_cli_tools(
 }
 
 /// GET /api/channels — list configured channels with status
-pub async fn handle_api_channels(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
+pub async fn handle_api_channels(State(state): State<AppState>) -> impl IntoResponse {
     let config = state.config.read().clone();
     let health = zeroclaw_runtime::health::snapshot();
     // One entry per `[channels.<type>.<alias>]` block. Owning
@@ -1213,14 +1123,7 @@ pub async fn handle_api_channels(
 }
 
 /// GET /api/tuis — list connected TUI sessions
-pub async fn handle_api_tuis(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
+pub async fn handle_api_tuis(State(state): State<AppState>) -> impl IntoResponse {
     let tuis: Vec<serde_json::Value> = state
         .tui_registry
         .as_ref()
@@ -1420,14 +1323,7 @@ fn normalized_webhook_path(path: Option<&str>) -> String {
 }
 
 /// GET /api/health — component health snapshot
-pub async fn handle_api_health(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
+pub async fn handle_api_health(State(_state): State<AppState>) -> impl IntoResponse {
     let snapshot = zeroclaw_runtime::health::snapshot();
     Json(serde_json::json!({"health": snapshot})).into_response()
 }
@@ -1437,14 +1333,7 @@ pub async fn handle_api_health(
 // ── Session API handlers ─────────────────────────────────────────
 
 /// GET /api/sessions — list gateway sessions
-pub async fn handle_api_sessions_list(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
+pub async fn handle_api_sessions_list(State(state): State<AppState>) -> impl IntoResponse {
     let Some(ref backend) = state.session_backend else {
         return Json(serde_json::json!({
             "sessions": [],
@@ -1503,13 +1392,8 @@ pub async fn handle_api_sessions_list(
 /// GET /api/sessions/{id}/messages — load persisted gateway WebSocket chat transcript
 pub async fn handle_api_session_messages(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let Some(ref backend) = state.session_backend else {
         return Json(serde_json::json!({
             "session_id": id,
@@ -1550,14 +1434,9 @@ pub async fn handle_api_session_messages(
 /// POST /api/sessions/{id}/messages — push a visible notification into a gateway session
 pub async fn handle_api_session_message_post(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<SessionMessagePostBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     if body.content.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -1641,13 +1520,8 @@ pub async fn handle_api_session_message_post(
 /// DELETE /api/sessions/{id} — delete a gateway session
 pub async fn handle_api_session_delete(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let Some(ref backend) = state.session_backend else {
         return (
             StatusCode::NOT_FOUND,
@@ -1701,14 +1575,9 @@ pub async fn handle_api_session_delete(
 /// PUT /api/sessions/{id} — rename a gateway session
 pub async fn handle_api_session_rename(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let Some(ref backend) = state.session_backend else {
         return (
             StatusCode::NOT_FOUND,
@@ -1749,14 +1618,7 @@ pub async fn handle_api_session_rename(
 }
 
 /// GET /api/sessions/running — list sessions currently in "running" state
-pub async fn handle_api_sessions_running(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
+pub async fn handle_api_sessions_running(State(state): State<AppState>) -> impl IntoResponse {
     let Some(ref backend) = state.session_backend else {
         return Json(serde_json::json!({
             "sessions": [],
@@ -1785,13 +1647,8 @@ pub async fn handle_api_sessions_running(
 /// GET /api/sessions/{id}/state — get session state
 pub async fn handle_api_session_state(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let Some(ref backend) = state.session_backend else {
         return (
             StatusCode::NOT_FOUND,
@@ -1843,13 +1700,8 @@ pub async fn handle_api_session_state(
 /// token present). Both are success — abort is idempotent.
 pub async fn handle_api_session_abort(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let session_key = format!("gw_{id}");
 
     // Look up and cancel the token. Hold the lock only long enough to
@@ -2214,7 +2066,6 @@ mod tests {
 
         let response = handle_api_memory_list(
             State(state),
-            HeaderMap::new(),
             Query(MemoryQuery {
                 query: None,
                 category: None,
@@ -2245,7 +2096,6 @@ mod tests {
 
         let response = handle_api_memory_list(
             State(state),
-            HeaderMap::new(),
             Query(MemoryQuery {
                 query: Some("huge".into()),
                 category: Some("conversation".into()),
@@ -2288,7 +2138,6 @@ mod tests {
         async fn tool_names(state: AppState, agent: Option<&str>) -> Vec<String> {
             let response = handle_api_tools(
                 State(state),
-                HeaderMap::new(),
                 Query(ToolsQuery {
                     agent: agent.map(str::to_string),
                 }),
@@ -2416,7 +2265,7 @@ mod tests {
             },
         );
 
-        let response = handle_api_channels(State(test_state(config)), HeaderMap::new())
+        let response = handle_api_channels(State(test_state(config)))
             .await
             .into_response();
         let json = response_json(response).await;
@@ -2664,9 +2513,7 @@ mod tests {
         let config = config_with_webhook("ops", true, true, 42617, Some("/webhook"));
         let state = test_state(config);
 
-        let response = handle_api_channels(State(state), HeaderMap::new())
-            .await
-            .into_response();
+        let response = handle_api_channels(State(state)).await.into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
@@ -2719,7 +2566,6 @@ mod tests {
 
         let response = handle_api_session_message_post(
             State(state.clone()),
-            HeaderMap::new(),
             Path("operator-1".to_string()),
             Json(
                 serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
@@ -2774,7 +2620,6 @@ mod tests {
 
         let response = handle_api_session_message_post(
             State(state),
-            HeaderMap::new(),
             Path("operator-1".to_string()),
             Json(
                 serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
@@ -2805,7 +2650,6 @@ mod tests {
 
         let response = handle_api_session_message_post(
             State(state),
-            HeaderMap::new(),
             Path("operator-1".to_string()),
             Json(
                 serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
@@ -2844,7 +2688,6 @@ mod tests {
 
         let response_fut = handle_api_session_message_post(
             State(state),
-            HeaderMap::new(),
             Path("operator-1".to_string()),
             Json(
                 serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
@@ -2888,7 +2731,6 @@ mod tests {
 
         let add_response = handle_api_cron_add(
             State(state.clone()),
-            HeaderMap::new(),
             Json(
                 serde_json::from_value::<CronAddBody>(serde_json::json!({
                     "name": "test-job",
@@ -2914,9 +2756,7 @@ mod tests {
         assert_eq!(add_json["job"]["delivery"]["channel"], "discord");
         assert_eq!(add_json["job"]["delivery"]["to"], "1234567890");
 
-        let list_response = handle_api_cron_list(State(state), HeaderMap::new())
-            .await
-            .into_response();
+        let list_response = handle_api_cron_list(State(state)).await.into_response();
         let list_json = response_json(list_response).await;
         let jobs = list_json["jobs"].as_array().expect("jobs array");
         assert_eq!(jobs.len(), 1);
@@ -2938,7 +2778,6 @@ mod tests {
 
         let response = handle_api_cron_add(
             State(state.clone()),
-            HeaderMap::new(),
             Json(
                 serde_json::from_value::<CronAddBody>(serde_json::json!({
                     "name": "agent-job",
@@ -2977,7 +2816,6 @@ mod tests {
 
         let response = handle_api_cron_add(
             State(state.clone()),
-            HeaderMap::new(),
             Json(
                 serde_json::from_value::<CronAddBody>(serde_json::json!({
                     "agent": "test-agent",
@@ -3017,7 +2855,6 @@ mod tests {
 
         let response = handle_api_cron_add(
             State(state),
-            HeaderMap::new(),
             Json(
                 serde_json::from_value::<CronAddBody>(serde_json::json!({
                     "agent": "test-agent",
@@ -3068,7 +2905,6 @@ mod tests {
 
         let response = handle_api_cron_patch(
             State(state.clone()),
-            HeaderMap::new(),
             Path(job.id.clone()),
             Json(
                 serde_json::from_value::<CronPatchBody>(serde_json::json!({
@@ -3119,7 +2955,6 @@ mod tests {
 
         let response = handle_api_cron_patch(
             State(state.clone()),
-            HeaderMap::new(),
             Path(job.id.clone()),
             Json(
                 serde_json::from_value::<CronPatchBody>(serde_json::json!({
@@ -3171,7 +3006,6 @@ mod tests {
 
         let response = handle_api_cron_patch(
             State(state.clone()),
-            HeaderMap::new(),
             Path(job.id.clone()),
             Json(
                 serde_json::from_value::<CronPatchBody>(serde_json::json!({
@@ -3222,7 +3056,6 @@ mod tests {
 
         let response = handle_api_cron_patch(
             State(state),
-            HeaderMap::new(),
             Path(job.id),
             Json(
                 serde_json::from_value::<CronPatchBody>(serde_json::json!({
@@ -3271,7 +3104,6 @@ mod tests {
 
         let response = handle_api_cron_patch(
             State(state.clone()),
-            HeaderMap::new(),
             Path(job.id.clone()),
             Json(
                 serde_json::from_value::<CronPatchBody>(serde_json::json!({
@@ -3330,7 +3162,6 @@ mod tests {
         // No `agent` field at all — pause/resume must not require one.
         let response = handle_api_cron_patch(
             State(state.clone()),
-            HeaderMap::new(),
             Path(job.id.clone()),
             Json(
                 serde_json::from_value::<CronPatchBody>(serde_json::json!({ "enabled": false }))
@@ -3377,7 +3208,6 @@ mod tests {
         // Metadata-only patch (no command/prompt) — agent must be optional.
         let response = handle_api_cron_patch(
             State(state.clone()),
-            HeaderMap::new(),
             Path(job.id.clone()),
             Json(
                 serde_json::from_value::<CronPatchBody>(serde_json::json!({
@@ -3435,7 +3265,6 @@ mod tests {
         // must be a clean 400, not a fall-through.
         let response = handle_api_cron_patch(
             State(state.clone()),
-            HeaderMap::new(),
             Path(job.id.clone()),
             Json(
                 serde_json::from_value::<CronPatchBody>(
@@ -3491,7 +3320,6 @@ mod tests {
         // 500 that an unguarded path would surface.
         let response = handle_api_cron_patch(
             State(state.clone()),
-            HeaderMap::new(),
             Path(job.id.clone()),
             Json(
                 serde_json::from_value::<CronPatchBody>(serde_json::json!({
@@ -3524,7 +3352,6 @@ mod tests {
 
         let add_response = handle_api_cron_add(
             State(state.clone()),
-            HeaderMap::new(),
             Json(
                 serde_json::from_value::<CronAddBody>(serde_json::json!({
                     "name": "agent-job",
@@ -3548,7 +3375,6 @@ mod tests {
         // so it is not agent-gated and may omit `agent`.
         let response = handle_api_cron_patch(
             State(state.clone()),
-            HeaderMap::new(),
             Path(id.clone()),
             Json(
                 serde_json::from_value::<CronPatchBody>(
@@ -3583,7 +3409,6 @@ mod tests {
 
         let response = handle_api_cron_add(
             State(state.clone()),
-            HeaderMap::new(),
             Json(
                 serde_json::from_value::<CronAddBody>(serde_json::json!({
                     "name": "invalid-delivery-job",
@@ -3647,10 +3472,9 @@ mod tests {
         // agent by reverse-lookup against `agent.cron_jobs`.
         link_job_to_test_agent(&state, &job.id);
 
-        let response =
-            handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job.id.clone()))
-                .await
-                .into_response();
+        let response = handle_api_cron_run(State(state.clone()), Path(job.id.clone()))
+            .await
+            .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
@@ -3713,10 +3537,9 @@ mod tests {
         .expect("job added");
         link_job_to_test_agent(&state, &job.id);
 
-        let response =
-            handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job.id.clone()))
-                .await
-                .into_response();
+        let response = handle_api_cron_run(State(state.clone()), Path(job.id.clone()))
+            .await
+            .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
@@ -3763,13 +3586,9 @@ mod tests {
         std::fs::create_dir_all(&config.data_dir).unwrap();
         let state = test_state(with_test_agent(config));
 
-        let response = handle_api_cron_run(
-            State(state),
-            HeaderMap::new(),
-            Path("does-not-exist".to_string()),
-        )
-        .await
-        .into_response();
+        let response = handle_api_cron_run(State(state), Path("does-not-exist".to_string()))
+            .await
+            .into_response();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
@@ -3821,15 +3640,6 @@ mod tests {
         state.pairing = pairing;
         state.device_registry = Some(registry);
         (state, token, device_id)
-    }
-
-    fn bearer_headers(token: &str) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        h.insert(
-            header::AUTHORIZATION,
-            format!("Bearer {token}").parse().unwrap(),
-        );
-        h
     }
 
     /// The backfill inserts a placeholder row for every paired-token hash that
@@ -3941,13 +3751,9 @@ mod tests {
         let (state, old_token, device_id) = paired_state_with_device(&tmp).await;
         assert!(state.pairing.is_authenticated(&old_token));
 
-        let response = rotate_device_token(
-            State(state.clone()),
-            bearer_headers(&old_token),
-            Path(device_id.clone()),
-        )
-        .await
-        .into_response();
+        let response = rotate_device_token(State(state.clone()), Path(device_id.clone()))
+            .await
+            .into_response();
         assert_eq!(response.status(), StatusCode::OK);
 
         assert!(
@@ -3969,13 +3775,9 @@ mod tests {
         let (state, old_token, device_id) = paired_state_with_device(&tmp).await;
         let old_hash = PairingGuard::token_hash(&old_token);
 
-        let response = rotate_device_token(
-            State(state.clone()),
-            bearer_headers(&old_token),
-            Path(device_id),
-        )
-        .await
-        .into_response();
+        let response = rotate_device_token(State(state.clone()), Path(device_id))
+            .await
+            .into_response();
         assert_eq!(response.status(), StatusCode::OK);
 
         let persisted = state.config.read().gateway.paired_tokens.clone();
@@ -4031,13 +3833,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (state, old_token, device_id) = paired_state_with_device(&tmp).await;
 
-        let response = revoke_device(
-            State(state.clone()),
-            bearer_headers(&old_token),
-            Path(device_id),
-        )
-        .await
-        .into_response();
+        let response = revoke_device(State(state.clone()), Path(device_id))
+            .await
+            .into_response();
         assert_eq!(response.status(), StatusCode::OK);
 
         assert!(
@@ -4061,13 +3859,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (state, token, _) = paired_state_with_device(&tmp).await;
 
-        let response = rotate_device_token(
-            State(state.clone()),
-            bearer_headers(&token),
-            Path("does-not-exist".into()),
-        )
-        .await
-        .into_response();
+        let response = rotate_device_token(State(state.clone()), Path("does-not-exist".into()))
+            .await
+            .into_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(
             state.pairing.is_authenticated(&token),
@@ -4090,13 +3884,9 @@ mod tests {
             .generate_new_pairing_code()
             .expect("require_pairing was enabled");
 
-        let response = rotate_device_token(
-            State(state.clone()),
-            bearer_headers(&token),
-            Path(device_id.clone()),
-        )
-        .await
-        .into_response();
+        let response = rotate_device_token(State(state.clone()), Path(device_id.clone()))
+            .await
+            .into_response();
         assert_eq!(response.status(), StatusCode::OK);
 
         assert!(
@@ -4132,7 +3922,7 @@ mod tests {
 
         let pairing = Arc::new(PairingGuard::new(true, &[]));
         let code = pairing.pairing_code().unwrap();
-        let admin_token = pairing.try_pair(&code, "admin").await.unwrap().unwrap();
+        let _admin_token = pairing.try_pair(&code, "admin").await.unwrap().unwrap();
 
         let registry = Arc::new(DeviceRegistry::new(&data_dir));
         for id in ["dev-a", "dev-b"] {
@@ -4163,16 +3953,14 @@ mod tests {
 
         let s1 = state.clone();
         let s2 = state.clone();
-        let h1 = bearer_headers(&admin_token);
-        let h2 = bearer_headers(&admin_token);
         let (r1, r2) = tokio::join!(
             async move {
-                rotate_device_token(State(s1), h1, Path("dev-a".into()))
+                rotate_device_token(State(s1), Path("dev-a".into()))
                     .await
                     .into_response()
             },
             async move {
-                rotate_device_token(State(s2), h2, Path("dev-b".into()))
+                rotate_device_token(State(s2), Path("dev-b".into()))
                     .await
                     .into_response()
             },

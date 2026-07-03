@@ -10,12 +10,7 @@
 //! All business logic lives in `zeroclaw-runtime`; this module is route
 //! plumbing only.
 
-use axum::{
-    Json,
-    extract::State,
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
-};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::presets::BuilderSubmission;
 use zeroclaw_runtime::quickstart::{
@@ -24,7 +19,6 @@ use zeroclaw_runtime::quickstart::{
 };
 
 use super::AppState;
-use super::api::require_auth;
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -55,10 +49,7 @@ pub enum ApplyResult {
 /// pulling the entire config. Response shape is owned by
 /// `zeroclaw_runtime::quickstart::QuickstartState`; both transports
 /// build the body via [`zeroclaw_runtime::quickstart::snapshot_state`] so they cannot drift.
-pub async fn handle_state(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+pub async fn handle_state(State(state): State<AppState>) -> impl IntoResponse {
     let cfg = state.config.read().clone();
     let body = zeroclaw_runtime::quickstart::snapshot_state(&cfg);
     (StatusCode::OK, Json(body)).into_response()
@@ -76,13 +67,9 @@ pub struct FieldsResult {
 }
 
 pub async fn handle_fields(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+    State(_state): State<AppState>,
     Json(req): Json<FieldsRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
     let body = FieldsResult {
         fields: zeroclaw_runtime::quickstart::field_shape(req.section, &req.type_key),
     };
@@ -91,12 +78,8 @@ pub async fn handle_fields(
 
 pub async fn handle_validate(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(submission): Json<BuilderSubmission>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
     let cfg = state.config.read().clone();
     let body = match validate_only_with_surface(&submission, &cfg, Surface::Web) {
         Ok(()) => ValidateResult::Ok,
@@ -121,25 +104,17 @@ pub struct DismissRequest {
 }
 
 pub async fn handle_dismiss(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+    State(_state): State<AppState>,
     Json(req): Json<DismissRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
     record_dismissed(&req.run_id, req.surface, req.last_step);
     (StatusCode::NO_CONTENT, ()).into_response()
 }
 
 pub async fn handle_apply(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(submission): Json<BuilderSubmission>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
     let mut working = state.config.read().clone();
     let result = apply_with_surface(submission, &mut working, Surface::Web).await;
     let body = match result {

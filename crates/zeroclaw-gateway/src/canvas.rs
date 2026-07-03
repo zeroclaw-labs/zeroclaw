@@ -6,7 +6,6 @@
 //! - `WS   /ws/canvas/:id`  — real-time canvas updates via WebSocket
 
 use super::AppState;
-use super::api::require_auth;
 use axum::{
     extract::{
         Path, State, WebSocketUpgrade,
@@ -26,14 +25,7 @@ pub struct CanvasPostBody {
 }
 
 /// GET /api/canvas — list all active canvases.
-pub async fn handle_canvas_list(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
+pub async fn handle_canvas_list(State(state): State<AppState>) -> impl IntoResponse {
     let ids = state.canvas_store.list();
     Json(serde_json::json!({ "canvases": ids })).into_response()
 }
@@ -41,13 +33,8 @@ pub async fn handle_canvas_list(
 /// GET /api/canvas/:id — get current canvas content.
 pub async fn handle_canvas_get(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     match state.canvas_store.snapshot(&id) {
         Some(frame) => Json(serde_json::json!({
             "canvas_id": id,
@@ -65,13 +52,8 @@ pub async fn handle_canvas_get(
 /// GET /api/canvas/:id/history — get canvas frame history.
 pub async fn handle_canvas_history(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let history = state.canvas_store.history(&id);
     Json(serde_json::json!({
         "canvas_id": id,
@@ -83,14 +65,9 @@ pub async fn handle_canvas_history(
 /// POST /api/canvas/:id — push content to a canvas.
 pub async fn handle_canvas_post(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<CanvasPostBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let content_type = body.content_type.as_deref().unwrap_or("html");
 
     // Validate content_type against allowed set (prevent injecting "eval" frames via REST).
@@ -144,13 +121,8 @@ pub async fn handle_canvas_post(
 /// DELETE /api/canvas/:id — clear a canvas.
 pub async fn handle_canvas_clear(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     state.canvas_store.clear(&id);
     Json(serde_json::json!({
         "canvas_id": id,

@@ -67,10 +67,6 @@ pub async fn handle_register_start(
     headers: HeaderMap,
     Json(body): Json<StartRegistrationBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let webauthn = match &state.webauthn {
         Some(w) => w,
         None => {
@@ -107,10 +103,6 @@ pub async fn handle_register_finish(
     headers: HeaderMap,
     Json(body): Json<FinishRegistrationBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let webauthn = match &state.webauthn {
         Some(w) => w,
         None => {
@@ -161,10 +153,6 @@ pub async fn handle_auth_start(
     headers: HeaderMap,
     Json(body): Json<StartAuthenticationBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let webauthn = match &state.webauthn {
         Some(w) => w,
         None => {
@@ -198,10 +186,6 @@ pub async fn handle_auth_finish(
     headers: HeaderMap,
     Json(body): Json<FinishAuthenticationBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let webauthn = match &state.webauthn {
         Some(w) => w,
         None => {
@@ -247,10 +231,6 @@ pub async fn handle_list_credentials(
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<CredentialsQuery>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let webauthn = match &state.webauthn {
         Some(w) => w,
         None => {
@@ -292,10 +272,6 @@ pub async fn handle_delete_credential(
     Path(credential_id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<CredentialsQuery>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let webauthn = match &state.webauthn {
         Some(w) => w,
         None => {

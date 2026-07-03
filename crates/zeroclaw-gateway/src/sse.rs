@@ -6,7 +6,6 @@ use super::AppState;
 use axum::{
     Json,
     extract::State,
-    http::{HeaderMap, StatusCode, header},
     response::{
         IntoResponse,
         sse::{Event, KeepAlive, Sse},
@@ -48,27 +47,7 @@ impl EventBuffer {
 }
 
 /// GET /api/events — SSE event stream
-pub async fn handle_sse_events(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    // Auth check
-    if state.pairing.require_pairing() {
-        let token = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|auth| auth.strip_prefix("Bearer "))
-            .unwrap_or("");
-
-        if !state.pairing.is_authenticated(token) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide Authorization: Bearer <token>",
-            )
-                .into_response();
-        }
-    }
-
+pub async fn handle_sse_events(State(state): State<AppState>) -> impl IntoResponse {
     let rx = state.event_tx.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(
         |result: Result<
@@ -91,13 +70,7 @@ pub async fn handle_sse_events(
 }
 
 /// GET /api/events/history — return buffered recent events as JSON.
-pub async fn handle_events_history(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = super::api::require_auth(&state, &headers) {
-        return e.into_response();
-    }
+pub async fn handle_events_history(State(state): State<AppState>) -> impl IntoResponse {
     Json(history_events_payload(&state.event_buffer)).into_response()
 }
 
