@@ -133,6 +133,14 @@ Scoped path labels do not guarantee a same-prefix base label. Because `pr-path-l
 | `security:secrets` | runtime and config secrets handling |
 | `memory:backend` | memory backend selection and storage implementation files |
 
+### Manual component labels
+
+Some scoped component labels are manual routing labels rather than synchronized path labels.
+
+`agent:prompt` is for provider-visible prompt, context, and response-guidance policy. Use it when the work is about system-prompt content, tool-call formatting guidance, prompt-cache-sensitive context, channel response guidance, or other model-visible instruction surfaces that cross the base `agent`, `channel`, `memory`, `provider`, or `runtime` labels. Apply it in addition to applicable base or scope labels; it does not replace them. Do not apply it to every `crates/zeroclaw-runtime/src/agent/**` change; use the base `agent` label for ordinary agent runtime changes.
+
+`agent:loop` is retired. For agent-loop routing, use base `agent` plus any matching `runtime`, provider, channel, tool, or risk labels.
+
 Do not apply legacy `observability: runtime_trace` to new issues or PRs. Use `observability:otel` when the work is about OpenTelemetry tracing, add base `observability` only when the issue or PR also matches that base surface, and decide any future runtime-trace-specific canonical label in a separate create/migrate packet.
 
 Gateway subarea labels such as `gateway: api`, `gateway: sse`, `gateway:local_bridge`, and `gateway:webhook_ingress` remain live migration holdbacks. New routing should use base `gateway` until a separate packet either creates canonical no-space/hyphenated sublabels and migrates refs, or collapses those labels into base `gateway`.
@@ -302,7 +310,8 @@ Applied manually: the auto-response automation that used to handle these was rem
 |---|---|
 | `r:needs-repro` | Incomplete bug report; request a deterministic repro |
 | `r:support` | Usage / help item better handled outside the bug backlog |
-| `stale-candidate` | Dormant PR or issue; candidate for closing |
+| `needs-author-action` | Author response is needed before maintainers can continue the review or merge path. For PRs, this is not a stale warning by itself. |
+| `stale-candidate` | Dormant PR or issue that is a candidate for closing. For PRs, follow the stale ramp in [Reviewer Playbook → PR backlog pruning](./reviewer-playbook.md#pr-backlog-pruning). |
 
 ## Community pickup labels
 

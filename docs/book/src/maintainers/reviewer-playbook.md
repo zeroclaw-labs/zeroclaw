@@ -127,8 +127,14 @@ When review demand exceeds capacity:
 
 1. Keep active bug and security PRs (`size:XS` or `size:S`) at the top of the queue.
 2. Ask overlapping PRs to consolidate; close older ones with a superseded or replaced rationale after the author acknowledges. See [Superseding PRs](./superseding.md) for the attribution rules.
-3. Mark dormant PRs as `stale-candidate` before stale closure window starts.
-4. Require rebase + fresh validation evidence before reopening anything that's been stale-closed.
+3. Use the PR stale ramp below. PR backlog pruning uses `needs-author-action` and `stale-candidate`; issue stale sweeps use `status:stale` under the RFC stale policy.
+
+| State | When to use | Required public note | Follow-up |
+|---|---|---|---|
+| `needs-author-action` | The next PR step is on the author: rebase, conflict fix, scope split, review answer, requested code change, or refreshed validation. | A review or comment names the concrete action. | Continue normal review when the author responds. This is not a closure warning by itself. |
+| `stale-candidate` | A prior author-action request has sat unanswered and the PR now blocks useful review, or the branch is clearly stale, dirty, or obsolete against current `master`. Do not stale-escalate work that is parked under a visible maintainer plan, explicit dependency, active owner, or recorded revisit date. | A comment names the requested action and a follow-up date, normally 7-10 days out unless a maintainer chooses a longer window. It should distinguish a stale branch from a still-valid bug or feature request. | At the follow-up date, re-check live state. If the author responded or the branch became reviewable, remove or keep off `stale-candidate`. If there is still no response and no maintainer takeover or replacement path, close with a backlog-hygiene rationale and a clear reopening or replacement path. |
+
+If the underlying bug or feature is still valid, preserve it in an issue, tracker row, replacement PR, or takeover plan instead of implying that the idea was rejected. Require rebase + fresh validation evidence before reopening anything that's been stale-closed.
 
 ## Automation override
 
