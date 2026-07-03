@@ -2120,6 +2120,21 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
                 }
             }),
         },
+        TurnEvent::Plan { entries } => JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "plan",
+                    // PlanEntry serializes to the ACP-faithful
+                    // { content, priority, status } shape (+ additive
+                    // activeForm when present, which strict ACP clients
+                    // ignore). Whole-list replace per the ACP plan spec.
+                    "entries": entries,
+                }
+            }),
+        },
         // Usage events are filtered out at every call site (ACP has no
         // `session/update` shape for them; the cost tracker records them
         // out-of-band). Reaching this arm means a caller forgot the filter.
@@ -3182,6 +3197,45 @@ mod tests {
             result_value["params"]["update"]["content"][0]["content"]["text"],
             "file1.txt\nfile2.txt"
         );
+    }
+
+    #[test]
+    fn plan_event_projects_to_acp_plan_update() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+
+        let event = TurnEvent::Plan {
+            entries: vec![
+                PlanEntry {
+                    content: "Analyze the existing codebase structure".to_string(),
+                    status: PlanStatus::Pending,
+                    priority: PlanPriority::High,
+                    active_form: None,
+                },
+                PlanEntry {
+                    content: "Create unit tests".to_string(),
+                    status: PlanStatus::InProgress,
+                    priority: PlanPriority::Medium,
+                    active_form: Some("Creating unit tests".to_string()),
+                },
+            ],
+        };
+        let notif = notification_for_turn_event("sess_abc", &event)
+            .expect("plan yields a notification");
+        let v = serde_json::to_value(&notif).unwrap();
+
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["sessionId"], "sess_abc");
+        assert_eq!(v["params"]["update"]["sessionUpdate"], "plan");
+        let entries = v["params"]["update"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["content"], "Analyze the existing codebase structure");
+        assert_eq!(entries[0]["priority"], "high");
+        assert_eq!(entries[0]["status"], "pending");
+        // ACP-required fields always present on every entry:
+        assert!(entries[1]["priority"].is_string());
+        assert_eq!(entries[1]["status"], "in_progress");
+        // ZeroClaw extension carried but additive:
+        assert_eq!(entries[1]["activeForm"], "Creating unit tests");
     }
 
     /// `session/stop` must succeed while a `session/prompt` turn is in flight.
