@@ -1231,11 +1231,12 @@ async fn run_onboard_flow(
 
     let outcome = if use_llm && freeform {
         let spec = zeroclaw_onboarding::driver::build_flow_spec(&mut config, &request)?;
-        let walk_agent = Box::pin(zeroclaw_runtime::agent::Agent::from_config(
+        let mut walk_agent = Box::pin(zeroclaw_runtime::agent::Agent::from_config(
             &config,
             agent_alias,
         ))
         .await?;
+        walk_agent.disarm_tools();
         let mut turn = InProcessAgentTurn::new(walk_agent);
         let mut io = TtyOperatorIo;
         let mut secrets = TtySecretReader;
@@ -1249,20 +1250,22 @@ async fn run_onboard_flow(
         .await?
     } else if use_llm {
         let mut spec = zeroclaw_onboarding::driver::build_flow_spec(&mut config, &request)?;
-        let phrasing_agent = Box::pin(zeroclaw_runtime::agent::Agent::from_config(
+        let mut phrasing_agent = Box::pin(zeroclaw_runtime::agent::Agent::from_config(
             &config,
             agent_alias,
         ))
         .await?;
+        phrasing_agent.disarm_tools();
         let mut phraser = AgentPhraser::new(InProcessAgentTurn::new(phrasing_agent))
             .with_locale(selected_locale.clone());
         phrase_spec(&mut spec, &mut phraser).await?;
 
-        let walk_agent = Box::pin(zeroclaw_runtime::agent::Agent::from_config(
+        let mut walk_agent = Box::pin(zeroclaw_runtime::agent::Agent::from_config(
             &config,
             agent_alias,
         ))
         .await?;
+        walk_agent.disarm_tools();
         let responder = AgentResponder::new(InProcessAgentTurn::new(walk_agent), TtyOperatorIo)
             .with_locale(selected_locale.clone());
         let mut transport = LlmTransport::new(responder, TtySecretReader);
