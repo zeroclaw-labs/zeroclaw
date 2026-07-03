@@ -639,10 +639,11 @@ mod tests {
             Ok(_) => panic!("expected an error for an unknown provider"),
             Err(e) => e,
         };
-        assert!(
-            err.to_string()
-                .contains("unknown git channel provider `bitbucket`")
-        );
+        let msg = err.to_string();
+        assert!(msg.contains("unknown git channel provider `bitbucket`"));
+        // This slice ships the Gitea/Forgejo provider alongside GitHub; the
+        // error must advertise exactly the providers the build accepts.
+        assert!(msg.contains("supported: github, gitea, forgejo"));
     }
 
     // Regression (fail closed): a gitea/forgejo config without api_base_url

@@ -12361,7 +12361,7 @@ impl ChannelsConfig {
             ChannelInfo {
                 kind: "git",
                 name: "Git",
-                desc: "Git forge (GitHub): issues, PRs & events",
+                desc: "Git forge (GitHub, Gitea, Forgejo): issues, PRs & events",
                 configured: !self.git.is_empty(),
             },
             ChannelInfo {
@@ -15668,9 +15668,9 @@ impl ChannelConfig for BlueskyConfig {
 /// A `provider` selects the forge. GitHub authenticates as a GitHub App:
 /// a short-lived RS256 JWT signed with the app's private key is exchanged
 /// for per-installation access tokens. Gitea and Forgejo use a personal
-/// access token against the instance's `/api/v1` endpoint. Inbound issue/PR
-/// comments are polled from the forge REST API, so the daemon needs no
-/// inbound network exposure.
+/// access token against the instance's `/api/v1` endpoint, named by the
+/// required `api_base_url`. Inbound issue/PR comments are polled from the
+/// forge REST API, so the daemon needs no inbound network exposure.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.git"]
