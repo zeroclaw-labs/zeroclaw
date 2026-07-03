@@ -1,5 +1,8 @@
 use super::embeddings::EmbeddingProvider;
-use super::traits::{ExportFilter, Memory, MemoryCategory, MemoryEntry, is_recent_recall_query};
+use super::traits::{
+    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, StoreOptions,
+    is_recent_recall_query,
+};
 use super::vector;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -82,6 +85,7 @@ impl SqliteMemory {
         )?;
         Self::init_schema(&conn)?;
         zeroclaw_config::schema::v2::migrate_sqlite_memory_to_v3(&db_path, &conn)?;
+        Self::init_schema(&conn)?;
         Ok(Self {
             alias: alias.to_string(),
             conn: Arc::new(Mutex::new(conn)),
@@ -137,6 +141,7 @@ impl SqliteMemory {
 
         Self::init_schema(&conn)?;
         zeroclaw_config::schema::v2::migrate_sqlite_memory_to_v3(&db_path, &conn)?;
+        Self::init_schema(&conn)?;
 
         Ok(Self {
             alias: alias.to_string(),
@@ -333,6 +338,22 @@ impl SqliteMemory {
             "superseded_by",
             "ALTER TABLE memories ADD COLUMN superseded_by TEXT;",
         )?;
+        add_memories_column_if_missing(conn, "kind", "ALTER TABLE memories ADD COLUMN kind TEXT;")?;
+        add_memories_column_if_missing(
+            conn,
+            "pinned",
+            "ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;",
+        )?;
+        add_memories_column_if_missing(
+            conn,
+            "tenant_id",
+            "ALTER TABLE memories ADD COLUMN tenant_id TEXT;",
+        )?;
+        execute_batch_retry(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_memories_namespace_category ON memories(namespace, category);",
+        )
+        .with_context(|| "SQLite init_schema failed: CREATE INDEX idx_memories_namespace_category")?;
 
         Self::migrate_session_ids_to_sanitized(conn)?;
 
@@ -378,6 +399,97 @@ impl SqliteMemory {
         Ok(())
     }
 
+    async fn store_row_with_metadata(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let embedding_bytes = match self.get_or_compute_embedding(content).await {
+            Ok(emb) => emb.map(|emb| vector::vec_to_bytes(&emb)),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "key": key,
+                            "error": format!("{e}"),
+                        })),
+                    "memory store: embedding failed; persisting row without a vector \
+                     (run `zeroclaw memory reindex` to backfill once the embedder recovers)"
+                );
+                None
+            }
+        };
+
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let content = content.to_string();
+        let sid = session_id.map(String::from);
+        let ns = options.namespace.unwrap_or_else(|| "default".to_string());
+        let imp = options.importance.unwrap_or(0.5);
+        let kind = options
+            .kind
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let pinned = i64::from(options.pinned);
+        let tenant_id = options.tenant_id;
+        let aid = agent_id.map(String::from);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.lock();
+            let now = Local::now().to_rfc3339();
+            let cat = Self::category_to_str(&category);
+            let id = Uuid::new_v4().to_string();
+
+            conn.execute(
+                "INSERT INTO memories (
+                    id, key, content, category, embedding, created_at, updated_at,
+                    session_id, namespace, importance, agent_id, kind, pinned, tenant_id
+                 )
+                 VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    COALESCE(?11, (SELECT id FROM agents WHERE alias = 'default' LIMIT 1)),
+                    ?12, ?13, ?14
+                 )
+                 ON CONFLICT(agent_id, key) DO UPDATE SET
+                    content = excluded.content,
+                    category = excluded.category,
+                    embedding = excluded.embedding,
+                    updated_at = excluded.updated_at,
+                    session_id = excluded.session_id,
+                    namespace = excluded.namespace,
+                    importance = excluded.importance,
+                    kind = excluded.kind,
+                    pinned = excluded.pinned,
+                    tenant_id = excluded.tenant_id",
+                params![
+                    id,
+                    key,
+                    content,
+                    cat,
+                    embedding_bytes,
+                    now,
+                    now,
+                    sid,
+                    ns,
+                    imp,
+                    aid,
+                    kind,
+                    pinned,
+                    tenant_id
+                ],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
     fn category_to_str(cat: &MemoryCategory) -> String {
         match cat {
             MemoryCategory::Core => "core".into(),
@@ -394,6 +506,10 @@ impl SqliteMemory {
             "conversation" => MemoryCategory::Conversation,
             other => MemoryCategory::Custom(other.to_string()),
         }
+    }
+
+    fn decode_kind(raw: Option<String>) -> Option<super::traits::MemoryKind> {
+        raw.and_then(|kind| serde_json::from_str(&kind).ok())
     }
 
     /// Deterministic content hash for embedding cache.
@@ -641,7 +757,7 @@ impl SqliteMemory {
             let until_ref = until_owned.as_deref();
 
             let mut sql =
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, a.alias, m.agent_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE m.superseded_by IS NULL AND 1=1"
                     .to_string();
@@ -682,8 +798,11 @@ impl SqliteMemory {
                     namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
                     importance: row.get(7)?,
                     superseded_by: row.get(8)?,
-                    agent_alias: row.get(9)?,
-                    agent_id: row.get(10)?,
+                    kind: Self::decode_kind(row.get(9)?),
+                    pinned: row.get::<_, i64>(10)? != 0,
+                    tenant_id: row.get(13)?,
+                    agent_alias: row.get(11)?,
+                    agent_id: row.get(12)?,
                 })
             })?;
 
@@ -813,7 +932,7 @@ impl Memory for SqliteMemory {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let sql = format!(
-                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, a.alias, m.agent_id \
+                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
                      FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                      WHERE m.superseded_by IS NULL AND m.id IN ({placeholders})"
                 );
@@ -836,18 +955,57 @@ impl Memory for SqliteMemory {
                         row.get::<_, Option<f64>>(7)?,
                         row.get::<_, Option<String>>(8)?,
                         row.get::<_, Option<String>>(9)?,
-                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, i64>(10)? != 0,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
                     ))
                 })?;
 
                 let mut entry_map = std::collections::HashMap::new();
                 for row in rows {
-                    let (id, key, content, cat, ts, sid, ns, imp, sup, alias, aid) = row?;
-                    entry_map.insert(id, (key, content, cat, ts, sid, ns, imp, sup, alias, aid));
+                    let (
+                        id,
+                        key,
+                        content,
+                        cat,
+                        ts,
+                        sid,
+                        ns,
+                        imp,
+                        sup,
+                        kind,
+                        pinned,
+                        alias,
+                        aid,
+                        tenant,
+                    ) = row?;
+                    entry_map.insert(
+                        id,
+                        (
+                            key, content, cat, ts, sid, ns, imp, sup, kind, pinned, alias, aid,
+                            tenant,
+                        ),
+                    );
                 }
 
                 for scored in &merged {
-                    if let Some((key, content, cat, ts, sid, ns, imp, sup, alias, aid)) = entry_map.remove(&scored.id) {
+                    if let Some((
+                        key,
+                        content,
+                        cat,
+                        ts,
+                        sid,
+                        ns,
+                        imp,
+                        sup,
+                        kind,
+                        pinned,
+                        alias,
+                        aid,
+                        tenant,
+                    )) = entry_map.remove(&scored.id)
+                    {
                         if let Some(s) = since_ref
                             && ts.as_str() < s {
                                 continue;
@@ -867,6 +1025,9 @@ impl Memory for SqliteMemory {
                             namespace: ns.unwrap_or_else(|| "default".into()),
                             importance: imp,
                             superseded_by: sup,
+                            kind: Self::decode_kind(kind),
+                            pinned,
+                            tenant_id: tenant,
                             agent_alias: alias,
                             agent_id: aid,
                         };
@@ -923,7 +1084,7 @@ impl Memory for SqliteMemory {
                         param_idx += 1;
                     }
                     let sql = format!(
-                        "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, a.alias, m.agent_id
+                        "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id
                          FROM memories m LEFT JOIN agents a ON a.id = m.agent_id
                          WHERE m.superseded_by IS NULL AND ({where_clause}){time_conditions}
                          ORDER BY m.updated_at DESC
@@ -957,8 +1118,11 @@ impl Memory for SqliteMemory {
                             namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
                             importance: row.get(7)?,
                             superseded_by: row.get(8)?,
-                            agent_alias: row.get(9)?,
-                            agent_id: row.get(10)?,
+                            kind: Self::decode_kind(row.get(9)?),
+                            pinned: row.get::<_, i64>(10)? != 0,
+                            tenant_id: row.get(13)?,
+                            agent_alias: row.get(11)?,
+                            agent_id: row.get(12)?,
                         })
                     })?;
                     for row in rows {
@@ -996,7 +1160,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, a.alias, m.agent_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE m.key = ?1",
             )?;
@@ -1013,8 +1177,11 @@ impl Memory for SqliteMemory {
                     namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
                     importance: row.get(7)?,
                     superseded_by: row.get(8)?,
-                    agent_alias: row.get(9)?,
-                    agent_id: row.get(10)?,
+                    kind: Self::decode_kind(row.get(9)?),
+                    pinned: row.get::<_, i64>(10)? != 0,
+                    tenant_id: row.get(13)?,
+                    agent_alias: row.get(11)?,
+                    agent_id: row.get(12)?,
                 })
             })?;
 
@@ -1038,7 +1205,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, a.alias, m.agent_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE m.key = ?1 AND m.agent_id = ?2",
             )?;
@@ -1055,8 +1222,11 @@ impl Memory for SqliteMemory {
                     namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
                     importance: row.get(7)?,
                     superseded_by: row.get(8)?,
-                    agent_alias: row.get(9)?,
-                    agent_id: row.get(10)?,
+                    kind: Self::decode_kind(row.get(9)?),
+                    pinned: row.get::<_, i64>(10)? != 0,
+                    tenant_id: row.get(13)?,
+                    agent_alias: row.get(11)?,
+                    agent_id: row.get(12)?,
                 })
             })?;
 
@@ -1096,15 +1266,18 @@ impl Memory for SqliteMemory {
                     namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
                     importance: row.get(7)?,
                     superseded_by: row.get(8)?,
-                    agent_alias: row.get(9)?,
-                    agent_id: row.get(10)?,
+                    kind: Self::decode_kind(row.get(9)?),
+                    pinned: row.get::<_, i64>(10)? != 0,
+                    tenant_id: row.get(13)?,
+                    agent_alias: row.get(11)?,
+                    agent_id: row.get(12)?,
                 })
             };
 
             if let Some(ref cat) = category {
                 let cat_str = Self::category_to_str(cat);
                 let mut stmt = conn.prepare(
-                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, a.alias, m.agent_id
+                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id
                      FROM memories m LEFT JOIN agents a ON a.id = m.agent_id
                      WHERE m.superseded_by IS NULL AND m.category = ?1 ORDER BY m.updated_at DESC LIMIT ?2",
                 )?;
@@ -1119,7 +1292,7 @@ impl Memory for SqliteMemory {
                 }
             } else {
                 let mut stmt = conn.prepare(
-                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, a.alias, m.agent_id
+                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id
                      FROM memories m LEFT JOIN agents a ON a.id = m.agent_id
                      WHERE m.superseded_by IS NULL ORDER BY m.updated_at DESC LIMIT ?1",
                 )?;
@@ -1394,7 +1567,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let mut sql =
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, a.alias, m.agent_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE 1=1"
                     .to_string();
@@ -1443,8 +1616,11 @@ impl Memory for SqliteMemory {
                     namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
                     importance: row.get(7)?,
                     superseded_by: row.get(8)?,
-                    agent_alias: row.get(9)?,
-                    agent_id: row.get(10)?,
+                    kind: Self::decode_kind(row.get(9)?),
+                    pinned: row.get::<_, i64>(10)? != 0,
+                    tenant_id: row.get(13)?,
+                    agent_alias: row.get(11)?,
+                    agent_id: row.get(12)?,
                 })
             })?;
 
@@ -1464,7 +1640,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, a.alias, m.agent_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE m.agent_id = (SELECT id FROM agents WHERE alias = ?1 LIMIT 1) \
                  ORDER BY m.created_at ASC",
@@ -1481,8 +1657,11 @@ impl Memory for SqliteMemory {
                     namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
                     importance: row.get(7)?,
                     superseded_by: row.get(8)?,
-                    agent_alias: row.get(9)?,
-                    agent_id: row.get(10)?,
+                    kind: Self::decode_kind(row.get(9)?),
+                    pinned: row.get::<_, i64>(10)? != 0,
+                    tenant_id: row.get(13)?,
+                    agent_alias: row.get(11)?,
+                    agent_id: row.get(12)?,
                 })
             })?;
             let mut results = Vec::new();
@@ -1526,10 +1705,31 @@ impl Memory for SqliteMemory {
         // Same routing rule as `store`: no agent context at the trait
         // boundary, so attribute to the default agent through
         // `store_with_agent`.
-        self.store_with_agent(
-            key, content, category, session_id, namespace, importance, None,
+        self.store_row_with_metadata(
+            key,
+            content,
+            category,
+            session_id,
+            StoreOptions {
+                namespace: namespace.map(str::to_string),
+                importance,
+                ..StoreOptions::default()
+            },
+            None,
         )
         .await
+    }
+
+    async fn store_with_options(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+    ) -> anyhow::Result<()> {
+        self.store_row_with_metadata(key, content, category, session_id, options, None)
+            .await
     }
 
     async fn store_with_agent(
@@ -1542,63 +1742,104 @@ impl Memory for SqliteMemory {
         importance: Option<f64>,
         agent_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        // Graceful degrade: an embedding failure (provider 404/401, rate limit,
-        // outage, rotated key) must NOT discard the write. Persist the row with
-        // a NULL vector and log a recoverable warning — `zeroclaw memory
-        // reindex` backfills NULL embeddings from the retained `content` once
-        // the embedder is healthy again. Propagating the error here previously
-        // turned a transient credential fault into silent, permanent data loss.
-        let embedding_bytes = match self.get_or_compute_embedding(content).await {
-            Ok(emb) => emb.map(|emb| vector::vec_to_bytes(&emb)),
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "key": key,
-                            "error": format!("{e}"),
-                        })),
-                    "memory store: embedding failed; persisting row without a vector \
-                     (run `zeroclaw memory reindex` to backfill once the embedder recovers)"
-                );
-                None
-            }
-        };
+        self.store_row_with_metadata(
+            key,
+            content,
+            category,
+            session_id,
+            StoreOptions {
+                namespace: namespace.map(str::to_string),
+                importance,
+                ..StoreOptions::default()
+            },
+            agent_id,
+        )
+        .await
+    }
 
+    async fn supersede(&self, superseded_ids: &[String], new_id: &str) -> anyhow::Result<()> {
         let conn = self.conn.clone();
-        let key = key.to_string();
-        let content = content.to_string();
-        let sid = session_id.map(String::from);
-        let ns = namespace.unwrap_or("default").to_string();
-        let imp = importance.unwrap_or(0.5);
-        let aid = agent_id.map(String::from);
-
+        let ids = superseded_ids.to_vec();
+        let new_id = new_id.to_string();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = conn.lock();
-            let now = Local::now().to_rfc3339();
-            let cat = Self::category_to_str(&category);
-            let id = Uuid::new_v4().to_string();
+            crate::conflict::mark_superseded(&conn, &ids, &new_id)
+        })
+        .await?
+    }
 
-            // Uniqueness is per (agent_id, key): two agents may hold rows
-            // with the same key without clobbering each other. `agent_id`
-            // falls back to the synthesized default agent when the caller
-            // didn't supply one (callers going through AgentScopedMemory
-            // always do).
-            conn.execute(
-                "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id, namespace, importance, agent_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, COALESCE(?11, (SELECT id FROM agents WHERE alias = 'default' LIMIT 1)))
-                 ON CONFLICT(agent_id, key) DO UPDATE SET
-                    content = excluded.content,
-                    category = excluded.category,
-                    embedding = excluded.embedding,
-                    updated_at = excluded.updated_at,
-                    session_id = excluded.session_id,
-                    namespace = excluded.namespace,
-                    importance = excluded.importance",
-                params![id, key, content, cat, embedding_bytes, now, now, sid, ns, imp, aid],
+    async fn count_in_scope(
+        &self,
+        namespace: Option<&str>,
+        category: Option<&MemoryCategory>,
+    ) -> anyhow::Result<u64> {
+        let conn = self.conn.clone();
+        let namespace = namespace.map(str::to_string);
+        let category = category.map(Self::category_to_str);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+            let conn = conn.lock();
+            let count = match (namespace, category) {
+                (Some(ns), Some(cat)) => conn.query_row(
+                    "SELECT COUNT(*) FROM memories WHERE namespace = ?1 AND category = ?2 AND superseded_by IS NULL",
+                    params![ns, cat],
+                    |row| row.get::<_, u64>(0),
+                )?,
+                (Some(ns), None) => conn.query_row(
+                    "SELECT COUNT(*) FROM memories WHERE namespace = ?1 AND superseded_by IS NULL",
+                    params![ns],
+                    |row| row.get::<_, u64>(0),
+                )?,
+                (None, Some(cat)) => conn.query_row(
+                    "SELECT COUNT(*) FROM memories WHERE category = ?1 AND superseded_by IS NULL",
+                    params![cat],
+                    |row| row.get::<_, u64>(0),
+                )?,
+                (None, None) => conn.query_row(
+                    "SELECT COUNT(*) FROM memories WHERE superseded_by IS NULL",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )?,
+            };
+            Ok(count)
+        })
+        .await?
+    }
+
+    async fn stats(&self) -> anyhow::Result<MemoryStats> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<MemoryStats> {
+            let conn = conn.lock();
+            let total_rows = conn.query_row("SELECT COUNT(*) FROM memories", [], |row| {
+                row.get::<_, u64>(0)
+            })?;
+            let superseded_rows = conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE superseded_by IS NOT NULL",
+                [],
+                |row| row.get::<_, u64>(0),
             )?;
-            Ok(())
+            let pinned_rows = conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE pinned = 1",
+                [],
+                |row| row.get::<_, u64>(0),
+            )?;
+            let bytes = conn.query_row(
+                "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM memories",
+                [],
+                |row| row.get::<_, u64>(0),
+            )?;
+            let mut stmt =
+                conn.prepare("SELECT category, COUNT(*) FROM memories GROUP BY category")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+            })?;
+            let by_category = rows.collect::<Result<Vec<_>, _>>()?;
+            Ok(MemoryStats {
+                total_rows,
+                by_category,
+                superseded_rows,
+                pinned_rows,
+                bytes,
+            })
         })
         .await?
     }
@@ -3214,6 +3455,305 @@ mod tests {
             assert_eq!(results[0].key, "k1");
             assert_eq!(results[0].session_id.as_deref(), Some("sess-x"));
         }
+    }
+
+    #[tokio::test]
+    async fn count_in_scope_counts_only_active_rows() {
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.store_with_options(
+            "core_alpha",
+            "core alpha",
+            MemoryCategory::Core,
+            None,
+            StoreOptions {
+                namespace: Some("alpha".to_string()),
+                pinned: true,
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        mem.store_with_options(
+            "daily_alpha",
+            "daily alpha",
+            MemoryCategory::Daily,
+            None,
+            StoreOptions {
+                namespace: Some("alpha".to_string()),
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        mem.store_with_options(
+            "core_beta",
+            "core beta",
+            MemoryCategory::Core,
+            None,
+            StoreOptions {
+                namespace: Some("beta".to_string()),
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let beta = mem
+            .get("core_beta")
+            .await
+            .unwrap()
+            .expect("core_beta should exist before supersede");
+        mem.supersede(&[beta.id], "core_alpha").await.unwrap();
+
+        assert_eq!(mem.count_in_scope(Some("alpha"), None).await.unwrap(), 2);
+        assert_eq!(mem.count_in_scope(Some("beta"), None).await.unwrap(), 0);
+        assert_eq!(
+            mem.count_in_scope(None, Some(&MemoryCategory::Core))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            mem.count_in_scope(None, Some(&MemoryCategory::Daily))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(mem.count_in_scope(None, None).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn stats_reports_memory_store_telemetry() {
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.store_with_options(
+            "core_alpha",
+            "core alpha",
+            MemoryCategory::Core,
+            None,
+            StoreOptions {
+                pinned: true,
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        mem.store("daily_alpha", "daily alpha", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+        mem.store("core_beta", "core beta", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let beta = mem
+            .get("core_beta")
+            .await
+            .unwrap()
+            .expect("core_beta should exist before supersede");
+        mem.supersede(&[beta.id], "core_alpha").await.unwrap();
+
+        let stats = mem.stats().await.unwrap();
+        assert_eq!(stats.total_rows, 3);
+        assert_eq!(stats.superseded_rows, 1);
+        assert_eq!(stats.pinned_rows, 1);
+        assert_eq!(
+            stats.bytes,
+            "core alpha".len() as u64 + "daily alpha".len() as u64 + "core beta".len() as u64
+        );
+
+        let by_category: std::collections::HashMap<_, _> = stats.by_category.into_iter().collect();
+        assert_eq!(by_category.get("core"), Some(&2));
+        assert_eq!(by_category.get("daily"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn store_with_options_round_trips_memory_kind() {
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.store_with_options(
+            "decision",
+            "Use staged rollout",
+            MemoryCategory::Core,
+            None,
+            StoreOptions::default().with_kind(super::super::traits::MemoryKind::Semantic(
+                super::super::traits::SemanticSubtype::Decision,
+            )),
+        )
+        .await
+        .unwrap();
+
+        let entry = mem
+            .get("decision")
+            .await
+            .unwrap()
+            .expect("kind-tagged row should be readable");
+        assert_eq!(
+            entry.kind,
+            Some(super::super::traits::MemoryKind::Semantic(
+                super::super::traits::SemanticSubtype::Decision
+            ))
+        );
+
+        let recalled = mem.recall("rollout", 5, None, None, None).await.unwrap();
+        assert_eq!(
+            recalled.first().and_then(|entry| entry.kind.clone()),
+            Some(super::super::traits::MemoryKind::Semantic(
+                super::super::traits::SemanticSubtype::Decision
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_round_trips_through_get_list_recall_and_export() {
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.store_with_options(
+            "pinned_readback",
+            "pinned readback marker",
+            MemoryCategory::Core,
+            Some("session-pinned"),
+            StoreOptions {
+                pinned: true,
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let entry = mem
+            .get("pinned_readback")
+            .await
+            .unwrap()
+            .expect("pinned row should be readable");
+        assert!(entry.pinned);
+
+        let listed = mem
+            .list(Some(&MemoryCategory::Core), Some("session-pinned"))
+            .await
+            .unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|entry| entry.key == "pinned_readback" && entry.pinned)
+        );
+
+        let recalled = mem
+            .recall("readback", 10, Some("session-pinned"), None, None)
+            .await
+            .unwrap();
+        assert!(
+            recalled
+                .iter()
+                .any(|entry| entry.key == "pinned_readback" && entry.pinned)
+        );
+
+        let exported = mem.export(&ExportFilter::default()).await.unwrap();
+        assert!(
+            exported
+                .iter()
+                .any(|entry| entry.key == "pinned_readback" && entry.pinned)
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_id_round_trips_through_get_list_recall_and_export() {
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.store_with_options(
+            "tenant_scoped",
+            "tenant scoped marker",
+            MemoryCategory::Core,
+            Some("session-tenant"),
+            StoreOptions::default().with_tenant_id("acme"),
+        )
+        .await
+        .unwrap();
+
+        let entry = mem
+            .get("tenant_scoped")
+            .await
+            .unwrap()
+            .expect("tenant-scoped row should be readable");
+        assert_eq!(entry.tenant_id.as_deref(), Some("acme"));
+
+        let listed = mem
+            .list(Some(&MemoryCategory::Core), Some("session-tenant"))
+            .await
+            .unwrap();
+        assert!(listed.iter().any(
+            |entry| entry.key == "tenant_scoped" && entry.tenant_id.as_deref() == Some("acme")
+        ));
+
+        let recalled = mem
+            .recall("marker", 10, Some("session-tenant"), None, None)
+            .await
+            .unwrap();
+        assert!(recalled.iter().any(
+            |entry| entry.key == "tenant_scoped" && entry.tenant_id.as_deref() == Some("acme")
+        ));
+
+        let exported = mem.export(&ExportFilter::default()).await.unwrap();
+        assert!(exported.iter().any(
+            |entry| entry.key == "tenant_scoped" && entry.tenant_id.as_deref() == Some("acme")
+        ));
+    }
+
+    #[tokio::test]
+    async fn supersede_soft_hides_losers_but_keeps_them_reversible() {
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.store_with_options(
+            "old_fact",
+            "the office is in Denver",
+            MemoryCategory::Core,
+            Some("s"),
+            StoreOptions::default(),
+        )
+        .await
+        .unwrap();
+        mem.store_with_options(
+            "new_fact",
+            "the office moved to Austin",
+            MemoryCategory::Core,
+            Some("s"),
+            StoreOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let old = mem.get("old_fact").await.unwrap().expect("old row present");
+        let new = mem.get("new_fact").await.unwrap().expect("new row present");
+
+        mem.supersede(std::slice::from_ref(&old.id), &new.id)
+            .await
+            .unwrap();
+
+        // Recall hides the superseded loser but still surfaces the winner.
+        let recalled = mem
+            .recall("office", 10, Some("s"), None, None)
+            .await
+            .unwrap();
+        assert!(
+            recalled.iter().all(|e| e.key != "old_fact"),
+            "superseded row must not surface in recall"
+        );
+        assert!(
+            recalled.iter().any(|e| e.key == "new_fact"),
+            "the superseding row still recalls"
+        );
+
+        // Soft-hide, not hard delete: the row persists with a supersede marker.
+        let hidden = mem
+            .get("old_fact")
+            .await
+            .unwrap()
+            .expect("supersede is reversible, the row still exists");
+        assert_eq!(
+            hidden.superseded_by.as_deref(),
+            Some(new.id.as_str()),
+            "the loser records who superseded it"
+        );
     }
 
     #[tokio::test]

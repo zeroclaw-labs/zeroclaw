@@ -112,6 +112,9 @@ fn from_wit_entry(e: WitMemoryEntry) -> MemoryEntry {
         namespace: e.namespace,
         importance: e.importance,
         superseded_by: e.superseded_by,
+        kind: None,
+        pinned: false,
+        tenant_id: None,
         agent_alias: e.agent_alias,
         agent_id: e.agent_id,
     }
