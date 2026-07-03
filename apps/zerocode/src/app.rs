@@ -95,8 +95,8 @@ impl Mode {
             Mode::Dashboard => "zc-pane-dashboard",
             Mode::Config => "zc-pane-config",
             Mode::Doctor => "zc-pane-doctor",
-            Mode::Code => "zc-pane-code",
-            Mode::Chat => "zc-pane-chat",
+            Mode::Code => transcript::PaneKind::Code.fluent_key(),
+            Mode::Chat => transcript::PaneKind::Chat.fluent_key(),
             Mode::Logs => "zc-pane-logs",
             Mode::Quickstart => "zc-pane-quickstart",
         }
