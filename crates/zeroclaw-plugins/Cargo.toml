@@ -9,7 +9,7 @@ publish = false
 [features]
 default = ["plugins-wit-v0"]
 plugins-wit-v0 = []
-plugins-wasmtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
+plugins-wasmtime = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http"]
 plugins-wasm-cranelift = ["plugins-wasmtime", "wasmtime/cranelift"]
 plugins-wasm-pulley = ["plugins-wasmtime", "wasmtime/pulley"]
 
@@ -35,6 +35,10 @@ wasmtime = { version = "43", default-features = false, features = [
 ], optional = true }
 wasmtime-wasi = { version = "43", default-features = false, features = [
   "p2",
+], optional = true }
+wasmtime-wasi-http = { version = "43", default-features = false, features = [
+  "p2",
+  "default-send-request",
 ], optional = true }
 
 [dev-dependencies]

@@ -15,6 +15,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::time::{self, Duration};
+use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl};
 use zeroclaw_log::Instrument;
@@ -286,7 +287,11 @@ pub async fn run_manual_job(
     }
 }
 
-pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
+pub async fn run(
+    config: Config,
+    event_tx: EventBroadcast,
+    cancel: CancellationToken,
+) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -379,27 +384,44 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
     }
 
     loop {
-        interval.tick().await;
-        // Keep scheduler liveness fresh even when there are no due jobs.
-        crate::health::mark_component_ok(SCHEDULER_COMPONENT);
+        // `select!` between the interval tick and the cancellation
+        // token so the daemon's shutdown path (`channels_cancel.cancel()`
+        // at daemon/mod.rs:584) reaches the scheduler without waiting
+        // for the next tick — and so the loop returns `Ok(())` cleanly
+        // before the supervisor's `.abort()` fallback would fire.
+        tokio::select! {
+            _ = interval.tick() => {
+                // Keep scheduler liveness fresh even when there are no due jobs.
+                crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
-        let jobs = match due_jobs(&config, Utc::now()) {
-            Ok(jobs) => jobs,
-            Err(e) => {
-                crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "Scheduler query failed"
-                );
-                continue;
+                let jobs = match due_jobs(&config, Utc::now()) {
+                    Ok(jobs) => jobs,
+                    Err(e) => {
+                        crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "Scheduler query failed"
+                        );
+                        continue;
+                    }
+                };
+
+                let jobs = claim_due_jobs(&config, jobs);
+                process_due_jobs(&config, jobs, SCHEDULER_COMPONENT, &event_tx).await;
             }
-        };
-
-        let jobs = claim_due_jobs(&config, jobs);
-        process_due_jobs(&config, jobs, SCHEDULER_COMPONENT, &event_tx).await;
+            _ = cancel.cancelled() => {
+                crate::health::mark_component_ok(SCHEDULER_COMPONENT);
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "Cron scheduler shutting down via cancellation token"
+                );
+                return Ok(());
+            }
+        }
     }
 }
 

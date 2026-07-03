@@ -903,4 +903,60 @@ mod tests {
             "empty page under an until_line_offset cursor must also report at_end"
         );
     }
+
+    #[test]
+    fn action_filter_matches_case_insensitively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+        write_jsonl(
+            &path,
+            &[
+                make_event("LlmRequest", None),
+                make_event("tool_call", None),
+            ],
+        );
+        let filter = LogFilter {
+            action: Some("llmrequest".into()),
+            ..Default::default()
+        };
+        let page = load_page(&path, &filter, 10).unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].event.action, "LlmRequest");
+    }
+
+    #[test]
+    fn category_filter_matches_case_insensitively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+        let mut agent_ev = make_event("a", None);
+        agent_ev.event.category = "agent".into();
+        let mut tool_ev = make_event("b", None);
+        tool_ev.event.category = "tool".into();
+        write_jsonl(&path, &[agent_ev, tool_ev]);
+        let filter = LogFilter {
+            category: Some("AGENT".into()),
+            ..Default::default()
+        };
+        let page = load_page(&path, &filter, 10).unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].event.action, "a");
+    }
+
+    #[test]
+    fn outcome_filter_matches_case_insensitively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+        let mut ok_ev = make_event("a", None);
+        ok_ev.event.outcome = "success".into();
+        let mut fail_ev = make_event("b", None);
+        fail_ev.event.outcome = "failure".into();
+        write_jsonl(&path, &[ok_ev, fail_ev]);
+        let filter = LogFilter {
+            outcome: Some("FAILURE".into()),
+            ..Default::default()
+        };
+        let page = load_page(&path, &filter, 10).unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].event.action, "b");
+    }
 }
