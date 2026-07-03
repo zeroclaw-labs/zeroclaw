@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 /// HTTP request tool for API interactions.
@@ -447,7 +447,7 @@ impl Tool for HttpRequestTool {
                 None => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some("'auth_secret' must be a string".into()),
                     });
                 }
@@ -459,7 +459,7 @@ impl Tool for HttpRequestTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
@@ -472,7 +472,7 @@ impl Tool for HttpRequestTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -483,7 +483,7 @@ impl Tool for HttpRequestTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -494,7 +494,7 @@ impl Tool for HttpRequestTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -502,7 +502,7 @@ impl Tool for HttpRequestTool {
         if let Err(e) = self.apply_auth_secret(&mut request_headers, auth_secret) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e.to_string()),
             });
         }
@@ -545,7 +545,7 @@ impl Tool for HttpRequestTool {
 
                 Ok(ToolResult {
                     success: status.is_success(),
-                    output,
+                    output: output.into(),
                     error: if status.is_client_error() || status.is_server_error() {
                         Some(format!("HTTP {}", status_code))
                     } else {
@@ -555,7 +555,7 @@ impl Tool for HttpRequestTool {
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("HTTP request failed: {e}")),
             }),
         }

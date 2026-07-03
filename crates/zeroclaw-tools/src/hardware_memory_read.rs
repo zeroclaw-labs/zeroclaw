@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use serde_json::json;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// RAM base for Nucleo-F401RE (STM32F401)
 const NUCLEO_RAM_BASE: u64 = 0x2000_0000;
@@ -63,7 +63,7 @@ impl Tool for HardwareMemoryReadTool {
         if self.boards.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "No peripherals configured. Add nucleo-f401re to config.toml [peripherals.boards]."
                         .into(),
@@ -82,7 +82,7 @@ impl Tool for HardwareMemoryReadTool {
         if chip.is_none() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Memory read only supports nucleo-f401re, nucleo-f411re. Got: {}",
                     board
@@ -128,7 +128,7 @@ impl Tool for HardwareMemoryReadTool {
         {
             Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "Memory read requires probe feature. Build with: cargo build --features hardware,probe"
                         .into(),

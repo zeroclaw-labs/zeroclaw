@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use serde_json::json;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 const MAX_ROUND_DECIMALS: i64 = 15;
 
@@ -107,7 +107,7 @@ impl Tool for CalculatorTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing required parameter: function".to_string()),
                 });
             }
@@ -146,12 +146,12 @@ impl Tool for CalculatorTool {
         match result {
             Ok(output) => Ok(ToolResult {
                 success: true,
-                output,
+                output: output.into(),
                 error: None,
             }),
             Err(err) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(err),
             }),
         }

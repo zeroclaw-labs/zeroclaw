@@ -7,7 +7,7 @@ use async_trait::async_trait;
 
 use crate::mcp_client::McpRegistry;
 use crate::mcp_protocol::McpToolDef;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// A zeroclaw [`Tool`] backed by an MCP server tool.
 ///
@@ -67,12 +67,12 @@ impl Tool for McpToolWrapper {
         match self.registry.call_tool(&self.prefixed_name, args).await {
             Ok(output) => Ok(ToolResult {
                 success: true,
-                output,
+                output: output.into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e.to_string()),
             }),
         }
@@ -179,7 +179,7 @@ mod tests {
         // A real happy-path requires a live MCP server; that is covered by E2E tests.
         let _: ToolResult = ToolResult {
             success: true,
-            output: "hello".to_string(),
+            output: "hello".to_string().into(),
             error: None,
         };
     }

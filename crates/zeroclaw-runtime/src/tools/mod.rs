@@ -125,7 +125,7 @@ pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
 // Traits from zeroclaw-api
 pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};
-pub use zeroclaw_api::tool::{Tool, ToolResult, ToolSpec};
+pub use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSpec};
 
 // Local tool re-exports (tools with root deps, kept in misc)
 pub use cron_add::CronAddTool;
@@ -2285,7 +2285,7 @@ mod tests {
     fn tool_result_with_error_serde() {
         let result = ToolResult {
             success: false,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: Some("boom".into()),
         };
         let json = serde_json::to_string(&result).unwrap();

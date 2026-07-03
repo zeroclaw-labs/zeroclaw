@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 /// Maximum PDF file size (50 MB).
@@ -102,7 +102,7 @@ impl Tool for PdfReadTool {
                 let _ = self.security.record_action();
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to resolve file path: {e}")),
                 });
             }
@@ -111,7 +111,7 @@ impl Tool for PdfReadTool {
         if !self.security.is_resolved_path_readable(&resolved_path) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     self.security
                         .resolved_path_violation_message(&resolved_path),
@@ -130,7 +130,7 @@ impl Tool for PdfReadTool {
                 if meta.len() > MAX_PDF_BYTES {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "PDF too large: {} bytes (limit: {MAX_PDF_BYTES} bytes)",
                             meta.len()
@@ -141,7 +141,7 @@ impl Tool for PdfReadTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to read file metadata: {e}")),
                 });
             }
@@ -152,7 +152,7 @@ impl Tool for PdfReadTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Failed to read PDF file: {e}")),
                 });
             }
@@ -216,7 +216,7 @@ impl Tool for PdfReadTool {
             let _ = max_chars;
             Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "PDF extraction is not enabled. \
                      Rebuild with: cargo build --features rag-pdf"

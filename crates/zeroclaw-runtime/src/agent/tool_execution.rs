@@ -319,7 +319,7 @@ pub(crate) async fn execute_one_tool(
                         receipt,
                     })
                 } else {
-                    let reason = r.error.unwrap_or(r.output);
+                    let reason = r.error.unwrap_or_else(|| r.output.into_string());
                     observer.record_event(&ObserverEvent::ToolCall {
                         tool: call_name.to_string(),
                         tool_call_id: tool_call_id_owned.clone(),

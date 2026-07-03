@@ -147,7 +147,7 @@ impl Tool for CountingTool {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(crate::tools::ToolResult {
             success: true,
-            output: format!("{}-out", self.name),
+            output: format!("{}-out", self.name).into(),
             error: None,
         })
     }

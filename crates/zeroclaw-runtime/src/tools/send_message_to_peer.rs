@@ -42,7 +42,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
 /// Send a message to a peer on a shared channel. Bound to a single
@@ -159,7 +159,7 @@ impl Tool for SendMessageToPeerTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "target {target:?} is not on agent {alias:?}'s resolved peer set for channel {channel:?}; \
                      add a [peer_groups.<name>] entry that lists both this agent and the target before sending",
@@ -180,7 +180,7 @@ impl Tool for SendMessageToPeerTool {
         if !agent_listens_on_channel {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "agent {alias:?} does not list channel {channel:?} on its `channels`; \
                      add the channel ref to [agents.{alias}.channels] before sending",
@@ -236,7 +236,7 @@ impl Tool for SendMessageToPeerTool {
                 success: true,
                 output: format!(
                     "accepted for in-process delivery to peer agent {canonical:?} (recipient runs detached; observe its agent loop for the actual outcome)"
-                ),
+                ).into(),
                 error: None,
             });
         }
@@ -244,12 +244,12 @@ impl Tool for SendMessageToPeerTool {
         match deliver_announcement(&self.config, &channel, &target, None, &message).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
-                output: format!("delivered to external peer {target:?} on {channel}"),
+                output: format!("delivered to external peer {target:?} on {channel}").into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("delivery failed: {e:#}")),
             }),
         }

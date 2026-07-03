@@ -918,7 +918,7 @@ impl Tool for WebSearchTool {
 
         Ok(ToolResult {
             success: true,
-            output: result,
+            output: result.into(),
             error: None,
         })
     }

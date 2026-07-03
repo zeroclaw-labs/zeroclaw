@@ -25,7 +25,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use zeroclaw_api::attribution::{Attributable, Role};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 /// Type alias for a path-extraction closure used by [`PathGuardedTool`].
@@ -96,7 +96,7 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
             });
         }
@@ -111,7 +111,7 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
         if result.success && !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
             });
         }
@@ -212,7 +212,7 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
             if let Some(path) = blocked {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Path blocked by security policy: {path}")),
                 });
             }
@@ -448,7 +448,7 @@ mod tests {
             async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
                 Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("validation failed".into()),
                 })
             }

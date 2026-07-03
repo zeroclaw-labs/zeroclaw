@@ -55,7 +55,7 @@ pub(crate) async fn record_executed_outcomes(
         if let Some(hooks) = ctx.hooks {
             let tool_result_obj = crate::tools::ToolResult {
                 success: outcome.success,
-                output: outcome.output.clone(),
+                output: outcome.output.clone().into(),
                 error: None,
             };
             hooks

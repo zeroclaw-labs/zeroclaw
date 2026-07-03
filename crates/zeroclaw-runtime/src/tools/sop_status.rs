@@ -123,13 +123,13 @@ impl Tool for SopStatusTool {
                     self.append_gate_status(&mut output, include_gate_status);
                     Ok(ToolResult {
                         success: true,
-                        output,
+                        output: output.into(),
                         error: None,
                     })
                 }
                 None => Ok(ToolResult {
                     success: true,
-                    output: format!("No run found with ID '{run_id}'."),
+                    output: format!("No run found with ID '{run_id}'.").into(),
                     error: None,
                 }),
             };
@@ -198,7 +198,7 @@ impl Tool for SopStatusTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }

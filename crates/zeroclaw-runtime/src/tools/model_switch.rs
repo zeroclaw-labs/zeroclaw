@@ -4,7 +4,7 @@ use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
 #[cfg(test)]
@@ -121,7 +121,7 @@ impl Tool for ModelSwitchTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -133,7 +133,7 @@ impl Tool for ModelSwitchTool {
             "list_models" => self.handle_list_models(&args).await,
             _ => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unknown action: {}. Valid actions: get, set, list_model_providers, list_models",
                     action
@@ -153,7 +153,7 @@ impl ModelSwitchTool {
             output: serde_json::to_string_pretty(&json!({
                 "pending_switch": pending,
                 "note": "To switch models, use action 'set' with dotted <type>.<alias> model_provider and model parameters"
-            }))?,
+            }))?.into(),
             error: None,
         })
     }
@@ -166,7 +166,7 @@ impl ModelSwitchTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing 'model_provider' parameter for 'set' action".to_string()),
                 });
             }
@@ -179,7 +179,7 @@ impl ModelSwitchTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing 'model' parameter for 'set' action".to_string()),
                 });
             }
@@ -197,7 +197,7 @@ impl ModelSwitchTool {
                         "provider_ref_shape": "<type>.<alias>",
                         "available_provider_families": known_model_providers.iter().map(|p| p.name).collect::<Vec<_>>(),
                         "configured_provider_profiles": configured_profiles
-                    }))?,
+                    }))?.into(),
                     error: Some(error),
                 });
             }
@@ -207,7 +207,7 @@ impl ModelSwitchTool {
         if model.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Model ID cannot be empty".to_string()),
             });
         }
@@ -223,7 +223,7 @@ impl ModelSwitchTool {
                 "model_provider": model_provider,
                 "model": model,
                 "note": "The active runtime path will consume this provider-profile/model switch where model_switch is supported. This does not write persisted config."
-            }))?,
+            }))?.into(),
             error: None,
         })
     }
@@ -253,7 +253,7 @@ impl ModelSwitchTool {
                 "configured_count": configured_count,
                 "provider_ref_shape": "<type>.<alias>",
                 "example": "Use action 'set' with a dotted provider profile ref such as 'openai.default'"
-            }))?,
+            }))?.into(),
             error: None,
         })
     }
@@ -274,7 +274,7 @@ impl ModelSwitchTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(
                         "Missing 'model_provider' parameter for 'list_models' action".to_string(),
                     ),
@@ -291,7 +291,7 @@ impl ModelSwitchTool {
                     output: serde_json::to_string_pretty(&json!({
                         "provider_ref_shape": "<type>.<alias>",
                         "configured_provider_profiles": configured_model_provider_profiles(&self.config)
-                    }))?,
+                    }))?.into(),
                     error: Some(error),
                 });
             }
@@ -334,7 +334,7 @@ impl ModelSwitchTool {
                     "model_provider": model_provider,
                     "models": [],
                     "note": "No common models listed for this model_provider family. Check model_provider documentation for available models."
-                }))?,
+                }))?.into(),
                 error: None,
             });
         }
@@ -345,7 +345,8 @@ impl ModelSwitchTool {
                 "model_provider": model_provider,
                 "models": models,
                 "example": "Use action 'set' with this model_provider and a model ID to switch"
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }

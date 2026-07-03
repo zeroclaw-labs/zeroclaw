@@ -4507,7 +4507,7 @@ mod tests {
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<tools::ToolResult> {
             Ok(tools::ToolResult {
                 success: true,
-                output: String::new(),
+                output: tools::ToolOutput::default(),
                 error: None,
             })
         }
