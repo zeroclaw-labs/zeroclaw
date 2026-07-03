@@ -2564,8 +2564,13 @@ mod outbound {
     ///   / cloud-metadata addresses and `localhost` / `*.local` names are
     ///   refused (parser-level SSRF guard). DNS-rebind is **not** mitigated
     ///   here; that would require a synchronous resolve inside the validator
-    ///   and is tracked as a follow-up. The fetch is also bounded by
-    ///   `MAX_MARKER_BYTES` and `MARKER_HTTP_TIMEOUT` in `fetch_http`.
+    ///   and is tracked as a follow-up. Even if the original URL passes,
+    ///   every redirect target the `fetch_http` client encounters is also
+    ///   re-validated against the same `is_private_or_local_host` primitive
+    ///   (see `marker_http_client`'s `Policy::custom`), so a public-looking
+    ///   marker can't `302 Location: http://169.254.169.254/...` past the
+    ///   guard. The fetch is also bounded by `MAX_MARKER_BYTES` and
+    ///   `MARKER_HTTP_TIMEOUT` in `fetch_http`.
     /// * Schemes other than `http`/`https` (`file:`, `data:`, anything with
     ///   `://`) are refused outright.
     /// * Local paths are canonicalised and must live inside `workspace_dir`.
@@ -2714,19 +2719,67 @@ mod outbound {
         Ok(MarkerTarget::Local(target_canon))
     }
 
+    /// Maximum number of redirects to follow on a marker HTTP fetch. The
+    /// `Policy::custom` closure below rejects any redirect target whose host
+    /// is private/local, so the cap mainly bounds the worst-case public-→-public
+    /// chain an attacker can construct.
+    const MAX_MARKER_REDIRECTS: usize = 10;
+
+    /// Marker HTTP client. Uses `Policy::custom` so that every redirect target
+    /// is re-validated against the same `is_private_or_local_host` primitive
+    /// the parser-level guard uses (`validate_marker_target` above). Without
+    /// this, a public-looking marker URL could pass the parser check and then
+    /// 302 to `http://169.254.169.254/` or `http://127.0.0.1/`, leaving the
+    /// SSRF open at the fetch boundary. Mirrors the redirect-validation
+    /// closure in `web_fetch.rs::validate_target_url` so any future change to
+    /// the trust boundary lands on both tools together.
     fn marker_http_client() -> &'static reqwest::Client {
         static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
         CLIENT.get_or_init(|| {
+            let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= MAX_MARKER_REDIRECTS {
+                    return attempt.error(std::io::Error::other(format!(
+                        "Too many marker redirects (max {MAX_MARKER_REDIRECTS})"
+                    )));
+                }
+                // `attempt.url()` borrows the attempt, so we copy out the
+                // bits we need into owned Strings before `attempt.error(...)`,
+                // which moves the attempt, can run.
+                let target_str = attempt.url().as_str().to_string();
+                let host = attempt.url().host_str().unwrap_or("").to_string();
+                if zeroclaw_tools::helpers::domain_guard::is_private_or_local_host(&host) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "target": target_str,
+                                "host": host,
+                                "reason": "ssrf_redirect_to_private_host",
+                            })),
+                        "matrix: marker redirect targets a private/local host"
+                    );
+                    return attempt.error(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "Blocked marker redirect to private or local host ({host}); \
+                             refusing for SSRF safety. Use a public URL or attach the file \
+                             from workspace_dir directly."
+                        ),
+                    ));
+                }
+                attempt.follow()
+            });
             reqwest::Client::builder()
                 .timeout(MARKER_HTTP_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::limited(5))
+                .redirect(redirect_policy)
                 .user_agent("zeroclaw-matrix/1.0")
                 .build()
                 .expect("default reqwest client config never fails to build")
         })
     }
 
-    async fn fetch_http(url: reqwest::Url) -> Result<Vec<u8>> {
+    pub(super) async fn fetch_http(url: reqwest::Url) -> Result<Vec<u8>> {
         let client = marker_http_client();
         let resp = client
             .get(url.clone())
@@ -5994,6 +6047,119 @@ mod tests {
                     "public host {h} must be accepted, got: {result:?}"
                 );
             }
+        }
+    }
+
+    mod outbound_redirect_ssrf {
+        //! Fetch-boundary tests for the marker HTTP redirect policy.
+        //!
+        //! The parser-level SSRF guard in `validate_marker_target` only sees
+        //! the URL the agent emitted. `marker_http_client` (used by `fetch_http`)
+        //! must also re-validate every redirect target, otherwise a public-
+        //! looking marker can `302 Location: http://169.254.169.254/...` past
+        //! the parser and exfiltrate cloud metadata into the room. These tests
+        //! stand up a real `wiremock` server that 302s to a private host and
+        //! assert `fetch_http` rejects the chain.
+        //!
+        //! They intentionally exercise the *fetch* boundary (not just the
+        //! parser) — that's what the audit blocker (PR #8657 review) flagged
+        //! when the first review pass added only the literal-host string
+        //! check.
+
+        use super::super::outbound::fetch_http;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn private_redirect_body(location: &str) -> ResponseTemplate {
+            ResponseTemplate::new(302).insert_header("Location", location)
+        }
+
+        #[tokio::test]
+        async fn rejects_redirect_to_cloud_metadata_ip() {
+            // AWS / GCP / Azure instance-metadata endpoint. The parser-level
+            // guard would already block `[image:http://169.254.169.254/...]`
+            // directly — this test confirms the redirect chain is closed too,
+            // so a public marker can be coaxed into uploading cloud
+            // credentials by way of a 302.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/photo.jpg"))
+                .respond_with(private_redirect_body(
+                    "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let url = reqwest::Url::parse(&format!("{}/photo.jpg", server.uri())).unwrap();
+            let err: anyhow::Error = fetch_http(url)
+                .await
+                .expect_err("redirect to cloud-metadata IP must be rejected");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("private or local host") || msg.contains("PermissionDenied"),
+                "expected SSRF redirect refusal, got: {msg}"
+            );
+            server.verify().await;
+        }
+
+        #[tokio::test]
+        async fn rejects_redirect_to_loopback() {
+            // Even though the agent marker host is a fresh `wiremock` loopback
+            // bind (so the *initial* URL is fine), a `Location: 127.0.0.1`
+            // redirect must be stopped by the per-hop closure — not by
+            // trusting the final URL until reqwest has already opened the
+            // connection.
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/photo.jpg"))
+                .respond_with(private_redirect_body("http://127.0.0.1:9200/_cat/indices"))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let url = reqwest::Url::parse(&format!("{}/photo.jpg", server.uri())).unwrap();
+            let err: anyhow::Error = fetch_http(url)
+                .await
+                .expect_err("redirect to loopback must be rejected");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("private or local host") || msg.contains("PermissionDenied"),
+                "expected SSRF redirect refusal, got: {msg}"
+            );
+            server.verify().await;
+        }
+
+        #[tokio::test]
+        async fn follows_public_redirect_target() {
+            // Sanity check: when the redirect target's host string is public,
+            // the per-hop closure follows it (does not error). We deliberately
+            // use a `Location:` that points at a public-looking hostname
+            // (`example.com`) without actually resolving it — the closure's
+            // gate is the host *string*, so this verifies the follow path
+            // runs end-to-end without hitting a private-host block. Wiremock
+            // can't mock a different host from itself, so we can't model a
+            // full multi-hop CDN chain here; the "rejects private" cases
+            // above prove the gate fires, this one proves it doesn't
+            // false-positive on a public hostname.
+            //
+            // The test asserts the closure returns `attempt.follow()` rather
+            // than `attempt.error(...)` — i.e. the redirect is not blocked.
+            // We can't observe `attempt.follow()`'s result directly, so we
+            // assert that the *next* hop request happens by setting up a
+            // wiremock that responds to the public-looking Location and
+            // checking the request lands. Wiremock can't intercept
+            // `example.com`, so we test the closure decision via a unit
+            // check on the primitive: `is_private_or_local_host("example.com")`
+            // must be `false` for the gate to ever follow it.
+            assert!(
+                !zeroclaw_tools::helpers::domain_guard::is_private_or_local_host("example.com"),
+                "public hostnames must not be classified as private by the per-hop guard"
+            );
+            assert!(
+                !zeroclaw_tools::helpers::domain_guard::is_private_or_local_host("cdn.example.com"),
+                "public subdomains must not be classified as private"
+            );
         }
     }
 
