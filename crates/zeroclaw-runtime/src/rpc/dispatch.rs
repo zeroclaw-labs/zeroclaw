@@ -5,7 +5,7 @@
 //! variant has a handler via exhaustive `match`.
 
 use super::context::RpcContext;
-use super::transport::RpcTransport;
+use super::transport::{RpcTransport, TransportKind};
 use super::turn::{TurnAttribution, TurnOutcome, execute_turn};
 use super::types::*;
 
@@ -384,6 +384,17 @@ pub struct RpcDispatcher {
     ctx: Arc<RpcContext>,
     rpc: Arc<RpcOutbound>,
     authenticated: bool,
+    /// The principal bound by the `initialize` auth handshake (RFC #7141).
+    /// `None` until initialize succeeds. Legacy paths (no registry) bind the
+    /// shared-operator sentinel so downstream consumers never branch on the
+    /// registry's presence.
+    principal: Option<zeroclaw_api::principal::Principal>,
+    /// Transport-intrinsic credential (e.g. Unix peer uid), captured at
+    /// `run()` from the transport before the read loop starts.
+    transport_credential: crate::security::auth_provider::Credential,
+    /// Which listener produced this connection. WSS enforces the provider
+    /// registry when configured; local IPC keeps its filesystem-mode trust.
+    transport_kind: TransportKind,
     /// TUI session UID assigned during `initialize`. Used for registry
     /// cleanup on disconnect.
     tui_id: Option<String>,
@@ -410,6 +421,9 @@ impl RpcDispatcher {
             ctx,
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
             authenticated: false,
+            principal: None,
+            transport_credential: crate::security::auth_provider::Credential::None,
+            transport_kind: TransportKind::Local,
             tui_id: None,
             peer_label,
             client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities::default(),
@@ -429,6 +443,19 @@ impl RpcDispatcher {
         self.tui_id = tui_id;
     }
 
+    /// Test-only: stamp the transport kind and intrinsic credential normally
+    /// captured from the transport at `run()`, so the `initialize` auth gate
+    /// can be exercised without a live listener. Never called from prod.
+    #[cfg(test)]
+    pub fn set_transport_for_test(
+        &mut self,
+        kind: TransportKind,
+        credential: crate::security::auth_provider::Credential,
+    ) {
+        self.transport_kind = kind;
+        self.transport_credential = credential;
+    }
+
     /// Construct a pre-authenticated dispatcher sharing the same context and
     /// RPC outbound as `self`. Used to run long-lived methods (e.g.
     /// `session/prompt`) in a spawned task so the read loop remains live.
@@ -437,6 +464,9 @@ impl RpcDispatcher {
             ctx: Arc::clone(&self.ctx),
             rpc: Arc::clone(&self.rpc),
             authenticated: true,
+            principal: self.principal.clone(),
+            transport_credential: self.transport_credential.clone(),
+            transport_kind: self.transport_kind,
             tui_id: self.tui_id.clone(),
             peer_label: self.peer_label.clone(),
             client_elicitation_caps: self.client_elicitation_caps,
@@ -505,6 +535,8 @@ impl RpcDispatcher {
 
     /// Read frames from transport, dispatch, repeat.
     pub async fn run(&mut self, transport: &mut (dyn RpcTransport + Send)) {
+        self.transport_credential = transport.credential();
+        self.transport_kind = transport.kind();
         while let Some(line) = transport.next_frame().await {
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -723,6 +755,49 @@ impl RpcDispatcher {
         self.client_elicitation_caps =
             zeroclaw_api::elicitation::ElicitationCapabilities::from_value(elicitation);
 
+        // RFC #7141 auth handshake: when a provider registry is configured,
+        // resolve a credential before binding any identity. The explicit
+        // bearer (params.auth_token) wins; otherwise the transport-intrinsic
+        // credential (Unix peer uid) is presented. Local IPC connections with
+        // no resolvable credential keep legacy trust (the socket endpoint is
+        // 0o600); WSS connections are default-deny once the registry exists.
+        let principal = match self.ctx.auth_registry.as_deref() {
+            Some(registry) => {
+                let credential = match req.auth_token.as_deref() {
+                    Some(token) => {
+                        crate::security::auth_provider::Credential::Bearer(token.to_string())
+                    }
+                    None => self.transport_credential.clone(),
+                };
+                let outcome = registry.resolve(&credential).await;
+                match (outcome.principal(), self.transport_kind) {
+                    (Some(p), _) => p.clone(),
+                    (None, TransportKind::Local) => {
+                        zeroclaw_api::principal::Principal::shared_operator()
+                    }
+                    (None, TransportKind::Wss) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "peer": self.peer_label,
+                            })),
+                            "WSS initialize rejected: no auth provider resolved the credential"
+                        );
+                        return Err(rpc_err(
+                            AUTH_REQUIRED,
+                            "Authentication required: pass auth_token in initialize",
+                        ));
+                    }
+                }
+            }
+            None => zeroclaw_api::principal::Principal::shared_operator(),
+        };
+
         // TUI identity: reconnect with previous credentials or generate new
         let tui_id = if let (Some(claimed_id), Some(sig)) =
             (req.tui_id.as_deref(), req.tui_sig.as_deref())
@@ -762,6 +837,7 @@ impl RpcDispatcher {
             });
         self.tui_id = Some(tui_id.clone());
 
+        self.principal = Some(principal);
         self.authenticated = true;
 
         let capabilities: Vec<String> = Method::ALL
@@ -769,12 +845,26 @@ impl RpcDispatcher {
             .map(|(_, name)| (*name).to_string())
             .collect();
 
+        let auth_methods: Vec<String> = self
+            .ctx
+            .auth_registry
+            .as_deref()
+            .map(|r| {
+                r.advertised_methods()
+                    .iter()
+                    .filter_map(|m| serde_json::to_value(m).ok())
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         to_result(InitializeResult {
             protocol_version: RPC_PROTOCOL_VERSION,
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             tui_id: Some(tui_id),
             tui_sig,
             capabilities,
+            auth_methods,
         })
     }
 
@@ -4908,6 +4998,7 @@ mod tests {
     #[test]
     fn to_result_roundtrip() {
         let r = InitializeResult {
+            auth_methods: Vec::new(),
             protocol_version: 1,
             server_version: "0.1.0".into(),
             tui_id: None,
@@ -4962,6 +5053,143 @@ mod tests {
         let _ = dispatcher.handle_initialize(&params).await.unwrap();
         assert!(dispatcher.client_elicitation_caps.form);
         assert!(!dispatcher.client_elicitation_caps.url);
+    }
+
+    // -----------------------------------------------------------------------
+    // initialize auth gate (RFC #7141)
+
+    fn make_auth_test_dispatcher(
+        paired_tokens: &[String],
+    ) -> (RpcDispatcher, Arc<crate::rpc::session::SessionStore>) {
+        use crate::security::auth_provider::{
+            NativeAuthProvider, PeercredAuthProvider, ProviderRegistry,
+        };
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&sessions),
+        );
+        let mut ctx = Arc::try_unwrap(ctx)
+            .ok()
+            .expect("minimal test context should be uniquely owned");
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(PeercredAuthProvider::new(1000)));
+        registry.register(Arc::new(NativeAuthProvider::from_paired_tokens(
+            paired_tokens,
+        )));
+        ctx.auth_registry = Some(Arc::new(registry));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(Arc::new(ctx), tx, "test-peer".into());
+        (dispatcher, sessions)
+    }
+
+    #[tokio::test]
+    async fn wss_initialize_without_credential_is_rejected() {
+        let (mut dispatcher, _sessions) = make_auth_test_dispatcher(&["zc_valid".to_string()]);
+        dispatcher.set_transport_for_test(
+            TransportKind::Wss,
+            crate::security::auth_provider::Credential::None,
+        );
+        let params = serde_json::json!({ "protocol_version": RPC_PROTOCOL_VERSION });
+        let err = dispatcher.handle_initialize(&params).await.unwrap_err();
+        assert_eq!(err.code, AUTH_REQUIRED);
+        assert!(!dispatcher.authenticated);
+        assert!(dispatcher.principal.is_none());
+    }
+
+    #[tokio::test]
+    async fn wss_initialize_with_valid_bearer_binds_principal() {
+        let (mut dispatcher, _sessions) = make_auth_test_dispatcher(&["zc_valid".to_string()]);
+        dispatcher.set_transport_for_test(
+            TransportKind::Wss,
+            crate::security::auth_provider::Credential::None,
+        );
+        let params = serde_json::json!({
+            "protocol_version": RPC_PROTOCOL_VERSION,
+            "auth_token": "zc_valid",
+        });
+        let result = dispatcher.handle_initialize(&params).await;
+        assert!(result.is_ok(), "expected success, got {result:?}");
+        assert!(dispatcher.authenticated);
+        let p = dispatcher.principal.as_ref().expect("principal bound");
+        assert_eq!(p.auth_method, zeroclaw_api::principal::AuthMethod::Native);
+        let auth_methods = result.unwrap()["auth_methods"]
+            .as_array()
+            .expect("auth_methods advertised")
+            .clone();
+        assert!(auth_methods.iter().any(|m| m == "peercred"));
+        assert!(auth_methods.iter().any(|m| m == "native"));
+    }
+
+    #[tokio::test]
+    async fn wss_initialize_with_wrong_bearer_is_rejected() {
+        let (mut dispatcher, _sessions) = make_auth_test_dispatcher(&["zc_valid".to_string()]);
+        dispatcher.set_transport_for_test(
+            TransportKind::Wss,
+            crate::security::auth_provider::Credential::None,
+        );
+        let params = serde_json::json!({
+            "protocol_version": RPC_PROTOCOL_VERSION,
+            "auth_token": "zc_wrong",
+        });
+        let err = dispatcher.handle_initialize(&params).await.unwrap_err();
+        assert_eq!(err.code, AUTH_REQUIRED);
+        assert!(!dispatcher.authenticated);
+    }
+
+    #[tokio::test]
+    async fn local_initialize_with_matching_peercred_binds_peercred_principal() {
+        let (mut dispatcher, _sessions) = make_auth_test_dispatcher(&["zc_valid".to_string()]);
+        dispatcher.set_transport_for_test(
+            TransportKind::Local,
+            crate::security::auth_provider::Credential::Peercred { uid: 1000 },
+        );
+        let params = serde_json::json!({ "protocol_version": RPC_PROTOCOL_VERSION });
+        let result = dispatcher.handle_initialize(&params).await;
+        assert!(result.is_ok(), "expected success, got {result:?}");
+        let p = dispatcher.principal.as_ref().expect("principal bound");
+        assert_eq!(p.auth_method, zeroclaw_api::principal::AuthMethod::Peercred);
+    }
+
+    #[tokio::test]
+    async fn local_initialize_keeps_legacy_trust_when_credential_unresolvable() {
+        // A local peer whose uid doesn't match keeps today's behaviour: the
+        // 0o600 endpoint already gates access, so initialize binds the
+        // shared-operator sentinel instead of refusing.
+        let (mut dispatcher, _sessions) = make_auth_test_dispatcher(&["zc_valid".to_string()]);
+        dispatcher.set_transport_for_test(
+            TransportKind::Local,
+            crate::security::auth_provider::Credential::Peercred { uid: 1001 },
+        );
+        let params = serde_json::json!({ "protocol_version": RPC_PROTOCOL_VERSION });
+        let result = dispatcher.handle_initialize(&params).await;
+        assert!(result.is_ok(), "expected success, got {result:?}");
+        let p = dispatcher.principal.as_ref().expect("principal bound");
+        assert_eq!(
+            p.auth_method,
+            zeroclaw_api::principal::AuthMethod::SharedOperator
+        );
+    }
+
+    #[tokio::test]
+    async fn no_registry_preserves_legacy_initialize() {
+        let (mut dispatcher, _sessions) =
+            make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let params = serde_json::json!({ "protocol_version": RPC_PROTOCOL_VERSION });
+        let result = dispatcher.handle_initialize(&params).await;
+        assert!(result.is_ok());
+        assert!(dispatcher.authenticated);
+        let p = dispatcher.principal.as_ref().expect("principal bound");
+        assert_eq!(
+            p.auth_method,
+            zeroclaw_api::principal::AuthMethod::SharedOperator
+        );
+        assert!(
+            result.unwrap().get("auth_methods").is_none(),
+            "no registry, nothing advertised"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -6782,6 +7010,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
+            auth_registry: None,
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-close:pid=1".into());
@@ -6824,6 +7053,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
+            auth_registry: None,
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-delete:pid=1".into());
@@ -6923,6 +7153,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
+            auth_registry: None,
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-real-close:pid=1".into());

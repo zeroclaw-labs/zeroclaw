@@ -154,6 +154,11 @@ pub struct RpcContext {
 
     /// Lifecycle hook runner. `None` when hooks are disabled in config.
     pub hooks: Option<Arc<crate::hooks::HookRunner>>,
+
+    /// RFC #7141 inbound auth provider registry, consulted by the
+    /// `initialize` handshake. `None` preserves legacy behaviour
+    /// (initialize binds the trusted shared operator unconditionally).
+    pub auth_registry: Option<Arc<crate::security::auth_provider::ProviderRegistry>>,
 }
 
 impl RpcContext {
@@ -184,6 +189,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            auth_registry: None,
         })
     }
 
@@ -204,6 +210,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            auth_registry: None,
         })
     }
 
@@ -228,6 +235,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            auth_registry: None,
         })
     }
 
@@ -253,6 +261,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            auth_registry: None,
         })
     }
 
@@ -278,6 +287,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            auth_registry: None,
         })
     }
 }

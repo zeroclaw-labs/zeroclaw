@@ -629,6 +629,10 @@ impl RpcClient {
     /// Same handshake and reconnect semantics as [`Self::connect`] — pass
     /// previous `tui_id`/`tui_sig` to reclaim identity on reconnect.
     ///
+    /// `auth_token` is presented in the initialize handshake for daemons with
+    /// `wss.require_auth` enabled (RFC #7141). `None` preserves the legacy
+    /// unauthenticated handshake.
+    ///
     /// When `tls_skip_verify` is true, certificate verification is
     /// disabled — required for self-signed certs on remote hosts.
     pub async fn connect_wss(
@@ -636,6 +640,7 @@ impl RpcClient {
         prev_tui_id: Option<&str>,
         prev_tui_sig: Option<&str>,
         tls_skip_verify: bool,
+        auth_token: Option<&str>,
     ) -> Result<Self> {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
@@ -729,6 +734,9 @@ impl RpcClient {
         }
         if let Some(sig) = prev_tui_sig {
             init_params["tui_sig"] = serde_json::Value::String(sig.to_string());
+        }
+        if let Some(token) = auth_token {
+            init_params["auth_token"] = serde_json::Value::String(token.to_string());
         }
         // NOTE: We intentionally do NOT forward the TUI's environment here.
         // In a WSS connection the daemon is on a remote machine, so env values

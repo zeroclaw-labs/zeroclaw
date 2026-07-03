@@ -19,6 +19,12 @@
 //! later phase), so it changes no runtime behaviour. Default-deny means an empty
 //! registry rejects everything — wiring it on is a deliberate, later step.
 
+pub mod native;
+pub mod peercred;
+
+pub use native::NativeAuthProvider;
+pub use peercred::PeercredAuthProvider;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

@@ -631,6 +631,35 @@ pub async fn run(
             None
         };
 
+        // RFC #7141: build the inbound auth provider registry when WSS auth
+        // is opted in. `peercred` authenticates same-uid local-socket peers;
+        // `native` authenticates the persisted gateway pairing bearer over
+        // WSS. Registry stays `None` when not opted in, preserving legacy
+        // initialize behaviour on both transports.
+        let auth_registry: Option<
+            std::sync::Arc<crate::security::auth_provider::ProviderRegistry>,
+        > = if config.wss.enabled && config.wss.require_auth {
+            use crate::security::auth_provider::{
+                NativeAuthProvider, PeercredAuthProvider, ProviderRegistry,
+            };
+            let mut registry = ProviderRegistry::new();
+            registry.register(std::sync::Arc::new(
+                PeercredAuthProvider::for_current_process(),
+            ));
+            registry.register(std::sync::Arc::new(NativeAuthProvider::from_paired_tokens(
+                &config.gateway.paired_tokens,
+            )));
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"providers": registry.names()})),
+                "RPC auth provider registry enabled (wss.require_auth)"
+            );
+            Some(std::sync::Arc::new(registry))
+        } else {
+            None
+        };
+
         Some(std::sync::Arc::new(RpcContext {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
             sessions,
@@ -654,6 +683,7 @@ pub async fn run(
             sop_engine,
             sop_audit,
             hooks,
+            auth_registry,
         }))
     } else {
         None

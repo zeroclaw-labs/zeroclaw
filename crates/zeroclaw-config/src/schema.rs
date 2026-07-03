@@ -6697,6 +6697,14 @@ pub struct WssConfig {
     /// Path to the PEM-encoded server private key file.
     #[serde(default)]
     pub key_path: String,
+    /// Require RFC #7141 provider authentication on WSS connections
+    /// (default: false). When true, `initialize` must present a credential
+    /// that a configured auth provider (e.g. the `native` pairing bearer)
+    /// resolves; connections with no resolvable credential are rejected
+    /// (default-deny). When false, today's behaviour is preserved: any
+    /// completed TLS handshake yields a privileged session.
+    #[serde(default)]
+    pub require_auth: bool,
 }
 
 impl Default for WssConfig {
@@ -6707,6 +6715,7 @@ impl Default for WssConfig {
             port: default_wss_port(),
             cert_path: String::new(),
             key_path: String::new(),
+            require_auth: false,
         }
     }
 }
