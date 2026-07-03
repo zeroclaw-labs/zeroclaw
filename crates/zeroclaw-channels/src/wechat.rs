@@ -2849,6 +2849,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // `std::os::unix::fs::symlink` is Unix-only; on Windows the
+    // lexical-only containment path is still exercised by the
+    // other tests in this module.
     fn resolve_local_attachment_path_rejects_symlink_escaping_workspace() {
         // Workspace contains `outside -> /tmp/.../outside-target`, where the
         // target dir lives outside the workspace. Lexical normalization
@@ -2877,6 +2880,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // Symlink creation is Unix-only; the test still proves the
+    // canonical-containment path on the platforms where it runs.
     fn resolve_local_attachment_path_accepts_symlink_within_workspace() {
         // Workspace-internal symlinks are legitimate aliases (e.g. a
         // `latest -> 2026-07-03` link inside an attachments directory).
