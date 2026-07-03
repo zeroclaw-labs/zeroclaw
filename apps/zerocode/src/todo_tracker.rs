@@ -17,6 +17,7 @@ pub(crate) enum TodoLocation {
 }
 
 #[allow(dead_code)]
+#[derive(Debug)]
 pub(crate) struct TodoTracker {
     entries: Vec<PlanEntry>,
     visible: bool,

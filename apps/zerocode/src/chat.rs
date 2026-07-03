@@ -1494,6 +1494,10 @@ impl Chat {
                 state.show_thoughts = !state.show_thoughts;
                 state.mark_dirty_full();
             }
+            Some(ChatTabAction::TodoToggle) => {
+                state.todo_tracker.toggle();
+                state.mark_dirty_full();
+            }
             Some(ChatTabAction::BrowseEnter) => {
                 if state.in_browse_mode() {
                     state.browse_move_up(1, false);
@@ -2578,7 +2582,58 @@ fn draw_error(frame: &mut Frame, area: Rect, msg: &str, tab_title: &str) {
 
 // ── Active chat rendering ────────────────────────────────────────
 
+/// Split `area` into (body, optional tracker area) based on the
+/// tracker's location and visibility. Side panels (`Left`/`Right`) take
+/// a fixed-width column clamped to at most half the pane width; the
+/// bottom strip grows with the plan up to a cap, clamped to at most half
+/// the pane height. Returns `None` for the tracker area when it wants no
+/// space — the body then gets the whole area (existing layout untouched).
+fn carve_todo_area(
+    tracker: &crate::todo_tracker::TodoTracker,
+    area: Rect,
+) -> (Rect, Option<Rect>) {
+    // Config-driven width/height land in a later task; sensible defaults here.
+    const SIDE_WIDTH: u16 = 32;
+    const BOTTOM_MAX_HEIGHT: u16 = 5;
+
+    if !tracker.wants_space() {
+        return (area, None);
+    }
+    match tracker.location() {
+        crate::todo_tracker::TodoLocation::Right => {
+            let w = SIDE_WIDTH.min(area.width / 2);
+            let body = Rect::new(area.x, area.y, area.width.saturating_sub(w), area.height);
+            let panel = Rect::new(area.x + body.width, area.y, w, area.height);
+            (body, Some(panel))
+        }
+        crate::todo_tracker::TodoLocation::Left => {
+            let w = SIDE_WIDTH.min(area.width / 2);
+            let panel = Rect::new(area.x, area.y, w, area.height);
+            let body = Rect::new(area.x + w, area.y, area.width.saturating_sub(w), area.height);
+            (body, Some(panel))
+        }
+        crate::todo_tracker::TodoLocation::Bottom => {
+            // Grow up to the cap (+2 rows for the bordered block), but never
+            // exceed half the pane height.
+            let want = (tracker.total() as u16 + 2).min(BOTTOM_MAX_HEIGHT);
+            let h = want.min(area.height / 2);
+            let body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(h));
+            let panel = Rect::new(area.x, area.y + body.height, area.width, h);
+            (body, Some(panel))
+        }
+    }
+}
+
 fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
+    // Carve the TodoWrite tracker's area first (outermost split), so the
+    // rest of the pane (queue sidebar, transcript, input) lays out in the
+    // remaining body. When the tracker wants no space, `body == area` and
+    // the existing layout is untouched.
+    let (area, todo_area) = carve_todo_area(&state.todo_tracker, area);
+    if let Some(panel) = todo_area {
+        state.todo_tracker.render(f, panel);
+    }
+
     let area = if state.queue_sidebar_open() {
         let sidebar_w = state.queue_sidebar_width(area.width);
         let cols = Layout::default()
@@ -4464,6 +4519,9 @@ pub struct ChatState {
     pub info_message: Option<crate::widgets::InfoMessage>,
     /// Active model / model_provider picker overlay.
     model_picker: ModelPickerOverlay,
+    /// Live TodoWrite tracker panel for this session. Read-only; fed by
+    /// `SessionUpdate::Plan`, toggled by the user, laid out per config.
+    todo_tracker: crate::todo_tracker::TodoTracker,
 }
 
 impl ChatState {
@@ -4526,6 +4584,11 @@ impl ChatState {
             queue_scroll: 0,
             info_message: None,
             model_picker: ModelPickerOverlay::None,
+            todo_tracker: crate::todo_tracker::TodoTracker::new(
+                crate::todo_tracker::TodoLocation::Right,
+                true,
+                false,
+            ),
         }
     }
 
@@ -5239,8 +5302,12 @@ impl ChatState {
                     }
                 }
             }
-            // Plan updates are wired here in a follow-up task.
-            SessionUpdate::Plan { .. } => {}
+            // Whole-list replace: hand the authoritative plan to the
+            // tracker, which runs the auto-pop rule. Session routing is
+            // already enforced by the session_id check above.
+            SessionUpdate::Plan { entries, .. } => {
+                self.todo_tracker.set_plan(entries);
+            }
         }
     }
 
@@ -5776,6 +5843,53 @@ mod tests {
 
     fn state() -> ChatState {
         ChatState::new("sess-1".to_string(), "myagent".to_string())
+    }
+
+    #[test]
+    fn hidden_tracker_leaves_full_area_for_body() {
+        let t = crate::todo_tracker::TodoTracker::new(
+            crate::todo_tracker::TodoLocation::Right,
+            true,
+            false,
+        ); // hidden, no plan
+        let full = Rect::new(0, 0, 100, 40);
+        let (body, tracker) = carve_todo_area(&t, full);
+        assert_eq!(body, full);
+        assert!(tracker.is_none());
+    }
+
+    #[test]
+    fn visible_right_tracker_carves_column() {
+        let mut t = crate::todo_tracker::TodoTracker::new(
+            crate::todo_tracker::TodoLocation::Right,
+            true,
+            true,
+        );
+        t.set_plan(vec![crate::wire::PlanEntry {
+            content: "A".into(),
+            status: crate::wire::PlanStatus::Pending,
+            priority: crate::wire::PlanPriority::Medium,
+            active_form: None,
+        }]);
+        let full = Rect::new(0, 0, 100, 40);
+        let (body, tracker) = carve_todo_area(&t, full);
+        let tracker = tracker.expect("visible tracker gets an area");
+        assert_eq!(body.width + tracker.width, full.width);
+        assert_eq!(tracker.width, 32);
+        assert_eq!(body.height, full.height);
+    }
+
+    #[test]
+    fn tracker_width_is_clamped_on_narrow_terminals() {
+        let t = crate::todo_tracker::TodoTracker::new(
+            crate::todo_tracker::TodoLocation::Right,
+            true,
+            true,
+        );
+        let full = Rect::new(0, 0, 40, 20); // narrow
+        let (_body, tracker) = carve_todo_area(&t, full);
+        let tracker = tracker.expect("side panel visible");
+        assert!(tracker.width <= full.width / 2, "clamped to <= 50% width");
     }
 
     #[test]
