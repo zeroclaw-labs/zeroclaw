@@ -1176,13 +1176,31 @@ fn apply_homebrew_onboard_config_dir() {
 /// `[✓]` if the seed is enough to satisfy the selector; the user can
 /// still open that selector and overwrite it.
 #[cfg(feature = "agent-runtime")]
+#[derive(Clone, Copy, PartialEq)]
+enum OnboardFlowMode {
+    Cli,
+    LlmPerField,
+    LlmFreeform,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl OnboardFlowMode {
+    fn from_flags(llm: bool, freeform: bool) -> Self {
+        match (llm, freeform) {
+            (true, true) => Self::LlmFreeform,
+            (true, false) => Self::LlmPerField,
+            (false, _) => Self::Cli,
+        }
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
 async fn run_onboard_flow(
     mut config: zeroclaw_config::schema::Config,
     section: &str,
     layer: &str,
     instance: &str,
-    use_llm: bool,
-    freeform: bool,
+    mode: OnboardFlowMode,
     agent_alias: &str,
     create: bool,
     required_only: bool,
@@ -1229,7 +1247,7 @@ async fn run_onboard_flow(
         zeroclaw_onboarding::driver::select_locale(&mut locale_transport).await?
     };
 
-    let outcome = if use_llm && freeform {
+    let outcome = if mode == OnboardFlowMode::LlmFreeform {
         let spec = zeroclaw_onboarding::driver::build_flow_spec(&mut config, &request)?;
         let mut walk_agent = Box::pin(zeroclaw_runtime::agent::Agent::from_config(
             &config,
@@ -1248,7 +1266,7 @@ async fn run_onboard_flow(
             &mut secrets,
         ))
         .await?
-    } else if use_llm {
+    } else if mode == OnboardFlowMode::LlmPerField {
         let mut spec = zeroclaw_onboarding::driver::build_flow_spec(&mut config, &request)?;
         let mut phrasing_agent = Box::pin(zeroclaw_runtime::agent::Agent::from_config(
             &config,
@@ -3634,8 +3652,7 @@ async fn main() -> Result<()> {
                 &section,
                 &layer,
                 &instance,
-                llm,
-                freeform,
+                OnboardFlowMode::from_flags(llm, freeform),
                 &agent,
                 create,
                 required_only,
