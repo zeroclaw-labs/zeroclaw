@@ -5,6 +5,8 @@ use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
+use crate::helpers::domain_guard;
+
 /// Text browser tool: renders web pages as plain text using text-based browsers
 /// (lynx, links, w3m). Ideal for headless/SSH environments where graphical
 /// browsers are unavailable.
@@ -13,26 +15,44 @@ pub struct TextBrowserTool {
     preferred_browser: Option<String>,
     timeout_secs: u64,
     max_response_size: usize,
+    allowed_private_hosts: Vec<String>,
 }
 
 /// The text browsers we support, in order of auto-detection preference.
 const SUPPORTED_BROWSERS: &[&str] = &["lynx", "links", "w3m"];
 
 impl TextBrowserTool {
+    /// Construct with no private-host opt-in (deny-by-default). Use
+    /// [`Self::new_with_private_hosts`] to allow specific private hosts.
     pub fn new(
         security: Arc<SecurityPolicy>,
         preferred_browser: Option<String>,
         timeout_secs: u64,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        Self::new_with_private_hosts(security, preferred_browser, timeout_secs, Vec::new())
+    }
+
+    /// Construct with an explicit `allowed_private_hosts` opt-in list (mirrors
+    /// the `browser`/`browser_open`/`http_request` pattern from PRs #8171 and #6981).
+    pub fn new_with_private_hosts(
+        security: Arc<SecurityPolicy>,
+        preferred_browser: Option<String>,
+        timeout_secs: u64,
+        allowed_private_hosts: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             security,
             preferred_browser,
             timeout_secs,
             max_response_size: 500_000, // 500KB, consistent with web_fetch
-        }
+            allowed_private_hosts: domain_guard::normalize_allowed_domains(
+                allowed_private_hosts,
+                "text_browser.allowed_private_hosts",
+            )?,
+        })
     }
 
-    fn validate_url(url: &str) -> anyhow::Result<String> {
+    fn validate_url(&self, url: &str) -> anyhow::Result<String> {
         let url = url.trim();
 
         if url.is_empty() {
@@ -45,6 +65,44 @@ impl TextBrowserTool {
 
         if !url.starts_with("http://") && !url.starts_with("https://") {
             anyhow::bail!("Only http:// and https:// URLs are allowed");
+        }
+
+        // Parse with `reqwest::Url` instead of hand-rolling authority/host
+        // extraction. The pre-fix `validate_url` only checked the scheme, so
+        // `http://169.254.169.254/latest/meta-data` (EC2 IMDS),
+        // `http://localhost:9200/_cat/indices`, and
+        // `http://example.com@127.0.0.1/` (userinfo) all reached the text
+        // browser. Using the same parser that the browser backend resolves
+        // against closes the userinfo/path-class mismatch surfaces.
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| anyhow::Error::msg(format!("Invalid URL format: {e}")))?;
+
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            anyhow::bail!("URL userinfo is not allowed");
+        }
+
+        let host_str = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::Error::msg("URL must include a host"))?;
+
+        // Re-add IPv6 brackets so the host string matches the shape used
+        // elsewhere in this crate (`[::1]`, `[fe80::1]`). `Url::host_str`
+        // strips the brackets for IPv6 literals.
+        let is_ipv6 = host_str.parse::<std::net::Ipv6Addr>().is_ok();
+        let host = if is_ipv6 {
+            format!("[{host_str}]")
+        } else {
+            host_str.to_lowercase()
+        };
+
+        // SSRF gate: deny by default for private/local hosts unless the operator
+        // explicitly listed them. Mirrors `browser`/`http_request`/`web_fetch`.
+        let private_host = domain_guard::is_private_or_local_host(&host);
+        let private_host_allowed = private_host
+            && domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts);
+
+        if private_host && !private_host_allowed {
+            anyhow::bail!("Blocked local/private host: {host}");
         }
 
         Ok(url.to_string())
@@ -206,7 +264,7 @@ impl Tool for TextBrowserTool {
             });
         }
 
-        let url = match Self::validate_url(url) {
+        let url = match self.validate_url(url) {
             Ok(v) => v,
             Err(e) => {
                 return Ok(ToolResult {
@@ -303,7 +361,7 @@ mod tests {
             autonomy: AutonomyLevel::Supervised,
             ..SecurityPolicy::default()
         });
-        TextBrowserTool::new(security, None, 30)
+        TextBrowserTool::new(security, None, 30).unwrap()
     }
 
     #[test]
@@ -332,25 +390,30 @@ mod tests {
 
     #[test]
     fn validate_url_accepts_http() {
-        let got = TextBrowserTool::validate_url("http://example.com/page").unwrap();
+        let tool = test_tool();
+        let got = tool.validate_url("http://example.com/page").unwrap();
         assert_eq!(got, "http://example.com/page");
     }
 
     #[test]
     fn validate_url_accepts_https() {
-        let got = TextBrowserTool::validate_url("https://example.com/page").unwrap();
+        let tool = test_tool();
+        let got = tool.validate_url("https://example.com/page").unwrap();
         assert_eq!(got, "https://example.com/page");
     }
 
     #[test]
     fn validate_url_rejects_empty() {
-        let err = TextBrowserTool::validate_url("").unwrap_err().to_string();
+        let tool = test_tool();
+        let err = tool.validate_url("").unwrap_err().to_string();
         assert!(err.contains("empty"));
     }
 
     #[test]
     fn validate_url_rejects_ftp() {
-        let err = TextBrowserTool::validate_url("ftp://example.com")
+        let tool = test_tool();
+        let err = tool
+            .validate_url("ftp://example.com")
             .unwrap_err()
             .to_string();
         assert!(err.contains("http://") || err.contains("https://"));
@@ -358,7 +421,9 @@ mod tests {
 
     #[test]
     fn validate_url_rejects_whitespace() {
-        let err = TextBrowserTool::validate_url("https://example.com/hello world")
+        let tool = test_tool();
+        let err = tool
+            .validate_url("https://example.com/hello world")
             .unwrap_err()
             .to_string();
         assert!(err.contains("whitespace"));
@@ -374,7 +439,7 @@ mod tests {
     #[test]
     fn truncate_over_limit() {
         let security = Arc::new(SecurityPolicy::default());
-        let mut tool = TextBrowserTool::new(security, None, 30);
+        let mut tool = TextBrowserTool::new(security, None, 30).unwrap();
         tool.max_response_size = 10;
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);
@@ -405,7 +470,7 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = TextBrowserTool::new(security, None, 30);
+        let tool = TextBrowserTool::new(security, None, 30).unwrap();
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -420,12 +485,122 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = TextBrowserTool::new(security, None, 30);
+        let tool = TextBrowserTool::new(security, None, 30).unwrap();
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("rate limit"));
+    }
+
+    // ── SSRF guards (audit-zeroclaw-2026-07-03.md finding #2) ──────
+
+    fn private_tool(allowed_private_hosts: Vec<&str>) -> TextBrowserTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        TextBrowserTool::new_with_private_hosts(
+            security,
+            None,
+            30,
+            allowed_private_hosts
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rejects_loopback_by_default() {
+        let tool = private_tool(vec![]);
+        let err = tool
+            .validate_url("http://localhost/page")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_rfc1918_by_default() {
+        let tool = private_tool(vec![]);
+        for url in ["http://10.0.0.5", "http://192.168.1.5", "http://172.16.0.1"] {
+            let err = tool.validate_url(url).unwrap_err().to_string();
+            assert!(err.contains("local/private"), "got: {err} for {url}");
+        }
+    }
+
+    #[test]
+    fn rejects_cloud_metadata_by_default() {
+        let tool = private_tool(vec![]);
+        let err = tool
+            .validate_url("http://169.254.169.254/latest/meta-data/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_link_local_ipv6_by_default() {
+        let tool = private_tool(vec![]);
+        let err = tool
+            .validate_url("http://[fe80::1]/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"), "got: {err}");
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_permits_localhost() {
+        let tool = private_tool(vec!["*"]);
+        assert!(tool.validate_url("http://localhost/page").is_ok());
+        assert!(tool.validate_url("https://localhost:8443/x").is_ok());
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_permits_rfc1918() {
+        let tool = private_tool(vec!["*"]);
+        assert!(tool.validate_url("http://10.0.0.1").is_ok());
+        assert!(tool.validate_url("http://192.168.1.5").is_ok());
+    }
+
+    #[test]
+    fn specific_private_host_entry_permits_listed_host() {
+        let tool = private_tool(vec!["10.0.0.1"]);
+        assert!(tool.validate_url("http://10.0.0.1").is_ok());
+    }
+
+    #[test]
+    fn specific_private_host_entry_does_not_match_unlisted() {
+        let tool = private_tool(vec!["10.0.0.1"]);
+        let err = tool
+            .validate_url("http://10.0.0.2")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_userinfo_targeting_private_host() {
+        // `reqwest::Url` rejects userinfo outright — parser-level SSRF defense
+        // (no operator opt-out). Mirrors the `browser` tool fix in PR #8171.
+        let tool = private_tool(vec!["*"]);
+        let err = tool
+            .validate_url("http://example.com@127.0.0.1/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("userinfo"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_userinfo_with_password() {
+        let tool = private_tool(vec!["*"]);
+        let err = tool
+            .validate_url("https://user:pass@10.0.0.1/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("userinfo"), "got: {err}");
     }
 }
