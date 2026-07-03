@@ -110,6 +110,7 @@ mod tests {
                 attachments: vec![],
                 in_reply_to: None,
                 suppress_voice: false,
+                force_voice: false,
             })
             .await;
         assert!(result.is_ok());
@@ -128,6 +129,7 @@ mod tests {
                 attachments: vec![],
                 in_reply_to: None,
                 suppress_voice: false,
+                force_voice: false,
             })
             .await;
         assert!(result.is_ok());

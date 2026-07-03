@@ -45,8 +45,10 @@ omits the compiled component.
   implement a world. The worked guide below is Rust because that is the path
   with the most support today, but the boundary itself is language-agnostic.
 - **Sandboxed by default.** The host loads each plugin into a WASI context with
-  no filesystem preopens and no network. A plugin cannot quietly reach the host;
-  it gets exactly the host functions wired into its world and nothing more.
+  no filesystem preopens and no ambient network. A plugin cannot quietly reach
+  the host; it gets exactly the host functions wired into its world and nothing
+  more. Outbound HTTP is the one network surface that can be opened, and only for
+  a plugin whose manifest grants `http_client`.
 - **Verifiable provenance.** Manifests can be Ed25519-signed, and an operator
   can require signatures from trusted publishers before any plugin loads.
 
@@ -55,16 +57,19 @@ omits the compiled component.
 These are real limits of the current host, not style preferences. Know them
 before you design around a capability that is not there.
 
-- **Only `logging` and config injection are wired.** Of the permissions a
-  manifest can declare, only `config_read` does anything in the component host.
-  HTTP, filesystem, and memory-access permissions are accepted by the manifest
-  schema but are inert: the host functions that would grant them are not yet
-  registered in the linker. Declaring them grants nothing. See Permissions and
-  Host imports below.
-- **No host network or filesystem.** Because the WASI context has no preopens
-  and no network, a plugin cannot open sockets or read host files through
-  ambient WASI. It works with the data passed across the boundary and its own
-  injected config section.
+- **`logging`, config injection, `http_client`, and host-fed inbound are wired.**
+  Of the permissions a manifest can declare, `config_read` injects the plugin's
+  own config section, and `http_client` attaches an outbound `wasi:http` surface
+  so the plugin can make HTTP requests. Filesystem and memory-access permissions
+  are still accepted by the manifest schema but inert: their host functions are
+  not yet registered in the linker. See Permissions and Host imports below.
+- **No ambient host network or filesystem.** The WASI context has no preopens and
+  no ambient network, so a plugin cannot open raw sockets or read host files
+  through ambient WASI. A `http_client` plugin gets outbound `wasi:http` and
+  nothing else; it cannot listen. Channel plugins that must receive inbound
+  traffic do not open a listener themselves: the host runs the listener and
+  feeds messages through the `inbound` import, which the plugin drains from its
+  `poll-message` export.
 - **A 32-bit boundary.** The target is `wasm32-wasip2`. Guest memory is a 32-bit
   address space and the component ABI lowers offsets as 32-bit regardless of
   host word size. Large values (for example a channel attachment's raw bytes)
@@ -104,6 +109,16 @@ The three world bridges map each WIT world onto the runtime's native traits:
 
 Tool plugins use a fresh store per call (stateless). Channel and memory plugins
 hold a warm store guarded by an async mutex for the lifetime of the plugin.
+
+Tool plugins are discovered and registered end to end: the runtime walks
+`channel_plugin_details()`'s tool counterpart and builds a `WasmTool` for each.
+The channel host adapter (`WasmChannel`, its `wasi:http` gating, `configure`
+jail, and host-fed `inbound` queue) is complete and unit-covered, and
+`PluginHost::channel_plugin_details()` exposes the wasm-backed channel plugins
+to register. Wiring those into the live orchestrator (the discovery-to-channel
+loop in the runtime, plus a per-vendor host listener that drains its transport
+into each channel's `inbound` queue) is the remaining seam and lands with the
+runtime channel-registration change, not this host slice.
 
 ## Plugin structure
 
@@ -240,13 +255,18 @@ bundle (`validate_manifest_shape` in `host.rs`).
 `crates/zeroclaw-plugins/src/lib.rs`. Read the enum for the canonical set.
 
 Be aware of the gap between declared and enforced: in the component host today
-the only permission with a behavioral effect is `config_read`. `runtime.rs`
-passes a tool plugin's resolved config section into `execute` only when the
-manifest grants `config_read`, and strips any caller-supplied `__config` so the
-section cannot be spoofed. The remaining variants are accepted by the manifest
-schema but are not yet wired to a host import in the component host: declaring
-them grants nothing on its own. They reserve the names for the host functions
-that will gate them (see Host imports below).
+`config_read` and `http_client` have behavioral effect. `runtime.rs` passes a
+tool plugin's resolved config section into `execute` only when the manifest
+grants `config_read`, and strips any caller-supplied `__config` so the section
+cannot be spoofed; a channel plugin receives the same section through its
+`configure` export under the same rule. `http_client` attaches an outbound
+`wasi:http` context to the plugin's store and links the `wasi:http` interface,
+so a granted plugin can make HTTP requests and one without the permission has no
+network surface at all. The remaining variants (`file_read`, `file_write`,
+`memory_read`, `memory_write`) are accepted by the manifest schema but are not
+yet wired to a host import: declaring them grants nothing on its own. They
+reserve the names for the host functions that will gate them (see Host imports
+below).
 
 ## WIT interfaces
 
@@ -310,13 +330,33 @@ is breaking and requires a new `vN+1/` directory.
 
 ## Host imports
 
-Host functions are imported by the plugin and provided by the runtime. In the
-component host the only import wired into every world's linker is `logging`
-(via `add_wasi` in `component.rs`); no other host import is registered today.
-That is why the non-`config_read` permissions above are inert: the host
-functions they would gate (HTTP, filesystem, memory access) are not yet wired
-into the linker. A plugin's only ambient authority is the WASI context, which is
-built with no preopens and no network.
+Host functions are imported by the plugin and provided by the runtime. Every
+world's linker wires `logging` (via the host impl in `component_logging.rs`,
+linked alongside `add_wasi` in `component.rs`). The `channel-plugin` world also
+imports `inbound`, the host-fed message queue a channel drains from
+`poll-message`. Outbound `wasi:http` is linked on top for any plugin whose
+manifest grants `http_client` (`add_wasi_http` in `component.rs`), gated so the
+context and the linked interface always agree. The filesystem and memory-access
+permissions remain inert: the host functions that would gate them are not yet
+wired into the linker. A plugin's ambient authority is the WASI context (no
+preopens, no ambient network) plus exactly the host imports its world and
+permissions wire in.
+
+### `inbound`
+
+`wit/v0/inbound.wit` is imported by the `channel-plugin` world. A channel plugin
+runs with no listener of its own, so the host runs the listener (a webhook
+server, a vendor tunnel, a polling client) and enqueues each received message.
+The plugin drains the queue from its `poll-message` export by calling
+`inbound-poll`, with `inbound-pending` available to drain in batches:
+
+```wit
+inbound-poll: func() -> option<host-inbound-message>;
+inbound-pending: func() -> u32;
+```
+
+The host side owns an `InboundQueue` per channel; `WasmChannel::inbound` hands a
+clone to the listener task so enqueued traffic is visible to the plugin's drain.
 
 ### `logging`
 
