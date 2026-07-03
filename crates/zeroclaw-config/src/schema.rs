@@ -17234,6 +17234,9 @@ impl Config {
             config.degraded_security = salvage.dropped_security;
             config.degraded_sections = salvage.dropped;
             if let Some(from_version) = stale_version {
+                let _attribution =
+                    ::zeroclaw_log::attribution_span!(&crate::migration::ConfigLoadAttribution)
+                        .entered();
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
