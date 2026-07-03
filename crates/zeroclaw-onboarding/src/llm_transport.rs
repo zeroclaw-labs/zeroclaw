@@ -154,6 +154,10 @@ impl<L: LlmResponder, S: SecretReader> FlowTransport for LlmTransport<L, S> {
         if prompt.routes_secret() {
             loop {
                 let raw = self.secret_reader.read_secret(&prompt_text).await?;
+                if crate::cli_transport::is_secret_deferral(&raw) {
+                    // Typed deferral: leave the credential unset and move on.
+                    return Ok(ResponseValue::Secret(SecretValue::new(String::new())));
+                }
                 if !raw.is_empty() {
                     return Ok(ResponseValue::Secret(SecretValue::new(raw)));
                 }
@@ -264,6 +268,20 @@ mod tests {
         let value = transport.ask(&prompt).await.unwrap();
         match value {
             ResponseValue::Secret(secret) => assert_eq!(secret.expose(), "sk-live"),
+            other => panic!("expected secret, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_deferral_yields_empty_secret_without_retry_loop() {
+        let mut transport =
+            LlmTransport::new(PanicResponder, RecordingSecretReader::new(vec!["later"]));
+        let prompt = Prompt::new("API key", ResponseType::Secret);
+        let value = transport.ask(&prompt).await.unwrap();
+        match value {
+            ResponseValue::Secret(secret) => {
+                assert!(secret.expose().is_empty(), "'later' defers the secret");
+            }
             other => panic!("expected secret, got {other:?}"),
         }
     }

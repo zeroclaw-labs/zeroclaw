@@ -136,7 +136,11 @@ When you are confident, reply with a line starting with `ANSWER:` followed by ON
 `ANSWER: yes` or `ANSWER: no` for yes/no fields, `ANSWER: 42` for numbers, \
 `ANSWER: <option>` (exactly one offered option) for choices, `ANSWER: <value>` for free text. \
 If the field is optional and the person does not want it, reply `ANSWER: none`. \
-Never invent a value the person did not agree to for a required field; ask instead. \
+If the person does not care, defers to you, or says anything like 'whatever' or 'I don't know', \
+pick the safest sensible default yourself, tell them in one short sentence what you chose, and \
+emit the ANSWER line; do not interrogate an indifferent person. \
+Never invent a value the person did not agree to for a required field that has no sensible \
+default (ids, addresses, names); ask instead. \
 Anything you say without the `ANSWER:` line is shown to the person as conversation. \
 Use their earlier choices to stay consistent. Here is the first field.\n\n";
 

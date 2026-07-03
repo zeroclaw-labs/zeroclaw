@@ -153,7 +153,12 @@ impl Spec {
                 .ok_or_else(|| WalkError::UnknownNode(current.clone()))?;
             let response = transport.ask(&node.prompt).await?;
 
-            if node.optional && response_is_empty(&response) {
+            // An empty secret on a REQUIRED secret node is an explicit
+            // deferral: transports only produce it from a typed 'later'
+            // sentinel (bare Enter re-asks at the transport). The field stays
+            // unset and the walk proceeds; bricking the whole flow because
+            // the person has not created the token yet helps nobody.
+            if response_is_empty(&response) && (node.optional || node.prompt.routes_secret()) {
                 match node.on_success.clone() {
                     Step::Node(next) => {
                         current = next;
@@ -539,16 +544,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failure_on_token_loops_back_then_succeeds() {
+    async fn empty_secret_defers_field_and_completes_without_writing() {
         use crate::response_type::SecretValue;
         let (_tmp, mut config) = test_config();
         let mut transport = ScriptedTransport::new(vec![
             ResponseValue::YesNo(true),
             ResponseValue::Secret(SecretValue::new(String::new())),
-            ResponseValue::Secret(SecretValue::new("tok".into())),
         ]);
         let outcome = spec().walk(&mut transport, &mut config).await.unwrap();
         assert_eq!(outcome, completed());
+        assert_eq!(
+            config
+                .channels
+                .matrix
+                .get("home")
+                .unwrap()
+                .access_token
+                .as_deref(),
+            None,
+            "a deferred secret leaves the field unset"
+        );
     }
 
     #[tokio::test]

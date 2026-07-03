@@ -58,6 +58,9 @@ You can ONLY set the fields listed below; if the person asks you to change anyth
 (other agents, autonomy, unrelated settings), say plainly that it is outside this setup. \
 If the person asks for safety, simplicity, or says they do not understand computers, prefer \
 restrictive values (for example exclude the `shell` tool) and say so in one short sentence. \
+If the person does not care about something, defers to you, or gives 'whatever' answers, choose \
+safe sensible defaults yourself and note them in the preview; only insist on an answer for \
+values you truly cannot invent (ids, addresses, names). \
 Fields marked (secret) are NEVER collected by you: do not ask for the value; it is gathered \
 securely after the person approves. Fields marked (optional) may be omitted from your submission. \
 When you are confident you know every required value, reply with a line containing only \
@@ -294,7 +297,8 @@ pub fn render_preview(spec: &Spec, plan: &PrefilledPlan) -> String {
             }
             PlannedAction::CollectSecret => {
                 preview.push_str(&format!(
-                    "  {label} = <secret: you will be asked for this privately>\n"
+                    "  {label} = <secret: asked privately after you approve; \
+                     answer 'later' to leave it unset>\n"
                 ));
             }
         }
@@ -394,6 +398,11 @@ async fn collect_secrets<S: SecretReader>(
         let prompt_text = crate::i18n::resolve_prompt_text(&node.prompt);
         loop {
             let raw = secrets.read_secret(&prompt_text).await?;
+            if crate::cli_transport::is_secret_deferral(&raw) {
+                // The person is not ready to hand this over; the field stays
+                // unset and they can rerun this section when they have it.
+                break;
+            }
             if !raw.is_empty() {
                 collected.insert(
                     step.node.clone(),
@@ -681,7 +690,7 @@ mod tests {
         assert!(matches!(outcome, Outcome::Completed { .. }));
         let preview = &io.heard[0];
         assert!(
-            preview.contains("<secret: you will be asked for this privately>"),
+            preview.contains("<secret: asked privately after you approve"),
             "required secret masked in preview: {preview}"
         );
         assert!(
@@ -760,6 +769,30 @@ mod tests {
         assert!(
             !feedback.contains("sk-leaked"),
             "rejection never echoes the secret value"
+        );
+    }
+
+    #[tokio::test]
+    async fn required_secret_deferred_leaves_field_unset() {
+        let mut config = discord_config();
+        let spec = spec_for(&config, "channels.discord.main", "main");
+        let submission = format!("SUBMIT: {}", full_submission(&spec));
+        let mut turn = ScriptedTurn::new(vec![&submission]);
+        let mut io = ScriptedOperator::new(vec!["yes"]);
+        let mut secrets = ScriptedSecrets::new(vec!["later"]);
+
+        let outcome = run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, Outcome::Completed { .. }),
+            "deferring the token must not brick the flow"
+        );
+        let discord = config.channels.discord.get("main").unwrap();
+        assert!(
+            discord.bot_token.is_empty(),
+            "deferred secret stays unset, no phantom value"
         );
     }
 

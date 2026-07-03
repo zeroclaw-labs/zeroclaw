@@ -3,6 +3,16 @@ use std::io::{BufRead, Write};
 use zeroclaw_runtime::flow::{FlowTransport, Outcome, Prompt, TransportError, TransportResult};
 use zeroclaw_runtime::response_type::{ResponseType, ResponseValue, SecretValue};
 
+/// The operator wants this secret left unset for now. Deliberately a typed
+/// word, not bare Enter: an accidental Enter on a masked prompt must re-ask,
+/// not silently skip a credential.
+pub fn is_secret_deferral(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.eq_ignore_ascii_case("later")
+        || trimmed.eq_ignore_ascii_case("skip")
+        || trimmed.eq_ignore_ascii_case("not yet")
+}
+
 #[async_trait]
 pub trait CliSecretSource: Send {
     async fn read_secret(&mut self, prompt_text: &str) -> TransportResult<String>;
@@ -87,9 +97,15 @@ impl<R: BufRead + Send, W: Write + Send, S: CliSecretSource> CliTransport<R, W, 
     }
 
     fn prompt_line(&self, prompt: &Prompt) -> String {
+        let hint = if prompt.routes_secret() {
+            " (type 'later' to leave it unset for now)"
+        } else {
+            ""
+        };
         format!(
-            "{} {}\n",
+            "{}{} {}\n",
             crate::i18n::resolve_prompt_text(prompt),
+            hint,
             prompt.sigil().as_str()
         )
     }
@@ -121,6 +137,11 @@ impl<R: BufRead + Send, W: Write + Send, S: CliSecretSource> CliTransport<R, W, 
             ResponseType::Secret => {
                 if raw.is_empty() {
                     None
+                } else if is_secret_deferral(raw) {
+                    // 'later' typed into the masked prompt: leave the field
+                    // unset instead of holding the walk hostage until the
+                    // person produces a token they may not have yet.
+                    Some(ResponseValue::Secret(SecretValue::new(String::new())))
                 } else {
                     Some(ResponseValue::Secret(SecretValue::new(raw.to_string())))
                 }
@@ -260,7 +281,10 @@ mod tests {
             other => panic!("expected secret, got {other:?}"),
         }
         let rendered = String::from_utf8(output).unwrap();
-        assert_eq!(rendered, "Token #\n");
+        assert_eq!(
+            rendered,
+            "Token (type 'later' to leave it unset for now) #\n"
+        );
         assert!(!rendered.contains("sk-secret"));
     }
 
@@ -350,6 +374,37 @@ mod tests {
         let prompt = Prompt::new("Token", ResponseType::Secret);
         let result = transport.ask(&prompt).await;
         assert!(matches!(result, Err(TransportError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn secret_deferral_yields_empty_secret() {
+        let mut output: Vec<u8> = Vec::new();
+        let mut transport = CliTransport::with_secret_source(
+            Cursor::new(Vec::new()),
+            &mut output,
+            ScriptedSecretSource::new(vec!["later"]),
+        );
+        let prompt = Prompt::new("Token", ResponseType::Secret);
+        let value = transport.ask(&prompt).await.unwrap();
+        let ResponseValue::Secret(secret) = value else {
+            panic!("secret prompt yields a secret value");
+        };
+        assert!(secret.expose().is_empty(), "'later' defers the credential");
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(
+            rendered.contains("type 'later'"),
+            "prompt advertises the deferral escape: {rendered}"
+        );
+    }
+
+    #[test]
+    fn secret_deferral_matrix() {
+        for defer in ["later", "LATER", "skip", "not yet", " later "] {
+            assert!(is_secret_deferral(defer), "should defer: {defer}");
+        }
+        for keep in ["", "sk-real-token", "laterx", "skipperoo"] {
+            assert!(!is_secret_deferral(keep), "should NOT defer: {keep}");
+        }
     }
 
     #[tokio::test]
