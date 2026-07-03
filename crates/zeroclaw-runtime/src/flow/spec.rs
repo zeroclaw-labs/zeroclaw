@@ -89,6 +89,33 @@ pub struct Spec {
     pub nodes: BTreeMap<NodeId, Node>,
 }
 
+/// One resolved step of a prefilled plan: what happens at a node when the
+/// walk is driven by a value map instead of live prompts.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlannedAction {
+    /// The mapped value validates and will be written via the node's target.
+    Write(ResponseValue),
+    /// Optional node with no mapped value: property stays unwritten.
+    Skip,
+    /// Secret node: the value is never in the map (secrets do not route
+    /// through the LLM); it must be collected operator-side before apply.
+    CollectSecret,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedStep {
+    pub node: NodeId,
+    pub action: PlannedAction,
+}
+
+/// A validated, ordered path through the spec produced from a value map.
+/// Resolution is pure: nothing is written until [`Spec::apply_prefilled`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrefilledPlan {
+    pub steps: Vec<PlannedStep>,
+    pub outcome: Outcome,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WalkError {
     #[error("spec references unknown node {0:?}")]
@@ -97,6 +124,19 @@ pub enum WalkError {
     Transport(#[from] crate::flow::transport::TransportError),
     #[error(transparent)]
     Write(#[from] crate::flow::config_write::WriteError),
+}
+
+/// Why a prefilled value map cannot be resolved into a walkable path.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PrefilledError {
+    #[error("spec references unknown node {0:?}")]
+    UnknownNode(NodeId),
+    #[error("required field {0:?} has no value")]
+    MissingValue(NodeId),
+    #[error("value for field {0:?} does not validate")]
+    InvalidValue(NodeId),
+    #[error("prefilled resolution did not terminate")]
+    NoProgress,
 }
 
 impl Spec {
@@ -148,6 +188,113 @@ impl Spec {
                 }
             }
         }
+    }
+
+    /// Resolve a node-keyed value map into an ordered plan without writing
+    /// anything. Secrets never appear in the map: a secret node plans a
+    /// `CollectSecret` step and takes its success edge. Optional nodes with no
+    /// mapped value plan a `Skip`. Any required non-secret node with a missing
+    /// or invalid value fails resolution, so a bad map is rejected whole
+    /// before a single write happens.
+    pub fn resolve_prefilled(
+        &self,
+        values: &BTreeMap<NodeId, ResponseValue>,
+    ) -> Result<PrefilledPlan, PrefilledError> {
+        let mut steps = Vec::new();
+        let mut current = self.start.clone();
+        // Each node may appear at most once on a valid prefilled path; more
+        // iterations than nodes means the value map routes in a cycle.
+        for _ in 0..=self.nodes.len() {
+            let node = self
+                .nodes
+                .get(&current)
+                .ok_or_else(|| PrefilledError::UnknownNode(current.clone()))?;
+
+            if node.prompt.routes_secret() {
+                // Optional secrets are left unset: the guide cannot know the
+                // value and the operator was not asked for it in the preview.
+                // Only required secrets are collected after approval.
+                steps.push(PlannedStep {
+                    node: current.clone(),
+                    action: if node.optional {
+                        PlannedAction::Skip
+                    } else {
+                        PlannedAction::CollectSecret
+                    },
+                });
+                match node.on_success.clone() {
+                    Step::Node(next) => current = next,
+                    Step::Terminal(outcome) => return Ok(PrefilledPlan { steps, outcome }),
+                }
+                continue;
+            }
+
+            let Some(response) = values.get(&current) else {
+                if node.optional {
+                    steps.push(PlannedStep {
+                        node: current.clone(),
+                        action: PlannedAction::Skip,
+                    });
+                    match node.on_success.clone() {
+                        Step::Node(next) => current = next,
+                        Step::Terminal(outcome) => return Ok(PrefilledPlan { steps, outcome }),
+                    }
+                    continue;
+                }
+                return Err(PrefilledError::MissingValue(current.clone()));
+            };
+
+            if (node.validate)(response).is_err() {
+                return Err(PrefilledError::InvalidValue(current.clone()));
+            }
+            steps.push(PlannedStep {
+                node: current.clone(),
+                action: PlannedAction::Write(response.clone()),
+            });
+            match node.resolve(response) {
+                Step::Node(next) => current = next,
+                Step::Terminal(outcome) => return Ok(PrefilledPlan { steps, outcome }),
+            }
+        }
+        Err(PrefilledError::NoProgress)
+    }
+
+    /// Execute a resolved plan: run map-key side effects and write every
+    /// planned value through the node's write target, exactly as the live
+    /// walk would. `secrets` supplies the operator-collected values for the
+    /// plan's `CollectSecret` steps; a `CollectSecret` step with no supplied
+    /// secret is skipped so apply stays usable for sections without secrets.
+    pub fn apply_prefilled(
+        &self,
+        plan: &PrefilledPlan,
+        secrets: &BTreeMap<NodeId, ResponseValue>,
+        config: &mut Config,
+    ) -> Result<Outcome, WalkError> {
+        for step in &plan.steps {
+            let node = self
+                .nodes
+                .get(&step.node)
+                .ok_or_else(|| WalkError::UnknownNode(step.node.clone()))?;
+            let response = match &step.action {
+                PlannedAction::Write(value) => value,
+                PlannedAction::CollectSecret => match secrets.get(&step.node) {
+                    Some(value) => value,
+                    None => continue,
+                },
+                PlannedAction::Skip => continue,
+            };
+            if let Some((section, key)) = &node.ensure_map_key {
+                config
+                    .create_map_key(section, key)
+                    .map_err(|reason| WriteError::Config(anyhow::Error::msg(reason)))?;
+            }
+            if let Some(target) = &node.write_target {
+                write_to_target(config, target, response)?;
+            } else if !node.prop.is_empty() {
+                write_response(config, &node.prop, response)?;
+            }
+        }
+        Ok(plan.outcome.clone())
     }
 
     #[must_use]

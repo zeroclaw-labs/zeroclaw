@@ -463,6 +463,12 @@ enum Commands {
         #[arg(long)]
         llm: bool,
 
+        /// With --llm: hold one freeform conversation instead of a per-field
+        /// walk. The guide infers values from intent, submits a complete map,
+        /// and nothing is written until the operator approves a preview.
+        #[arg(long, requires = "llm")]
+        freeform: bool,
+
         /// Agent alias used when --llm is set.
         #[arg(long, default_value = "default")]
         agent: String,
@@ -1176,6 +1182,7 @@ async fn run_onboard_flow(
     layer: &str,
     instance: &str,
     use_llm: bool,
+    freeform: bool,
     agent_alias: &str,
     create: bool,
     required_only: bool,
@@ -1222,7 +1229,25 @@ async fn run_onboard_flow(
         zeroclaw_onboarding::driver::select_locale(&mut locale_transport).await?
     };
 
-    let outcome = if use_llm {
+    let outcome = if use_llm && freeform {
+        let spec = zeroclaw_onboarding::driver::build_flow_spec(&mut config, &request)?;
+        let walk_agent = Box::pin(zeroclaw_runtime::agent::Agent::from_config(
+            &config,
+            agent_alias,
+        ))
+        .await?;
+        let mut turn = InProcessAgentTurn::new(walk_agent);
+        let mut io = TtyOperatorIo;
+        let mut secrets = TtySecretReader;
+        Box::pin(zeroclaw_onboarding::run_freeform(
+            &spec,
+            &mut config,
+            &mut turn,
+            &mut io,
+            &mut secrets,
+        ))
+        .await?
+    } else if use_llm {
         let mut spec = zeroclaw_onboarding::driver::build_flow_spec(&mut config, &request)?;
         let phrasing_agent = Box::pin(zeroclaw_runtime::agent::Agent::from_config(
             &config,
@@ -3590,6 +3615,7 @@ async fn main() -> Result<()> {
             layer,
             instance,
             llm,
+            freeform,
             agent,
             create,
             required_only,
@@ -3600,6 +3626,7 @@ async fn main() -> Result<()> {
                 &layer,
                 &instance,
                 llm,
+                freeform,
                 &agent,
                 create,
                 required_only,

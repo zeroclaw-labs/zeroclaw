@@ -3,6 +3,7 @@
 pub mod agent_responder;
 pub mod cli_transport;
 pub mod driver;
+pub mod freeform;
 pub mod i18n;
 pub mod llm_transport;
 pub mod outcome_message;
@@ -14,6 +15,7 @@ pub use agent_responder::{
 };
 pub use cli_transport::{CliSecretSource, CliTransport, TtyPasswordSource};
 pub use driver::{DriverError, FlowRequest, build_flow_spec, run_flow};
+pub use freeform::{FreeformError, render_preview, run_freeform, spec_brief};
 pub use llm_transport::{LlmResponder, LlmTransport, SecretReader, TtySecretReader};
 pub use phrasing::{AgentPhraser, phrase_spec};
 pub use spec_builder::{

@@ -53,27 +53,34 @@ impl<L: LlmResponder, S: SecretReader> LlmTransport<L, S> {
     }
 
     fn parse_non_secret(prompt: &Prompt, raw: &str) -> Option<ResponseValue> {
-        let trimmed = raw.trim();
-        match &prompt.response_type {
-            ResponseType::Secret => None,
-            ResponseType::FreeformText => {
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(ResponseValue::FreeformText(trimmed.to_string()))
-                }
-            }
-            ResponseType::Number => ResponseValue::parse_number(trimmed),
-            ResponseType::YesNo => parse_yes_no(trimmed).map(ResponseValue::YesNo),
-            ResponseType::Choice { options } => options
-                .iter()
-                .find(|option| option.value == trimmed)
-                .map(|option| ResponseValue::Choice(option.value.clone())),
-        }
+        parse_raw(prompt, raw)
     }
 }
 
-fn parse_yes_no(raw: &str) -> Option<bool> {
+/// Parse a raw string against a prompt's response type. The single value
+/// parser for every LLM-fed transport, so freeform submissions and per-field
+/// answers accept exactly the same shapes.
+pub(crate) fn parse_raw(prompt: &Prompt, raw: &str) -> Option<ResponseValue> {
+    let trimmed = raw.trim();
+    match &prompt.response_type {
+        ResponseType::Secret => None,
+        ResponseType::FreeformText => {
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(ResponseValue::FreeformText(trimmed.to_string()))
+            }
+        }
+        ResponseType::Number => ResponseValue::parse_number(trimmed),
+        ResponseType::YesNo => parse_yes_no(trimmed).map(ResponseValue::YesNo),
+        ResponseType::Choice { options } => options
+            .iter()
+            .find(|option| option.value == trimmed)
+            .map(|option| ResponseValue::Choice(option.value.clone())),
+    }
+}
+
+pub(crate) fn parse_yes_no(raw: &str) -> Option<bool> {
     let normalized = raw.to_ascii_lowercase();
     let affirmative = ["y", "yes", "true"];
     let negative = ["n", "no", "false"];
