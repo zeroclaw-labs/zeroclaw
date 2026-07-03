@@ -821,6 +821,18 @@ impl TelegramChannel {
         }
     }
 
+    /// Most recent successful multi-message send across all in-flight drafts
+    /// for `recipient`. Used to pace the approval prompt so the inline
+    /// keyboard does not crowd the just-delivered pre-tool narration.
+    fn latest_multi_message_send_at(&self, recipient: &str) -> Option<std::time::Instant> {
+        let drafts = self.multi_message_drafts.lock();
+        drafts
+            .iter()
+            .filter(|(key, _)| key.recipient == recipient)
+            .filter_map(|(_, draft)| draft.last_sent_at)
+            .max()
+    }
+
     /// Send the unsent suffix of the draft's sanitized narration for one agent
     /// turn. `sent_text` advances only after a successful `sendMessage`.
     async fn flush_unsent(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
@@ -4416,6 +4428,16 @@ Ensure only one `zeroclaw` process is using this bot token."
         self.flush_pending_multi_message_drafts_for_recipient(recipient)
             .await?;
 
+        // Pace the approval prompt after the pre-tool narration: reintroduce
+        // the multi_message inter-message gap between the last narration
+        // message and the inline keyboard, so the prompt doesn't arrive glued
+        // to it. No-op when nothing was just sent (last send is old/absent →
+        // elapsed already exceeds the delay).
+        if self.stream_mode == StreamMode::MultiMessage {
+            let last_sent_at = self.latest_multi_message_send_at(recipient);
+            self.pace_multi_message_send(last_sent_at).await;
+        }
+
         // Parse recipient for chat_id + optional thread_id ("chat_id:thread_id" format).
         let (chat_id, thread_id) = recipient
             .split_once(':')
@@ -5273,6 +5295,65 @@ mod tests {
         assert_eq!(
             result,
             Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny)
+        );
+    }
+
+    /// The approval prompt must not arrive glued to the pre-tool narration:
+    /// after flushing the narration, `request_approval` paces by
+    /// `multi_message_delay_ms` before sending the inline keyboard (restores
+    /// the inter-message gap the streaming redesign dropped). Asserts a lower
+    /// bound on elapsed time — deterministic because the pacing sleep
+    /// guarantees at least the configured delay once narration was just sent.
+    #[tokio::test]
+    async fn request_approval_paces_prompt_after_narration() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::ChannelApprovalRequest;
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let delay_ms: u64 = 200;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::MultiMessage, 750, delay_ms)
+        .with_api_base(mock_server.uri())
+        .with_approval_timeout_secs(0);
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("...", "123"))
+            .await
+            .unwrap()
+            .expect("draft id");
+        ch.update_draft("123", &draft_id, "Понял, вызовем калькулятор:")
+            .await
+            .unwrap();
+
+        let request = ChannelApprovalRequest {
+            tool_name: "calculator".to_string(),
+            arguments_summary: "expr=1+1".to_string(),
+            raw_arguments: None,
+        };
+
+        let started = std::time::Instant::now();
+        let _ = ch.request_approval("123", &request).await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(delay_ms),
+            "approval prompt must be paced by multi_message_delay_ms ({delay_ms}ms) \
+             after narration; elapsed {elapsed:?}"
         );
     }
 
