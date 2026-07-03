@@ -107,24 +107,15 @@ pub fn eligible(step: &SopStep, run_data: &RunData) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sop::step_contract::StepRouting;
     use crate::sop::types::{
-        SopEvent, SopExecutionMode, SopPriority, SopRunStatus, SopStepKind, SopTriggerSource,
+        SopEvent, SopExecutionMode, SopPriority, SopRunStatus, SopTriggerSource,
     };
 
     fn step(number: u32) -> SopStep {
         SopStep {
             number,
             title: format!("Step {number}"),
-            body: String::new(),
-            suggested_tools: Vec::new(),
-            requires_confirmation: false,
-            kind: SopStepKind::Execute,
-            schema: None,
-            scope: None,
-            routing: StepRouting::default(),
-            on_failure: Default::default(),
-            mode: None,
+            ..SopStep::default()
         }
     }
 

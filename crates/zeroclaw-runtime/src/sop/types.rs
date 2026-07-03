@@ -269,6 +269,24 @@ pub struct StepSchema {
 
 // ── Step ────────────────────────────────────────────────────────
 
+/// An authored tool invocation planned for a step. Args may embed
+/// `{{steps.N.path}}` / `{{calls.K.path}}` bindings (see `sop::binding`)
+/// that resolve against captured run data before dispatch. `pinned`
+/// carries a sample output (typically lifted from a real run's
+/// `StepToolCall.output_data`) so downstream bindings can be authored
+/// and previewed without re-executing the tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct PlannedToolCall {
+    pub tool: String,
+    /// Argument template; string leaves may contain bindings.
+    #[serde(default)]
+    pub args: serde_json::Value,
+    /// Pinned sample output for authoring/preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<serde_json::Value>,
+}
+
 /// A single step in an SOP procedure, parsed from SOP.md.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -298,6 +316,10 @@ pub struct SopStep {
     /// Optional per-step execution mode override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<SopExecutionMode>,
+    /// Ordered tool calls planned for this step. Args may carry
+    /// `{{steps.N}}` / `{{calls.K}}` bindings validated at save time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<PlannedToolCall>,
 }
 
 impl Default for SopStep {
@@ -314,6 +336,7 @@ impl Default for SopStep {
             routing: StepRouting::default(),
             on_failure: StepFailure::default(),
             mode: None,
+            calls: Vec::new(),
         }
     }
 }

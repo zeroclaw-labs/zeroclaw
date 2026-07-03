@@ -1,6 +1,7 @@
 pub mod active_scope;
 pub mod approval;
 pub mod audit;
+pub mod binding;
 pub mod condition;
 pub mod dispatch;
 pub mod engine;
@@ -18,6 +19,11 @@ pub mod types;
 pub mod wire;
 
 pub use audit::SopAuditLogger;
+#[allow(unused_imports)]
+pub use binding::{
+    BindingContext, BindingRef, BindingScope, ExtractedBinding, extract_bindings, remap_step_refs,
+    resolve_args,
+};
 pub use engine::{MaintenanceSummary, SopEngine};
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphNode, GraphPin, GraphSeverity, GraphWire,
@@ -35,11 +41,11 @@ pub use trigger_registry::{
     BoundTriggerSource, ChannelAlias, ChannelTriggerKind, ConfiguredChannel, TriggerField,
     TriggerFieldKind, TriggerSourceRegistry, build_registry, registry_from_config,
 };
-#[allow(unused_imports)]
 pub use types::{
-    DeterministicRunState, DeterministicSavings, FilesystemEventKind, Sop, SopEvent,
-    SopExecutionMode, SopPriority, SopRun, SopRunAction, SopRunStatus, SopStep, SopStepKind,
-    SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource, StepSchema,
+    DeterministicRunState, DeterministicSavings, FilesystemEventKind, PlannedToolCall, Sop,
+    SopEvent, SopExecutionMode, SopPriority, SopRun, SopRunAction, SopRunStatus, SopStep,
+    SopStepKind, SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource, StepSchema,
+    StepToolCall,
 };
 pub use wire::{WireEdit, WireError, WireOp, apply_wire};
 
@@ -215,6 +221,9 @@ pub fn normalize_step_numbers(sop: &mut Sop) {
                 .get(&target)
                 .map(|s| StepFailure::Goto { step: *s })
                 .unwrap_or(StepFailure::Fail);
+        }
+        for call in &mut step.calls {
+            binding::remap_step_refs(&mut call.args, &remap);
         }
     }
 }
@@ -420,6 +429,10 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
                 current.on_failure = parse_step_failure(val);
             } else if let Some(val) = bullet.strip_prefix("mode:") {
                 current.mode = Some(parse_execution_mode(val));
+            } else if let Some(val) = bullet.strip_prefix("call:") {
+                if let Ok(call) = serde_json::from_str::<PlannedToolCall>(val.trim()) {
+                    current.calls.push(call);
+                }
             } else {
                 // Continuation body line
                 if !current.body.is_empty() {
@@ -458,6 +471,7 @@ struct StepParseState {
     routing: StepRouting,
     on_failure: StepFailure,
     mode: Option<SopExecutionMode>,
+    calls: Vec<PlannedToolCall>,
 }
 
 impl StepParseState {
@@ -484,6 +498,7 @@ impl StepParseState {
             routing: std::mem::take(&mut self.routing),
             on_failure: std::mem::take(&mut self.on_failure),
             mode: self.mode.take(),
+            calls: std::mem::take(&mut self.calls),
         });
         *self = Self::default();
     }
@@ -670,6 +685,11 @@ fn render_step_bullets(step: &SopStep) -> Vec<String> {
     if let Some(mode) = step.mode {
         bullets.push(format!("mode: {mode}"));
     }
+    for call in &step.calls {
+        if let Ok(rendered) = serde_json::to_string(call) {
+            bullets.push(format!("call: {rendered}"));
+        }
+    }
 
     bullets
 }
@@ -755,6 +775,66 @@ pub fn validate_sop(sop: &Sop) -> Vec<String> {
     warnings
 }
 
+/// Validate planned-call binding references across the SOP. Blocking:
+/// malformed binding syntax, `steps.N` naming an unknown step, a step
+/// referencing itself or a later step, and `calls.K` at or past the
+/// referencing call's own index. Warning: a `steps.N` reference to a step
+/// that declares no output schema and no planned calls (nothing known to
+/// bind against).
+fn validate_planned_call_bindings(
+    sop: &Sop,
+    blocking: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let known: std::collections::HashMap<u32, &SopStep> =
+        sop.steps.iter().map(|s| (s.number, s)).collect();
+    for step in &sop.steps {
+        for (call_idx, call) in step.calls.iter().enumerate() {
+            let label = format!("Step {} call {call_idx} ({})", step.number, call.tool);
+            for extracted in binding::extract_bindings(&call.args) {
+                match extracted {
+                    binding::ExtractedBinding::Malformed { raw, reason } => {
+                        blocking.push(format!("{label}: malformed binding '{raw}': {reason}"));
+                    }
+                    binding::ExtractedBinding::Valid(bref) => match bref.scope {
+                        binding::BindingScope::Step(n) => match known.get(&n) {
+                            None => blocking.push(format!(
+                                "{label}: binding '{}' references unknown step {n}",
+                                bref.raw
+                            )),
+                            Some(_) if n >= step.number => blocking.push(format!(
+                                "{label}: binding '{}' references step {n}, which does not run before step {}",
+                                bref.raw, step.number
+                            )),
+                            Some(target)
+                                if target.calls.is_empty()
+                                    && target
+                                        .schema
+                                        .as_ref()
+                                        .is_none_or(|s| s.output.is_none()) =>
+                            {
+                                warnings.push(format!(
+                                    "{label}: binding '{}' targets step {n}, which declares no output schema or planned calls",
+                                    bref.raw
+                                ));
+                            }
+                            Some(_) => {}
+                        },
+                        binding::BindingScope::Call(k) => {
+                            if k as usize >= call_idx {
+                                blocking.push(format!(
+                                    "{label}: binding '{}' references call {k}, which does not run before call {call_idx}",
+                                    bref.raw
+                                ));
+                            }
+                        }
+                    },
+                }
+            }
+        }
+    }
+}
+
 /// Result of `validate_sop_strict`: `blocking` problems reject a save,
 /// `warnings` surface in editors but do not block.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -790,8 +870,10 @@ pub fn validate_sop_strict(sop: &Sop) -> SopValidation {
         }
     }
 
-    let graph = SopGraph::from_sop(sop);
     let mut warnings = Vec::new();
+    validate_planned_call_bindings(sop, &mut blocking, &mut warnings);
+
+    let graph = SopGraph::from_sop(sop);
     for diag in &graph.diagnostics {
         match diag.severity {
             GraphSeverity::Error => {
@@ -1060,5 +1142,130 @@ mod tests {
         );
         assert_eq!(step.on_failure, StepFailure::Retry { max: 2 });
         assert_eq!(step.mode, Some(SopExecutionMode::Auto));
+    }
+
+    fn planned(tool: &str, args: serde_json::Value) -> PlannedToolCall {
+        PlannedToolCall {
+            tool: tool.into(),
+            args,
+            pinned: None,
+        }
+    }
+
+    #[test]
+    fn planned_calls_roundtrip_through_render_and_parse() {
+        let mut step = titled_step(1, "fetch");
+        step.calls = vec![
+            planned("http_request", json!({"url": "https://example.com"})),
+            PlannedToolCall {
+                tool: "calculator".into(),
+                args: json!({"function": "add", "values": "{{calls.0.status}}"}),
+                pinned: Some(json!({"result": 3.0})),
+            },
+        ];
+        let rendered = render_steps(std::slice::from_ref(&step));
+        let parsed = parse_steps(&rendered);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].calls, step.calls);
+    }
+
+    #[test]
+    fn strict_save_blocks_forward_step_binding() {
+        let mut s1 = titled_step(1, "a");
+        s1.calls = vec![planned("shell", json!({"command": "{{steps.2.out}}"}))];
+        let sop = authoring_sop(vec![s1, titled_step(2, "b")]);
+        let v = validate_sop_strict(&sop);
+        assert!(
+            v.blocking
+                .iter()
+                .any(|b| b.contains("does not run before step 1")),
+            "got: {:?}",
+            v.blocking
+        );
+    }
+
+    #[test]
+    fn strict_save_blocks_unknown_step_and_self_call_bindings() {
+        let mut s2 = titled_step(2, "b");
+        s2.calls = vec![
+            planned("shell", json!({"command": "{{steps.9.out}}"})),
+            planned("shell", json!({"command": "{{calls.1.out}}"})),
+        ];
+        let sop = authoring_sop(vec![titled_step(1, "a"), s2]);
+        let v = validate_sop_strict(&sop);
+        assert!(
+            v.blocking.iter().any(|b| b.contains("unknown step 9")),
+            "got: {:?}",
+            v.blocking
+        );
+        assert!(
+            v.blocking
+                .iter()
+                .any(|b| b.contains("does not run before call 1")),
+            "got: {:?}",
+            v.blocking
+        );
+    }
+
+    #[test]
+    fn strict_save_blocks_malformed_binding() {
+        let mut s1 = titled_step(1, "a");
+        s1.calls = vec![planned("shell", json!({"command": "{{bogus.thing}}"}))];
+        let sop = authoring_sop(vec![s1]);
+        let v = validate_sop_strict(&sop);
+        assert!(
+            v.blocking.iter().any(|b| b.contains("malformed binding")),
+            "got: {:?}",
+            v.blocking
+        );
+    }
+
+    #[test]
+    fn strict_save_accepts_valid_bindings_and_warns_on_schemaless_target() {
+        let mut s1 = titled_step(1, "a");
+        s1.schema = Some(StepSchema {
+            input: None,
+            output: Some(json!({"type": "object"})),
+        });
+        let mut s2 = titled_step(2, "b");
+        s2.calls = vec![
+            planned("http_request", json!({"url": "{{steps.1.url}}"})),
+            planned("shell", json!({"command": "echo {{calls.0.status}}"})),
+        ];
+        let mut s3 = titled_step(3, "c");
+        s3.calls = vec![planned("shell", json!({"command": "{{steps.2.out}}"}))];
+        let sop = authoring_sop(vec![s1, s2, s3]);
+        let v = validate_sop_strict(&sop);
+        assert!(v.is_ok(), "blocking: {:?}", v.blocking);
+
+        let mut s4 = titled_step(1, "bare");
+        let mut s5 = titled_step(2, "binder");
+        s5.calls = vec![planned("shell", json!({"command": "{{steps.1.out}}"}))];
+        s4.calls = Vec::new();
+        let sop = authoring_sop(vec![s4, s5]);
+        let v = validate_sop_strict(&sop);
+        assert!(v.is_ok());
+        assert!(
+            v.warnings
+                .iter()
+                .any(|w| w.contains("no output schema or planned calls")),
+            "got: {:?}",
+            v.warnings
+        );
+    }
+
+    #[test]
+    fn normalize_step_numbers_rewrites_call_bindings() {
+        let mut s3 = titled_step(30, "c");
+        s3.calls = vec![planned(
+            "shell",
+            json!({"command": "{{steps.10.out}} then {{steps.20.ok}}"}),
+        )];
+        let mut sop = authoring_sop(vec![titled_step(10, "a"), titled_step(20, "b"), s3]);
+        normalize_step_numbers(&mut sop);
+        assert_eq!(
+            sop.steps[2].calls[0].args,
+            json!({"command": "{{steps.1.out}} then {{steps.2.ok}}"})
+        );
     }
 }
