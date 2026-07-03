@@ -440,6 +440,11 @@ cli-skills-none-installed = No skills installed.
 cli-skills-create-hint = {"  "}Create one: zeroclaw skills add my-skill --bundle <alias>
 cli-skills-install-hint = {"  "}Or install: zeroclaw skills install <source>
 cli-skills-installed-header = Installed skills ({$count}):
+cli-skills-list-group-bundle = bundle: {$alias}
+cli-skills-list-group-agent = loaded by agent '{$alias}'
+cli-skills-list-group-global = global / open-skills / plugins (not from a bundle)
+cli-skills-agent-not-configured = agent '{$alias}' is not configured
+cli-skills-agent-multiple-bundles = agent '{$alias}' has multiple skill bundles ({$bundles}); pass --bundle to choose one
 cli-skills-tags = Tags:  {$tags}
 
 # ── sop (zeroclaw sop) ──

@@ -71,7 +71,10 @@ pub async fn handle_command(
                     zeroclaw_config::skill_bundles::resolve_directory(config, &install_root, b)
                         .map_err(anyhow::Error::msg)?;
                 rendered.push((
-                    format!("bundle: {b}"),
+                    get_required_cli_string_with_args(
+                        "cli-skills-list-group-bundle",
+                        &[("alias", b)],
+                    ),
                     load_skills_from_directory(&dir, allow_scripts).0,
                 ));
             } else if let Some(ref a) = agent {
@@ -79,10 +82,19 @@ pub async fn handle_command(
                 // agent boot/loop uses (workspace + open-skills + plugins +
                 // assigned bundles), so `list --agent` mirrors runtime behavior.
                 if config.agent(a).is_none() {
-                    anyhow::bail!("agent '{a}' is not configured");
+                    anyhow::bail!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-skills-agent-not-configured",
+                            &[("alias", a)],
+                        )
+                    );
                 }
                 rendered.push((
-                    format!("loaded by agent '{a}'"),
+                    get_required_cli_string_with_args(
+                        "cli-skills-list-group-agent",
+                        &[("alias", a)],
+                    ),
                     load_skills_for_agent_from_config(config, a),
                 ));
             } else {
@@ -97,13 +109,16 @@ pub async fn handle_command(
                         alias,
                     ) {
                         rendered.push((
-                            format!("bundle: {alias}"),
+                            get_required_cli_string_with_args(
+                                "cli-skills-list-group-bundle",
+                                &[("alias", alias)],
+                            ),
                             load_skills_from_directory(&dir, allow_scripts).0,
                         ));
                     }
                 }
                 rendered.push((
-                    "global / open-skills / plugins (not from a bundle)".to_string(),
+                    get_required_cli_string("cli-skills-list-group-global"),
                     load_skills_with_config(&config.data_dir, config),
                 ));
             }
@@ -290,7 +305,13 @@ pub async fn handle_command(
             if let Some(ref a) = agent
                 && config.agent(a).is_none()
             {
-                anyhow::bail!("agent '{a}' is not configured");
+                anyhow::bail!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-agent-not-configured",
+                        &[("alias", a)],
+                    )
+                );
             }
 
             // Explicit bundle: archive through the service (recoverable).
@@ -482,13 +503,19 @@ fn resolve_install_location(
     if let Some(a) = agent
         && config.agent(a).is_none()
     {
-        anyhow::bail!("agent '{a}' is not configured");
+        anyhow::bail!(
+            "{}",
+            get_required_cli_string_with_args("cli-skills-agent-not-configured", &[("alias", a)],)
+        );
     }
 
     // 1. An explicit bundle wins outright (mirrors `skills add`/`edit`).
     if let Some(alias) = bundle {
         if !config.skill_bundles.contains_key(alias) {
-            anyhow::bail!("skill bundle '{alias}' is not configured");
+            anyhow::bail!(
+                "{}",
+                get_required_cli_string_with_args("cli-bundle-not-configured", &[("alias", alias)])
+            );
         }
         let dir = zeroclaw_config::skill_bundles::resolve_directory(config, &install_root, alias)
             .map_err(anyhow::Error::msg)?;
@@ -519,10 +546,16 @@ fn resolve_install_location(
                 });
             }
             [] => {} // no bundle assigned — fall through to the global dir
-            many => anyhow::bail!(
-                "agent '{alias}' has multiple skill bundles ({}); pass --bundle to choose one",
-                many.join(", ")
-            ),
+            many => {
+                let bundles = many.join(", ");
+                anyhow::bail!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-agent-multiple-bundles",
+                        &[("alias", alias), ("bundles", bundles.as_str())],
+                    )
+                );
+            }
         }
     }
 
