@@ -32,19 +32,30 @@ use crate::turn_status::TurnStatus;
 /// Maximum number of visible content rows before the input bar scrolls.
 const MAX_INPUT_ROWS: u16 = 5;
 
-/// Slash commands available for auto-complete.
-const SLASH_COMMANDS: &[&str] = &[
+// Zerocode is an RPC-only surface and must not link ZeroClaw backend crates.
+// Until command discovery is delivered over the RPC boundary, this local list
+// only drives TUI autocomplete for commands handled locally by `parse_slash_command`.
+const LOCAL_TUI_SLASH_COMMANDS: &[&str] = &[
     "/attach",
     "/attachments",
-    "/clear-queue",
+    "/clear-queue [index]",
     "/detach",
-    "/model",
-    "/model-provider",
+    "/model [model]",
+    "/model-provider [provider]",
     "/new",
     "/new-session",
     "/restart-session",
     "/toggle-thinking",
 ];
+
+/// Extract the executable command token from an autocomplete/help label.
+///
+/// `LOCAL_TUI_SLASH_COMMANDS` is display text, so entries may include argument
+/// hints like `/model [model]`. Input mutation and command parsing must use only
+/// the first token; otherwise help text leaks into command semantics.
+fn slash_command_token(label: &str) -> &str {
+    label.split_whitespace().next().unwrap_or(label)
+}
 
 // ── Action type ──────────────────────────────────────────────────
 
@@ -95,6 +106,11 @@ pub(crate) enum InputBarAction {
 
 // ── Slash commands ───────────────────────────────────────────────
 
+/// Parsed local TUI slash command.
+///
+/// This enum is UI intent only. It mirrors the input bar's local command
+/// surface and deliberately does not carry runtime admission facts such as
+/// route, principal, or durable task ids.
 enum SlashCommand<'a> {
     Attach(&'a str),
     Detach(Option<usize>),
@@ -612,10 +628,14 @@ impl InputBarState {
         if text.starts_with('/') && !text.contains(' ') {
             let prefix = text.as_str();
             self.autocomplete_target = AutocompleteTarget::Command;
-            self.autocomplete_matches = SLASH_COMMANDS
+            self.autocomplete_matches = LOCAL_TUI_SLASH_COMMANDS
                 .iter()
-                .filter(|cmd| cmd.starts_with(prefix) && **cmd != prefix)
-                .map(|c| (*c).to_string())
+                .copied()
+                .filter(|cmd| {
+                    let token = slash_command_token(cmd);
+                    token.starts_with(prefix) && token != prefix
+                })
+                .map(str::to_string)
                 .collect();
             self.finalize_autocomplete();
             return;
@@ -710,11 +730,12 @@ impl InputBarState {
     fn apply_autocomplete_choice(&mut self, choice: &str) {
         match self.autocomplete_target {
             AutocompleteTarget::Command => {
-                let takes_arg = choice == "/model" || choice == "/model-provider";
+                let command = slash_command_token(choice);
+                let takes_arg = command == "/model" || command == "/model-provider";
                 self.input = if takes_arg {
-                    format!("{choice} ")
+                    format!("{command} ")
                 } else {
-                    choice.to_string()
+                    command.to_string()
                 };
             }
             AutocompleteTarget::ModelArg => {
@@ -742,8 +763,9 @@ impl InputBarState {
         let target = self.autocomplete_target;
         self.apply_autocomplete_choice(&choice);
         self.dismiss_autocomplete();
+        let command = slash_command_token(&choice);
         let fills_only = target == AutocompleteTarget::Command
-            && (choice == "/model" || choice == "/model-provider");
+            && (command == "/model" || command == "/model-provider");
         if fills_only {
             return InputBarAction::Consumed;
         }

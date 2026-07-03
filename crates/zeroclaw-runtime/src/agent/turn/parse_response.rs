@@ -97,12 +97,28 @@ pub(crate) fn unforwarded_narration<'a>(
 }
 
 /// The interpreted Ok-arm of one provider call.
+///
+/// This is a transient split of one model response into the surfaces that need
+/// different handling: visible text, tool dispatch, native provider tool calls,
+/// and conversation-history content. It is not a transcript record; callers
+/// decide which fields become user-visible output, which feed the next tool
+/// loop iteration, and which are committed to history.
 pub(crate) struct InterpretedResponse {
+    /// Raw assistant text after provider-level extraction.
     pub(crate) response_text: String,
+    /// Assistant text after XML/tool-call protocol parsing removes command
+    /// scaffolding that should not be replayed as ordinary narration.
     pub(crate) parsed_text: String,
+    /// Tool calls parsed from ZeroClaw's text protocol.
     pub(crate) tool_calls: Vec<ParsedToolCall>,
+    /// Assistant content to commit to conversation history for this provider
+    /// response. This may differ from user-visible narration when streaming or
+    /// protocol suppression is active.
     pub(crate) assistant_history_content: String,
+    /// Provider-native tool calls supplied outside the text protocol.
     pub(crate) native_tool_calls: Vec<ToolCall>,
+    /// Whether parsing saw malformed protocol content that should affect loop
+    /// decisions or diagnostics.
     pub(crate) parse_issue_detected: bool,
 }
 
@@ -142,14 +158,15 @@ pub(crate) async fn interpret_chat_response(
 
     // Record cost via the task-local tracker (no-op when not scoped) and keep
     // the per-call USD so both the Usage event and the llm_response log line
-    // can carry it. `None` = untracked (no cost scope or no usage);
-    // `Some(0.0)` = tracked but unpriced (the missing-pricing WARN fires
-    // inside record_tool_loop_cost_usage in that case).
-    let call_cost_usd = resp
-        .usage
-        .as_ref()
-        .and_then(|usage| record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage))
-        .map(|(_total_tokens, cost_usd)| cost_usd);
+    // can carry it. `None` = untracked (no cost scope or no usage). A tracked
+    // unpriced call still returns `Some(0.0)`, and the persisted cost row marks
+    // `pricing_available = false` so goal cost budgets can fail closed.
+    let call_cost_usd = match resp.usage.as_ref() {
+        Some(usage) => record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage)
+            .await
+            .map(|(_total_tokens, cost_usd)| cost_usd),
+        None => None,
+    };
 
     // Per-LLM-call usage event, right after the observer success event
     // (upstream E2 parity, agent.rs Usage emission).

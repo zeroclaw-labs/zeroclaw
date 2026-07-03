@@ -9,6 +9,7 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use serde::{Deserialize, Serialize};
+use zeroclaw_commands::{CommandExecution, CommandSurface, commands_for_surface};
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 use zeroclaw_memory::MemoryEntry;
 
@@ -55,6 +56,39 @@ pub(crate) fn require_auth(
                 "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
             })),
         ))
+    }
+}
+
+/// GET /api/commands — built-in slash command catalogue for web clients.
+pub async fn handle_api_commands(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = require_auth(&state, &headers) {
+        return resp.into_response();
+    }
+
+    Json(serde_json::json!({
+        "commands": web_visible_commands(),
+    }))
+    .into_response()
+}
+
+pub(crate) fn web_visible_commands() -> Vec<zeroclaw_commands::CommandSpec> {
+    commands_for_surface(CommandSurface::Web)
+        .filter(|spec| spec.execution != CommandExecution::GoalAdmission)
+        .collect()
+}
+
+#[cfg(test)]
+mod command_catalogue_tests {
+    use super::*;
+
+    #[test]
+    fn web_visible_commands_are_empty_until_web_consumes_shared_discovery() {
+        let commands = web_visible_commands();
+
+        assert!(commands.is_empty());
     }
 }
 

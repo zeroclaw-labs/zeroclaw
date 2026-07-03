@@ -7,6 +7,7 @@
 )]
 #![cfg_attr(feature = "channel-matrix", recursion_limit = "256")]
 
+pub(crate) mod addressed_command;
 pub mod allowlist;
 pub mod listing;
 pub mod orchestrator;

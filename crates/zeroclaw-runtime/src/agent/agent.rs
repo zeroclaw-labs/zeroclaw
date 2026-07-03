@@ -35,6 +35,19 @@ pub fn build_session_model_provider(
     model_provider_ref: &str,
     model_override: Option<&str>,
 ) -> Result<(Box<dyn ModelProvider>, String, String)> {
+    build_session_model_provider_with_options(config, model_provider_ref, model_override, |_| {})
+}
+
+/// Build a session model provider while letting narrow callers override the
+/// alias-resolved runtime options before construction. The parser, model
+/// resolution, credential lookup, routing, and resilience wiring stay here as
+/// the single provider-construction path.
+pub fn build_session_model_provider_with_options(
+    config: &Config,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+    configure_options: impl FnOnce(&mut zeroclaw_providers::ModelProviderRuntimeOptions),
+) -> Result<(Box<dyn ModelProvider>, String, String)> {
     let (model_provider_name, model_provider_alias) = model_provider_ref
         .split_once('.')
         .map(|(t, a)| (t.to_string(), a.to_string()))
@@ -66,11 +79,12 @@ pub fn build_session_model_provider(
             ))
         })?;
 
-    let model_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+    let mut model_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
         config,
         &model_provider_name,
         &model_provider_alias,
     );
+    configure_options(&mut model_provider_runtime_options);
 
     let model_provider = zeroclaw_providers::create_routed_model_provider_with_options(
         config,
@@ -86,17 +100,35 @@ pub fn build_session_model_provider(
     Ok((model_provider, model_provider_name, model_name))
 }
 
+/// Scope guard that closes an agent turn exactly once.
+///
+/// The guard owns the transient accounting needed to emit `AgentEnd` even when
+/// the turn exits through an error path. It is not conversation state: history
+/// commits live on `Agent`, while durable usage attribution is persisted by the
+/// cost tracker.
 struct TurnGuard {
+    /// Observer receiving the final turn event.
     observer: Arc<dyn Observer>,
+    /// Provider family/alias used by this turn.
     model_provider: String,
+    /// Model id used by this turn.
     model: String,
+    /// Optional runtime turn id for correlating observer events.
     turn_id: Option<String>,
+    /// Monotonic start timestamp used for elapsed-time reporting.
     turn_started_at: Instant,
+    /// Agent alias for attribution surfaces.
     agent_alias: Option<String>,
+    /// Channel name that originated the turn.
     channel_name: String,
+    /// Input tokens observed across streamed usage chunks.
     total_input_tokens: u64,
+    /// Output tokens observed across streamed usage chunks.
     total_output_tokens: u64,
+    /// Whether the provider emitted usage data at all.
     saw_usage: bool,
+    /// Set once the guard has fired so `Drop` and explicit completion cannot
+    /// double-emit the end event.
     done: bool,
 }
 
@@ -408,16 +440,30 @@ impl Drop for Agent {
     }
 }
 
+/// Successful streamed turn result after model output and history commits.
+///
+/// This is the caller-facing result packet, not the conversation store itself.
+/// The returned messages are the newly committed history records for the turn.
 #[derive(Debug)]
 pub struct StreamedTurnSuccess {
+    /// Final assistant text returned to the caller.
     pub response: String,
+    /// Conversation messages appended during the turn.
     pub new_messages: Vec<ConversationMessage>,
 }
 
+/// Failed streamed turn result that may still have committed partial output.
+///
+/// Tool-loop or provider errors can happen after some assistant text has been
+/// streamed and stored. Callers need both the error and the committed fragment
+/// to keep user-visible output and conversation history aligned.
 #[derive(Debug)]
 pub struct StreamedTurnError {
+    /// Failure returned by the provider, tool loop, or runtime wrapper.
     pub error: anyhow::Error,
+    /// Assistant text already committed before the failure.
     pub committed_response: String,
+    /// Conversation messages appended before the failure surfaced.
     pub new_messages: Vec<ConversationMessage>,
 }
 
@@ -425,10 +471,16 @@ pub struct StreamedTurnError {
 /// cheap (Arc clones); the underlying maps are shared with the live tools.
 #[derive(Clone, Default)]
 pub struct AgentChannelHandles {
+    /// Channel map used by `ask_user`.
     pub ask_user: Option<tools::PerToolChannelHandle>,
+    /// Channel map used by room-management tools.
     pub channel_room: Option<tools::PerToolChannelHandle>,
+    /// Channel map used by reaction tools. Always present because the reaction
+    /// path uses an empty map as its no-channel default.
     pub reaction: tools::PerToolChannelHandle,
+    /// Channel map used by poll tools.
     pub poll: Option<tools::PerToolChannelHandle>,
+    /// Channel map used by `escalate_to_human`.
     pub escalate: Option<tools::PerToolChannelHandle>,
 }
 
@@ -475,6 +527,11 @@ impl AgentChannelHandles {
     }
 }
 
+/// Builder for an [`Agent`] runtime instance.
+///
+/// Fields here are construction-time dependencies and optional overrides. Once
+/// `build` returns, live runtime state belongs to [`Agent`]; the builder is not
+/// a cache of active configuration.
 pub struct AgentBuilder {
     model_provider: Option<Box<dyn ModelProvider>>,
     tools: Option<Vec<Box<dyn Tool>>>,
@@ -1452,6 +1509,7 @@ impl Agent {
             sop_engine,
             sop_audit,
             None,
+            tools::GoalAdmissionToolPolicy::Omit,
         );
         let mut tools = all_tools_result.tools;
         let delegate_handle = all_tools_result.delegate_handle;

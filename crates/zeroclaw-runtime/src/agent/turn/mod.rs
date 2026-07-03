@@ -830,10 +830,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             }
         }
 
-        // When multiple tool calls are present and interactive CLI approval is not needed, run
-        // tool executions concurrently for lower wall-clock latency.
-        let allow_parallel_execution =
-            parallel_tools && should_execute_tools_in_parallel(&tool_calls, approval);
         let PreparedToolCalls {
             mut ordered_results,
             executable_indices,
@@ -847,6 +843,12 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             knobs.dedup_enabled,
         )
         .await?;
+        // Decide parallelism after hook/default/dedup preparation, not from
+        // raw model calls. `before_tool_call` hooks may rewrite the tool name;
+        // policy-sensitive goal admission tools must be seen under their
+        // executable names before a batch is allowed to run concurrently.
+        let allow_parallel_execution =
+            parallel_tools && should_execute_tools_in_parallel(&executable_calls, approval);
 
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
         let execution_result =

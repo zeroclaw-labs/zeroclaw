@@ -1,6 +1,7 @@
+use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, record_tool_loop_cost_usage};
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    TOOL_LOOP_SESSION_KEY, ToolLoop, run_tool_call_loop,
+    TOOL_LOOP_SESSION_KEY, ToolLoop, is_tool_loop_cancelled, run_tool_call_loop,
 };
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
@@ -21,7 +22,7 @@ use zeroclaw_config::schema::{
 };
 use zeroclaw_log::Instrument as _;
 use zeroclaw_memory::Memory;
-use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
+use zeroclaw_providers::{self, ChatMessage, ChatRequest, ModelProvider, ProviderDispatch};
 use zeroclaw_tools::memory_export::MemoryExportTool;
 use zeroclaw_tools::memory_forget::MemoryForgetTool;
 use zeroclaw_tools::memory_purge::MemoryPurgeTool;
@@ -32,6 +33,53 @@ fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
 }
 
+async fn active_goal_task_id_from_cost_context() -> Option<String> {
+    let ctx = TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()?;
+    if !ctx.goal_attribution_enabled() {
+        return None;
+    }
+    let agent_alias = ctx.agent_alias.as_deref()?;
+    let control_plane = crate::control_plane::control_plane()?;
+    control_plane
+        .goal_store
+        .latest_active_goal_id_for_context(
+            agent_alias,
+            ctx.originator_route.as_deref(),
+            ctx.principal_id.as_deref(),
+        )
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn active_goal_task_id_from_runtime_context() -> Option<String> {
+    if !crate::control_plane::current_goal_turn_evaluation_requested() {
+        return None;
+    }
+    let ctx = crate::control_plane::current_goal_admission_context()?;
+    let control_plane = crate::control_plane::control_plane()?;
+    control_plane
+        .goal_store
+        .latest_active_goal_id_for_context(
+            ctx.agent_alias.as_str(),
+            ctx.originator_route.as_deref(),
+            ctx.principal_id.as_deref(),
+        )
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn active_goal_task_id_for_delegate_policy() -> Option<String> {
+    if let Some(task_id) = active_goal_task_id_from_runtime_context().await {
+        return Some(task_id);
+    }
+    active_goal_task_id_from_cost_context().await
+}
+
 async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output
 where
     F: std::future::Future,
@@ -40,14 +88,26 @@ where
 }
 
 /// Serializable result of a background delegate task.
+///
+/// This is the legacy result file shape for background delegation. Goal mode
+/// currently rejects background delegation because this record has no durable
+/// parent-linked completion or usage-reporting contract back to the active
+/// goal task.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackgroundDelegateResult {
+    /// Background task id returned to the caller for later polling.
     pub task_id: String,
+    /// Delegate target alias that performed the work.
     pub agent: String,
+    /// Current or terminal background task lifecycle for the result file.
     pub status: BackgroundTaskStatus,
+    /// Captured successful delegate output, when available.
     pub output: Option<String>,
+    /// Captured delegate failure text, when available.
     pub error: Option<String>,
+    /// RFC3339 task start timestamp.
     pub started_at: String,
+    /// RFC3339 terminal timestamp, absent while running.
     pub finished_at: Option<String>,
 }
 
@@ -55,9 +115,13 @@ pub struct BackgroundDelegateResult {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BackgroundTaskStatus {
+    /// Task has been launched and has not yet written a terminal result.
     Running,
+    /// Task completed successfully and `output` should be present.
     Completed,
+    /// Task failed and `error` should explain the failure.
     Failed,
+    /// Task was cancelled before producing a terminal delegate answer.
     Cancelled,
 }
 
@@ -118,6 +182,11 @@ pub struct DelegateTool {
     caller_alias: String,
 }
 
+/// Whether a delegate call still needs caller-side admission.
+///
+/// This is not durable authorization state. It exists only to avoid re-asking
+/// the wrong question inside already-admitted background workers while keeping
+/// the normal user-visible tool path fully checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DelegateAdmission {
     /// This call entered through the user-visible `delegate` tool and must run
@@ -727,6 +796,7 @@ impl DelegateTool {
             None,
             None,
             None,
+            crate::tools::GoalAdmissionToolPolicy::Omit,
         )
         .tools;
 
@@ -1129,6 +1199,17 @@ impl Tool for DelegateTool {
             .unwrap_or(false);
 
         if background {
+            if crate::control_plane::current_goal_start_tool_batch_requested()
+                || active_goal_task_id_for_delegate_policy().await.is_some()
+            {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(crate::i18n::get_required_tool_string(
+                        "tool-delegate-error-background-goal-context",
+                    )),
+                });
+            }
             return self.execute_background(agent_name, prompt, &args).await;
         }
 
@@ -1290,9 +1371,22 @@ impl DelegateTool {
             .resolve_delegation_timeout(&agent_config.runtime_profile)
             .unwrap_or(self.delegate_config.timeout_secs);
         let dispatcher = ProviderDispatch::from_ref(&*model_provider);
+        let mut messages = Vec::new();
+        if let Some(system_prompt) = system_prompt_ref {
+            messages.push(ChatMessage::system(system_prompt.to_string()));
+        }
+        messages.push(ChatMessage::user(full_prompt.clone()));
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            dispatcher.chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                &model,
+                temperature,
+            ),
         )
         .await;
 
@@ -1311,7 +1405,10 @@ impl DelegateTool {
 
         match result {
             Ok(response) => {
-                let mut rendered = response;
+                if let Some(usage) = &response.usage {
+                    record_tool_loop_cost_usage(&provider_type, &model, usage).await;
+                }
+                let mut rendered = response.text.unwrap_or_default();
                 if rendered.trim().is_empty() {
                     rendered = "[Empty response]".to_string();
                 }
@@ -1739,6 +1836,13 @@ impl DelegateTool {
             .ok()
             .flatten();
         let parent_session_key = current_tool_loop_session_key();
+        let parent_goal_cost_context = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+        let parent_goal_admission_context = crate::control_plane::current_goal_admission_context();
+        let parent_goal_turn_evaluation_marker =
+            crate::control_plane::current_goal_turn_evaluation_marker();
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
@@ -1768,6 +1872,9 @@ impl DelegateTool {
             let root_config = self.root_config.clone();
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
+            let goal_cost_context = parent_goal_cost_context.clone();
+            let goal_admission_context = parent_goal_admission_context.clone();
+            let goal_turn_evaluation_marker = parent_goal_turn_evaluation_marker.clone();
             let memory = self.memory.clone();
             let __zc_delegate_alias = agent_name.clone();
 
@@ -1803,7 +1910,21 @@ impl DelegateTool {
                                 // so the target policy is rebuilt for its own
                                 // agentic loop; the preflight above only
                                 // prevents partial fan-out.
-                                Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
+                                TOOL_LOOP_COST_TRACKING_CONTEXT
+                                    .scope(
+                                        goal_cost_context,
+                                        crate::control_plane::scope_goal_turn_evaluation_marker(
+                                            goal_turn_evaluation_marker,
+                                            crate::control_plane::scope_goal_admission_context(
+                                                goal_admission_context,
+                                                Box::pin(inner.execute_sync(
+                                                    &agent_name,
+                                                    &prompt,
+                                                    &args_clone,
+                                                )),
+                                            ),
+                                        ),
+                                    )
                                     .await
                             })
                             .await
@@ -1820,6 +1941,7 @@ impl DelegateTool {
         // Collect all results
         let mut outputs = Vec::with_capacity(handles.len());
         let mut all_success = true;
+        let mut loop_cancellation = None;
 
         for handle in handles {
             match handle.await {
@@ -1839,13 +1961,26 @@ impl DelegateTool {
                 }
                 Ok((agent_name, Err(e))) => {
                     all_success = false;
-                    outputs.push(format!("--- {agent_name} (success=false) ---\nError: {e}"));
+                    if is_tool_loop_cancelled(&e) {
+                        if loop_cancellation.is_none() {
+                            loop_cancellation = Some(e);
+                        }
+                        outputs.push(format!(
+                            "--- {agent_name} (success=false) ---\nTool loop cancelled"
+                        ));
+                    } else {
+                        outputs.push(format!("--- {agent_name} (success=false) ---\nError: {e}"));
+                    }
                 }
                 Err(e) => {
                     all_success = false;
                     outputs.push(format!("--- [join error] ---\n{e}"));
                 }
             }
+        }
+
+        if let Some(e) = loop_cancellation {
+            return Err(e);
         }
 
         Ok(ToolResult {
@@ -2491,6 +2626,7 @@ impl DelegateTool {
                     error: None,
                 })
             }
+            Ok(Err(e)) if is_tool_loop_cancelled(&e) => Err(e),
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -2568,6 +2704,7 @@ mod tests {
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::tools::{MemoryRecallTool, MemoryStoreTool};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::TempDir;
     use tokio::time::{Instant, sleep};
     use zeroclaw_config::schema::{
@@ -2578,7 +2715,7 @@ mod tests {
     use zeroclaw_memory::{AgentScopedMemory, SqliteMemory};
     use zeroclaw_providers::{ChatRequest, ChatResponse, ToolCall};
 
-    zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool);
+    zeroclaw_api::mock_tool_attribution!(EchoTool, CancellingEchoTool, FakeMcpTool);
 
     #[tokio::test]
     async fn reconciled_loss_label_surfaces_registry_truth() {
@@ -2808,6 +2945,8 @@ mod tests {
     #[derive(Default)]
     struct EchoTool;
 
+    struct CancellingEchoTool;
+
     #[async_trait]
     impl Tool for EchoTool {
         fn name(&self) -> &str {
@@ -2839,6 +2978,31 @@ mod tests {
                 output: format!("echo:{value}"),
                 error: None,
             })
+        }
+    }
+
+    #[async_trait]
+    impl Tool for CancellingEchoTool {
+        fn name(&self) -> &str {
+            "echo_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Cancels the agentic delegate loop"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "string"}
+                },
+                "required": ["value"]
+            })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Err(crate::agent::turn::ToolLoopCancelled.into())
         }
     }
 
@@ -3055,6 +3219,47 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "InfiniteToolCallModelProvider"
+        }
+    }
+
+    struct GoalMarkerProbeTool {
+        observed: Arc<AtomicBool>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for GoalMarkerProbeTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+
+        fn alias(&self) -> &str {
+            "goal-marker-probe"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for GoalMarkerProbeTool {
+        fn name(&self) -> &str {
+            "goal_marker_probe"
+        }
+
+        fn description(&self) -> &str {
+            "Records whether the active goal-work marker is scoped"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.observed.store(
+                crate::control_plane::current_goal_turn_evaluation_requested(),
+                Ordering::SeqCst,
+            );
+            Ok(ToolResult {
+                success: true,
+                output: "goal marker probed".into(),
+                error: None,
+            })
         }
     }
 
@@ -3452,6 +3657,36 @@ mod tests {
         LocalChatServer { uri, _task: task }
     }
 
+    async fn start_single_tool_call_chat_server(
+        tool_name: &'static str,
+        tool_call_id: &'static str,
+        arguments: serde_json::Value,
+        final_content: &'static str,
+    ) -> LocalChatServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let responses = vec![
+            chat_completion_tool_call(tool_name, tool_call_id, arguments),
+            serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": final_content
+                    }
+                }]
+            }),
+        ];
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _request = read_http_request(&mut socket).await;
+                write_json_response(&mut socket, response).await;
+            }
+        });
+
+        LocalChatServer { uri, _task: task }
+    }
+
     async fn start_final_chat_server(contents: Vec<&'static str>) -> LocalChatServer {
         // Minimal OpenAI-compatible responder for tests that only need to prove
         // which delegate path ran. Each expected child turn consumes one final
@@ -3477,6 +3712,36 @@ mod tests {
                 let _request = read_http_request(&mut socket).await;
                 write_json_response(&mut socket, response).await;
             }
+        });
+
+        LocalChatServer { uri, _task: task }
+    }
+
+    async fn start_final_chat_server_with_usage(
+        content: &'static str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) -> LocalChatServer {
+        // Same minimal response as `start_final_chat_server`, but with usage so
+        // tests can prove delegate calls feed the shared cost ledger.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let response = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": content
+                }
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens
+            }
+        });
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            write_json_response(&mut socket, response).await;
         });
 
         LocalChatServer { uri, _task: task }
@@ -3524,6 +3789,399 @@ mod tests {
         assert_eq!(schema["additionalProperties"], json!(false));
         assert_eq!(schema["properties"]["agent"]["minLength"], json!(1));
         assert_eq!(schema["properties"]["prompt"]["minLength"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn background_delegation_rejected_when_goal_context_active() {
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let store: Arc<dyn crate::control_plane::TaskRegistry> =
+            match crate::control_plane::control_plane() {
+                Some(control_plane) => Arc::clone(&control_plane.store),
+                None => {
+                    let sqlite_store =
+                        Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+                    let store: Arc<dyn crate::control_plane::TaskRegistry> = sqlite_store.clone();
+                    let goal_store: Arc<dyn crate::control_plane::GoalTaskRegistry> = sqlite_store;
+                    let _ = crate::control_plane::init_control_plane(
+                        crate::control_plane::ControlPlaneHandle {
+                            store: Arc::clone(&store),
+                            goal_store,
+                            boot_id: "test-boot".into(),
+                            recovered_goal_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+                            data_dir_lock: None,
+                        },
+                    );
+                    Arc::clone(&crate::control_plane::control_plane().unwrap().store)
+                }
+            };
+        store
+            .create(crate::control_plane::TaskRecord {
+                id: format!("goal-{}", uuid::Uuid::new_v4()),
+                kind: crate::control_plane::TaskKind::Goal,
+                agent: agent.clone(),
+                status: crate::control_plane::TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: "test-boot".into(),
+                heartbeat_at: None,
+                depth: 0,
+                parent_id: None,
+                originator_route: None,
+                delivered: false,
+                idem_key: None,
+                principal_id: None,
+                started_at: chrono::Utc::now().to_rfc3339(),
+                finished_at: None,
+            })
+            .await
+            .unwrap();
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let goal_admission_context = crate::control_plane::GoalAdmissionContext::new(agent.clone());
+        let goal_context = crate::agent::cost::ToolLoopCostTrackingContext::usage_only()
+            .with_agent_alias(agent)
+            .with_goal_admission_context(&goal_admission_context);
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(goal_context),
+                tool.execute(json!({
+                    "agent": "researcher",
+                    "prompt": "do detached work",
+                    "background": true
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Background delegation is disabled")
+        );
+    }
+
+    #[tokio::test]
+    async fn background_delegation_rejected_when_goal_context_active_without_cost_context() {
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let store: Arc<dyn crate::control_plane::TaskRegistry> =
+            match crate::control_plane::control_plane() {
+                Some(control_plane) => Arc::clone(&control_plane.store),
+                None => {
+                    let sqlite_store =
+                        Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+                    let store: Arc<dyn crate::control_plane::TaskRegistry> = sqlite_store.clone();
+                    let goal_store: Arc<dyn crate::control_plane::GoalTaskRegistry> = sqlite_store;
+                    let _ = crate::control_plane::init_control_plane(
+                        crate::control_plane::ControlPlaneHandle {
+                            store: Arc::clone(&store),
+                            goal_store,
+                            boot_id: "test-boot".into(),
+                            recovered_goal_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+                            data_dir_lock: None,
+                        },
+                    );
+                    Arc::clone(&crate::control_plane::control_plane().unwrap().store)
+                }
+            };
+        store
+            .create(crate::control_plane::TaskRecord {
+                id: format!("goal-{}", uuid::Uuid::new_v4()),
+                kind: crate::control_plane::TaskKind::Goal,
+                agent: agent.clone(),
+                status: crate::control_plane::TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: "test-boot".into(),
+                heartbeat_at: None,
+                depth: 0,
+                parent_id: None,
+                originator_route: None,
+                delivered: false,
+                idem_key: None,
+                principal_id: None,
+                started_at: chrono::Utc::now().to_rfc3339(),
+                finished_at: None,
+            })
+            .await
+            .unwrap();
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let goal_context = crate::control_plane::GoalAdmissionContext::new(agent);
+        let marker = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let result = crate::control_plane::scope_goal_turn_evaluation_marker(
+            Some(marker),
+            crate::control_plane::scope_goal_admission_context(
+                Some(goal_context),
+                tool.execute(json!({
+                    "agent": "researcher",
+                    "prompt": "do detached work",
+                    "background": true
+                })),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Background delegation is disabled")
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_admission_context_does_not_activate_goal_delegate_policy() {
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let route = format!("route-{}", uuid::Uuid::new_v4());
+        let principal = format!("principal-{}", uuid::Uuid::new_v4());
+        let store: Arc<dyn crate::control_plane::TaskRegistry> =
+            match crate::control_plane::control_plane() {
+                Some(control_plane) => Arc::clone(&control_plane.store),
+                None => {
+                    let sqlite_store =
+                        Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+                    let store: Arc<dyn crate::control_plane::TaskRegistry> = sqlite_store.clone();
+                    let goal_store: Arc<dyn crate::control_plane::GoalTaskRegistry> = sqlite_store;
+                    let _ = crate::control_plane::init_control_plane(
+                        crate::control_plane::ControlPlaneHandle {
+                            store: Arc::clone(&store),
+                            goal_store,
+                            boot_id: "test-boot".into(),
+                            recovered_goal_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+                            data_dir_lock: None,
+                        },
+                    );
+                    Arc::clone(&crate::control_plane::control_plane().unwrap().store)
+                }
+            };
+        store
+            .create(crate::control_plane::TaskRecord {
+                id: format!("goal-{}", uuid::Uuid::new_v4()),
+                kind: crate::control_plane::TaskKind::Goal,
+                agent: agent.clone(),
+                status: crate::control_plane::TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: "test-boot".into(),
+                heartbeat_at: None,
+                depth: 0,
+                parent_id: None,
+                originator_route: Some(route.clone()),
+                delivered: false,
+                idem_key: None,
+                principal_id: Some(principal.clone()),
+                started_at: chrono::Utc::now().to_rfc3339(),
+                finished_at: None,
+            })
+            .await
+            .unwrap();
+        let goal_context = crate::control_plane::GoalAdmissionContext::new(agent)
+            .with_originator_route(Some(route))
+            .with_principal_id(Some(principal));
+        let active = crate::control_plane::scope_goal_admission_context(
+            Some(goal_context),
+            active_goal_task_id_for_delegate_policy(),
+        )
+        .await;
+
+        assert_eq!(
+            active, None,
+            "ordinary channel turns may carry trusted goal admission facts, \
+             but must not become active goal work until the controller marks the turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_start_batch_rejects_background_delegation_before_admission_promotes_turn() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+
+        let result = crate::control_plane::scope_goal_start_tool_batch(
+            true,
+            tool.execute(json!({
+                "agent": "researcher",
+                "prompt": "do detached work",
+                "background": true
+            })),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.success);
+        let expected =
+            crate::i18n::get_required_tool_string("tool-delegate-error-background-goal-context");
+        assert_eq!(result.error.as_deref(), Some(expected.as_str()));
+    }
+
+    #[tokio::test]
+    async fn synchronous_delegation_usage_is_attributed_to_active_goal() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let server = start_final_chat_server_with_usage("sync-ok", 1_200, 300).await;
+        let tmp = TempDir::new().unwrap();
+        let caller_alias = format!("caller-{}", uuid::Uuid::new_v4());
+        let target_alias = format!("target-{}", uuid::Uuid::new_v4());
+        let route = format!("route-{}", uuid::Uuid::new_v4());
+        let principal = format!("principal-{}", uuid::Uuid::new_v4());
+        let goal_id = format!("goal-{}", uuid::Uuid::new_v4());
+
+        let model_provider_config = ModelProviderConfig {
+            uri: Some(server.uri.clone()),
+            model: Some("sync-usage-model".to_string()),
+            api_key: Some("sync-usage-key".to_string()),
+            timeout_secs: Some(2),
+            pricing: [
+                ("sync-usage-model.input".to_string(), 1.0),
+                ("sync-usage-model.output".to_string(), 2.0),
+            ]
+            .into_iter()
+            .collect(),
+            ..ModelProviderConfig::default()
+        };
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: model_provider_config.clone(),
+            },
+        );
+        config.risk_profiles.insert(
+            "caller_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![DelegateTool::NAME.to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("target_profile".to_string(), RiskProfileConfig::default());
+        config.agents.insert(
+            caller_alias.clone(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "caller_profile".into(),
+                delegates: vec![DelegateTargetConfig::bounded(target_alias.clone())],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            target_alias.clone(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "target_profile".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), model_provider_config);
+        let caller_security = Arc::new(
+            SecurityPolicy::for_agent(&config, &caller_alias).expect("caller policy resolves"),
+        );
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_security))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias(caller_alias.clone())
+            .with_providers_models(providers_models)
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone());
+
+        let store: Arc<dyn crate::control_plane::TaskRegistry> =
+            match crate::control_plane::control_plane() {
+                Some(control_plane) => Arc::clone(&control_plane.store),
+                None => {
+                    let sqlite_store =
+                        Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+                    let store: Arc<dyn crate::control_plane::TaskRegistry> = sqlite_store.clone();
+                    let goal_store: Arc<dyn crate::control_plane::GoalTaskRegistry> = sqlite_store;
+                    let _ = crate::control_plane::init_control_plane(
+                        crate::control_plane::ControlPlaneHandle {
+                            store: Arc::clone(&store),
+                            goal_store,
+                            boot_id: "test-boot".into(),
+                            recovered_goal_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+                            data_dir_lock: None,
+                        },
+                    );
+                    Arc::clone(&crate::control_plane::control_plane().unwrap().store)
+                }
+            };
+        store
+            .create(crate::control_plane::TaskRecord {
+                id: goal_id.clone(),
+                kind: crate::control_plane::TaskKind::Goal,
+                agent: caller_alias.clone(),
+                status: crate::control_plane::TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: "test-boot".into(),
+                heartbeat_at: None,
+                depth: 0,
+                parent_id: None,
+                originator_route: Some(route.clone()),
+                delivered: false,
+                idem_key: None,
+                principal_id: Some(principal.clone()),
+                started_at: chrono::Utc::now().to_rfc3339(),
+                finished_at: None,
+            })
+            .await
+            .unwrap();
+
+        let cost_config = zeroclaw_config::schema::CostConfig {
+            enabled: true,
+            track_per_agent: true,
+            ..zeroclaw_config::schema::CostConfig::default()
+        };
+        let tracker = Arc::new(crate::cost::CostTracker::new(cost_config, tmp.path()).unwrap());
+        let goal_ctx = crate::control_plane::GoalAdmissionContext::new(caller_alias.clone())
+            .with_originator_route(Some(route))
+            .with_principal_id(Some(principal));
+        let cost_ctx = crate::agent::cost::ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "custom".to_string(),
+                HashMap::from([
+                    ("sync-usage-model.input".to_string(), 1.0),
+                    ("sync-usage-model.output".to_string(), 2.0),
+                ]),
+            )])),
+        )
+        .with_agent_alias(caller_alias.clone())
+        .with_goal_admission_context(&goal_ctx);
+
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(cost_ctx),
+                tool.execute(json!({
+                    "agent": target_alias,
+                    "prompt": "do foreground child work"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "sync delegate failed: {result:?}");
+        assert!(result.output.contains("sync-ok"), "{result:?}");
+        let summary = tracker.get_summary_for_task(&goal_id).unwrap();
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.total_tokens, 1_500);
+        assert_eq!(
+            summary
+                .by_agent
+                .get(&caller_alias)
+                .map(|stats| stats.request_count),
+            Some(1)
+        );
     }
 
     #[test]
@@ -4175,6 +4833,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_agentic_propagates_tool_loop_cancelled() {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(CancellingEchoTool)])));
+
+        let err = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &OneToolThenFinalModelProvider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .expect_err("ToolLoopCancelled should propagate out of agentic delegate");
+
+        assert!(is_tool_loop_cancelled(&err), "unexpected error: {err:#}");
+    }
+
+    #[tokio::test]
     async fn execute_agentic_rebinds_memory_tools_to_target_agent_scope() {
         // Memory tools are stateful even when they come from the parent registry.
         // Agentic delegation must rebind them to the target alias so a child
@@ -4261,6 +4943,232 @@ mod tests {
         assert!(result.success, "parallel delegate failed: {result:?}");
         assert!(result.output.contains("memory workflow done"));
         assert_stored_for_target_only(&fixture, "parallel-key").await;
+    }
+
+    #[tokio::test]
+    async fn parallel_agentic_delegate_propagates_active_goal_marker() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let observed_marker = Arc::new(AtomicBool::new(false));
+        let server = start_single_tool_call_chat_server(
+            "goal_marker_probe",
+            "call_goal_marker_probe",
+            serde_json::json!({}),
+            "probe done",
+        )
+        .await;
+        let tmp = TempDir::new().unwrap();
+        let model_provider_config = ModelProviderConfig {
+            uri: Some(server.uri.clone()),
+            model: Some("goal-marker-test-model".to_string()),
+            api_key: Some("goal-marker-test-key".to_string()),
+            timeout_secs: Some(2),
+            ..ModelProviderConfig::default()
+        };
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: model_provider_config.clone(),
+            },
+        );
+        config.risk_profiles.insert(
+            "caller_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![
+                    DelegateTool::NAME.to_string(),
+                    "goal_marker_probe".to_string(),
+                ],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target_profile".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["goal_marker_probe".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic_test".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 3,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "caller_profile".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "target_profile".into(),
+                runtime_profile: "agentic_test".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), model_provider_config);
+        let caller_security =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>> =
+            Arc::new(RwLock::new(vec![Arc::new(GoalMarkerProbeTool {
+                observed: Arc::clone(&observed_marker),
+            })]));
+        let tool = DelegateTool::new(config.agents.clone(), None, caller_security)
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_providers_models(providers_models)
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(parent_tools);
+        let active_goal_marker = Arc::new(AtomicBool::new(true));
+
+        let result = crate::control_plane::scope_goal_turn_evaluation_marker(
+            Some(active_goal_marker),
+            tool.execute(json!({
+                "parallel": ["target"],
+                "prompt": "probe goal marker"
+            })),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.success, "parallel delegate failed: {result:?}");
+        assert!(result.output.contains("probe done"), "{result:?}");
+        assert!(
+            observed_marker.load(Ordering::SeqCst),
+            "spawned foreground delegate workers must inherit the active goal-work marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_agentic_delegate_propagates_tool_loop_cancelled() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let server = start_single_tool_call_chat_server(
+            "echo_tool",
+            "call_echo_tool",
+            serde_json::json!({"value": "cancel"}),
+            "unreachable",
+        )
+        .await;
+        let tmp = TempDir::new().unwrap();
+        let model_provider_config = ModelProviderConfig {
+            uri: Some(server.uri.clone()),
+            model: Some("parallel-cancel-test-model".to_string()),
+            api_key: Some("parallel-cancel-test-key".to_string()),
+            timeout_secs: Some(2),
+            ..ModelProviderConfig::default()
+        };
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: model_provider_config.clone(),
+            },
+        );
+        config.risk_profiles.insert(
+            "caller_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![DelegateTool::NAME.to_string(), "echo_tool".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target_profile".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["echo_tool".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic_test".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 3,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "caller_profile".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "target_profile".into(),
+                runtime_profile: "agentic_test".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), model_provider_config);
+        let caller_security =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>> =
+            Arc::new(RwLock::new(vec![Arc::new(CancellingEchoTool)]));
+        let tool = DelegateTool::new(config.agents.clone(), None, caller_security)
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_providers_models(providers_models)
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(parent_tools);
+
+        let err = tool
+            .execute(json!({
+                "parallel": ["target"],
+                "prompt": "cancel from child"
+            }))
+            .await
+            .expect_err("ToolLoopCancelled should propagate out of parallel delegate");
+
+        assert!(is_tool_loop_cancelled(&err), "unexpected error: {err:#}");
     }
 
     #[tokio::test]
