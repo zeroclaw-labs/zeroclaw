@@ -74,14 +74,7 @@ pub fn build_api(root: &Path) -> anyhow::Result<()> {
     let target = target_dir(root);
     run_cmd(
         Command::new("cargo")
-            .args([
-                "doc",
-                "--no-deps",
-                "--workspace",
-                "--exclude",
-                "zeroclaw-desktop",
-                "--target-dir",
-            ])
+            .args(["doc", "--no-deps", "--workspace", "--target-dir"])
             .arg(&target)
             .current_dir(root),
     )
