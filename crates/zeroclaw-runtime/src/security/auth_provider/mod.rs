@@ -22,10 +22,12 @@
 pub mod native;
 pub mod oidc;
 pub mod peercred;
+pub mod ssh_key;
 
 pub use native::NativeAuthProvider;
 pub use oidc::OidcAuthProvider;
 pub use peercred::PeercredAuthProvider;
+pub use ssh_key::{RosterUser, SshKeyAuthProvider, UserRoster};
 
 use std::sync::Arc;
 

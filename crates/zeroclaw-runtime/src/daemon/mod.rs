@@ -636,12 +636,17 @@ pub async fn run(
         > = if config.wss.enabled {
             use crate::security::auth_provider::{
                 NativeAuthProvider, OidcAuthProvider, PeercredAuthProvider, ProviderRegistry,
+                RosterUser, SshKeyAuthProvider, UserRoster,
             };
-            if config.gateway.paired_tokens.is_empty() && config.oidc.is_empty() {
+            if config.gateway.paired_tokens.is_empty()
+                && config.oidc.is_empty()
+                && config.users.is_empty()
+            {
                 anyhow::bail!(
                     "wss is enabled but no auth provider can resolve a remote credential: \
-                     no gateway pairing token exists and no [oidc.<alias>] issuer is \
-                     configured. Pair a client, configure an OIDC issuer, or disable [wss]."
+                     no gateway pairing token exists, no [oidc.<alias>] issuer is \
+                     configured, and no [users.<name>] roster entry exists. Pair a \
+                     client, configure an OIDC issuer or user roster, or disable [wss]."
                 );
             }
             let profiles: std::sync::Arc<
@@ -653,10 +658,31 @@ pub async fn run(
                     .map(|(alias, profile)| (alias.clone(), profile.resolve()))
                     .collect(),
             );
+            let roster: std::sync::Arc<UserRoster> = std::sync::Arc::new(
+                config
+                    .users
+                    .iter()
+                    .filter_map(|(name, user)| {
+                        profiles.get(&user.permission_profile).map(|grants| {
+                            (
+                                name.clone(),
+                                RosterUser {
+                                    authorized_keys: user.authorized_keys.clone(),
+                                    uid: user.uid,
+                                    grants: grants.clone(),
+                                },
+                            )
+                        })
+                    })
+                    .collect(),
+            );
             let mut registry = ProviderRegistry::new();
             registry.register(std::sync::Arc::new(
-                PeercredAuthProvider::for_current_process(),
+                PeercredAuthProvider::for_current_process().with_roster(roster.clone()),
             ));
+            if !roster.is_empty() {
+                registry.register(std::sync::Arc::new(SshKeyAuthProvider::new(roster)));
+            }
             for (alias, oidc_config) in &config.oidc {
                 registry.register(std::sync::Arc::new(OidcAuthProvider::new(
                     format!("oidc.{alias}"),

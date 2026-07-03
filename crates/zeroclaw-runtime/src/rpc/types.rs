@@ -69,6 +69,15 @@ rpc_type! {
         /// ignored when the daemon has no provider registry configured.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub auth_token: Option<String>,
+        /// Username for the ssh-key challenge handshake. Paired with
+        /// `auth_signature` over the nonce previously issued by
+        /// `auth/challenge` on this connection.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub auth_username: Option<String>,
+        /// Base64 signature over the `auth/challenge` nonce, made with a key
+        /// registered in `[users.<auth_username>].authorized_keys`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub auth_signature: Option<String>,
         /// Shell environment from the TUI process, used to forward the user's
         /// real env (PATH, credentials, etc.) to subprocesses spawned by the
         /// daemon on their behalf. Omitted by older clients; defaults to empty.

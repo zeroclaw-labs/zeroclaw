@@ -466,6 +466,8 @@ mod tests {
 
         let params = InitializeParams {
             auth_token: None,
+            auth_username: None,
+            auth_signature: None,
             protocol_version: 1,
             tui_id: None,
             tui_sig: None,
@@ -514,6 +516,8 @@ mod tests {
 
         let init_params = InitializeParams {
             auth_token: None,
+            auth_username: None,
+            auth_signature: None,
             protocol_version: 1,
             tui_id: None,
             tui_sig: None,
@@ -760,6 +764,8 @@ mod tests {
 
         let init_params = InitializeParams {
             auth_token: None,
+            auth_username: None,
+            auth_signature: None,
             protocol_version: 1,
             tui_id: None,
             tui_sig: None,

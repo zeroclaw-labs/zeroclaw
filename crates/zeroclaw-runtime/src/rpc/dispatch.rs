@@ -45,6 +45,7 @@ mod notification {
 pub enum Method {
     // Core
     Initialize,
+    AuthChallenge,
     Status,
     Health,
     DoctorRun,
@@ -151,6 +152,7 @@ impl Method {
     /// The single table. Wire name ↔ variant, defined once.
     pub const ALL: &[(Method, &str)] = &[
         (Method::Initialize, "initialize"),
+        (Method::AuthChallenge, "auth/challenge"),
         (Method::Status, "status"),
         (Method::Health, "health"),
         (Method::DoctorRun, "doctor/run"),
@@ -270,7 +272,7 @@ impl Method {
     pub fn required_grant(self) -> Option<(Resource, Verb)> {
         use Method as M;
         Some(match self {
-            M::Initialize => return None,
+            M::Initialize | M::AuthChallenge => return None,
             M::Status | M::Health => (Resource::System, Verb::Read),
             M::DoctorRun => (Resource::System, Verb::Execute),
 
@@ -498,6 +500,9 @@ pub struct RpcDispatcher {
     /// — Zerocode's Code tab is a superset of ACP, so both surfaces speak
     /// the same elicitation RFD.
     client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities,
+    /// Server-issued nonce for the ssh-key challenge handshake. Set by
+    /// `auth/challenge`, consumed (taken) by the next `initialize`.
+    auth_nonce: Option<Vec<u8>>,
 }
 
 impl RpcDispatcher {
@@ -512,6 +517,7 @@ impl RpcDispatcher {
             tui_id: None,
             peer_label,
             client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities::default(),
+            auth_nonce: None,
         }
     }
 
@@ -555,6 +561,7 @@ impl RpcDispatcher {
             tui_id: self.tui_id.clone(),
             peer_label: self.peer_label.clone(),
             client_elicitation_caps: self.client_elicitation_caps,
+            auth_nonce: None,
         }
     }
 
@@ -667,7 +674,7 @@ impl RpcDispatcher {
             }
         };
 
-        if !self.authenticated && method != Method::Initialize {
+        if !self.authenticated && method != Method::Initialize && method != Method::AuthChallenge {
             if !is_notification {
                 self.send_error(id, AUTH_REQUIRED, "First call must be 'initialize'")
                     .await;
@@ -704,6 +711,7 @@ impl RpcDispatcher {
         let result = match method {
             // Core
             Method::Initialize => self.handle_initialize(&req.params).await,
+            Method::AuthChallenge => self.handle_auth_challenge(),
             Method::Status => self.handle_status().await,
             Method::Health => self.handle_health(),
             Method::DoctorRun => self.handle_doctor_run().await,
@@ -840,6 +848,18 @@ impl RpcDispatcher {
 
     // ── Core handlers ────────────────────────────────────────────
 
+    fn handle_auth_challenge(&mut self) -> RpcResult {
+        use base64::Engine as _;
+        use ring::rand::{SecureRandom as _, SystemRandom};
+        let mut nonce = vec![0u8; 32];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| rpc_err(INTERNAL_ERROR, "Nonce generation failed"))?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&nonce);
+        self.auth_nonce = Some(nonce);
+        Ok(serde_json::json!({ "nonce": encoded }))
+    }
+
     async fn handle_initialize(&mut self, params: &Value) -> RpcResult {
         let req: InitializeParams = parse_params(params)?;
 
@@ -873,11 +893,35 @@ impl RpcDispatcher {
         // 0o600); WSS connections are default-deny once the registry exists.
         let principal = match self.ctx.auth_registry.as_deref() {
             Some(registry) => {
-                let credential = match req.auth_token.as_deref() {
-                    Some(token) => {
+                let nonce = self.auth_nonce.take();
+                let credential = match (
+                    req.auth_token.as_deref(),
+                    req.auth_username.as_deref(),
+                    req.auth_signature.as_deref(),
+                ) {
+                    (Some(token), _, _) => {
                         crate::security::auth_provider::Credential::Bearer(token.to_string())
                     }
-                    None => self.transport_credential.clone(),
+                    (None, Some(username), Some(signature_b64)) => {
+                        use base64::Engine as _;
+                        let Some(nonce) = nonce else {
+                            return Err(rpc_err(
+                                AUTH_REQUIRED,
+                                "No challenge outstanding: call auth/challenge first",
+                            ));
+                        };
+                        let signature = base64::engine::general_purpose::STANDARD
+                            .decode(signature_b64)
+                            .map_err(|_| {
+                                rpc_err(AUTH_REQUIRED, "auth_signature is not valid base64")
+                            })?;
+                        crate::security::auth_provider::Credential::SshSignature {
+                            username: username.to_string(),
+                            nonce,
+                            signature,
+                        }
+                    }
+                    _ => self.transport_credential.clone(),
                 };
                 let outcome = registry.resolve(&credential).await;
                 match (outcome.principal(), self.transport_kind) {
@@ -5284,6 +5328,132 @@ mod tests {
         assert!(!dispatcher.authenticated);
     }
 
+    fn make_ssh_test_dispatcher() -> (
+        RpcDispatcher,
+        ring::signature::Ed25519KeyPair,
+        Arc<crate::rpc::session::SessionStore>,
+    ) {
+        use crate::security::auth_provider::{
+            ProviderRegistry, RosterUser, SshKeyAuthProvider, UserRoster,
+        };
+        use base64::Engine as _;
+        use ring::rand::SystemRandom;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public = key.public_key().as_ref().to_vec();
+        let mut blob = Vec::new();
+        for part in [b"ssh-ed25519".as_slice(), &public] {
+            blob.extend_from_slice(&(part.len() as u32).to_be_bytes());
+            blob.extend_from_slice(part);
+        }
+        let entry = format!(
+            "ssh-ed25519 {} test@host",
+            base64::engine::general_purpose::STANDARD.encode(&blob)
+        );
+        let mut roster = UserRoster::new();
+        roster.insert(
+            "alice".to_string(),
+            RosterUser {
+                authorized_keys: vec![entry],
+                uid: None,
+                grants: zeroclaw_api::grants::ResolvedGrants::all(),
+            },
+        );
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&sessions),
+        );
+        let mut ctx = Arc::try_unwrap(ctx)
+            .ok()
+            .expect("minimal test context should be uniquely owned");
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(SshKeyAuthProvider::new(Arc::new(roster))));
+        ctx.auth_registry = Some(Arc::new(registry));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(Arc::new(ctx), tx, "test-peer".into());
+        dispatcher.set_transport_for_test(
+            TransportKind::Wss,
+            crate::security::auth_provider::Credential::None,
+        );
+        (dispatcher, key, sessions)
+    }
+
+    #[tokio::test]
+    async fn ssh_challenge_handshake_binds_named_principal() {
+        use base64::Engine as _;
+        let (mut dispatcher, key, _sessions) = make_ssh_test_dispatcher();
+
+        let challenge = dispatcher.handle_auth_challenge().unwrap();
+        let nonce_b64 = challenge["nonce"].as_str().expect("nonce issued");
+        let nonce = base64::engine::general_purpose::STANDARD
+            .decode(nonce_b64)
+            .unwrap();
+        let signature = key.sign(&nonce).as_ref().to_vec();
+        let params = serde_json::json!({
+            "protocol_version": RPC_PROTOCOL_VERSION,
+            "auth_username": "alice",
+            "auth_signature": base64::engine::general_purpose::STANDARD.encode(&signature),
+        });
+        let result = dispatcher.handle_initialize(&params).await;
+        assert!(result.is_ok(), "expected success, got {result:?}");
+        let p = dispatcher.principal.as_ref().expect("principal bound");
+        assert_eq!(p.id.as_str(), "alice");
+        assert_eq!(p.auth_method, zeroclaw_api::principal::AuthMethod::SshKey);
+        assert!(p.is_authenticated());
+    }
+
+    #[tokio::test]
+    async fn ssh_initialize_without_prior_challenge_is_rejected() {
+        use base64::Engine as _;
+        let (mut dispatcher, key, _sessions) = make_ssh_test_dispatcher();
+        let signature = key.sign(b"self-chosen-nonce").as_ref().to_vec();
+        let params = serde_json::json!({
+            "protocol_version": RPC_PROTOCOL_VERSION,
+            "auth_username": "alice",
+            "auth_signature": base64::engine::general_purpose::STANDARD.encode(&signature),
+        });
+        let err = dispatcher.handle_initialize(&params).await.unwrap_err();
+        assert_eq!(err.code, AUTH_REQUIRED);
+        assert!(!dispatcher.authenticated);
+    }
+
+    #[tokio::test]
+    async fn ssh_nonce_is_single_use() {
+        use base64::Engine as _;
+        let (mut dispatcher, key, _sessions) = make_ssh_test_dispatcher();
+        let challenge = dispatcher.handle_auth_challenge().unwrap();
+        let nonce = base64::engine::general_purpose::STANDARD
+            .decode(challenge["nonce"].as_str().unwrap())
+            .unwrap();
+        let bad_sig = key.sign(b"wrong-message").as_ref().to_vec();
+        let params = serde_json::json!({
+            "protocol_version": RPC_PROTOCOL_VERSION,
+            "auth_username": "alice",
+            "auth_signature": base64::engine::general_purpose::STANDARD.encode(&bad_sig),
+        });
+        let err = dispatcher.handle_initialize(&params).await.unwrap_err();
+        assert_eq!(err.code, AUTH_REQUIRED);
+
+        let good_sig = key.sign(&nonce).as_ref().to_vec();
+        let params = serde_json::json!({
+            "protocol_version": RPC_PROTOCOL_VERSION,
+            "auth_username": "alice",
+            "auth_signature": base64::engine::general_purpose::STANDARD.encode(&good_sig),
+        });
+        let err = dispatcher.handle_initialize(&params).await.unwrap_err();
+        assert_eq!(
+            err.code, AUTH_REQUIRED,
+            "nonce must be consumed by the failed attempt, not replayable"
+        );
+    }
+
     #[tokio::test]
     async fn local_initialize_with_matching_peercred_binds_peercred_principal() {
         let (mut dispatcher, _sessions) = make_auth_test_dispatcher(&["zc_valid".to_string()]);
@@ -5342,9 +5512,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn every_method_is_classified_and_only_initialize_is_exempt() {
+    fn every_method_is_classified_and_only_handshake_methods_are_exempt() {
         for (method, wire) in Method::ALL {
-            if *method == Method::Initialize {
+            if matches!(*method, Method::Initialize | Method::AuthChallenge) {
                 assert!(method.required_grant().is_none(), "{wire} must be exempt");
             } else {
                 assert!(
