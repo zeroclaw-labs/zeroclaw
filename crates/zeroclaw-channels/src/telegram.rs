@@ -947,11 +947,16 @@ impl TelegramChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        suppress_voice: bool,
     ) -> anyhow::Result<()> {
         let text = strip_tool_call_tags(text);
         let (chat_id, parsed_thread) = Self::parse_reply_target(recipient);
 
-        self.try_queue_voice_reply(recipient, &text, true, false);
+        // Skipped when suppress_voice forces text-only delivery (#7361 send_via
+        // modality="text"), matching the non-multi-message finalize path.
+        if !suppress_voice {
+            self.try_queue_voice_reply(recipient, &text, true, false);
+        }
 
         let key = Self::multi_draft_key(recipient, message_id);
         let flush_lock = {
@@ -3730,7 +3735,7 @@ impl Channel for TelegramChannel {
     ) -> anyhow::Result<()> {
         if self.stream_mode == StreamMode::MultiMessage {
             return self
-                .finalize_multi_message_draft(recipient, message_id, text)
+                .finalize_multi_message_draft(recipient, message_id, text, suppress_voice)
                 .await;
         }
 
@@ -5354,6 +5359,133 @@ mod tests {
             elapsed >= std::time::Duration::from_millis(delay_ms),
             "approval prompt must be paced by multi_message_delay_ms ({delay_ms}ms) \
              after narration; elapsed {elapsed:?}"
+        );
+    }
+
+    /// #7361/#8561 regression: in MultiMessage stream mode, `finalize_draft`
+    /// must thread `suppress_voice` into `finalize_multi_message_draft` so a
+    /// `send_via(modality="text")` reply on a voice-capable Telegram recipient
+    /// delivers text only and does NOT queue a TTS voice reply. The OpenAI TTS
+    /// provider is pointed at the mock, so a request to its `/v1/audio/speech`
+    /// synthesis endpoint is the observable proof that voice fired.
+    #[tokio::test]
+    async fn finalize_multi_message_suppress_voice_skips_tts_but_delivers_text() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, OpenAITtsProviderConfig, TtsProviderConfig,
+        };
+
+        let mock_server = MockServer::start().await;
+        // Catch-all for every POST: Bot API (sendMessage/sendVoice) and the
+        // OpenAI TTS `/v1/audio/speech` synthesis call. Assertions are on the
+        // chronological set of recorded request paths, not on mock matching.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // TTS enabled; the agent that owns this channel uses the mock OpenAI TTS.
+        let mut config = Config::default();
+        config.tts.enabled = true;
+        config.agents.insert(
+            "abac".to_string(),
+            AliasedAgentConfig {
+                tts_provider: "openai.default".into(),
+                channels: vec!["telegram.telegram_test_alias".into()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.providers.tts.openai.insert(
+            "default".to_string(),
+            OpenAITtsProviderConfig {
+                base: TtsProviderConfig {
+                    api_key: Some("k".to_string()),
+                    uri: Some(format!("{}/v1/audio/speech", mock_server.uri())),
+                    voice: Some("alloy".to_string()),
+                    ..TtsProviderConfig::default()
+                },
+            },
+        );
+
+        // Recipient "123" is voice-capable, so a non-suppressed finalize WOULD
+        // queue TTS — that is what makes the suppress assertion meaningful.
+        let make_channel = || {
+            TelegramChannel::new(
+                "fake-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                false,
+            )
+            .with_streaming(StreamMode::MultiMessage, 750, 0)
+            .with_api_base(mock_server.uri())
+            .with_voice_peer_resolver(Arc::new(|| vec!["123".to_string()]))
+            .with_tts(&config)
+        };
+        let long_text = "Сбросьте питание контроллера и проверьте терминаторы шины Profibus DP на обоих концах.";
+        assert!(long_text.len() > 40, "voice path requires substantive text");
+
+        let tts_hits = |reqs: &[wiremock::Request]| {
+            reqs.iter()
+                .filter(|r| r.url.path().ends_with("/v1/audio/speech"))
+                .count()
+        };
+
+        // ── suppress_voice = true → text delivered, NO TTS synthesis ──
+        let ch = make_channel();
+        let draft_id = ch
+            .send_draft(&SendMessage::new("...", "123"))
+            .await
+            .unwrap()
+            .expect("draft id");
+        ch.update_draft("123", &draft_id, long_text).await.unwrap();
+        ch.finalize_draft("123", &draft_id, long_text, true)
+            .await
+            .unwrap();
+
+        let reqs = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            tts_hits(&reqs),
+            0,
+            "suppress_voice=true must NOT trigger TTS synthesis on the multi_message finalize path"
+        );
+        assert!(
+            reqs.iter().any(|r| r.url.path().ends_with("/sendMessage")
+                && String::from_utf8_lossy(&r.body).contains("Profibus")),
+            "the final text must still be delivered"
+        );
+
+        // ── control: suppress_voice = false → TTS synthesis DOES fire ──
+        // (proves the recipient/setup would otherwise queue voice, so the
+        // assertion above is not vacuously true). The synthesis runs in a
+        // spawned task, so poll for the recorded request.
+        let ch2 = make_channel();
+        let draft2 = ch2
+            .send_draft(&SendMessage::new("...", "123"))
+            .await
+            .unwrap()
+            .expect("draft id");
+        ch2.update_draft("123", &draft2, long_text).await.unwrap();
+        ch2.finalize_draft("123", &draft2, long_text, false)
+            .await
+            .unwrap();
+
+        let mut fired = false;
+        for _ in 0..40 {
+            let reqs = mock_server.received_requests().await.unwrap();
+            if tts_hits(&reqs) > 0 {
+                fired = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            fired,
+            "control: suppress_voice=false SHOULD trigger TTS synthesis — proves the setup fires voice"
         );
     }
 
