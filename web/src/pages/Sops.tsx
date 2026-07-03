@@ -259,9 +259,7 @@ function StepEditor({
   step,
   index,
   count,
-  selected,
   capturedCalls,
-  onSelect,
   onChange,
   onRemove,
   onMove,
@@ -269,9 +267,7 @@ function StepEditor({
   step: SopStep;
   index: number;
   count: number;
-  selected: boolean;
   capturedCalls?: StepToolCall[];
-  onSelect: () => void;
   onChange: (patch: Partial<SopStep>) => void;
   onRemove: () => void;
   onMove: (dir: -1 | 1) => void;
@@ -289,11 +285,7 @@ function StepEditor({
   return (
     <div
       ref={rowRef}
-      onFocusCapture={onSelect}
-      onClick={onSelect}
-      className={`rounded-[var(--radius-lg)] border bg-pc-surface p-3 ${
-        selected ? 'border-pc-accent ring-1 ring-pc-accent' : 'border-pc-border'
-      }`}
+      className="rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface p-3"
     >
       <div className="mb-2 flex items-center gap-2">
         <span className="inline-flex h-6 w-6 items-center justify-center rounded bg-pc-accent-light text-xs font-semibold text-pc-accent">
@@ -789,20 +781,81 @@ function TriggerEditor({
   );
 }
 
-function SopEditor({
+function StepListRow({
+  step,
+  index,
+  count,
+  selected,
+  onSelect,
+  onMove,
+  onRemove,
+}: {
+  step: SopStep;
+  index: number;
+  count: number;
+  selected: boolean;
+  onSelect: () => void;
+  onMove: (dir: -1 | 1) => void;
+  onRemove: () => void;
+}) {
+  return (
+    <div
+      className={`flex items-center gap-2 rounded border px-2 py-1.5 ${
+        selected ? 'border-pc-accent ring-1 ring-pc-accent' : 'border-pc-border'
+      }`}
+    >
+      <button type="button" onClick={onSelect} className="flex min-w-0 flex-1 items-center gap-2 text-left">
+        <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded bg-pc-accent-light text-[11px] font-semibold text-pc-accent">
+          {step.number}
+        </span>
+        <span className="truncate text-sm text-pc-text">{step.title || t('sops.untitled')}</span>
+        {step.kind === 'checkpoint' ? <Badge tone="warn">⏸</Badge> : null}
+        {step.calls && step.calls.length > 0 ? (
+          <span className="shrink-0 text-[11px] text-pc-text-muted">⚙ {step.calls.length}</span>
+        ) : null}
+      </button>
+      <button
+        type="button"
+        onClick={() => onMove(-1)}
+        disabled={index === 0}
+        className="rounded px-1 text-pc-text-muted hover:bg-pc-elevated disabled:opacity-30"
+        aria-label={t('sops.move_up')}
+      >
+        ↑
+      </button>
+      <button
+        type="button"
+        onClick={() => onMove(1)}
+        disabled={index === count - 1}
+        className="rounded px-1 text-pc-text-muted hover:bg-pc-elevated disabled:opacity-30"
+        aria-label={t('sops.move_down')}
+      >
+        ↓
+      </button>
+      <button
+        type="button"
+        onClick={onRemove}
+        className="rounded px-1 text-rose-500 hover:bg-pc-elevated"
+        aria-label={t('sops.remove_step')}
+      >
+        <Trash2 className="h-3.5 w-3.5" aria-hidden />
+      </button>
+    </div>
+  );
+}
+
+function DraftSidebar({
   draft,
   saving,
   saveError,
   selectedStep,
   selectedTrigger,
   triggerRegistry,
-  runCallsByStep,
   onSelectStep,
   onField,
   onTrigger,
   onAddTrigger,
   onRemoveTrigger,
-  onStep,
   onAddStep,
   onRemoveStep,
   onMoveStep,
@@ -815,13 +868,11 @@ function SopEditor({
   selectedStep: number | null;
   selectedTrigger: number | null;
   triggerRegistry: TriggerSourceRegistry | null;
-  runCallsByStep: Map<number, StepToolCall[]>;
   onSelectStep: (n: number) => void;
   onField: (patch: Partial<Sop>) => void;
   onTrigger: (i: number, next: SopTrigger) => void;
   onAddTrigger: () => void;
   onRemoveTrigger: (i: number) => void;
-  onStep: (i: number, patch: Partial<SopStep>) => void;
   onAddStep: () => void;
   onRemoveStep: (i: number) => void;
   onMoveStep: (i: number, dir: -1 | 1) => void;
@@ -856,37 +907,35 @@ function SopEditor({
         </div>
       </div>
       {saveError ? <div className="text-sm text-rose-500">{saveError}</div> : null}
-      <div className="grid grid-cols-2 gap-3">
-        <TextField
-          label={t('sops.field_name')}
-          value={draft.name}
-          onChange={(v) => onField({ name: v })}
-        />
-        <TextField
-          label={t('sops.field_version')}
-          value={draft.version}
-          onChange={(v) => onField({ version: v })}
-        />
-      </div>
+      <TextField
+        label={t('sops.field_name')}
+        value={draft.name}
+        onChange={(v) => onField({ name: v })}
+      />
       <TextField
         label={t('sops.field_description')}
         value={draft.description}
         onChange={(v) => onField({ description: v })}
       />
       <div className="grid grid-cols-2 gap-3">
+        <TextField
+          label={t('sops.field_version')}
+          value={draft.version}
+          onChange={(v) => onField({ version: v })}
+        />
         <SelectField
           label={t('sops.field_priority')}
           value={draft.priority}
           onChange={(v) => onField({ priority: v as Sop['priority'] })}
           options={['critical', 'high', 'normal', 'low']}
         />
-        <SelectField
-          label={t('sops.field_execution_mode')}
-          value={draft.execution_mode}
-          onChange={(v) => onField({ execution_mode: v as Sop['execution_mode'] })}
-          options={['auto', 'supervised', 'step_by_step', 'priority_based', 'deterministic']}
-        />
       </div>
+      <SelectField
+        label={t('sops.field_execution_mode')}
+        value={draft.execution_mode}
+        onChange={(v) => onField({ execution_mode: v as Sop['execution_mode'] })}
+        options={['auto', 'supervised', 'step_by_step', 'priority_based', 'deterministic']}
+      />
       <div className="space-y-2">
         <div className="flex items-center justify-between">
           <span className="text-sm font-medium text-pc-text">{t('sops.triggers')}</span>
@@ -925,22 +974,61 @@ function SopEditor({
             <Plus className="h-3.5 w-3.5" aria-hidden /> {t('sops.add_step')}
           </button>
         </div>
-        {draft.steps.map((s, i) => (
-          <StepEditor
-            key={i}
-            step={s}
-            index={i}
-            count={draft.steps.length}
-            selected={selectedStep === s.number}
-            capturedCalls={runCallsByStep.get(s.number)}
-            onSelect={() => onSelectStep(s.number)}
-            onChange={(patch) => onStep(i, patch)}
-            onRemove={() => onRemoveStep(i)}
-            onMove={(dir) => onMoveStep(i, dir)}
-          />
-        ))}
+        {draft.steps.length === 0 ? (
+          <p className="text-xs text-pc-text-muted">{t('sops.no_steps')}</p>
+        ) : (
+          draft.steps.map((s, i) => (
+            <StepListRow
+              key={i}
+              step={s}
+              index={i}
+              count={draft.steps.length}
+              selected={selectedStep === s.number}
+              onSelect={() => onSelectStep(s.number)}
+              onMove={(dir) => onMoveStep(i, dir)}
+              onRemove={() => onRemoveStep(i)}
+            />
+          ))
+        )}
       </div>
     </Card>
+  );
+}
+
+function StepInspector({
+  draft,
+  selectedStep,
+  runCallsByStep,
+  onStep,
+  onRemoveStep,
+  onMoveStep,
+}: {
+  draft: Sop;
+  selectedStep: number | null;
+  runCallsByStep: Map<number, StepToolCall[]>;
+  onStep: (i: number, patch: Partial<SopStep>) => void;
+  onRemoveStep: (i: number) => void;
+  onMoveStep: (i: number, dir: -1 | 1) => void;
+}) {
+  const index = draft.steps.findIndex((s) => s.number === selectedStep);
+  const step = index >= 0 ? draft.steps[index] : undefined;
+  if (!step) {
+    return (
+      <Card>
+        <p className="text-sm text-pc-text-muted">{t('sops.inspector_empty')}</p>
+      </Card>
+    );
+  }
+  return (
+    <StepEditor
+      step={step}
+      index={index}
+      count={draft.steps.length}
+      capturedCalls={runCallsByStep.get(step.number)}
+      onChange={(patch) => onStep(index, patch)}
+      onRemove={() => onRemoveStep(index)}
+      onMove={(dir) => onMoveStep(index, dir)}
+    />
   );
 }
 
@@ -1179,6 +1267,20 @@ export default function Sops() {
   const runStateByStep = useMemo(() => overlayStateByStep(overlay), [overlay]);
   const runCallsByStep = useMemo(() => overlayCallsByStep(overlay), [overlay]);
 
+  // Keep the inspector pointed at a real step: select the first step when a
+  // draft opens and drop the selection when its step is removed.
+  useEffect(() => {
+    if (!draft) {
+      setSelectedStep(null);
+      return;
+    }
+    setSelectedStep((cur) =>
+      cur !== null && draft.steps.some((s) => s.number === cur)
+        ? cur
+        : (draft.steps[0]?.number ?? null),
+    );
+  }, [draft]);
+
   const mutateDraft = useCallback((updater: (d: Sop) => Sop) => {
     setSaveError(null);
     setDraft((d) => (d ? updater(d) : d));
@@ -1242,7 +1344,25 @@ export default function Sops() {
         </Card>
       ) : null}
       {draft && editorHandlers ? (
-        <div className="space-y-4">
+        <div className="grid grid-cols-[20rem_minmax(0,1fr)_24rem] items-start gap-4">
+          <DraftSidebar
+            draft={draft}
+            saving={saving}
+            saveError={saveError}
+            selectedStep={selectedStep}
+            selectedTrigger={selectedTrigger}
+            triggerRegistry={triggerRegistry}
+            onSelectStep={setSelectedStep}
+            onField={editorHandlers.onField}
+            onTrigger={editorHandlers.onTrigger}
+            onAddTrigger={editorHandlers.onAddTrigger}
+            onRemoveTrigger={editorHandlers.onRemoveTrigger}
+            onAddStep={editorHandlers.onAddStep}
+            onRemoveStep={editorHandlers.onRemoveStep}
+            onMoveStep={editorHandlers.onMoveStep}
+            onSave={onSaveDraft}
+            onCancel={() => setDraft(null)}
+          />
           {draftGraph ? (
             <SopCanvas
               draft={draft}
@@ -1252,29 +1372,23 @@ export default function Sops() {
               onSelectStep={setSelectedStep}
               onSelectTrigger={setSelectedTrigger}
               onAddStep={editorHandlers.onAddStep}
+              onRemoveStep={(n) => {
+                const i = draft.steps.findIndex((s) => s.number === n);
+                if (i >= 0) editorHandlers.onRemoveStep(i);
+              }}
               onConnect={onConnect}
               onDisconnect={onDisconnect}
             />
-          ) : null}
-          <SopEditor
+          ) : (
+            <div />
+          )}
+          <StepInspector
             draft={draft}
-            saving={saving}
-            saveError={saveError}
             selectedStep={selectedStep}
-            selectedTrigger={selectedTrigger}
-            triggerRegistry={triggerRegistry}
             runCallsByStep={runCallsByStep}
-            onSelectStep={setSelectedStep}
-            onField={editorHandlers.onField}
-            onTrigger={editorHandlers.onTrigger}
-            onAddTrigger={editorHandlers.onAddTrigger}
-            onRemoveTrigger={editorHandlers.onRemoveTrigger}
             onStep={editorHandlers.onStep}
-            onAddStep={editorHandlers.onAddStep}
             onRemoveStep={editorHandlers.onRemoveStep}
             onMoveStep={editorHandlers.onMoveStep}
-            onSave={onSaveDraft}
-            onCancel={() => setDraft(null)}
           />
         </div>
       ) : loading ? (

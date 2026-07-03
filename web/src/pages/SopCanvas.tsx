@@ -90,8 +90,33 @@ interface Props {
   onSelectStep: (n: number) => void;
   onSelectTrigger: (index: number) => void;
   onAddStep: () => void;
+  onRemoveStep?: (n: number) => void;
   onConnect: (from: number, to: number, kind: FlowRole, portIndex?: number) => void;
   onDisconnect: (from: number, to: number, kind: FlowRole, portIndex?: number) => void;
+}
+
+type ContextMenu = { x: number; y: number; step: number | null };
+
+function MenuItem({
+  label,
+  tone,
+  onClick,
+}: {
+  label: string;
+  tone?: 'danger';
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`block w-full px-3 py-1.5 text-left hover:bg-pc-elevated ${
+        tone === 'danger' ? 'text-rose-500' : 'text-pc-text'
+      }`}
+    >
+      {label}
+    </button>
+  );
 }
 
 export default function SopCanvas({
@@ -103,6 +128,7 @@ export default function SopCanvas({
   onSelectStep,
   onSelectTrigger,
   onAddStep,
+  onRemoveStep,
   onConnect,
   onDisconnect,
 }: Props) {
@@ -113,6 +139,7 @@ export default function SopCanvas({
   const [linkPort, setLinkPort] = useState<number | undefined>(undefined);
   const [cursor, setCursor] = useState<XY | null>(null);
   const [hoverWire, setHoverWire] = useState<number | null>(null);
+  const [menu, setMenu] = useState<ContextMenu | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
 
   // Reseed from the backend layout when the projection changes, preserving any
@@ -163,6 +190,17 @@ export default function SopCanvas({
   );
 
   const endDrag = useCallback(() => setDrag(null), []);
+
+  const openMenu = useCallback(
+    (e: React.MouseEvent, step: number | null) => {
+      if (readOnly) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const p = toLocal(e.clientX, e.clientY);
+      setMenu({ x: p.x, y: p.y, step });
+    },
+    [readOnly, toLocal],
+  );
 
   const startLink = useCallback((step: number, kind: FlowRole, port?: number) => {
     setLinkKind(kind);
@@ -217,6 +255,64 @@ export default function SopCanvas({
           </button>
         </div>
       ) : null}
+      {menu ? (
+        <div
+          className="absolute z-20 w-44 rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface py-1 text-sm shadow-lg"
+          style={{ left: menu.x, top: menu.y }}
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          {menu.step !== null ? (
+            <>
+              <MenuItem
+                label={t('sops.menu_edit_step')}
+                onClick={() => {
+                  onSelectStep(menu.step as number);
+                  setMenu(null);
+                }}
+              />
+              <MenuItem
+                label={t('sops.menu_wire_sequence')}
+                onClick={() => {
+                  startLink(menu.step as number, 'sequence');
+                  setMenu(null);
+                }}
+              />
+              <MenuItem
+                label={t('sops.menu_wire_dependency')}
+                onClick={() => {
+                  startLink(menu.step as number, 'dependency');
+                  setMenu(null);
+                }}
+              />
+              <MenuItem
+                label={t('sops.menu_wire_failure')}
+                onClick={() => {
+                  startLink(menu.step as number, 'failure');
+                  setMenu(null);
+                }}
+              />
+              {onRemoveStep ? (
+                <MenuItem
+                  label={t('sops.menu_remove_step')}
+                  tone="danger"
+                  onClick={() => {
+                    onRemoveStep(menu.step as number);
+                    setMenu(null);
+                  }}
+                />
+              ) : null}
+            </>
+          ) : (
+            <MenuItem
+              label={t('sops.add_step')}
+              onClick={() => {
+                onAddStep();
+                setMenu(null);
+              }}
+            />
+          )}
+        </div>
+      ) : null}
       <svg
         ref={svgRef}
         width={extent.w}
@@ -224,6 +320,8 @@ export default function SopCanvas({
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
         onPointerLeave={endDrag}
+        onPointerDown={() => setMenu(null)}
+        onContextMenu={(e) => openMenu(e, null)}
         className="block touch-none select-none"
       >
         <defs>
@@ -419,7 +517,9 @@ export default function SopCanvas({
       <g
         key={node.step}
         transform={`translate(${p.x}, ${p.y})`}
+        onContextMenu={(e) => openMenu(e, node.step)}
         onPointerDown={(e) => {
+          if (e.button !== 0) return;
           if (linkFrom !== null) {
             completeLink(node.step);
             return;
