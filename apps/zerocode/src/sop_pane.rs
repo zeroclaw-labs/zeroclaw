@@ -10,7 +10,8 @@ use ratatui::{
 
 use crate::client::{
     FlowRole, GraphLayout, GraphNode, GraphPin, GraphWire, NodeKind, NodeRunState, PinClass,
-    RpcClient, SopDraft, SopGraphView, SopStep, SopStepKind, StepFailure, SwitchRule,
+    PlannedToolCall, RpcClient, SopDraft, SopGraphView, SopStep, SopStepKind, StepFailure,
+    SwitchRule,
 };
 
 pub(crate) struct SopPane {
@@ -81,6 +82,7 @@ enum StepField {
     OnFailure,
     FailureArg,
     Switch,
+    Calls,
 }
 
 impl StepField {
@@ -95,7 +97,8 @@ impl StepField {
             Self::When => Self::OnFailure,
             Self::OnFailure => Self::FailureArg,
             Self::FailureArg => Self::Switch,
-            Self::Switch => Self::Title,
+            Self::Switch => Self::Calls,
+            Self::Calls => Self::Title,
         }
     }
 }
@@ -256,6 +259,48 @@ fn pop_switch_char(rules: &mut Vec<SwitchRule>) {
     }
 }
 
+/// Text codec for the calls field: the buffer holds raw JSON while the
+/// operator types; a parseable buffer materializes into `calls` and an
+/// unparseable one stays in the buffer so nothing is lost mid-edit.
+fn calls_text(step: &SopStep) -> String {
+    match &step.calls_buf {
+        Some(buf) => buf.clone(),
+        None if step.calls.is_empty() => String::new(),
+        None => serde_json::to_string(&step.calls).unwrap_or_default(),
+    }
+}
+
+fn sync_calls_from_buf(step: &mut SopStep) {
+    let Some(buf) = &step.calls_buf else {
+        return;
+    };
+    if buf.trim().is_empty() {
+        step.calls.clear();
+        return;
+    }
+    if let Ok(parsed) = serde_json::from_str::<Vec<PlannedToolCall>>(buf) {
+        step.calls = parsed;
+    }
+}
+
+fn push_calls_char(step: &mut SopStep, c: char) {
+    let mut buf = step.calls_buf.take().unwrap_or_else(|| calls_text(step));
+    buf.push(c);
+    step.calls_buf = Some(buf);
+    sync_calls_from_buf(step);
+}
+
+fn pop_calls_char(step: &mut SopStep) {
+    let mut buf = step.calls_buf.take().unwrap_or_else(|| calls_text(step));
+    buf.pop();
+    step.calls_buf = if buf.is_empty() { None } else { Some(buf) };
+    if step.calls_buf.is_none() {
+        step.calls.clear();
+    } else {
+        sync_calls_from_buf(step);
+    }
+}
+
 fn push_num_csv_char(list: &mut Vec<u32>, c: char) {
     if c == ',' {
         list.push(0);
@@ -337,9 +382,19 @@ fn failure_label(f: &StepFailure) -> String {
 }
 
 #[derive(Default, serde::Deserialize)]
+struct OverlayCallView {
+    index: u64,
+    tool: String,
+    success: bool,
+    duration_ms: u64,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
 struct OverlayNodeView {
     step: u64,
     state: NodeRunState,
+    tool_calls: Vec<OverlayCallView>,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -360,6 +415,14 @@ impl RunOverlayView {
             .iter()
             .find(|n| n.step == step)
             .map(|n| n.state)
+    }
+
+    fn calls_of(&self, step: u64) -> &[OverlayCallView] {
+        self.node_states
+            .iter()
+            .find(|n| n.step == step)
+            .map(|n| n.tool_calls.as_slice())
+            .unwrap_or(&[])
     }
 }
 
@@ -1015,6 +1078,7 @@ impl SopPane {
             }
             StepField::FailureArg => push_failure_arg_char(&mut step.on_failure, c),
             StepField::Switch => push_switch_char(&mut step.routing.switch, c),
+            StepField::Calls => push_calls_char(step, c),
         }
     }
 
@@ -1062,6 +1126,7 @@ impl SopPane {
             StepField::OnFailure => {}
             StepField::FailureArg => pop_failure_arg_char(&mut step.on_failure),
             StepField::Switch => pop_switch_char(&mut step.routing.switch),
+            StepField::Calls => pop_calls_char(step),
         }
     }
 
@@ -1409,7 +1474,7 @@ impl SopPane {
                 } else {
                     format!("{}. {} -> {}", node.step, node.title, outs.join(", "))
                 };
-                match self
+                let mut rendered = match self
                     .overlay
                     .as_ref()
                     .and_then(|o| o.state_of(node.step as u64))
@@ -1417,7 +1482,19 @@ impl SopPane {
                     Some(state) => format!("{} {line}", state_marker(state, active)),
                     None if self.overlay.is_some() => format!("  {line}"),
                     None => line,
+                };
+                if let Some(overlay) = &self.overlay {
+                    for call in overlay.calls_of(node.step as u64) {
+                        rendered.push_str(&format!(
+                            "\n     {} {} [{}] {}ms",
+                            call.index,
+                            call.tool,
+                            if call.success { "ok" } else { "failed" },
+                            call.duration_ms
+                        ));
+                    }
                 }
+                rendered
             })
             .collect();
         if !self.graph.diagnostics.is_empty() {
@@ -1547,6 +1624,23 @@ impl SopPane {
             if on_step && ed.field == StepField::Switch {
                 lines.push(
                     "      (name>when>goto; ... — makes this an if-this-then-that node)".into(),
+                );
+            }
+            let (m, cur) = marker(StepField::Calls);
+            let calls_ok = step.calls_buf.is_none()
+                || step
+                    .calls_buf
+                    .as_deref()
+                    .is_some_and(|b| serde_json::from_str::<Vec<PlannedToolCall>>(b).is_ok());
+            lines.push(format!(
+                "{m} calls{}: {}{cur}",
+                if calls_ok { "" } else { " (invalid JSON)" },
+                calls_text(step)
+            ));
+            if on_step && ed.field == StepField::Calls {
+                lines.push(
+                    "      (JSON array of {tool, args, pinned?}; args strings may bind {{steps.N.path}} / {{calls.K.path}})"
+                        .into(),
                 );
             }
             lines.push(String::new());
@@ -1812,6 +1906,10 @@ fn render_editor_card(
         Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
     ]);
     let detail = match step {
+        Some(s) if !s.calls.is_empty() => Line::from(Span::styled(
+            format!("⚙ {} planned calls", s.calls.len()),
+            Style::default().fg(Color::Cyan),
+        )),
         Some(s) if !s.routing.switch.is_empty() => Line::from(Span::styled(
             format!("⋔ {} ports", s.routing.switch.len()),
             Style::default().fg(Color::Magenta),

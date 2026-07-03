@@ -4,6 +4,7 @@ import { Link } from 'react-router-dom';
 import { Badge, Card, PageHeader } from '@/components/ui';
 import SopCanvas from './SopCanvas';
 import ToolPicker from '@/components/ToolPicker';
+import { PlannedCallsEditor, CapturedCallList } from '@/components/SopCalls';
 import { t } from '@/lib/i18n';
 import {
   listSops,
@@ -17,6 +18,7 @@ import {
   graphDraft,
   triggerSources,
   overlayStateByStep,
+  overlayCallsByStep,
   runStateTone,
   type RunStateTone,
   type WireRole,
@@ -29,6 +31,7 @@ import {
   type SopStep,
   type SopTrigger,
   type StepFailure,
+  type StepToolCall,
   type TriggerSourceRegistry,
   type BoundTriggerSource,
   type TriggerField,
@@ -105,10 +108,12 @@ function SopFieldList({
   overlay?: RunOverlay | null;
 }) {
   const stateByStep = overlayStateByStep(overlay);
+  const callsByStep = overlayCallsByStep(overlay);
   return (
     <div className="divide-y divide-pc-border rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface text-sm">
       {graph.nodes.map((node) => {
         const state = stateByStep.get(node.step);
+        const calls = callsByStep.get(node.step);
         return (
           <div key={node.step} className="flex items-start gap-3 px-3 py-2">
             <span className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded bg-pc-accent-light text-xs font-semibold text-pc-accent">
@@ -132,6 +137,14 @@ function SopFieldList({
                   ? '—'
                   : node.outputs.map((p) => `${p.name}:${pinTypeLabel(p)}`).join(', ')}
               </div>
+              {calls ? (
+                <div className="mt-2">
+                  <div className="mb-1 text-xs font-medium text-pc-text">
+                    {t('sops.captured_calls')}
+                  </div>
+                  <CapturedCallList calls={calls} />
+                </div>
+              ) : null}
             </div>
           </div>
         );
@@ -247,6 +260,7 @@ function StepEditor({
   index,
   count,
   selected,
+  capturedCalls,
   onSelect,
   onChange,
   onRemove,
@@ -256,6 +270,7 @@ function StepEditor({
   index: number;
   count: number;
   selected: boolean;
+  capturedCalls?: StepToolCall[];
   onSelect: () => void;
   onChange: (patch: Partial<SopStep>) => void;
   onRemove: () => void;
@@ -476,6 +491,13 @@ function StepEditor({
             );
           })
         )}
+      </div>
+      <div className="mt-2">
+        <PlannedCallsEditor
+          calls={step.calls ?? []}
+          captured={capturedCalls}
+          onChange={(next) => onChange({ calls: next })}
+        />
       </div>
     </div>
   );
@@ -774,6 +796,7 @@ function SopEditor({
   selectedStep,
   selectedTrigger,
   triggerRegistry,
+  runCallsByStep,
   onSelectStep,
   onField,
   onTrigger,
@@ -792,6 +815,7 @@ function SopEditor({
   selectedStep: number | null;
   selectedTrigger: number | null;
   triggerRegistry: TriggerSourceRegistry | null;
+  runCallsByStep: Map<number, StepToolCall[]>;
   onSelectStep: (n: number) => void;
   onField: (patch: Partial<Sop>) => void;
   onTrigger: (i: number, next: SopTrigger) => void;
@@ -908,6 +932,7 @@ function SopEditor({
             index={i}
             count={draft.steps.length}
             selected={selectedStep === s.number}
+            capturedCalls={runCallsByStep.get(s.number)}
             onSelect={() => onSelectStep(s.number)}
             onChange={(patch) => onStep(i, patch)}
             onRemove={() => onRemoveStep(i)}
@@ -1152,6 +1177,7 @@ export default function Sops() {
   }, [selected, runId]);
 
   const runStateByStep = useMemo(() => overlayStateByStep(overlay), [overlay]);
+  const runCallsByStep = useMemo(() => overlayCallsByStep(overlay), [overlay]);
 
   const mutateDraft = useCallback((updater: (d: Sop) => Sop) => {
     setSaveError(null);
@@ -1237,6 +1263,7 @@ export default function Sops() {
             selectedStep={selectedStep}
             selectedTrigger={selectedTrigger}
             triggerRegistry={triggerRegistry}
+            runCallsByStep={runCallsByStep}
             onSelectStep={setSelectedStep}
             onField={editorHandlers.onField}
             onTrigger={editorHandlers.onTrigger}

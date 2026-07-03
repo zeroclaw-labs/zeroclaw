@@ -457,9 +457,11 @@ export default function SopCanvas({
           </text>
         ) : null}
         <text x={12} y={46} fontSize="10" fill="var(--pc-text-muted)">
-          {step?.suggested_tools && step.suggested_tools.length > 0
-            ? step.suggested_tools.slice(0, 3).join(', ')
-            : t('sops.no_tools')}
+          {step?.calls && step.calls.length > 0
+            ? `⚙ ${step.calls.length} ${t('sops.calls_chip')}`
+            : step?.suggested_tools && step.suggested_tools.length > 0
+              ? step.suggested_tools.slice(0, 3).join(', ')
+              : t('sops.no_tools')}
         </text>
         {state ? (
           <text x={12} y={64} fontSize="10" fill={nodeStateStroke(state)}>

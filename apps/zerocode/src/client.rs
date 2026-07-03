@@ -2187,6 +2187,17 @@ impl StepFailure {
     }
 }
 
+/// Mirror of runtime `PlannedToolCall`; drift is caught by the
+/// `draft_wire_shape` tests on both sides.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlannedToolCall {
+    pub tool: String,
+    #[serde(default)]
+    pub args: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SopStep {
     pub number: u32,
@@ -2202,6 +2213,11 @@ pub struct SopStep {
     pub routing: StepRouting,
     #[serde(default, skip_serializing_if = "StepFailure::is_fail")]
     pub on_failure: StepFailure,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<PlannedToolCall>,
+    /// Editor-local raw JSON text for `calls`; never on the wire.
+    #[serde(skip)]
+    pub calls_buf: Option<String>,
 }
 
 impl Default for SopStep {
@@ -2215,6 +2231,8 @@ impl Default for SopStep {
             kind: SopStepKind::Execute,
             routing: StepRouting::default(),
             on_failure: StepFailure::Fail,
+            calls: Vec::new(),
+            calls_buf: None,
         }
     }
 }
@@ -2760,6 +2778,42 @@ mod sop_method_tests {
         let reparsed: SopGraphView =
             serde_json::from_value(serde_json::to_value(&view).unwrap()).unwrap();
         assert_eq!(view, reparsed);
+    }
+
+    /// Pins the planned-call wire shape against runtime `PlannedToolCall`
+    /// (`sop::types`). The editor-local `calls_buf` must never leak onto
+    /// the wire.
+    #[test]
+    fn step_calls_serialize_to_canonical_wire() {
+        let step = SopStep {
+            number: 2,
+            title: "compute".into(),
+            body: "b".into(),
+            calls: vec![PlannedToolCall {
+                tool: "calculator".into(),
+                args: json!({"function": "add", "values": "{{steps.1.value}}"}),
+                pinned: Some(json!({"value": 3})),
+            }],
+            calls_buf: Some("editor scratch".into()),
+            ..SopStep::default()
+        };
+        let value = serde_json::to_value(&step).unwrap();
+        assert_eq!(
+            value["calls"],
+            json!([{
+                "tool": "calculator",
+                "args": {"function": "add", "values": "{{steps.1.value}}"},
+                "pinned": {"value": 3}
+            }])
+        );
+        assert!(
+            value.get("calls_buf").is_none(),
+            "calls_buf must not hit the wire"
+        );
+
+        let reparsed: SopStep = serde_json::from_value(value).unwrap();
+        assert_eq!(reparsed.calls, step.calls);
+        assert!(reparsed.calls_buf.is_none());
     }
 
     #[test]

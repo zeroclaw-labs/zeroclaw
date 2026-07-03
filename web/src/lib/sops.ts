@@ -14,6 +14,8 @@ export type SwitchRule = Schemas['SwitchRule'];
 export type StepFailure = Schemas['StepFailure'];
 export type StepSchema = Schemas['StepSchema'];
 export type StepToolScope = Schemas['StepToolScope'];
+export type PlannedToolCall = Schemas['PlannedToolCall'];
+export type StepToolCall = Schemas['StepToolCall'];
 
 export type SopGraph = Schemas['SopGraph'];
 export type GraphNode = Schemas['GraphNode'];
@@ -132,6 +134,18 @@ export function overlayStateByStep(
 ): Map<number, NodeRunState> {
   const map = new Map<number, NodeRunState>();
   for (const n of overlay?.nodes ?? []) map.set(n.step, n.state);
+  return map;
+}
+
+/// Index a run overlay's captured tool calls by step number. Feeds the
+/// call inspector and lets planned calls pin a sample output from a run.
+export function overlayCallsByStep(
+  overlay: RunOverlay | null | undefined,
+): Map<number, StepToolCall[]> {
+  const map = new Map<number, StepToolCall[]>();
+  for (const n of overlay?.nodes ?? []) {
+    if (n.tool_calls && n.tool_calls.length > 0) map.set(n.step, n.tool_calls);
+  }
   return map;
 }
 
