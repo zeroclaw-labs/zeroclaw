@@ -6505,9 +6505,18 @@ mod tests {
 
         assert_eq!(lines[0].spans[0].content.as_ref(), " ");
         assert_eq!(lines[0].spans[1].content.as_ref(), " ");
-        assert!(lines[0].spans[0].style.bg.is_some());
-        assert!(lines[0].spans[1].style.bg.is_some());
-        assert_ne!(lines[0].spans[0].style.bg, lines[0].spans[1].style.bg);
+        assert_eq!(
+            lines[0].spans[0].style.bg,
+            rail_span(TranscriptRail::Agent, Modifier::empty(), 1.0)
+                .style
+                .bg
+        );
+        assert_eq!(
+            lines[0].spans[1].style.bg,
+            rail_glow_span(TranscriptRail::Agent, Modifier::empty())
+                .style
+                .bg
+        );
         assert!(!rendered_entry(&entry, 80).contains('▌'));
     }
 
