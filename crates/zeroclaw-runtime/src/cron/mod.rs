@@ -804,6 +804,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .unwrap();
 
@@ -815,6 +816,7 @@ mod tests {
                 command: None,
                 name: None,
                 allowed_tools: vec!["shell".into()],
+                uses_memory: None,
             },
             &config,
         )

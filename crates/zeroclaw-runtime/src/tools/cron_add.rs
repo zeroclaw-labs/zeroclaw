@@ -286,6 +286,11 @@ impl Tool for CronAddTool {
                     "type": "boolean",
                     "description": "If true, the job is automatically deleted after its first successful run. Defaults to true for one-shot 'at' and 'after' schedules."
                 },
+                "uses_memory": {
+                    "type": "boolean",
+                    "description": "If true (default), recall and inject memory context before agent job runs. Set to false for stateless digest/report jobs that should not accumulate or consume memory entries.",
+                    "default": true
+                },
                 "approved": {
                     "type": "boolean",
                     "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
@@ -481,6 +486,10 @@ impl Tool for CronAddTool {
                     },
                     None => None,
                 };
+                let uses_memory = args
+                    .get("uses_memory")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true);
 
                 if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
                     return Ok(blocked);
@@ -502,6 +511,7 @@ impl Tool for CronAddTool {
                     delivery,
                     delete_after_run,
                     allowed_tools,
+                    uses_memory,
                 )
             }
         };
