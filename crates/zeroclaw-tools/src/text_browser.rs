@@ -53,6 +53,17 @@ impl TextBrowserTool {
     }
 
     fn validate_url(&self, url: &str) -> anyhow::Result<String> {
+        self.validate_url_with_dns_check(url, validate_resolved_host_is_public)
+    }
+
+    /// Internal entry that accepts a pluggable DNS validator. Mirrors
+    /// `web_fetch::validate_target_url_with_dns_check` so unit tests can
+    /// drive the resolved-IP SSRF gate without depending on real DNS.
+    fn validate_url_with_dns_check(
+        &self,
+        url: &str,
+        validate_dns: impl FnOnce(&str) -> anyhow::Result<()>,
+    ) -> anyhow::Result<String> {
         let url = url.trim();
 
         if url.is_empty() {
@@ -103,6 +114,19 @@ impl TextBrowserTool {
 
         if private_host && !private_host_allowed {
             anyhow::bail!("Blocked local/private host: {host}");
+        }
+
+        // Resolved-IP SSRF gate. The literal-host check above only inspects
+        // the string. An attacker who controls a public-looking hostname whose
+        // DNS answer points at `10.0.0.5`, `127.0.0.1`, or `169.254.169.254`
+        // (e.g. a corporate internal name, or a DNS-rebinding setup) would
+        // pass the literal gate and reach `lynx`/`links`/`w3m`. Resolving the
+        // host and rejecting non-public / cloud-metadata addresses closes
+        // that path. Skipped when the host is on the operator's
+        // `allowed_private_hosts` (explicit per-host or "*" wildcard) — the
+        // operator has already accepted the risk.
+        if !private_host_allowed {
+            validate_dns(&host)?;
         }
 
         Ok(url.to_string())
@@ -350,6 +374,48 @@ impl Tool for TextBrowserTool {
     }
 }
 
+// ── Helper functions ────────────────────────────────────────────────────────
+
+/// Resolve `host` and reject any answer that points at a non-global /
+/// cloud-metadata address. Mirrors `web_fetch::validate_resolved_host_is_public`.
+///
+/// In `#[cfg(test)]` builds this is a no-op so unit tests don't depend on real
+/// DNS. The rejection logic itself is covered exhaustively at
+/// `helpers/domain_guard.rs::validate_resolved_ips_are_public` (see the unit
+/// tests there for IP-cloud-metadata / RFC1918 / loopback / link-local
+/// coverage). The integration with `validate_url` is exercised by
+/// `validate_url_with_dns_check` tests in this file.
+#[cfg(not(test))]
+fn validate_resolved_host_is_public(host: &str) -> anyhow::Result<()> {
+    use std::net::ToSocketAddrs;
+
+    let ips = (host, 0)
+        .to_socket_addrs()
+        .map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "host": host,
+                        "error": format!("{}", e),
+                    })),
+                "text_browser: failed to resolve host"
+            );
+            anyhow::Error::msg(format!("Failed to resolve host '{host}': {e}"))
+        })?
+        .map(|addr| addr.ip())
+        .collect::<Vec<_>>();
+
+    domain_guard::validate_resolved_ips_are_public(host, &ips)
+}
+
+#[cfg(test)]
+fn validate_resolved_host_is_public(_host: &str) -> anyhow::Result<()> {
+    // DNS checks are covered by validate_resolved_ips_are_public unit tests.
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +493,108 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("whitespace"));
+    }
+
+    #[test]
+    fn validate_url_with_dns_check_rejects_hostname_resolving_to_private_ip() {
+        // Regression for Audacity88's 2026-07-03 review of #8635: the
+        // literal-host gate only inspects the host *string*. An attacker who
+        // controls a public-looking hostname whose DNS answer points at
+        // `10.0.0.5` would pass the literal gate and reach the text browser.
+        // Use the test-seam `validate_url_with_dns_check` to feed a fake DNS
+        // answer and verify the resolved-IP gate fires.
+        let tool = test_tool();
+        let err = tool
+            .validate_url_with_dns_check("http://internal.corp/", |host| {
+                domain_guard::validate_resolved_ips_are_public(
+                    host,
+                    &[std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5))],
+                )
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-global") || err.contains("10.0.0.5"),
+            "expected resolved-IP gate to reject 10.0.0.5, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_url_with_dns_check_rejects_hostname_resolving_to_metadata_ip() {
+        // DNS-rebinding / attacker-controlled NS pointing at the EC2 metadata
+        // service: must be rejected even when the host string is not
+        // literally private.
+        let tool = test_tool();
+        let err = tool
+            .validate_url_with_dns_check("http://attacker.example.com/", |host| {
+                domain_guard::validate_resolved_ips_are_public(
+                    host,
+                    &[std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                        169, 254, 169, 254,
+                    ))],
+                )
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("metadata") || err.contains("169.254.169.254"),
+            "expected metadata-IP gate to fire, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_url_with_dns_check_skips_dns_when_private_host_allowlisted() {
+        // When the operator lists a literal-private host in
+        // `allowed_private_hosts`, the literal gate accepts and the resolved-IP
+        // gate is skipped — they have already accepted the risk for that host.
+        // Use `10.0.0.5` (a literal RFC1918 IP) so the literal-host gate
+        // classifies it as private in the first place.
+        let security = Arc::new(SecurityPolicy::default());
+        let tool =
+            TextBrowserTool::new_with_private_hosts(security, None, 30, vec!["10.0.0.5".into()])
+                .unwrap();
+        // DNS validator should never be called: even if it errors, the call
+        // succeeds because the allowlist lifts the gate.
+        let got = tool
+            .validate_url_with_dns_check("http://10.0.0.5/", |_host| {
+                Err(anyhow::Error::msg("DNS validator should not be invoked"))
+            })
+            .unwrap();
+        assert_eq!(got, "http://10.0.0.5/");
+    }
+
+    #[test]
+    fn validate_url_with_dns_check_skips_dns_when_wildcard_allowlisted() {
+        // Operator's `allowed_private_hosts = ["*"]` is the blanket opt-in.
+        // The resolved-IP gate is skipped for a literal-private host; the
+        // literal-host gate also passes via the wildcard match.
+        let security = Arc::new(SecurityPolicy::default());
+        let tool =
+            TextBrowserTool::new_with_private_hosts(security, None, 30, vec!["*".into()]).unwrap();
+        let got = tool
+            .validate_url_with_dns_check("http://10.0.0.5/", |_host| {
+                Err(anyhow::Error::msg("DNS validator should not be invoked"))
+            })
+            .unwrap();
+        assert_eq!(got, "http://10.0.0.5/");
+    }
+
+    #[test]
+    fn validate_url_with_dns_check_accepts_hostname_resolving_to_public_ip() {
+        // Sanity: a public-looking name that resolves to a public IP passes
+        // both gates.
+        let tool = test_tool();
+        let got = tool
+            .validate_url_with_dns_check("http://example.com/page", |host| {
+                domain_guard::validate_resolved_ips_are_public(
+                    host,
+                    &[std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                        93, 184, 216, 34,
+                    ))],
+                )
+            })
+            .unwrap();
+        assert_eq!(got, "http://example.com/page");
     }
 
     #[test]
