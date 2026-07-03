@@ -55,11 +55,30 @@ fn build_provider(cfg: &GitConfig) -> anyhow::Result<Box<dyn GitProvider>> {
                 );
             }
         }
-        "gitea" | "forgejo" => {
+        provider @ ("gitea" | "forgejo") => {
             #[cfg(feature = "provider-gitea")]
             {
+                // Fail closed before any HTTP client exists: every request
+                // attaches `access_token` as a bearer credential, so guessing
+                // a default host would send the token to an endpoint the
+                // operator never named (e.g. a Forgejo PAT to gitea.com).
+                let api_base_url = cfg
+                    .api_base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "git channel provider `{provider}` requires \
+                             channels.git.<alias>.api_base_url - the instance's API base \
+                             URL including /api/v1, e.g. `https://git.example.org/api/v1` \
+                             (or `https://gitea.com/api/v1` for the public Gitea service). \
+                             No default host is assumed because API requests carry the \
+                             access token"
+                        )
+                    })?;
                 Ok(Box::new(super::providers::gitea::GiteaProvider::new(
-                    cfg.api_base_url.clone(),
+                    api_base_url.to_string(),
                     cfg.access_token.clone(),
                     cfg.proxy_url.clone(),
                 )))
@@ -67,7 +86,7 @@ fn build_provider(cfg: &GitConfig) -> anyhow::Result<Box<dyn GitProvider>> {
             #[cfg(not(feature = "provider-gitea"))]
             {
                 anyhow::bail!(
-                    "git channel provider `gitea`/`forgejo` requires the `provider-gitea` feature"
+                    "git channel provider `{provider}` requires the `provider-gitea` feature"
                 );
             }
         }
@@ -624,6 +643,40 @@ mod tests {
             err.to_string()
                 .contains("unknown git channel provider `bitbucket`")
         );
+    }
+
+    // Regression (fail closed): a gitea/forgejo config without api_base_url
+    // must error at construction - synchronously, before any provider or
+    // HTTP client exists, so no request (carrying the access token) can be
+    // sent anywhere. The old code silently fell back to
+    // https://gitea.com/api/v1 and attached the configured token to every
+    // request against it.
+    #[cfg(feature = "provider-gitea")]
+    #[test]
+    fn gitea_forgejo_without_api_base_url_fails_closed() {
+        for provider in ["gitea", "forgejo"] {
+            for api_base_url in [None, Some("   ".to_string())] {
+                let cfg = GitConfig {
+                    provider: provider.to_string(),
+                    access_token: "s3cr3t-tok".to_string(),
+                    api_base_url: api_base_url.clone(),
+                    ..GitConfig::default()
+                };
+                let err = match GitChannel::new(cfg, "main", Arc::new(Vec::new)) {
+                    Ok(_) => {
+                        panic!("`{provider}` with api_base_url {api_base_url:?} must not construct")
+                    }
+                    Err(e) => e,
+                };
+                let msg = err.to_string();
+                assert!(msg.contains("api_base_url"), "{msg}");
+                assert!(msg.contains(provider), "{msg}");
+                assert!(
+                    !msg.contains("s3cr3t-tok"),
+                    "error must not echo the token: {msg}"
+                );
+            }
+        }
     }
 
     #[test]
