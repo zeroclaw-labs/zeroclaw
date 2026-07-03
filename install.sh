@@ -1160,9 +1160,12 @@ See all available features:
     for app in $WANT_APPS; do validate_app "$app"; done
   else
     WANT_APPS="$DEFAULT_APPS"
-    if [ "$WITHOUT_TUI" = true ]; then
-      WANT_APPS=$(printf '%s' "$WANT_APPS" | tr ' ' '\n' | grep -vx "$TUI_BIN_NAME" | paste -sd' ' -)
-    fi
+  fi
+
+  # --without-tui drops the TUI app from the resolved default or --full
+  # set (an explicit --apps list is honored as-is).
+  if [ "$WITHOUT_TUI" = true ] && [ -z "$USER_APPS" ]; then
+    WANT_APPS=$(printf '%s' "$WANT_APPS" | tr ' ' '\n' | grep -vx "$TUI_BIN_NAME" | paste -sd' ' -)
   fi
 
   # agent-runtime is a default feature; if defaults are stripped and it
