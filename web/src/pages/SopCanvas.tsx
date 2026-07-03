@@ -81,6 +81,15 @@ function switchPortY(nodeY: number, index: number): number {
   return nodeY + SWITCH_PORT_TOP + index * SWITCH_PORT_GAP;
 }
 
+// Vertical offsets of the default output handles from the node's vertical
+// center. Wires must leave from the handle that spawned them, not from a
+// single midpoint, or the rope visually detaches from its port.
+const HANDLE_OFFSET: Partial<Record<FlowRole, number>> = {
+  sequence: 0,
+  dependency: 18,
+  failure: -18,
+};
+
 interface Props {
   draft: Sop;
   graph: SopGraph;
@@ -346,7 +355,13 @@ export default function SopCanvas({
             const kind = (w.flow_role ?? 'sequence') as FlowRole;
             const active = runStateByStep.get(w.to_step) === 'active';
             const portIndex = switchPortIndex(w);
-            const srcY = portIndex !== undefined ? switchPortY(a.y, portIndex) : undefined;
+            const handleOffset = HANDLE_OFFSET[kind];
+            const srcY =
+              portIndex !== undefined
+                ? switchPortY(a.y, portIndex)
+                : handleOffset !== undefined
+                  ? a.y + NODE_H / 2 + handleOffset
+                  : undefined;
             const d = edgePath(a, b, srcY);
             const hovered = hoverWire === i;
             const wireLabel = kind === 'trigger' ? nodeByStep.get(w.from_step)?.subtitle : undefined;
@@ -450,7 +465,15 @@ export default function SopCanvas({
           })}
         {linkFrom !== null && cursor && pos.get(linkFrom) ? (
           <path
-            d={edgePath(pos.get(linkFrom) as XY, { x: cursor.x - NODE_W, y: cursor.y - NODE_H / 2 })}
+            d={edgePath(
+              pos.get(linkFrom) as XY,
+              { x: cursor.x - NODE_W, y: cursor.y - NODE_H / 2 },
+              linkPort !== undefined
+                ? switchPortY((pos.get(linkFrom) as XY).y, linkPort)
+                : HANDLE_OFFSET[linkKind] !== undefined
+                  ? (pos.get(linkFrom) as XY).y + NODE_H / 2 + (HANDLE_OFFSET[linkKind] as number)
+                  : undefined,
+            )}
             fill="none"
             stroke={wireStroke(linkKind)}
             strokeWidth={1.75}
