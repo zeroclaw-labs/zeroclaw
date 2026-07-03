@@ -12,7 +12,6 @@ use ratatui::{
 };
 
 use crate::client::{ConnectionState, RpcClient};
-use crate::transcript;
 use crate::code;
 use crate::config;
 use crate::config_manager;
@@ -23,6 +22,7 @@ use crate::logs;
 use crate::mouse;
 use crate::quickstart_pane;
 use crate::theme;
+use crate::transcript;
 use crate::widgets::{CtxBar, HelpContext, HelpEntry, HelpNode};
 
 /// Pending Quickstart Code transition.
@@ -232,7 +232,8 @@ pub async fn run(
                 code_pane.set_resume_session_id($resume_code.0);
                 code_pane.set_resume_agent_alias($resume_code.1);
                 code_pane.init().await?;
-                let mut chat_pane = transcript::Transcript::new(rpc.clone(), transcript::PaneKind::Chat);
+                let mut chat_pane =
+                    transcript::Transcript::new(rpc.clone(), transcript::PaneKind::Chat);
                 chat_pane.init().await?;
                 let pending_start_code = {
                     let mut guard = reconnect_state.lock().expect("reconnect state poisoned");
@@ -505,8 +506,9 @@ pub async fn run(
                                 config_app = panes.1;
                                 doctor_pane = panes.2;
                                 code_pane = panes.3;
-                                logs_pane = panes.4;
-                                quickstart = panes.5;
+                                chat_pane = panes.4;
+                                logs_pane = panes.5;
+                                quickstart = panes.6;
                                 reconnect_last_attempt = None;
                                 ephemeral_respawn_done = false;
                                 needs_intervention = false;

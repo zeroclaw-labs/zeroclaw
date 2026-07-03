@@ -424,8 +424,7 @@ impl Transcript {
             self.start_session(agent_alias, None).await;
             return;
         }
-        if self.pane_kind == PaneKind::Code
-            && self.rpc.transport() == crate::client::Transport::Wss
+        if self.pane_kind == PaneKind::Code && self.rpc.transport() == crate::client::Transport::Wss
         {
             // Remote ACP: start from the daemon root, not a local path.
             let start_dir = std::path::PathBuf::from("/");

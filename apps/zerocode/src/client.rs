@@ -3244,7 +3244,8 @@ mod session_method_tests {
         let (rpc, mut write_rx) = make_rpc();
         let client = RpcClient::with_rpc(rpc.clone());
 
-        let task = tokio::spawn(async move { client.session_new("my-agent", Some("/tmp/work")).await });
+        let task =
+            tokio::spawn(async move { client.session_new("my-agent", Some("/tmp/work")).await });
 
         let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
             .await

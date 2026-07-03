@@ -566,6 +566,15 @@ enum AutocompleteTarget {
     ModelProviderArg,
 }
 
+fn cleanup_clipboard_temp(path: &PathBuf) {
+    if path.exists() {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) => eprintln!("clipboard temp cleanup failed: {error}"),
+        }
+    }
+}
+
 impl InputBarState {
     pub fn new() -> Self {
         Self {
@@ -749,9 +758,11 @@ impl InputBarState {
         if draft.is_empty() {
             return None;
         }
+        let attachments = std::mem::take(&mut self.pending_attachments);
+        self.release_clipboard_temp_ownership(&attachments);
         let stashed = StashedDraft {
             text: self.input.clone(),
-            attachments: std::mem::take(&mut self.pending_attachments),
+            attachments,
         };
         self.draft_stash.push(stashed);
         self.clear_input();
@@ -1070,12 +1081,16 @@ impl InputBarState {
 
     pub fn take_attachments(&mut self) -> Vec<PendingAttachment> {
         let taken = std::mem::take(&mut self.pending_attachments);
-        for att in &taken {
-            if att.source == crate::attachment::AttachmentSource::Clipboard {
-                self.clipboard_temps.retain(|p| p != &att.path);
+        self.release_clipboard_temp_ownership(&taken);
+        taken
+    }
+
+    fn release_clipboard_temp_ownership(&mut self, attachments: &[PendingAttachment]) {
+        for attachment in attachments {
+            if attachment.source == crate::attachment::AttachmentSource::Clipboard {
+                self.clipboard_temps.retain(|path| path != &attachment.path);
             }
         }
-        taken
     }
 
     // ── Lifecycle ────────────────────────────────────────────
@@ -1090,6 +1105,9 @@ impl InputBarState {
         self.clear_selection();
         self.dismiss_autocomplete();
         self.reset_history_cursor();
+        self.prompt_history.clear();
+        self.cleanup_stashed_draft_temps();
+        self.draft_stash.clear();
         self.cleanup_temps();
     }
 
@@ -1107,10 +1125,15 @@ impl InputBarState {
     /// Remove clipboard temp files (called after turn completes).
     pub fn cleanup_temps(&mut self) {
         for path in self.clipboard_temps.drain(..) {
-            if path.exists() {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(error) => eprintln!("clipboard temp cleanup failed: {error}"),
+            cleanup_clipboard_temp(&path);
+        }
+    }
+
+    fn cleanup_stashed_draft_temps(&self) {
+        for draft in &self.draft_stash {
+            for attachment in &draft.attachments {
+                if attachment.source == crate::attachment::AttachmentSource::Clipboard {
+                    cleanup_clipboard_temp(&attachment.path);
                 }
             }
         }
@@ -2177,6 +2200,8 @@ mod tests {
         assert_eq!(bar.cursor(), 0);
         assert!(bar.pending_attachments().is_empty());
         assert!(!bar.has_file_explorer());
+        assert_eq!(bar.prompt_history_len(), 0);
+        assert_eq!(bar.draft_stash_len(), 0);
     }
 
     #[test]
@@ -2206,13 +2231,7 @@ mod tests {
     fn loading_for_edit_retakes_clipboard_temp_ownership() {
         let mut bar = InputBarState::new();
         let tmp = std::env::temp_dir().join("zc_test_clip_retake.png");
-        let att = PendingAttachment {
-            path: tmp.clone(),
-            mime_type: "image/png".into(),
-            filename: "clip.png".into(),
-            size_bytes: 1,
-            source: crate::attachment::AttachmentSource::Clipboard,
-        };
+        let att = test_clipboard_attachment(tmp.clone());
         bar.load_for_edit("edit".into(), vec![att]);
         assert!(bar.clipboard_temps().contains(&tmp));
     }
@@ -2463,6 +2482,64 @@ mod tests {
         assert!(matches!(restored, InputBarAction::RestoredDraft(_)));
         assert_eq!(bar.pending_attachments().len(), 1);
         assert_eq!(bar.pending_attachments()[0].filename, "a.txt");
+    }
+
+    #[test]
+    fn draft_stash_preserves_clipboard_temp_ownership() {
+        let mut bar = InputBarState::new();
+        let tmp = std::env::temp_dir().join("zc_test_clip_stash.png");
+        std::fs::write(&tmp, b"x").unwrap();
+        bar.clipboard_temps.push(tmp.clone());
+        bar.insert_text("send file");
+        bar.add_attachment(test_clipboard_attachment(tmp.clone()));
+
+        let stashed = bar.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
+        assert!(matches!(stashed, InputBarAction::StashedDraft(_)));
+        assert!(bar.clipboard_temps().is_empty());
+        bar.cleanup_temps();
+        assert!(tmp.exists(), "stashed clipboard temp must survive cleanup");
+
+        let restored = bar.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert!(matches!(restored, InputBarAction::RestoredDraft(_)));
+        assert_eq!(bar.pending_attachments().len(), 1);
+        assert!(bar.clipboard_temps().contains(&tmp));
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn reset_clears_prompt_history_and_stash() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("sent prompt");
+        assert!(matches!(bar.handle_enter(), InputBarAction::Submit { .. }));
+        bar.insert_text("stash prompt");
+        assert!(matches!(
+            bar.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT)),
+            InputBarAction::StashedDraft(_)
+        ));
+
+        bar.reset();
+
+        assert_eq!(bar.prompt_history_len(), 0);
+        assert_eq!(bar.draft_stash_len(), 0);
+    }
+
+    #[test]
+    fn reset_removes_stashed_clipboard_temps() {
+        let mut bar = InputBarState::new();
+        let tmp = std::env::temp_dir().join("zc_test_clip_reset_stash.png");
+        std::fs::write(&tmp, b"x").unwrap();
+        bar.clipboard_temps.push(tmp.clone());
+        bar.insert_text("stash prompt");
+        bar.add_attachment(test_clipboard_attachment(tmp.clone()));
+        assert!(matches!(
+            bar.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT)),
+            InputBarAction::StashedDraft(_)
+        ));
+
+        bar.reset();
+
+        assert_eq!(bar.draft_stash_len(), 0);
+        assert!(!tmp.exists(), "reset must clean stashed clipboard temp");
     }
 
     #[test]
@@ -2796,6 +2873,16 @@ mod tests {
             filename: filename.into(),
             size_bytes: 1,
             source: crate::attachment::AttachmentSource::File,
+        }
+    }
+
+    fn test_clipboard_attachment(path: PathBuf) -> PendingAttachment {
+        PendingAttachment {
+            path,
+            mime_type: "image/png".into(),
+            filename: "clip.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::Clipboard,
         }
     }
 
