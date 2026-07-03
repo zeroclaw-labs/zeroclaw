@@ -44,7 +44,8 @@ ignore = [
     { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version unmaintained; tracking #8519" },
     { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident unmaintained; tracking #8519" },
     # macro/font helpers unmaintained (transitive); tracking #8519.
-    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained; transitive macro helper; tracking #8519" },
+    # RUSTSEC-2024-0370 (proc-macro-error) was dropped when zeroclaw-desktop
+    # (Tauri) was removed in PR #8544.
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained; transitive macro helper; tracking #8519" },
     { id = "RUSTSEC-2024-0388", reason = "derivative unmaintained; transitive derive helper; tracking #8519" },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; via pdf-extract -> lopdf; tracking #8519" },

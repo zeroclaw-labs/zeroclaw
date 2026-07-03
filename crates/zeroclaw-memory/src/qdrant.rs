@@ -194,6 +194,9 @@ impl QdrantMemory {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
                     agent_alias: payload.agent_id.clone(),
                     agent_id: payload.agent_id,
                 })
@@ -457,6 +460,9 @@ impl QdrantMemory {
                 namespace: "default".into(),
                 importance: None,
                 superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
                 agent_alias: payload.agent_id.clone(),
                 agent_id: payload.agent_id,
             })
@@ -645,6 +651,9 @@ impl Memory for QdrantMemory {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
                     agent_alias: payload.agent_id.clone(),
                     agent_id: payload.agent_id,
                 })
@@ -745,6 +754,9 @@ impl Memory for QdrantMemory {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
                     agent_alias: payload.agent_id.clone(),
                     agent_id: payload.agent_id,
                 })
@@ -1066,6 +1078,9 @@ impl Memory for QdrantMemory {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
                     agent_alias: payload.agent_id.clone(),
                     agent_id: payload.agent_id,
                 })
