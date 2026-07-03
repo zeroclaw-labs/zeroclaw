@@ -1033,6 +1033,54 @@ fn build_channel_system_prompt(
     prompt
 }
 
+/// Build a channel system prompt whose tool-availability claim is derived
+/// from the **per-turn** `native_tool_specs_present` signal rather than
+/// from the startup prompt's frozen signal.
+///
+/// The startup prompt is built once with `model_provider.supports_native_tools()`
+/// against the base provider, and never reflects per-turn route/vision
+/// resolution or `non_cli_excluded_tools` filtering. A non-CLI channel turn
+/// at autonomy below `Full` can therefore advertise native tools while the
+/// request sends a filtered/empty `tool_specs` list — issue #8054 Surface 1(a).
+///
+/// This helper preserves the startup prompt's cached-prefix byte-stability
+/// (important for provider prompt caching) by performing a surgical anchor
+/// swap rather than a full prompt rebuild. The anchor strings
+/// (`NATIVE_TOOLS_TASK_FRAMING` / `NO_TOOLS_TASK_FRAMING`) are emitted by
+/// `build_system_prompt_with_mode_and_autonomy` in
+/// `crates/zeroclaw-runtime/src/agent/system_prompt.rs` (introduced by
+/// PR #8053). If neither anchor is present in the base prompt (e.g. a
+/// custom `system_prompt_prefix` overrides the default), the helper is a
+/// no-op — same as today's behavior.
+fn build_channel_system_prompt_for_message_with_signal(
+    base_prompt: &str,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+    native_tool_specs_present: bool,
+) -> String {
+    let prompt = build_channel_system_prompt_for_message(base_prompt, msg, target_channel);
+    let want = if native_tool_specs_present {
+        ::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING
+    } else {
+        ::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING
+    };
+    if prompt.contains(::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING) {
+        prompt.replace(
+            ::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING,
+            want,
+        )
+    } else if prompt.contains(::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING) {
+        prompt.replace(
+            ::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING,
+            want,
+        )
+    } else {
+        // Anchor absent (custom system_prompt_prefix or unusual config);
+        // no-op. Preserves byte-stability for non-default startup prompts.
+        prompt
+    }
+}
+
 fn current_date_section() -> String {
     let now = chrono::Local::now();
     format!(
@@ -4728,8 +4776,38 @@ async fn process_channel_message_body(
     } else {
         refreshed_new_session_system_prompt(ctx.as_ref())
     };
-    let mut system_prompt =
-        build_channel_system_prompt_for_message(&base_system_prompt, &msg, target_channel.as_ref());
+    // Per-turn effective tool signal — mirrors the request-side slice at
+    // line 4776 so the prompt's native/text tool claim matches what the
+    // request will actually send. See issue #8054 Surface 1(a) and the
+    // audit-zeroclaw-2026-06-28.md entry. Pattern lifted from PR #8053
+    // (direct runtime agent path) and #8216 (/think directive stripping).
+    let per_turn_excluded_tools: &[String] =
+        if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
+            &[]
+        } else {
+            ctx.non_cli_excluded_tools.as_ref()
+        };
+    // `process_channel_message_body` returns `()`, so the per-turn helper's
+    // `Result<bool>` is unwrapped to a default-false signal. The
+    // `build_iteration_tool_specs` path that backs this helper is the same
+    // one the request path uses (line 4855), so on a transient error the
+    // prompt falls back to the safer "no native tool specs" claim rather
+    // than a stale "yes native" one — i.e. the prompt under-claims, never
+    // over-claims, on error.
+    let per_turn_native_tool_specs_present =
+        ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
+            active_model_provider.as_ref(),
+            ctx.tools_registry.as_ref(),
+            per_turn_excluded_tools,
+            ctx.activated_tools.as_ref(),
+        )
+        .unwrap_or(false);
+    let mut system_prompt = build_channel_system_prompt_for_message_with_signal(
+        &base_system_prompt,
+        &msg,
+        target_channel.as_ref(),
+        per_turn_native_tool_specs_present,
+    );
     if send_message_to_peer_tool_available(ctx.as_ref(), &msg)
         && let Some(current_channel_ref) = peer_prompt_channel_ref(ctx.as_ref(), &msg)
     {
@@ -23908,6 +23986,131 @@ Done."#;
         assert!(
             !prompt.contains("delivery="),
             "system prompt must not include the cron_add delivery hint; got {prompt}"
+        );
+    }
+
+    // --- Surface 1(a) regression tests (issue #8054) ---
+
+    fn build_msg_for_signal_test() -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            channel: "mattermost".to_string(),
+            reply_target: "ch:thread".to_string(),
+            sender: "user_test".to_string(),
+            content: "hello".to_string(),
+            id: "msg-001".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn channel_prompt_reflects_per_turn_signal_false_uses_no_tools_framing() {
+        // Regression for #8054 Surface 1(a): when the per-turn
+        // `native_tool_specs_present` is false (e.g. the base provider
+        // supports native but `non_cli_excluded_tools` removed the only
+        // native tool), the channel prompt must use
+        // `NO_TOOLS_TASK_FRAMING` and not `NATIVE_TOOLS_TASK_FRAMING`,
+        // even if the startup prompt had the latter baked in.
+        let base_prompt_with_native = format!(
+            "{}\n{}",
+            "Some base agent prompt.",
+            ::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING,
+        );
+        let msg = build_msg_for_signal_test();
+        let prompt = build_channel_system_prompt_for_message_with_signal(
+            &base_prompt_with_native,
+            &msg,
+            None,
+            false, // per-turn: no effective native specs
+        );
+        assert!(
+            prompt.contains(::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING),
+            "per-turn signal=false must inject NO_TOOLS_TASK_FRAMING; got: {prompt}"
+        );
+        assert!(
+            !prompt.contains(::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING),
+            "per-turn signal=false must remove NATIVE_TOOLS_TASK_FRAMING; got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn channel_prompt_keeps_startup_signal_when_per_turn_agrees() {
+        // Byte-stability: when the per-turn signal matches the anchor
+        // already present in the startup prompt, the helper returns a
+        // prompt that contains that anchor. We compare against the
+        // "expected" rendering (built via the non-signal helper with the
+        // same base) to assert no extra mutation happens. Cached-prefix
+        // byte-stability is what makes this safe to invoke every turn.
+        let base_prompt_with_no_tools = format!(
+            "{}\n{}",
+            "Some base agent prompt.",
+            ::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING,
+        );
+        let msg = build_msg_for_signal_test();
+        let prompt_with_helper = build_channel_system_prompt_for_message_with_signal(
+            &base_prompt_with_no_tools,
+            &msg,
+            None,
+            false, // matches the anchor already in the base prompt
+        );
+        let prompt_baseline =
+            build_channel_system_prompt_for_message(&base_prompt_with_no_tools, &msg, None);
+        assert_eq!(
+            prompt_with_helper, prompt_baseline,
+            "per-turn signal matching the startup anchor must produce an identical prompt"
+        );
+    }
+
+    #[test]
+    fn channel_prompt_rewrites_no_tools_to_native_when_per_turn_differs() {
+        // Override activation (the other direction): when the per-turn
+        // signal flips to true, the helper rewrites the anchor from
+        // NO_TOOLS_TASK_FRAMING to NATIVE_TOOLS_TASK_FRAMING. (This
+        // happens e.g. when a vision-routed message resolves to a
+        // native-capable provider different from the startup base
+        // provider, and the channel turn's filtered tool set is
+        // non-empty.)
+        let base_prompt_with_no_tools = format!(
+            "{}\n{}",
+            "Some base agent prompt.",
+            ::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING,
+        );
+        let msg = build_msg_for_signal_test();
+        let prompt = build_channel_system_prompt_for_message_with_signal(
+            &base_prompt_with_no_tools,
+            &msg,
+            None,
+            true, // per-turn: native specs now present
+        );
+        assert!(
+            prompt.contains(::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING),
+            "per-turn signal=true must inject NATIVE_TOOLS_TASK_FRAMING; got: {prompt}"
+        );
+        assert!(
+            !prompt.contains(::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING),
+            "per-turn signal=true must remove NO_TOOLS_TASK_FRAMING; got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn channel_prompt_no_op_when_anchor_absent() {
+        // Cross-check: if neither anchor is present in the base prompt
+        // (e.g. a custom `system_prompt_prefix` overrides the default
+        // framing), the helper is a no-op — it returns the rendered
+        // prompt unchanged. This preserves the existing behavior for
+        // non-default startup prompts.
+        let base_prompt_no_anchor = "Custom agent prompt with no tool-availability anchor.";
+        let msg = build_msg_for_signal_test();
+        let prompt_with_helper = build_channel_system_prompt_for_message_with_signal(
+            base_prompt_no_anchor,
+            &msg,
+            None,
+            true,
+        );
+        let prompt_baseline =
+            build_channel_system_prompt_for_message(base_prompt_no_anchor, &msg, None);
+        assert_eq!(
+            prompt_with_helper, prompt_baseline,
+            "no-anchor base prompt must produce an identical prompt regardless of per-turn signal"
         );
     }
 

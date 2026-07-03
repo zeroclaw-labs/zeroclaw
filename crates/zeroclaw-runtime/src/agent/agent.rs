@@ -1962,15 +1962,22 @@ impl Agent {
     }
 
     fn build_system_prompt(&self) -> Result<String> {
-        let expose_text_tool_protocol = !self.config.resolved.strict_tool_parsing
-            || self.tool_dispatcher.should_send_tool_specs();
+        self.build_system_prompt_with_dispatcher(self.tool_dispatcher.as_ref())
+    }
+
+    fn build_system_prompt_with_dispatcher(
+        &self,
+        dispatcher: &dyn ToolDispatcher,
+    ) -> Result<String> {
+        let expose_text_tool_protocol =
+            !self.config.resolved.strict_tool_parsing || dispatcher.should_send_tool_specs();
         let no_tools: Vec<Box<dyn Tool>> = Vec::new();
         let prompt_tools = if expose_text_tool_protocol {
             &self.tools
         } else {
             &no_tools
         };
-        let instructions = self.tool_dispatcher.prompt_instructions(prompt_tools);
+        let instructions = dispatcher.prompt_instructions(prompt_tools);
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
             agent_workspace_dir: &self.agent_workspace_dir,
@@ -1980,7 +1987,7 @@ impl Agent {
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
-            sends_native_tool_specs: self.tool_dispatcher.should_send_tool_specs()
+            sends_native_tool_specs: dispatcher.should_send_tool_specs()
                 && !prompt_tools.is_empty(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
@@ -1997,7 +2004,28 @@ impl Agent {
         Ok(prompt)
     }
 
-    // Superseded by the loop's prepare/approve/execute pipeline (#7415).
+    /// Rebuild the stored system prompt using the dispatcher that matches the
+    /// active provider for this turn.
+    ///
+    /// `Agent::from_config` freezes the tool dispatcher and builds the prompt
+    /// once against the base provider. A multimodal/vision turn can route to a
+    /// different active provider, so we rebuild `history[0]` here before the
+    /// turn proceeds. This is the Agent-level complement to the per-iteration
+    /// anchor refresh in `turn/mod.rs` (#8054 Surface 3).
+    fn rebuild_system_prompt_for_dispatcher(
+        &mut self,
+        dispatcher: &dyn ToolDispatcher,
+    ) -> Result<()> {
+        let new_prompt = self.build_system_prompt_with_dispatcher(dispatcher)?;
+        let Some(ConversationMessage::Chat(first)) = self.history.first_mut() else {
+            return Ok(());
+        };
+        if first.role != "system" {
+            return Ok(());
+        }
+        first.content = new_prompt;
+        Ok(())
+    }
 
     fn classify_model(&self, user_message: &str) -> String {
         if let Some(decision) =
@@ -2256,7 +2284,31 @@ impl Agent {
         // otherwise distinct conversations can collide when their final
         // prompt matches. Keyed on the raw provider transcript — multimodal
         // preparation is a per-iteration loop concern now.
-        let provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+        //
+        // ── Per-turn active-provider resolution and prompt refresh (#8054 Surface 2) ──
+        // The agent was built against the base provider, but a multimodal turn
+        // may route to a vision provider with different native-tool support.
+        // Rebuild the stored system prompt with the active provider's
+        // dispatcher and use that dispatcher when preparing the provider-visible
+        // transcript.
+        let active_dispatcher = {
+            let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let (vision_provider_box, _degrade_strip_images) =
+                crate::agent::turn::resolve_vision_provider(
+                    self.model_provider.as_ref(),
+                    &base_provider_messages,
+                    &self.multimodal_config,
+                    &self.model_provider_name,
+                )?;
+            let active_provider: &dyn ModelProvider = vision_provider_box
+                .as_deref()
+                .unwrap_or(self.model_provider.as_ref());
+            tool_dispatcher_for_provider(&self.config, active_provider)
+        };
+
+        self.rebuild_system_prompt_for_dispatcher(active_dispatcher.as_ref())?;
+
+        let provider_messages = active_dispatcher.to_provider_messages(&self.history);
         let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
 
         if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
@@ -2651,7 +2703,41 @@ impl Agent {
         // provider-visible transcript (matches `Agent::turn`; the old code
         // re-checked every iteration, but only a transcript identical to a
         // previously cached single-exchange turn can ever hit).
-        let provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+        //
+        // ── Per-turn active-provider resolution and prompt refresh (#8054 Surface 2) ──
+        // The agent was built against the base provider, but a multimodal turn
+        // may route to a vision provider with different native-tool support.
+        // Rebuild the stored system prompt if the active provider's tool mode
+        // differs from the prompt's current claim, and use the active provider's
+        // dispatcher when preparing the provider-visible transcript.
+        let active_dispatcher = {
+            let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let (vision_provider_box, _degrade_strip_images) =
+                crate::agent::turn::resolve_vision_provider(
+                    self.model_provider.as_ref(),
+                    &base_provider_messages,
+                    &self.multimodal_config,
+                    &self.model_provider_name,
+                )
+                .map_err(|error| StreamedTurnError {
+                    error,
+                    committed_response: String::new(),
+                    new_messages: new_msgs.clone(),
+                })?;
+            let active_provider: &dyn ModelProvider = vision_provider_box
+                .as_deref()
+                .unwrap_or(self.model_provider.as_ref());
+            tool_dispatcher_for_provider(&self.config, active_provider)
+        };
+
+        self.rebuild_system_prompt_for_dispatcher(active_dispatcher.as_ref())
+            .map_err(|error| StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: new_msgs.clone(),
+            })?;
+
+        let provider_messages = active_dispatcher.to_provider_messages(&self.history);
         let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
 
         if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
@@ -3861,6 +3947,370 @@ mod tests {
         assert!(xml_prompt.contains("## Tools"));
         assert!(xml_prompt.contains("echo"));
         assert!(xml_prompt.contains("## Tool Use Protocol"));
+    }
+
+    mod surface2_tests {
+        use super::*;
+        use crate::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher};
+
+        /// Marker text produced by the section-based prompt builder when tools
+        /// are advertised as XML/text instructions rather than native tool specs.
+        const XML_TOOLS_MARKER: &str = "## Tools";
+        type CapturedTranscripts = Arc<Mutex<Vec<Vec<ChatMessage>>>>;
+
+        /// Test provider that captures the provider-visible transcript and
+        /// reports a configurable native-tool capability.
+        struct CapturingModelProvider {
+            responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
+            supports_native: bool,
+            captured_messages: CapturedTranscripts,
+        }
+
+        #[async_trait]
+        impl ModelProvider for CapturingModelProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<String> {
+                Ok("ok".into())
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                self.captured_messages
+                    .lock()
+                    .push(request.messages.to_vec());
+                let mut guard = self.responses.lock();
+                if guard.is_empty() {
+                    return Ok(zeroclaw_providers::ChatResponse {
+                        text: Some("done".into()),
+                        tool_calls: vec![],
+                        usage: None,
+                        reasoning_content: None,
+                    });
+                }
+                Ok(guard.remove(0))
+            }
+
+            fn supports_native_tools(&self) -> bool {
+                self.supports_native
+            }
+        }
+
+        impl ::zeroclaw_api::attribution::Attributable for CapturingModelProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "CapturingModelProvider"
+            }
+        }
+
+        fn capturing_provider(
+            supports_native: bool,
+        ) -> (Box<dyn ModelProvider>, CapturedTranscripts) {
+            let captured: CapturedTranscripts = Arc::new(Mutex::new(Vec::new()));
+            (
+                Box::new(CapturingModelProvider {
+                    responses: Mutex::new(vec![]),
+                    supports_native,
+                    captured_messages: Arc::clone(&captured),
+                }),
+                captured,
+            )
+        }
+
+        fn test_agent_with_provider(
+            provider: Box<dyn ModelProvider>,
+            tools: Vec<Box<dyn Tool>>,
+        ) -> Agent {
+            test_agent_with_provider_and_multimodal(provider, tools, None, None)
+        }
+
+        fn test_agent_with_provider_and_multimodal(
+            provider: Box<dyn ModelProvider>,
+            tools: Vec<Box<dyn Tool>>,
+            tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
+            multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
+        ) -> Agent {
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let workspace = tempfile::TempDir::new().expect("temp dir");
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                    .expect("memory creation should succeed"),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            let mut builder = Agent::builder()
+                .model_provider(provider)
+                .tools(tools)
+                .memory(mem)
+                .observer(observer)
+                .workspace_dir(workspace.path().to_path_buf());
+            if let Some(dispatcher) = tool_dispatcher {
+                builder = builder.tool_dispatcher(dispatcher);
+            } else {
+                builder = builder.tool_dispatcher(Box::new(NativeToolDispatcher));
+            }
+            if let Some(mm) = multimodal_config {
+                builder = builder.multimodal_config(mm);
+            }
+            builder.build().expect("agent builder should succeed")
+        }
+
+        #[test]
+        fn build_system_prompt_with_dispatcher_reflects_dispatcher_mode() {
+            let workspace = tempfile::TempDir::new().expect("temp dir");
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                    .expect("memory creation should succeed"),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            let agent = Agent::builder()
+                .model_provider(Box::new(MockModelProvider {
+                    responses: Mutex::new(vec![]),
+                }))
+                .tools(vec![Box::new(MockTool)])
+                .memory(mem)
+                .observer(observer)
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(workspace.path().to_path_buf())
+                .build()
+                .expect("agent builder should succeed");
+
+            let native_prompt = agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher as &dyn ToolDispatcher)
+                .unwrap();
+            assert!(
+                !native_prompt.contains(XML_TOOLS_MARKER),
+                "native dispatcher must not emit XML tool listing"
+            );
+
+            let xml_prompt = agent
+                .build_system_prompt_with_dispatcher(&XmlToolDispatcher as &dyn ToolDispatcher)
+                .unwrap();
+            assert!(
+                xml_prompt.contains(XML_TOOLS_MARKER),
+                "xml dispatcher must emit XML tool listing"
+            );
+        }
+
+        #[test]
+        fn rebuild_system_prompt_switches_to_xml_when_active_provider_non_native() {
+            let (provider, _) = capturing_provider(true);
+            let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+
+            // Seed a native-style system prompt as if the agent was built
+            // against a native-capable base provider.
+            let native_prompt = agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher as &dyn ToolDispatcher)
+                .unwrap();
+            agent.history = vec![ConversationMessage::Chat(ChatMessage::system(
+                native_prompt,
+            ))];
+
+            // Active provider for this turn does not support native tools.
+            agent
+                .rebuild_system_prompt_for_dispatcher(&XmlToolDispatcher)
+                .expect("rebuild should succeed");
+
+            let prompt = match &agent.history[0] {
+                ConversationMessage::Chat(msg) => msg.content.clone(),
+                _ => panic!("history[0] should be a chat message"),
+            };
+            assert!(
+                prompt.contains(XML_TOOLS_MARKER),
+                "prompt must be rebuilt with XML tool listing"
+            );
+        }
+
+        #[test]
+        fn rebuild_system_prompt_switches_to_native_when_active_provider_native() {
+            let (provider, _) = capturing_provider(false);
+            let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+
+            let xml_prompt = agent
+                .build_system_prompt_with_dispatcher(&XmlToolDispatcher as &dyn ToolDispatcher)
+                .unwrap();
+            agent.history = vec![ConversationMessage::Chat(ChatMessage::system(xml_prompt))];
+
+            // Active provider for this turn supports native tools.
+            agent
+                .rebuild_system_prompt_for_dispatcher(&NativeToolDispatcher)
+                .expect("rebuild should succeed");
+
+            let prompt = match &agent.history[0] {
+                ConversationMessage::Chat(msg) => msg.content.clone(),
+                _ => panic!("history[0] should be a chat message"),
+            };
+            assert!(
+                !prompt.contains(XML_TOOLS_MARKER),
+                "prompt must be rebuilt without XML tool listing"
+            );
+        }
+
+        #[tokio::test]
+        async fn turn_uses_active_provider_tool_mode_for_transcript() {
+            let (provider, captured) = capturing_provider(false);
+            let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+
+            // The base provider does not support native tools, so the active
+            // provider resolved by the turn path must be non-native. The
+            // provider-visible transcript should reflect that.
+            agent.turn("hello").await.expect("turn should succeed");
+
+            let messages = captured.lock();
+            let first_call = messages
+                .first()
+                .expect("provider should have received a request");
+            let system = first_call
+                .iter()
+                .find(|m| m.role == "system")
+                .expect("transcript must contain a system message");
+            assert!(
+                system.content.contains(XML_TOOLS_MARKER),
+                "system prompt must advertise XML tools when active provider is non-native"
+            );
+        }
+
+        #[tokio::test]
+        async fn turn_streamed_uses_active_provider_tool_mode_for_transcript() {
+            let (provider, captured) = capturing_provider(false);
+            let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
+
+            agent
+                .turn_streamed("hello", event_tx, None)
+                .await
+                .expect("streamed turn should succeed");
+
+            let messages = captured.lock();
+            let first_call = messages
+                .first()
+                .expect("provider should have received a request");
+            let system = first_call
+                .iter()
+                .find(|m| m.role == "system")
+                .expect("transcript must contain a system message");
+            assert!(
+                system.content.contains(XML_TOOLS_MARKER),
+                "streamed system prompt must advertise XML tools when active provider is non-native"
+            );
+        }
+
+        /// Regression: an image turn that routes to a vision provider with
+        /// different native-tool support rebuilds the stored system prompt and
+        /// provider-visible transcript for that provider (#8054 Surface 2).
+        #[tokio::test]
+        async fn turn_rebuilds_prompt_for_vision_routed_xml_provider() {
+            // Base provider supports native tools but not vision. The configured
+            // vision provider is a custom OpenAI-compatible endpoint: it supports
+            // vision but not native tools.
+            let (base_provider, _captured) = capturing_provider(true);
+            let mm_config = zeroclaw_config::schema::MultimodalConfig {
+                vision_model_provider: Some("custom:http://127.0.0.1:9".into()),
+                ..Default::default()
+            };
+            let mut agent = test_agent_with_provider_and_multimodal(
+                base_provider,
+                vec![Box::new(MockTool)],
+                Some(Box::new(NativeToolDispatcher)),
+                Some(mm_config),
+            );
+
+            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
+
+            // The vision provider will fail to connect to localhost:9, but the
+            // prompt rebuild and provider-visible transcript happen before the
+            // network call.
+            let result = agent.turn(msg).await;
+            assert!(
+                result.is_err(),
+                "vision provider chat should fail to connect"
+            );
+
+            let system_content = match &agent.history[0] {
+                ConversationMessage::Chat(m) => m.content.clone(),
+                _ => panic!("history[0] should be a chat message"),
+            };
+            assert!(
+                system_content.contains(XML_TOOLS_MARKER),
+                "stored system prompt must be rebuilt for XML vision provider"
+            );
+
+            let provider_messages = XmlToolDispatcher.to_provider_messages(&agent.history);
+            let system = provider_messages
+                .iter()
+                .find(|m| m.role == "system")
+                .expect("transcript must contain a system message");
+            assert!(
+                system.content.contains(XML_TOOLS_MARKER),
+                "provider-visible transcript must advertise XML tools for vision provider"
+            );
+        }
+
+        #[tokio::test]
+        async fn turn_streamed_rebuilds_prompt_for_vision_routed_native_provider() {
+            // Base provider does not support native tools or vision. The
+            // configured vision provider is an Anthropic-compatible endpoint:
+            // it supports both vision and native tools.
+            let (base_provider, _captured) = capturing_provider(false);
+            let mm_config = zeroclaw_config::schema::MultimodalConfig {
+                vision_model_provider: Some("anthropic-custom:http://127.0.0.1:9".into()),
+                ..Default::default()
+            };
+            let mut agent = test_agent_with_provider_and_multimodal(
+                base_provider,
+                vec![Box::new(MockTool)],
+                Some(Box::new(XmlToolDispatcher)),
+                Some(mm_config),
+            );
+
+            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
+
+            let result = agent.turn_streamed(msg, event_tx, None).await;
+            assert!(
+                result.is_err(),
+                "vision provider chat should fail to connect"
+            );
+
+            let system_content = match &agent.history[0] {
+                ConversationMessage::Chat(m) => m.content.clone(),
+                _ => panic!("history[0] should be a chat message"),
+            };
+            assert!(
+                !system_content.contains(XML_TOOLS_MARKER),
+                "stored system prompt must be rebuilt for native vision provider"
+            );
+
+            let provider_messages = NativeToolDispatcher.to_provider_messages(&agent.history);
+            let system = provider_messages
+                .iter()
+                .find(|m| m.role == "system")
+                .expect("transcript must contain a system message");
+            assert!(
+                !system.content.contains(XML_TOOLS_MARKER),
+                "provider-visible transcript must advertise native tools for vision provider"
+            );
+        }
     }
 
     #[tokio::test]
