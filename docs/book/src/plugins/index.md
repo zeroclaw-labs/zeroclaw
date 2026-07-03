@@ -150,8 +150,13 @@ not yet reachable from a running daemon:
 
 ## Configuration
 
-Never hand-edit config files. The plugin system is configured through the same
-schema mirror as everything else, via zerocode, the gateway, or the CLI:
+The plugin system is configured through the same schema mirror as everything
+else, via zerocode, the gateway, or the CLI. Prefer these surfaces over
+hand-editing: a syntax slip in a hand-edited section (for example
+`[plugins.entries]` where `[[plugins.entries]]` is meant) currently makes the
+whole `[plugins]` section fail deserialization and silently fall back to
+defaults, which reads back as `plugins.enabled = false` with no warning
+(tracked in issue #8636). The common operations:
 
 ```bash
 # turn the system on
@@ -170,7 +175,14 @@ zeroclaw config set plugins.limits.max_memory_mb 256
 
 Per-plugin settings live under `plugins.entries`, keyed by plugin name; each
 entry carries a secret-marked key-value map that is what a `config_read`
-plugin receives at call time. The canonical field list and defaults are in the
+plugin receives at call time. One known seam: `config set` routes list paths
+by natural keys already present in live config, and `plugin install` does not
+yet seed an entry, so the **first** write to a fresh plugin's entry fails
+with `Unknown property` and currently requires adding the entry to the config
+file by hand (tracked in issue #8636); once the entry exists, every surface
+reads and writes it normally. Values written through the CLI are stored
+encrypted (`enc2:…`) under the secret marking; hand-written plaintext values
+are also accepted at load. The canonical field list and defaults are in the
 [Config reference](../reference/config.md); `zeroclaw config list` shows the
 live values.
 

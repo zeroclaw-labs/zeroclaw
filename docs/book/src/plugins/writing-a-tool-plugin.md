@@ -16,6 +16,22 @@ repository. You never need a ZeroClaw checkout to build one, only the `wit/`
 contract files (fetched in step 1) and an installed `zeroclaw` binary with
 the plugin host compiled in to run it.
 
+> **The release binary is not that binary.** The prebuilt binaries the
+> installer ships do not include the plugin host (`zeroclaw plugin …` is an
+> unrecognized subcommand), and `plugins-wasm` is not in the crate's default
+> feature set. Build the host side from source, and note the backend
+> features do **not** imply the umbrella: `--features plugins-wasm-cranelift`
+> alone builds cleanly and still produces a plugin-less binary, because the
+> runtime integration is gated on `plugins-wasm` itself. The working
+> invocation is:
+>
+> ```bash
+> cargo build --release --features plugins-wasm,plugins-wasm-cranelift
+> ```
+>
+> The [protocol page](../developing/plugin-protocol.md#build-features)
+> documents the backend choices.
+
 ## How a tool call flows
 
 Understand the runtime shape before writing code:
@@ -301,6 +317,45 @@ For this plugin: `name` and `version` matching what `plugin-info` reports,
 that permission is what attaches the `wasi:http` context to your store, and
 without it there is no network surface at all.
 
+### Tools that call the network
+
+Arguably the most common real-world tool shape is not a pure transform like
+`redact` but a bridge to an external API: declare `http_client` in the
+manifest, read credentials from `__config`, make an outbound request. The
+missing piece relative to this guide is an HTTP client that works inside a
+component: `reqwest` and friends do not, because there is no socket surface,
+only `wasi:http`. A client known to work against this host is
+[`waki`](https://crates.io/crates/waki), which is blocking and therefore fits
+`execute`'s synchronous signature directly. Add it gated to the component
+target so your pure-logic modules stay natively testable:
+
+```bash
+cargo add waki --target 'cfg(target_family = "wasm")'
+```
+
+The shape of a call, inside `execute` after parsing `__config`:
+
+```rust
+let resp = waki::Client::new()
+    .get("https://api.example.com/search")
+    .query([("q", term.as_str())])
+    .header("Authorization", format!("Bearer {api_key}"))
+    .connect_timeout(std::time::Duration::from_secs(5))
+    .send()
+    .map_err(|e| format!("request failed: {e}"))?;
+```
+
+Two version facts that look like breakage but are not: waki vendors its own
+wit-bindgen (0.34) alongside the 0.46 your world bindings use; the two
+coexist, each generating its own bindings. And waki emits `wasi:http@0.2.4`
+imports while the current toolchain baseline is `@0.2.6`; the host links
+both without issue. Neither requires action.
+
+Remember the trust framing from the [overview](./index.md): `http_client` is
+all-or-nothing. The sandbox does not bound where a granted plugin sends
+data, so operators running `strict` signature policy are trusting your code,
+not a URL allowlist.
+
 ## 6. Test the logic natively
 
 Because `redact.rs` has no wasm dependency, plain `cargo test` covers it on
@@ -338,7 +393,11 @@ Ask the agent to use the tool:
 
 The model sees `redact` in its catalog with your schema, calls it, and the
 host runs the component in a fresh store under the configured fuel and memory
-limits. Your `log-record` events appear in the structured log with the
+limits. Plugin tools are not in the builtin read-only auto-approve set, so at
+non-full autonomy the call surfaces the operator approval prompt like any
+other privileged tool; anticipate that in your tool description rather than
+being surprised by it. Your `log-record` events appear in the structured log
+with the
 [span attribution](../ops/observability.md#zeroclaw-attribution) of the host
 call site.
 
