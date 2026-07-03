@@ -7,8 +7,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_config::schema::{Config, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL};
+use zeroclaw_config::schema::{
+    Config, DEFAULT_MULTI_MESSAGE_DELAY_MS, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL,
+};
 use zeroclaw_runtime::security::pairing::PairingGuard;
+
+static ORPHAN_THINK_TAG_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"</?(?:redacted_)?think(?:ing)?>").expect("ORPHAN_THINK_TAG_RE must compile")
+});
 
 /// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
@@ -24,18 +30,37 @@ struct MultiDraftKey {
 
 #[derive(Debug, Clone)]
 struct MultiDraftState {
-    sent_so_far: usize,
+    /// Sanitized visible text already delivered to Telegram for this draft.
+    /// Flushes send only the suffix of `latest_visible` after this prefix, so
+    /// both flush paths account against the same canonical string.
+    sent_text: String,
     thread_id: Option<String>,
-    /// Latest visible narration from orchestrator `update_draft` (not sent until flush).
+    /// Latest sanitized narration from the orchestrator (not sent until flush).
     latest_visible: String,
+    /// Serializes flushes racing between the draft-updater task and the
+    /// approval path so the same suffix is never sent twice.
+    flush_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Completion instant of the last successful send, for inter-message pacing.
+    last_sent_at: Option<std::time::Instant>,
+}
+
+impl MultiDraftState {
+    fn new(thread_id: Option<String>) -> Self {
+        Self {
+            sent_text: String::new(),
+            thread_id,
+            latest_visible: String::new(),
+            flush_lock: Arc::new(tokio::sync::Mutex::new(())),
+            last_sent_at: None,
+        }
+    }
 }
 
 /// Strip think blocks and orphan tag fragments before multi-message delivery.
 fn sanitize_multi_message_visible_text(text: &str) -> String {
-    let stripped = zeroclaw_tool_call_parser::strip_think_tags(text);
-    stripped
-        .replace("</think>", "")
-        .replace("<think>", "")
+    let stripped = zeroclaw_tool_call_parser::strip_tool_result_blocks(text);
+    ORPHAN_THINK_TAG_RE
+        .replace_all(&stripped, "")
         .trim()
         .to_string()
 }
@@ -675,7 +700,7 @@ impl TelegramChannel {
             client: reqwest::Client::new(),
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: TELEGRAM_DRAFT_UPDATE_INTERVAL_MS,
-            multi_message_delay_ms: 800,
+            multi_message_delay_ms: DEFAULT_MULTI_MESSAGE_DELAY_MS,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             multi_message_drafts: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
@@ -780,14 +805,25 @@ impl TelegramChannel {
         message_id.starts_with(TELEGRAM_MULTI_MESSAGE_SYNTHETIC_PREFIX)
     }
 
-    /// Send the unsent suffix of accumulated text for one agent turn. Advances
-    /// `sent_so_far` only after a successful `sendMessage`.
-    async fn flush_unsent(
-        &self,
-        recipient: &str,
-        message_id: &str,
-        text: &str,
-    ) -> anyhow::Result<()> {
+    /// Sleep out the remainder of `multi_message_delay_ms` since the last
+    /// successful send, pacing consecutive multi-message posts without a
+    /// trailing delay after the final one.
+    async fn pace_multi_message_send(&self, last_sent_at: Option<std::time::Instant>) {
+        let delay = Duration::from_millis(self.multi_message_delay_ms);
+        if delay.is_zero() {
+            return;
+        }
+        if let Some(last) = last_sent_at {
+            let elapsed = last.elapsed();
+            if elapsed < delay {
+                tokio::time::sleep(delay - elapsed).await;
+            }
+        }
+    }
+
+    /// Send the unsent suffix of the draft's sanitized narration for one agent
+    /// turn. `sent_text` advances only after a successful `sendMessage`.
+    async fn flush_unsent(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
         if !Self::is_multi_message_synthetic_draft(message_id) {
             return Ok(());
         }
@@ -795,31 +831,58 @@ impl TelegramChannel {
         let key = Self::multi_draft_key(recipient, message_id);
         let (chat_id, parsed_thread) = Self::parse_reply_target(recipient);
 
-        let (unsent, thread_id, delay) = {
+        // Serialize flushes per draft: the turn-boundary flush (draft-updater
+        // task) and the approval-path flush (agent loop) can race, and both
+        // would otherwise read the same unsent suffix and send it twice.
+        let flush_lock = {
+            let drafts = self.multi_message_drafts.lock();
+            let Some(draft) = drafts.get(&key) else {
+                return Ok(());
+            };
+            draft.flush_lock.clone()
+        };
+        let _flush_guard = flush_lock.lock().await;
+
+        let (current, unsent, thread_id, last_sent_at) = {
             let mut drafts = self.multi_message_drafts.lock();
             let Some(draft) = drafts.get_mut(&key) else {
                 return Ok(());
             };
-            if text.len() < draft.sent_so_far {
-                draft.sent_so_far = 0;
-            }
-            if text.len() <= draft.sent_so_far {
+            let current = draft.latest_visible.clone();
+            // Never slice by byte offset: `sent_text` must be a literal prefix
+            // of the current buffer. Sanitization can rewrite already-delivered
+            // text (e.g. a think block closing across the sent boundary); in
+            // that case resync without sending anything rather than emit a
+            // garbled fragment — `finalize_draft` still delivers the final
+            // turn in full.
+            let Some(unsent) = current
+                .strip_prefix(draft.sent_text.as_str())
+                .map(str::to_string)
+            else {
+                draft.sent_text = current;
                 return Ok(());
-            }
-            let unsent = text[draft.sent_so_far..].to_string();
+            };
             let thread_id = draft.thread_id.clone().or(parsed_thread);
-            let delay = Duration::from_millis(self.multi_message_delay_ms);
-            (unsent, thread_id, delay)
+            (current, unsent, thread_id, draft.last_sent_at)
         };
 
-        let content = sanitize_multi_message_visible_text(unsent.trim());
-        if content.is_empty() {
+        let cleaned = strip_tool_call_tags(unsent.trim());
+        let cleaned = cleaned.trim();
+        if cleaned.is_empty() {
+            // Nothing user-visible in this turn (e.g. a bare tool-call
+            // envelope): mark it consumed instead of POSTing an empty message
+            // and retrying it on every subsequent flush.
+            let mut drafts = self.multi_message_drafts.lock();
+            if let Some(draft) = drafts.get_mut(&key) {
+                draft.sent_text = current;
+            }
             return Ok(());
         }
 
-        let cleaned = strip_tool_call_tags(&content);
+        self.pace_multi_message_send(last_sent_at).await;
+
         if let Err(e) = self
-            .send_text_chunks(&cleaned, &chat_id, thread_id.as_deref())
+            .send_text_chunks(cleaned, &chat_id, thread_id.as_deref())
             .await
         {
             ::zeroclaw_log::record!(
@@ -834,12 +897,9 @@ impl TelegramChannel {
         {
             let mut drafts = self.multi_message_drafts.lock();
             if let Some(draft) = drafts.get_mut(&key) {
-                draft.sent_so_far += unsent.len();
+                draft.sent_text = current;
+                draft.last_sent_at = Some(std::time::Instant::now());
             }
-        }
-
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
         }
 
         Ok(())
@@ -854,18 +914,17 @@ impl TelegramChannel {
             return Ok(());
         }
 
-        let pending: Vec<(String, String)> = {
+        let pending: Vec<String> = {
             let drafts = self.multi_message_drafts.lock();
             drafts
-                .iter()
-                .filter(|(key, _)| key.recipient == recipient)
-                .map(|(key, state)| (key.draft_id.clone(), state.latest_visible.clone()))
+                .keys()
+                .filter(|key| key.recipient == recipient)
+                .map(|key| key.draft_id.clone())
                 .collect()
         };
 
-        for (draft_id, latest_visible) in pending {
-            self.flush_unsent(recipient, &draft_id, &latest_visible)
-                .await?;
+        for draft_id in pending {
+            self.flush_unsent(recipient, &draft_id).await?;
         }
 
         Ok(())
@@ -883,12 +942,22 @@ impl TelegramChannel {
         self.try_queue_voice_reply(recipient, &text, true);
 
         let key = Self::multi_draft_key(recipient, message_id);
-        let thread_id = {
+        let flush_lock = {
+            let drafts = self.multi_message_drafts.lock();
+            let Some(draft) = drafts.get(&key) else {
+                return Ok(());
+            };
+            draft.flush_lock.clone()
+        };
+        // Wait out any in-flight turn flush so the final send cannot interleave
+        // with an intermediate one for the same draft.
+        let _flush_guard = flush_lock.lock().await;
+        let (thread_id, last_sent_at) = {
             let mut drafts = self.multi_message_drafts.lock();
             let Some(draft) = drafts.remove(&key) else {
                 return Ok(());
             };
-            draft.thread_id.or(parsed_thread)
+            (draft.thread_id.or(parsed_thread), draft.last_sent_at)
         };
         self.last_draft_edit.lock().remove(&chat_id);
 
@@ -896,9 +965,10 @@ impl TelegramChannel {
         // `finalize_draft` receives the final agent-turn text (`delivered_response`),
         // not the draft updater's accumulated multi-turn buffer. Intermediate turns
         // are emitted via `flush_draft_turn`; send the final turn in full.
-        let remainder = text_without_markers.trim().to_string();
+        let remainder = sanitize_multi_message_visible_text(&text_without_markers);
 
         if !remainder.is_empty() {
+            self.pace_multi_message_send(last_sent_at).await;
             self.send_text_chunks(&remainder, &chat_id, thread_id.as_deref())
                 .await?;
         }
@@ -3499,11 +3569,7 @@ impl Channel for TelegramChannel {
                 let (_, thread_id) = Self::parse_reply_target(&message.recipient);
                 self.multi_message_drafts.lock().insert(
                     Self::multi_draft_key(&message.recipient, &draft_id),
-                    MultiDraftState {
-                        sent_so_far: 0,
-                        thread_id,
-                        latest_visible: String::new(),
-                    },
+                    MultiDraftState::new(thread_id),
                 );
                 Ok(Some(draft_id))
             }
@@ -3593,10 +3659,13 @@ impl Channel for TelegramChannel {
                 if !Self::is_multi_message_synthetic_draft(message_id) {
                     return Ok(());
                 }
+                // Sanitize outside the drafts lock: regex passes over the full
+                // accumulated text must not block concurrent flushes.
+                let visible = sanitize_multi_message_visible_text(text);
                 let key = Self::multi_draft_key(recipient, message_id);
                 let mut drafts = self.multi_message_drafts.lock();
                 if let Some(draft) = drafts.get_mut(&key) {
-                    draft.latest_visible = text.to_string();
+                    draft.latest_visible = visible;
                 }
                 Ok(())
             }
@@ -3609,10 +3678,23 @@ impl Channel for TelegramChannel {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
-        if self.stream_mode == StreamMode::MultiMessage {
-            return self.flush_unsent(recipient, message_id, text).await;
+        if self.stream_mode != StreamMode::MultiMessage
+            || !Self::is_multi_message_synthetic_draft(message_id)
+        {
+            return Ok(());
         }
-        Ok(())
+        // Refresh the canonical buffer from the turn text, then flush from it.
+        // Both flush paths must account against the same sanitized string —
+        // never against caller-supplied text with different normalization.
+        let visible = sanitize_multi_message_visible_text(text);
+        {
+            let key = Self::multi_draft_key(recipient, message_id);
+            let mut drafts = self.multi_message_drafts.lock();
+            if let Some(draft) = drafts.get_mut(&key) {
+                draft.latest_visible = visible;
+            }
+        }
+        self.flush_unsent(recipient, message_id).await
     }
 
     async fn update_draft_progress(
@@ -4844,32 +4926,20 @@ mod tests {
             let second_key = super::super::TelegramChannel::multi_draft_key(recipient, &second_id);
 
             let mut drafts = std::collections::HashMap::new();
-            drafts.insert(
-                first_key.clone(),
-                MultiDraftState {
-                    sent_so_far: 5,
-                    thread_id: None,
-                    latest_visible: String::new(),
-                },
-            );
-            drafts.insert(
-                second_key.clone(),
-                MultiDraftState {
-                    sent_so_far: 0,
-                    thread_id: None,
-                    latest_visible: String::new(),
-                },
-            );
+            let mut first_state = MultiDraftState::new(None);
+            first_state.sent_text = "Пять".to_string();
+            drafts.insert(first_key.clone(), first_state);
+            drafts.insert(second_key.clone(), MultiDraftState::new(None));
 
-            drafts
-                .get_mut(&second_key)
-                .expect("second draft")
-                .sent_so_far = 12;
+            drafts.get_mut(&second_key).expect("second draft").sent_text = "Двенадцать".to_string();
 
-            assert_eq!(drafts.get(&first_key).expect("first draft").sent_so_far, 5);
             assert_eq!(
-                drafts.get(&second_key).expect("second draft").sent_so_far,
-                12
+                drafts.get(&first_key).expect("first draft").sent_text,
+                "Пять"
+            );
+            assert_eq!(
+                drafts.get(&second_key).expect("second draft").sent_text,
+                "Двенадцать"
             );
         }
 
@@ -4921,19 +4991,11 @@ mod tests {
         let other_id = format!("{TELEGRAM_MULTI_MESSAGE_SYNTHETIC_PREFIX}keep-me");
         ch.multi_message_drafts.lock().insert(
             TelegramChannel::multi_draft_key("123", &draft_id),
-            MultiDraftState {
-                sent_so_far: 42,
-                thread_id: Some("99".to_string()),
-                latest_visible: String::new(),
-            },
+            MultiDraftState::new(Some("99".to_string())),
         );
         ch.multi_message_drafts.lock().insert(
             TelegramChannel::multi_draft_key("123", &other_id),
-            MultiDraftState {
-                sent_so_far: 7,
-                thread_id: None,
-                latest_visible: String::new(),
-            },
+            MultiDraftState::new(None),
         );
 
         ch.cancel_draft("123", &draft_id).await.unwrap();
@@ -4996,13 +5058,13 @@ mod tests {
                 .lock()
                 .get(&key)
                 .expect("draft state")
-                .sent_so_far,
-            "Searching the docs...".len()
+                .sent_text,
+            "Searching the docs..."
         );
     }
 
     #[tokio::test]
-    async fn flush_draft_turn_failed_send_does_not_advance_sent_so_far() {
+    async fn flush_draft_turn_failed_send_does_not_advance_sent_text() {
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -5038,14 +5100,14 @@ mod tests {
             .unwrap();
 
         let key = TelegramChannel::multi_draft_key("123", &draft_id);
-        assert_eq!(
+        assert!(
             ch.multi_message_drafts
                 .lock()
                 .get(&key)
                 .expect("draft state")
-                .sent_so_far,
-            0,
-            "sent_so_far must not advance when both HTML and plain send fail"
+                .sent_text
+                .is_empty(),
+            "sent_text must not advance when both HTML and plain send fail"
         );
     }
 
@@ -5145,13 +5207,9 @@ mod tests {
             .unwrap()
             .expect("draft id");
 
-        ch.flush_draft_turn(
-            "123",
-            &draft_id,
-            "</think>Понял, продолжаем мультитурн!",
-        )
-        .await
-        .unwrap();
+        ch.flush_draft_turn("123", &draft_id, "</think>Понял, продолжаем мультитурн!")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -5201,13 +5259,9 @@ mod tests {
             .unwrap()
             .expect("draft id");
 
-        ch.update_draft(
-            "123",
-            &draft_id,
-            "Понял, вызовем калькулятор:",
-        )
-        .await
-        .unwrap();
+        ch.update_draft("123", &draft_id, "Понял, вызовем калькулятор:")
+            .await
+            .unwrap();
 
         let request = ChannelApprovalRequest {
             tool_name: "calculator".to_string(),
@@ -5261,6 +5315,173 @@ mod tests {
         ch.finalize_draft("123", &draft_id, "Final answer")
             .await
             .expect("finalize sends unsent remainder");
+    }
+
+    #[tokio::test]
+    async fn flush_draft_turn_sends_only_new_suffix_across_turns() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .and(body_json(serde_json::json!({
+                "chat_id": "123",
+                "text": "Ищу документы по запросу…",
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .and(body_json(serde_json::json!({
+                "chat_id": "123",
+                "text": "Готово: вот ответ.",
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 2 } }),
+                ),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::MultiMessage, 750, 0)
+        .with_api_base(mock_server.uri());
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("...", "123"))
+            .await
+            .unwrap()
+            .expect("draft id");
+
+        ch.flush_draft_turn("123", &draft_id, "Ищу документы по запросу…")
+            .await
+            .unwrap();
+        ch.flush_draft_turn(
+            "123",
+            &draft_id,
+            "Ищу документы по запросу…\n\nГотово: вот ответ.",
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn flush_never_slices_when_sent_text_is_not_a_prefix() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::MultiMessage, 750, 0)
+        .with_api_base(mock_server.uri());
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("...", "123"))
+            .await
+            .unwrap()
+            .expect("draft id");
+
+        // Simulate an earlier flush accounted against a different buffer
+        // (the old byte-offset bug that produced lone ">" messages).
+        let key = TelegramChannel::multi_draft_key("123", &draft_id);
+        ch.multi_message_drafts
+            .lock()
+            .get_mut(&key)
+            .expect("draft state")
+            .sent_text = "Совсем другой текст".to_string();
+
+        ch.flush_draft_turn("123", &draft_id, "Понял, поехали")
+            .await
+            .unwrap();
+
+        // No sendMessage happened (mock expects 0) and state resynced.
+        assert_eq!(
+            ch.multi_message_drafts
+                .lock()
+                .get(&key)
+                .expect("draft state")
+                .sent_text,
+            "Понял, поехали"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_skips_tool_call_envelope_without_posting_empty_message() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::MultiMessage, 750, 0)
+        .with_api_base(mock_server.uri());
+
+        let draft_id = ch
+            .send_draft(&SendMessage::new("...", "123"))
+            .await
+            .unwrap()
+            .expect("draft id");
+
+        let envelope = "<tool_call>{\"name\":\"shell\"}</tool_call>";
+        ch.flush_draft_turn("123", &draft_id, envelope)
+            .await
+            .unwrap();
+
+        // The turn is marked consumed so later flushes don't retry an empty send.
+        let key = TelegramChannel::multi_draft_key("123", &draft_id);
+        assert_eq!(
+            ch.multi_message_drafts
+                .lock()
+                .get(&key)
+                .expect("draft state")
+                .sent_text,
+            envelope
+        );
     }
 
     #[test]
