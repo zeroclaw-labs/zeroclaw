@@ -15,6 +15,33 @@ use super::payloads::{
 };
 use crate::git::types::{GitChannelError, IssueRef, RepoRef};
 
+/// Pages followed per list call. GitHub paginates list endpoints with a
+/// `Link: rel="next"` header; following it keeps a single 100-item page
+/// from starving a cursor that advances on the newest returned item — the
+/// busy-repo livelock where >100 items match `since` on one page, the
+/// newest sort off the page, and the cursor never reaches them. The cap
+/// bounds one poll tick's fetch: ascending streams still make forward
+/// progress across ticks, and a truncation is logged.
+const MAX_PAGES_PER_POLL: usize = 20;
+
+/// Extract the `rel="next"` URL from a GitHub `Link` header, if present.
+///
+/// Example header value:
+/// `<https://api.github.com/…?page=2>; rel="next", <…?page=9>; rel="last"`.
+fn next_page_url(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let link = headers.get(reqwest::header::LINK)?.to_str().ok()?;
+    link.split(',').find_map(|segment| {
+        let mut parts = segment.split(';');
+        let url = parts.next()?.trim();
+        let is_next = parts.any(|param| param.trim() == "rel=\"next\"");
+        is_next.then(|| {
+            url.trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_string()
+        })
+    })
+}
+
 pub struct GithubApi {
     base: String,
     proxy_url: Option<String>,
@@ -87,6 +114,58 @@ impl GithubApi {
             return Ok(());
         }
         Err(Self::error_from(endpoint, resp).await)
+    }
+
+    /// GET a list endpoint, following `Link: rel="next"` pagination and
+    /// concatenating the pages (bounded by [`MAX_PAGES_PER_POLL`]).
+    /// `extract` pulls the item vec out of each decoded page body, so both
+    /// bare-array endpoints (`|page| page`) and envelope endpoints
+    /// (`{ workflow_runs: [...] }`) share one pager. Following pagination
+    /// is what stops a full first page from livelocking a cursor that
+    /// advances on the newest returned item.
+    async fn get_paged<P, T>(
+        &self,
+        endpoint: &str,
+        first_url: String,
+        token: &str,
+        extract: impl Fn(P) -> Vec<T>,
+    ) -> Result<Vec<T>, GitChannelError>
+    where
+        P: DeserializeOwned,
+    {
+        let mut out: Vec<T> = Vec::new();
+        let mut next = Some(first_url);
+        let mut pages = 0usize;
+        while let Some(url) = next.take() {
+            let resp = self
+                .request(reqwest::Method::GET, url, token)
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                return Err(Self::error_from(endpoint, resp).await);
+            }
+            let following = next_page_url(resp.headers());
+            let page: P = resp.json().await?;
+            out.extend(extract(page));
+            pages += 1;
+            if pages >= MAX_PAGES_PER_POLL {
+                if following.is_some() {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "endpoint": endpoint,
+                                "pages": pages,
+                            })),
+                        "git list endpoint hit the per-poll page cap; \
+                         remaining pages roll over to the next tick"
+                    );
+                }
+                break;
+            }
+            next = following;
+        }
+        Ok(out)
     }
 
     async fn error_from(endpoint: &str, resp: reqwest::Response) -> GitChannelError {
@@ -221,9 +300,11 @@ impl GithubApi {
             self.base,
             since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         );
-        self.execute(
+        self.get_paged(
             "GET /repos/{owner}/{repo}/issues/comments",
-            self.request(reqwest::Method::GET, url, token),
+            url,
+            token,
+            |page: Vec<GhComment>| page,
         )
         .await
     }
@@ -242,9 +323,11 @@ impl GithubApi {
             self.base,
             since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         );
-        self.execute(
+        self.get_paged(
             "GET /repos/{owner}/{repo}/issues",
-            self.request(reqwest::Method::GET, url, token),
+            url,
+            token,
+            |page: Vec<GhIssue>| page,
         )
         .await
     }
@@ -262,9 +345,11 @@ impl GithubApi {
             self.base,
             since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         );
-        self.execute(
+        self.get_paged(
             "GET /repos/{owner}/{repo}/pulls/comments",
-            self.request(reqwest::Method::GET, url, token),
+            url,
+            token,
+            |page: Vec<GhReviewComment>| page,
         )
         .await
     }
@@ -303,13 +388,13 @@ impl GithubApi {
             self.base,
             since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         );
-        let page: Page = self
-            .execute(
-                "GET /repos/{owner}/{repo}/actions/runs",
-                self.request(reqwest::Method::GET, url, token),
-            )
-            .await?;
-        Ok(page.workflow_runs)
+        self.get_paged(
+            "GET /repos/{owner}/{repo}/actions/runs",
+            url,
+            token,
+            |page: Page| page.workflow_runs,
+        )
+        .await
     }
 
     /// `GET /repos/{owner}/{repo}/events` — the repository activity feed
@@ -446,5 +531,37 @@ impl GithubApi {
                 .json(&serde_json::json!({ "content": content })),
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_page_url;
+
+    fn headers(link: &str) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(reqwest::header::LINK, link.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn next_page_url_extracts_the_next_relation() {
+        let h = headers(
+            "<https://api.github.com/repositories/1/issues?page=2>; rel=\"next\", \
+             <https://api.github.com/repositories/1/issues?page=9>; rel=\"last\"",
+        );
+        assert_eq!(
+            next_page_url(&h).as_deref(),
+            Some("https://api.github.com/repositories/1/issues?page=2")
+        );
+    }
+
+    #[test]
+    fn next_page_url_is_none_without_a_next_relation() {
+        // Only prev/first relations: nothing more to follow.
+        let h = headers("<https://api.github.com/x?page=1>; rel=\"prev\"");
+        assert!(next_page_url(&h).is_none());
+        // No Link header at all.
+        assert!(next_page_url(&reqwest::header::HeaderMap::new()).is_none());
     }
 }
