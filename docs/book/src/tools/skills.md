@@ -145,6 +145,8 @@ zeroclaw skills test --verbose
 
 `zeroclaw skills test` runs the skill's `TEST.sh` file when one exists. Inspect `TEST.sh` before running tests from a skill source you do not already trust.
 
+For a worked example that turns a built-in tool into a reusable operator workflow, see [using relationship memory from skills](./relationship-memory-skill-template.md).
+
 ## Prompt-triggered capability suggestions
 
 ZeroClaw can optionally suggest an installable skill capability when a submitted prompt clearly names something that exists in cached registry metadata but is not installed. The server-side path runs after submission and before the normal LLM turn. It only returns a suggestion; it does not install the skill, enable it, write memory, or treat the skill body as global instructions.
@@ -170,5 +172,6 @@ The default prompt injection mode is `full`, which includes full skill instructi
 ## See also
 
 - [Tools overview](./overview.md)
+- [Using relationship memory from skills](./relationship-memory-skill-template.md)
 - [Security overview](../security/overview.md)
 - [Tool receipts](../security/tool-receipts.md)
