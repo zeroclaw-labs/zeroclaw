@@ -29749,6 +29749,50 @@ api_key = "op://zeroclaw/provider/openai-api-key"
     }
 
     #[test]
+    async fn create_map_key_seeds_plugin_entry_and_routes_config_set() {
+        // The `zeroclaw plugin install` seeding path: a fresh
+        // `[[plugins.entries]]` entry named after the plugin must make
+        // `config set plugins.entries.<name>.config.<key>` routable;
+        // natural-key path routing only matches keys already present in
+        // live config.
+        let mut config = Config::default();
+        let created = config
+            .create_map_key("plugins.entries", "weather-tool")
+            .expect("plugins.entries must accept new natural-key entries");
+        assert!(created, "first add should report created=true");
+        assert_eq!(config.plugins.entries.len(), 1);
+        assert_eq!(config.plugins.entries[0].name, "weather-tool");
+
+        config
+            .set_prop("plugins.entries.weather-tool.config.api_key", "sk-test")
+            .expect("config set must route through the seeded entry");
+        assert_eq!(
+            config
+                .plugins
+                .entry_config("weather-tool")
+                .and_then(|c| c.get("api_key"))
+                .map(String::as_str),
+            Some("sk-test")
+        );
+
+        // Idempotent: reinstalling must not clobber operator values.
+        let again = config
+            .create_map_key("plugins.entries", "weather-tool")
+            .expect("second add still resolves the section");
+        assert!(!again, "duplicate add should report created=false");
+        assert_eq!(config.plugins.entries.len(), 1);
+        assert_eq!(
+            config
+                .plugins
+                .entry_config("weather-tool")
+                .and_then(|c| c.get("api_key"))
+                .map(String::as_str),
+            Some("sk-test"),
+            "re-seeding must leave existing config values untouched"
+        );
+    }
+
+    #[test]
     async fn create_map_key_inserts_default_alias_under_typed_family() {
         // Dashboard "+ Add alias" target is the typed family slot,
         // not a free-form provider key under `providers.models`.
