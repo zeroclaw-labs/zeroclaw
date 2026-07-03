@@ -53,6 +53,12 @@ impl OperatorIo for TtyOperatorIo {
 
     async fn hear(&mut self) -> TransportResult<String> {
         tokio::task::spawn_blocking(|| {
+            {
+                use std::io::Write;
+                let mut out = std::io::stdout();
+                let _ = write!(out, "> ");
+                let _ = out.flush();
+            }
             let mut line = String::new();
             match std::io::stdin().read_line(&mut line) {
                 Ok(0) | Err(_) => Err(zeroclaw_runtime::flow::TransportError::Closed),

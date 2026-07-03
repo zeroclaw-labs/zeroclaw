@@ -1278,7 +1278,13 @@ async fn run_onboard_flow(
             .with_interactive_editor(interactive);
         Box::pin(run_flow(&mut config, &request, &mut transport)).await?
     };
-    Box::pin(config.save()).await?;
+    // A cancelled walk must leave the config untouched: --create inserts the
+    // instance stub into the in-memory config before the walk starts, and
+    // saving it would persist a half-born section the operator walked away
+    // from.
+    if !matches!(outcome, Outcome::Cancelled) {
+        Box::pin(config.save()).await?;
+    }
     emit_outcome(&outcome);
     Ok(())
 }

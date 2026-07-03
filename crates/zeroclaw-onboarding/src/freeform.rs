@@ -54,12 +54,19 @@ Do NOT walk them through fields one at a time and do NOT ask about technical tun
 (timeouts, intervals, stream modes) unless they bring them up; infer sensible values from what \
 they tell you about their situation, and prefer defaults for anything they will not care about. \
 Ask only the questions a human setup assistant would genuinely need answered. \
+You can ONLY set the fields listed below; if the person asks you to change anything else \
+(other agents, autonomy, unrelated settings), say plainly that it is outside this setup. \
+If the person asks for safety, simplicity, or says they do not understand computers, prefer \
+restrictive values (for example exclude the `shell` tool) and say so in one short sentence. \
 Fields marked (secret) are NEVER collected by you: do not ask for the value; it is gathered \
 securely after the person approves. Fields marked (optional) may be omitted from your submission. \
 When you are confident you know every required value, reply with a line containing only \
 `SUBMIT:` followed by a JSON object mapping each field id to its value as a string \
 (yes/no fields: \"yes\" or \"no\"; choice fields: exactly one listed token). \
 Anything you say without the SUBMIT line is shown to the person as conversation. \
+If the person pastes what looks like a secret or token into chat, tell them you cannot \
+accept it there, that it will be collected privately after they approve, and that they \
+should reset it if it is real. Never place it in your submission. \
 If your submission is rejected you will receive the machine error; fix it and resubmit \
 without bothering the person unless you need information only they have.\n";
 
@@ -128,11 +135,23 @@ enum Vetted {
 }
 
 fn vet_submission(spec: &Spec, submission_json: &str) -> Vetted {
-    let parsed: serde_json::Value = match serde_json::from_str(submission_json) {
-        Ok(value) => value,
-        Err(error) => {
+    // Take the first JSON value and ignore anything after it: guides
+    // routinely append commentary after the object, and that prose must not
+    // invalidate an otherwise correct submission.
+    let parsed: serde_json::Value = match serde_json::Deserializer::from_str(submission_json)
+        .into_iter::<serde_json::Value>()
+        .next()
+    {
+        Some(Ok(value)) => value,
+        Some(Err(error)) => {
             return Vetted::Rejected(format!(
                 "Submission rejected: the text after `{SUBMIT_MARKER}` is not valid JSON ({error}). \
+                 Resubmit a single JSON object mapping field ids to string values."
+            ));
+        }
+        None => {
+            return Vetted::Rejected(format!(
+                "Submission rejected: nothing parseable after `{SUBMIT_MARKER}`. \
                  Resubmit a single JSON object mapping field ids to string values."
             ));
         }
@@ -160,11 +179,31 @@ fn vet_submission(spec: &Spec, submission_json: &str) -> Vetted {
         if raw_value.is_null() {
             continue;
         }
-        let raw = match raw_value {
-            serde_json::Value::String(text) => text.clone(),
-            other => other.to_string(),
+        let raw = match flatten_value(raw_value) {
+            Some(text) => text,
+            None => {
+                problems.push(format!(
+                    "- `{key}`: value must be a string (or a flat array of strings), not nested JSON"
+                ));
+                continue;
+            }
         };
-        if node.prompt.optional && is_decline(&raw) {
+        if raw.chars().any(char::is_control) {
+            // A human at the CLI walk can never type a control character;
+            // the guide must not be able to write one either, and embedded
+            // newlines could forge extra lines in the operator preview.
+            problems.push(format!(
+                "- `{key}`: value must not contain control characters"
+            ));
+            continue;
+        }
+        if is_decline(&raw) {
+            if node.prompt.optional {
+                continue;
+            }
+            problems.push(format!(
+                "- `{key}` is required; `{raw}` is not a value. Ask the person if you cannot infer it"
+            ));
             continue;
         }
         match parse_raw(&node.prompt, &raw) {
@@ -206,6 +245,31 @@ fn is_decline(raw: &str) -> bool {
     trimmed.is_empty()
         || trimmed.eq_ignore_ascii_case("none")
         || trimmed.eq_ignore_ascii_case("skip")
+}
+
+/// Flatten a submitted JSON value into the raw string the prompt parser
+/// expects. Guides sometimes send native JSON types (numbers, booleans,
+/// arrays of ids) instead of strings; scalars stringify losslessly and flat
+/// scalar arrays join into the comma-separated shape list fields accept.
+/// Nested objects/arrays have no defensible flattening and are rejected.
+fn flatten_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(flag) => Some(if *flag { "yes" } else { "no" }.to_string()),
+        serde_json::Value::Array(items) => {
+            let mut parts = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    serde_json::Value::String(text) => parts.push(text.clone()),
+                    serde_json::Value::Number(number) => parts.push(number.to_string()),
+                    _ => return None,
+                }
+            }
+            Some(parts.join(", "))
+        }
+        serde_json::Value::Null | serde_json::Value::Object(_) => None,
+    }
 }
 
 /// Render the operator-facing preview of a resolved plan. Secret values are
@@ -251,7 +315,65 @@ fn display_value(value: &ResponseValue) -> String {
 }
 
 fn is_approval(reply: &str) -> bool {
-    crate::llm_transport::parse_yes_no(reply.trim()).unwrap_or(false)
+    if let Some(flag) = crate::llm_transport::parse_yes_no(reply.trim()) {
+        return flag;
+    }
+    // Real operators approve in sentences ("all good, apply it", "yes please
+    // go ahead"). Approve only when an affirmative word is present AND no
+    // hedge/change word is: "yes but disable shell" must NOT apply.
+    let mut affirmative = false;
+    for word in reply
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+    {
+        if APPROVAL_BLOCKERS.contains(&word.as_str()) {
+            return false;
+        }
+        if APPROVAL_WORDS.contains(&word.as_str()) {
+            affirmative = true;
+        }
+    }
+    affirmative
+}
+
+const APPROVAL_WORDS: &[&str] = &[
+    "yes",
+    "yep",
+    "yeah",
+    "yup",
+    "ok",
+    "okay",
+    "sure",
+    "apply",
+    "approve",
+    "approved",
+    "confirm",
+    "confirmed",
+    "good",
+    "perfect",
+    "lgtm",
+    "proceed",
+    "go",
+];
+
+const APPROVAL_BLOCKERS: &[&str] = &[
+    "no", "not", "nope", "dont", "don", "but", "except", "change", "changes", "instead", "wait",
+    "hold", "stop", "cancel", "remove", "add", "actually", "wrong", "fix", "edit", "adjust",
+    "swap", "rather", "unless", "however",
+];
+
+/// A hard operator abort. Checked deterministically on every operator reply
+/// so a person can always leave the session without convincing the guide.
+fn is_cancel(reply: &str) -> bool {
+    let word = reply
+        .trim()
+        .trim_end_matches(['.', '!'])
+        .to_ascii_lowercase();
+    matches!(
+        word.as_str(),
+        "cancel" | "quit" | "abort" | "exit" | "/quit"
+    )
 }
 
 /// Collect every planned secret off-LLM through the masked secret channel,
@@ -303,12 +425,33 @@ where
     let mut message = format!("{FREEFORM_BRIEFING}{}", spec_brief(spec));
     let mut invalid_submissions = 0usize;
 
-    for _ in 0..MAX_SESSION_TURNS {
+    for session_turn in 0..MAX_SESSION_TURNS {
         let reply = turn.run_single(&message).await?;
 
         let Some(submission) = extract_submission(&reply) else {
-            io.say(reply.trim()).await?;
-            message = io.hear().await?;
+            let spoken = reply.trim();
+            if spoken.is_empty() {
+                // A blank guide turn shown to the operator reads as a hang.
+                // Bounce it back to the guide instead of the person.
+                message = format!(
+                    "Your reply was empty. Continue the conversation or submit with `{SUBMIT_MARKER}`."
+                );
+                continue;
+            }
+            io.say(spoken).await?;
+            let operator = io.hear().await?;
+            if is_cancel(&operator) {
+                return Ok(Outcome::Cancelled);
+            }
+            message = if session_turn + 4 >= MAX_SESSION_TURNS {
+                format!(
+                    "{operator}\n\nThe session is nearly out of turns. Resolve now: submit with \
+                     `{SUBMIT_MARKER}` using sensible defaults for anything still unknown, or \
+                     state plainly what single piece of information you still need."
+                )
+            } else {
+                operator
+            };
             continue;
         };
 
@@ -324,6 +467,9 @@ where
                 invalid_submissions = 0;
                 io.say(&render_preview(spec, &plan)).await?;
                 let verdict = io.hear().await?;
+                if is_cancel(&verdict) {
+                    return Ok(Outcome::Cancelled);
+                }
                 if is_approval(&verdict) {
                     let collected = collect_secrets(spec, &plan, secrets).await?;
                     let outcome = spec.apply_prefilled(&plan, &collected, config)?;
@@ -636,5 +782,256 @@ mod tests {
             turn.seen[1]
         );
         assert_eq!(io.heard.len(), 2, "operator saw both previews");
+    }
+
+    #[tokio::test]
+    async fn hedged_approval_does_not_apply() {
+        let mut config = matrix_config();
+        let spec = matrix_spec(&config);
+        let submission = format!("SUBMIT: {}", full_submission(&spec));
+        let mut turn = ScriptedTurn::new(vec![&submission, &submission]);
+        let mut io = ScriptedOperator::new(vec!["yes but change the server to matrix.org", "yes"]);
+        let mut secrets = ScriptedSecrets::new(vec![]);
+
+        run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
+            .await
+            .unwrap();
+
+        assert!(
+            turn.seen[1].contains("did not approve"),
+            "hedged yes routed back to the guide, not applied: {}",
+            turn.seen[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn sentence_approval_applies() {
+        let mut config = matrix_config();
+        let spec = matrix_spec(&config);
+        let submission = format!("SUBMIT: {}", full_submission(&spec));
+        let mut turn = ScriptedTurn::new(vec![&submission]);
+        let mut io = ScriptedOperator::new(vec!["all good, apply it"]);
+        let mut secrets = ScriptedSecrets::new(vec![]);
+
+        let outcome = run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, Outcome::Completed { .. }));
+    }
+
+    #[tokio::test]
+    async fn operator_cancel_ends_session_without_writes() {
+        let mut config = matrix_config();
+        let spec = matrix_spec(&config);
+        let submission = format!("SUBMIT: {}", full_submission(&spec));
+        let mut turn = ScriptedTurn::new(vec![&submission]);
+        let mut io = ScriptedOperator::new(vec!["cancel"]);
+        let mut secrets = ScriptedSecrets::new(vec![]);
+
+        let outcome = run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, Outcome::Cancelled));
+        let matrix = config.channels.matrix.get("home").unwrap();
+        assert!(matrix.homeserver.is_empty(), "nothing was written");
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_conversation_ends_session() {
+        let mut config = matrix_config();
+        let spec = matrix_spec(&config);
+        let mut turn = ScriptedTurn::new(vec!["What server do you folks use?"]);
+        let mut io = ScriptedOperator::new(vec!["quit"]);
+        let mut secrets = ScriptedSecrets::new(vec![]);
+
+        let outcome = run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, Outcome::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn required_field_declined_with_skip_is_rejected() {
+        let mut config = matrix_config();
+        let spec = matrix_spec(&config);
+        let required_text_id = spec
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                !node.prompt.optional
+                    && !node.prompt.routes_secret()
+                    && matches!(node.prompt.response_type, ResponseType::FreeformText)
+            })
+            .map(|(id, _)| id.0.clone())
+            .expect("matrix has a required text field");
+        let bad = format!(r#"SUBMIT: {{"{required_text_id}": "skip"}}"#);
+        let good = format!("SUBMIT: {}", full_submission(&spec));
+        let mut turn = ScriptedTurn::new(vec![&bad, &good]);
+        let mut io = ScriptedOperator::new(vec!["yes"]);
+        let mut secrets = ScriptedSecrets::new(vec![]);
+
+        run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
+            .await
+            .unwrap();
+
+        assert!(
+            turn.seen[1].contains("is required"),
+            "skip on a required field rejected: {}",
+            turn.seen[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn native_json_types_are_flattened() {
+        let mut config = matrix_config();
+        let spec = matrix_spec(&config);
+        let mut map = serde_json::Map::new();
+        for (id, node) in &spec.nodes {
+            if node.prompt.routes_secret() || node.prompt.optional {
+                continue;
+            }
+            let value = match &node.prompt.response_type {
+                ResponseType::YesNo => serde_json::Value::Bool(true),
+                ResponseType::Number => serde_json::json!(42),
+                ResponseType::Choice { options } => {
+                    serde_json::Value::String(options[0].value.clone())
+                }
+                _ => serde_json::Value::String("https://matrix.example.com".into()),
+            };
+            map.insert(id.0.clone(), value);
+        }
+        let submission = format!("SUBMIT: {}", serde_json::Value::Object(map));
+        let mut turn = ScriptedTurn::new(vec![&submission]);
+        let mut io = ScriptedOperator::new(vec!["yes"]);
+        let mut secrets = ScriptedSecrets::new(vec![]);
+
+        let outcome = run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, Outcome::Completed { .. }),
+            "booleans and numbers flatten to the string contract"
+        );
+        assert!(config.channels.matrix.get("home").unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn trailing_prose_after_json_is_tolerated() {
+        let mut config = matrix_config();
+        let spec = matrix_spec(&config);
+        let submission = format!(
+            "SUBMIT: {}\nLet me know if you want anything changed!",
+            full_submission(&spec)
+        );
+        let mut turn = ScriptedTurn::new(vec![&submission]);
+        let mut io = ScriptedOperator::new(vec!["yes"]);
+        let mut secrets = ScriptedSecrets::new(vec![]);
+
+        let outcome = run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, Outcome::Completed { .. }));
+    }
+
+    #[tokio::test]
+    async fn control_characters_in_values_are_rejected() {
+        let mut config = matrix_config();
+        let spec = matrix_spec(&config);
+        let bad =
+            "SUBMIT: {\"channels.matrix.home.homeserver\": \"https://x.com\\nfake_line = true\"}";
+        let good = format!("SUBMIT: {}", full_submission(&spec));
+        let mut turn = ScriptedTurn::new(vec![bad, &good]);
+        let mut io = ScriptedOperator::new(vec!["yes"]);
+        let mut secrets = ScriptedSecrets::new(vec![]);
+
+        run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
+            .await
+            .unwrap();
+
+        assert!(
+            turn.seen[1].contains("control characters"),
+            "newline smuggling rejected: {}",
+            turn.seen[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_guide_reply_bounces_back_without_operator_turn() {
+        let mut config = matrix_config();
+        let spec = matrix_spec(&config);
+        let submission = format!("SUBMIT: {}", full_submission(&spec));
+        let mut turn = ScriptedTurn::new(vec!["   ", &submission]);
+        let mut io = ScriptedOperator::new(vec!["yes"]);
+        let mut secrets = ScriptedSecrets::new(vec![]);
+
+        let outcome = run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, Outcome::Completed { .. }));
+        assert!(
+            turn.seen[1].contains("Your reply was empty"),
+            "blank turn bounced to guide: {}",
+            turn.seen[1]
+        );
+        assert_eq!(io.heard.len(), 1, "operator only ever saw the preview");
+    }
+
+    #[tokio::test]
+    async fn submission_budget_aborts_after_max_consecutive_rejections() {
+        let mut config = matrix_config();
+        let spec = matrix_spec(&config);
+        let bad = r#"SUBMIT: {"nonsense.field": "x"}"#;
+        let mut turn = ScriptedTurn::new(vec![bad; MAX_INVALID_SUBMISSIONS]);
+        let mut io = ScriptedOperator::new(vec![]);
+        let mut secrets = ScriptedSecrets::new(vec![]);
+
+        let error = run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, FreeformError::SubmissionBudgetExhausted));
+        assert!(io.heard.is_empty(), "operator never saw machine errors");
+    }
+
+    #[test]
+    fn approval_parser_matrix() {
+        for approve in [
+            "yes",
+            "y",
+            "Yes please",
+            "yep looks good",
+            "ok apply it",
+            "all good, apply it",
+            "sure go ahead",
+            "LGTM",
+        ] {
+            assert!(is_approval(approve), "should approve: {approve}");
+        }
+        for reject in [
+            "no",
+            "yes but change the port",
+            "ok wait",
+            "looks wrong",
+            "apply it except the shell thing",
+            "hmm",
+            "add archiving first",
+            "dont",
+            "",
+        ] {
+            assert!(!is_approval(reject), "should NOT approve: {reject}");
+        }
+    }
+
+    #[test]
+    fn cancel_parser_matrix() {
+        for cancel in [
+            "cancel", "Cancel", "quit", "abort", "exit", "/quit", "cancel.",
+        ] {
+            assert!(is_cancel(cancel), "should cancel: {cancel}");
+        }
+        for keep in ["cancel the archive bit", "no", "quit asking me stuff"] {
+            assert!(!is_cancel(keep), "should NOT cancel: {keep}");
+        }
     }
 }
