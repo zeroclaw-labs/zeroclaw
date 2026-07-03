@@ -3290,6 +3290,32 @@ async fn main() -> Result<()> {
 
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
+    // Malformed sections the resilient loader dropped to defaults are logged
+    // to the trace file, but the terminal is muted unless --verbose. Echo
+    // them to stderr unconditionally: an operator whose `[plugins]` (or any
+    // other block) silently reset to defaults must see it on every command,
+    // not only when spelunking logs. Security-critical drops additionally
+    // hard-gate serving in gate_security_posture.
+    for section in config
+        .degraded_sections
+        .iter()
+        .chain(config.degraded_security.iter())
+    {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-config-section-degraded",
+                &[
+                    ("section", section),
+                    ("path", &config.config_path.display().to_string()),
+                ],
+                "warning: config section is malformed and was reset to defaults \
+                 for this run. Values in that section are NOT in effect. Run \
+                 `zeroclaw config migrate` to see the parse error, then repair \
+                 the file."
+            )
+        );
+    }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
     #[cfg(feature = "agent-runtime")]
