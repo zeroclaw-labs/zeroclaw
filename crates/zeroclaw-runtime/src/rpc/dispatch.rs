@@ -1623,10 +1623,18 @@ impl RpcDispatcher {
                             tokio::task::spawn_blocking(move || store.set_token_count(&sid, it))
                                 .await;
                     }
-                    // Store-then-emit: persist a TodoWrite plan before its
-                    // notification goes out, so a racing reconnect reads a
-                    // consistent list. No-op for every other event.
-                    persist_plan_if_any(&sessions_for_plan, &sid, &event).await;
+                    // Store-then-emit: persist a TodoWrite plan (both the
+                    // in-memory live cache and, for ACP sessions, the durable
+                    // store) before its notification goes out, so a racing
+                    // reconnect — or a later resume — reads a consistent list.
+                    // No-op for every other event.
+                    persist_plan_if_any(
+                        &sessions_for_plan,
+                        acp_token_store.as_ref(),
+                        &sid,
+                        &event,
+                    )
+                    .await;
                     if let Some(n) = notification_for_turn_event(&sid, &event, max_ctx) {
                         let _ = rpc.send_raw(n).await;
                     }
@@ -3942,16 +3950,42 @@ fn truncate_memory_previews(
     entries
 }
 
-/// Persist a `TurnEvent::Plan` into per-session state before it is
-/// emitted, so a racing reconnect reads a consistent plan. No-op for
-/// every other event. This is the "store" half of store-then-emit.
+/// Persist a `TurnEvent::Plan` before it is emitted, so a racing
+/// reconnect — or a later `session/resume` — reads a consistent plan.
+/// Writes both the in-memory live cache (`sessions`) and, when an ACP
+/// durable store is present, the on-disk `plan_json` column (via
+/// `spawn_blocking`, since SQLite is synchronous). No-op for every
+/// other event. Durable-write failures are logged-and-swallowed: the
+/// in-memory cache is still authoritative for the live session.
 async fn persist_plan_if_any(
     sessions: &crate::rpc::session::SessionStore,
+    acp_store: Option<&std::sync::Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
     session_id: &str,
     event: &TurnEvent,
 ) {
-    if let TurnEvent::Plan { entries } = event {
-        sessions.set_plan(session_id, entries.clone()).await;
+    let TurnEvent::Plan { entries } = event else {
+        return;
+    };
+    sessions.set_plan(session_id, entries.clone()).await;
+    if let Some(store) = acp_store {
+        let store = store.clone();
+        let sid = session_id.to_string();
+        let entries = entries.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) = store.set_plan(&sid, &entries) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": sid,
+                            "error": e.to_string(),
+                        })),
+                    "Failed to persist TodoWrite plan to ACP session store"
+                );
+            }
+        })
+        .await;
     }
 }
 
@@ -4877,7 +4911,7 @@ mod tests {
         let event = TurnEvent::Plan {
             entries: entries.clone(),
         };
-        persist_plan_if_any(&store, sid, &event).await;
+        persist_plan_if_any(&store, None, sid, &event).await;
         assert_eq!(store.get_plan(sid).await.unwrap(), entries);
     }
 
@@ -4887,6 +4921,7 @@ mod tests {
         let store = store_with_one_session(sid).await;
         persist_plan_if_any(
             &store,
+            None,
             sid,
             &TurnEvent::Chunk {
                 delta: "hi".into(),
@@ -4894,6 +4929,36 @@ mod tests {
         )
         .await;
         assert!(store.get_plan(sid).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_event_persists_to_durable_acp_store() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+        let sid = "durable-plan-sess";
+        let sessions = store_with_one_session(sid).await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let acp = Arc::new(
+            zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap(),
+        );
+        acp.create_session(sid, "alpha", tmp.path().to_str().unwrap())
+            .unwrap();
+
+        let entries = vec![PlanEntry {
+            content: "Durable".to_string(),
+            status: PlanStatus::Pending,
+            priority: PlanPriority::Low,
+            active_form: None,
+        }];
+        let event = TurnEvent::Plan {
+            entries: entries.clone(),
+        };
+        persist_plan_if_any(&sessions, Some(&acp), sid, &event).await;
+
+        // In-memory cache updated…
+        assert_eq!(sessions.get_plan(sid).await.unwrap(), entries);
+        // …and durable store updated (survives daemon restart / eviction).
+        assert_eq!(acp.get_plan(sid).unwrap(), entries);
     }
 
     #[test]
