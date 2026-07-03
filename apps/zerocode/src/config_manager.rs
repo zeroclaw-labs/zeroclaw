@@ -4686,67 +4686,12 @@ fn render_breadcrumb(frame: &mut Frame, area: Rect, segments: &[String]) {
 
 // ── $EDITOR helper ───────────────────────────────────────────────
 
-/// Open `content` in `$EDITOR` (or `$VISUAL`). Returns `Ok(edited)` on
-/// success, or `Err(reason)` if the editor could not be launched / exited
-/// non-zero. The caller falls back to the inline TUI editor on `Err`.
 fn edit_in_external_editor(
     term: &mut Term,
     content: &str,
     filename_hint: &str,
 ) -> Result<String, String> {
-    let Some(editor) = crate::editor::editor_from_env_or_path() else {
-        return Err("no external editor found; set VISUAL or EDITOR".to_string());
-    };
-
-    // Write content to a temp file with the right extension.
-    let dir = std::env::temp_dir();
-    let tmp_path = dir.join(filename_hint);
-    std::fs::write(&tmp_path, content).map_err(|e| format!("tmp write: {e}"))?;
-
-    // Suspend TUI: leave alternate screen + disable raw mode so the
-    // child process gets a normal terminal.
-    let _ = execute!(
-        term.backend_mut(),
-        PopKeyboardEnhancementFlags,
-        LeaveAlternateScreen
-    );
-    let _ = disable_raw_mode();
-
-    // Launch via `sh -c` so $EDITOR values with flags (e.g. "vim -u NONE",
-    // "code --wait") work correctly.
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("{} \"{}\"", editor, tmp_path.display()))
-        .status();
-
-    // Restore TUI.
-    let _ = enable_raw_mode();
-    let _ = execute!(term.backend_mut(), EnterAlternateScreen);
-    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
-        let _ = execute!(
-            term.backend_mut(),
-            PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
-        );
-    }
-    // Force a full redraw so ratatui repaints everything.
-    let _ = term.clear();
-
-    match status {
-        Ok(s) if s.success() => {
-            let edited =
-                std::fs::read_to_string(&tmp_path).map_err(|e| format!("tmp read: {e}"))?;
-            let _ = std::fs::remove_file(&tmp_path);
-            Ok(edited)
-        }
-        Ok(s) => {
-            let _ = std::fs::remove_file(&tmp_path);
-            Err(format!("{editor} exited with {s}"))
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp_path);
-            Err(format!("failed to launch {editor}: {e}"))
-        }
-    }
+    crate::editor::edit_text_in_external_editor(term, content, filename_hint)
 }
 
 #[cfg(test)]

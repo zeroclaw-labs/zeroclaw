@@ -50,6 +50,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 pulldown-cmark = { version = "0.13", default-features = false }
 mime_guess = "2"
 shellexpand = "3.1"
+shlex = "1.3"
 directories = { workspace = true }
 fluent = "0.16"
 unic-langid = "0.9"

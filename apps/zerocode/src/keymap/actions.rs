@@ -332,6 +332,9 @@ keyactions! {
         AutocompletePrev   [] => "autocomplete prev",
         AutocompleteAccept [Chord::key(KeyCode::Tab)] => "accept completion",
         AutocompleteCancel [Chord::key(KeyCode::Esc)] => "cancel completion",
+        OpenExternalEditor [Chord::with(KeyCode::Char('e'), KeyModifiers::ALT)] => "edit in editor",
+        StashDraft         [Chord::with(KeyCode::Char('s'), KeyModifiers::ALT)] => "stash draft",
+        RestoreDraft       [Chord::with(KeyCode::Char('r'), KeyModifiers::ALT)] => "restore draft",
         AttachClipboard    [] => "attach clipboard",
     }
 }

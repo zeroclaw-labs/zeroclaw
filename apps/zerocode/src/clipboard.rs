@@ -4,9 +4,7 @@
 //! clipboard and read text from the clipboard. Gracefully degrades —
 //! returns `None` if no tool is available or no image/text is present.
 
-use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
 
 /// Try to read image data from the system clipboard.
 ///
@@ -207,13 +205,24 @@ fn run_text_tool(tool: &TextTool) -> Option<Vec<u8>> {
     Some(output.stdout)
 }
 
-/// Generate a temp file path for a clipboard image.
-pub(crate) fn clipboard_temp_path(ext: &str) -> PathBuf {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_millis();
-    std::env::temp_dir().join(format!("clipboard_{ts}.{ext}"))
+/// Create a temp file for a clipboard image.
+pub(crate) fn clipboard_temp_file(ext: &str) -> std::io::Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix("clipboard-")
+        .suffix(&format!(".{}", sanitized_extension(ext)))
+        .tempfile()
+}
+
+fn sanitized_extension(ext: &str) -> String {
+    let cleaned: String = ext
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect();
+    if cleaned.is_empty() {
+        "png".to_string()
+    } else {
+        cleaned
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -259,9 +268,16 @@ mod tests {
     }
 
     #[test]
-    fn temp_path_has_extension() {
-        let p = clipboard_temp_path("png");
-        assert!(p.to_str().unwrap().ends_with(".png"));
-        assert!(p.to_str().unwrap().contains("clipboard_"));
+    fn temp_file_has_extension() {
+        let file = clipboard_temp_file("png").unwrap();
+        let path = file.path().to_string_lossy();
+        assert!(path.ends_with(".png"));
+        assert!(path.contains("clipboard-"));
+    }
+
+    #[test]
+    fn temp_file_sanitizes_extension() {
+        let file = clipboard_temp_file("p n/g").unwrap();
+        assert!(file.path().to_string_lossy().ends_with(".png"));
     }
 }

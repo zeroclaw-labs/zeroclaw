@@ -877,6 +877,29 @@ impl Transcript {
         }
     }
 
+    fn open_prompt_editor(term: &mut crate::config_manager::Term, state: &mut TranscriptState) {
+        if state.turn_in_flight || state.queue_len() > 0 {
+            state.set_info_notice(crate::i18n::t("zc-input-editor-busy"));
+            return;
+        }
+        match crate::editor::edit_text_in_external_editor(
+            term,
+            state.input_bar.editor_buffer(),
+            "prompt.md",
+        ) {
+            Ok(edited) => {
+                state.input_bar.replace_editor_buffer(edited);
+                state.set_info_notice(crate::i18n::t("zc-input-editor-loaded"));
+            }
+            Err(error) => {
+                state.set_info_notice(crate::i18n::t_args(
+                    "zc-input-editor-error",
+                    &[("error", &error)],
+                ));
+            }
+        }
+    }
+
     fn drain_model_fetch_results(&mut self) {
         while let Ok(res) = self.model_fetch_rx.try_recv() {
             self.apply_model_fetch(res);
@@ -1499,6 +1522,24 @@ impl Transcript {
                 InputBarAction::OpenModelProviderPicker => {
                     let rpc = self.rpc.clone();
                     Self::open_provider_picker(&rpc, state).await;
+                    return false;
+                }
+                InputBarAction::OpenExternalEditor => {
+                    Self::open_prompt_editor(term, state);
+                    return false;
+                }
+                InputBarAction::StashedDraft(draft) => {
+                    state.set_info_notice(crate::i18n::t_args(
+                        "zc-input-draft-stashed",
+                        &[("preview", &first_line_preview(&draft, 48))],
+                    ));
+                    return false;
+                }
+                InputBarAction::RestoredDraft(draft) => {
+                    state.set_info_notice(crate::i18n::t_args(
+                        "zc-input-draft-restored",
+                        &[("preview", &first_line_preview(&draft, 48))],
+                    ));
                     return false;
                 }
                 InputBarAction::Consumed => return false,
@@ -3130,12 +3171,47 @@ fn session_status_text(state: &TranscriptState, width: usize) -> String {
     {
         parts.push(tokens);
     }
+    if state.queue_len() > 0 {
+        parts.push(queue_status_text(state));
+    }
+    if state.input_bar.prompt_history_len() > 0 {
+        parts.push(crate::i18n::t_args(
+            "zc-code-status-history",
+            &[("count", &state.input_bar.prompt_history_len().to_string())],
+        ));
+    }
+    if state.input_bar.draft_stash_len() > 0 {
+        parts.push(crate::i18n::t_args(
+            "zc-code-status-stash",
+            &[("count", &state.input_bar.draft_stash_len().to_string())],
+        ));
+    }
+    if let Some(editor) = crate::editor::editor_label() {
+        parts.push(crate::i18n::t_args(
+            "zc-code-status-editor",
+            &[("editor", &editor)],
+        ));
+    }
     if let Some(cwd) = cwd_status_text(state) {
         parts.push(cwd);
     }
     parts.push(crate::i18n::t("zc-code-status-help"));
     let line = format!(" {} ", parts.join(" · "));
     first_line_preview(&line, width)
+}
+
+fn queue_status_text(state: &TranscriptState) -> String {
+    if state.queue_paused() {
+        crate::i18n::t_args(
+            "zc-code-status-queue-paused",
+            &[("count", &state.queue_len().to_string())],
+        )
+    } else {
+        crate::i18n::t_args(
+            "zc-code-status-queue",
+            &[("count", &state.queue_len().to_string())],
+        )
+    }
 }
 
 fn context_status_text(input: Option<u64>, max: Option<u64>) -> Option<String> {
@@ -6380,6 +6456,7 @@ pub async fn open_editor_for_content(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     fn state() -> TranscriptState {
         TranscriptState::new("sess-1".to_string(), "myagent".to_string())
@@ -6943,6 +7020,39 @@ mod tests {
             s.title(),
             "ag  abcdef1  anthropic.personal_code  claude-opus-4-8"
         );
+    }
+
+    #[test]
+    fn status_row_includes_prompt_command_metadata() {
+        let mut state = state();
+        state.set_model_identity(Some("openai.work"), Some("gpt-5"));
+        state.context_input_tokens = Some(1234);
+        state.context_max_tokens = Some(8192);
+        state.turn_in_flight = true;
+        state
+            .enqueue_message("queued".to_string(), Vec::new())
+            .unwrap();
+        state.input_bar.insert_text("remember me");
+        assert!(matches!(
+            state.input_bar.handle_key(KeyEvent::from(KeyCode::Enter)),
+            InputBarAction::Submit { .. }
+        ));
+        state.input_bar.insert_text("stash me");
+        assert!(matches!(
+            state
+                .input_bar
+                .handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT)),
+            InputBarAction::StashedDraft(_)
+        ));
+
+        let status = session_status_text(&state, 240);
+
+        assert!(status.contains("myagent"));
+        assert!(status.contains("openai.work/gpt-5"));
+        assert!(status.contains("ctx 1,234 / 8,192"));
+        assert!(status.contains("queue 1"));
+        assert!(status.contains("history 1"));
+        assert!(status.contains("stash 1"));
     }
 
     #[test]

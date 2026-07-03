@@ -30,6 +30,7 @@ use crate::turn_status::TurnStatus;
 
 /// Maximum number of visible content rows before the input bar scrolls.
 const MAX_INPUT_ROWS: u16 = 5;
+const MAX_PROMPT_HISTORY: usize = 100;
 
 /// Slash commands available for auto-complete.
 const SLASH_COMMANDS: &[&str] = &[
@@ -85,6 +86,12 @@ pub(crate) enum InputBarAction {
     /// User typed `/model` with no argument — parent opens the model picker
     /// modal over the cached model catalog.
     OpenModelPicker,
+    /// User requested editing the prompt draft in `$VISUAL` / `$EDITOR`.
+    OpenExternalEditor,
+    /// User stored the current prompt draft without sending it.
+    StashedDraft(String),
+    /// User restored the latest stashed prompt draft.
+    RestoredDraft(String),
     /// User typed `/model-provider` with no argument — parent opens the
     /// two-stage model_provider picker modal.
     OpenModelProviderPicker,
@@ -535,6 +542,16 @@ pub(crate) struct InputBarState {
     model_catalog_provider: Option<String>,
     /// Cached model_provider names for `/model-provider <partial>` autocomplete.
     provider_catalog: Vec<String>,
+    prompt_history: Vec<String>,
+    draft_stash: Vec<StashedDraft>,
+    history_cursor: Option<usize>,
+    history_draft: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct StashedDraft {
+    text: String,
+    attachments: Vec<PendingAttachment>,
 }
 
 /// What the autocomplete popup is currently offering, so Tab-completion knows
@@ -569,6 +586,10 @@ impl InputBarState {
             model_catalog: Vec::new(),
             model_catalog_provider: None,
             provider_catalog: Vec::new(),
+            prompt_history: Vec::new(),
+            draft_stash: Vec::new(),
+            history_cursor: None,
+            history_draft: None,
         }
     }
 
@@ -622,6 +643,7 @@ impl InputBarState {
             self.input.replace_range(start..end, "");
             self.cursor = start;
             self.selection_anchor = None;
+            self.reset_history_cursor();
             Some(deleted)
         } else {
             None
@@ -701,6 +723,107 @@ impl InputBarState {
         }
     }
 
+    pub fn editor_buffer(&self) -> &str {
+        &self.input
+    }
+
+    pub fn replace_editor_buffer(&mut self, text: String) {
+        self.load_for_edit(text, self.pending_attachments.clone());
+    }
+
+    pub fn prompt_history_len(&self) -> usize {
+        self.prompt_history.len()
+    }
+
+    #[cfg(test)]
+    pub fn history_cursor(&self) -> Option<usize> {
+        self.history_cursor
+    }
+
+    pub fn draft_stash_len(&self) -> usize {
+        self.draft_stash.len()
+    }
+
+    fn stash_current_draft(&mut self) -> Option<String> {
+        let draft = self.input.trim().to_string();
+        if draft.is_empty() {
+            return None;
+        }
+        let stashed = StashedDraft {
+            text: self.input.clone(),
+            attachments: std::mem::take(&mut self.pending_attachments),
+        };
+        self.draft_stash.push(stashed);
+        self.clear_input();
+        Some(draft)
+    }
+
+    fn restore_latest_draft(&mut self) -> Option<String> {
+        let draft = self.draft_stash.pop()?;
+        let text = draft.text.clone();
+        self.load_for_edit(draft.text, draft.attachments);
+        Some(text)
+    }
+
+    fn remember_prompt(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self
+            .prompt_history
+            .last()
+            .is_some_and(|entry| entry == text)
+        {
+            return;
+        }
+        self.prompt_history.push(text.to_string());
+        if self.prompt_history.len() > MAX_PROMPT_HISTORY {
+            self.prompt_history.remove(0);
+        }
+    }
+
+    fn reset_history_cursor(&mut self) {
+        self.history_cursor = None;
+        self.history_draft = None;
+    }
+
+    fn recall_history_prev(&mut self) -> bool {
+        if self.prompt_history.is_empty() {
+            return false;
+        }
+        if self.history_cursor.is_none() {
+            self.history_draft = Some(self.input.clone());
+        }
+        let next = self
+            .history_cursor
+            .map(|cursor| cursor.saturating_sub(1))
+            .unwrap_or_else(|| self.prompt_history.len().saturating_sub(1));
+        self.load_history_entry(next);
+        true
+    }
+
+    fn recall_history_next(&mut self) -> bool {
+        let Some(cursor) = self.history_cursor else {
+            return false;
+        };
+        if cursor + 1 < self.prompt_history.len() {
+            self.load_history_entry(cursor + 1);
+        } else {
+            let draft = self.history_draft.take().unwrap_or_default();
+            self.replace_input(draft, self.pending_attachments.clone());
+            self.history_cursor = None;
+        }
+        true
+    }
+
+    fn load_history_entry(&mut self, cursor: usize) {
+        if let Some(entry) = self.prompt_history.get(cursor).cloned() {
+            self.replace_input(entry, self.pending_attachments.clone());
+            self.history_cursor = Some(cursor);
+        }
+    }
+
     /// Replace the input's catalog cache for argument autocomplete. Called by
     /// the app layer after an async `catalog_models` / model_provider fetch.
     pub fn set_model_catalog(&mut self, model_provider: String, models: Vec<String>) {
@@ -752,6 +875,7 @@ impl InputBarState {
             }
         }
         self.cursor = self.input.len();
+        self.reset_history_cursor();
     }
 
     /// Enter pressed while the autocomplete popup is open: accept the
@@ -784,6 +908,7 @@ impl InputBarState {
         self.delete_selection();
         self.input.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+        self.reset_history_cursor();
         self.update_autocomplete();
     }
 
@@ -802,6 +927,7 @@ impl InputBarState {
             let prev_start = self.cursor - prev_grapheme.len();
             self.input.replace_range(prev_start..self.cursor, "");
             self.cursor = prev_start;
+            self.reset_history_cursor();
             self.update_autocomplete();
         }
     }
@@ -873,6 +999,24 @@ impl InputBarState {
         true
     }
 
+    fn cursor_on_first_visual_row(&self) -> bool {
+        let width = self.last_inner_width;
+        if width == 0 {
+            return true;
+        }
+        let (row, _) = cursor_to_visual(&self.input, self.cursor, width);
+        row == 0
+    }
+
+    fn cursor_on_last_visual_row(&self) -> bool {
+        let width = self.last_inner_width;
+        if width == 0 {
+            return true;
+        }
+        let (row, _) = cursor_to_visual(&self.input, self.cursor, width);
+        row + 1 >= wrapped_line_count(&self.input, width)
+    }
+
     /// Extract the input text and reset the cursor.
     pub fn take_input(&mut self) -> String {
         self.cursor = 0;
@@ -887,6 +1031,7 @@ impl InputBarState {
         self.delete_selection();
         self.input.insert_str(self.cursor, text);
         self.cursor += text.len();
+        self.reset_history_cursor();
         self.update_autocomplete();
     }
 
@@ -897,6 +1042,11 @@ impl InputBarState {
     }
 
     pub fn load_for_edit(&mut self, text: String, attachments: Vec<PendingAttachment>) {
+        self.replace_input(text, attachments);
+        self.reset_history_cursor();
+    }
+
+    fn replace_input(&mut self, text: String, attachments: Vec<PendingAttachment>) {
         self.input = text;
         self.cursor = self.input.len();
         self.scroll_offset = 0;
@@ -939,6 +1089,7 @@ impl InputBarState {
         self.file_explorer = None;
         self.clear_selection();
         self.dismiss_autocomplete();
+        self.reset_history_cursor();
         self.cleanup_temps();
     }
 
@@ -950,12 +1101,18 @@ impl InputBarState {
         self.scroll_offset = 0;
         self.clear_selection();
         self.dismiss_autocomplete();
+        self.reset_history_cursor();
     }
 
     /// Remove clipboard temp files (called after turn completes).
     pub fn cleanup_temps(&mut self) {
         for path in self.clipboard_temps.drain(..) {
-            let _ = std::fs::remove_file(path);
+            if path.exists() {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) => eprintln!("clipboard temp cleanup failed: {error}"),
+                }
+            }
         }
     }
 
@@ -1056,11 +1213,18 @@ impl InputBarState {
                 return self.handle_inject();
             }
             Some(IbWidgetAction::HistoryPrev) => {
-                self.move_cursor_up();
+                if !self.cursor_on_first_visual_row() || !self.recall_history_prev() {
+                    self.move_cursor_up();
+                }
                 return InputBarAction::Consumed;
             }
             Some(IbWidgetAction::HistoryNext) => {
-                self.move_cursor_down();
+                if self.history_cursor.is_none()
+                    || !self.cursor_on_last_visual_row()
+                    || !self.recall_history_next()
+                {
+                    self.move_cursor_down();
+                }
                 return InputBarAction::Consumed;
             }
             Some(IbWidgetAction::OpenFileBrowser) => {
@@ -1113,6 +1277,21 @@ impl InputBarState {
             }
             Some(IbWidgetAction::ClearInput) => {
                 self.clear_input();
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::OpenExternalEditor) => {
+                return InputBarAction::OpenExternalEditor;
+            }
+            Some(IbWidgetAction::StashDraft) => {
+                if let Some(draft) = self.stash_current_draft() {
+                    return InputBarAction::StashedDraft(draft);
+                }
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::RestoreDraft) => {
+                if let Some(draft) = self.restore_latest_draft() {
+                    return InputBarAction::RestoredDraft(draft);
+                }
                 return InputBarAction::Consumed;
             }
             _ => {}
@@ -1320,6 +1499,8 @@ impl InputBarState {
                 }
                 SlashCommand::ModelProviderPicker => InputBarAction::OpenModelProviderPicker,
                 SlashCommand::NotACommand => {
+                    self.remember_prompt(&msg);
+                    self.reset_history_cursor();
                     let attachments = self.take_attachments();
                     InputBarAction::Submit {
                         text: Some(msg),
@@ -1343,6 +1524,8 @@ impl InputBarState {
         let msg = self.take_input();
         if !msg.is_empty() {
             if matches!(parse_slash_command(&msg), SlashCommand::NotACommand) {
+                self.remember_prompt(&msg);
+                self.reset_history_cursor();
                 let attachments = self.take_attachments();
                 InputBarAction::Inject {
                     text: Some(msg),
@@ -1367,13 +1550,36 @@ impl InputBarState {
         match clipboard::read_clipboard_image() {
             Some((bytes, mime)) => {
                 let ext = mime.rsplit('/').next().unwrap_or("png");
-                let tmp_path = clipboard::clipboard_temp_path(ext);
-                if let Err(e) = std::fs::write(&tmp_path, &bytes) {
+                let mut tmp_file = match clipboard::clipboard_temp_file(ext) {
+                    Ok(tmp_file) => tmp_file,
+                    Err(error) => {
+                        return InputBarAction::StatusMessage(crate::i18n::t_args(
+                            "zc-input-clipboard-error",
+                            &[("error", &error.to_string())],
+                        ));
+                    }
+                };
+                if let Err(error) = std::io::Write::write_all(&mut tmp_file, &bytes) {
                     return InputBarAction::StatusMessage(crate::i18n::t_args(
                         "zc-input-clipboard-error",
-                        &[("error", &e.to_string())],
+                        &[("error", &error.to_string())],
                     ));
                 }
+                if let Err(error) = std::io::Write::flush(&mut tmp_file) {
+                    return InputBarAction::StatusMessage(crate::i18n::t_args(
+                        "zc-input-clipboard-error",
+                        &[("error", &error.to_string())],
+                    ));
+                }
+                let (_file, tmp_path) = match tmp_file.keep() {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        return InputBarAction::StatusMessage(crate::i18n::t_args(
+                            "zc-input-clipboard-error",
+                            &[("error", &error.error.to_string())],
+                        ));
+                    }
+                };
                 match PendingAttachment::from_path(tmp_path.to_str().unwrap_or("")) {
                     Ok(mut att) => {
                         att.source = crate::attachment::AttachmentSource::Clipboard;
@@ -1385,11 +1591,16 @@ impl InputBarState {
                             &[("label", &label)],
                         ))
                     }
-                    Err(e) => {
-                        let _ = std::fs::remove_file(&tmp_path);
+                    Err(error) => {
+                        if let Err(cleanup_error) = std::fs::remove_file(&tmp_path) {
+                            return InputBarAction::StatusMessage(crate::i18n::t_args(
+                                "zc-input-clipboard-error",
+                                &[("error", &cleanup_error.to_string())],
+                            ));
+                        }
                         InputBarAction::StatusMessage(crate::i18n::t_args(
                             "zc-input-clipboard-error",
-                            &[("error", &e.to_string())],
+                            &[("error", &error.to_string())],
                         ))
                     }
                 }
@@ -1572,7 +1783,7 @@ impl InputBarState {
                 (String::new(), theme::dim_style())
             } else {
                 (
-                    crate::i18n::t("zc-input-placeholder-code"),
+                    crate::i18n::t("zc-input-placeholder-code-rich"),
                     theme::dim_style(),
                 )
             };
@@ -2197,6 +2408,101 @@ mod tests {
     }
 
     #[test]
+    fn prompt_history_recalls_submitted_prompts() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("first prompt");
+        assert!(matches!(bar.handle_enter(), InputBarAction::Submit { .. }));
+        bar.insert_text("second prompt");
+        assert!(matches!(bar.handle_enter(), InputBarAction::Submit { .. }));
+
+        assert!(bar.recall_history_prev());
+        assert_eq!(bar.input(), "second prompt");
+        assert_eq!(bar.history_cursor(), Some(1));
+        assert!(bar.recall_history_prev());
+        assert_eq!(bar.input(), "first prompt");
+        assert_eq!(bar.history_cursor(), Some(0));
+        assert!(bar.recall_history_next());
+        assert_eq!(bar.input(), "second prompt");
+        assert!(bar.recall_history_next());
+        assert_eq!(bar.input(), "");
+        assert_eq!(bar.history_cursor(), None);
+    }
+
+    #[test]
+    fn draft_stash_round_trips_without_sending() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("save for later");
+
+        let stashed = bar.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
+        assert!(
+            matches!(stashed, InputBarAction::StashedDraft(ref text) if text == "save for later")
+        );
+        assert_eq!(bar.input(), "");
+        assert_eq!(bar.draft_stash_len(), 1);
+
+        let restored = bar.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert!(
+            matches!(restored, InputBarAction::RestoredDraft(ref text) if text == "save for later")
+        );
+        assert_eq!(bar.input(), "save for later");
+        assert_eq!(bar.draft_stash_len(), 0);
+    }
+
+    #[test]
+    fn draft_stash_round_trips_attachments() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("send file");
+        bar.add_attachment(test_attachment("a.txt"));
+
+        let stashed = bar.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
+        assert!(matches!(stashed, InputBarAction::StashedDraft(_)));
+        assert!(bar.pending_attachments().is_empty());
+        bar.add_attachment(test_attachment("b.txt"));
+
+        let restored = bar.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert!(matches!(restored, InputBarAction::RestoredDraft(_)));
+        assert_eq!(bar.pending_attachments().len(), 1);
+        assert_eq!(bar.pending_attachments()[0].filename, "a.txt");
+    }
+
+    #[test]
+    fn history_edit_exits_recall_mode() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("sent prompt");
+        assert!(matches!(bar.handle_enter(), InputBarAction::Submit { .. }));
+
+        assert!(bar.recall_history_prev());
+        bar.push_input_char('!');
+        assert_eq!(bar.history_cursor(), None);
+        assert!(!bar.recall_history_next());
+        assert_eq!(bar.input(), "sent prompt!");
+    }
+
+    #[test]
+    fn history_up_preserves_multiline_navigation() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("old prompt");
+        assert!(matches!(bar.handle_enter(), InputBarAction::Submit { .. }));
+        bar.insert_text("line one\nline two");
+        bar.last_inner_width = 80;
+        bar.cursor = bar.input.len();
+
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Up));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "line one\nline two");
+        assert_eq!(bar.history_cursor(), None);
+        assert!(bar.cursor < bar.input.len());
+    }
+
+    #[test]
+    fn external_editor_action_comes_from_keymap() {
+        let mut bar = InputBarState::new();
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT));
+        assert!(matches!(action, InputBarAction::OpenExternalEditor));
+    }
+
+    #[test]
     fn model_picker_command_returns_open_action() {
         let mut bar = InputBarState::new();
         bar.insert_text("/model");
@@ -2480,6 +2786,16 @@ mod tests {
                 recovered, cursor,
                 "round-trip failed for cursor={cursor} -> ({row},{col}) -> {recovered}"
             );
+        }
+    }
+
+    fn test_attachment(filename: &str) -> PendingAttachment {
+        PendingAttachment {
+            path: PathBuf::from(format!("/tmp/{filename}")),
+            mime_type: "text/plain".into(),
+            filename: filename.into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
         }
     }
 
