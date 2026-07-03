@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScoutSource {
     GitHub,
-    ClawHub,
     HuggingFace,
 }
 
@@ -22,7 +21,6 @@ impl std::str::FromStr for ScoutSource {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         Ok(match s.to_lowercase().as_str() {
             "github" => Self::GitHub,
-            "clawhub" => Self::ClawHub,
             "huggingface" | "hf" => Self::HuggingFace,
             _ => {
                 ::zeroclaw_log::record!(
@@ -248,10 +246,6 @@ mod tests {
         assert_eq!(
             "GitHub".parse::<ScoutSource>().unwrap(),
             ScoutSource::GitHub
-        );
-        assert_eq!(
-            "clawhub".parse::<ScoutSource>().unwrap(),
-            ScoutSource::ClawHub
         );
         assert_eq!(
             "huggingface".parse::<ScoutSource>().unwrap(),

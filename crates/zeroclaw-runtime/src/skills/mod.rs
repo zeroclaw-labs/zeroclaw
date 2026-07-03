@@ -2,15 +2,11 @@ pub mod skill_http;
 pub mod skill_tool;
 use anyhow::{Context, Result};
 use directories::UserDirs;
-use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
-
-use zip::ZipArchive;
 
 pub mod audit;
 pub mod bundle;
@@ -41,14 +37,6 @@ pub(crate) use suggestions::render_missing_skill_install_suggestion;
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
-
-// ─── ClawHub / OpenClaw registry installers ───────────────────────────────
-const CLAWHUB_DOMAIN: &str = "clawhub.ai";
-const CLAWHUB_WWW_DOMAIN: &str = "www.clawhub.ai";
-const CLAWHUB_DOWNLOAD_API: &str = "https://clawhub.ai/api/v1/download";
-const MAX_SKILL_ZIP_BYTES: u64 = 50 * 1024 * 1024;
-const MAX_SKILL_ZIP_ENTRIES: usize = 500;
-const MAX_SKILL_ZIP_EXPANSION_RATIO: u64 = 10;
 
 // ─── Skills registry (zeroclaw-skills) ────────────────────────────────────────
 const SKILLS_REGISTRY_REPO_URL: &str = "https://github.com/zeroclaw-labs/zeroclaw-skills";
@@ -1857,114 +1845,7 @@ pub fn init_skills_dir(workspace_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn is_clawhub_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case(CLAWHUB_DOMAIN) || host.eq_ignore_ascii_case(CLAWHUB_WWW_DOMAIN)
-}
-
-fn parse_clawhub_url(source: &str) -> Option<Url> {
-    let parsed = Url::parse(source).ok()?;
-    match parsed.scheme() {
-        "https" | "http" => {}
-        _ => return None,
-    }
-
-    if !parsed.host_str().is_some_and(is_clawhub_host) {
-        return None;
-    }
-
-    Some(parsed)
-}
-
-pub fn is_clawhub_source(source: &str) -> bool {
-    if source.starts_with("clawhub:") {
-        return true;
-    }
-    parse_clawhub_url(source).is_some()
-}
-
-fn clawhub_download_url(source: &str) -> Result<String> {
-    // Short prefix: clawhub:<slug>
-    if let Some(slug) = source.strip_prefix("clawhub:") {
-        let slug = slug.trim().trim_end_matches('/');
-        if slug.is_empty() || slug.contains('/') {
-            anyhow::bail!(
-                "invalid clawhub source '{}': expected 'clawhub:<slug>' (no slashes in slug)",
-                source
-            );
-        }
-        return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={slug}"));
-    }
-
-    // Profile URL: https://clawhub.ai/<owner>/<slug> or https://www.clawhub.ai/<slug>
-    if let Some(parsed) = parse_clawhub_url(source) {
-        let path = parsed
-            .path_segments()
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join("/");
-
-        if path.is_empty() {
-            anyhow::bail!("could not extract slug from ClawHub URL: {source}");
-        }
-
-        return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={path}"));
-    }
-
-    anyhow::bail!("unrecognised ClawHub source format: {source}")
-}
-
-fn normalize_skill_name(s: &str) -> String {
-    s.to_lowercase()
-        .chars()
-        .map(|c| if c == '-' { '_' } else { c })
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect()
-}
-
-fn clawhub_skill_dir_name(source: &str) -> Result<String> {
-    if let Some(slug) = source.strip_prefix("clawhub:") {
-        let slug = slug.trim().trim_end_matches('/');
-        let base = slug.rsplit('/').next().unwrap_or(slug);
-        let name = normalize_skill_name(base);
-        return Ok(if name.is_empty() {
-            "skill".to_string()
-        } else {
-            name
-        });
-    }
-
-    let parsed = parse_clawhub_url(source).ok_or_else(|| {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"source": source})),
-            "skill install rejected: invalid clawhub URL"
-        );
-        anyhow::Error::msg(format!("invalid clawhub URL: {source}"))
-    })?;
-
-    let path = parsed
-        .path_segments()
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-
-    let base = path.last().copied().unwrap_or("skill");
-    let name = normalize_skill_name(base);
-    Ok(if name.is_empty() {
-        "skill".to_string()
-    } else {
-        name
-    })
-}
-
 pub fn is_git_source(source: &str) -> bool {
-    // ClawHub URLs look like https:// but are not git repos
-    if is_clawhub_source(source) {
-        return false;
-    }
     is_git_scheme_source(source, "https://")
         || is_git_scheme_source(source, "http://")
         || is_git_scheme_source(source, "ssh://")
@@ -2187,267 +2068,6 @@ pub fn install_git_skill_source(
     }
 }
 
-/// True when a zip entry path could escape the extraction root (parent
-/// traversal, absolute path, backslash, drive/scheme colon) or is empty.
-fn is_unsafe_zip_entry_name(raw_name: &str) -> bool {
-    raw_name.is_empty()
-        || raw_name.contains("..")
-        || raw_name.starts_with('/')
-        || raw_name.contains('\\')
-        || raw_name.contains(':')
-}
-
-fn checked_zip_size_add(total: u64, next: u64, label: &str) -> Result<u64> {
-    total
-        .checked_add(next)
-        .with_context(|| format!("skill zip rejected: {label} size overflow"))
-}
-
-fn append_skill_zip_chunk(bytes: &mut Vec<u8>, chunk: &[u8], max_bytes: u64) -> Result<()> {
-    let current_len = u64::try_from(bytes.len()).context("skill zip buffer length overflow")?;
-    let chunk_len = u64::try_from(chunk.len()).context("skill zip chunk length overflow")?;
-    let next_len = checked_zip_size_add(current_len, chunk_len, "downloaded")?;
-    if next_len > max_bytes {
-        anyhow::bail!("skill zip rejected: too large ({next_len} bytes > {max_bytes})");
-    }
-    bytes.extend_from_slice(chunk);
-    Ok(())
-}
-
-async fn download_skill_zip_bytes(
-    mut response: reqwest::Response,
-    max_bytes: u64,
-) -> Result<Vec<u8>> {
-    if let Some(len) = response.content_length()
-        && len > max_bytes
-    {
-        anyhow::bail!("skill zip rejected: too large ({len} bytes > {max_bytes})");
-    }
-
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .context("failed to read skill zip response body")?
-    {
-        append_skill_zip_chunk(&mut bytes, &chunk, max_bytes)?;
-    }
-    Ok(bytes)
-}
-
-fn exceeds_skill_zip_ratio(uncompressed_bytes: u64, compressed_bytes: u64) -> bool {
-    compressed_bytes > 0
-        && uncompressed_bytes > compressed_bytes.saturating_mul(MAX_SKILL_ZIP_EXPANSION_RATIO)
-}
-
-fn validate_skill_zip_limits<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
-    max_bytes: u64,
-) -> Result<u64> {
-    let entry_count = archive.len();
-    if entry_count > MAX_SKILL_ZIP_ENTRIES {
-        anyhow::bail!(
-            "skill zip rejected: too many entries ({} > {})",
-            entry_count,
-            MAX_SKILL_ZIP_ENTRIES
-        );
-    }
-
-    let mut compressed_bytes = 0_u64;
-    let mut uncompressed_bytes = 0_u64;
-    for i in 0..entry_count {
-        let entry = archive.by_index(i)?;
-        let raw_name = entry.name().to_string();
-        if is_unsafe_zip_entry_name(&raw_name) {
-            anyhow::bail!("zip entry contains unsafe path: {raw_name}");
-        }
-
-        let entry_compressed_bytes = entry.compressed_size();
-        let entry_uncompressed_bytes = entry.size();
-        if entry_uncompressed_bytes > 0 && entry_compressed_bytes == 0 {
-            anyhow::bail!(
-                "skill zip rejected: entry '{}' has invalid compression ratio",
-                raw_name
-            );
-        }
-
-        compressed_bytes =
-            checked_zip_size_add(compressed_bytes, entry_compressed_bytes, "compressed")?;
-        uncompressed_bytes =
-            checked_zip_size_add(uncompressed_bytes, entry_uncompressed_bytes, "uncompressed")?;
-
-        if uncompressed_bytes > max_bytes {
-            anyhow::bail!(
-                "skill zip rejected: extracted size too large ({} bytes > {})",
-                uncompressed_bytes,
-                max_bytes
-            );
-        }
-        if exceeds_skill_zip_ratio(uncompressed_bytes, compressed_bytes) {
-            anyhow::bail!(
-                "skill zip rejected: expansion ratio exceeds {}x",
-                MAX_SKILL_ZIP_EXPANSION_RATIO
-            );
-        }
-    }
-
-    Ok(compressed_bytes)
-}
-
-fn extract_zip_secure(bytes: Vec<u8>, dest: &Path, max_bytes: u64) -> Result<()> {
-    let archive_len = u64::try_from(bytes.len()).context("skill zip buffer length overflow")?;
-    if archive_len > max_bytes {
-        anyhow::bail!(
-            "skill zip rejected: too large ({} bytes > {})",
-            archive_len,
-            max_bytes
-        );
-    }
-
-    let cursor = Cursor::new(bytes);
-    let mut archive = ZipArchive::new(cursor).context("downloaded content is not a valid zip")?;
-    let compressed_bytes = validate_skill_zip_limits(&mut archive, max_bytes)?;
-
-    std::fs::create_dir_all(dest)?;
-    let result = extract_validated_skill_zip(&mut archive, dest, max_bytes, compressed_bytes);
-    if result.is_err() {
-        let _ = std::fs::remove_dir_all(dest);
-    }
-    result
-}
-
-fn copy_zip_entry_bounded<R: Read, W: Write>(
-    entry: &mut R,
-    output: &mut W,
-    extracted_bytes: &mut u64,
-    max_bytes: u64,
-    compressed_bytes: u64,
-) -> Result<()> {
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let read_bytes = entry.read(&mut buffer)?;
-        if read_bytes == 0 {
-            return Ok(());
-        }
-
-        let read_bytes = u64::try_from(read_bytes).context("skill zip read length overflow")?;
-        let next_extracted = checked_zip_size_add(*extracted_bytes, read_bytes, "extracted")?;
-        if next_extracted > max_bytes {
-            anyhow::bail!(
-                "skill zip rejected: extracted size too large ({} bytes > {})",
-                next_extracted,
-                max_bytes
-            );
-        }
-        if exceeds_skill_zip_ratio(next_extracted, compressed_bytes) {
-            anyhow::bail!(
-                "skill zip rejected: expansion ratio exceeds {}x",
-                MAX_SKILL_ZIP_EXPANSION_RATIO
-            );
-        }
-
-        let read_len = usize::try_from(read_bytes).context("skill zip write length overflow")?;
-        output.write_all(&buffer[..read_len])?;
-        *extracted_bytes = next_extracted;
-    }
-}
-
-fn extract_validated_skill_zip<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
-    dest: &Path,
-    max_bytes: u64,
-    compressed_bytes: u64,
-) -> Result<()> {
-    let mut extracted_bytes = 0_u64;
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        let raw_name = entry.name().to_string();
-        let out_path = dest.join(&raw_name);
-        if entry.is_dir() {
-            std::fs::create_dir_all(&out_path)?;
-            continue;
-        }
-
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let mut out_file = std::fs::File::create(&out_path).with_context(|| {
-            format!(
-                "failed to create extracted file: {}",
-                out_path.display().to_string()
-            )
-        })?;
-        copy_zip_entry_bounded(
-            &mut entry,
-            &mut out_file,
-            &mut extracted_bytes,
-            max_bytes,
-            compressed_bytes,
-        )?;
-    }
-
-    Ok(())
-}
-
-pub async fn install_clawhub_skill_source(
-    source: &str,
-    skills_path: &Path,
-    allow_scripts: bool,
-) -> Result<(PathBuf, usize)> {
-    let download_url = clawhub_download_url(source)
-        .with_context(|| format!("invalid ClawHub source: {source}"))?;
-    let skill_dir_name = clawhub_skill_dir_name(source)?;
-    let installed_dir = skills_path.join(&skill_dir_name);
-    if installed_dir.exists() {
-        anyhow::bail!(
-            "Destination skill already exists: {}",
-            installed_dir.display()
-        );
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
-
-    let resp = client
-        .get(&download_url)
-        .send()
-        .await
-        .with_context(|| format!("failed to fetch zip from {download_url}"))?;
-
-    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        anyhow::bail!("ClawHub rate limit reached (HTTP 429). Wait a moment and retry.");
-    }
-    if !resp.status().is_success() {
-        anyhow::bail!("ClawHub download failed (HTTP {})", resp.status());
-    }
-
-    let bytes = download_skill_zip_bytes(resp, MAX_SKILL_ZIP_BYTES).await?;
-    extract_zip_secure(bytes, &installed_dir, MAX_SKILL_ZIP_BYTES)?;
-
-    let has_manifest = installed_dir.join("SKILL.md").exists()
-        || installed_dir.join("SKILL.toml").exists()
-        || installed_dir.join("manifest.toml").exists();
-    if !has_manifest {
-        std::fs::write(
-            installed_dir.join("SKILL.toml"),
-            format!(
-                "[skill]\nname = \"{}\"\ndescription = \"ClawHub installed skill\"\nversion = \"0.1.0\"\n",
-                skill_dir_name
-            ),
-        )?;
-    }
-
-    match enforce_skill_security_audit(&installed_dir, allow_scripts) {
-        Ok(report) => Ok((installed_dir, report.files_scanned)),
-        Err(err) => {
-            let _ = std::fs::remove_dir_all(&installed_dir);
-            Err(err)
-        }
-    }
-}
-
 // ─── Skills registry resolution ───────────────────────────────────────────────
 
 pub fn is_registry_source(source: &str) -> bool {
@@ -2616,6 +2236,60 @@ fn list_registry_skill_names(registry_dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// Install a single skill by name from a git catalog repository.
+///
+/// Clones `url` into a throwaway directory, resolves `skills/<skill_name>/`
+/// (the same `<repo>/skills/<name>/` layout as the default and extra
+/// registries), and installs it through the shared local-copy path (which
+/// runs the security audit). No archive handling — pure `git clone`.
+pub fn install_git_catalog_skill_source(
+    url: &str,
+    skill_name: &str,
+    skills_path: &Path,
+    allow_scripts: bool,
+    workspace_dir: &Path,
+) -> Result<(PathBuf, usize)> {
+    if !is_registry_source(skill_name) {
+        anyhow::bail!(
+            "invalid --skill name '{skill_name}': use a bare skill name (letters, digits, '-', '_')"
+        );
+    }
+
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut hasher);
+    let clone_dir = workspace_dir.join(format!(".skill-catalog-{:016x}", hasher.finish()));
+    if clone_dir.exists() {
+        let _ = std::fs::remove_dir_all(&clone_dir);
+    }
+
+    clone_skills_registry(&clone_dir, url)
+        .with_context(|| format!("failed to clone skill catalog {url}"))?;
+
+    let result = (|| {
+        let skill_dir = clone_dir.join("skills").join(skill_name);
+        if !skill_dir.is_dir() {
+            let available = list_registry_skill_names(&clone_dir);
+            if available.is_empty() {
+                anyhow::bail!(
+                    "skill '{skill_name}' not found in {url}: no skills/ directory, or it is empty"
+                );
+            }
+            anyhow::bail!(
+                "skill '{skill_name}' not found in {url}.\nAvailable skills: {}",
+                available.join(", ")
+            );
+        }
+        let skill_dir_str = skill_dir
+            .to_str()
+            .with_context(|| format!("skill path is not valid UTF-8: {}", skill_dir.display()))?;
+        install_local_skill_source(skill_dir_str, skills_path, allow_scripts)
+    })();
+
+    let _ = std::fs::remove_dir_all(&clone_dir);
+    result
 }
 
 pub fn install_registry_skill_source(
@@ -2842,53 +2516,6 @@ fn namespace_plugin_skill(plugin_name: &str, mut skill: Skill) -> Skill {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
-    use std::io::{self, Write};
-
-    struct CountingWriter {
-        written: usize,
-    }
-
-    impl Write for CountingWriter {
-        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            self.written += buffer.len();
-            Ok(buffer.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    struct ChunkReader {
-        chunks: Vec<Vec<u8>>,
-        index: usize,
-    }
-
-    impl Read for ChunkReader {
-        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-            let Some(chunk) = self.chunks.get(self.index) else {
-                return Ok(0);
-            };
-            let copied = chunk.len().min(buffer.len());
-            buffer[..copied].copy_from_slice(&chunk[..copied]);
-            self.index += 1;
-            Ok(copied)
-        }
-    }
-
-    fn make_skill_zip(entries: &[(&str, &[u8])], method: zip::CompressionMethod) -> Vec<u8> {
-        let mut buf = Vec::new();
-        {
-            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opts = zip::write::SimpleFileOptions::default().compression_method(method);
-            for (name, body) in entries {
-                writer.start_file(*name, opts).unwrap();
-                writer.write_all(body).unwrap();
-            }
-            writer.finish().unwrap();
-        }
-        buf
-    }
 
     #[test]
     fn parse_simple_frontmatter_keeps_blank_line_in_block_scalar() {
@@ -2952,8 +2579,8 @@ mod registry_tests {
     }
 
     #[test]
-    fn test_is_registry_source_rejects_clawhub() {
-        assert!(!is_registry_source("clawhub:my-skill"));
+    fn test_is_registry_source_rejects_prefixed() {
+        assert!(!is_registry_source("external:my-skill"));
     }
 
     #[test]
@@ -2992,7 +2619,7 @@ mod registry_tests {
 
     #[test]
     fn test_is_extra_registry_source_rejects_competing_schemes() {
-        assert!(!is_extra_registry_source("clawhub:x"));
+        assert!(!is_extra_registry_source("external:x"));
         assert!(!is_extra_registry_source("https://github.com/o/r"));
         assert!(!is_extra_registry_source("git@github.com:o/r"));
         assert!(!is_extra_registry_source("./local"));
@@ -3007,155 +2634,6 @@ mod registry_tests {
         assert_eq!(parse_extra_registry_source("registry:onlyname"), None);
         assert_eq!(parse_extra_registry_source("registry:a/b/c"), None);
         assert_eq!(parse_extra_registry_source("auto-coder"), None);
-    }
-
-    #[test]
-    fn test_is_unsafe_zip_entry_name() {
-        assert!(is_unsafe_zip_entry_name(""));
-        assert!(is_unsafe_zip_entry_name("../evil.txt"));
-        assert!(is_unsafe_zip_entry_name("a/../b"));
-        assert!(is_unsafe_zip_entry_name("/abs/path"));
-        assert!(is_unsafe_zip_entry_name("dir\\file"));
-        assert!(is_unsafe_zip_entry_name("c:/win"));
-        assert!(!is_unsafe_zip_entry_name("SKILL.md"));
-        assert!(!is_unsafe_zip_entry_name("scripts/run.sh"));
-    }
-
-    #[test]
-    fn test_append_skill_zip_chunk_accepts_within_limit() {
-        let mut bytes = b"abc".to_vec();
-        append_skill_zip_chunk(&mut bytes, b"def", 6).unwrap();
-        assert_eq!(bytes, b"abcdef");
-    }
-
-    #[test]
-    fn test_append_skill_zip_chunk_rejects_oversize() {
-        let mut bytes = b"abc".to_vec();
-        let err = append_skill_zip_chunk(&mut bytes, b"defg", 6)
-            .expect_err("oversize chunk must be rejected");
-        assert!(err.to_string().contains("too large"), "got: {err}");
-        assert_eq!(bytes, b"abc");
-    }
-
-    #[test]
-    fn test_extract_zip_secure_happy_path() {
-        let buf = make_skill_zip(
-            &[("SKILL.md", b"# demo"), ("scripts/run.txt", b"echo hi")],
-            zip::CompressionMethod::Stored,
-        );
-
-        let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("skill");
-        extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES).unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(dest.join("SKILL.md")).unwrap(),
-            "# demo"
-        );
-        assert_eq!(
-            std::fs::read_to_string(dest.join("scripts/run.txt")).unwrap(),
-            "echo hi"
-        );
-    }
-
-    #[test]
-    fn test_extract_zip_secure_rejects_oversize_archive() {
-        let buf = make_skill_zip(&[("SKILL.md", b"# demo")], zip::CompressionMethod::Stored);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("skill");
-        let err = extract_zip_secure(buf, &dest, 1).expect_err("oversize zip must be rejected");
-        assert!(err.to_string().contains("too large"), "got: {err}");
-        assert!(
-            !dest.exists(),
-            "dest must not be created when the zip is rejected for size"
-        );
-    }
-
-    #[test]
-    fn test_extract_zip_secure_rejects_too_many_entries() {
-        let entries: Vec<(String, Vec<u8>)> = (0..=MAX_SKILL_ZIP_ENTRIES)
-            .map(|index| (format!("files/{index}.txt"), b"x".to_vec()))
-            .collect();
-        let entry_refs: Vec<(&str, &[u8])> = entries
-            .iter()
-            .map(|(name, body)| (name.as_str(), body.as_slice()))
-            .collect();
-        let buf = make_skill_zip(&entry_refs, zip::CompressionMethod::Stored);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("skill");
-        let err = extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES)
-            .expect_err("zip with too many entries must be rejected");
-        assert!(err.to_string().contains("too many entries"), "got: {err}");
-        assert!(!dest.exists(), "dest must not be created for rejected zip");
-    }
-
-    #[test]
-    fn test_copy_zip_entry_bounded_stops_before_limit_overwrite() {
-        let payload = vec![b'a'; 1024];
-        let mut reader = Cursor::new(payload);
-        let mut writer = CountingWriter { written: 0 };
-        let mut extracted_bytes = 0;
-
-        let err = copy_zip_entry_bounded(&mut reader, &mut writer, &mut extracted_bytes, 500, 1024)
-            .expect_err("bounded copy must reject before writing over the cap");
-
-        assert!(
-            err.to_string().contains("extracted size too large"),
-            "got: {err}"
-        );
-        assert_eq!(writer.written, 0);
-        assert_eq!(extracted_bytes, 0);
-    }
-
-    #[test]
-    fn test_copy_zip_entry_bounded_preserves_prior_valid_write() {
-        let mut reader = ChunkReader {
-            chunks: vec![vec![b'a'; 400], vec![b'b'; 200]],
-            index: 0,
-        };
-        let mut writer = CountingWriter { written: 0 };
-        let mut extracted_bytes = 0;
-
-        let err = copy_zip_entry_bounded(&mut reader, &mut writer, &mut extracted_bytes, 500, 1024)
-            .expect_err("bounded copy must reject the chunk that crosses the cap");
-
-        assert!(
-            err.to_string().contains("extracted size too large"),
-            "got: {err}"
-        );
-        assert_eq!(writer.written, 400);
-        assert_eq!(extracted_bytes, 400);
-    }
-
-    #[test]
-    fn test_extract_zip_secure_rejects_extracted_size_limit() {
-        let payload = vec![b'a'; 1024];
-        let buf = make_skill_zip(&[("SKILL.md", &payload)], zip::CompressionMethod::Deflated);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("skill");
-        let err = extract_zip_secure(buf, &dest, 500)
-            .expect_err("zip exceeding extracted size limit must be rejected");
-        assert!(
-            err.to_string().contains("extracted size too large"),
-            "got: {err}"
-        );
-        assert!(!dest.exists(), "dest must not be created for rejected zip");
-    }
-
-    #[test]
-    fn test_extract_zip_secure_rejects_expansion_ratio() {
-        let payload = vec![b'a'; 1024];
-        let buf = make_skill_zip(&[("SKILL.md", &payload)], zip::CompressionMethod::Deflated);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("skill");
-        let err = extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES)
-            .expect_err("zip exceeding expansion ratio must be rejected");
-        assert!(err.to_string().contains("expansion ratio"), "got: {err}");
-        assert!(!dest.exists(), "dest must not be created for rejected zip");
     }
 
     #[test]
@@ -3176,6 +2654,29 @@ mod registry_tests {
         )
         .expect_err("unknown registry must error before any git work");
         assert!(err.to_string().contains("nope"), "got: {err}");
+    }
+
+    #[test]
+    fn test_install_git_catalog_rejects_non_bare_skill_name() {
+        // The bare-name guard must reject anything with a path separator before
+        // any network/git work happens (hermetic — no clone is attempted).
+        assert!(!is_registry_source("a/b"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_path = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let err = install_git_catalog_skill_source(
+            "https://github.com/example/skills",
+            "a/b",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect_err("a slashed --skill name must be rejected before any git work");
+        assert!(err.to_string().contains("bare skill name"), "got: {err}");
     }
 
     #[test]

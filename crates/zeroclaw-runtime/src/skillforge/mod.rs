@@ -43,7 +43,7 @@ fn default_auto_integrate() -> bool {
     true
 }
 fn default_sources() -> Vec<String> {
-    vec!["github".into(), "clawhub".into()]
+    vec!["github".into()]
 }
 fn default_scan_interval() -> u64 {
     24
@@ -172,7 +172,7 @@ impl SkillForge {
                         }
                     }
                 }
-                ScoutSource::ClawHub | ScoutSource::HuggingFace => {
+                ScoutSource::HuggingFace => {
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -271,6 +271,6 @@ mod tests {
         assert!(cfg.auto_integrate);
         assert_eq!(cfg.scan_interval_hours, 24);
         assert!((cfg.min_score - 0.7).abs() < f64::EPSILON);
-        assert_eq!(cfg.sources, vec!["github", "clawhub"]);
+        assert_eq!(cfg.sources, vec!["github"]);
     }
 }

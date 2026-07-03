@@ -13,6 +13,10 @@ ZeroClaw v0.8.2 opens up two new front doors: **A2A agent discovery** for agent-
 - Discord channels picked up interaction components (buttons, selects, modals, autocomplete, buttoned approval) and rich outbound embeds.
 - The Telegram bot token and similar secrets are now redacted through the canonical global leak detector instead of channel-local regexes.
 
+## Breaking Changes
+
+- Removed the built-in ClawHub skill-install source (`zeroclaw skills install clawhub:<slug>` and clawhub.ai URLs). Install skills from a local path, Git URL, or registry name instead. SkillForge's default discovery sources no longer include the never-implemented `clawhub` source.
+
 ## Security
 
 ZeroClaw treats every inbound payload as untrusted and tightens the seams an attacker would reach for.
@@ -166,7 +170,7 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 | config | Warn when `a2a.exposed_skills` resolves no skills (#8283) |
 | cli | Persist the model in config on `models set` instead of probing providers (#7094); refresh non-default channel guidance (#7955) |
 | web_fetch | `allowed_private_hosts = ["*"]` covers DNS-resolved private hosts (#7412) |
-| skills | Correct the "ClawhHub" typo in skill installer messages (#8262) |
+| skills | Correct a registry-name typo in skill installer messages (#8262) |
 | docker | Keep Node base policy in container TOML (#8112); correct Node 24 digest pins (#7932); drop stale aardvark-sys build.rs COPY (#8092) |
 
 ## Docs

@@ -103,7 +103,7 @@ zeroclaw skills audit ./release-check
 
 </div>
 
-Install a skill from a local directory, Git URL, registry name, or ClawHub source:
+Install a skill from a local directory, Git URL, or registry name:
 
 <div class="os-tabs-src">
 
@@ -113,7 +113,18 @@ Install a skill from a local directory, Git URL, registry name, or ClawHub sourc
 zeroclaw skills install ./release-check
 zeroclaw skills install https://example.com/zeroclaw-release-check.git
 zeroclaw skills install release-check
-zeroclaw skills install clawhub:release-check
+```
+
+</div>
+
+Install one skill by name from a Git catalog repository (a repo whose skills live under `skills/<name>/`):
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+zeroclaw skills install https://github.com/vercel-labs/skills --skill find-skills
 ```
 
 </div>
