@@ -220,8 +220,7 @@ impl ScopedToolRegistry {
                         // cannot leak into either side (issue #8054 Surface 1(b)).
                         // The `with_access_policy` step on the search tool is
                         // defense-in-depth — the stub set is already pre-filtered.
-                        let filtered_deferred =
-                            deferred_set.filter_by_policy(mcp_policy.as_ref());
+                        let filtered_deferred = deferred_set.filter_by_policy(mcp_policy.as_ref());
                         let allowed_stub_count = mcp_allowed_tool_count(
                             filtered_deferred
                                 .stubs
