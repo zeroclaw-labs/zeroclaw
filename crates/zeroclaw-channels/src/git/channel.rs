@@ -58,9 +58,7 @@ fn build_provider(cfg: &GitConfig) -> anyhow::Result<Box<dyn GitProvider>> {
         "gitea" | "forgejo" => {
             anyhow::bail!("git channel provider `gitea`/`forgejo` is not available in this build")
         }
-        other => anyhow::bail!(
-            "unknown git channel provider `{other}` (supported: github, gitea, forgejo)"
-        ),
+        other => anyhow::bail!("unknown git channel provider `{other}` (supported: github)"),
     }
 }
 
@@ -607,10 +605,13 @@ mod tests {
             Ok(_) => panic!("expected an error for an unknown provider"),
             Err(e) => e,
         };
-        assert!(
-            err.to_string()
-                .contains("unknown git channel provider `bitbucket`")
-        );
+        let msg = err.to_string();
+        assert!(msg.contains("unknown git channel provider `bitbucket`"));
+        // This slice ships the GitHub provider only; the error must not
+        // advertise forges the build rejects (gitea/forgejo land later).
+        assert!(msg.contains("supported: github"));
+        assert!(!msg.contains("gitea"));
+        assert!(!msg.contains("forgejo"));
     }
 
     #[test]

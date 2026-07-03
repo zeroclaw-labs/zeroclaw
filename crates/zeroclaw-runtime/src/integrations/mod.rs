@@ -127,7 +127,7 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("    2. Pull a model: ollama pull llama3");
             println!("    3. Set model_provider to 'ollama' in config.toml");
         }
-        "GitHub" => {
+        "Git" => {
             println!("  Setup:");
             println!("    1. Create a GitHub App (Settings → Developer settings → GitHub Apps)");
             println!(
