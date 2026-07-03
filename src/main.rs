@@ -2612,19 +2612,70 @@ fn plugin_host_with_configured_security(
 /// matches keys already present in live config, so a missing entry makes the
 /// plugin unconfigurable through standard surfaces.
 #[cfg(feature = "plugins-wasm")]
-async fn seed_plugin_entry(config: &mut crate::config::schema::Config, name: &str) -> Result<()> {
-    if config.plugins.entries.iter().any(|e| e.name == name) {
+async fn seed_plugin_config_entry(
+    config: &mut crate::config::schema::Config,
+    plugin_name: &str,
+) -> Result<()> {
+    // A degraded [plugins] block means the on-disk section is malformed and
+    // the in-memory view is defaults. save_dirty cannot write through the
+    // broken shape (verified: it silently no-ops), so seeding would print a
+    // success message while persisting nothing. The whole-config sentinel
+    // (unparseable TOML) is worse: save_dirty hard-fails parsing the file
+    // and would turn a successful install into a command error. Refuse
+    // honestly in both cases.
+    let whole_config_degraded = config
+        .degraded_security
+        .iter()
+        .any(|s| s == crate::config::migration::WHOLE_CONFIG_SENTINEL);
+    if whole_config_degraded || config.degraded_sections.iter().any(|s| s == "plugins") {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-plugin-config-entry-seed-skipped",
+                &[("name", plugin_name)],
+                "warning: skipped seeding the plugin config entry: the [plugins] \
+                 section on disk is malformed. Repair it, then add a \
+                 `[[plugins.entries]]` block for the plugin by hand."
+            )
+        );
         return Ok(());
     }
-    config
-        .plugins
-        .entries
-        .push(crate::config::schema::PluginEntryConfig {
-            name: name.to_string(),
-            config: std::collections::HashMap::new(),
-        });
-    config.mark_dirty(&format!("plugins.entries.{name}"));
+    // Dotted-path routing splits on `.`, so a plugin name containing a dot
+    // (or an empty name) can never be addressed by
+    // `config set plugins.entries.<name>...`, and the per-entry dirty path
+    // `plugins.entries.<name>` cannot round-trip through the natural-key
+    // writer either: save_dirty silently no-ops while the success message
+    // claims otherwise (verified). Skip honestly.
+    if plugin_name.is_empty() || plugin_name.contains('.') {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-plugin-config-entry-seed-unaddressable",
+                &[("name", plugin_name)],
+                "warning: skipped seeding the plugin config entry: the plugin \
+                 name cannot be addressed by a dotted config path. Add a \
+                 `[[plugins.entries]]` block to the config file by hand."
+            )
+        );
+        return Ok(());
+    }
+    let created = config
+        .create_map_key("plugins.entries", plugin_name)
+        .map_err(anyhow::Error::msg)?;
+    if !created {
+        return Ok(());
+    }
+    config.mark_dirty(&format!("plugins.entries.{plugin_name}"));
     Box::pin(config.save_dirty()).await?;
+    println!(
+        "{}",
+        ta(
+            "cli-plugin-config-entry-seeded",
+            &[("name", plugin_name)],
+            "Seeded config entry. Set plugin config values with \
+             `zeroclaw config set plugins.entries.<name>.config.<key>`."
+        )
+    );
     Ok(())
 }
 
@@ -5747,7 +5798,7 @@ async fn main() -> Result<()> {
                 let mut host = plugin_host_with_configured_security(&config)?;
                 if plugin_registry::is_local_plugin_source(&source) {
                     let name = host.install(&source)?;
-                    seed_plugin_entry(&mut config, &name).await?;
+                    seed_plugin_config_entry(&mut config, &name).await?;
                     println!(
                         "{}",
                         ta(
@@ -5774,7 +5825,7 @@ async fn main() -> Result<()> {
                     .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
                     let name = host.install(&plugin_dir)?;
-                    seed_plugin_entry(&mut config, &name).await?;
+                    seed_plugin_config_entry(&mut config, &name).await?;
                     println!(
                         "{}",
                         ta(
