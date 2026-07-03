@@ -155,8 +155,12 @@ pub async fn maybe_run_skill_review(
 
     match result {
         Ok(final_text) => {
-            let summary =
-                summarize_actions(&receipts, &review_history[fork_start_len..], &final_text);
+            // `review_history` was mutated in place by the forked tool-call loop
+            // (trim_history / compact_context), so it may have shrunk below
+            // `fork_start_len`. Clamp the slice start; an in-fork-compacted
+            // history yields an empty summary instead of panicking (#8654).
+            let fork_msgs = fork_messages(&review_history, fork_start_len);
+            let summary = summarize_actions(&receipts, fork_msgs, &final_text);
             if !summary.is_empty() {
                 println!(
                     "{}",
@@ -216,6 +220,25 @@ fn should_trigger(history: &[ChatMessage], threshold: u32) -> bool {
 
 fn count_tool_iterations(history: &[ChatMessage]) -> usize {
     history.iter().filter(|m| m.role == "tool").count()
+}
+
+/// Slice `review_history` down to the messages produced by the review fork
+/// itself (everything after `fork_start_len`).
+///
+/// `fork_start_len` is captured before the forked `run_tool_call_loop` runs,
+/// and that loop mutates `review_history` in place (trim_history /
+/// compact_context). If an in-fork compaction shrinks the history below
+/// `fork_start_len`, the raw `&review_history[fork_start_len..]` would panic
+/// with a range-start-out-of-bounds and, under panic=abort, take down the whole
+/// agent process. Clamp the start to the current length so a compacted history
+/// yields an empty slice instead. Behavior is unchanged when no compaction
+/// occurred.
+fn fork_messages<'a>(
+    review_history: &'a [ChatMessage],
+    fork_start_len: usize,
+) -> &'a [ChatMessage] {
+    let start = fork_start_len.min(review_history.len());
+    &review_history[start..]
 }
 
 /// Convert the review's tool receipts + final text into a one-line summary
@@ -429,5 +452,56 @@ mod tests {
             extract_action_summary(receipt),
             Some("archived old-thing".to_string())
         );
+    }
+
+    #[test]
+    fn fork_messages_returns_empty_when_history_shrunk_below_fork_start() {
+        // Regression for #8654: the fork captured `fork_start_len` before
+        // running the tool-call loop, but in-fork compaction (trim_history /
+        // compact_context) can shrink review_history below that captured
+        // length. Slicing review_history[fork_start_len..] directly would
+        // panic ("range start index N out of range for slice of length M")
+        // and, under panic=abort, kill the agent process. fork_messages must
+        // clamp and return an empty slice instead.
+        //
+        // This test would panic without the clamp in fork_messages.
+        let review_history = vec![
+            msg("user", "fork review input"),
+            msg("assistant", "nothing to save."),
+        ];
+        // fork captured len 5, but compaction shrank history to len 2.
+        let fork_start_len = 5;
+        let slice = fork_messages(&review_history, fork_start_len);
+        assert!(
+            slice.is_empty(),
+            "history compacted below fork_start_len must yield an empty slice, got {slice:?}"
+        );
+    }
+
+    #[test]
+    fn fork_messages_returns_fork_suffix_when_history_not_compacted() {
+        // Non-compaction behavior is unchanged: returns the fork's own
+        // messages (everything strictly after fork_start_len).
+        let review_history = vec![
+            msg("user", "parent turn"),
+            msg("assistant", "parent reply"),
+            msg("user", "fork review input"),
+            msg("tool", "Patched skill 'deploy'."),
+            msg("assistant", "done"),
+        ];
+        let fork_start_len = 2;
+        let slice = fork_messages(&review_history, fork_start_len);
+        assert_eq!(slice.len(), 3);
+        assert_eq!(slice[0].role, "user");
+        assert_eq!(slice[1].role, "tool");
+        assert_eq!(slice[2].role, "assistant");
+    }
+
+    #[test]
+    fn fork_messages_empty_at_exact_boundary() {
+        // Boundary: fork_start_len == review_history.len() -> empty slice, no panic.
+        let review_history = vec![msg("user", "a"), msg("user", "b")];
+        let slice = fork_messages(&review_history, 2);
+        assert!(slice.is_empty());
     }
 }
