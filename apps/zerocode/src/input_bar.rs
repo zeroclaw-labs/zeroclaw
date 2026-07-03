@@ -755,7 +755,7 @@ impl InputBarState {
 
     fn stash_current_draft(&mut self) -> Option<String> {
         let draft = self.input.trim().to_string();
-        if draft.is_empty() {
+        if draft.is_empty() && self.pending_attachments.is_empty() {
             return None;
         }
         let attachments = std::mem::take(&mut self.pending_attachments);
@@ -770,6 +770,9 @@ impl InputBarState {
     }
 
     fn restore_latest_draft(&mut self) -> Option<String> {
+        if !self.input.is_empty() || !self.pending_attachments.is_empty() {
+            return None;
+        }
         let draft = self.draft_stash.pop()?;
         let text = draft.text.clone();
         self.load_for_edit(draft.text, draft.attachments);
@@ -1616,10 +1619,7 @@ impl InputBarState {
                     }
                     Err(error) => {
                         if let Err(cleanup_error) = std::fs::remove_file(&tmp_path) {
-                            return InputBarAction::StatusMessage(crate::i18n::t_args(
-                                "zc-input-clipboard-error",
-                                &[("error", &cleanup_error.to_string())],
-                            ));
+                            eprintln!("clipboard temp cleanup failed: {cleanup_error}");
                         }
                         InputBarAction::StatusMessage(crate::i18n::t_args(
                             "zc-input-clipboard-error",
@@ -1806,7 +1806,16 @@ impl InputBarState {
                 (String::new(), theme::dim_style())
             } else {
                 (
-                    crate::i18n::t("zc-input-placeholder-code-rich"),
+                    crate::i18n::t_args(
+                        "zc-input-placeholder-code-rich",
+                        &[(
+                            "chord",
+                            &crate::keymap::action_key_labels(
+                                crate::keymap::InputBarAction::OpenExternalEditor,
+                            )
+                            .join("/"),
+                        )],
+                    ),
                     theme::dim_style(),
                 )
             };
@@ -2476,11 +2485,42 @@ mod tests {
         let stashed = bar.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
         assert!(matches!(stashed, InputBarAction::StashedDraft(_)));
         assert!(bar.pending_attachments().is_empty());
-        bar.add_attachment(test_attachment("b.txt"));
 
         let restored = bar.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
         assert!(matches!(restored, InputBarAction::RestoredDraft(_)));
         assert_eq!(bar.pending_attachments().len(), 1);
+        assert_eq!(bar.pending_attachments()[0].filename, "a.txt");
+    }
+
+    #[test]
+    fn draft_restore_does_not_overwrite_active_text() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("save for later");
+        assert!(matches!(
+            bar.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT)),
+            InputBarAction::StashedDraft(_)
+        ));
+        bar.insert_text("active draft");
+
+        let restored = bar.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+
+        assert!(matches!(restored, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "active draft");
+        assert_eq!(bar.draft_stash_len(), 1);
+    }
+
+    #[test]
+    fn draft_stash_preserves_attachment_only_draft() {
+        let mut bar = InputBarState::new();
+        bar.add_attachment(test_attachment("a.txt"));
+
+        let stashed = bar.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
+
+        assert!(matches!(stashed, InputBarAction::StashedDraft(_)));
+        assert!(bar.pending_attachments().is_empty());
+        assert_eq!(bar.draft_stash_len(), 1);
+        let restored = bar.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert!(matches!(restored, InputBarAction::RestoredDraft(_)));
         assert_eq!(bar.pending_attachments()[0].filename, "a.txt");
     }
 

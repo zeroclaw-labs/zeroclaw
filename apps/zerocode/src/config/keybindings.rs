@@ -280,7 +280,7 @@ pub fn build_override_table(rows: HashMap<String, Vec<Chord>>) -> Result<Overrid
 }
 
 fn canonical_tag(tag: &str) -> &str {
-    const LEGACY_CODE_TAG: &str = concat!("ch", "at");
+    const LEGACY_CODE_TAG: &str = "chat";
     if tag == LEGACY_CODE_TAG {
         CodeTabAction::TAG
     } else {
@@ -358,13 +358,10 @@ mod tests {
     #[test]
     fn legacy_code_tag_is_canonicalized() {
         let mut rows = HashMap::new();
-        rows.insert(
-            format!("{}.scroll_up", concat!("ch", "at")),
-            vec![Chord::key(KeyCode::Esc)],
-        );
+        rows.insert("chat.scroll_up".to_string(), vec![Chord::key(KeyCode::Esc)]);
         let table = build_override_table(rows).expect("legacy tag accepted");
         assert!(table.contains_key(CodeTabAction::TAG));
-        assert!(!table.contains_key(concat!("ch", "at")));
+        assert!(!table.contains_key("chat"));
     }
 
     #[test]

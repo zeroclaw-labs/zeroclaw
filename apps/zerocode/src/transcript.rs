@@ -3166,63 +3166,11 @@ fn session_status_text(state: &TranscriptState, width: usize) -> String {
     } else if let Some(model) = &state.model {
         parts.push(model.clone());
     }
-    if let Some(tokens) = context_status_text(state.context_input_tokens, state.context_max_tokens)
-    {
-        parts.push(tokens);
-    }
-    if state.queue_len() > 0 {
-        parts.push(queue_status_text(state));
-    }
-    if state.input_bar.prompt_history_len() > 0 {
-        parts.push(crate::i18n::t_args(
-            "zc-code-status-history",
-            &[("count", &state.input_bar.prompt_history_len().to_string())],
-        ));
-    }
-    if state.input_bar.draft_stash_len() > 0 {
-        parts.push(crate::i18n::t_args(
-            "zc-code-status-stash",
-            &[("count", &state.input_bar.draft_stash_len().to_string())],
-        ));
-    }
-    if let Some(editor) = crate::editor::editor_label() {
-        parts.push(crate::i18n::t_args(
-            "zc-code-status-editor",
-            &[("editor", &editor)],
-        ));
-    }
     if let Some(cwd) = cwd_status_text(state) {
         parts.push(cwd);
     }
-    parts.push(crate::i18n::t("zc-code-status-help"));
     let line = format!(" {} ", parts.join(" · "));
     first_line_preview(&line, width)
-}
-
-fn queue_status_text(state: &TranscriptState) -> String {
-    if state.queue_paused() {
-        crate::i18n::t_args(
-            "zc-code-status-queue-paused",
-            &[("count", &state.queue_len().to_string())],
-        )
-    } else {
-        crate::i18n::t_args(
-            "zc-code-status-queue",
-            &[("count", &state.queue_len().to_string())],
-        )
-    }
-}
-
-fn context_status_text(input: Option<u64>, max: Option<u64>) -> Option<String> {
-    let input = input?;
-    match max {
-        Some(max) if max > 0 => Some(format!(
-            "ctx {} / {}",
-            compact_number(input),
-            compact_number(max)
-        )),
-        _ => Some(format!("ctx {}", compact_number(input))),
-    }
 }
 
 fn cwd_status_text(state: &TranscriptState) -> Option<String> {
@@ -3239,18 +3187,6 @@ fn cwd_status_text(state: &TranscriptState) -> Option<String> {
         text.push(')');
     }
     Some(text)
-}
-
-fn compact_number(value: u64) -> String {
-    let raw = value.to_string();
-    let mut output = String::new();
-    for (index, ch) in raw.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            output.push(',');
-        }
-        output.push(ch);
-    }
-    output.chars().rev().collect()
 }
 
 fn render_queue_sidebar(f: &mut Frame, state: &mut TranscriptState, area: Rect) {
@@ -3392,49 +3328,45 @@ fn render_tool_entry(
     ));
 
     let body_start = lines.len();
-    match name {
-        "file_edit" => {
-            let input = parsed.as_ref();
-            let old = input
-                .and_then(|v| v.get("old_string"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let new = input
-                .and_then(|v| v.get("new_string"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let path = input.and_then(|v| v.get("path")).and_then(|v| v.as_str());
-            let ext = input.and_then(|v| file_ext(v));
-            let start_line = path
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .and_then(|content| {
-                    content
-                        .find(old)
-                        .map(|idx| content[..idx].bytes().filter(|b| *b == b'\n').count() + 1)
-                })
-                .unwrap_or(1);
-            lines.extend(diff::diff_lines(old, new, ext, start_line));
-        }
-        "file_write" => {
-            let input = parsed.as_ref();
-            let content = input
-                .and_then(|v| v.get("content"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let ext = input.and_then(|v| file_ext(v));
-            lines.extend(diff::write_lines(content, ext));
-        }
-        _ => {
-            let truncated = if input_json.len() > 120 {
-                format!("{}…", truncate_utf8(input_json, 120))
-            } else {
-                input_json.to_string()
-            };
-            lines.push(Line::from(Span::styled(
-                truncated,
-                theme::dim_style().add_modifier(selection),
-            )));
-        }
+    if name == "file_edit" {
+        let input = parsed.as_ref();
+        let old = input
+            .and_then(|v| v.get("old_string"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let new = input
+            .and_then(|v| v.get("new_string"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let path = input.and_then(|v| v.get("path")).and_then(|v| v.as_str());
+        let ext = input.and_then(|v| file_ext(v));
+        let start_line = path
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|content| {
+                content
+                    .find(old)
+                    .map(|idx| content[..idx].bytes().filter(|b| *b == b'\n').count() + 1)
+            })
+            .unwrap_or(1);
+        lines.extend(diff::diff_lines(old, new, ext, start_line));
+    } else if name == "file_write" {
+        let input = parsed.as_ref();
+        let content = input
+            .and_then(|v| v.get("content"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let ext = input.and_then(|v| file_ext(v));
+        lines.extend(diff::write_lines(content, ext));
+    } else {
+        let truncated = if input_json.len() > 120 {
+            format!("{}…", truncate_utf8(input_json, 120))
+        } else {
+            input_json.to_string()
+        };
+        lines.push(Line::from(Span::styled(
+            truncated,
+            theme::dim_style().add_modifier(selection),
+        )));
     }
 
     if let Some(res) = result {
@@ -3698,34 +3630,31 @@ fn tool_title(name: &str, input: Option<&serde_json::Value>) -> String {
             .and_then(|value| value.get(key))
             .and_then(|value| value.as_str())
     };
-    match name {
-        "shell" | "bash" | "terminal" => string_field("command")
+    const SHELL_TOOL_NAME: &str = "shell";
+    if name == SHELL_TOOL_NAME {
+        return string_field("command")
             .map(|command| format!("$ {command}"))
-            .unwrap_or_else(|| format!("$ {name}")),
-        "file_read" | "read" => string_field("path")
-            .or_else(|| string_field("filePath"))
-            .map(|path| format!("→ Read {path}"))
-            .unwrap_or_else(|| "→ Read".to_string()),
-        "file_write" | "write" => string_field("path")
-            .or_else(|| string_field("filePath"))
-            .map(|path| format!("← Write {path}"))
-            .unwrap_or_else(|| "← Write".to_string()),
-        "file_edit" | "edit" => string_field("path")
-            .or_else(|| string_field("filePath"))
-            .map(|path| format!("← Edit {path}"))
-            .unwrap_or_else(|| "← Edit".to_string()),
-        "grep" | "search" | "file_search" => string_field("pattern")
+            .unwrap_or_else(|| format!("$ {name}"));
+    }
+    if name.starts_with("file_") {
+        return file_tool_title(
+            name,
+            string_field("path").or_else(|| string_field("filePath")),
+        );
+    }
+    if name.contains("search") || name == "grep" || name == "glob" {
+        return string_field("pattern")
             .or_else(|| string_field("query"))
             .map(|pattern| format!("✱ {pattern}"))
-            .unwrap_or_else(|| format!("✱ {name}")),
-        "glob" => string_field("pattern")
-            .map(|pattern| format!("✱ {pattern}"))
-            .unwrap_or_else(|| "✱ Glob".to_string()),
-        "task" => string_field("description")
-            .map(|description| format!("▣ {description}"))
-            .unwrap_or_else(|| "▣ Task".to_string()),
-        _ => format!("⚙ {name}"),
+            .unwrap_or_else(|| format!("✱ {name}"));
     }
+    format!("⚙ {name}")
+}
+
+fn file_tool_title(name: &str, path: Option<&str>) -> String {
+    let action = name.strip_prefix("file_").unwrap_or(name);
+    let title = action.replace('_', " ");
+    path.map(|path| format!("{title} {path}")).unwrap_or(title)
 }
 
 fn rail_body_line(
@@ -7022,7 +6951,7 @@ mod tests {
     }
 
     #[test]
-    fn status_row_includes_prompt_command_metadata() {
+    fn status_row_omits_debug_and_input_state() {
         let mut state = state();
         state.set_model_identity(Some("openai.work"), Some("gpt-5"));
         state.context_input_tokens = Some(1234);
@@ -7048,10 +6977,23 @@ mod tests {
 
         assert!(status.contains("myagent"));
         assert!(status.contains("openai.work/gpt-5"));
-        assert!(status.contains("ctx 1,234 / 8,192"));
-        assert!(status.contains("queue 1"));
-        assert!(status.contains("history 1"));
-        assert!(status.contains("stash 1"));
+        assert!(!status.contains("ctx"));
+        assert!(!status.contains("queue"));
+        assert!(!status.contains("history"));
+        assert!(!status.contains("stash"));
+        assert!(!status.contains("editor"));
+    }
+
+    #[test]
+    fn tool_title_uses_zeroclaw_tool_fields() {
+        let shell = serde_json::json!({ "command": "cargo test" });
+        let read = serde_json::json!({ "path": "Cargo.toml" });
+        let search = serde_json::json!({ "pattern": "PaneKind" });
+
+        assert_eq!(tool_title("shell", Some(&shell)), "$ cargo test");
+        assert_eq!(tool_title("file_read", Some(&read)), "read Cargo.toml");
+        assert_eq!(tool_title("content_search", Some(&search)), "✱ PaneKind");
+        assert_eq!(tool_title("sop_execute", None), "⚙ sop_execute");
     }
 
     #[test]

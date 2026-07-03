@@ -84,7 +84,7 @@ single task. See [Delegation & SubAgents](./delegation.md).
 - [Filesystem components](./filesystem.md): the workspace, memory, and identity
   that live on disk per agent.
 - [Running agents](./operating.md): addressing agents, coexistence, and how an
-  agent surfaces in the zerocode Code and Chat panes.
+  agent surfaces in zerocode's Code pane and optional Chat pane.
 
 For the runtime internals, the permission model, the memory model, and the
 agent loop, see [Runtime internals](./internals.md).

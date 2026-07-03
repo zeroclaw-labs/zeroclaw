@@ -86,9 +86,7 @@ zc-zerocode-agent-theme-hint = { $assign } assign theme   ·   { $clear } clear 
 
 zc-input-no-pending-attachments = No pending attachments.
 zc-input-no-clipboard-image = Clipboard is empty.
-zc-input-placeholder-code = Type a coding request
-zc-input-placeholder-code-rich = Ask, paste code, /attach files, /model switch, Alt+E editor
-zc-input-editor-unavailable = no editor
+zc-input-placeholder-code-rich = Ask, paste code, /attach files, /model switch, { $chord } editor
 zc-input-editor-missing = No external editor found; set VISUAL or EDITOR.
 zc-input-editor-busy = Finish the active turn or queue before opening an editor.
 zc-input-editor-loaded = Loaded editor draft
@@ -375,7 +373,6 @@ zc-code-help-select-agent = Select agent
 zc-code-help-quit = Quit
 zc-code-help-switch-session = Switch session
 zc-code-help-close = Close
-zc-code-help-cancel = Cancel
 zc-code-help-approve = Approve
 zc-code-help-always-approve = Always approve
 zc-code-help-deny = Deny
@@ -408,7 +405,6 @@ zc-code-action-copy = copy
 zc-code-action-copy-md = md
 zc-code-action-retry = retry
 zc-code-action-edit = edit
-zc-code-status-help = ?=help
 zc-code-status-queue = queue { $count }
 zc-code-status-queue-paused = queue paused { $count }
 zc-code-status-history = history { $count }

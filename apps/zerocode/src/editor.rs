@@ -28,10 +28,6 @@ pub(crate) fn editor_from_env_or_path() -> Option<String> {
         })
 }
 
-pub(crate) fn editor_label() -> Option<String> {
-    editor_from_env_or_path()
-}
-
 pub(crate) fn edit_text_in_external_editor(
     term: &mut Term,
     content: &str,
