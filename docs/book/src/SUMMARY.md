@@ -32,6 +32,7 @@
   - [Platform install files](./setup/dist-files.md)
 - [Architecture](./architecture/overview.md)
   - [Request lifecycle](./architecture/request-lifecycle.md)
+  - [Channel runtime lifecycle](./architecture/channel-runtime-lifecycle.md)
   - [Crates](./architecture/crates.md)
   - [Logging](./architecture/logging.md)
   - [Runtime state and persistence](./architecture/runtime-state-and-persistence.md)
