@@ -569,7 +569,12 @@ pub async fn run(
                     continue;
                 }
 
-                if global == Some(GlobalAction::Quit) {
+                let pane_wants_quit_chord = match mode {
+                    Mode::Chat => chat_pane.wants_quit_chord(),
+                    Mode::Acp => acp_pane.wants_quit_chord(),
+                    _ => false,
+                };
+                if global == Some(GlobalAction::Quit) && !pane_wants_quit_chord {
                     // First Ctrl+C: clear input bar text, clear transient
                     // state (browse mode, overlay, …) and arm the confirm modal.
                     match mode {

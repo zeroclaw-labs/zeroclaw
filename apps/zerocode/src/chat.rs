@@ -2208,6 +2208,15 @@ impl Chat {
         }
     }
 
+    pub(crate) fn wants_quit_chord(&self) -> bool {
+        match &self.phase {
+            ChatPhase::Active(s) => {
+                s.turn_in_flight && !matches!(s.turn_status, TurnStatus::Cancelling)
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn wants_text_input(&self) -> bool {
         match &self.phase {
             // CWD picker always captures text input.
@@ -5993,6 +6002,36 @@ mod tests {
         assert!(
             chat.wants_text_input(),
             "an active pending elicitation must claim modal focus"
+        );
+    }
+
+    #[tokio::test]
+    async fn wants_quit_chord_tracks_in_flight_turn_state() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Active(Box::new(state()));
+
+        assert!(
+            !chat.wants_quit_chord(),
+            "idle pane must leave Ctrl+C to the quit modal"
+        );
+
+        if let ChatPhase::Active(s) = &mut chat.phase {
+            s.turn_in_flight = true;
+        }
+        assert!(
+            chat.wants_quit_chord(),
+            "an in-flight turn must consume Ctrl+C to cancel before quit"
+        );
+
+        if let ChatPhase::Active(s) = &mut chat.phase {
+            s.enter_cancelling();
+        }
+        assert!(
+            !chat.wants_quit_chord(),
+            "an already-cancelling turn must not re-consume Ctrl+C"
         );
     }
 
