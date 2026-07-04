@@ -382,14 +382,10 @@ impl Observer for OtelObserver {
                     // strict OTel GenAI conformance.
                     KeyValue::new("gen_ai.operation.name", "retrieval"),
                     KeyValue::new("gen_ai.system", backend.clone()),
+                    KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
+                    KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
                     KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                 ];
-                if let Some(ch) = channel {
-                    span_attrs.push(KeyValue::new("zeroclaw.channel", ch.clone()));
-                }
-                if let Some(alias) = agent_alias {
-                    span_attrs.push(KeyValue::new("gen_ai.agent.name", alias.clone()));
-                }
                 if let Some(q) = query_summary {
                     // Langfuse-specific Input/Output pane attrs. Emitting
                     // both keeps vendor-agnostic backends happy while
@@ -447,14 +443,10 @@ impl Observer for OtelObserver {
                     KeyValue::new("duration_s", secs),
                     KeyValue::new("gen_ai.operation.name", "retrieval"),
                     KeyValue::new("gen_ai.system", "zeroclaw_rag"),
+                    KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
+                    KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
                     KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                 ];
-                if let Some(ch) = channel {
-                    span_attrs.push(KeyValue::new("zeroclaw.channel", ch.clone()));
-                }
-                if let Some(alias) = agent_alias {
-                    span_attrs.push(KeyValue::new("gen_ai.agent.name", alias.clone()));
-                }
                 if let Some(q) = query_summary {
                     span_attrs.push(KeyValue::new("input.value", q.clone()));
                     span_attrs.push(KeyValue::new(
@@ -497,21 +489,17 @@ impl Observer for OtelObserver {
                 // invoke_agent, retrieval, text_completion). We omit
                 // `gen_ai.operation.name` and lean on `db.*` conventions
                 // instead.
-                let mut span_attrs = vec![
+                let span_attrs = vec![
                     KeyValue::new("memory.category", category.clone()),
                     KeyValue::new("memory.backend", backend.clone()),
                     KeyValue::new("memory.success", *success),
                     KeyValue::new("duration_s", secs),
                     KeyValue::new("db.system", backend.clone()),
                     KeyValue::new("db.operation", "INSERT"),
+                    KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
+                    KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
                     KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                 ];
-                if let Some(ch) = channel {
-                    span_attrs.push(KeyValue::new("zeroclaw.channel", ch.clone()));
-                }
-                if let Some(alias) = agent_alias {
-                    span_attrs.push(KeyValue::new("gen_ai.agent.name", alias.clone()));
-                }
 
                 let parent_cx = self.parent_cx_for(turn_id.as_deref());
                 let mut span = tracer.build_with_context(
