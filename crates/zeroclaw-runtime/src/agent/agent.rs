@@ -1080,6 +1080,7 @@ impl Agent {
         &mut self,
         user_message: &str,
         new_msgs: &mut Vec<ConversationMessage>,
+        turn: zeroclaw_api::observability_traits::TurnMetaRef<'_>,
     ) {
         let context = self
             .memory_strategy
@@ -1087,7 +1088,7 @@ impl Agent {
                 &*self.observer,
                 user_message,
                 self.memory_session_id.as_deref(),
-                zeroclaw_api::observability_traits::TurnMetaRef::default(),
+                turn,
             )
             .await
             .unwrap_or_default();
@@ -1108,9 +1109,9 @@ impl Agent {
                 backend: self.memory.name().to_string(),
                 duration: store_start.elapsed(),
                 success: store_result.is_ok(),
-                channel: None,
-                agent_alias: None,
-                turn_id: None,
+                channel: turn.channel.map(str::to_string),
+                agent_alias: turn.agent_alias.map(str::to_string),
+                turn_id: turn.turn_id.map(str::to_string),
             });
         }
 
@@ -2280,55 +2281,6 @@ impl Agent {
                 )));
         }
 
-        let context = self
-            .memory_strategy
-            .load_context(
-                &*self.observer,
-                user_message,
-                self.memory_session_id.as_deref(),
-                zeroclaw_api::observability_traits::TurnMetaRef::default(),
-            )
-            .await
-            .unwrap_or_default();
-
-        if self.auto_save {
-            let store_start = std::time::Instant::now();
-            let store_result = self
-                .memory
-                .store(
-                    "user_msg",
-                    user_message,
-                    MemoryCategory::Conversation,
-                    self.memory_session_id.as_deref(),
-                )
-                .await;
-            self.observer.record_event(&ObserverEvent::MemoryStore {
-                category: MemoryCategory::Conversation.to_string(),
-                backend: self.memory.name().to_string(),
-                duration: store_start.elapsed(),
-                success: store_result.is_ok(),
-                channel: None,
-                agent_alias: None,
-                turn_id: None,
-            });
-        }
-
-        let now = self.current_turn_datetime();
-        let (year, month, day) = (now.year(), now.month(), now.day());
-        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
-        let tz = now.format("%Z");
-        let date_str =
-            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
-
-        let enriched = if context.is_empty() {
-            format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
-        } else {
-            format!("[CURRENT DATE & TIME: {date_str}]\n\n{context}\n\n{user_message}")
-        };
-
-        self.history
-            .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
-
         let effective_model = self.classify_model(user_message);
 
         let turn_id = Self::new_turn_id();
@@ -2355,6 +2307,60 @@ impl Agent {
             saw_usage: false,
             done: false,
         };
+
+        let observer_alias = self.observer_agent_alias();
+        let context = self
+            .memory_strategy
+            .load_context(
+                &*self.observer,
+                user_message,
+                self.memory_session_id.as_deref(),
+                zeroclaw_api::observability_traits::TurnMetaRef {
+                    channel: Some(self.channel_name.as_str()),
+                    agent_alias: observer_alias.as_deref(),
+                    turn_id: Some(&turn_id),
+                },
+            )
+            .await
+            .unwrap_or_default();
+
+        if self.auto_save {
+            let store_start = std::time::Instant::now();
+            let store_result = self
+                .memory
+                .store(
+                    "user_msg",
+                    user_message,
+                    MemoryCategory::Conversation,
+                    self.memory_session_id.as_deref(),
+                )
+                .await;
+            self.observer.record_event(&ObserverEvent::MemoryStore {
+                category: MemoryCategory::Conversation.to_string(),
+                backend: self.memory.name().to_string(),
+                duration: store_start.elapsed(),
+                success: store_result.is_ok(),
+                channel: Some(self.channel_name.clone()),
+                agent_alias: self.observer_agent_alias(),
+                turn_id: Some(turn_id.clone()),
+            });
+        }
+
+        let now = self.current_turn_datetime();
+        let (year, month, day) = (now.year(), now.month(), now.day());
+        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
+        let tz = now.format("%Z");
+        let date_str =
+            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
+
+        let enriched = if context.is_empty() {
+            format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
+        } else {
+            format!("[CURRENT DATE & TIME: {date_str}]\n\n{context}\n\n{user_message}")
+        };
+
+        self.history
+            .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
         // Response cache: check once before entering the loop (only for
         // deterministic, text-only prompts). The key must include the whole
@@ -2746,10 +2752,6 @@ impl Agent {
                 )));
         }
 
-        let mut new_msgs: Vec<ConversationMessage> = Vec::new();
-        self.append_streamed_user_message_to_history(user_message, &mut new_msgs)
-            .await;
-
         let effective_model = self.classify_model(user_message);
         let turn_started_at = Instant::now();
         let turn_id = Self::new_turn_id();
@@ -2776,6 +2778,19 @@ impl Agent {
             saw_usage: false,
             done: false,
         };
+
+        let mut new_msgs: Vec<ConversationMessage> = Vec::new();
+        {
+            let channel_name = self.channel_name.clone();
+            let observer_alias = self.observer_agent_alias();
+            let turn_meta = zeroclaw_api::observability_traits::TurnMetaRef {
+                channel: Some(channel_name.as_str()),
+                agent_alias: observer_alias.as_deref(),
+                turn_id: Some(&turn_id),
+            };
+            self.append_streamed_user_message_to_history(user_message, &mut new_msgs, turn_meta)
+                .await;
+        }
 
         // Response cache: check once before the round loop, keyed on the full
         // provider-visible transcript (matches `Agent::turn`; the old code
@@ -2897,8 +2912,19 @@ impl Agent {
             // Steering drain: each accepted mid-turn message becomes its own
             // enriched user turn in both transcripts before the next round.
             for steering_message in crate::agent::loop_::drain_steering_messages(&mut steering_rx) {
-                self.append_streamed_user_message_to_history(&steering_message, &mut new_msgs)
-                    .await;
+                let channel_name = self.channel_name.clone();
+                let observer_alias = self.observer_agent_alias();
+                let turn_meta = zeroclaw_api::observability_traits::TurnMetaRef {
+                    channel: Some(channel_name.as_str()),
+                    agent_alias: observer_alias.as_deref(),
+                    turn_id: Some(&turn_id),
+                };
+                self.append_streamed_user_message_to_history(
+                    &steering_message,
+                    &mut new_msgs,
+                    turn_meta,
+                )
+                .await;
                 if let Some(ConversationMessage::Chat(user_msg)) = new_msgs.last() {
                     loop_history.push(user_msg.clone());
                 }
@@ -7614,7 +7640,10 @@ mod tests {
             | ObserverEvent::LlmResponse { turn_id, .. }
             | ObserverEvent::AgentEnd { turn_id, .. }
             | ObserverEvent::ToolCall { turn_id, .. }
-            | ObserverEvent::ToolCallStart { turn_id, .. } => turn_id.as_deref(),
+            | ObserverEvent::ToolCallStart { turn_id, .. }
+            | ObserverEvent::MemoryRecall { turn_id, .. }
+            | ObserverEvent::MemoryStore { turn_id, .. }
+            | ObserverEvent::RagRetrieve { turn_id, .. } => turn_id.as_deref(),
             _ => None,
         }
     }
@@ -7675,6 +7704,24 @@ mod tests {
                     turn_id,
                     ..
                 } => ("ToolCall", channel, agent_alias, turn_id),
+                ObserverEvent::MemoryRecall {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("MemoryRecall", channel, agent_alias, turn_id),
+                ObserverEvent::MemoryStore {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("MemoryStore", channel, agent_alias, turn_id),
+                ObserverEvent::RagRetrieve {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("RagRetrieve", channel, agent_alias, turn_id),
                 _ => continue,
             };
             assert!(
@@ -7707,7 +7754,10 @@ mod tests {
                     | ObserverEvent::LlmRequest { agent_alias, .. }
                     | ObserverEvent::LlmResponse { agent_alias, .. }
                     | ObserverEvent::ToolCallStart { agent_alias, .. }
-                    | ObserverEvent::ToolCall { agent_alias, .. } => agent_alias,
+                    | ObserverEvent::ToolCall { agent_alias, .. }
+                    | ObserverEvent::MemoryRecall { agent_alias, .. }
+                    | ObserverEvent::MemoryStore { agent_alias, .. }
+                    | ObserverEvent::RagRetrieve { agent_alias, .. } => agent_alias,
                     _ => continue,
                 };
                 assert_eq!(
@@ -7726,7 +7776,10 @@ mod tests {
                     | ObserverEvent::LlmResponse { channel: ch, .. }
                     | ObserverEvent::ToolCallStart { channel: ch, .. }
                     | ObserverEvent::ToolCall { channel: ch, .. }
-                    | ObserverEvent::AgentEnd { channel: ch, .. } => ch,
+                    | ObserverEvent::AgentEnd { channel: ch, .. }
+                    | ObserverEvent::MemoryRecall { channel: ch, .. }
+                    | ObserverEvent::MemoryStore { channel: ch, .. }
+                    | ObserverEvent::RagRetrieve { channel: ch, .. } => ch,
                     _ => continue,
                 };
                 assert_eq!(ch.as_deref(), Some(channel), "channel should be consistent");
