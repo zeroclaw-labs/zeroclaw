@@ -23,7 +23,8 @@ Read these files at the start of every session. They are authoritative.
 
 - `AGENTS.md` — risk tiers, high-risk paths, anti-patterns, commands
 - `docs/book/src/contributing/pr-review-protocol.md` — **the full review protocol**;
-  follow it exactly for every PR, including the review-body Markdown format
+  follow it exactly for every PR, including template completeness,
+  public-artifact truthfulness, and the review-body Markdown format
 - `.github/pull_request_template.md` — required PR body sections; used to
   check template completeness
 - `docs/book/src/foundations/fnd-003-governance.md` — label taxonomy, tracking
@@ -96,6 +97,8 @@ The protocol specifies:
 - **Label hygiene** — fix obvious label mismatches yourself when the active
   reviewer has label permissions, after approval for the public-state mutation;
   do not ask authors to update labels they may not be allowed to edit
+- **Template and public-artifact checks** — run the checks defined in the
+  protocol before approving
 - **The verdict decision tree** — which flag to use based on review state
 - **The feedback taxonomy** (🔴 / 🟡 / ✅ / 🔵 / 🟢), including the required
   H3 review-body heading format that starts each formal finding with the
