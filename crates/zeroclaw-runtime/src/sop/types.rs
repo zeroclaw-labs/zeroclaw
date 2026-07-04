@@ -112,7 +112,16 @@ impl std::str::FromStr for FilesystemEventKind {
 // ── Trigger ─────────────────────────────────────────────────────
 
 /// What event can activate an SOP.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, strum_macros::EnumDiscriminants)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum_macros::EnumDiscriminants,
+    zeroclaw_macros::TriggerFields,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "lowercase")]
 #[strum_discriminants(
@@ -182,6 +191,7 @@ pub enum SopTrigger {
     /// Inbound message on a configured agent-loop channel (telegram, discord,
     /// slack, ...). Live: delivered by the channel orchestrator when the
     /// channel's SOP dispatch mode is enabled.
+    #[trigger(config_derived)]
     Channel {
         /// `ChannelKind` snake_case value naming the channel type.
         channel: String,

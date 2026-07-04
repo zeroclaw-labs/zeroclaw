@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
-use super::condition::evaluate_condition;
 use super::load_sops;
 use super::metrics::SopMetricsCollector;
 use super::route::{self, NextStep, RouteCtx};
@@ -2016,133 +2015,23 @@ pub(crate) enum GateState {
 // ── Trigger matching ────────────────────────────────────────────
 
 /// Check whether a single trigger definition matches an incoming event.
+///
+/// Source class is the cheap gate: a trigger can only match an event from its
+/// own source. Past that, matching is the trigger's own responsibility via its
+/// `TriggerBehavior`, so there is no per-source logic to drift here.
 fn trigger_matches(trigger: &SopTrigger, event: &SopEvent) -> bool {
-    match (trigger, event.source) {
-        (SopTrigger::Mqtt { topic, condition }, SopTriggerSource::Mqtt) => {
-            let topic_match = event
-                .topic
-                .as_deref()
-                .is_some_and(|t| mqtt_topic_matches(topic, t));
-            if !topic_match {
-                return false;
-            }
-            // Evaluate condition against payload (None condition = unconditional)
-            match condition {
-                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
-                None => true,
-            }
-        }
-
-        (
-            SopTrigger::Amqp {
-                routing_key,
-                condition,
-            },
-            SopTriggerSource::Amqp,
-        ) => {
-            let key_match = event
-                .topic
-                .as_deref()
-                .is_some_and(|t| amqp_routing_key_matches(routing_key, t));
-            if !key_match {
-                return false;
-            }
-            match condition {
-                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
-                None => true,
-            }
-        }
-
-        (SopTrigger::Webhook { path }, SopTriggerSource::Webhook) => {
-            event.topic.as_deref().is_some_and(|t| t == path)
-        }
-
-        (
-            SopTrigger::Peripheral {
-                board,
-                signal,
-                condition,
-            },
-            SopTriggerSource::Peripheral,
-        ) => {
-            let topic_match = event.topic.as_deref().is_some_and(|t| {
-                let expected = format!("{board}/{signal}");
-                t == expected
-            });
-            if !topic_match {
-                return false;
-            }
-            // Evaluate condition against payload (None condition = unconditional)
-            match condition {
-                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
-                None => true,
-            }
-        }
-
-        (SopTrigger::Cron { expression }, SopTriggerSource::Cron) => {
-            event.topic.as_deref().is_some_and(|t| t == expression)
-        }
-
-        (
-            SopTrigger::Filesystem {
-                path,
-                events,
-                condition,
-            },
-            SopTriggerSource::Filesystem,
-        ) => {
-            let path_match = event
-                .topic
-                .as_deref()
-                .is_some_and(|t| filesystem_path_matches(path, t));
-            if !path_match {
-                return false;
-            }
-            if !events.is_empty() && !filesystem_event_listed(events, event.payload.as_deref()) {
-                return false;
-            }
-            match condition {
-                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
-                None => true,
-            }
-        }
-
-        (
-            SopTrigger::Calendar {
-                calendar_source,
-                calendar_ids,
-            },
-            SopTriggerSource::Calendar,
-        ) => calendar_trigger_matches(calendar_source, calendar_ids, event),
-
-        (
-            SopTrigger::Channel {
-                channel,
-                alias,
-                condition,
-            },
-            SopTriggerSource::Channel,
-        ) => {
-            if !channel_trigger_topic_matches(channel, alias.as_deref(), event.topic.as_deref()) {
-                return false;
-            }
-            match condition {
-                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
-                None => true,
-            }
-        }
-
-        (SopTrigger::Manual, SopTriggerSource::Manual) => true,
-
-        _ => false,
-    }
+    trigger.source() == event.source && trigger.behavior().matches(event)
 }
 
 /// Match a channel trigger against an event topic of the form `channel` or
 /// `channel/alias`. Channel type compares case-insensitively; an aliased
 /// trigger requires an exact alias, an alias-less trigger matches any
 /// instance. No topic fails closed.
-fn channel_trigger_topic_matches(channel: &str, alias: Option<&str>, topic: Option<&str>) -> bool {
+pub(crate) fn channel_trigger_topic_matches(
+    channel: &str,
+    alias: Option<&str>,
+    topic: Option<&str>,
+) -> bool {
     let Some(topic) = topic else {
         return false;
     };
@@ -2159,7 +2048,7 @@ fn channel_trigger_topic_matches(channel: &str, alias: Option<&str>, topic: Opti
     }
 }
 
-fn calendar_trigger_matches(
+pub(crate) fn calendar_trigger_matches(
     calendar_source: &str,
     calendar_ids: &[String],
     event: &SopEvent,
@@ -2187,7 +2076,7 @@ fn calendar_trigger_matches(
 }
 
 /// Simple MQTT topic matching with `+` (single-level) and `#` (multi-level) wildcards.
-fn mqtt_topic_matches(pattern: &str, topic: &str) -> bool {
+pub(crate) fn mqtt_topic_matches(pattern: &str, topic: &str) -> bool {
     let pat_parts: Vec<&str> = pattern.split('/').collect();
     let top_parts: Vec<&str> = topic.split('/').collect();
 
@@ -2219,7 +2108,7 @@ fn mqtt_topic_matches(pattern: &str, topic: &str) -> bool {
 /// AMQP topic-exchange routing-key matching. Keys are `.`-delimited words;
 /// `*` matches exactly one word and `#` matches zero or more words. A `#` that
 /// can absorb zero segments is what distinguishes this from MQTT matching.
-fn amqp_routing_key_matches(pattern: &str, key: &str) -> bool {
+pub(crate) fn amqp_routing_key_matches(pattern: &str, key: &str) -> bool {
     let pat: Vec<&str> = pattern.split('.').collect();
     let words: Vec<&str> = key.split('.').collect();
     amqp_match_from(&pat, &words)
@@ -2239,7 +2128,7 @@ fn amqp_match_from(pat: &[&str], words: &[&str]) -> bool {
 /// Glob match a filesystem trigger `pattern` against a normalized `path`,
 /// supporting `*` (single segment) and `**` (recursive) wildcards via the
 /// `glob` crate. A bare directory pattern also matches paths nested beneath it.
-fn filesystem_path_matches(pattern: &str, path: &str) -> bool {
+pub(crate) fn filesystem_path_matches(pattern: &str, path: &str) -> bool {
     if let Ok(compiled) = glob::Pattern::new(pattern)
         && compiled.matches(path)
     {
@@ -2250,7 +2139,10 @@ fn filesystem_path_matches(pattern: &str, path: &str) -> bool {
 }
 
 /// Whether the payload's `event` field names one of the trigger's listed kinds.
-fn filesystem_event_listed(events: &[FilesystemEventKind], payload: Option<&str>) -> bool {
+pub(crate) fn filesystem_event_listed(
+    events: &[FilesystemEventKind],
+    payload: Option<&str>,
+) -> bool {
     let Some(payload) = payload else {
         return false;
     };

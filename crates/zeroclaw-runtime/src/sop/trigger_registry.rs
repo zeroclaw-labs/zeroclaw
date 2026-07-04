@@ -58,7 +58,7 @@ pub struct TriggerField {
 }
 
 impl TriggerField {
-    fn text(name: &str) -> Self {
+    pub(crate) fn text(name: &str) -> Self {
         Self {
             name: name.to_string(),
             options: Vec::new(),
@@ -67,16 +67,25 @@ impl TriggerField {
         }
     }
 
-    fn list(name: &str) -> Self {
+    pub(crate) fn list(name: &str) -> Self {
         Self {
             kind: TriggerFieldKind::List,
             ..Self::text(name)
         }
     }
 
-    fn expression(name: &str) -> Self {
+    pub(crate) fn expression(name: &str) -> Self {
         Self {
             kind: TriggerFieldKind::Expression,
+            ..Self::text(name)
+        }
+    }
+
+    pub(crate) fn options(name: &str, options: Vec<String>) -> Self {
+        Self {
+            options,
+            multi: true,
+            kind: TriggerFieldKind::List,
             ..Self::text(name)
         }
     }
@@ -138,59 +147,19 @@ pub fn registry_from_config(config: &zeroclaw_config::schema::Config) -> Trigger
 }
 
 /// Build the registry by walking the trigger-source and channel enums.
-/// Every `SopTriggerSource` except `Channel` becomes a bound source; every
-/// inbound-capable `ChannelKind` becomes a channel row with whatever
-/// configured aliases match it.
+/// Every `SopTriggerSource` except `Channel` becomes a bound source whose field
+/// specs come from the source's own `TriggerBehavior`; every inbound-capable
+/// `ChannelKind` becomes a channel row with whatever configured aliases match
+/// it. No per-source field list lives here: the source describes its own fields.
 #[must_use]
 pub fn build_registry(configured: &[ConfiguredChannel]) -> TriggerSourceRegistry {
     use crate::sop::types::SopTriggerSource;
 
-    let filesystem_events: Vec<String> = crate::sop::types::FilesystemEventKind::iter()
-        .map(|k| {
-            let s: &'static str = k.into();
-            s.to_string()
-        })
-        .collect();
-
     let bound = SopTriggerSource::iter()
-        .filter_map(|source| {
-            let fields = match source {
-                SopTriggerSource::Channel => return None,
-                SopTriggerSource::Webhook => vec![TriggerField::text("path")],
-                SopTriggerSource::Cron => vec![TriggerField::text("expression")],
-                SopTriggerSource::Mqtt => vec![
-                    TriggerField::text("topic"),
-                    TriggerField::expression("condition"),
-                ],
-                SopTriggerSource::Filesystem => vec![
-                    TriggerField::text("path"),
-                    TriggerField {
-                        name: "events".to_string(),
-                        options: filesystem_events.clone(),
-                        multi: true,
-                        kind: TriggerFieldKind::List,
-                    },
-                    TriggerField::expression("condition"),
-                ],
-                SopTriggerSource::Peripheral => vec![
-                    TriggerField::text("board"),
-                    TriggerField::text("signal"),
-                    TriggerField::expression("condition"),
-                ],
-                SopTriggerSource::Calendar => vec![
-                    TriggerField::text("calendar_source"),
-                    TriggerField::list("calendar_ids"),
-                ],
-                SopTriggerSource::Amqp => vec![
-                    TriggerField::text("routing_key"),
-                    TriggerField::expression("condition"),
-                ],
-                SopTriggerSource::Manual => vec![],
-            };
-            Some(BoundTriggerSource {
-                source: source.to_string(),
-                fields,
-            })
+        .filter(|source| *source != SopTriggerSource::Channel)
+        .map(|source| BoundTriggerSource {
+            source: source.to_string(),
+            fields: source.field_specs(),
         })
         .collect();
 
@@ -332,12 +301,23 @@ mod tests {
                 .unwrap_or_else(|| panic!("source {source} missing from registry"));
             let json = serde_json::to_value(trigger).unwrap();
             let keys = json.as_object().unwrap();
+            let spec_names: Vec<&str> = bound.fields.iter().map(|f| f.name.as_str()).collect();
             for field in &bound.fields {
                 assert!(
                     keys.contains_key(&field.name),
                     "registry field '{}' for source {source} does not exist on the \
                      serialized trigger; field names drifted from SopTrigger serde fields",
                     field.name
+                );
+            }
+            for key in keys.keys() {
+                if key == "type" {
+                    continue;
+                }
+                assert!(
+                    spec_names.contains(&key.as_str()),
+                    "serde field '{key}' on source {source} has no derived field spec; \
+                     the TriggerFields derive dropped a variant field"
                 );
             }
         }

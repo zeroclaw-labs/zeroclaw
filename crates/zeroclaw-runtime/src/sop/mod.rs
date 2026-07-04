@@ -15,6 +15,7 @@ pub mod scope;
 pub mod step_contract;
 pub mod store;
 pub mod trigger_registry;
+pub mod trigger_source;
 pub mod types;
 pub mod wire;
 
