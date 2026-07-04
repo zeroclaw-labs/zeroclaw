@@ -44,6 +44,21 @@ pub struct TurnTokenUsage {
     pub output_tokens: u64,
 }
 
+/// Borrowed turn-correlation metadata handed to memory hooks so the events
+/// they emit can join the active turn trace.
+///
+/// All fields are optional: `None` means the operation is not running inside
+/// a correlated agent turn, and observers degrade to root spans rather than
+/// fabricating correlation. The source of truth for each value is the turn
+/// mint site (`Agent::turn`, `run()`, `process_message`); this struct only
+/// carries the borrow.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TurnMetaRef<'a> {
+    pub channel: Option<&'a str>,
+    pub agent_alias: Option<&'a str>,
+    pub turn_id: Option<&'a str>,
+}
+
 /// Discrete events emitted by the agent runtime for observability.
 ///
 /// Each variant represents a lifecycle event that observers can record,
@@ -171,6 +186,9 @@ pub enum ObserverEvent {
         /// Bounded backend identifier (e.g. `"sqlite"`, `"qdrant"`, `"none"`).
         backend: String,
         success: bool,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// A memory store (write) operation has completed.
     ///
@@ -187,6 +205,9 @@ pub enum ObserverEvent {
         backend: String,
         duration: Duration,
         success: bool,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// A RAG retrieval pass has completed.
     ///
@@ -200,6 +221,9 @@ pub enum ObserverEvent {
         duration: Duration,
         num_chunks: usize,
         num_boards: usize,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// The agent produced a final answer for the current user message.
     TurnComplete,
@@ -479,18 +503,27 @@ mod tests {
             num_entries: 3,
             backend: "sqlite".into(),
             success: true,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
         };
         let store = ObserverEvent::MemoryStore {
             category: "conversation".into(),
             backend: "sqlite".into(),
             duration: Duration::from_millis(8),
             success: true,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
         };
         let rag = ObserverEvent::RagRetrieve {
             query_summary: None,
             duration: Duration::from_millis(120),
             num_chunks: 5,
             num_boards: 2,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
         };
 
         assert!(matches!(recall.clone(), ObserverEvent::MemoryRecall { .. }));
