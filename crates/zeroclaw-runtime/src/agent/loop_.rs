@@ -1525,10 +1525,13 @@ pub async fn run(
                     Err(e) => {
                         ::zeroclaw_log::record!(
                             ERROR,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                                .with_category(::zeroclaw_log::EventCategory::Agent)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                             "MCP registry failed to initialize"
                         );
                         None
@@ -1541,8 +1544,7 @@ pub async fn run(
                     mcp_tool_access_policy(security.as_ref(), allowed_tools.as_deref());
                 // Register the generic MCP resource/prompt capability tools
                 // (policy-gated, both deferred and eager modes).
-                for tool in
-                    crate::tools::build_mcp_capability_tools(&registry, mcp_policy.as_ref())
+                for tool in crate::tools::build_mcp_capability_tools(&registry, mcp_policy.as_ref())
                 {
                     register_eager_mcp_tool_if_allowed(
                         tool,
@@ -1565,11 +1567,8 @@ pub async fn run(
                     .await;
                     ::zeroclaw_log::record!(
                         INFO,
-                        ::zeroclaw_log::Event::new(
-                            module_path!(),
-                            ::zeroclaw_log::Action::Load
-                        )
-                        .with_category(::zeroclaw_log::EventCategory::Tool),
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                            .with_category(::zeroclaw_log::EventCategory::Tool),
                         &format!(
                             "MCP deferred: {} tool stub(s) from {} server(s)",
                             deferred_set.len(),
@@ -1599,17 +1598,16 @@ pub async fn run(
                         }
                         if let Some(ref handle) = delegate_handle {
                             let delegate_tools = std::sync::Arc::clone(handle);
-                            tool_search = tool_search.with_activation_hook(
-                                std::sync::Arc::new(move |tool| {
+                            tool_search = tool_search.with_activation_hook(std::sync::Arc::new(
+                                move |tool| {
                                     let mut tools = delegate_tools.write();
-                                    let already_registered = tools
-                                        .iter()
-                                        .any(|existing| existing.name() == tool.name());
+                                    let already_registered =
+                                        tools.iter().any(|existing| existing.name() == tool.name());
                                     if !already_registered {
                                         tools.push(tool);
                                     }
-                                }),
-                            );
+                                },
+                            ));
                         }
                         tools_registry.push(Box::new(tool_search));
                     }
@@ -1671,11 +1669,8 @@ pub async fn run(
                 // any of the eager-path counters here.
                 ::zeroclaw_log::record!(
                     INFO,
-                    ::zeroclaw_log::Event::new(
-                        module_path!(),
-                        ::zeroclaw_log::Action::Note
-                    )
-                    .with_category(::zeroclaw_log::EventCategory::Tool),
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Tool),
                     "MCP client: no registry available; continuing without MCP tools"
                 );
             }

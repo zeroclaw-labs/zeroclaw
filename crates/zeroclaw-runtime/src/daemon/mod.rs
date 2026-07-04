@@ -1059,9 +1059,8 @@ type HeartbeatMcpRegistryTestHook = std::sync::Arc<
 >;
 
 #[cfg(test)]
-static HEARTBEAT_MCP_REGISTRY_TEST_HOOK: std::sync::Mutex<
-    Option<HeartbeatMcpRegistryTestHook>,
-> = std::sync::Mutex::new(None);
+static HEARTBEAT_MCP_REGISTRY_TEST_HOOK: std::sync::Mutex<Option<HeartbeatMcpRegistryTestHook>> =
+    std::sync::Mutex::new(None);
 
 /// Serializes the regression tests for the daemon heartbeat MCP
 /// registry hook (`#5903`). The hook itself is process-global, so a
@@ -3195,8 +3194,8 @@ mod tests {
     //    differed on every tick.
     #[tokio::test]
     async fn heartbeat_mcp_registry_constructed_once_across_n_ticks() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
@@ -3217,10 +3216,11 @@ mod tests {
         );
         let shared_for_hook_clone = Arc::clone(&shared_for_hook);
         let construct_count_for_hook = Arc::clone(&construct_count);
-        let _hook_guard = set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
-            construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
-            Arc::clone(&shared_for_hook_clone)
-        }));
+        let _hook_guard =
+            set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
+                construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                Arc::clone(&shared_for_hook_clone)
+            }));
 
         // (a) Simulate worker boot: the daemon calls
         //     `connect_heartbeat_mcp_registry` exactly once.
@@ -3318,8 +3318,8 @@ mod tests {
     // it at 1.
     #[tokio::test]
     async fn heartbeat_mcp_shared_arc_survives_n_tick_drops() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
@@ -3336,10 +3336,11 @@ mod tests {
         );
         let shared_for_hook_clone = Arc::clone(&shared_for_hook);
         let construct_count_for_hook = Arc::clone(&construct_count);
-        let _hook_guard = set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
-            construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
-            Arc::clone(&shared_for_hook_clone)
-        }));
+        let _hook_guard =
+            set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
+                construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                Arc::clone(&shared_for_hook_clone)
+            }));
 
         let worker_shared = connect_heartbeat_mcp_registry(&config, agent_alias)
             .await
@@ -3397,8 +3398,8 @@ mod tests {
     // the call counter.
     #[tokio::test]
     async fn heartbeat_worker_reuses_shared_mcp_registry_across_n_ticks() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
@@ -3417,10 +3418,11 @@ mod tests {
         );
         let shared_for_hook_clone = Arc::clone(&shared_for_hook);
         let construct_count_for_hook = Arc::clone(&construct_count);
-        let _hook_guard = set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
-            construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
-            Arc::clone(&shared_for_hook_clone)
-        }));
+        let _hook_guard =
+            set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
+                construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                Arc::clone(&shared_for_hook_clone)
+            }));
 
         // ── Worker boot: connect ONCE ──────────────────────────────
         // Mirrors `run_heartbeat_worker`'s pre-loop call. The fix
@@ -3506,8 +3508,8 @@ mod tests {
     //    the daemon worker only calls it once.
     #[tokio::test]
     async fn connect_heartbeat_mcp_registry_helper_counts_per_invocation() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
@@ -3521,10 +3523,11 @@ mod tests {
         );
         let shared_for_hook_clone = Arc::clone(&shared_for_hook);
         let construct_count_for_hook = Arc::clone(&construct_count);
-        let _hook_guard = set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
-            construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
-            Arc::clone(&shared_for_hook_clone)
-        }));
+        let _hook_guard =
+            set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
+                construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                Arc::clone(&shared_for_hook_clone)
+            }));
 
         // 5 invocations → counter must reach 5. A buggy helper that
         // memoised the first call's Arc would leave the counter at 1,
@@ -3533,7 +3536,8 @@ mod tests {
         // though in practice it MUST NOT call it more than once per
         // worker lifetime, see the regressions above).
         const INVOCATIONS: usize = 5;
-        let mut returned_ptrs: Vec<*const crate::tools::McpRegistry> = Vec::with_capacity(INVOCATIONS);
+        let mut returned_ptrs: Vec<*const crate::tools::McpRegistry> =
+            Vec::with_capacity(INVOCATIONS);
         for _ in 0..INVOCATIONS {
             let r = connect_heartbeat_mcp_registry(&config, agent_alias)
                 .await
