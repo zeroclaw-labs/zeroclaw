@@ -17080,6 +17080,42 @@ impl Config {
         out
     }
 
+    /// Sender usernames authorized to issue `/model --agent <model>` on
+    /// `<channel_type>.<alias>`. A `[peer_groups.<name>]` contributes
+    /// when its `channel` matches (type-wide or dotted) **and** its
+    /// `admin_for_agent_scope = true`. Returns deduped and sorted.
+    /// Live-resolve, no cache — operator edits take effect on next
+    /// command. See issue #8044.
+    pub fn channel_agent_scope_admins(
+        &self,
+        channel_type: &str,
+        alias: &str,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for group in self.peer_groups.values() {
+            if !group.admin_for_agent_scope {
+                continue;
+            }
+            let group_matches = match group.channel.split_once('.') {
+                Some((ty, al)) => ty == channel_type && al == alias,
+                None => group.channel == channel_type,
+            };
+            if !group_matches {
+                continue;
+            }
+            for peer in &group.external_peers {
+                let username = peer.as_str().to_string();
+                if seen.insert(username.clone()) {
+                    out.push(username);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
     /// Collect the `IntegrationDescriptor` from every nested config that
     /// declares one via `#[integration(...)]`. Adding a new toggleable
     /// integration is one struct-level attribute on the new config + one
