@@ -386,6 +386,8 @@ Options:
   --preset NAME        Named feature preset: 'minimal' (kernel only, ~6.6MB) or
                        'full' (every channel plus heavyweight extras such as
                        whatsapp-web and channel-matrix). Source builds only.
+  --full               Install everything: the 'full' feature preset plus every
+                       installable app (implies --source)
   --minimal            Alias for --preset minimal
   --features X,Y       Select specific features — source only (comma-separated)
   --apps X,Y           Select apps to install (e.g. zerocode); "none" to skip all
@@ -410,6 +412,7 @@ Examples:
   $0 --source --minimal                        # smallest possible binary
   $0 --source --features agent-runtime,channel-discord  # custom feature set
   $0 --source --preset full                   # every channel plus heavyweight extras
+  $0 --full                                    # everything: full preset + every app
   $0 --skip-quickstart                            # install only, configure later
   $0 --prefix /tmp/zc-test --skip-quickstart      # isolated test install
   $0 --dry-run --prebuilt                      # preview without installing
@@ -732,6 +735,7 @@ PRESET=""       # ""=unset, "minimal"=alias for --minimal, "full"=default-featur
 WITH_GATEWAY="" # ""=unset (preset/feature default applies), "true"/"false"=explicit toggle
 WITHOUT_TUI=""  # ""=unset (default: install TUI), "true"=skip TUI
 USER_APPS=""    # ""=unset (default apps), "none"=skip all, or comma list (e.g. "zerocode")
+FULL_APPS=false # true when --full: install every discovered app, not just the defaults
 
 # Support legacy env var
 if [ -n "${ZEROCLAW_CARGO_FEATURES:-}" ]; then
@@ -754,6 +758,11 @@ while [ $# -gt 0 ]; do
     full) PRESET="full" ;;
     *) die "Unknown preset '$1'. Expected: minimal or full" ;;
     esac
+    ;;
+  --full)
+    # Everything: the 'full' feature preset plus every installable app.
+    PRESET="full"
+    FULL_APPS=true
     ;;
   --features)
     if [ $# -lt 2 ]; then
@@ -1141,16 +1150,22 @@ See all available features:
   # Resolve the app set: explicit --apps list, "none" to skip, or the
   # full installable set by default. --without-tui is back-compat for
   # dropping the TUI app from the default set.
-  if [ "$USER_APPS" = "none" ]; then
+  if [ "$FULL_APPS" = true ] && [ -z "$USER_APPS" ]; then
+    # --full installs every discovered app (an explicit --apps still wins).
+    WANT_APPS="$APPS"
+  elif [ "$USER_APPS" = "none" ]; then
     WANT_APPS=""
   elif [ -n "$USER_APPS" ]; then
     WANT_APPS=$(printf '%s' "$USER_APPS" | tr ',[:space:]' '\n' | grep -v '^$' | sort -u | paste -sd' ' -)
     for app in $WANT_APPS; do validate_app "$app"; done
   else
     WANT_APPS="$DEFAULT_APPS"
-    if [ "$WITHOUT_TUI" = true ]; then
-      WANT_APPS=$(printf '%s' "$WANT_APPS" | tr ' ' '\n' | grep -vx "$TUI_BIN_NAME" | paste -sd' ' -)
-    fi
+  fi
+
+  # --without-tui drops the TUI app from the resolved default or --full
+  # set (an explicit --apps list is honored as-is).
+  if [ "$WITHOUT_TUI" = true ] && [ -z "$USER_APPS" ]; then
+    WANT_APPS=$(printf '%s' "$WANT_APPS" | tr ' ' '\n' | grep -vx "$TUI_BIN_NAME" | paste -sd' ' -)
   fi
 
   # agent-runtime is a default feature; if defaults are stripped and it

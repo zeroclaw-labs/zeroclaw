@@ -10177,6 +10177,38 @@ pub struct MemoryConfig {
     /// Cosine similarity threshold for conflict detection (0.0–1.0).
     #[serde(default = "default_conflict_threshold")]
     pub conflict_threshold: f64,
+    /// Enable reversible supersede soft-hide machinery when wired.
+    #[serde(default = "default_conflict_supersede_enabled")]
+    pub conflict_supersede_enabled: bool,
+    /// Enable write-time near-duplicate detection.
+    #[serde(default)]
+    pub dedup_on_write: bool,
+    /// Jaccard threshold for text-only duplicate detection.
+    #[serde(default = "default_dedup_jaccard_threshold")]
+    pub dedup_jaccard_threshold: f64,
+    /// Action to take when a duplicate is detected.
+    #[serde(default)]
+    pub dedup_action: MemoryDedupAction,
+
+    // ── Memory Budget / Pinning ────────────────────────────────
+    /// Maximum Core rows before budget compaction. 0 = unbounded.
+    #[serde(default)]
+    pub core_max_rows: u64,
+    /// Maximum Core bytes before budget compaction. 0 = unbounded.
+    #[serde(default)]
+    pub core_max_bytes: u64,
+    /// Maximum Daily rows before budget compaction. 0 = unbounded.
+    #[serde(default)]
+    pub daily_max_rows: u64,
+    /// Eviction ordering for budget compaction.
+    #[serde(default)]
+    pub evict_order: MemoryEvictOrder,
+    /// Namespaces protected from budget eviction.
+    #[serde(default)]
+    pub pin_namespaces: Vec<String>,
+    /// Pin entries at or above this importance. >1.0 means disabled.
+    #[serde(default = "default_pin_min_importance")]
+    pub pin_min_importance: f64,
 
     // ── Audit Trail ─────────────────────────────────────────────
     /// Enable audit logging of memory operations.
@@ -10231,6 +10263,44 @@ fn default_namespace() -> String {
 fn default_conflict_threshold() -> f64 {
     0.85
 }
+fn default_conflict_supersede_enabled() -> bool {
+    true
+}
+fn default_dedup_jaccard_threshold() -> f64 {
+    0.80
+}
+fn default_pin_min_importance() -> f64 {
+    1.01
+}
+
+/// Write-time duplicate handling policy for memory entries.
+#[derive(
+    Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryDedupAction {
+    /// Reject an incoming near-duplicate.
+    #[default]
+    Reject,
+    /// Merge an incoming near-duplicate into a survivor.
+    Merge,
+}
+
+/// Memory budget eviction order.
+#[derive(
+    Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryEvictOrder {
+    /// Evict the lowest-value rows first.
+    #[default]
+    Value,
+    /// Evict the oldest rows first.
+    Oldest,
+}
+
 fn default_audit_retention_days() -> u32 {
     30
 }
@@ -10326,6 +10396,16 @@ impl Default for MemoryConfig {
             fts_early_return_score: default_fts_early_return_score(),
             default_namespace: default_namespace(),
             conflict_threshold: default_conflict_threshold(),
+            conflict_supersede_enabled: default_conflict_supersede_enabled(),
+            dedup_on_write: false,
+            dedup_jaccard_threshold: default_dedup_jaccard_threshold(),
+            dedup_action: MemoryDedupAction::default(),
+            core_max_rows: 0,
+            core_max_bytes: 0,
+            daily_max_rows: 0,
+            evict_order: MemoryEvictOrder::default(),
+            pin_namespaces: Vec::new(),
+            pin_min_importance: default_pin_min_importance(),
             audit_enabled: false,
             audit_retention_days: default_audit_retention_days(),
             policy: MemoryPolicyConfig::default(),

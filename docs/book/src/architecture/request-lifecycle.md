@@ -26,7 +26,7 @@ sequenceDiagram
     participant CH as Channel
     participant RT as Runtime
     participant SEC as Security
-    participant MEM as Memory
+    participant MEM as Memory / history
     participant PR as Provider
     participant TL as Tool
 
@@ -53,11 +53,11 @@ sequenceDiagram
     end
     RT->>TL: invoke(args)
     TL-->>RT: ToolResult
-    RT->>MEM: append(tool_call, tool_result)
+    RT->>MEM: append to turn/session history
     RT->>PR: chat(..., + tool_result)
     PR-->>RT: StreamEvent::TextDelta (final)
     RT-->>CH: reply(final)
-    RT->>MEM: persist(conversation)
+    RT->>MEM: persist conversation/session history
 ```
 
 Key properties:
@@ -66,7 +66,7 @@ Key properties:
 - **Tool calls are mid-stream.** The model can emit a tool call while still generating text. The runtime pauses the stream, validates, invokes, feeds the result back, and resumes.
 - **Security gates every tool call.** `evaluate_tool_access` consults the [autonomy level](../security/autonomy.md), allow/deny lists, and path boundaries. Medium-risk calls under `Supervised` autonomy go to the operator-approval path.
 - **Memory context is engine-injected.** Before the first provider call, the turn engine resolves an injection policy from the turn's `TurnOrigin` (who initiated the turn): nested sub-turns never inject, scheduled origins (cron, daemon) inject with conversation-category entries excluded, and user-facing origins inject (excluding conversation entries when the turn has no session scope). A spawn site can suppress injection for any origin (for example a cron job with `uses_memory = false`), and turns that carry no memory backend skip it entirely. A single renderer applies time decay, relevance filtering, a prompt-poisoning skip set, and budget caps uniformly on every path; memory backends only answer `recall`, they do not format context.
-- **Memory is persistent.** The conversation, tool calls, and tool results are written to the memory backend. (Receipts ride in-band in the conversation text rather than as a separate persisted artifact.)
+- **History and memory are separate.** Session history preserves conversation, tool-call, and tool-result continuity. Explicit memory writes persist selected entries in the memory backend. Receipts ride in-band in the conversation text rather than as a separate persisted artifact. For payload ownership details, see [Memory and payload lifecycle](./memory-payload-lifecycle.md).
 
 ## Tool receipts
 
