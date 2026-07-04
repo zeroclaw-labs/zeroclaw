@@ -2017,16 +2017,56 @@ fn set_scope_override(
 /// (`RequireExplicit`); operators who want the prior behavior opt in
 /// by marking one or more peer groups `admin_for_agent_scope = true`.
 /// See issue #8044.
+///
+/// **Effective-on-restart semantics:** this gate reads
+/// `ctx.prompt_config`, an `Arc<Config>` snapshot captured when the
+/// runtime context was built. A `peer_groups` edit in `config.toml`
+/// therefore takes effect on context rebuild / daemon restart, not on
+/// the next command — same lifetime as the other `prompt_config`-backed
+/// orchestrator helpers. (The `channel_external_peers` sibling reads a
+/// live `RwLock` for inbound dispatch because the gateway constructs
+/// fresh `peer_resolver` closures per alias; the orchestrator's runtime
+/// context is built once at startup and uses the snapshot path.)
+///
+/// Matching routes through `crate::allowlist::is_user_allowed` so the
+/// gate honors the same wildcard (`["*"]` admits anyone) and per-channel
+/// peer-identity semantics every inbound channel uses, instead of a raw
+/// `==` that ignores wildcard, case, and the leading `@` Telegram strips
+/// before comparison. Both the configured peer list and the incoming
+/// sender are normalized through [`normalize_peer_username`] (strip a
+/// leading `@`, ASCII-lowercase) so an operator who writes
+/// `external_peers = ["@user_1"]` is matched by an inbound `user_1`
+/// sender — matching what every channel's inbound path does before
+/// calling `is_user_allowed`.
 fn is_agent_scope_authorized(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
 ) -> bool {
     let channel_type = msg.channel.as_str();
     let channel_alias = msg.channel_alias.as_deref().unwrap_or(msg.channel.as_str());
-    let admins = ctx
+    let admins: Vec<String> = ctx
         .prompt_config
-        .channel_agent_scope_admins(channel_type, channel_alias);
-    admins.iter().any(|s| s == msg.sender.as_str())
+        .channel_agent_scope_admins(channel_type, channel_alias)
+        .into_iter()
+        .map(|p| normalize_peer_username(&p))
+        .collect();
+    let sender = normalize_peer_username(msg.sender.as_str());
+    crate::allowlist::is_user_allowed(&admins, &sender, crate::allowlist::Match::Sensitive)
+}
+
+/// Canonical peer-username form used by the agent-scope gate. Inbound
+/// channels (Telegram: `Self::normalize_identity`; IRC: `Match::CaseInsensitive`;
+/// Matrix: same) already collapse the inbound sender into a stripped /
+/// case-folded identity before calling `allowlist::is_user_allowed`. The
+/// gate must apply the same shape to the configured `external_peers`
+/// list so an operator's `"@user_1"` / `"user_1"` / `"@Alice"` entries
+/// all match the same channel-normalized sender identity.
+///
+/// Kept local to this module so any future per-channel nuance (E.164
+/// phone, email domain) can be plumbed explicitly through
+/// `allowlist::is_user_allowed_by` rather than overloading this helper.
+fn normalize_peer_username(raw: &str) -> String {
+    raw.trim_start_matches('@').to_ascii_lowercase()
 }
 
 fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
@@ -2871,7 +2911,7 @@ async fn handle_runtime_command_if_needed(
                     let channel_alias =
                         msg.channel_alias.as_deref().unwrap_or(msg.channel.as_str());
                     ::zeroclaw_log::record!(
-                        WARN,
+                        INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Approve)
                             .with_outcome(::zeroclaw_log::EventOutcome::Success)
                             .with_attrs(::serde_json::json!({
@@ -18804,10 +18844,13 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[test]
     fn channel_agent_scope_admins_filters_by_admin_flag() {
-        // Live-resolve helper honors admin_for_agent_scope = true only.
-        // Build a Config with one admin-flagged group and one unflagged
-        // group covering the same channel; the admin-flagged group must
-        // surface while the unflagged group must not.
+        // The resolver itself honors `admin_for_agent_scope = true`
+        // only — build a `Config` with one admin-flagged group and one
+        // unflagged group covering the same channel; the admin-flagged
+        // group must surface while the unflagged group must not.
+        // (Note: the orchestrator gate reads through a snapshot of this
+        // `Config`, so operator edits become visible after restart — see
+        // `is_agent_scope_authorized` docstring.)
         use zeroclaw_config::schema::Config;
         let mut config = Config::default();
         config.peer_groups.insert(
@@ -18820,6 +18863,260 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         let admins = config.channel_agent_scope_admins("discord", "clamps");
         assert_eq!(admins, vec!["alice".to_string(), "ops".to_string()]);
+    }
+
+    // --- SSOT normalization + wildcard + leading-`@` + case-insensitive.
+    // The gate routes through `allowlist::is_user_allowed`, so the
+    // helpers below must mirror the inbound-channel normalization shape
+    // (strip leading `@`, ASCII-lowercase) and honor `["*"]` for the
+    // configured peer list. These tests pin that contract so a future
+    // refactor cannot silently fall back to the raw `==` shape that
+    // rejected correctly-configured admins. See issue #8044.
+
+    #[test]
+    fn normalize_peer_username_strips_leading_at_and_lowercases() {
+        assert_eq!(normalize_peer_username("@user_1"), "user_1");
+        assert_eq!(normalize_peer_username("user_1"), "user_1");
+        assert_eq!(normalize_peer_username("@Alice"), "alice");
+        assert_eq!(normalize_peer_username("ALICE"), "alice");
+        // Multiple leading `@` are collapsed to nothing: a config typo
+        // like "@@alice" still resolves to the bare identity.
+        assert_eq!(normalize_peer_username("@@alice"), "alice");
+        // Empty input stays empty (would deny everything downstream).
+        assert_eq!(normalize_peer_username(""), "");
+    }
+
+    #[test]
+    fn agent_scope_gate_matches_inbound_normalized_sender() {
+        // Telegram inbound path strips a leading `@` from the sender
+        // before calling `is_user_allowed`. The gate must accept a
+        // configured `"@user_1"` against a sender that arrived as
+        // `"user_1"` (no leading `@`).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "telegram_admins".into(),
+            peer_group("telegram.prod", &["@user_1"], true),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(
+            is_agent_scope_authorized(
+                &ctx,
+                &agent_scope_msg_with_channel("user_1", "telegram", "prod")
+            ),
+            "leading-`@` config entry must match Telegram's @-stripped sender identity"
+        );
+        // Without normalization, the raw `==` would deny this.
+    }
+
+    #[test]
+    fn agent_scope_gate_matches_case_insensitive_sender() {
+        // Inbound IRC and Matrix use `Match::CaseInsensitive`; the
+        // gate's ASCII-lowercase normalization must produce the same
+        // outcome so a configured `"Alice"` matches an inbound `"alice"`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "irc_admins".into(),
+            peer_group("irc.freenode", &["Alice"], true),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(
+            is_agent_scope_authorized(
+                &ctx,
+                &agent_scope_msg_with_channel("alice", "irc", "freenode")
+            ),
+            "configured `Alice` must match an inbound `alice` sender (RFC 2812 case-insensitive)"
+        );
+        assert!(
+            is_agent_scope_authorized(
+                &ctx,
+                &agent_scope_msg_with_channel("ALICE", "irc", "freenode")
+            ),
+            "configured `Alice` must match an inbound `ALICE` sender"
+        );
+    }
+
+    #[test]
+    fn agent_scope_gate_honors_wildcard_admin() {
+        // A peer group with `external_peers = ["*"]` is the documented
+        // wildcard: every sender on the channel is an admin. The raw
+        // `==` shape denied this; the SSOT shape admits it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "discord_open".into(),
+            peer_group("discord.clamps", &["*"], true),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(is_agent_scope_authorized(&ctx, &agent_scope_msg("anyone")));
+        assert!(is_agent_scope_authorized(
+            &ctx,
+            &agent_scope_msg("even_a_random_handle")
+        ));
+    }
+
+    fn agent_scope_msg_with_channel(
+        sender: &str,
+        channel: &str,
+        alias: &str,
+    ) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: sender.into(),
+            reply_target: "chan-1".into(),
+            channel: channel.into(),
+            channel_alias: Some(alias.into()),
+            thread_ts: None,
+            content: "/model --agent gpt-4o".into(),
+            ..Default::default()
+        }
+    }
+
+    // --- Dispatch-level wiring tests for the agent-scope authorization
+    // gate. These exercise `handle_runtime_command_if_needed` directly so
+    // a future refactor that drops `scope == OverrideScope::Agent &&
+    // !is_agent_scope_authorized(...)` from the dispatch site cannot
+    // silently re-open the hole — every helper-only test would still pass
+    // while the gate was bypassed. See issue #8044 review pass 2.
+
+    fn scope_user_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: sender.into(),
+            reply_target: "chan-1".into(),
+            channel: "discord".into(),
+            channel_alias: Some("clamps".into()),
+            thread_ts: None,
+            content: "/model --user gpt-4o".into(),
+            ..Default::default()
+        }
+    }
+
+    fn scope_agent_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: sender.into(),
+            reply_target: "chan-1".into(),
+            channel: "discord".into(),
+            channel_alias: Some("clamps".into()),
+            thread_ts: None,
+            content: "/model --agent gpt-4o".into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_agent_scope_writes_override_for_admin_sender() {
+        // Authorized sender: dispatch must reach the SetModelScoped(Agent)
+        // accept branch and write a scope override.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice"], true),
+        );
+        let ctx = Arc::new(channel_runtime_context_with_peer_groups(tmp.path(), groups));
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        let handled = handle_runtime_command_if_needed(
+            ctx.as_ref(),
+            &scope_agent_msg("alice"),
+            Some(&target),
+        )
+        .await;
+        assert!(handled, "agent-scope command must be handled by dispatch");
+
+        let overrides = ctx.scope_overrides.lock().unwrap();
+        assert_eq!(
+            overrides.len(),
+            1,
+            "authorized admin must produce exactly one scope override, got {overrides:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_agent_scope_rejects_unauthorized_sender_without_writing() {
+        // Unauthorized sender: dispatch must surface the rejection string
+        // and leave the override map empty. If the gate is dropped, the
+        // override would be written and this test would fail.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice"], true),
+        );
+        let ctx = Arc::new(channel_runtime_context_with_peer_groups(tmp.path(), groups));
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        let handled = handle_runtime_command_if_needed(
+            ctx.as_ref(),
+            &scope_agent_msg("mallory"),
+            Some(&target),
+        )
+        .await;
+        assert!(handled, "command must be handled even when rejected");
+
+        let overrides = ctx.scope_overrides.lock().unwrap();
+        assert!(
+            overrides.is_empty(),
+            "unauthorized sender must NOT write a scope override, got {overrides:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_user_scope_writes_override_regardless_of_admin_status() {
+        // The agent-scope gate must NOT affect `--user`. Even when the
+        // sender is not in any admin peer group, `/model --user` writes
+        // its override. This pins the gate's scope: only the Agent branch
+        // consults `is_agent_scope_authorized`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = Arc::new(channel_runtime_context_with_peer_groups(
+            tmp.path(),
+            std::collections::HashMap::new(),
+        ));
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        let handled = handle_runtime_command_if_needed(
+            ctx.as_ref(),
+            &scope_user_msg("mallory"),
+            Some(&target),
+        )
+        .await;
+        assert!(handled, "user-scope command must be handled");
+
+        let overrides = ctx.scope_overrides.lock().unwrap();
+        assert_eq!(
+            overrides.len(),
+            1,
+            "`/model --user` must write a scope override even when sender is not an admin, got {overrides:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_agent_scope_rejects_when_no_peer_groups_configured() {
+        // Default config (no peer_groups) — every sender must be denied.
+        // Without the gate this would silently write the override.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = Arc::new(channel_runtime_context_with_peer_groups(
+            tmp.path(),
+            std::collections::HashMap::new(),
+        ));
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        let handled = handle_runtime_command_if_needed(
+            ctx.as_ref(),
+            &scope_agent_msg("alice"),
+            Some(&target),
+        )
+        .await;
+        assert!(handled);
+
+        let overrides = ctx.scope_overrides.lock().unwrap();
+        assert!(
+            overrides.is_empty(),
+            "default-deny must produce zero overrides when no peer_groups are configured, got {overrides:?}"
+        );
     }
 
     #[test]

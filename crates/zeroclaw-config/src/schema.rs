@@ -17084,8 +17084,12 @@ impl Config {
     /// `<channel_type>.<alias>`. A `[peer_groups.<name>]` contributes
     /// when its `channel` matches (type-wide or dotted) **and** its
     /// `admin_for_agent_scope = true`. Returns deduped and sorted.
-    /// Live-resolve, no cache — operator edits take effect on next
-    /// command. See issue #8044.
+    /// Live-resolve against the `Config` this method is called on —
+    /// no internal cache. Edits to `peer_groups` take effect at the
+    /// next `Config::channel_agent_scope_admins` call; the orchestrator
+    /// gate reads through a snapshot of this `Config`, so operator
+    /// edits become visible after the runtime context is rebuilt
+    /// (daemon restart). See issue #8044.
     pub fn channel_agent_scope_admins(&self, channel_type: &str, alias: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
