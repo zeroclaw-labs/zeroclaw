@@ -23,6 +23,13 @@ pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
 /// A per-line idle bound converts that into a retryable `StreamError`.
 const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// Error-text marker for a model refusal (`stop_reason: "refusal"`, e.g.
+/// Claude Fable 5 safety classifiers declining a request). Single source for
+/// both the error construction here and the non-retryable classification in
+/// `reliable::is_model_refusal` — retrying the same model cannot succeed, so
+/// the failover loop must move to the next `fallback_models` entry instead.
+pub(crate) const REFUSAL_ERROR_MARKER: &str = "model refused the request (stop_reason: refusal";
+
 use crate::stream_guard::AbortOnDrop;
 
 pub struct AnthropicModelProvider {
@@ -199,6 +206,17 @@ struct NativeChatResponse {
     content: Vec<NativeContentIn>,
     #[serde(default)]
     usage: Option<AnthropicUsage>,
+    /// Why generation stopped. Claude 4+ can return `"refusal"` (safety
+    /// classifiers declined the request) with an EMPTY `content` array on an
+    /// HTTP 200 — without checking this, a refusal is indistinguishable from
+    /// a blank completion and gets re-rolled instead of failed over.
+    #[serde(default)]
+    stop_reason: Option<String>,
+    /// Structured refusal info (`category`, `explanation`). Populated only
+    /// when `stop_reason == "refusal"`; kept untyped because only the
+    /// category string is read.
+    #[serde(default)]
+    stop_details: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -688,6 +706,36 @@ impl AnthropicModelProvider {
         }
     }
 
+    /// Map a `stop_reason: "refusal"` response to an error instead of letting
+    /// it surface as an empty completion. A refusal arrives on an HTTP 200
+    /// (pre-output: empty `content`; mid-stream: partial text), so without
+    /// this the reliability layer re-rolls the "blank" turn against the same
+    /// model — pointless for a policy decline — and never fails over to a
+    /// configured `fallback_models` entry. The error text carries
+    /// [`REFUSAL_ERROR_MARKER`] so `reliable::is_model_refusal` classifies it
+    /// as non-retryable and moves to the next entry immediately.
+    fn refusal_error(response: &NativeChatResponse) -> Option<anyhow::Error> {
+        if response.stop_reason.as_deref() != Some("refusal") {
+            return None;
+        }
+        let category = response
+            .stop_details
+            .as_ref()
+            .and_then(|d| d.get("category"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("unspecified");
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"category": category})),
+            "anthropic: model refused the request (stop_reason: refusal)"
+        );
+        Some(anyhow::Error::msg(format!(
+            "{REFUSAL_ERROR_MARKER}; category: {category})"
+        )))
+    }
+
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
         let mut text_parts = Vec::new();
         let mut thinking_parts = Vec::new();
@@ -1054,6 +1102,36 @@ impl AnthropicModelProvider {
                     if let Some(v) = observed_output {
                         output_tokens = Some(v);
                     }
+                    if stop_reason == "refusal" {
+                        // Safety classifiers declined the request mid-stream
+                        // (HTTP 200; already-streamed partial output must be
+                        // discarded). Fail the stream so the caller's
+                        // non-streaming fallback re-detects the refusal and
+                        // the reliability layer fails over to the next
+                        // `fallback_models` entry instead of re-rolling.
+                        let category = event
+                            .get("delta")
+                            .and_then(|d| d.get("stop_details"))
+                            .and_then(|d| d.get("category"))
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("unspecified");
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"category": category})),
+                            "anthropic stream: model refused the request (stop_reason: refusal)"
+                        );
+                        let _ = tx
+                            .send(Err(StreamError::ModelProvider(format!(
+                                "{REFUSAL_ERROR_MARKER}; category: {category})"
+                            ))))
+                            .await;
+                        return;
+                    }
                     if stop_reason == "max_tokens" {
                         ::zeroclaw_log::record!(
                             WARN,
@@ -1213,6 +1291,9 @@ impl ModelProvider for AnthropicModelProvider {
         }
 
         let chat_response: NativeChatResponse = response.json().await?;
+        if let Some(refusal) = Self::refusal_error(&chat_response) {
+            return Err(refusal);
+        }
         let parsed = Self::parse_native_response(chat_response);
         parsed.text.ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -1318,6 +1399,9 @@ impl ModelProvider for AnthropicModelProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
+        if let Some(refusal) = Self::refusal_error(&native_response) {
+            return Err(refusal);
+        }
         Ok(Self::parse_native_response(native_response))
     }
 
@@ -1545,6 +1629,9 @@ impl ModelProvider for AnthropicModelProvider {
                     .json()
                     .await
                     .map_err(|e| StreamError::ModelProvider(format!("response decode: {e}")))?;
+                if let Some(refusal) = Self::refusal_error(&parsed) {
+                    return Err(StreamError::ModelProvider(refusal.to_string()));
+                }
                 Ok(Self::parse_native_response(parsed))
             })
             .flat_map(|result| match result {
@@ -2923,6 +3010,94 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
 
         server_handle.abort();
+    }
+
+    #[test]
+    fn refusal_stop_reason_maps_to_error() {
+        // Claude 4+ refusal: HTTP 200, stop_reason "refusal", EMPTY content.
+        // Must become an error (with the reliable-layer marker and the
+        // stop_details category), not a blank completion.
+        let json = r#"{
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_details": {"type": "refusal", "category": "cyber"},
+            "usage": {"input_tokens": 10, "output_tokens": 0}
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let err = AnthropicModelProvider::refusal_error(&resp)
+            .expect("stop_reason refusal must map to an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(REFUSAL_ERROR_MARKER),
+            "error must carry the refusal marker: {msg}"
+        );
+        assert!(
+            msg.contains("cyber"),
+            "error must carry the category: {msg}"
+        );
+        assert!(
+            crate::reliable::is_model_refusal(&err),
+            "reliable layer must classify the marker as a refusal"
+        );
+        assert!(
+            crate::reliable::is_non_retryable(&err),
+            "a refusal must be non-retryable so the loop fails over"
+        );
+    }
+
+    #[test]
+    fn non_refusal_stop_reasons_do_not_error() {
+        for stop_reason in ["end_turn", "max_tokens", "tool_use"] {
+            let json = format!(
+                r#"{{
+                    "content": [{{"type": "text", "text": "Hello"}}],
+                    "stop_reason": "{stop_reason}"
+                }}"#
+            );
+            let resp: NativeChatResponse = serde_json::from_str(&json).unwrap();
+            assert!(
+                AnthropicModelProvider::refusal_error(&resp).is_none(),
+                "stop_reason {stop_reason} must not map to a refusal error"
+            );
+        }
+        // Legacy responses without stop_reason at all.
+        let resp: NativeChatResponse =
+            serde_json::from_str(r#"{"content": [{"type": "text", "text": "Hi"}]}"#).unwrap();
+        assert!(AnthropicModelProvider::refusal_error(&resp).is_none());
+    }
+
+    #[tokio::test]
+    async fn sse_refusal_stop_reason_fails_the_stream() {
+        use std::io::Cursor;
+
+        let bytes: &[u8] = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-fable-5\",\"usage\":{\"input_tokens\":10}}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_details\":{\"type\":\"refusal\",\"category\":\"cyber\"}},\"usage\":{\"output_tokens\":0}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut saw_refusal_error = false;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            if let Err(e) = ev {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains(REFUSAL_ERROR_MARKER),
+                    "stream error must carry the refusal marker: {msg}"
+                );
+                assert!(msg.contains("cyber"), "must carry the category: {msg}");
+                saw_refusal_error = true;
+            }
+        }
+        assert!(
+            saw_refusal_error,
+            "a refusal stop_reason must fail the stream, not end it silently"
+        );
     }
 
     #[test]

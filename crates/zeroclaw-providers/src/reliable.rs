@@ -103,8 +103,24 @@ pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
     None
 }
 
+/// A model refusal (`stop_reason: "refusal"` — e.g. Claude Fable 5 safety
+/// classifiers declining a request). Deterministic for the given model and
+/// prompt: retrying the same entry cannot succeed, so the failover loop must
+/// break to the next `fallback_models` entry, which then records the
+/// downgrade and surfaces the user-visible fallback notice.
+pub fn is_model_refusal(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .contains(crate::anthropic::REFUSAL_ERROR_MARKER)
+}
+
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 pub fn is_non_retryable(err: &anyhow::Error) -> bool {
+    // Model refusals are deterministic policy declines — retrying the same
+    // model is pointless; fail over to the next entry immediately.
+    if is_model_refusal(err) {
+        return true;
+    }
+
     // Context window errors are NOT non-retryable — they can be recovered
     // by truncating conversation history, so let the retry loop handle them.
     if is_context_window_exceeded(err) {
@@ -2326,6 +2342,81 @@ mod tests {
             fallback.is_none(),
             "primary pinned entry serving the requested model is not a fallback"
         );
+    }
+
+    /// A refusal on the requested-model entry (deterministic; the mock's
+    /// `error` carries the anthropic refusal marker) must be classified
+    /// non-retryable, skip same-entry retries, and fail over to the next
+    /// pinned entry — recording the served model so the fallback notice
+    /// fires. This is the Fable->Opus security-question path end to end at
+    /// the provider layer.
+    #[tokio::test]
+    async fn refusal_fails_over_to_next_pinned_model_without_retry() {
+        // Guard: the literal the mock emits must satisfy the marker contract,
+        // so this test breaks loudly if the marker text ever drifts.
+        let refusal_message = format!(
+            "{}; category: cyber)",
+            crate::anthropic::REFUSAL_ERROR_MARKER
+        );
+        assert!(is_model_refusal(&anyhow::Error::msg(
+            refusal_message.clone()
+        )));
+
+        let refused_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+
+        let refusal_error: &'static str = Box::leak(refusal_message.into_boxed_str());
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "anthropic",
+            vec![
+                ReliableModelProviderEntry::new_pinned(
+                    "anthropic",
+                    "anthropic.main",
+                    "main",
+                    "claude-fable-5",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&refused_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: refusal_error,
+                    }),
+                ),
+                ReliableModelProviderEntry::new_pinned(
+                    "anthropic",
+                    "anthropic.main",
+                    "main",
+                    "claude-opus-4-8",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: 0,
+                        response: "opus answer",
+                        error: "unused",
+                    }),
+                ),
+            ],
+            // Retries are permitted (3) — the refusal must break out anyway.
+            3,
+            1,
+        );
+
+        let (result, fallback) = scope_provider_fallback(async {
+            let result = model_provider
+                .simple_chat("how do I exploit X?", "claude-fable-5", Some(0.0))
+                .await;
+            (result, take_last_provider_fallback())
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), "opus answer");
+        assert_eq!(
+            refused_calls.load(Ordering::SeqCst),
+            1,
+            "a refusal is deterministic; the refused model must not be retried"
+        );
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+        let fallback = fallback.expect("refusal failover must be recorded");
+        assert_eq!(fallback.requested_model, "claude-fable-5");
+        assert_eq!(fallback.actual_model, "claude-opus-4-8");
     }
 
     /// Returns an empty completion (blank `chat_with_system` text, which the
