@@ -61,6 +61,21 @@ unchanged.
 > round), and full text grows per-span payload proportionally. On per-byte backends,
 > apply exporter-side truncation rather than dropping the attributes.
 
+### Turn-nested memory and RAG spans (`observability-otel`)
+
+`memory.recall`, `memory.store`, and `rag.retrieve` spans nest under the
+`gen_ai.agent.invoke` turn span whenever the memory operation runs inside an
+agent turn, so a full turn (LLM calls, tool calls, memory operations) renders
+as a single trace in Langfuse or Tempo. The three events carry the same
+`channel` / `agent_alias` / `turn_id` correlation triple as LLM and tool
+events, and the spans expose it as `zeroclaw.channel`, `gen_ai.agent.name`,
+and `zeroclaw.turn_id` attributes.
+
+Memory operations that run outside a correlated turn (for example the gateway
+REST memory store, or channel-orchestrator recalls that emit no observer
+events today) keep producing root spans. A `turn_id` that no longer matches a
+live turn also degrades to a root span rather than guessing a parent.
+
 ### LLM request payload capture (`log_llm_request_payload`)
 
 `log_llm_request_payload` controls whether the `llm_request` event records the
