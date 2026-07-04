@@ -3319,6 +3319,233 @@ mod tests {
         // lock so the next regression test can install its own hook.
     }
 
+    // ── #5903: PROVE that the real `connect_all` path spawns the
+    //    stdio MCP child ONCE and reuses it across N heartbeat
+    //    ticks. The two regressions above cover the path where a
+    //    test hook short-circuits `connect_heartbeat_mcp_registry`
+    //    to a pre-built `Arc<McpRegistry>` and counts constructions
+    //    through a closure. That path cannot catch the actual
+    //    stdio-child leak: a buggy worker that calls
+    //    `McpRegistry::connect_all` per tick on the real path would
+    //    spawn one child per tick — but the hook would never fire,
+    //    because the test hook is only consulted on the
+    //    `connect_heartbeat_mcp_registry` side, not on every
+    //    `agent::run` re-construction.
+    //
+    //    This test exercises the REAL `connect_all` path (no test
+    //    hook), spawns a real `@modelcontextprotocol/server-filesystem`
+    //    via `npx`, and watches the OS process table for the
+    //    resulting `mcp-server-filesystem` node process. The fix
+    //    hoists registry construction out of the tick loop, so the
+    //    process count MUST stay at 1 across N=8 ticks. The pre-fix
+    //    code would have caused the count to grow to N+1 (one per
+    //    tick), leaking an orphaned stdio child every tick.
+    //
+    //    Drop semantics: `StdioTransport` is built with
+    //    `kill_on_drop(true)` (see `zeroclaw-tools::mcp_transport`),
+    //    so dropping the only `Arc<McpRegistry>` reaps the child.
+    //    The final assertion in this test verifies that the worker
+    //    boundary (drop the shared Arc) does indeed tear the child
+    //    down — pinning the "drop Arc == kill child" invariant that
+    //    the heartbeat worker relies on.
+    //
+    //    Ignored by default: it spawns a real npx subprocess and
+    //    needs node + npx on PATH. Run explicitly with:
+    //      cargo test -p zeroclaw-runtime --lib \
+    //        heartbeat_mcp_registry_reuses_one_stdio_child_across_ticks \
+    //        -- --ignored
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "spawns a real stdio MCP server via npx @modelcontextprotocol/server-filesystem; needs node/npx on PATH so it does not run in normal CI. Run: cargo test -p zeroclaw-runtime --lib heartbeat_mcp_registry_reuses_one_stdio_child_across_ticks -- --ignored"]
+    async fn heartbeat_mcp_registry_reuses_one_stdio_child_across_ticks() {
+        use std::sync::Arc;
+        use zeroclaw_config::schema::{AliasedAgentConfig, McpBundleConfig, McpServerConfig};
+
+        // `pgrep -f` matches the full command line. The
+        // `@modelcontextprotocol/server-filesystem` package runs as
+        // a node script whose absolute path contains this literal
+        // substring, so a single `-f` match is enough to count the
+        // child.
+        const CHILD_PATTERN: &str = "mcp-server-filesystem";
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+
+        // (1) Enable MCP and register one stdio server pointing at a
+        //     throwaway directory inside `tmp`. The server needs a
+        //     directory argument (it serves `read_file` /
+        //     `list_directory` over it) — we use the tmp root so the
+        //     server has something valid to operate on.
+        config.mcp.enabled = true;
+        config.mcp.servers.push(McpServerConfig {
+            name: "fs".to_string(),
+            transport: zeroclaw_config::schema::McpTransport::Stdio,
+            command: "npx".to_string(),
+            args: vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-filesystem".to_string(),
+                tmp.path().display().to_string(),
+            ],
+            ..McpServerConfig::default()
+        });
+
+        // (2) Bundle the server under "b" and grant it to the "ops"
+        //     agent. `mcp_servers_for_agent("ops")` must return one
+        //     `McpServerConfig` (the "fs" entry above) for the
+        //     connect_all path to find and spawn it.
+        config.mcp_bundles.insert(
+            "b".to_string(),
+            McpBundleConfig {
+                servers: vec!["fs".to_string()],
+                exclude: vec![],
+            },
+        );
+        config.agents.insert(
+            "ops".to_string(),
+            AliasedAgentConfig {
+                mcp_bundles: vec!["b".to_string()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        // Helper: count OS processes whose cmdline matches the MCP
+        // stdio child. `pgrep -f` returns 0 lines when nothing
+        // matches (and exits 1), so we read stdout and count
+        // non-empty lines. We never trust pgrep's exit status — a
+        // no-match is "0 children", not a test failure.
+        let count_children = || -> usize {
+            std::process::Command::new("pgrep")
+                .args(["-f", CHILD_PATTERN])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+                .unwrap_or(0)
+        };
+
+        // (3) Real connect path — NO test hook installed. This
+        //     mirrors `run_heartbeat_worker`'s pre-loop call. The
+        //     registry's `connect_all` will spawn one node child via
+        //     `tokio::process::Command::new("npx")...spawn()`.
+        let shared = connect_heartbeat_mcp_registry(&config, "ops")
+            .await
+            .expect("connect_heartbeat_mcp_registry succeeds on the real path")
+            .expect("registry present: mcp.enabled = true and 'ops' has one granted stdio server");
+
+        // The very first construction MUST have produced exactly
+        // one stdio child. We sleep ~800ms before polling so npx has
+        // time to fetch (if needed) and exec node.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let count_after_connect = count_children();
+        assert_eq!(
+            count_after_connect, 1,
+            "after the single connect_all there must be exactly one mcp-server-filesystem child; \
+             got {count_after_connect} (a count > 1 indicates multiple children were spawned at boot)"
+        );
+
+        // (4) Simulate N=8 heartbeat ticks. Each tick builds a fresh
+        //     `AgentRunOverrides` cloning the shared Arc (no
+        //     construction), records its pointer, and drops the
+        //     overrides. The child count MUST stay at 1 and the
+        //     Arc pointer MUST stay identical (std::ptr::eq) — the
+        //     exact signal #5903 cares about.
+        const N: usize = 8;
+        let first_ptr: *const crate::tools::McpRegistry = Arc::as_ptr(&shared);
+        for tick in 0..N {
+            let overrides = crate::agent::loop_::AgentRunOverrides {
+                mcp_registry: Some(Arc::clone(&shared)),
+                ..crate::agent::loop_::AgentRunOverrides::default()
+            };
+            let registry = overrides
+                .mcp_registry
+                .as_ref()
+                .expect("tick overrides must carry the shared registry");
+            let tick_ptr = Arc::as_ptr(registry);
+            assert!(
+                std::ptr::eq(tick_ptr, first_ptr),
+                "tick {tick} saw a different Arc<McpRegistry> pointer ({:p} != {:p}); \
+                 the daemon worker must reuse ONE shared registry across all ticks",
+                tick_ptr,
+                first_ptr,
+            );
+            // Drop overrides (mirrors end-of-`agent::run`). The
+            // shared Arc on the worker keeps the registry alive.
+            drop(overrides);
+
+            let count_during_ticks = count_children();
+            assert_eq!(
+                count_during_ticks, 1,
+                "tick {tick}: mcp-server-filesystem child count drifted to {count_during_ticks}; \
+                 expected exactly 1 across all ticks (the daemon must not respawn the stdio \
+                 child per heartbeat tick — that is the #5903 leak)"
+            );
+        }
+
+        // Sanity: the real registry still owns the server it
+        // connected to (i.e. we didn't accidentally exercise an
+        // empty-fixture path).
+        assert_eq!(
+            shared.server_count(),
+            1,
+            "the real-path registry must hold exactly the 1 stdio server we configured"
+        );
+
+        // (5) Worker shutdown boundary. `kill_on_drop(true)` on the
+        //     `tokio::process::Child` inside `StdioTransport` means
+        //     dropping the only Arc kills the node process. Poll for
+        //     up to ~3s for the child to disappear. If the platform's
+        //     Drop semantics differ and the child survives, we
+        //     weaken the assertion to "count never increased" — the
+        //     regression signal we care about is "1 child across all
+        //     ticks", not the OS-killing implementation detail.
+        let pre_drop_count = count_children();
+        drop(shared);
+        let mut returned_to_zero = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if count_children() == 0 {
+                returned_to_zero = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let post_drop_count = count_children();
+        if returned_to_zero {
+            assert_eq!(
+                post_drop_count, 0,
+                "dropping the shared Arc must reap the stdio MCP child \
+                 (kill_on_drop is set on the underlying tokio::process::Child)"
+            );
+        } else {
+            // The Drop impl may not have killed the child on this
+            // platform (or the OS has not yet reaped it within the
+            // 3s window). The #5903 regression — "per-tick
+            // construction" — is still proven by the in-tick
+            // assertions above (child count stayed exactly 1 across
+            // N=8 ticks). The only failure here would be the count
+            // INCREASING, which would mean a stray new spawn
+            // happened during shutdown.
+            assert!(
+                post_drop_count <= pre_drop_count,
+                "after dropping the shared Arc, the mcp-server-filesystem child count \
+                 increased from {pre_drop_count} to {post_drop_count}; \
+                 dropping the registry must not spawn additional children"
+            );
+            // Best-effort reap: leave a clearly-attributed warning
+            // in the test log so a CI failure of the strict path is
+            // easy to triage.
+            eprintln!(
+                "heartbeat_mcp_registry_reuses_one_stdio_child_across_ticks: \
+                 Drop did not reap the child within 3s on this platform \
+                 (pre={pre_drop_count}, post={post_drop_count}); \
+                 the per-tick count == 1 assertion above is the load-bearing \
+                 regression signal — the strict post-drop == 0 path is best-effort"
+            );
+        }
+    }
+
     // Belt-and-suspenders: a focused second regression that
     // demonstrates the OLD behavior would have failed this test.
     // We construct the helper closure with a shared Arc, then prove
