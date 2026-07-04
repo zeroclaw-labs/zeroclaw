@@ -96,6 +96,15 @@ impl HelpNode {
         }
     }
 
+    /// Leaf node with a dim section header and entries.
+    pub fn titled(title: impl Into<String>, entries: Vec<HelpEntry>) -> Self {
+        Self {
+            title: Some(title.into()),
+            entries,
+            ..Default::default()
+        }
+    }
+
     /// Consume self and append a child node, returning the modified node.
     pub fn with_child(mut self, child: HelpNode) -> Self {
         self.children.push(child);

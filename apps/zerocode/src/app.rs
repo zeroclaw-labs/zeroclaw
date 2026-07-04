@@ -649,8 +649,12 @@ pub async fn run(
                     continue;
                 }
 
-                // `?` opens help unless pane is in text-input mode.
-                if global == Some(GlobalAction::Help) && !in_text_input {
+                // `?` opens help unless the pane is in text-input mode; F1 is a
+                // reserved help chord that works even while the editor has focus.
+                let help_bypasses_text_input = key.code == crossterm::event::KeyCode::F(1); // keyguard: F1 is a non-textual reserved help chord; both chords map to one action so the raw key is the only discriminator
+                if global == Some(GlobalAction::Help)
+                    && (!in_text_input || help_bypasses_text_input)
+                {
                     show_help = true;
                     continue;
                 }

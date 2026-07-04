@@ -79,6 +79,14 @@ mod tests {
     }
 
     #[test]
+    fn global_help_resolves_from_question_mark_and_f1() {
+        let q = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        assert_eq!(GlobalAction::from_chord(&q), Some(GlobalAction::Help));
+        let f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE);
+        assert_eq!(GlobalAction::from_chord(&f1), Some(GlobalAction::Help));
+    }
+
+    #[test]
     fn input_bar_enter_is_submit() {
         let ev = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(
