@@ -1063,29 +1063,90 @@ static HEARTBEAT_MCP_REGISTRY_TEST_HOOK: std::sync::Mutex<
     Option<HeartbeatMcpRegistryTestHook>,
 > = std::sync::Mutex::new(None);
 
+/// Serializes the regression tests for the daemon heartbeat MCP
+/// registry hook (`#5903`). The hook itself is process-global, so a
+/// test that installs the hook, runs assertions, and then resets
+/// cannot safely interleave with another test doing the same: a
+/// concurrent `reset_heartbeat_mcp_registry_test_hook` would clear
+/// the hook before the first test observes it, and a concurrent
+/// `set_heartbeat_mcp_registry_test_hook` from another test would
+/// swap in a hook whose counter Arc belongs to the other test. To
+/// keep the regression tests deterministic, every hook-using test
+/// takes this mutex (via [`HeartbeatMcpRegistryTestHookGuard`]) for
+/// the entire duration of its hook-installed work.
+#[cfg(test)]
+static HEARTBEAT_MCP_REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII guard that ties a test-only MCP registry hook installation
+/// to the global serialising lock. Construction takes the global
+/// mutex, installs the supplied hook, and returns a guard whose
+/// `Drop` clears the hook and releases the mutex. Tests that need
+/// the MCP registry hook to be observed by the daemon MUST hold
+/// this guard for the duration of the work that depends on it;
+/// otherwise a parallel test could clobber the hook (or reset it
+/// while the current test is still running) and the assertion would
+/// see a stale or absent hook.
+#[cfg(test)]
+pub(crate) struct HeartbeatMcpRegistryTestHookGuard {
+    serial_lock: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+#[cfg(test)]
+impl HeartbeatMcpRegistryTestHookGuard {
+    /// Install `hook` under the global serialising lock and return a
+    /// guard whose `Drop` clears the hook and releases the lock.
+    fn install(hook: HeartbeatMcpRegistryTestHook) -> Self {
+        // Hold the serial lock before mutating the hook global so a
+        // concurrent test cannot observe a torn state (hook swapped
+        // halfway, or reset between this test's set and use).
+        let serial_lock = HEARTBEAT_MCP_REGISTRY_TEST_LOCK
+            .lock()
+            .expect("heartbeat MCP registry test serial lock should not be poisoned");
+        let mut guard = HEARTBEAT_MCP_REGISTRY_TEST_HOOK
+            .lock()
+            .expect("heartbeat MCP registry test hook lock should not be poisoned");
+        *guard = Some(hook);
+        // Drop the hook global mutex immediately — the serial lock
+        // is what prevents another test from racing with us now, and
+        // the hook global only needs its inner value read once per
+        // helper invocation.
+        drop(guard);
+        Self {
+            serial_lock: Some(serial_lock),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for HeartbeatMcpRegistryTestHookGuard {
+    fn drop(&mut self) {
+        // Clear the hook first (still under the serial lock taken by
+        // `install`) so the next test sees a clean slate.
+        if let Ok(mut guard) = HEARTBEAT_MCP_REGISTRY_TEST_HOOK.lock() {
+            *guard = None;
+        }
+        // Releasing the serial lock last allows the next waiting
+        // test to proceed only after our hook is gone.
+        drop(self.serial_lock.take());
+    }
+}
+
 /// Install a test-only hook that returns a pre-built `Arc<McpRegistry>`
 /// for a given `(agent_alias, server_configs)` pair. Used by the
 /// regression test in `tests` to bypass the real `connect_all` while
 /// still counting constructions via the user's own counter logic.
+///
+/// Returns a guard that MUST be held for the duration of the test
+/// work that depends on the hook; on drop, the hook is cleared and
+/// the serialising lock is released so the next queued test can run.
+/// Spinning off a detached future that outlives the guard will leave
+/// the hook pointing at a stale closure and is not supported.
 #[cfg(test)]
 #[allow(dead_code)]
-pub(crate) fn set_heartbeat_mcp_registry_test_hook(hook: HeartbeatMcpRegistryTestHook) {
-    let mut guard = HEARTBEAT_MCP_REGISTRY_TEST_HOOK
-        .lock()
-        .expect("heartbeat MCP registry test hook lock should not be poisoned");
-    *guard = Some(hook);
-}
-
-/// Reset the test hook. Called from the regression test's setup and
-/// from the global test teardown so hooks installed in one test do not
-/// leak into the next.
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn reset_heartbeat_mcp_registry_test_hook() {
-    let mut guard = HEARTBEAT_MCP_REGISTRY_TEST_HOOK
-        .lock()
-        .expect("heartbeat MCP registry test hook lock should not be poisoned");
-    *guard = None;
+pub(crate) fn set_heartbeat_mcp_registry_test_hook(
+    hook: HeartbeatMcpRegistryTestHook,
+) -> HeartbeatMcpRegistryTestHookGuard {
+    HeartbeatMcpRegistryTestHookGuard::install(hook)
 }
 
 /// Snapshot the current test hook (cloned). Returns `None` when no
@@ -3144,7 +3205,10 @@ mod tests {
         // Install a counter hook: every invocation increments and
         // returns the SAME shared Arc<McpRegistry>. A counter that
         // monotonically increases across calls is the regression
-        // signal — the old path would call this once per tick.
+        // signal — the old path would call this once per tick. The
+        // returned RAII guard must outlive every assertion below; if
+        // it drops while another test starts, that other test could
+        // clobber or reset the hook before we observe it.
         let construct_count = Arc::new(AtomicUsize::new(0));
         let shared_for_hook: Arc<crate::tools::McpRegistry> = Arc::new(
             crate::tools::McpRegistry::connect_all(&[])
@@ -3153,7 +3217,7 @@ mod tests {
         );
         let shared_for_hook_clone = Arc::clone(&shared_for_hook);
         let construct_count_for_hook = Arc::clone(&construct_count);
-        set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
+        let _hook_guard = set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
             construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
             Arc::clone(&shared_for_hook_clone)
         }));
@@ -3241,7 +3305,9 @@ mod tests {
         // reaped cleanly by `kill_on_drop(true)`.
         drop(shared);
 
-        reset_heartbeat_mcp_registry_test_hook();
+        // The hook guard (held as `_hook_guard` above) drops here,
+        // clearing the global hook and releasing the serialising
+        // lock so the next regression test can install its own hook.
     }
 
     // Belt-and-suspenders: a focused second regression that
@@ -3259,7 +3325,9 @@ mod tests {
         let config = test_config(&tmp);
         let agent_alias = "ops";
 
-        // Always-on counter — every hook invocation bumps it.
+        // Always-on counter — every hook invocation bumps it. The
+        // RAII guard MUST outlive the loop below so the hook stays
+        // installed across every simulated tick.
         let construct_count = Arc::new(AtomicUsize::new(0));
         let shared_for_hook: Arc<crate::tools::McpRegistry> = Arc::new(
             crate::tools::McpRegistry::connect_all(&[])
@@ -3268,7 +3336,7 @@ mod tests {
         );
         let shared_for_hook_clone = Arc::clone(&shared_for_hook);
         let construct_count_for_hook = Arc::clone(&construct_count);
-        set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
+        let _hook_guard = set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
             construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
             Arc::clone(&shared_for_hook_clone)
         }));
@@ -3311,7 +3379,8 @@ mod tests {
              a higher count means the daemon is rebuilding the MCP registry per tick"
         );
 
-        reset_heartbeat_mcp_registry_test_hook();
+        // The hook guard drops here, releasing the serialising
+        // lock and clearing the global hook for the next test.
     }
 
     // Direct regression for #5903: simulate the full heartbeat worker's
@@ -3337,7 +3406,9 @@ mod tests {
 
         // Hook fires once per `connect_heartbeat_mcp_registry` call.
         // The OLD bug: per-tick construction would make this counter
-        // equal to TICKS. The fix: 1, regardless of TICKS.
+        // equal to TICKS. The fix: 1, regardless of TICKS. Bind the
+        // hook to the test lifetime via the RAII guard so a
+        // concurrent regression test cannot clobber it.
         let construct_count = Arc::new(AtomicUsize::new(0));
         let shared_for_hook: Arc<crate::tools::McpRegistry> = Arc::new(
             crate::tools::McpRegistry::connect_all(&[])
@@ -3346,7 +3417,7 @@ mod tests {
         );
         let shared_for_hook_clone = Arc::clone(&shared_for_hook);
         let construct_count_for_hook = Arc::clone(&construct_count);
-        set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
+        let _hook_guard = set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
             construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
             Arc::clone(&shared_for_hook_clone)
         }));
@@ -3417,7 +3488,8 @@ mod tests {
             "worker + hook must each hold a strong Arc; got {strong_after_ticks}"
         );
 
-        reset_heartbeat_mcp_registry_test_hook();
+        // `_hook_guard` drops here, releasing the serialising lock
+        // and clearing the global hook for the next test.
     }
 
     // ── FAIL-ON-OLD guard: a test that would fail under the
@@ -3449,7 +3521,7 @@ mod tests {
         );
         let shared_for_hook_clone = Arc::clone(&shared_for_hook);
         let construct_count_for_hook = Arc::clone(&construct_count);
-        set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
+        let _hook_guard = set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
             construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
             Arc::clone(&shared_for_hook_clone)
         }));
@@ -3493,6 +3565,7 @@ mod tests {
             );
         }
 
-        reset_heartbeat_mcp_registry_test_hook();
+        // `_hook_guard` drops here, releasing the serialising lock
+        // and clearing the global hook for the next test.
     }
 }
