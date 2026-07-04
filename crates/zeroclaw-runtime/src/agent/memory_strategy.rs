@@ -102,6 +102,7 @@ impl MemoryStrategy for DefaultMemoryStrategy {
             model,
             temperature,
             self.memory.as_ref(),
+            &self.memory_config,
             user_message,
             assistant_response,
         )

@@ -32,6 +32,7 @@ pub mod goal_start;
 pub mod model_switch;
 pub mod read_skill;
 pub mod schedule;
+pub mod scoped;
 pub mod security_ops;
 pub mod send_message_to_peer;
 pub mod shell;
