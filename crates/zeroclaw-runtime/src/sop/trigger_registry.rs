@@ -257,50 +257,36 @@ mod tests {
 
     #[test]
     fn bound_field_names_match_trigger_serde_fields() {
-        use crate::sop::types::SopTrigger;
-
-        let samples = [
-            SopTrigger::Mqtt {
-                topic: "t".into(),
-                condition: Some("c".into()),
-            },
-            SopTrigger::Webhook { path: "p".into() },
-            SopTrigger::Cron {
-                expression: "* * * * *".into(),
-            },
-            SopTrigger::Peripheral {
-                board: "b".into(),
-                signal: "s".into(),
-                condition: Some("c".into()),
-            },
-            SopTrigger::Filesystem {
-                path: "p".into(),
-                events: vec![],
-                condition: Some("c".into()),
-            },
-            SopTrigger::Calendar {
-                calendar_source: "s".into(),
-                calendar_ids: vec![],
-            },
-            SopTrigger::Manual,
-            SopTrigger::Amqp {
-                routing_key: "k".into(),
-                condition: Some("c".into()),
-            },
-        ];
+        use crate::sop::types::{SopTriggerSource, sample_trigger};
 
         let registry = build_registry(&[]);
-        let mut seen_sources = Vec::new();
-        for trigger in &samples {
-            let source = trigger.source();
-            seen_sources.push(source);
-            let bound = registry
+        for source in SopTriggerSource::iter() {
+            let trigger = sample_trigger(source);
+            let json = serde_json::to_value(&trigger).unwrap();
+            let keys = json.as_object().unwrap();
+
+            let Some(bound) = registry
                 .bound
                 .iter()
                 .find(|b| b.source == source.to_string())
-                .unwrap_or_else(|| panic!("source {source} missing from registry"));
-            let json = serde_json::to_value(trigger).unwrap();
-            let keys = json.as_object().unwrap();
+            else {
+                // Not in `bound` means the source is config-derived: its options
+                // come from live channel config, surfaced through the registry's
+                // channel walk rather than a static field spec. Identify it
+                // structurally (empty field_specs) and assert that channel walk
+                // is populated, with no field names to match against serde.
+                assert!(
+                    source.field_specs().is_empty(),
+                    "source {source} is absent from bound but still exposes static \
+                     field specs; the registry dropped its bound entry"
+                );
+                assert!(
+                    !registry.channels.is_empty(),
+                    "config-derived source {source} has no channel walk to draw \
+                     options from"
+                );
+                continue;
+            };
             let spec_names: Vec<&str> = bound.fields.iter().map(|f| f.name.as_str()).collect();
             for field in &bound.fields {
                 assert!(
@@ -320,12 +306,6 @@ mod tests {
                      the TriggerFields derive dropped a variant field"
                 );
             }
-        }
-        for source in SopTriggerSource::iter() {
-            assert!(
-                source == SopTriggerSource::Channel || seen_sources.contains(&source),
-                "trigger source {source} has no sample in this drift guard; add one"
-            );
         }
     }
 
@@ -399,10 +379,12 @@ mod tests {
             );
         }
 
-        // Every non-channel source must appear in the table, so adding a
-        // source cannot skip the kind contract silently.
+        // Every source with derived fields must appear in the table, so adding
+        // a source cannot skip the kind contract silently. Config-derived
+        // sources (empty field_specs) carry no static kinds to pin and are
+        // identified structurally, not by name.
         for source in SopTriggerSource::iter() {
-            if source == SopTriggerSource::Channel {
+            if source.field_specs().is_empty() && !expected.iter().any(|(s, _)| *s == source) {
                 continue;
             }
             assert!(

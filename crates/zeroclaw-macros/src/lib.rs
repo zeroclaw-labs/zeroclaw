@@ -2617,10 +2617,86 @@ pub fn derive_trigger_fields(input: TokenStream) -> TokenStream {
         })
         .collect();
 
+    let display_arms: Vec<proc_macro2::TokenStream> = data
+        .variants
+        .iter()
+        .map(|variant| {
+            let vident = &variant.ident;
+            let is_unit = matches!(variant.fields, Fields::Unit);
+            let disp = parse_trigger_display(variant);
+
+            let mut binds: Vec<proc_macro2::TokenStream> = Vec::new();
+            for fname in disp.fields.iter().chain(disp.opt.iter()) {
+                let fident = syn::Ident::new(fname, proc_macro2::Span::call_site());
+                binds.push(quote! { #fident });
+            }
+            let pattern = if is_unit {
+                quote! { Self::#vident }
+            } else if binds.is_empty() {
+                quote! { Self::#vident { .. } }
+            } else {
+                quote! { Self::#vident { #(#binds),* , .. } }
+            };
+
+            let body = if disp.fields.is_empty() {
+                quote! { write!(f, "{source}") }
+            } else {
+                let field_idents: Vec<syn::Ident> = disp
+                    .fields
+                    .iter()
+                    .map(|n| syn::Ident::new(n, proc_macro2::Span::call_site()))
+                    .collect();
+                let joined = field_idents
+                    .iter()
+                    .map(|id| quote! { #id })
+                    .collect::<Vec<_>>();
+                let base = {
+                    let mut parts = Vec::new();
+                    for (i, id) in joined.iter().enumerate() {
+                        if i > 0 {
+                            parts.push(quote! { write!(f, "/")?; });
+                        }
+                        parts.push(quote! { write!(f, "{}", #id)?; });
+                    }
+                    parts
+                };
+                match &disp.opt {
+                    Some(opt) => {
+                        let opt_ident = syn::Ident::new(opt, proc_macro2::Span::call_site());
+                        quote! {
+                            write!(f, "{source}:")?;
+                            #(#base)*
+                            if let ::core::option::Option::Some(v) = #opt_ident {
+                                write!(f, "/{}", v)?;
+                            }
+                            Ok(())
+                        }
+                    }
+                    None => quote! {
+                        write!(f, "{source}:")?;
+                        #(#base)*
+                        Ok(())
+                    },
+                }
+            };
+
+            quote! { #pattern => { #body } }
+        })
+        .collect();
+
     let expanded = quote! {
         impl #name {
             pub(crate) fn field_specs(&self) -> ::std::vec::Vec<crate::sop::trigger_registry::TriggerField> {
                 self.source().field_specs()
+            }
+        }
+
+        impl ::core::fmt::Display for #name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                let source = self.source();
+                match self {
+                    #(#display_arms)*
+                }
             }
         }
 
@@ -2654,6 +2730,40 @@ fn trigger_attr_has_flag(attr: &syn::Attribute, flag: &str) -> bool {
         Ok(())
     });
     found
+}
+
+/// Parsed `#[trigger(display = "...", opt = "...")]` for one variant.
+struct TriggerDisplay {
+    /// Field names rendered as the `:`-suffix, joined by `/`. Empty means the
+    /// variant renders as the bare source with no suffix.
+    fields: Vec<String>,
+    /// Optional trailing field rendered as `/{field}` only when it is `Some`.
+    opt: Option<String>,
+}
+
+fn parse_trigger_display(variant: &syn::Variant) -> TriggerDisplay {
+    let mut display = TriggerDisplay {
+        fields: Vec::new(),
+        opt: None,
+    };
+    for attr in &variant.attrs {
+        if !attr.path().is_ident("trigger") {
+            continue;
+        }
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("display") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                display.fields = lit.value().split('/').map(str::to_string).collect();
+            } else if meta.path.is_ident("opt") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                display.opt = Some(lit.value());
+            }
+            Ok(())
+        });
+    }
+    display
 }
 
 /// Build the `TriggerField` constructor call for one named field, or `None`

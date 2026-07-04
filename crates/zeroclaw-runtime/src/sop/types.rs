@@ -141,6 +141,7 @@ impl std::str::FromStr for FilesystemEventKind {
 )]
 pub enum SopTrigger {
     /// MQTT message arrival. Live: delivered by the MQTT listener.
+    #[trigger(display = "topic")]
     Mqtt {
         /// Topic filter. `+` matches one level, `#` matches the remaining levels.
         topic: String,
@@ -150,16 +151,19 @@ pub enum SopTrigger {
         condition: Option<String>,
     },
     /// Inbound HTTP request. Defined and matched, but no live route feeds it.
+    #[trigger(display = "path")]
     Webhook {
         /// Request path matched exactly against the event path.
         path: String,
     },
     /// Time-based firing. Defined and matched, but no scheduler feeds it.
+    #[trigger(display = "expression")]
     Cron {
         /// Cron expression evaluated over the run window.
         expression: String,
     },
     /// Hardware signal. Defined and matched, but no peripheral listener feeds it.
+    #[trigger(display = "board/signal")]
     Peripheral {
         /// Board identifier the signal originates from.
         board: String,
@@ -170,6 +174,7 @@ pub enum SopTrigger {
         condition: Option<String>,
     },
     /// Filesystem change. Live: delivered by the filesystem watcher.
+    #[trigger(display = "path")]
     Filesystem {
         /// Path glob (`*`, `**`, `?`); a bare directory matches anything under it.
         path: String,
@@ -181,6 +186,7 @@ pub enum SopTrigger {
         condition: Option<String>,
     },
     /// Calendar event state. Defined and matched, but no poller feeds it live.
+    #[trigger(display = "calendar_source")]
     Calendar {
         /// Calendar source identifier the event originates from.
         calendar_source: String,
@@ -191,7 +197,7 @@ pub enum SopTrigger {
     /// Inbound message on a configured agent-loop channel (telegram, discord,
     /// slack, ...). Live: delivered by the channel orchestrator when the
     /// channel's SOP dispatch mode is enabled.
-    #[trigger(config_derived)]
+    #[trigger(config_derived, display = "channel", opt = "alias")]
     Channel {
         /// `ChannelKind` snake_case value naming the channel type.
         channel: String,
@@ -205,6 +211,7 @@ pub enum SopTrigger {
     /// Agent-initiated run via the `sop_execute` tool. Not an external fan-in.
     Manual,
     /// AMQP delivery. Live: delivered by the AMQP consumer in a SOP dispatch mode.
+    #[trigger(display = "routing_key")]
     Amqp {
         /// Routing-key filter (topic-exchange semantics): `.`-delimited words,
         /// `*` matches one word, `#` matches zero or more words.
@@ -213,28 +220,6 @@ pub enum SopTrigger {
         #[serde(default)]
         condition: Option<String>,
     },
-}
-
-impl fmt::Display for SopTrigger {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let source = self.source();
-        match self {
-            Self::Mqtt { topic, .. } => write!(f, "{source}:{topic}"),
-            Self::Webhook { path } => write!(f, "{source}:{path}"),
-            Self::Cron { expression } => write!(f, "{source}:{expression}"),
-            Self::Peripheral { board, signal, .. } => write!(f, "{source}:{board}/{signal}"),
-            Self::Filesystem { path, .. } => write!(f, "{source}:{path}"),
-            Self::Calendar {
-                calendar_source, ..
-            } => write!(f, "{source}:{calendar_source}"),
-            Self::Channel { channel, alias, .. } => match alias {
-                Some(a) => write!(f, "{source}:{channel}/{a}"),
-                None => write!(f, "{source}:{channel}"),
-            },
-            Self::Manual => write!(f, "{source}"),
-            Self::Amqp { routing_key, .. } => write!(f, "{source}:{routing_key}"),
-        }
-    }
 }
 
 impl SopTrigger {
@@ -674,9 +659,53 @@ pub enum SopRunAction {
     },
 }
 
+/// Exhaustive sample builder: one representative `SopTrigger` per source.
+/// The match has no wildcard, so adding a source fails to compile here until a
+/// sample is supplied, keeping every drift walk that consumes it exhaustive.
+#[cfg(test)]
+pub(crate) fn sample_trigger(source: SopTriggerSource) -> SopTrigger {
+    match source {
+        SopTriggerSource::Mqtt => SopTrigger::Mqtt {
+            topic: "t".into(),
+            condition: None,
+        },
+        SopTriggerSource::Webhook => SopTrigger::Webhook {
+            path: "/hook".into(),
+        },
+        SopTriggerSource::Cron => SopTrigger::Cron {
+            expression: "* * * * *".into(),
+        },
+        SopTriggerSource::Peripheral => SopTrigger::Peripheral {
+            board: "b".into(),
+            signal: "s".into(),
+            condition: None,
+        },
+        SopTriggerSource::Filesystem => SopTrigger::Filesystem {
+            path: "/p".into(),
+            events: vec![],
+            condition: None,
+        },
+        SopTriggerSource::Calendar => SopTrigger::Calendar {
+            calendar_source: "src".into(),
+            calendar_ids: vec![],
+        },
+        SopTriggerSource::Channel => SopTrigger::Channel {
+            channel: "telegram".into(),
+            alias: None,
+            condition: None,
+        },
+        SopTriggerSource::Manual => SopTrigger::Manual,
+        SopTriggerSource::Amqp => SopTrigger::Amqp {
+            routing_key: "k".into(),
+            condition: None,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use strum::IntoEnumIterator;
 
     #[test]
     fn priority_display() {
@@ -709,6 +738,68 @@ mod tests {
 
         let manual = SopTrigger::Manual;
         assert_eq!(manual.to_string(), "manual");
+    }
+
+    #[test]
+    fn trigger_display_covers_every_variant() {
+        // Walks every source through the exhaustive sample builder and checks
+        // structural Display invariants that hold for all sources, with no
+        // per-source string table to drift. A variant missing its
+        // `#[trigger(display=...)]` attribute renders as the bare source and
+        // fails the payload-suffix check; a new source is forced through
+        // `sample_trigger` by the compiler.
+        for source in SopTriggerSource::iter() {
+            let trigger = sample_trigger(source);
+            let rendered = trigger.to_string();
+            let source_str = source.to_string();
+
+            assert!(
+                rendered == source_str || rendered.starts_with(&format!("{source_str}:")),
+                "source {source} Display '{rendered}' must be the bare source or \
+                 '{source_str}:<value>'"
+            );
+
+            // Whether the variant carries authoring fields is derived from its
+            // serde form (keys beyond the `type` tag), not a hardcoded list.
+            let json = serde_json::to_value(&trigger).unwrap();
+            let payload_fields = json
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|k| k.as_str() != "type")
+                .count();
+
+            if payload_fields == 0 {
+                assert_eq!(
+                    rendered, source_str,
+                    "fieldless source {source} must render as the bare source"
+                );
+            } else {
+                assert_ne!(
+                    rendered, source_str,
+                    "source {source} has {payload_fields} field(s) but renders as the \
+                     bare source; its `#[trigger(display=...)]` attribute is missing"
+                );
+                let suffix = &rendered[source_str.len() + 1..];
+                assert!(
+                    !suffix.is_empty(),
+                    "source {source} renders an empty value suffix"
+                );
+            }
+        }
+        // The Channel alias branch is a within-variant option, not a source, so
+        // it is exercised explicitly: alias present must append `/{alias}`.
+        let bare = SopTrigger::Channel {
+            channel: "telegram".into(),
+            alias: None,
+            condition: None,
+        };
+        let aliased = SopTrigger::Channel {
+            channel: "telegram".into(),
+            alias: Some("prod".into()),
+            condition: None,
+        };
+        assert_eq!(aliased.to_string(), format!("{}/prod", bare));
     }
 
     #[test]
