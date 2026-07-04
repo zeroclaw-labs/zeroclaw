@@ -109,10 +109,9 @@ impl TextBrowserTool {
         // SSRF gate: deny by default for private/local hosts unless the operator
         // explicitly listed them. Mirrors `browser`/`http_request`/`web_fetch`.
         let private_host = domain_guard::is_private_or_local_host(&host);
-        let private_host_allowed = private_host
-            && domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts);
+        let host_allowed = domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts);
 
-        if private_host && !private_host_allowed {
+        if private_host && !host_allowed {
             anyhow::bail!("Blocked local/private host: {host}");
         }
 
@@ -122,10 +121,10 @@ impl TextBrowserTool {
         // (e.g. a corporate internal name, or a DNS-rebinding setup) would
         // pass the literal gate and reach `lynx`/`links`/`w3m`. Resolving the
         // host and rejecting non-public / cloud-metadata addresses closes
-        // that path. Skipped when the host is on the operator's
-        // `allowed_private_hosts` (explicit per-host or "*" wildcard) — the
-        // operator has already accepted the risk.
-        if !private_host_allowed {
+        // that path. Skipped when the operator has allowed the host via
+        // explicit entry or "*" wildcard, regardless of whether the host is
+        // literally private — they have already accepted the risk.
+        if !host_allowed {
             validate_dns(&host)?;
         }
 
@@ -577,6 +576,43 @@ mod tests {
             })
             .unwrap();
         assert_eq!(got, "http://10.0.0.5/");
+    }
+
+    #[test]
+    fn validate_url_with_dns_check_skips_dns_when_public_looking_hostname_allowlisted() {
+        // Regression for Audacity88's 2026-07-04 review of #8635: when the
+        // operator lists a public-looking hostname (not literally private) in
+        // `allowed_private_hosts`, the resolved-IP gate must be skipped even
+        // though `is_private_or_local_host` returns false for the host string.
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = TextBrowserTool::new_with_private_hosts(
+            security,
+            None,
+            30,
+            vec!["internal.corp".into()],
+        )
+        .unwrap();
+        let got = tool
+            .validate_url_with_dns_check("http://internal.corp/", |_host| {
+                Err(anyhow::Error::msg("DNS validator should not be invoked"))
+            })
+            .unwrap();
+        assert_eq!(got, "http://internal.corp/");
+    }
+
+    #[test]
+    fn validate_url_with_dns_check_skips_dns_when_public_looking_hostname_wildcard() {
+        // With `["*"]` wildcard, a public-looking hostname resolving to a
+        // private IP must also skip the DNS gate.
+        let security = Arc::new(SecurityPolicy::default());
+        let tool =
+            TextBrowserTool::new_with_private_hosts(security, None, 30, vec!["*".into()]).unwrap();
+        let got = tool
+            .validate_url_with_dns_check("http://internal.corp/", |_host| {
+                Err(anyhow::Error::msg("DNS validator should not be invoked"))
+            })
+            .unwrap();
+        assert_eq!(got, "http://internal.corp/");
     }
 
     #[test]
