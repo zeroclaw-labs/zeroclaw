@@ -93,10 +93,13 @@ pub struct BoundTriggerSource {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 /// Everything an authoring surface needs to offer trigger configuration:
-/// bound (non-channel) sources with their field shapes, plus per-channel
-/// availability. `Channel` is special-cased into `channels` because its
-/// options depend on live config, not just the enum.
+/// the full ordered source list, the bound (non-channel) sources with their
+/// field shapes, and per-channel availability. `Channel` is special-cased
+/// into `channels` because its options depend on live config, not just the
+/// enum; `sources` still names it so surfaces render the picker from one
+/// backend-walked list instead of reconstructing it.
 pub struct TriggerSourceRegistry {
+    pub sources: Vec<String>,
     pub bound: Vec<BoundTriggerSource>,
     pub channels: Vec<ChannelTriggerKind>,
 }
@@ -213,7 +216,13 @@ pub fn build_registry(configured: &[ConfiguredChannel]) -> TriggerSourceRegistry
         })
         .collect();
 
-    TriggerSourceRegistry { bound, channels }
+    let sources = SopTriggerSource::iter().map(|s| s.to_string()).collect();
+
+    TriggerSourceRegistry {
+        sources,
+        bound,
+        channels,
+    }
 }
 
 #[cfg(test)]
@@ -229,6 +238,19 @@ mod tests {
             enabled,
             owning_agent: None,
         }
+    }
+
+    #[test]
+    fn sources_is_the_full_trigger_source_walk() {
+        let registry = build_registry(&[]);
+        let expected: Vec<String> = SopTriggerSource::iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            registry.sources, expected,
+            "registry.sources must be the complete SopTriggerSource walk so \
+             surfaces render the picker from it without reconstructing"
+        );
+        assert!(registry.sources.contains(&"channel".to_string()));
+        assert!(registry.sources.contains(&"manual".to_string()));
     }
 
     #[test]

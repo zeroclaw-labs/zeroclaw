@@ -722,7 +722,7 @@ function TriggerEditor({
       ? []
       : (bound.find((b) => b.source === source)?.fields ?? []);
 
-  const sources: string[] = [
+  const sources: string[] = registry?.sources ?? [
     ...bound.map((b: BoundTriggerSource) => b.source),
     CHANNEL_SOURCE,
   ];
