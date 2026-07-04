@@ -4,8 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 
 use super::payloads::{
-    CreatedComment, GITEA_DEFAULT_API_BASE, GITEA_USER_AGENT, GiteaComment, GiteaIssue,
-    GiteaRelease, GiteaRepo, GiteaUser,
+    CreatedComment, GITEA_USER_AGENT, GiteaComment, GiteaIssue, GiteaRelease, GiteaRepo, GiteaUser,
 };
 use crate::git::types::{GitChannelError, IssueRef, RepoRef};
 
@@ -15,12 +14,11 @@ pub struct GiteaApi {
 }
 
 impl GiteaApi {
-    pub fn new(api_base_url: Option<String>, proxy_url: Option<String>) -> Self {
-        let base = api_base_url
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| GITEA_DEFAULT_API_BASE.to_string())
-            .trim_end_matches('/')
-            .to_string();
+    /// `api_base_url` must be non-blank - callers (`build_provider`, tests)
+    /// resolve and validate it first. Deliberately no fallback host here:
+    /// every request carries the operator's access token.
+    pub fn new(api_base_url: String, proxy_url: Option<String>) -> Self {
+        let base = api_base_url.trim().trim_end_matches('/').to_string();
         Self { base, proxy_url }
     }
 

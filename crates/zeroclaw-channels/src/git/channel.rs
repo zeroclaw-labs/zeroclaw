@@ -8,11 +8,12 @@
 //! the provider from config is the only forge-aware step, isolated to
 //! [`build_provider`]; everything else here is identical for any forge.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::GitConfig;
 
@@ -55,11 +56,30 @@ fn build_provider(cfg: &GitConfig) -> anyhow::Result<Box<dyn GitProvider>> {
                 );
             }
         }
-        "gitea" | "forgejo" => {
+        provider @ ("gitea" | "forgejo") => {
             #[cfg(feature = "provider-gitea")]
             {
+                // Fail closed before any HTTP client exists: every request
+                // attaches `access_token` as a bearer credential, so guessing
+                // a default host would send the token to an endpoint the
+                // operator never named (e.g. a Forgejo PAT to gitea.com).
+                let Some(api_base_url) = cfg
+                    .api_base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                else {
+                    anyhow::bail!(
+                        "git channel provider `{provider}` requires \
+                         channels.git.<alias>.api_base_url - the instance's API base \
+                         URL including /api/v1, e.g. `https://git.example.org/api/v1` \
+                         (or `https://gitea.com/api/v1` for the public Gitea service). \
+                         No default host is assumed because API requests carry the \
+                         access token"
+                    );
+                };
                 Ok(Box::new(super::providers::gitea::GiteaProvider::new(
-                    cfg.api_base_url.clone(),
+                    api_base_url.to_string(),
                     cfg.access_token.clone(),
                     cfg.proxy_url.clone(),
                 )))
@@ -67,7 +87,7 @@ fn build_provider(cfg: &GitConfig) -> anyhow::Result<Box<dyn GitProvider>> {
             #[cfg(not(feature = "provider-gitea"))]
             {
                 anyhow::bail!(
-                    "git channel provider `gitea`/`forgejo` requires the `provider-gitea` feature"
+                    "git channel provider `{provider}` requires the `provider-gitea` feature"
                 );
             }
         }
@@ -226,6 +246,18 @@ impl GitChannel {
     ) -> Result<bool, GitChannelError> {
         let repo_key = repo.to_string();
         let mut batch: Vec<GitEvent> = Vec::new();
+        // Cursor advances and the fresh feed ETag are STAGED here, not
+        // committed to `state`, until the whole batch has been dispatched.
+        // A fetch error on a later stream (or the rate-limit backoff that
+        // re-enters this function) must not advance a cursor or mark an
+        // event seen for events that were never delivered — otherwise the
+        // next tick skips them permanently.
+        let mut advances: Vec<(PollStream, DateTime<Utc>)> = Vec::new();
+        let mut fresh_etag: Option<String> = None;
+        // Dedup across streams within this tick, since the shared seen-set
+        // is not committed until dispatch: an item surfaced by both a
+        // targeted endpoint and the feed backbone is still admitted once.
+        let mut this_tick: HashSet<String> = HashSet::new();
 
         for stream in self.active_streams(plan) {
             let since = state.since(&repo_key, stream);
@@ -242,19 +274,16 @@ impl GitChannel {
                 continue;
             }
             if let Some(etag) = page.etag {
-                state.set_etag(&repo_key, etag);
+                fresh_etag = Some(etag);
             }
-            // Advance the per-stream cursor from the provider's report,
-            // independent of which events the dedup set ultimately admits
-            // (the cursor covers everything the endpoint returned).
             if let Some(advance_to) = page.advance_to {
-                state.advance(&repo_key, stream, advance_to);
+                advances.push((stream, advance_to));
             }
             for event in page.events {
-                // The seen-set is shared across streams, so an item
-                // surfaced by both a targeted endpoint and the feed
-                // backbone is admitted exactly once.
-                if state.admit(&event.dedup_id(), event.created_at()) {
+                let id = event.dedup_id();
+                // Read-only freshness check + within-tick dedup; the shared
+                // seen-set is committed per event only after it dispatches.
+                if state.is_fresh(&id, event.created_at()) && this_tick.insert(id) {
                     batch.push(event);
                 }
             }
@@ -262,9 +291,22 @@ impl GitChannel {
 
         batch.sort_by_key(GitEvent::created_at);
         for event in batch {
+            let id = event.dedup_id();
             if !self.dispatch_event(event, filter, tx).await {
+                // Receiver hung up (shutdown): commit nothing further, so
+                // the undelivered tail is re-fetched next run, and stop.
                 return Ok(false);
             }
+            state.mark_seen(&id);
+        }
+
+        // Every event was delivered: it is now safe to advance the stream
+        // cursors and remember the feed ETag.
+        if let Some(etag) = fresh_etag {
+            state.set_etag(&repo_key, etag);
+        }
+        for (stream, advance_to) in advances {
+            state.advance(&repo_key, stream, advance_to);
         }
         Ok(true)
     }
@@ -620,10 +662,45 @@ mod tests {
             Ok(_) => panic!("expected an error for an unknown provider"),
             Err(e) => e,
         };
-        assert!(
-            err.to_string()
-                .contains("unknown git channel provider `bitbucket`")
-        );
+        let msg = err.to_string();
+        assert!(msg.contains("unknown git channel provider `bitbucket`"));
+        // This slice ships the Gitea/Forgejo provider alongside GitHub; the
+        // error must advertise exactly the providers the build accepts.
+        assert!(msg.contains("supported: github, gitea, forgejo"));
+    }
+
+    // Regression (fail closed): a gitea/forgejo config without api_base_url
+    // must error at construction - synchronously, before any provider or
+    // HTTP client exists, so no request (carrying the access token) can be
+    // sent anywhere. The old code silently fell back to
+    // https://gitea.com/api/v1 and attached the configured token to every
+    // request against it.
+    #[cfg(feature = "provider-gitea")]
+    #[test]
+    fn gitea_forgejo_without_api_base_url_fails_closed() {
+        for provider in ["gitea", "forgejo"] {
+            for api_base_url in [None, Some("   ".to_string())] {
+                let cfg = GitConfig {
+                    provider: provider.to_string(),
+                    access_token: "s3cr3t-tok".to_string(),
+                    api_base_url: api_base_url.clone(),
+                    ..GitConfig::default()
+                };
+                let err = match GitChannel::new(cfg, "main", Arc::new(Vec::new)) {
+                    Ok(_) => {
+                        panic!("`{provider}` with api_base_url {api_base_url:?} must not construct")
+                    }
+                    Err(e) => e,
+                };
+                let msg = err.to_string();
+                assert!(msg.contains("api_base_url"), "{msg}");
+                assert!(msg.contains(provider), "{msg}");
+                assert!(
+                    !msg.contains("s3cr3t-tok"),
+                    "error must not echo the token: {msg}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1174,6 +1251,151 @@ mod tests {
                 }
                 other => panic!("expected RateLimited, got {other:?}"),
             }
+        }
+
+        /// Regression: a fetch error on a later stream must not drop events
+        /// already fetched from an earlier one. Before the staged-commit
+        /// fix, `poll_repo` advanced the Issues cursor and marked the issue
+        /// seen the moment the Issues stream returned, so a Comments-stream
+        /// error (the same shape as the rate-limit backoff that re-enters
+        /// this function) permanently lost the already-fetched issue: the
+        /// next tick's cursor had moved past it and the dedup set held it.
+        #[tokio::test]
+        async fn later_stream_error_does_not_drop_earlier_events() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            let now = chrono::Utc::now();
+            let issue = serde_json::json!([{
+                "id": 555,
+                "number": 12,
+                "title": "Flaky test",
+                "body": "@myapp please investigate",
+                "user": {"login": "marc", "type": "User"},
+                "created_at": (now - chrono::Duration::seconds(60)).to_rfc3339(),
+            }]);
+            mount_token_mock(&server).await;
+            Mock::given(method("GET"))
+                .and(path("/repos/octo/repo/issues"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(issue.clone()))
+                .mount(&server)
+                .await;
+            // The Comments stream (polled after Issues) fails mid-tick.
+            Mock::given(method("GET"))
+                .and(path("/repos/octo/repo/issues/comments"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            let key = write_test_key();
+            let ch = mock_channel(base_cfg(&key), server.uri());
+            let filter = test_filter();
+            let plan = default_plan();
+            let floor = now - chrono::Duration::hours(1);
+            let mut state = PollState::new(floor);
+            let repo = RepoRef::parse("octo/repo").unwrap();
+
+            // First tick errors on the Comments stream.
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let err = ch
+                .poll_repo(&repo, &filter, &plan, &mut state, &tx)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, GitChannelError::Api { status: 500, .. }));
+            // The Issues cursor did NOT advance past the undelivered issue.
+            assert_eq!(state.since(&repo.to_string(), PollStream::Issues), floor);
+            drop(tx);
+            assert!(rx.recv().await.is_none());
+
+            // Fix the Comments stream and poll again: the issue is still
+            // delivered (it was never marked seen), proving no event was lost.
+            server.reset().await;
+            mount_token_mock(&server).await;
+            Mock::given(method("GET"))
+                .and(path("/repos/octo/repo/issues"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(issue))
+                .mount(&server)
+                .await;
+            mount_empty(&server, "/repos/octo/repo/issues/comments").await;
+
+            let (tx2, mut rx2) = tokio::sync::mpsc::channel(8);
+            ch.poll_repo(&repo, &filter, &plan, &mut state, &tx2)
+                .await
+                .unwrap();
+            drop(tx2);
+            let msg = rx2.recv().await.unwrap();
+            assert_eq!(msg.id, "ghi_555");
+            assert!(rx2.recv().await.is_none());
+        }
+
+        /// Regression: the Issues stream follows `Link: rel="next"`
+        /// pagination, so items beyond the first 100-item page are still
+        /// delivered. Before this, one unpaginated page let a busy repo's
+        /// older `updated`-matching items saturate the page and starve
+        /// newer ones, livelocking a cursor that advances on the newest
+        /// returned item. Here page one links to page two and both issues
+        /// are forwarded.
+        #[tokio::test]
+        async fn issues_stream_follows_link_pagination() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            let now = chrono::Utc::now();
+            mount_token_mock(&server).await;
+            // Page one points at page two the way GitHub's Link header does.
+            let next_link = format!("<{}/paged/issues/2>; rel=\"next\"", server.uri());
+            Mock::given(method("GET"))
+                .and(path("/repos/octo/repo/issues"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("link", next_link.as_str())
+                        .set_body_json(serde_json::json!([{
+                            "id": 101,
+                            "number": 1,
+                            "title": "First",
+                            "body": "@myapp one",
+                            "user": {"login": "marc", "type": "User"},
+                            "created_at": (now - chrono::Duration::seconds(90)).to_rfc3339(),
+                        }])),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/paged/issues/2"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                        "id": 202,
+                        "number": 2,
+                        "title": "Second",
+                        "body": "@myapp two",
+                        "user": {"login": "marc", "type": "User"},
+                        "created_at": (now - chrono::Duration::seconds(30)).to_rfc3339(),
+                    }])),
+                )
+                .mount(&server)
+                .await;
+            mount_empty(&server, "/repos/octo/repo/issues/comments").await;
+
+            let key = write_test_key();
+            let ch = mock_channel(base_cfg(&key), server.uri());
+            let filter = test_filter();
+            let plan = default_plan();
+            let mut state = PollState::new(now - chrono::Duration::hours(1));
+            let repo = RepoRef::parse("octo/repo").unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            ch.poll_repo(&repo, &filter, &plan, &mut state, &tx)
+                .await
+                .unwrap();
+            drop(tx);
+
+            // Both pages' issues are delivered, oldest first.
+            let first = rx.recv().await.unwrap();
+            assert_eq!(first.id, "ghi_101");
+            let second = rx.recv().await.unwrap();
+            assert_eq!(second.id, "ghi_202");
+            assert!(rx.recv().await.is_none());
         }
     }
 }

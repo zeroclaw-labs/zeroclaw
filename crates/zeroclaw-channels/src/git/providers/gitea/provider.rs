@@ -16,11 +16,12 @@ pub struct GiteaProvider {
 }
 
 impl GiteaProvider {
-    pub fn new(
-        api_base_url: Option<String>,
-        access_token: String,
-        proxy_url: Option<String>,
-    ) -> Self {
+    /// `api_base_url` is required and must be non-blank; there is no
+    /// default host. [`build_provider`](crate::git::channel) fails closed
+    /// before constructing this provider when the config omits it, so a
+    /// bearer `access_token` is never sent to a host the operator did not
+    /// name.
+    pub fn new(api_base_url: String, access_token: String, proxy_url: Option<String>) -> Self {
         Self {
             api: GiteaApi::new(api_base_url, proxy_url),
             access_token,
@@ -302,7 +303,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = GiteaProvider::new(Some(server.uri()), "t".into(), None);
+        let provider = GiteaProvider::new(server.uri(), "t".into(), None);
         let repo = RepoRef::parse("octo/repo").unwrap();
         let page = provider
             .fetch_issues("t", &repo, now - chrono::Duration::hours(1))
@@ -329,7 +330,7 @@ mod tests {
             return;
         };
         let repo_str = std::env::var("GITEA_TEST_REPO").unwrap_or_else(|_| "Nillth/Hello".into());
-        let provider = GiteaProvider::new(Some(base), token, None);
+        let provider = GiteaProvider::new(base, token, None);
         match provider.self_identity().await {
             Ok(id) => eprintln!(
                 "IDENTITY OK: bot_login={} mention={}",
@@ -372,7 +373,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = GiteaProvider::new(Some(server.uri()), "t".into(), None);
+        let provider = GiteaProvider::new(server.uri(), "t".into(), None);
         let repo = RepoRef::parse("octo/repo").unwrap();
         let page = provider.fetch_issues("t", &repo, cursor).await.unwrap();
         assert_eq!(

@@ -3,7 +3,6 @@
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-pub const GITEA_DEFAULT_API_BASE: &str = "https://gitea.com/api/v1";
 pub const GITEA_USER_AGENT: &str = "zeroclaw";
 
 #[derive(Debug, Clone, Deserialize)]

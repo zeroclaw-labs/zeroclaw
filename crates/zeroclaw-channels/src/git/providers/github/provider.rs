@@ -116,11 +116,21 @@ impl GithubProvider {
             if let Some(transition) = mapping::from_pull_transition(&issue, repo) {
                 events.push(transition);
             }
-            // Advance on creation timestamps only: closes happen to old
-            // items that sort first, and advancing past them could skip
-            // unseen items behind a full page. The dedup set absorbs the
-            // re-reads this leaves behind.
-            advance_to = Some(advance_to.map_or(issue.created_at, |m| m.max(issue.created_at)));
+            // Advance on `updated_at`, the dimension `since` filters and the
+            // endpoint is sorted by (oldest-updated first, see
+            // `list_issues_since`). With all three aligned, the max updated
+            // time in a page is a monotonically forward watermark: every
+            // item at or below it was on this or an earlier page, and the
+            // page cap only defers strictly-newer items to the next tick
+            // rather than starving them. Advancing on `created_at` instead
+            // stalled here: an old item re-updated after the cursor kept
+            // matching `since` while never moving the watermark. Which
+            // events are *dispatched* is unaffected: `is_fresh` gates each
+            // event on its own timestamp (a reopened old issue's opening
+            // post stays below the cold-start floor; a close/merge carries
+            // its recent `closed_at`), independent of this cursor.
+            let updated = issue.updated_at();
+            advance_to = Some(advance_to.map_or(updated, |m| m.max(updated)));
         }
         Ok(FetchPage {
             events,
@@ -377,5 +387,82 @@ impl GitProvider for GithubProvider {
                 self.api.add_issue_reaction(&token, issue, content).await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::api::GithubApi;
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Regression for the capped-pagination livelock: a busy repo can fill
+    // more than one poll's worth of pages with OLD issues/PRs (created long
+    // ago) that keep matching `since` because they were just updated (e.g. a
+    // PR closed/merged after the cursor). Sorting by `created` and advancing
+    // the cursor on `created_at` left the watermark <= `since` forever, so
+    // the page cap refetched the same leading prefix every tick and pages
+    // beyond it were never reached. Sorting by `updated` and advancing on
+    // `updated_at` makes the capped window advance the watermark past itself,
+    // so the next tick reaches later pages instead of starving them.
+    #[tokio::test]
+    async fn capped_issue_window_advances_cursor_by_updated_at() {
+        // Fixed base so timestamps round-trip through RFC 3339 exactly.
+        let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let server = MockServer::start().await;
+
+        // More pages than the per-poll cap (MAX_PAGES_PER_POLL = 20). Each
+        // page is one item created 1000 days before `start` but updated
+        // `k` minutes after it, ascending, so a created-based cursor would
+        // stall at/below `start` while an updated-based one moves forward.
+        const PAGES: i64 = 21;
+        for k in 1..=PAGES {
+            let updated = start + chrono::Duration::minutes(k);
+            let body = serde_json::json!([{
+                "id": 1000 + k,
+                "number": k,
+                "title": format!("issue {k}"),
+                "user": {"login": "alice", "type": "User"},
+                "created_at": (start - chrono::Duration::days(1000)).to_rfc3339(),
+                "updated_at": updated.to_rfc3339(),
+                "html_url": "https://github.com/octo/repo/issues/1",
+            }]);
+            let mut resp = ResponseTemplate::new(200).set_body_json(serde_json::json!(body));
+            if k < PAGES {
+                let link = format!("<{}/paged/issues/{}>; rel=\"next\"", server.uri(), k + 1);
+                resp = resp.insert_header("link", link.as_str());
+            }
+            let route = if k == 1 {
+                "/repos/octo/repo/issues".to_string()
+            } else {
+                format!("/paged/issues/{k}")
+            };
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(resp)
+                .mount(&server)
+                .await;
+        }
+
+        let provider = GithubProvider::new(0, String::new(), Some(1), None)
+            .with_api(GithubApi::with_base(server.uri()));
+        let repo = RepoRef::parse("octo/repo").unwrap();
+        let page = provider.fetch_issues("t", &repo, start).await.unwrap();
+
+        let advance_to = page.advance_to.expect("fetched issues yield a cursor");
+        // Forward progress: the watermark moves past `start` (a created-based
+        // cursor would have stalled at the 1000-day-old creation time). This
+        // is the assertion that fails on the pre-fix code.
+        assert!(
+            advance_to > start,
+            "capped window must advance the cursor, not stall on old created_at"
+        );
+        // Advanced exactly to the newest UPDATED item within the capped
+        // window (page 20 at the cap), so `since` next tick clears the whole
+        // fetched prefix and reaches page 21.
+        assert_eq!(advance_to, start + chrono::Duration::minutes(20));
     }
 }

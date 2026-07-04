@@ -63,15 +63,18 @@ impl PollState {
             .unwrap_or(self.start)
     }
 
-    /// Whether an event is fresh: created at-or-after the floor, not yet
-    /// seen. Marks it seen.
-    pub fn admit(&mut self, id: &str, created_at: DateTime<Utc>) -> bool {
-        if created_at < self.start {
-            return false;
-        }
-        if self.seen.contains(id) {
-            return false;
-        }
+    /// Whether an event is fresh: created at-or-after the cold-start floor
+    /// and not yet processed. Read-only — call [`Self::mark_seen`] only
+    /// once the event has actually been dispatched, so a fetch/dispatch
+    /// error cannot advance the dedup set past an undelivered event.
+    pub fn is_fresh(&self, id: &str, created_at: DateTime<Utc>) -> bool {
+        created_at >= self.start && !self.seen.contains(id)
+    }
+
+    /// Record that an event has been dispatched so later ticks dedup it.
+    /// Evicts half the set when it reaches capacity (same policy as the
+    /// Twitter channel).
+    pub fn mark_seen(&mut self, id: &str) {
         if self.seen.len() >= DEDUP_CAPACITY {
             let evict: Vec<String> = self.seen.iter().take(DEDUP_CAPACITY / 2).cloned().collect();
             for key in evict {
@@ -79,7 +82,6 @@ impl PollState {
             }
         }
         self.seen.insert(id.to_string());
-        true
     }
 
     /// Advance a stream cursor to cover a processed event. Never moves
@@ -151,20 +153,21 @@ mod tests {
     }
 
     #[test]
-    fn admit_rejects_pre_start_events() {
-        let (mut s, start) = state();
-        assert!(!s.admit("ghc_1", start - Duration::seconds(5)));
-        assert!(s.admit("ghc_2", start + Duration::seconds(5)));
+    fn is_fresh_rejects_pre_start_events() {
+        let (s, start) = state();
+        assert!(!s.is_fresh("ghc_1", start - Duration::seconds(5)));
+        assert!(s.is_fresh("ghc_2", start + Duration::seconds(5)));
     }
 
     #[test]
-    fn admit_dedups_repeated_ids_across_transports() {
+    fn mark_seen_dedups_repeated_ids_across_transports() {
         let (mut s, start) = state();
         let t = start + Duration::seconds(1);
         // Same underlying object surfaced by a targeted endpoint…
-        assert!(s.admit("ghc_1", t));
-        // …and again by the feed backbone: admitted once.
-        assert!(!s.admit("ghc_1", t));
+        assert!(s.is_fresh("ghc_1", t));
+        s.mark_seen("ghc_1");
+        // …and again by the feed backbone: no longer fresh.
+        assert!(!s.is_fresh("ghc_1", t));
     }
 
     #[test]
