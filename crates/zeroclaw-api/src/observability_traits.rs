@@ -44,8 +44,8 @@ pub struct TurnTokenUsage {
     pub output_tokens: u64,
 }
 
-/// Borrowed turn-correlation metadata handed to memory hooks so the events
-/// they emit can join the active turn trace.
+/// Borrowed turn-correlation metadata handed to memory and RAG hooks so the
+/// events they emit can join the active turn trace.
 ///
 /// All fields are optional: `None` means the operation is not running inside
 /// a correlated agent turn, and observers degrade to root spans rather than
@@ -526,7 +526,12 @@ mod tests {
             turn_id: Some("turn-1".into()),
         };
 
-        assert!(matches!(recall.clone(), ObserverEvent::MemoryRecall { .. }));
+        match recall.clone() {
+            ObserverEvent::MemoryRecall { turn_id, .. } => {
+                assert_eq!(turn_id.as_deref(), Some("turn-1"));
+            }
+            other => panic!("clone changed variant: {other:?}"),
+        }
         assert!(matches!(store.clone(), ObserverEvent::MemoryStore { .. }));
         assert!(matches!(rag.clone(), ObserverEvent::RagRetrieve { .. }));
     }
