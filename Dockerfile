@@ -89,6 +89,9 @@ COPY --parents crates/zeroclaw-macros/src/ ./
 # below. Its real build.rs reads web/src/contexts/themes.json and would panic in
 # this pre-fetch stage, so it is stubbed.
 COPY apps/zerocode/Cargo.toml apps/zerocode/Cargo.toml
+# apps/zeroclaw-plugin-host: WASM execution sidecar shipped alongside the main
+# binary; manifest here for workspace resolution, real source copied below.
+COPY apps/zeroclaw-plugin-host/Cargo.toml apps/zeroclaw-plugin-host/Cargo.toml
 # tools/fill-translations and xtask are dev/build tools; copy manifests only so
 # Cargo can resolve the workspace, then stub their entry points so the
 # dependency pre-fetch step succeeds without building them into the image.
@@ -98,13 +101,14 @@ COPY xtask/Cargo.toml xtask/Cargo.toml
 # `src/bin/zeroclaw-acp-bridge.rs` is required because the `acp-bridge` feature
 # is in the root crate's default set; cargo selects the bin target during the
 # pre-fetch build even with only the workspace lib stubbed.
-RUN mkdir -p src src/bin benches apps/zerocode/src tools/fill-translations/src xtask/src/bin \
+RUN mkdir -p src src/bin benches apps/zerocode/src apps/zeroclaw-plugin-host/src tools/fill-translations/src xtask/src/bin \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
     && echo "fn main() {}" > src/bin/zeroclaw-acp-bridge.rs \
     && echo "fn main() {}" > benches/agent_benchmarks.rs \
     && echo "fn main() {}" > apps/zerocode/src/main.rs \
     && echo "fn main() {}" > apps/zerocode/build.rs \
+    && echo "fn main() {}" > apps/zeroclaw-plugin-host/src/main.rs \
     && echo "fn main() {}" > tools/fill-translations/src/main.rs \
     && echo "" > xtask/src/lib.rs \
     && echo "fn main() {}" > xtask/src/bin/mdbook.rs \
@@ -130,7 +134,8 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
       cargo build --release --locked --target "$RUST_TARGET" -p zeroclawlabs -p zerocode $ZEROCLAW_CARGO_FLAGS; \
     else \
       cargo build --release --locked --target "$RUST_TARGET" -p zeroclawlabs -p zerocode; \
-    fi
+    fi && \
+    cargo build --release --locked --target "$RUST_TARGET" -p zeroclaw-plugin-host
 RUN rm -rf src benches crates xtask tools/fill-translations
 
 # 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
@@ -142,12 +147,13 @@ COPY tools/fill-translations/ tools/fill-translations/
 # apps/zerocode ships in the image; copy its real source. Its build.rs reads the
 # dashboard theme registry under web/src/contexts, so that path must be present.
 COPY apps/zerocode/ apps/zerocode/
+COPY apps/zeroclaw-plugin-host/ apps/zeroclaw-plugin-host/
 COPY web/src/ web/src/
 # locales.toml lives at repo root and is embedded by zeroclaw-runtime via
 # include_str!("../../../locales.toml"); the real build needs it present.
 COPY locales.toml .
 COPY *.rs .
-RUN touch src/main.rs apps/zerocode/src/main.rs
+RUN touch src/main.rs apps/zerocode/src/main.rs apps/zeroclaw-plugin-host/src/main.rs
 # Bust the stubbed workspace crates so the real sources rebuild. zerocode is
 # purged from BOTH the target tree and the host tree (target/release/): with
 # --target, build scripts compile in the host tree, so its real build.rs (which
@@ -187,10 +193,12 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     else \
       cargo build --release --locked --target "$RUST_TARGET" -p zeroclawlabs -p zerocode; \
     fi && \
+    cargo build --release --locked --target "$RUST_TARGET" -p zeroclaw-plugin-host && \
     cp target/"$RUST_TARGET"/release/zeroclaw /app/zeroclaw && \
     cp target/"$RUST_TARGET"/release/zerocode /app/zerocode && \
-    "$STRIP" /app/zeroclaw /app/zerocode
-RUN for b in zeroclaw zerocode; do \
+    cp target/"$RUST_TARGET"/release/zeroclaw-plugin-host /app/zeroclaw-plugin-host && \
+    "$STRIP" /app/zeroclaw /app/zerocode /app/zeroclaw-plugin-host
+RUN for b in zeroclaw zerocode zeroclaw-plugin-host; do \
       size=$(stat -c%s "/app/$b") && \
       if [ "$size" -lt 1000000 ]; then echo "ERROR: $b too small (${size} bytes), likely dummy build artifact" && exit 1; fi; \
     done
@@ -231,6 +239,7 @@ RUN apt-get update && apt-get install -y \
 COPY --from=builder /zeroclaw-data /zeroclaw-data
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /app/zerocode /usr/local/bin/zerocode
+COPY --from=builder /app/zeroclaw-plugin-host /usr/local/bin/zeroclaw-plugin-host
 # Install the dashboard at /usr/share/zeroclawlabs/web/dist (outside the
 # documented /zeroclaw-data mount) so user volumes do not shadow it (#6400).
 COPY --from=web-builder /app/web/dist /usr/share/zeroclawlabs/web/dist
@@ -266,6 +275,7 @@ FROM ${ZEROCLAW_BASE_DISTROLESS} AS release
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /app/zerocode /usr/local/bin/zerocode
+COPY --from=builder /app/zeroclaw-plugin-host /usr/local/bin/zeroclaw-plugin-host
 COPY --from=builder /zeroclaw-data /zeroclaw-data
 # Install the dashboard at /usr/share/zeroclawlabs/web/dist (outside the
 # documented /zeroclaw-data mount) so user volumes do not shadow it (#6400).

@@ -73,4 +73,5 @@ lcov.info
 # is whitelisted and copied for the real build.
 apps/*
 !apps/zerocode/
+!apps/zeroclaw-plugin-host/
 scripts/
