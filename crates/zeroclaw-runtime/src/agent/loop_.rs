@@ -122,7 +122,7 @@ pub(crate) fn live_channel_registry() -> Option<tools::PerToolChannelHandle> {
     }
     Some(Arc::new(parking_lot::RwLock::new(map)))
 }
-use crate::observability::{self, Observer, ObserverEvent};
+use crate::observability::{self, Observer, ObserverEvent, TurnMetaRef};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
 use crate::tools::{self, Tool};
@@ -790,6 +790,7 @@ async fn build_context(
     min_relevance_score: f64,
     session_id: Option<&str>,
     exclude_conversation: bool,
+    turn: TurnMetaRef<'_>,
 ) -> String {
     let mut context = String::new();
     let backend = mem.name().to_string();
@@ -811,9 +812,9 @@ async fn build_context(
                 num_entries: entries.len(),
                 backend,
                 success: true,
-                channel: None,
-                agent_alias: None,
-                turn_id: None,
+                channel: turn.channel.map(str::to_string),
+                agent_alias: turn.agent_alias.map(str::to_string),
+                turn_id: turn.turn_id.map(str::to_string),
             });
 
             // Apply time decay: older non-Core memories score lower
@@ -878,9 +879,9 @@ async fn build_context(
                 num_entries: 0,
                 backend,
                 success: false,
-                channel: None,
-                agent_alias: None,
-                turn_id: None,
+                channel: turn.channel.map(str::to_string),
+                agent_alias: turn.agent_alias.map(str::to_string),
+                turn_id: turn.turn_id.map(str::to_string),
             });
             // Preserve original swallow behavior — recall errors are not
             // propagated; an empty context string is returned.
@@ -898,6 +899,7 @@ fn build_hardware_context(
     user_msg: &str,
     boards: &[String],
     chunk_limit: usize,
+    turn: TurnMetaRef<'_>,
 ) -> String {
     if rag.is_empty() || boards.is_empty() {
         return String::new();
@@ -919,9 +921,9 @@ fn build_hardware_context(
         duration,
         num_chunks: chunks.len(),
         num_boards: boards.len(),
-        channel: None,
-        agent_alias: None,
-        turn_id: None,
+        channel: turn.channel.map(str::to_string),
+        agent_alias: turn.agent_alias.map(str::to_string),
+        turn_id: turn.turn_id.map(str::to_string),
     });
 
     if chunks.is_empty() && pin_ctx.is_empty() {
@@ -2071,9 +2073,9 @@ pub async fn run(
                     backend: mem.name().to_string(),
                     duration: store_start.elapsed(),
                     success: store_result.is_ok(),
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    channel: Some(channel_name.to_string()),
+                    agent_alias: Some(agent_alias.to_string()),
+                    turn_id: Some(turn_id.clone()),
                 });
             }
 
@@ -2092,13 +2094,29 @@ pub async fn run(
                 config.memory.min_relevance_score,
                 memory_session_id.as_deref(),
                 exclude_conv,
+                TurnMetaRef {
+                    channel: Some(channel_name),
+                    agent_alias: Some(agent_alias),
+                    turn_id: Some(&turn_id),
+                },
             )
             .await;
             let rag_limit = if eff_compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
                 .map(|r| {
-                    build_hardware_context(r, &*observer, &effective_msg, &board_names, rag_limit)
+                    build_hardware_context(
+                        r,
+                        &*observer,
+                        &effective_msg,
+                        &board_names,
+                        rag_limit,
+                        TurnMetaRef {
+                            channel: Some(channel_name),
+                            agent_alias: Some(agent_alias),
+                            turn_id: Some(&turn_id),
+                        },
+                    )
                 })
                 .unwrap_or_default();
             let context = format!("{mem_context}{hw_context}");
@@ -2572,9 +2590,9 @@ pub async fn run(
                         backend: mem.name().to_string(),
                         duration: store_start.elapsed(),
                         success: store_result.is_ok(),
-                        channel: None,
-                        agent_alias: None,
-                        turn_id: None,
+                        channel: Some(channel_name.to_string()),
+                        agent_alias: Some(agent_alias.to_string()),
+                        turn_id: Some(turn_id.clone()),
                     });
                 }
 
@@ -2589,6 +2607,11 @@ pub async fn run(
                     config.memory.min_relevance_score,
                     memory_session_id.as_deref(),
                     memory_session_id.is_none(),
+                    TurnMetaRef {
+                        channel: Some(channel_name),
+                        agent_alias: Some(agent_alias),
+                        turn_id: Some(&turn_id),
+                    },
                 )
                 .await;
                 let rag_limit = if eff_compact_context { 2 } else { 5 };
@@ -2601,6 +2624,11 @@ pub async fn run(
                             &effective_input,
                             &board_names,
                             rag_limit,
+                            TurnMetaRef {
+                                channel: Some(channel_name),
+                                agent_alias: Some(agent_alias),
+                                turn_id: Some(&turn_id),
+                            },
                         )
                     })
                     .unwrap_or_default();
@@ -3577,13 +3605,21 @@ pub async fn process_message(
             config.memory.min_relevance_score,
             session_id,
             false,
+            TurnMetaRef::default(),
         )
         .await;
         let rag_limit = if eff_compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
             .map(|r| {
-                build_hardware_context(r, &*observer, effective_msg_ref, &board_names, rag_limit)
+                build_hardware_context(
+                    r,
+                    &*observer,
+                    effective_msg_ref,
+                    &board_names,
+                    rag_limit,
+                    TurnMetaRef::default(),
+                )
             })
             .unwrap_or_default();
         let context = format!("{mem_context}{hw_context}");
@@ -11962,7 +11998,16 @@ This is an example, not an invocation."#;
         .await
         .unwrap();
 
-        let context = build_context(&mem, &NoopObserver, "status updates", 0.0, None, false).await;
+        let context = build_context(
+            &mem,
+            &NoopObserver,
+            "status updates",
+            0.0,
+            None,
+            false,
+            TurnMetaRef::default(),
+        )
+        .await;
         assert!(context.contains("user_preference"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));
@@ -11997,7 +12042,16 @@ This is an example, not an invocation."#;
         .await
         .unwrap();
 
-        let context = build_context(&mem, &NoopObserver, "answers", 0.0, None, false).await;
+        let context = build_context(
+            &mem,
+            &NoopObserver,
+            "answers",
+            0.0,
+            None,
+            false,
+            TurnMetaRef::default(),
+        )
+        .await;
         assert!(context.contains("user_preference"));
         assert!(!context.contains("user_msg"));
         assert!(!context.contains("embedding prior context"));
@@ -12032,7 +12086,16 @@ This is an example, not an invocation."#;
         .await
         .unwrap();
 
-        let context = build_context(&mem, &NoopObserver, "Alice on-call", 0.0, None, true).await;
+        let context = build_context(
+            &mem,
+            &NoopObserver,
+            "Alice on-call",
+            0.0,
+            None,
+            true,
+            TurnMetaRef::default(),
+        )
+        .await;
         assert!(
             !context.contains("Alice"),
             "Conversation memory leaked into scheduled context: {context}"
@@ -12133,7 +12196,16 @@ This is an example, not an invocation."#;
         let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         let observer = RecallCountingObserver::default();
 
-        let _ = build_context(&mem, &observer, "any query", 0.0, None, false).await;
+        let _ = build_context(
+            &mem,
+            &observer,
+            "any query",
+            0.0,
+            None,
+            false,
+            TurnMetaRef::default(),
+        )
+        .await;
 
         let recalls = observer.recalls.lock();
         assert_eq!(
@@ -12241,7 +12313,16 @@ This is an example, not an invocation."#;
         let mem = FailingRecallMemory;
         let observer = RecallCountingObserver::default();
 
-        let context = build_context(&mem, &observer, "any query", 0.0, None, false).await;
+        let context = build_context(
+            &mem,
+            &observer,
+            "any query",
+            0.0,
+            None,
+            false,
+            TurnMetaRef::default(),
+        )
+        .await;
         assert!(
             context.is_empty(),
             "recall failure must still produce empty context (swallow behavior)"
@@ -12259,6 +12340,102 @@ This is an example, not an invocation."#;
             !recalls[0].success,
             "failed recall must report success = false"
         );
+    }
+
+    /// `build_context` must forward the caller's `TurnMetaRef` onto the
+    /// `MemoryRecall` event it emits, so the recall joins the turn trace
+    /// (see `TurnMetaRef` doc comment on the forwarding contract).
+    #[tokio::test]
+    async fn build_context_forwards_turn_meta() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let observer = CapturingObserver::default();
+
+        let _ = build_context(
+            &mem,
+            &observer,
+            "hello",
+            0.0,
+            None,
+            false,
+            TurnMetaRef {
+                channel: Some("daemon"),
+                agent_alias: Some("coder"),
+                turn_id: Some("turn-7"),
+            },
+        )
+        .await;
+
+        let events = observer.events.lock();
+        match events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::MemoryRecall { .. }))
+            .expect("build_context must emit MemoryRecall")
+        {
+            ObserverEvent::MemoryRecall {
+                turn_id,
+                channel,
+                agent_alias,
+                ..
+            } => {
+                assert_eq!(turn_id.as_deref(), Some("turn-7"));
+                assert_eq!(channel.as_deref(), Some("daemon"));
+                assert_eq!(agent_alias.as_deref(), Some("coder"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// `build_hardware_context` must forward the caller's `TurnMetaRef` onto
+    /// the `RagRetrieve` event it emits. Prior review flagged that
+    /// `RagRetrieve` correlation had no executing assertion anywhere.
+    #[tokio::test]
+    async fn build_hardware_context_forwards_turn_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("datasheets");
+        std::fs::create_dir_all(&base).unwrap();
+        let content = r#"# Test Board
+## Pin Aliases
+red_led: 13
+## GPIO
+Pin 13: LED
+"#;
+        std::fs::write(base.join("test-board.md"), content).unwrap();
+        let rag = crate::rag::HardwareRag::load(tmp.path(), "datasheets").unwrap();
+        let boards = vec!["test-board".to_string()];
+        let observer = CapturingObserver::default();
+
+        let _ = build_hardware_context(
+            &rag,
+            &observer,
+            "led",
+            &boards,
+            5,
+            TurnMetaRef {
+                channel: Some("daemon"),
+                agent_alias: Some("coder"),
+                turn_id: Some("turn-7"),
+            },
+        );
+
+        let events = observer.events.lock();
+        match events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::RagRetrieve { .. }))
+            .expect("build_hardware_context must emit RagRetrieve")
+        {
+            ObserverEvent::RagRetrieve {
+                turn_id,
+                channel,
+                agent_alias,
+                ..
+            } => {
+                assert_eq!(turn_id.as_deref(), Some("turn-7"));
+                assert_eq!(channel.as_deref(), Some("daemon"));
+                assert_eq!(agent_alias.as_deref(), Some("coder"));
+            }
+            _ => unreachable!(),
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
