@@ -3,6 +3,7 @@ use super::traits::{Memory, MemoryCategory, MemoryEntry, is_recent_recall_query}
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -20,7 +21,10 @@ pub struct QdrantMemory {
     base_url: String,
     collection: String,
     api_key: Option<String>,
-    embedder: Arc<dyn EmbeddingProvider>,
+    // Behind an `RwLock` so `config/set` can hot-swap the embedder on a
+    // long-lived handle after a provider-profile change (#8359). Reads snapshot
+    // the `Arc` and drop the guard before any `.await`.
+    embedder: RwLock<Arc<dyn EmbeddingProvider>>,
     /// Tracks whether collection has been initialized (lazy init for sync factory).
     initialized: OnceCell<()>,
 }
@@ -44,7 +48,7 @@ impl QdrantMemory {
 
         // Ensure collection exists with correct schema
         mem.ensure_collection().await?;
-        if mem.embedder.dimensions() > 0 {
+        if mem.embedder.read().dimensions() > 0 {
             mem.migrate_session_ids_to_sanitized().await?;
             zeroclaw_config::schema::v2::migrate_qdrant_collection_to_v3(
                 &mem.client,
@@ -79,9 +83,23 @@ impl QdrantMemory {
             base_url,
             collection: collection.to_string(),
             api_key,
-            embedder,
+            embedder: RwLock::new(embedder),
             initialized: OnceCell::new(),
         }
+    }
+
+    /// Replace the live embedder in place (#8359). Existing `Arc<dyn Memory>`
+    /// holders observe the new embedder on their next embed without the handle
+    /// being rebuilt. Shared by the `refresh_embedder` hook and tests.
+    pub(crate) fn swap_embedder(&self, embedder: Arc<dyn EmbeddingProvider>) {
+        *self.embedder.write() = embedder;
+    }
+
+    /// Dimensions of the currently-installed embedder (0 = Noop / no vectors).
+    /// Cheap read-only diagnostic; lets callers confirm a live embedder refresh
+    /// took effect after a `config/set` provider-profile change (#8359).
+    pub fn embedder_dimensions(&self) -> usize {
+        self.embedder.read().dimensions()
     }
 
     /// Ensure the collection is initialized (called lazily on first operation).
@@ -89,7 +107,7 @@ impl QdrantMemory {
         self.initialized
             .get_or_try_init(|| async {
                 self.ensure_collection().await?;
-                if self.embedder.dimensions() > 0 {
+                if self.embedder.read().dimensions() > 0 {
                     self.migrate_session_ids_to_sanitized().await?;
                     zeroclaw_config::schema::v2::migrate_qdrant_collection_to_v3(
                         &self.client,
@@ -207,7 +225,7 @@ impl QdrantMemory {
     }
 
     async fn ensure_collection(&self) -> Result<()> {
-        let dims = self.embedder.dimensions();
+        let dims = self.embedder.read().dimensions();
         if dims == 0 {
             // Noop embedder — skip vector collection setup
             ::zeroclaw_log::record!(
@@ -550,6 +568,27 @@ impl Memory for QdrantMemory {
         "qdrant"
     }
 
+    fn refresh_embedder(
+        &self,
+        model_provider: &str,
+        api_key: Option<&str>,
+        model: &str,
+        dimensions: usize,
+    ) {
+        // Rebuild from the freshly-resolved settings and swap in place. The
+        // Qdrant collection was created for the old vector dimensions; a
+        // dimension change still needs a manual reindex/collection rebuild, but
+        // the live handle no longer embeds against a stale endpoint/key (#8359).
+        let embedder: Arc<dyn EmbeddingProvider> =
+            Arc::from(super::embeddings::create_embedding_provider(
+                model_provider,
+                api_key,
+                model,
+                dimensions,
+            ));
+        self.swap_embedder(embedder);
+    }
+
     async fn store(
         &self,
         key: &str,
@@ -584,7 +623,8 @@ impl Memory for QdrantMemory {
         self.ensure_initialized().await?;
 
         // Generate embedding for the query
-        let embedding = self.embedder.embed_one(query).await?;
+        let embedder = self.embedder.read().clone();
+        let embedding = embedder.embed_one(query).await?;
 
         if embedding.is_empty() {
             // Fallback to listing if embeddings aren't available
@@ -911,7 +951,8 @@ impl Memory for QdrantMemory {
         self.ensure_initialized().await?;
 
         let combined_text = format!("{}\n{}", key, content);
-        let embedding = self.embedder.embed_one(&combined_text).await?;
+        let embedder = self.embedder.read().clone();
+        let embedding = embedder.embed_one(&combined_text).await?;
         if embedding.is_empty() {
             anyhow::bail!("Qdrant requires non-zero dimensional embeddings");
         }
@@ -1003,7 +1044,8 @@ impl Memory for QdrantMemory {
 
         self.ensure_initialized().await?;
 
-        let embedding = self.embedder.embed_one(query).await?;
+        let embedder = self.embedder.read().clone();
+        let embedding = embedder.embed_one(query).await?;
         if embedding.is_empty() {
             // No embedding available: fall back to listing under the
             // allowlist. Same surface as `recall`'s fallback.
@@ -1109,6 +1151,35 @@ impl ::zeroclaw_api::attribution::Attributable for QdrantMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Qdrant must also honor `Memory::refresh_embedder` (#8359) — before this
+    /// it inherited the default no-op and kept a stale embedder. Uses the lazy
+    /// constructor so no live Qdrant server is required.
+    #[test]
+    fn refresh_embedder_swaps_embedder_in_place() {
+        let mem = QdrantMemory::new_lazy(
+            "test",
+            "http://localhost:6333",
+            "mem",
+            None,
+            Arc::new(super::super::embeddings::NoopEmbedding), // dims 0
+        );
+        assert_eq!(mem.embedder_dimensions(), 0);
+
+        Memory::refresh_embedder(
+            &mem,
+            "openai",
+            Some("sk-test"),
+            "text-embedding-3-small",
+            1536,
+        );
+
+        assert_eq!(
+            mem.embedder_dimensions(),
+            1536,
+            "refresh_embedder must install the resolved provider's embedder"
+        );
+    }
 
     #[test]
     fn category_to_str_maps_known_categories() {
