@@ -322,6 +322,11 @@
       - any-glob-to-any-file:
           - "crates/zeroclaw-runtime/src/security/docker.rs"
 
+"security:leak-detector":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-runtime/src/security/leak_detector.rs"
+
 "security:pairing":
   - changed-files:
       - any-glob-to-any-file:
@@ -341,6 +346,11 @@
       - any-glob-to-any-file:
           - "crates/zeroclaw-runtime/src/security/secrets.rs"
           - "crates/zeroclaw-config/src/secrets.rs"
+
+"security:traits":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-runtime/src/security/traits.rs"
 
 "runtime":
   - changed-files:
@@ -449,6 +459,11 @@
   - changed-files:
       - any-glob-to-any-file:
           - "crates/zeroclaw-providers/src/reliable.rs"
+
+"provider:router":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-providers/src/router.rs"
 
 "provider:telnyx":
   - changed-files:

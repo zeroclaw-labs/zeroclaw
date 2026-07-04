@@ -910,6 +910,7 @@ impl WhatsAppWebChannel {
                 subject: None,
                 internal_sop_event: None,
                 passive_context,
+                explicitly_addressed: false,
                 conversation_scope,
             })
             .await
