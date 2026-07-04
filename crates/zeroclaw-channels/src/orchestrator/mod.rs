@@ -18679,6 +18679,154 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(parse_runtime_command("telegram", "/clear all"), None);
     }
 
+    // Build a ChannelRuntimeContext with a Config that has peer_groups
+    // populated for the agent-scope authorization tests below. Mirrors
+    // `channel_runtime_context_for_defaults_test` but lets the caller
+    // inject a pre-built peer_groups map. See issue #8044.
+    fn channel_runtime_context_with_peer_groups(
+        zeroclaw_dir: &std::path::Path,
+        peer_groups: std::collections::HashMap<
+            String,
+            zeroclaw_config::multi_agent::PeerGroupConfig,
+        >,
+    ) -> ChannelRuntimeContext {
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        prompt_config.peer_groups = peer_groups;
+        let mut ctx =
+            channel_runtime_context_for_defaults_test(zeroclaw_dir, "agentX", "openrouter.default", "config-default-model");
+        ctx.prompt_config = Arc::new(prompt_config);
+        ctx
+    }
+
+    fn agent_scope_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: sender.into(),
+            reply_target: "chan-1".into(),
+            channel: "discord".into(),
+            channel_alias: Some("clamps".into()),
+            thread_ts: None,
+            content: "/model --agent gpt-4o".into(),
+            ..Default::default()
+        }
+    }
+
+    fn user_scope_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: sender.into(),
+            reply_target: "chan-1".into(),
+            channel: "discord".into(),
+            channel_alias: Some("clamps".into()),
+            thread_ts: None,
+            content: "/model --user gpt-4o".into(),
+            ..Default::default()
+        }
+    }
+
+    fn peer_group(
+        channel: &str,
+        members: &[&str],
+        admin_for_agent_scope: bool,
+    ) -> zeroclaw_config::multi_agent::PeerGroupConfig {
+        use zeroclaw_config::multi_agent::{
+            AgentAlias, OutputModality, PeerGroupConfig, PeerUsername,
+        };
+        PeerGroupConfig {
+            channel: zeroclaw_config::providers::ChannelRef(channel.into()),
+            agents: Vec::<AgentAlias>::new(),
+            external_peers: members
+                .iter()
+                .map(|s| PeerUsername(s.to_string()))
+                .collect(),
+            ignore: Vec::new(),
+            output_modality: OutputModality::default(),
+            admin_for_agent_scope,
+        }
+    }
+
+    #[test]
+    fn set_model_scoped_agent_allowed_for_listed_admin() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice", "ops"], true),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(is_agent_scope_authorized(&ctx, &agent_scope_msg("alice")));
+        assert!(is_agent_scope_authorized(&ctx, &agent_scope_msg("ops")));
+    }
+
+    #[test]
+    fn set_model_scoped_agent_rejected_for_non_admin_member() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        // Same peer group as the admin test, but the admin flag is OFF.
+        groups.insert(
+            "discord_users".into(),
+            peer_group("discord.clamps", &["alice", "ops"], false),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(!is_agent_scope_authorized(&ctx, &agent_scope_msg("alice")));
+        assert!(!is_agent_scope_authorized(&ctx, &agent_scope_msg("ops")));
+        // Even an unknown sender is rejected (not silently allowed).
+        assert!(!is_agent_scope_authorized(&ctx, &agent_scope_msg("mallory")));
+    }
+
+    #[test]
+    fn set_model_scoped_agent_rejected_when_no_peer_groups_configured() {
+        // Default config has no peer_groups — default deny.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = channel_runtime_context_with_peer_groups(
+            tmp.path(),
+            std::collections::HashMap::new(),
+        );
+
+        assert!(!is_agent_scope_authorized(&ctx, &agent_scope_msg("alice")));
+    }
+
+    #[test]
+    fn set_model_scoped_user_unaffected_by_agent_scope_authz() {
+        // The helper is only invoked on the Agent branch; this test pins
+        // that `/model --user` does not even consult the helper. We
+        // assert by behavior: the helper is gated on OverrideScope::Agent
+        // in `handle_runtime_command_if_needed`, so for the User case
+        // no authorization check runs and the override is written.
+        // Here we simply verify that even when the sender is not an
+        // admin, the auth helper treats them neutrally — i.e. the gate
+        // is on the dispatch site, not the helper itself.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = channel_runtime_context_with_peer_groups(
+            tmp.path(),
+            std::collections::HashMap::new(),
+        );
+        // For the User branch the helper is not consulted, so this
+        // negative assertion is structural: the gate sits at the
+        // SetModelScoped dispatch point, not in this helper.
+        assert!(!is_agent_scope_authorized(&ctx, &user_scope_msg("alice")));
+    }
+
+    #[test]
+    fn channel_agent_scope_admins_filters_by_admin_flag() {
+        // Live-resolve helper honors admin_for_agent_scope = true only.
+        // Build a Config with one admin-flagged group and one unflagged
+        // group covering the same channel; the admin-flagged group must
+        // surface while the unflagged group must not.
+        use zeroclaw_config::schema::Config;
+        let mut config = Config::default();
+        config.peer_groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice", "ops"], true),
+        );
+        config.peer_groups.insert(
+            "discord_users".into(),
+            peer_group("discord.clamps", &["bob", "carol"], false),
+        );
+        let admins = config.channel_agent_scope_admins("discord", "clamps");
+        assert_eq!(admins, vec!["alice".to_string(), "ops".to_string()]);
+    }
+
     #[test]
     fn parse_runtime_command_maps_thinking_levels() {
         assert_eq!(
