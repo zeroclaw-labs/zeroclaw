@@ -359,6 +359,7 @@ impl Observer for OtelObserver {
                 num_entries,
                 backend,
                 success,
+                ..
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
@@ -414,6 +415,7 @@ impl Observer for OtelObserver {
                 duration,
                 num_chunks,
                 num_boards,
+                ..
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
@@ -458,6 +460,7 @@ impl Observer for OtelObserver {
                 backend,
                 duration,
                 success,
+                ..
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
@@ -1066,6 +1069,9 @@ mod tests {
             num_entries: 7,
             backend: "sqlite".into(),
             success: true,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         // MemoryRecall failure path with query_summary: None.
         obs.record_event(&ObserverEvent::MemoryRecall {
@@ -1074,6 +1080,9 @@ mod tests {
             num_entries: 0,
             backend: "qdrant".into(),
             success: false,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         // RagRetrieve with populated query_summary.
@@ -1082,6 +1091,9 @@ mod tests {
             duration: Duration::from_millis(120),
             num_chunks: 12,
             num_boards: 3,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         // RagRetrieve with query_summary: None.
         obs.record_event(&ObserverEvent::RagRetrieve {
@@ -1089,6 +1101,9 @@ mod tests {
             duration: Duration::ZERO,
             num_chunks: 0,
             num_boards: 0,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         // MemoryStore success path.
@@ -1097,6 +1112,9 @@ mod tests {
             backend: "sqlite".into(),
             duration: Duration::from_millis(8),
             success: true,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         // MemoryStore failure path.
         obs.record_event(&ObserverEvent::MemoryStore {
@@ -1104,6 +1122,9 @@ mod tests {
             backend: "qdrant".into(),
             duration: Duration::from_millis(3),
             success: false,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
     }
 

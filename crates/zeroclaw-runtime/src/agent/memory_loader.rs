@@ -74,6 +74,9 @@ impl MemoryLoader for DefaultMemoryLoader {
                     num_entries: entries.len(),
                     backend,
                     success: true,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 });
                 entries
             }
@@ -84,6 +87,9 @@ impl MemoryLoader for DefaultMemoryLoader {
                     num_entries: 0,
                     backend,
                     success: false,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 });
                 return Err(e);
             }

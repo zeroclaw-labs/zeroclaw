@@ -142,6 +142,7 @@ impl Observer for LogObserver {
                 backend,
                 duration,
                 success,
+                ..
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 ::zeroclaw_log::record!(

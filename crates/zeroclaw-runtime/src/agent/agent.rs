@@ -1107,6 +1107,9 @@ impl Agent {
                 backend: self.memory.name().to_string(),
                 duration: store_start.elapsed(),
                 success: store_result.is_ok(),
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
             });
         }
 
@@ -2302,6 +2305,9 @@ impl Agent {
                 backend: self.memory.name().to_string(),
                 duration: store_start.elapsed(),
                 success: store_result.is_ok(),
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
             });
         }
 

@@ -811,6 +811,9 @@ async fn build_context(
                 num_entries: entries.len(),
                 backend,
                 success: true,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
             });
 
             // Apply time decay: older non-Core memories score lower
@@ -875,6 +878,9 @@ async fn build_context(
                 num_entries: 0,
                 backend,
                 success: false,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
             });
             // Preserve original swallow behavior — recall errors are not
             // propagated; an empty context string is returned.
@@ -913,6 +919,9 @@ fn build_hardware_context(
         duration,
         num_chunks: chunks.len(),
         num_boards: boards.len(),
+        channel: None,
+        agent_alias: None,
+        turn_id: None,
     });
 
     if chunks.is_empty() && pin_ctx.is_empty() {
@@ -2062,6 +2071,9 @@ pub async fn run(
                     backend: mem.name().to_string(),
                     duration: store_start.elapsed(),
                     success: store_result.is_ok(),
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 });
             }
 
@@ -2560,6 +2572,9 @@ pub async fn run(
                         backend: mem.name().to_string(),
                         duration: store_start.elapsed(),
                         success: store_result.is_ok(),
+                        channel: None,
+                        agent_alias: None,
+                        turn_id: None,
                     });
                 }
 
