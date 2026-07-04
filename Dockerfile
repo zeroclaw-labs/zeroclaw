@@ -142,6 +142,10 @@ RUN rm -rf src benches crates xtask tools/fill-translations
 COPY src/ src/
 COPY benches/ benches/
 COPY crates/ crates/
+# zeroclaw-plugins embeds the WIT interface definitions at compile time via a
+# path relative to the crate (../../wit/v0); the plugins-wasm build fails to read
+# them unless the wit tree is present in the image context.
+COPY wit/ wit/
 COPY xtask/ xtask/
 COPY tools/fill-translations/ tools/fill-translations/
 # apps/zerocode ships in the image; copy its real source. Its build.rs reads the
