@@ -9,6 +9,8 @@ relates-to:
   - crates/zeroclaw-api/src/tool.rs
   - crates/zeroclaw-api/src/memory_traits.rs
   - crates/zeroclaw-api/src/observability_traits.rs
+  - crates/zeroclaw-api/src/runtime_traits.rs
+  - crates/zeroclaw-api/src/peripherals_traits.rs
   - docs/book/src/developing/first-party-extensions.md
 ---
 
@@ -18,6 +20,11 @@ This is a retroactive record of a decision made before the formal ADR
 process. The exact original decision date is not available in this
 record; the date above is the date this ADR was added to the
 architecture docs.
+
+This record was drafted from
+[FND-002 §6.3](../../foundations/fnd-002-documentation-standards.md#63-retroactive-adrs),
+the current `zeroclaw-api` trait surfaces, and the first-party extension
+docs. It was not recovered from an older ADR file.
 
 ## Context
 
@@ -42,8 +49,8 @@ implementations.
 ## Decision
 
 First-party extension families use explicit Rust trait contracts in
-`zeroclaw-api` and are registered through their existing factory or
-composition boundaries.
+`zeroclaw-api` and are wired through the existing factory, registry,
+composition, or host-provided boundary for that surface.
 
 The primary contracts include:
 
@@ -55,10 +62,11 @@ The primary contracts include:
 - `RuntimeAdapter` for host-runtime capabilities;
 - `Peripheral` for hardware and board surfaces.
 
-Shared behavior belongs at the trait, factory, policy, config, logging,
-or lower-layer helper boundary when multiple implementations need it.
-An individual integration should not patch the runtime loop or add
-parallel state only to make one provider, channel, tool, or backend work.
+Shared behavior belongs at the trait, factory, registry, policy, config,
+logging, or lower-layer helper boundary when multiple implementations
+need it. An individual integration should not patch the runtime loop or
+add parallel state only to make one provider, channel, tool, or backend
+work.
 
 This ADR covers first-party in-process extension surfaces. It does not
 replace the plugin, WIT, MCP, or skill-package boundaries for
@@ -72,8 +80,9 @@ Positive consequences:
   contract instead of as bespoke runtime changes.
 - Runtime code can stay focused on orchestration, policy, state, and
   lifecycle rather than vendor-specific behavior.
-- Tests can target factory registration, trait behavior, and edge cases
-  without needing a full end-to-end runtime for every integration.
+- Tests can target factory, registry, or host-boundary wiring, trait
+  behavior, and edge cases without needing a full end-to-end runtime for
+  every integration.
 - Documentation and review guidance can name concrete extension surfaces
   before implementation starts.
 

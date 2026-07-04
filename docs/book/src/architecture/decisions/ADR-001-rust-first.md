@@ -16,11 +16,17 @@ process. The exact original decision date is not available in this
 record; the date above is the date this ADR was added to the
 architecture docs.
 
+This record was drafted from
+[FND-002 §6.3](../../foundations/fnd-002-documentation-standards.md#63-retroactive-adrs)
+and the current repository structure. It was not recovered from an
+older ADR file.
+
 ## Context
 
-ZeroClaw is a local-first agent runtime that needs to run as a single
-binary, integrate with many operating-system and network boundaries,
-and keep strong control over security, memory, process, logging, and
+ZeroClaw is a local-first agent runtime whose primary distribution
+needs to run without a required language runtime installed by the user.
+It integrates with many operating-system and network boundaries, and it
+keeps strong control over security, memory, process, logging, and
 configuration behavior.
 
 The project also has adjacent agent-system experiments in other
@@ -42,16 +48,17 @@ Rust fits the requirements that shape the runtime:
 
 ## Decision
 
-ZeroClaw's runtime, first-party crates, CLI, gateway, tooling host,
+ZeroClaw's runtime, first-party crates, CLI, gateway, tooling hosts,
 provider integrations, channel integrations, memory backends, config
 schema, and hardware support are implemented as Rust workspace
 members.
 
 Non-Rust code may exist at the edges when it is the correct boundary:
-documentation tooling, shell scripts, packaging metadata, generated web
-assets, external CLIs, MCP servers, skill scripts, and plugin guests. It
-does not become the implementation base for the core runtime unless a
-new accepted ADR supersedes this one.
+shell scripts, release and packaging helpers, generated web assets,
+external CLIs, MCP servers, skill scripts, and plugin guests. These
+surfaces may support, package, drive, or extend ZeroClaw, but they do not
+become the implementation base for the core runtime unless a new
+accepted ADR supersedes this one.
 
 ## Consequences
 
@@ -59,8 +66,8 @@ Positive consequences:
 
 - Contributors can reason about runtime behavior through one typed
   workspace rather than several language runtimes.
-- Build, lint, test, docs generation, release, and feature gating all
-  route through Cargo.
+- Build, lint, test, docs generation, release, and feature gating for
+  the primary workspace all route through Cargo.
 - Security-sensitive code benefits from Rust's ownership model and
   explicit error propagation.
 - First-party integrations share crate boundaries, trait contracts, and
