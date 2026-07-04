@@ -1660,6 +1660,24 @@ pub async fn run(
                 // deferred and eager branches, so the deferred-path reassignment
                 // of `deferred_section` does not clobber them.
                 append_pinned_mcp_section(&mut deferred_section, &pinned_section);
+            } else {
+                // No shared `McpRegistry` and no per-call `connect_all`
+                // result (MCP disabled, no servers granted, or the
+                // `connect_all` itself failed — that error path is
+                // already logged inside the `else` arm of the
+                // `let registry = ...` expression above). The agent
+                // simply continues without MCP capability tools and
+                // without pinned MCP resources; no need to touch
+                // any of the eager-path counters here.
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(
+                        module_path!(),
+                        ::zeroclaw_log::Action::Note
+                    )
+                    .with_category(::zeroclaw_log::EventCategory::Tool),
+                    "MCP client: no registry available; continuing without MCP tools"
+                );
             }
         }
 
