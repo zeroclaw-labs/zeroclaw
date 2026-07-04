@@ -1130,6 +1130,23 @@ impl Agent {
         self.temperature = temperature;
     }
 
+    /// Refresh this agent's memory embedder after a provider-profile
+    /// `config/set`/`config/delete`, so a live session's per-agent memory stops
+    /// embedding against a stale endpoint/key without a daemon restart (#8359).
+    /// Forwards through any memory wrappers (e.g. `AgentScopedMemory`) to the
+    /// embedding backend; a no-op for backends that do not embed. `&self` —
+    /// the swap is interior to the memory handle.
+    pub fn refresh_memory_embedder(
+        &self,
+        model_provider: &str,
+        api_key: Option<&str>,
+        model: &str,
+        dimensions: usize,
+    ) {
+        self.memory
+            .refresh_embedder(model_provider, api_key, model, dimensions);
+    }
+
     #[cfg(test)]
     pub fn temperature_for_test(&self) -> Option<f64> {
         self.temperature
