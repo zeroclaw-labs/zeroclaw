@@ -44,6 +44,9 @@ pub mod telnyx;
 pub mod traits;
 
 pub use dispatch::{ProviderDispatch, ProviderDispatchRef};
+
+mod request_payload;
+
 #[allow(unused_imports)]
 pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, ModelProvider,
