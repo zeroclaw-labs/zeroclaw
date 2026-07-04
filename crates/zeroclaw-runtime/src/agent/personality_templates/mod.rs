@@ -29,6 +29,39 @@ const MEMORY: &str = include_str!("MEMORY.md");
 const AGENTS: &str = include_str!("AGENTS.md");
 const AGENTS_NO_MEMORY: &str = include_str!("AGENTS.no-memory.md");
 
+/// How a registry entry's body is resolved against the render context, so the
+/// memory-dependent files are data rather than special-cased control flow.
+enum Body {
+    /// One fixed template regardless of context.
+    Fixed(&'static str),
+    /// Memory on vs off selects between two templates.
+    MemoryVariant {
+        with_memory: &'static str,
+        without_memory: &'static str,
+    },
+    /// Rendered only when memory is enabled; otherwise the file is skipped.
+    MemoryGated(&'static str),
+}
+
+/// The canonical personality-template table. `render` walks this; nothing
+/// shadow-enumerates the file set with a literal match, so a new entry here is
+/// the only edit needed to add a template.
+const TEMPLATE_REGISTRY: &[(&str, Body)] = &[
+    ("IDENTITY.md", Body::Fixed(IDENTITY)),
+    ("SOUL.md", Body::Fixed(SOUL)),
+    ("USER.md", Body::Fixed(USER)),
+    ("HEARTBEAT.md", Body::Fixed(HEARTBEAT)),
+    ("TOOLS.md", Body::Fixed(TOOLS)),
+    (
+        "AGENTS.md",
+        Body::MemoryVariant {
+            with_memory: AGENTS,
+            without_memory: AGENTS_NO_MEMORY,
+        },
+    ),
+    ("MEMORY.md", Body::MemoryGated(MEMORY)),
+];
+
 /// Per-render context — substituted into the templates' placeholders.
 /// Values default to neutral placeholders the user can edit in-place
 /// once the template is loaded into the editor.
@@ -75,21 +108,28 @@ fn substitute(template: &str, ctx: &TemplateContext) -> String {
 /// generation directly during workspace scaffolding.
 #[must_use]
 pub fn render(filename: &str, ctx: &TemplateContext) -> Option<String> {
-    let raw = match filename {
-        "IDENTITY.md" => IDENTITY,
-        "SOUL.md" => SOUL,
-        "USER.md" => USER,
-        "HEARTBEAT.md" => HEARTBEAT,
-        "TOOLS.md" => TOOLS,
-        "AGENTS.md" => {
+    let entry = TEMPLATE_REGISTRY
+        .iter()
+        .find(|(name, _)| *name == filename)?;
+    let raw = match &entry.1 {
+        Body::Fixed(template) => template,
+        Body::MemoryVariant {
+            with_memory,
+            without_memory,
+        } => {
             if ctx.include_memory {
-                AGENTS
+                with_memory
             } else {
-                AGENTS_NO_MEMORY
+                without_memory
             }
         }
-        "MEMORY.md" if ctx.include_memory => MEMORY,
-        _ => return None,
+        Body::MemoryGated(template) => {
+            if ctx.include_memory {
+                template
+            } else {
+                return None;
+            }
+        }
     };
     Some(substitute(raw, ctx))
 }

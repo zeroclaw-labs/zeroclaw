@@ -31,7 +31,9 @@ pub enum AutonomyLevel {
 }
 
 /// Delegation mode for a risk profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum DelegationMode {
@@ -40,10 +42,6 @@ pub enum DelegationMode {
     Forbidden,
     /// Delegation permitted to the agents named in the allow-list.
     Allow,
-}
-
-impl crate::config::HasPropKind for DelegationMode {
-    const PROP_KIND: crate::config::PropKind = crate::config::PropKind::Enum;
 }
 
 /// Whether a risk profile may delegate work to other agents.
@@ -74,7 +72,9 @@ impl DelegationPolicy {
 }
 
 /// What to do when a configured approver cannot be reached. Default FAIL-CLOSED.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum OnNoApprover {
@@ -83,10 +83,6 @@ pub enum OnNoApprover {
     Deny,
     /// Explicit opt-in: fall back to the originating channel (today's behavior).
     InheritOriginator,
-}
-
-impl crate::config::HasPropKind for OnNoApprover {
-    const PROP_KIND: crate::config::PropKind = crate::config::PropKind::Enum;
 }
 
 fn default_approval_timeout_secs() -> u64 {

@@ -1188,6 +1188,16 @@ impl Agent {
         self.tools.iter().map(|t| t.name()).collect()
     }
 
+    /// Strip every tool from this agent, turning it into a pure
+    /// conversationalist. Onboarding guide agents use this: their whole job
+    /// is translating operator intent into typed field values, and any tool
+    /// access (shell, ask_user, file writes) is surface they must not have.
+    /// The system prompt is built per turn from the live tool registry, so a
+    /// disarmed agent also stops advertising tool protocols to the model.
+    pub fn disarm_tools(&mut self) {
+        self.tools.clear();
+    }
+
     /// Render the current system prompt. Test-only — lets regression tests
     /// assert on prompt-injected sections (e.g. the deferred-MCP-tools section
     /// that advertises `tool_search`) without driving a full turn (#8193).
@@ -4017,6 +4027,43 @@ mod tests {
         assert!(xml_prompt.contains("## Tools"));
         assert!(xml_prompt.contains("echo"));
         assert!(xml_prompt.contains("## Tool Use Protocol"));
+    }
+
+    #[test]
+    fn disarm_tools_empties_registry_and_stops_advertising_tools() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let workspace = tempfile::TempDir::new().expect("temp dir");
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(workspace.path().to_path_buf())
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        assert!(agent.build_system_prompt().unwrap().contains("echo"));
+
+        agent.disarm_tools();
+
+        assert!(agent.tool_names().is_empty(), "registry emptied");
+        let prompt = agent.build_system_prompt().unwrap();
+        assert!(
+            !prompt.contains("echo"),
+            "disarmed agent stops advertising tools to the model"
+        );
     }
 
     mod surface2_tests {

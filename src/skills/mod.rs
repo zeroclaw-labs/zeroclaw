@@ -400,7 +400,7 @@ fn handle_add(
     );
 
     if edit {
-        open_in_editor(
+        zeroclaw_runtime::editor::open_in_editor(
             &skill_dir.join(zeroclaw_runtime::skills::constants::SKILL_MANIFEST_FILENAME),
         )?;
     }
@@ -441,7 +441,7 @@ fn handle_edit(
     if !path.exists() {
         anyhow::bail!("file not found: {}", path.display());
     }
-    open_in_editor(&path)
+    zeroclaw_runtime::editor::open_in_editor(&path)
 }
 
 /// Create a skill bundle: insert the config entry, set a custom directory if
@@ -832,49 +832,5 @@ fn prompt_for_description(description: Option<String>) -> Result<String> {
         Ok(prompt)
     } else {
         anyhow::bail!("--description is required when stdin is not a TTY");
-    }
-}
-
-fn open_in_editor(path: &std::path::Path) -> Result<()> {
-    let Some(editor) = editor_from_env_or_path() else {
-        anyhow::bail!("no editor found; set VISUAL or EDITOR");
-    };
-    let status = std::process::Command::new(&editor).arg(path).status()?;
-    if !status.success() {
-        anyhow::bail!("{editor} exited with non-zero status");
-    }
-    Ok(())
-}
-
-fn editor_from_env_or_path() -> Option<String> {
-    std::env::var("VISUAL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("EDITOR")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .or_else(|| {
-            fallback_editors()
-                .iter()
-                .copied()
-                .find(|candidate| executable_on_path(candidate))
-                .map(str::to_string)
-        })
-}
-
-fn executable_on_path(name: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
-}
-
-fn fallback_editors() -> &'static [&'static str] {
-    if cfg!(windows) {
-        &["notepad.exe", "nano", "vim"]
-    } else {
-        &["nano", "vi", "vim", "editor"]
     }
 }

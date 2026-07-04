@@ -1234,10 +1234,20 @@ rpc_type! {
 // ══════════════════════════════════════════════════════════════════════
 
 rpc_type! {
+    pub enum ApprovalDecision {
+        AllowOnce,
+        AllowAlways,
+        #[serde(alias = "reject_once")]
+        Reject,
+        RejectWithEdit,
+    }
+}
+
+rpc_type! {
     pub struct SessionApproveParams {
         pub session_id: String,
         pub request_id: String,
-        pub decision: String,
+        pub decision: ApprovalDecision,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub replacement: Option<String>,
     }

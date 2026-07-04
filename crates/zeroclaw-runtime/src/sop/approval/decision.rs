@@ -15,6 +15,30 @@ pub enum ApprovalDecision {
     },
 }
 
+impl ApprovalDecision {
+    /// Parse a flat WebSocket approval frame where `decision` is a bare verb
+    /// (`approve` / `deny`) and `reason` is an optional sibling field. The wire
+    /// shape is flat, not the externally-tagged form serde derives for the enum
+    /// itself, so a flat mirror struct carries the serde rules and this is the
+    /// one place that bridges the frame to the typed decision.
+    #[must_use]
+    pub fn from_ws_frame(frame: &serde_json::Value) -> Option<Self> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case", tag = "decision")]
+        enum WsFrame {
+            Approve,
+            Deny {
+                #[serde(default)]
+                reason: Option<String>,
+            },
+        }
+        match serde_json::from_value::<WsFrame>(frame.clone()).ok()? {
+            WsFrame::Approve => Some(Self::Approve),
+            WsFrame::Deny { reason } => Some(Self::Deny { reason }),
+        }
+    }
+}
+
 /// What `resolve_gate` did. Returned to the caller (tool / CLI / gateway) so it
 /// can report, and so the executor/tick can act on a resumed action.
 #[derive(Debug, Clone)]
@@ -69,6 +93,30 @@ mod tests {
         // Deny without a reason round-trips too.
         let d2: ApprovalDecision = serde_json::from_str(r#"{"deny":{}}"#).unwrap();
         assert_eq!(d2, ApprovalDecision::Deny { reason: None });
+    }
+
+    #[test]
+    fn from_ws_frame_parses_the_flat_approval_shape() {
+        use serde_json::json;
+        assert_eq!(
+            ApprovalDecision::from_ws_frame(&json!({"decision": "approve"})),
+            Some(ApprovalDecision::Approve)
+        );
+        assert_eq!(
+            ApprovalDecision::from_ws_frame(&json!({"decision": "deny", "reason": "nope"})),
+            Some(ApprovalDecision::Deny {
+                reason: Some("nope".to_string())
+            })
+        );
+        assert_eq!(
+            ApprovalDecision::from_ws_frame(&json!({"decision": "deny"})),
+            Some(ApprovalDecision::Deny { reason: None })
+        );
+        assert_eq!(
+            ApprovalDecision::from_ws_frame(&json!({"decision": "garbage"})),
+            None
+        );
+        assert_eq!(ApprovalDecision::from_ws_frame(&json!({})), None);
     }
 
     #[test]

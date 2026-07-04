@@ -105,3 +105,5 @@ target/openapi.json
 /v[0-9]*.toml
 .worktrees/
 .zero-to-5/
+/crates/zeroclaw-onboarding/agents/
+/crates/zeroclaw-onboarding/state/

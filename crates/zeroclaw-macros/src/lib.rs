@@ -2166,34 +2166,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let enum_variants_expr = if is_vec {
             quote! { None::<fn() -> Vec<String>> }
         } else {
-            quote! {
-                {
-                    #[cfg(feature = "schema-export")]
-                    {
-                        if <#inner_ty as crate::config::HasPropKind>::PROP_KIND == crate::config::PropKind::Enum {
-                            Some(|| {
-                                crate::config::enum_variants::<#inner_ty>()
-                                    .split(", ")
-                                    .map(str::to_string)
-                                    // Defensive: the helper returns a placeholder
-                                    // string ("(unknown variants)") when schemars
-                                    // can't enumerate variants for the type. Drop
-                                    // empties and the placeholder so the dashboard
-                                    // form falls back to a text input instead of
-                                    // rendering a one-option dropdown of garbage.
-                                    .filter(|v| !v.is_empty() && v != "(unknown variants)")
-                                    .collect()
-                            })
-                        } else {
-                            None
-                        }
-                    }
-                    #[cfg(not(feature = "schema-export"))]
-                    {
-                        None::<fn() -> Vec<String>>
-                    }
-                }
-            }
+            quote! { <#inner_ty as crate::config::HasPropKind>::ENUM_VARIANTS }
         };
 
         let alias_source_expr = if is_vec {
@@ -2563,17 +2536,94 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 pub fn derive_config_enum(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
-    if !matches!(input.data, Data::Enum(_)) {
+    let Data::Enum(data) = &input.data else {
         return syn::Error::new_spanned(&input, "ConfigEnum can only be derived for enums")
             .to_compile_error()
             .into();
-    }
+    };
+    let rename_all = enum_rename_all(&input.attrs);
+    let wire_names: Vec<String> = data
+        .variants
+        .iter()
+        .map(|variant| variant_wire_name(variant, rename_all.as_deref()))
+        .collect();
     let (impl_g, ty_g, where_g) = input.generics.split_for_impl();
     TokenStream::from(quote! {
         impl #impl_g crate::config::HasPropKind for #name #ty_g #where_g {
             const PROP_KIND: crate::config::PropKind = crate::config::PropKind::Enum;
+            const ENUM_VARIANTS: Option<fn() -> Vec<String>> =
+                Some(<#name #ty_g as crate::config::HasEnumVariants>::variant_wire_names);
+        }
+
+        impl #impl_g crate::config::HasEnumVariants for #name #ty_g #where_g {
+            fn variant_wire_names() -> Vec<String> {
+                vec![ #( #wire_names.to_string() ),* ]
+            }
         }
     })
+}
+
+fn enum_rename_all(attrs: &[syn::Attribute]) -> Option<String> {
+    for attr in attrs {
+        if !attr.path().is_ident("serde") {
+            continue;
+        }
+        let mut found = None;
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename_all") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                found = Some(lit.value());
+            }
+            Ok(())
+        });
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+fn variant_wire_name(variant: &syn::Variant, rename_all: Option<&str>) -> String {
+    for attr in &variant.attrs {
+        if !attr.path().is_ident("serde") {
+            continue;
+        }
+        let mut renamed = None;
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                renamed = Some(lit.value());
+            }
+            Ok(())
+        });
+        if let Some(name) = renamed {
+            return name;
+        }
+    }
+    apply_rename_all(&variant.ident.to_string(), rename_all)
+}
+
+fn apply_rename_all(ident: &str, rename_all: Option<&str>) -> String {
+    match rename_all {
+        Some("lowercase") => ident.to_lowercase(),
+        Some("UPPERCASE") => ident.to_uppercase(),
+        Some("snake_case") => pascal_to_snake(ident),
+        Some("kebab-case") => pascal_to_snake(ident).replace('_', "-"),
+        _ => ident.to_string(),
+    }
+}
+
+fn pascal_to_snake(ident: &str) -> String {
+    let mut out = String::new();
+    for (index, ch) in ident.char_indices() {
+        if ch.is_uppercase() && index != 0 {
+            out.push('_');
+        }
+        out.extend(ch.to_lowercase());
+    }
+    out
 }
 
 fn derive_category(prefix: &str) -> String {
