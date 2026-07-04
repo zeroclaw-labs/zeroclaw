@@ -2022,10 +2022,7 @@ fn is_agent_scope_authorized(
     msg: &zeroclaw_api::channel::ChannelMessage,
 ) -> bool {
     let channel_type = msg.channel.as_str();
-    let channel_alias = msg
-        .channel_alias
-        .as_deref()
-        .unwrap_or_else(|| msg.channel.as_str());
+    let channel_alias = msg.channel_alias.as_deref().unwrap_or(msg.channel.as_str());
     let admins = ctx
         .prompt_config
         .channel_agent_scope_admins(channel_type, channel_alias);
@@ -2837,15 +2834,10 @@ async fn handle_runtime_command_if_needed(
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
                 "Model ID cannot be empty. Use `/model --user|--agent <model-id>`.".to_string()
-            } else if scope == OverrideScope::Agent
-                && !is_agent_scope_authorized(ctx, msg)
-            {
+            } else if scope == OverrideScope::Agent && !is_agent_scope_authorized(ctx, msg) {
                 // Per-sender authorization gate for the `--agent` scope only.
                 // `/model --user` is unaffected. See issue #8044.
-                let channel_alias = msg
-                    .channel_alias
-                    .as_deref()
-                    .unwrap_or_else(|| msg.channel.as_str());
+                let channel_alias = msg.channel_alias.as_deref().unwrap_or(msg.channel.as_str());
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -2876,10 +2868,8 @@ async fn handle_runtime_command_if_needed(
                 apply_model_ref(&mut next, &ctx.model_routes, &model);
                 set_scope_override(ctx, scope, msg, next.clone(), &defaults_snapshot);
                 if scope == OverrideScope::Agent {
-                    let channel_alias = msg
-                        .channel_alias
-                        .as_deref()
-                        .unwrap_or_else(|| msg.channel.as_str());
+                    let channel_alias =
+                        msg.channel_alias.as_deref().unwrap_or(msg.channel.as_str());
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Approve)
@@ -18690,10 +18680,16 @@ BTC is currently around $65,000 based on latest tool output."#
             zeroclaw_config::multi_agent::PeerGroupConfig,
         >,
     ) -> ChannelRuntimeContext {
-        let mut prompt_config = zeroclaw_config::schema::Config::default();
-        prompt_config.peer_groups = peer_groups;
-        let mut ctx =
-            channel_runtime_context_for_defaults_test(zeroclaw_dir, "agentX", "openrouter.default", "config-default-model");
+        let prompt_config = zeroclaw_config::schema::Config {
+            peer_groups,
+            ..Default::default()
+        };
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            zeroclaw_dir,
+            "agentX",
+            "openrouter.default",
+            "config-default-model",
+        );
         ctx.prompt_config = Arc::new(prompt_config);
         ctx
     }
@@ -18771,17 +18767,18 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(!is_agent_scope_authorized(&ctx, &agent_scope_msg("alice")));
         assert!(!is_agent_scope_authorized(&ctx, &agent_scope_msg("ops")));
         // Even an unknown sender is rejected (not silently allowed).
-        assert!(!is_agent_scope_authorized(&ctx, &agent_scope_msg("mallory")));
+        assert!(!is_agent_scope_authorized(
+            &ctx,
+            &agent_scope_msg("mallory")
+        ));
     }
 
     #[test]
     fn set_model_scoped_agent_rejected_when_no_peer_groups_configured() {
         // Default config has no peer_groups — default deny.
         let tmp = tempfile::TempDir::new().unwrap();
-        let ctx = channel_runtime_context_with_peer_groups(
-            tmp.path(),
-            std::collections::HashMap::new(),
-        );
+        let ctx =
+            channel_runtime_context_with_peer_groups(tmp.path(), std::collections::HashMap::new());
 
         assert!(!is_agent_scope_authorized(&ctx, &agent_scope_msg("alice")));
     }
@@ -18797,10 +18794,8 @@ BTC is currently around $65,000 based on latest tool output."#
         // admin, the auth helper treats them neutrally — i.e. the gate
         // is on the dispatch site, not the helper itself.
         let tmp = tempfile::TempDir::new().unwrap();
-        let ctx = channel_runtime_context_with_peer_groups(
-            tmp.path(),
-            std::collections::HashMap::new(),
-        );
+        let ctx =
+            channel_runtime_context_with_peer_groups(tmp.path(), std::collections::HashMap::new());
         // For the User branch the helper is not consulted, so this
         // negative assertion is structural: the gate sits at the
         // SetModelScoped dispatch point, not in this helper.

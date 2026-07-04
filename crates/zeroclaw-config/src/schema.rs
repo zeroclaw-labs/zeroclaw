@@ -17086,14 +17086,9 @@ impl Config {
     /// `admin_for_agent_scope = true`. Returns deduped and sorted.
     /// Live-resolve, no cache — operator edits take effect on next
     /// command. See issue #8044.
-    pub fn channel_agent_scope_admins(
-        &self,
-        channel_type: &str,
-        alias: &str,
-    ) -> Vec<String> {
+    pub fn channel_agent_scope_admins(&self, channel_type: &str, alias: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        let mut seen: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for group in self.peer_groups.values() {
             if !group.admin_for_agent_scope {
                 continue;
