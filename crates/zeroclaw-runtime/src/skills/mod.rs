@@ -3903,8 +3903,54 @@ description = "fine"
         ));
     }
 
-    /// Behavioral assertion for the open-skills swallow-site fix.
-    /// Same shape as the workspace test above; covers `load_open_skills_from_directory`.
+    /// #7861: a workspace skill bundling a shell script under the secure
+    /// default (`allow_scripts = false`) is dropped as an audit finding whose
+    /// summary carries the scripts-blocked marker, and is absent from the
+    /// loaded set. Flipping `allow_scripts = true` loads it and empties the
+    /// dropped set. This is what `zeroclaw skills list` surfaces as "Skipped".
+    #[test]
+    fn workspace_script_bundling_skill_reported_as_scripts_blocked_drop() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        let script_dir = skills_dir.join("script-skill");
+        std::fs::create_dir_all(&script_dir).unwrap();
+        std::fs::write(
+            script_dir.join("SKILL.md"),
+            "---\nname: script-skill\ndescription: bundles a shell helper\n---\n# Script Skill\n",
+        )
+        .unwrap();
+        std::fs::write(script_dir.join("helper.sh"), "echo hi\n").unwrap();
+
+        let (skills, dropped) = load_skills_from_directory(&skills_dir, false);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !names.contains(&"script-skill"),
+            "script-bundling skill must be dropped at the secure default; got: {names:?}"
+        );
+        assert_eq!(dropped.len(), 1, "the script skill must be reported");
+        assert_eq!(dropped[0].origin_hint, "workspace");
+        match &dropped[0].reason {
+            SkillDropReason::AuditFindings(summary) => assert!(
+                summary.contains("script-like files are blocked"),
+                "reason must mark scripts as the blocker; got: {summary}"
+            ),
+            other => panic!("expected AuditFindings, got: {other:?}"),
+        }
+
+        let (skills, dropped) = load_skills_from_directory(&skills_dir, true);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"script-skill"),
+            "script-bundling skill must load once allow_scripts=true; got: {names:?}"
+        );
+        assert!(
+            dropped.is_empty(),
+            "no drops expected with allow_scripts=true; got: {dropped:?}"
+        );
+    }
     #[test]
     fn open_skills_swallow_site_skips_invalid_toml_without_panicking() {
         use tempfile::TempDir;
