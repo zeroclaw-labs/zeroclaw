@@ -17,10 +17,12 @@ use zeroclaw_runtime::inkbox_onboarding as ob;
 
 const DEFAULT_BASE_URL: &str = "https://inkbox.ai";
 
-/// What a resolve flow returns: `(api_key, handle, phone, did_provision)` — the
-/// channel key, the bound identity handle, its phone number (if any), and
-/// whether we just provisioned that number this run (gates the SMS opt-in poll).
-type ResolvedIdentity = (String, String, Option<String>, bool);
+/// What a resolve flow returns: `(api_key, handle, existing_phone)` — the key
+/// the channel stores, the bound identity handle, and the identity's existing
+/// phone number if it already has one. Phone provisioning is decoupled from
+/// these flows: a fresh identity has no number here; the dedicated-number step
+/// (offered after iMessage) mints one.
+type ResolvedIdentity = (String, String, Option<String>);
 
 /// Run the Inkbox channel wizard.
 ///
@@ -53,10 +55,11 @@ pub(crate) fn run() -> anyhow::Result<Option<(String, BTreeMap<String, String>)>
         return Ok(None);
     };
 
-    // Resolve the identity by signup or pasted key. Each flow owns its own
-    // phone question and reports back the resolved number plus whether it was
-    // *just* provisioned this run.
-    let Some((api_key, handle, phone_number, did_provision)) = (if has_key {
+    // Resolve the identity by signup or pasted key. Phone provisioning is
+    // decoupled from these flows: a fresh identity starts with no number, and
+    // the dedicated-number step runs later (after iMessage). Each flow reports
+    // the identity's existing number, if any.
+    let Some((api_key, handle, existing_phone)) = (if has_key {
         api_key_flow(&base_url)?
     } else {
         signup_flow(&base_url)?
@@ -71,15 +74,29 @@ pub(crate) fn run() -> anyhow::Result<Option<(String, BTreeMap<String, String>)>
         fields.insert("base_url".into(), base_url.clone());
     }
 
-    // Order: SMS opt-in (only when we just provisioned — a pre-existing
-    // number is assumed already opted in) → realtime → iMessage → signing key.
+    // Channels in the order operators should think about them: connect over
+    // iMessage FIRST (no number to provision — you reach the agent through the
+    // shared Inkbox iMessage router), THEN offer a dedicated phone number for
+    // SMS + voice. This ordering holds across every entry path.
+    let imessage_on = setup_imessage(&base_url, &api_key, &handle)?;
+
+    let (phone_number, did_provision) =
+        offer_dedicated_number(&base_url, &api_key, &handle, existing_phone)?;
+
+    // SMS opt-in only when we just provisioned — a pre-existing number is
+    // assumed already opted in.
     if did_provision {
         if let Some(number) = phone_number.as_deref() {
             sms_opt_in(&base_url, &api_key, &handle, number)?;
         }
     }
-    setup_realtime(&mut fields)?;
-    setup_imessage(&base_url, &api_key, &handle)?;
+
+    // Calls can arrive over the dedicated number OR the shared iMessage line,
+    // so offer realtime whenever either exists.
+    if phone_number.is_some() || imessage_on {
+        setup_realtime(&mut fields)?;
+    }
+
     setup_signing_key(&base_url, &api_key, &mut fields)?;
 
     let alias = match prompt_alias()? {
@@ -99,8 +116,10 @@ pub(crate) fn run() -> anyhow::Result<Option<(String, BTreeMap<String, String>)>
     Ok(Some((alias, fields)))
 }
 
-/// Offer to provision a local number when the identity has none: stay silent
-/// and provision nothing if it already has one.
+/// Standalone "dedicated phone number" step, run AFTER iMessage so the wizard
+/// walks channels in a natural order: connect over iMessage first, then add a
+/// dedicated number. Says so (instead of silently skipping) when the identity
+/// already has a number.
 ///
 /// # Arguments
 /// * `base_url` - Inkbox API base URL.
@@ -110,39 +129,54 @@ pub(crate) fn run() -> anyhow::Result<Option<(String, BTreeMap<String, String>)>
 ///
 /// # Returns
 /// `(phone, did_provision)` — the number to use (existing or freshly minted)
-/// and whether this call provisioned it (gates the SMS opt-in poll).
-fn offer_phone_for_existing(
+/// and whether this call provisioned it (arms the SMS opt-in poll).
+fn offer_dedicated_number(
     base_url: &str,
     api_key: &str,
     handle: &str,
     current: Option<String>,
 ) -> anyhow::Result<(Option<String>, bool)> {
-    // Already has one — say nothing and move on.
-    if current.is_some() {
-        return Ok((current, false));
-    }
     println!(
         "\n  {}",
         crate::t(
-            "cli-quickstart-inkbox-no-phone",
-            "This agent has no phone number attached.",
+            "cli-quickstart-inkbox-dedicated-header",
+            "--- Dedicated phone number ---",
         )
     );
+    // Already has one — say so instead of silently skipping.
+    if let Some(number) = current {
+        println!(
+            "  {} {}",
+            crate::t(
+                "cli-quickstart-inkbox-dedicated-already",
+                "✓ Already provisioned:",
+            ),
+            number
+        );
+        return Ok((Some(number), false));
+    }
     println!(
         "  {}",
         crate::t(
-            "cli-quickstart-inkbox-phone-unlocks",
-            "A local US number unlocks SMS and voice for this agent.",
+            "cli-quickstart-inkbox-dedicated-explain",
+            "A local US number gives this agent its own line for SMS and voice.",
         )
     );
     if confirm(
         &crate::t(
-            "cli-quickstart-inkbox-provision-now",
-            "Provision a local phone number now?",
+            "cli-quickstart-inkbox-dedicated-provision",
+            "Provision a dedicated phone number now?",
         ),
         true,
     )? != Some(true)
     {
+        println!(
+            "  {}",
+            crate::t(
+                "cli-quickstart-inkbox-dedicated-skip",
+                "Skipped. Rerun setup anytime to add a number.",
+            )
+        );
         return Ok((None, false));
     }
     match ob::provision_phone(base_url, api_key, handle) {
@@ -154,12 +188,28 @@ fn offer_phone_for_existing(
             );
             Ok((Some(number), true))
         }
+        // Graceful fallback — most rejections here are plan gating. Point at
+        // pricing and keep the wizard moving; nothing downstream needs a number.
         Err(err) => {
-            eprintln!(
-                "  {} {}",
+            println!(
+                "  {}",
                 crate::t(
-                    "cli-quickstart-inkbox-provision-failed",
-                    "could not provision a number:",
+                    "cli-quickstart-inkbox-dedicated-pricing1",
+                    "Dedicated phone numbers are available on Inkbox paid tiers —",
+                )
+            );
+            println!(
+                "  {}",
+                crate::t(
+                    "cli-quickstart-inkbox-dedicated-pricing2",
+                    "see https://inkbox.ai/pricing for details.",
+                )
+            );
+            println!(
+                "  {} {})",
+                crate::t(
+                    "cli-quickstart-inkbox-dedicated-pricing3",
+                    "(provisioning response:",
                 ),
                 err
             );
@@ -252,35 +302,56 @@ fn signup_flow(base_url: &str) -> anyhow::Result<Option<ResolvedIdentity>> {
         email
     );
 
+    // A code survives at most 3 wrong guesses before the server kills it; track
+    // attempts locally so we can steer the user to 'resend' instead of burning
+    // guesses against a dead code. A successful resend resets the counter.
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut attempts_used: u32 = 0;
     loop {
-        let Some(entry) = input(
-            &crate::t(
+        let prompt_text = if attempts_used >= MAX_ATTEMPTS {
+            crate::t(
+                "cli-quickstart-inkbox-code-resend-only",
+                "Type 'resend' for a new code",
+            )
+        } else {
+            crate::t(
                 "cli-quickstart-inkbox-code",
                 "Verification code (or 'resend')",
-            ),
-            None,
-            true,
-        )?
-        else {
+            )
+        };
+        let Some(entry) = input(&prompt_text, None, true)? else {
             return Ok(None);
         };
         let entry = entry.trim().to_string();
-        if entry.is_empty() {
-            continue;
-        }
         if entry.eq_ignore_ascii_case("resend") || entry.eq_ignore_ascii_case("r") {
             match ob::resend(base_url, &signup.api_key) {
-                Ok(()) => println!(
-                    "  {} {}",
-                    crate::t("cli-quickstart-inkbox-resent", "✓ Resent. Check"),
-                    email
-                ),
+                Ok(()) => {
+                    println!(
+                        "  {} {}",
+                        crate::t("cli-quickstart-inkbox-resent", "✓ Resent. Check"),
+                        email
+                    );
+                    attempts_used = 0;
+                }
                 Err(err) => eprintln!(
                     "  {} {}",
                     crate::t("cli-quickstart-inkbox-resend-failed", "resend failed:"),
                     err
                 ),
             }
+            continue;
+        }
+        if entry.is_empty() {
+            continue;
+        }
+        if attempts_used >= MAX_ATTEMPTS {
+            println!(
+                "  {}",
+                crate::t(
+                    "cli-quickstart-inkbox-code-dead",
+                    "This code is dead. Type 'resend' before trying another code.",
+                )
+            );
             continue;
         }
         match ob::verify(base_url, &signup.api_key, &entry) {
@@ -291,23 +362,31 @@ fn signup_flow(base_url: &str) -> anyhow::Result<Option<ResolvedIdentity>> {
                 );
                 break;
             }
-            Err(err) => eprintln!(
-                "  {} {}",
-                crate::t("cli-quickstart-inkbox-bad-code", "wrong code:"),
-                err
-            ),
+            Err(err) => {
+                attempts_used += 1;
+                eprintln!(
+                    "  {} {} ({}/{} {})",
+                    crate::t("cli-quickstart-inkbox-bad-code", "wrong code:"),
+                    err,
+                    attempts_used,
+                    MAX_ATTEMPTS,
+                    crate::t("cli-quickstart-inkbox-attempts-used", "attempts used"),
+                );
+                if attempts_used >= MAX_ATTEMPTS {
+                    println!(
+                        "  {}",
+                        crate::t(
+                            "cli-quickstart-inkbox-code-now-dead",
+                            "This code is now dead. Type 'resend' for a fresh one.",
+                        )
+                    );
+                }
+            }
         }
     }
-    // Fresh identity has no number yet — offer to provision one, which also
-    // arms the SMS opt-in poll.
-    let (phone, did_provision) =
-        offer_phone_for_existing(base_url, &signup.api_key, &signup.agent_handle, None)?;
-    Ok(Some((
-        signup.api_key,
-        signup.agent_handle,
-        phone,
-        did_provision,
-    )))
+    // Fresh identity has no number yet; the dedicated-number step (offered
+    // after iMessage) mints one.
+    Ok(Some((signup.api_key, signup.agent_handle, None)))
 }
 
 /// Paste-a-key branch: validate the key and confirm its bound identity.
@@ -377,10 +456,9 @@ fn api_key_flow(base_url: &str) -> anyhow::Result<Option<ResolvedIdentity>> {
         }
     };
     // The key the channel will store: the pasted key for an agent-scoped key,
-    // or a freshly-minted agent-scoped key for the admin path. `created_new`
-    // marks the admin "create a new identity" path, whose phone question is
-    // handled during creation (so we don't re-offer it afterwards).
-    let (effective_key, handle, created_new): (String, String, bool) = match info.auth {
+    // or a freshly-minted agent-scoped key for the admin path (so the gateway
+    // never stores the admin key).
+    let (effective_key, handle): (String, String) = match info.auth {
         // Agent-scoped: bound to one identity — use it (warn if the API ever
         // returns more).
         ob::KeyAuth::AgentScoped => {
@@ -416,7 +494,7 @@ fn api_key_flow(base_url: &str) -> anyhow::Result<Option<ResolvedIdentity>> {
                 ),
                 handles[0]
             );
-            (api_key.clone(), handles[0].clone(), false)
+            (api_key.clone(), handles[0].clone())
         }
         // Admin-scoped: pick an existing identity OR create a new one, then mint
         // an agent-scoped key so the gateway never stores the admin key.
@@ -439,11 +517,11 @@ fn api_key_flow(base_url: &str) -> anyhow::Result<Option<ResolvedIdentity>> {
             else {
                 return Ok(None);
             };
-            let (chosen, created_new) = if idx < handles.len() {
-                (handles[idx].clone(), false)
+            let chosen = if idx < handles.len() {
+                handles[idx].clone()
             } else {
                 match create_new_identity(base_url, &api_key)? {
-                    Some(h) => (h, true),
+                    Some(h) => h,
                     None => return Ok(None),
                 }
             };
@@ -469,7 +547,7 @@ fn api_key_flow(base_url: &str) -> anyhow::Result<Option<ResolvedIdentity>> {
                 ),
                 chosen
             );
-            (minted, chosen, created_new)
+            (minted, chosen)
         }
     };
 
@@ -488,18 +566,10 @@ fn api_key_flow(base_url: &str) -> anyhow::Result<Option<ResolvedIdentity>> {
                 );
             }
             let handle = id.handle;
-            let (phone, did_provision) = if created_new {
-                // The create sub-flow already asked about (and may have minted)
-                // a number — don't re-offer; a number present means we just
-                // minted it, which arms the SMS opt-in poll.
-                let just_provisioned = id.phone_number.is_some();
-                (id.phone_number, just_provisioned)
-            } else {
-                // Existing identity (agent-scoped or admin-pick): offer a number
-                // only if it has none, mirroring `_offer_phone_for_existing`.
-                offer_phone_for_existing(base_url, &effective_key, &handle, id.phone_number)?
-            };
-            Ok(Some((effective_key, handle, phone, did_provision)))
+            // Phone provisioning is decoupled: report the identity's existing
+            // number (if any); the dedicated-number step (after iMessage) mints
+            // one when there is none.
+            Ok(Some((effective_key, handle, id.phone_number)))
         }
         Err(err) => {
             eprintln!(
@@ -543,17 +613,9 @@ fn create_new_identity(base_url: &str, api_key: &str) -> anyhow::Result<Option<S
     )?
     .map(|s| s.trim().to_string())
     .filter(|s| !s.is_empty());
-    let provision = matches!(
-        confirm(
-            &crate::t(
-                "cli-quickstart-inkbox-new-phone",
-                "Provision a local phone number? (unlocks SMS + voice)",
-            ),
-            true,
-        )?,
-        Some(true)
-    );
-    match ob::create_identity(base_url, api_key, &handle, display.as_deref(), provision) {
+    // Phone provisioning is decoupled from creation — the dedicated-number step
+    // (offered after iMessage) mints one. Create the identity with no number.
+    match ob::create_identity(base_url, api_key, &handle, display.as_deref(), false) {
         Ok(h) => {
             println!(
                 "  {} {}",
@@ -889,7 +951,12 @@ fn sms_opt_in(base_url: &str, api_key: &str, handle: &str, number: &str) -> anyh
 
 /// iMessage connect walkthrough: enable iMessage, walk the user through texting
 /// the router, then (opt-in) poll for the first inbound message and greet back.
-fn setup_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result<()> {
+///
+/// # Returns
+/// `true` when iMessage ended up enabled (already-on or newly enabled), so the
+/// caller can gate iMessage-dependent steps like realtime calling; `false` when
+/// the status check failed or the operator declined to enable it.
+fn setup_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result<bool> {
     println!(
         "\n  {}",
         crate::t("cli-quickstart-inkbox-imsg-header", "--- iMessage ---")
@@ -908,6 +975,20 @@ fn setup_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result
             "No number to provision — you connect through the Inkbox iMessage router.",
         )
     );
+    println!(
+        "  {}",
+        crate::t(
+            "cli-quickstart-inkbox-imsg-explain3",
+            "Once connected, the agent can also make and take voice calls with you",
+        )
+    );
+    println!(
+        "  {}",
+        crate::t(
+            "cli-quickstart-inkbox-imsg-explain4",
+            "over that same shared iMessage line.",
+        )
+    );
     // Skip the enable prompt entirely when iMessage is already on; surface
     // phones already connected so a rerun doesn't read like a first-time setup
     // (and defaults the walkthrough off when one exists).
@@ -922,7 +1003,7 @@ fn setup_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result
                 ),
                 err,
             );
-            return Ok(());
+            return Ok(false);
         }
     };
     let mut connected = status.connected;
@@ -943,7 +1024,7 @@ fn setup_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result
             true,
         )?
         else {
-            return Ok(());
+            return Ok(false);
         };
         if let Err(err) = ob::enable_imessage(base_url, api_key, handle) {
             eprintln!(
@@ -954,7 +1035,7 @@ fn setup_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result
                 ),
                 err,
             );
-            return Ok(());
+            return Ok(false);
         }
         println!(
             "  {}",
@@ -989,7 +1070,7 @@ fn setup_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result
         )
     };
     let Some(true) = confirm(&connect_q, connected.is_empty())? else {
-        return Ok(());
+        return Ok(true);
     };
     let (number, connect_command) = match ob::imessage_connect_info(base_url, api_key) {
         Ok(info) => info,
@@ -1002,7 +1083,7 @@ fn setup_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result
                 ),
                 err,
             );
-            return Ok(());
+            return Ok(true);
         }
     };
     println!(
@@ -1075,7 +1156,7 @@ fn setup_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result
                 "Skipped. The agent replies over iMessage once you connect and message it.",
             )
         );
-        return Ok(());
+        return Ok(true);
     };
     let (cid_str, sender) = found.split_once('|').unwrap_or((found.as_str(), ""));
     println!(
@@ -1109,7 +1190,7 @@ fn setup_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result
             ),
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Poll `check` every ~3s for up to [`POLL_SECS`], animating a spinner. Returns
