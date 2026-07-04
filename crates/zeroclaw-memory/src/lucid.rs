@@ -278,12 +278,33 @@ impl LucidMemory {
         let output = self.run_lucid_command(&args, self.recall_timeout).await?;
         Ok(Self::parse_lucid_context(&output))
     }
+
+    /// Dimensions of the underlying local SQLite embedder (0 = Noop). Lets
+    /// callers confirm a live embedder refresh reached the local backend (#8359).
+    pub fn embedder_dimensions(&self) -> usize {
+        self.local.embedder_dimensions()
+    }
 }
 
 #[async_trait]
 impl Memory for LucidMemory {
     fn name(&self) -> &str {
         "lucid"
+    }
+
+    fn refresh_embedder(
+        &self,
+        model_provider: &str,
+        api_key: Option<&str>,
+        model: &str,
+        dimensions: usize,
+    ) {
+        // Lucid delegates all local storage/embedding to the wrapped SQLite
+        // backend, so forward the refresh there (#8359). Without this, a
+        // Lucid-backed handle (including the install-wide RPC handle when
+        // `backend = lucid`) would keep a stale embedder.
+        self.local
+            .refresh_embedder(model_provider, api_key, model, dimensions);
     }
 
     async fn store(
@@ -522,6 +543,31 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    /// Lucid must forward `refresh_embedder` to its wrapped local SQLite so a
+    /// Lucid-backed handle (including the install-wide RPC handle when
+    /// `backend = lucid`) picks up a provider-profile change (#8359).
+    #[test]
+    fn refresh_embedder_forwards_to_local_sqlite() {
+        let tmp = TempDir::new().unwrap();
+        let local = SqliteMemory::new("test", tmp.path()).unwrap();
+        let lucid = LucidMemory::new("lucid", tmp.path(), local);
+        assert_eq!(lucid.embedder_dimensions(), 0);
+
+        Memory::refresh_embedder(
+            &lucid,
+            "openai",
+            Some("sk-test"),
+            "text-embedding-3-small",
+            1536,
+        );
+
+        assert_eq!(
+            lucid.embedder_dimensions(),
+            1536,
+            "LucidMemory must forward refresh_embedder to the local SQLite backend"
+        );
+    }
 
     fn write_fake_lucid_script(dir: &Path) -> String {
         let script_path = dir.join("fake-lucid.sh");

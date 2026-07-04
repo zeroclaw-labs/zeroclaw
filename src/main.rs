@@ -2692,6 +2692,81 @@ fn plugin_host_with_configured_security(
     )
 }
 
+/// Seed an empty `[[plugins.entries]]` block named after a freshly installed
+/// plugin. `config set plugins.entries.<name>.config.<key>` routes through
+/// natural-key path resolution, which only matches entries already present in
+/// live config; without a seeded entry the operator's only recourse is
+/// hand-editing the file. Idempotent: reinstalling a plugin whose entry
+/// already exists leaves the operator's config values untouched.
+#[cfg(feature = "plugins-wasm")]
+async fn seed_plugin_config_entry(
+    config: &mut crate::config::schema::Config,
+    plugin_name: &str,
+) -> Result<()> {
+    // A degraded [plugins] block means the on-disk section is malformed and
+    // the in-memory view is defaults. save_dirty cannot write through the
+    // broken shape (verified: it silently no-ops), so seeding would print a
+    // success message while persisting nothing. The whole-config sentinel
+    // (unparseable TOML) is worse: save_dirty hard-fails parsing the file
+    // and would turn a successful install into a command error. Refuse
+    // honestly in both cases.
+    let whole_config_degraded = config
+        .degraded_security
+        .iter()
+        .any(|s| s == crate::config::migration::WHOLE_CONFIG_SENTINEL);
+    if whole_config_degraded || config.degraded_sections.iter().any(|s| s == "plugins") {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-plugin-config-entry-seed-skipped",
+                &[("name", plugin_name)],
+                "warning: skipped seeding the plugin config entry: the \
+                 [plugins] section on disk is malformed. Repair it, add \
+                 `[[plugins.entries]]` with the plugin name, then set values \
+                 with `zeroclaw config set plugins.entries.<name>.config.<key>`."
+            )
+        );
+        return Ok(());
+    }
+    // Dotted-path routing splits on `.`, so a plugin name containing a dot
+    // (or an empty name) can never be addressed by
+    // `config set plugins.entries.<name>...`, and the per-entry dirty path
+    // `plugins.entries.<name>` cannot round-trip through the natural-key
+    // writer either: save_dirty silently no-ops while the success message
+    // claims otherwise (verified). Skip honestly.
+    if plugin_name.is_empty() || plugin_name.contains('.') {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-plugin-config-entry-seed-unaddressable",
+                &[("name", plugin_name)],
+                "warning: skipped seeding the plugin config entry: the plugin \
+                 name cannot be addressed by a dotted config path. Add a \
+                 `[[plugins.entries]]` block to the config file by hand."
+            )
+        );
+        return Ok(());
+    }
+    let created = config
+        .create_map_key("plugins.entries", plugin_name)
+        .map_err(anyhow::Error::msg)?;
+    if !created {
+        return Ok(());
+    }
+    config.mark_dirty(&format!("plugins.entries.{plugin_name}"));
+    Box::pin(config.save_dirty()).await?;
+    println!(
+        "{}",
+        ta(
+            "cli-plugin-config-entry-seeded",
+            &[("name", plugin_name)],
+            "Seeded config entry. Set plugin config values with \
+             `zeroclaw config set plugins.entries.<name>.config.<key>`."
+        )
+    );
+    Ok(())
+}
+
 #[derive(Subcommand, Debug)]
 enum ConfigCommands {
     /// Dump the full configuration JSON Schema to stdout. With `--path`, returns
@@ -2747,7 +2822,7 @@ enum ConfigCommands {
     },
     /// Migrate the on-disk config to the current schema version (preserves comments)
     Migrate {
-        /// Emit a structured JSON envelope ({migrated, backup_path?, schema_version}) instead of plain text.
+        /// Emit a structured JSON envelope ({migrated, backup_path?, schema_version, valid?, error?}) instead of plain text.
         #[arg(long)]
         json: bool,
     },
@@ -3376,6 +3451,32 @@ async fn main() -> Result<()> {
 
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
+    // Malformed sections the resilient loader dropped to defaults are logged
+    // to the trace file, but the terminal is muted unless --verbose. Echo
+    // them to stderr unconditionally: an operator whose `[plugins]` (or any
+    // other block) silently reset to defaults must see it on every command,
+    // not only when spelunking logs. Security-critical drops additionally
+    // hard-gate serving in gate_security_posture.
+    for section in config
+        .degraded_sections
+        .iter()
+        .chain(config.degraded_security.iter())
+    {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-config-section-degraded",
+                &[
+                    ("section", section),
+                    ("path", &config.config_path.display().to_string()),
+                ],
+                "warning: config section is malformed and was reset to defaults \
+                 for this run. Values in that section are NOT in effect. Run \
+                 `zeroclaw config migrate` to see the parse error, then repair \
+                 the file."
+            )
+        );
+    }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
     #[cfg(feature = "agent-runtime")]
@@ -5290,12 +5391,30 @@ async fn main() -> Result<()> {
                         }
                     }
                     None => {
+                        // Schema-current files can still carry a section that
+                        // fails typed deserialization (the resilient loader
+                        // resets it to defaults and the CLI points here for
+                        // the precise error). Run the strict path so this
+                        // command actually shows it instead of a dead-end
+                        // "already current".
+                        let strict_error = std::fs::read_to_string(&config.config_path)
+                            .ok()
+                            .and_then(|raw| {
+                                crate::config::migration::migrate_to_current(&raw)
+                                    .err()
+                                    .map(|e| format!("{e:#}"))
+                            });
                         if json {
                             let envelope = serde_json::json!({
                                 "migrated": false,
                                 "schema_version": crate::config::migration::CURRENT_SCHEMA_VERSION,
+                                "valid": strict_error.is_none(),
+                                "error": strict_error,
                             });
                             println!("{}", serde_json::to_string_pretty(&envelope)?);
+                            if strict_error.is_some() {
+                                std::process::exit(1);
+                            }
                         } else {
                             println!(
                                 "{}",
@@ -5304,6 +5423,14 @@ async fn main() -> Result<()> {
                                     "Config already at current schema version."
                                 )
                             );
+                            if let Some(error) = strict_error {
+                                anyhow::bail!(
+                                    "config at {} does not deserialize strictly; the resilient \
+                                     loader is substituting defaults for the failing section. \
+                                     Parse error: {error}",
+                                    config.config_path.display()
+                                );
+                            }
                         }
                     }
                 }
@@ -5780,7 +5907,7 @@ async fn main() -> Result<()> {
                 }
                 let mut host = plugin_host_with_configured_security(&config)?;
                 if plugin_registry::is_local_plugin_source(&source) {
-                    host.install(&source)?;
+                    let name = host.install(&source)?;
                     println!(
                         "{}",
                         ta(
@@ -5789,6 +5916,7 @@ async fn main() -> Result<()> {
                             "Plugin installed"
                         )
                     );
+                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
                 } else {
                     let registry_url = plugin_registry::registry_url(registry.as_deref());
                     println!(
@@ -5806,7 +5934,7 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
-                    host.install(&plugin_dir)?;
+                    let name = host.install(&plugin_dir)?;
                     println!(
                         "{}",
                         ta(
@@ -5818,6 +5946,7 @@ async fn main() -> Result<()> {
                             "Plugin installed"
                         )
                     );
+                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
                 }
                 Ok(())
             }
