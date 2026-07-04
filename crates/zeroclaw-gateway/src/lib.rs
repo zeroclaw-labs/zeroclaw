@@ -904,6 +904,7 @@ pub async fn run_gateway(
                 // need. Never connect them for a registry no turn runs against.
                 connect_peripherals: false,
                 exclude_memory: false,
+                list_deferred_mcp_specs: true,
             })
             .await;
             // Wire channel-driven tool handles so the dashboard agent can
@@ -1050,6 +1051,7 @@ pub async fn run_gateway(
             // boards would fail against the first holder anyway).
             connect_peripherals: false,
             exclude_memory: false,
+            list_deferred_mcp_specs: true,
         })
         .await;
         let specs: Vec<ToolSpec> = assembled.registry.iter().map(|t| t.spec()).collect();

@@ -105,6 +105,14 @@ pub struct ScopedAssembly<'a> {
     pub connect_peripherals: bool,
     /// Documented divergence: ACP excludes persistent memory tools.
     pub exclude_memory: bool,
+    /// Listing-only divergence: when deferred MCP loading is on, the live turn
+    /// paths collapse the whole MCP set into a single `tool_search` stub to save
+    /// prompt tokens. Enumeration surfaces (the gateway's `/api/tools` registries)
+    /// pass `true` so each policy-allowed MCP tool is ALSO listed by its own
+    /// `<server>__<tool>` spec - matching eager mode, so the dashboard Tools
+    /// screen shows the same tool set regardless of the deferred-loading knob
+    /// (#8302). Execution surfaces pass `false`; deferral is unchanged for them.
+    pub list_deferred_mcp_specs: bool,
 }
 
 /// Output of [`ScopedToolRegistry::assemble`]: the scoped registry plus the
@@ -140,6 +148,7 @@ impl ScopedToolRegistry {
             connect_mcp,
             connect_peripherals,
             exclude_memory,
+            list_deferred_mcp_specs,
         } = spec;
 
         let AllToolsResult {
@@ -213,6 +222,22 @@ impl ScopedToolRegistry {
                     if config.mcp.deferred_loading {
                         let deferred_set =
                             tools::DeferredMcpToolSet::from_registry(Arc::clone(&registry)).await;
+                        if list_deferred_mcp_specs {
+                            for stub in &deferred_set.stubs {
+                                if !eager_mcp_tool_allowed(&stub.prefixed_name, mcp_policy.as_ref())
+                                {
+                                    continue;
+                                }
+                                let wrapper: Arc<dyn Tool> =
+                                    Arc::new(stub.activate(Arc::clone(&registry)));
+                                register_eager_mcp_tool_if_allowed(
+                                    wrapper,
+                                    &mut tools_registry,
+                                    delegate_handle.as_ref(),
+                                    mcp_policy.as_ref(),
+                                );
+                            }
+                        }
                         let allowed_stub_count = mcp_allowed_tool_count(
                             deferred_set
                                 .stubs
@@ -393,6 +418,7 @@ mod tests {
             connect_mcp: false, // exercise the filter path without MCP fixtures
             connect_peripherals: false,
             exclude_memory: false,
+            list_deferred_mcp_specs: false,
         })
         .await;
         out.registry.iter().map(|t| t.name().to_string()).collect()
@@ -486,6 +512,7 @@ mod tests {
                 connect_mcp: true,
                 connect_peripherals: false,
                 exclude_memory: false,
+                list_deferred_mcp_specs: false,
             }),
         )
         .await
@@ -500,6 +527,148 @@ mod tests {
         assert!(
             out.activated_handle.is_none() && out.deferred_section.is_empty(),
             "no deferred-MCP artifacts may exist for an unscoped agent"
+        );
+    }
+
+    async fn mock_mcp_http_server() -> wiremock::MockServer {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method": "initialize"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "s")
+                    .set_body_json(serde_json::json!({
+                        "jsonrpc":"2.0","id":1,
+                        "result":{"capabilities":{"tools":{}}}
+                    })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method":"notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method":"tools/list"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc":"2.0","id":2,"result":{"tools":[
+                    {"name":"echo","description":"echo","inputSchema":{"type":"object"}},
+                    {"name":"add_numbers","description":"add","inputSchema":{"type":"object"}}
+                ]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method":"resources/list"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc":"2.0","id":3,"result":{"resources":[]}
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn config_with_bundled_mcp(server_uri: String) -> Config {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, McpBundleConfig, McpServerConfig, McpTransport, RiskProfileConfig,
+        };
+
+        let mut config = Config::default();
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "remote".into(),
+            transport: McpTransport::Http,
+            url: Some(server_uri),
+            ..Default::default()
+        }];
+        config.mcp_bundles.insert(
+            "mockbundle".into(),
+            McpBundleConfig {
+                servers: vec!["remote".into()],
+                exclude: Vec::new(),
+            },
+        );
+        config
+            .risk_profiles
+            .insert("test-profile".into(), RiskProfileConfig::default());
+        config.agents.insert(
+            "scoped".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                mcp_bundles: vec!["mockbundle".into()],
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    async fn assemble_listing_for(config: &Config) -> Vec<String> {
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ScopedToolRegistry::assemble(ScopedAssembly {
+                config,
+                agent_alias: "scoped",
+                security: &security,
+                built: built_with(Vec::new()),
+                skills: &[],
+                runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                caller_allowed: None,
+                connect_mcp: true,
+                connect_peripherals: false,
+                exclude_memory: false,
+                list_deferred_mcp_specs: true,
+            }),
+        )
+        .await
+        .expect("assemble must not hang");
+        out.registry.iter().map(|t| t.name().to_string()).collect()
+    }
+
+    /// Regression pin for #8302: a bundle-granted MCP server's individual tools
+    /// must appear in the `/api/tools` listing registry that `assemble` mints, in
+    /// BOTH eager and deferred loading modes. In v0.8.1 the listing was eager and
+    /// surfaced each `<server>__<tool>` spec; deferred loading collapsed the whole
+    /// server into a single `tool_search` stub, so the dashboard Tools screen
+    /// stopped showing MCP tools even for a correctly-bundled agent.
+    #[tokio::test]
+    async fn assemble_lists_bundled_mcp_tools_in_both_loading_modes() {
+        let server = mock_mcp_http_server().await;
+
+        let mut eager = config_with_bundled_mcp(server.uri());
+        eager.mcp.deferred_loading = false;
+        let eager_names = assemble_listing_for(&eager).await;
+        assert!(
+            eager_names.iter().any(|n| n == "remote__echo")
+                && eager_names.iter().any(|n| n == "remote__add_numbers"),
+            "eager mode must list each bundled MCP tool: {eager_names:?}"
+        );
+
+        let mut deferred = config_with_bundled_mcp(server.uri());
+        deferred.mcp.deferred_loading = true;
+        let deferred_names = assemble_listing_for(&deferred).await;
+        assert!(
+            deferred_names.iter().any(|n| n == "remote__echo")
+                && deferred_names.iter().any(|n| n == "remote__add_numbers"),
+            "deferred mode must still list each bundled MCP tool in the \
+             enumeration registry (#8302); got {deferred_names:?}"
         );
     }
 
