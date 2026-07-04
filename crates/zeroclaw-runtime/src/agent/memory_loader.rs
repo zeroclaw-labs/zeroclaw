@@ -16,6 +16,9 @@ pub trait MemoryLoader: Send + Sync {
     /// failure paths — so OTel/log observers can attribute per-turn memory
     /// cost. The agent runtime relies on this for end-to-end visibility
     /// of the implicit recall that runs at the start of each turn.
+    /// Implementations MUST also forward `turn`'s correlation fields onto
+    /// every emitted `MemoryRecall` (both paths) so the recall span joins
+    /// the active turn trace.
     async fn load_context(
         &self,
         memory: &dyn Memory,
