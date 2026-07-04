@@ -265,6 +265,69 @@ mod tests {
     }
 
     #[test]
+    fn bound_field_names_match_trigger_serde_fields() {
+        use crate::sop::types::SopTrigger;
+
+        let samples = [
+            SopTrigger::Mqtt {
+                topic: "t".into(),
+                condition: Some("c".into()),
+            },
+            SopTrigger::Webhook { path: "p".into() },
+            SopTrigger::Cron {
+                expression: "* * * * *".into(),
+            },
+            SopTrigger::Peripheral {
+                board: "b".into(),
+                signal: "s".into(),
+                condition: Some("c".into()),
+            },
+            SopTrigger::Filesystem {
+                path: "p".into(),
+                events: vec![],
+                condition: Some("c".into()),
+            },
+            SopTrigger::Calendar {
+                calendar_source: "s".into(),
+                calendar_ids: vec![],
+            },
+            SopTrigger::Manual,
+            SopTrigger::Amqp {
+                routing_key: "k".into(),
+                condition: Some("c".into()),
+            },
+        ];
+
+        let registry = build_registry(&[]);
+        let mut seen_sources = Vec::new();
+        for trigger in &samples {
+            let source = trigger.source();
+            seen_sources.push(source);
+            let bound = registry
+                .bound
+                .iter()
+                .find(|b| b.source == source.to_string())
+                .unwrap_or_else(|| panic!("source {source} missing from registry"));
+            let json = serde_json::to_value(trigger).unwrap();
+            let keys = json.as_object().unwrap();
+            for field in &bound.fields {
+                assert!(
+                    keys.contains_key(&field.name),
+                    "registry field '{}' for source {source} does not exist on the \
+                     serialized trigger; field names drifted from SopTrigger serde fields",
+                    field.name
+                );
+            }
+        }
+        for source in SopTriggerSource::iter() {
+            assert!(
+                source == SopTriggerSource::Channel || seen_sources.contains(&source),
+                "trigger source {source} has no sample in this drift guard; add one"
+            );
+        }
+    }
+
+    #[test]
     fn channels_walk_inbound_capable_kinds_only() {
         let registry = build_registry(&[]);
         assert!(!registry.channels.is_empty());

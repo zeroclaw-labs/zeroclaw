@@ -207,21 +207,22 @@ pub enum SopTrigger {
 
 impl fmt::Display for SopTrigger {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let source = self.source();
         match self {
-            Self::Mqtt { topic, .. } => write!(f, "mqtt:{topic}"),
-            Self::Webhook { path } => write!(f, "webhook:{path}"),
-            Self::Cron { expression } => write!(f, "cron:{expression}"),
-            Self::Peripheral { board, signal, .. } => write!(f, "peripheral:{board}/{signal}"),
-            Self::Filesystem { path, .. } => write!(f, "filesystem:{path}"),
+            Self::Mqtt { topic, .. } => write!(f, "{source}:{topic}"),
+            Self::Webhook { path } => write!(f, "{source}:{path}"),
+            Self::Cron { expression } => write!(f, "{source}:{expression}"),
+            Self::Peripheral { board, signal, .. } => write!(f, "{source}:{board}/{signal}"),
+            Self::Filesystem { path, .. } => write!(f, "{source}:{path}"),
             Self::Calendar {
                 calendar_source, ..
-            } => write!(f, "calendar:{calendar_source}"),
+            } => write!(f, "{source}:{calendar_source}"),
             Self::Channel { channel, alias, .. } => match alias {
-                Some(a) => write!(f, "channel:{channel}/{a}"),
-                None => write!(f, "channel:{channel}"),
+                Some(a) => write!(f, "{source}:{channel}/{a}"),
+                None => write!(f, "{source}:{channel}"),
             },
-            Self::Manual => write!(f, "manual"),
-            Self::Amqp { routing_key, .. } => write!(f, "amqp:{routing_key}"),
+            Self::Manual => write!(f, "{source}"),
+            Self::Amqp { routing_key, .. } => write!(f, "{source}:{routing_key}"),
         }
     }
 }
