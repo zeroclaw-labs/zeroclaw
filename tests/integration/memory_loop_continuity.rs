@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use zeroclaw::config::MemoryConfig;
 use zeroclaw::memory::sqlite::SqliteMemory;
 use zeroclaw::memory::traits::{Memory, MemoryCategory};
 use zeroclaw::providers::ToolCall;
@@ -410,6 +411,7 @@ async fn consolidation_extracts_facts_to_memory() {
         "test-model",
         None,
         mem.as_ref(),
+        &MemoryConfig::default(),
         "The project deadline is April 15th 2026",
         "Got it, I'll remember the deadline is April 15th.",
     )
@@ -442,6 +444,7 @@ async fn memory_survives_rapid_consolidation() {
             "test-model",
             None,
             mem.as_ref(),
+            &MemoryConfig::default(),
             &format!("User message {i}"),
             &format!("Assistant response {i}"),
         )

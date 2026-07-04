@@ -2104,10 +2104,8 @@ impl OpenAiCompatibleModelProvider {
                     last_assistant_tool_call_ids =
                         tool_calls.iter().filter_map(|tc| tc.id.clone()).collect();
 
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|value| MessageContent::Text(value.to_string()));
+                    let content = crate::request_payload::non_empty_string_field(&value, "content")
+                        .map(MessageContent::Text);
 
                     // `reasoning` (OpenRouter / vLLM >= v0.16.0). Preserve
                     // whichever field name was originally received so the
@@ -6068,6 +6066,45 @@ mod tests {
             }
             other => panic!("expected text content from fallback, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn convert_messages_for_native_omits_empty_tool_call_content() {
+        let empty_history_json = serde_json::json!({
+            "content": "",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"ls\"}"
+            }]
+        });
+        let non_empty_history_json = serde_json::json!({
+            "content": "I will check",
+            "tool_calls": [{
+                "id": "tc_2",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"pwd\"}"
+            }]
+        });
+
+        let messages = vec![
+            ChatMessage::assistant(empty_history_json.to_string()),
+            ChatMessage::assistant(non_empty_history_json.to_string()),
+        ];
+        let provider = make_model_provider("test", "https://example.com", None);
+        let native = provider.convert_messages_for_native(&messages, true);
+        let empty_json = serde_json::to_value(&native[0]).unwrap();
+        let non_empty_json = serde_json::to_value(&native[1]).unwrap();
+
+        assert_eq!(empty_json.get("content"), None);
+        assert_ne!(
+            empty_json.get("content"),
+            Some(&serde_json::Value::String(String::new()))
+        );
+        assert_eq!(
+            non_empty_json.get("content"),
+            Some(&serde_json::json!("I will check"))
+        );
     }
 
     #[test]
