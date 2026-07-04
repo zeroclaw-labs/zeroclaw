@@ -13,18 +13,6 @@ pub struct ExportFilter {
     pub until: Option<String>,
 }
 
-/// A single message in a conversation trace for procedural memory.
-///
-/// Used to capture "how to" patterns from tool-calling turns so that
-/// backends that support procedural storage can learn from them.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ProceduralMessage {
-    pub role: String,
-    pub content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-}
-
 /// A single memory entry
 #[derive(Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
@@ -44,6 +32,15 @@ pub struct MemoryEntry {
     /// If this entry was superseded by a newer conflicting entry.
     #[serde(default)]
     pub superseded_by: Option<String>,
+    /// Memory kind, orthogonal to the durability/recency category.
+    #[serde(default)]
+    pub kind: Option<MemoryKind>,
+    /// Whether this entry is protected from budget eviction.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Tenant or end-user scope for multi-user memory isolation.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     /// Resolved, human-readable agent alias for this row (the HashMap key
     /// in `Config::agents`, e.g. `"clamps"`). SQL-backed stores produce
     /// this via `LEFT JOIN agents ON agents.id = memories.agent_id`;
@@ -79,9 +76,37 @@ impl std::fmt::Debug for MemoryEntry {
             .field("score", &self.score)
             .field("namespace", &self.namespace)
             .field("importance", &self.importance)
+            .field("kind", &self.kind)
+            .field("pinned", &self.pinned)
+            .field("tenant_id", &self.tenant_id)
             .field("agent_alias", &self.agent_alias)
             .finish_non_exhaustive()
     }
+}
+
+/// Memory kind, orthogonal to [`MemoryCategory`].
+///
+/// Epic A owns this shared type and storage field. Later epics classify writes
+/// into kinds and use them during recall and context assembly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryKind {
+    /// Session or event memory.
+    Episodic,
+    /// Evergreen semantic memory.
+    Semantic(SemanticSubtype),
+    /// How-to or process memory.
+    Procedural,
+}
+
+/// Semantic memory subtypes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticSubtype {
+    Preference,
+    Fact,
+    Decision,
+    Entity,
 }
 
 /// Memory categories for organization
@@ -142,6 +167,73 @@ pub fn normalize_recent_recall_query(query: &str) -> &str {
     } else {
         query
     }
+}
+
+/// A single message in a conversation trace for procedural memory.
+///
+/// Used to capture "how to" patterns from tool-calling turns so that
+/// backends that support procedural storage can learn from them.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProceduralMessage {
+    pub role: String,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Options for storing memory metadata without growing write-method arity.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StoreOptions {
+    pub namespace: Option<String>,
+    pub importance: Option<f64>,
+    pub kind: Option<MemoryKind>,
+    pub pinned: bool,
+    pub tenant_id: Option<String>,
+}
+
+impl StoreOptions {
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = Some(namespace.into());
+        self
+    }
+
+    pub fn with_importance(mut self, importance: f64) -> Self {
+        self.importance = Some(importance);
+        self
+    }
+
+    pub fn with_kind(mut self, kind: MemoryKind) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+
+    pub fn pinned(mut self, pinned: bool) -> Self {
+        self.pinned = pinned;
+        self
+    }
+
+    pub fn with_tenant_id(mut self, tenant_id: impl Into<String>) -> Self {
+        self.tenant_id = Some(tenant_id.into());
+        self
+    }
+}
+
+/// Read-side memory store telemetry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MemoryStats {
+    pub total_rows: u64,
+    pub by_category: Vec<(String, u64)>,
+    pub superseded_rows: u64,
+    pub pinned_rows: u64,
+    pub bytes: u64,
+}
+
+/// Shared memory policy decision substrate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "decision")]
+pub enum MemoryPolicyDecision {
+    Allow,
+    Deny { reason: String },
 }
 
 /// Core memory trait — implement for any persistence backend
@@ -297,6 +389,45 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// Health check
     async fn health_check(&self) -> bool;
 
+    /// Mark entries as superseded by a newer row.
+    ///
+    /// Default: no-op. SQL backends can override this with reversible
+    /// soft-hide behavior; non-SQL backends remain source-compatible.
+    async fn supersede(&self, _superseded_ids: &[String], _new_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Store a procedural "how to" trace from a tool-calling turn.
+    ///
+    /// Default: no-op. Backends that support procedural storage can override.
+    async fn store_procedural(
+        &self,
+        _messages: &[ProceduralMessage],
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Count rows within a namespace/category scope.
+    ///
+    /// Default is zero so quota enforcement remains opt-in until a backend
+    /// provides an efficient implementation.
+    async fn count_in_scope(
+        &self,
+        _namespace: Option<&str>,
+        _category: Option<&MemoryCategory>,
+    ) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    /// Read-side memory store telemetry.
+    ///
+    /// Default is empty telemetry so status consumers can be introduced before
+    /// every backend has native stats support.
+    async fn stats(&self) -> anyhow::Result<MemoryStats> {
+        Ok(MemoryStats::default())
+    }
+
     /// Rebuild backend indexes: FTS tables and any missing embedding vectors.
     ///
     /// Intended as a manual fixup after bulk writes that didn't go through
@@ -309,19 +440,6 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// derived indexes (e.g. `SqliteMemory`).
     async fn reindex(&self) -> anyhow::Result<usize> {
         Ok(0)
-    }
-
-    /// Store a conversation trace as procedural memory.
-    ///
-    /// Backends that support procedural storage override this
-    /// to extract "how to" patterns from tool-calling turns.  The default
-    /// implementation is a no-op.
-    async fn store_procedural(
-        &self,
-        _messages: &[ProceduralMessage],
-        _session_id: Option<&str>,
-    ) -> anyhow::Result<()> {
-        Ok(())
     }
 
     /// Recall memories scoped to a specific namespace.
@@ -398,6 +516,29 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         _importance: Option<f64>,
     ) -> anyhow::Result<()> {
         self.store(key, content, category, session_id).await
+    }
+
+    /// Store a memory entry with the full additive metadata surface.
+    ///
+    /// Default delegates through the existing metadata method and intentionally
+    /// ignores fields that older backends do not yet persist.
+    async fn store_with_options(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+    ) -> anyhow::Result<()> {
+        self.store_with_metadata(
+            key,
+            content,
+            category,
+            session_id,
+            options.namespace.as_deref(),
+            options.importance,
+        )
+        .await
     }
 
     /// Store a memory entry attributed to an explicit agent UUID.
@@ -537,6 +678,9 @@ mod tests {
             namespace: "default".into(),
             importance: Some(0.7),
             superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
             agent_alias: None,
             agent_id: None,
         };
@@ -553,5 +697,58 @@ mod tests {
         assert_eq!(parsed.namespace, "default");
         assert_eq!(parsed.importance, Some(0.7));
         assert!(parsed.superseded_by.is_none());
+        assert!(parsed.kind.is_none());
+        assert!(!parsed.pinned);
+        assert!(parsed.tenant_id.is_none());
+    }
+
+    #[test]
+    fn memory_entry_defaults_new_memory_plane_fields_when_absent() {
+        let json = r#"{
+            "id": "id-1",
+            "key": "favorite_language",
+            "content": "Rust",
+            "category": "core",
+            "timestamp": "2026-02-16T00:00:00Z",
+            "session_id": null,
+            "score": null
+        }"#;
+
+        let parsed: MemoryEntry = serde_json::from_str(json).unwrap();
+
+        assert!(parsed.kind.is_none());
+        assert!(!parsed.pinned);
+        assert!(parsed.tenant_id.is_none());
+    }
+
+    #[test]
+    fn memory_entry_roundtrip_preserves_new_memory_plane_fields() {
+        let entry = MemoryEntry {
+            id: "id-2".into(),
+            key: "deployment_decision".into(),
+            content: "Use staged rollout".into(),
+            category: MemoryCategory::Core,
+            timestamp: "2026-02-16T00:00:00Z".into(),
+            session_id: None,
+            score: None,
+            namespace: "ops".into(),
+            importance: Some(0.9),
+            superseded_by: None,
+            kind: Some(MemoryKind::Semantic(SemanticSubtype::Decision)),
+            pinned: true,
+            tenant_id: Some("tenant-1".into()),
+            agent_alias: Some("agent-a".into()),
+            agent_id: Some("agent-uuid".into()),
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: MemoryEntry = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            parsed.kind,
+            Some(MemoryKind::Semantic(SemanticSubtype::Decision))
+        );
+        assert!(parsed.pinned);
+        assert_eq!(parsed.tenant_id.as_deref(), Some("tenant-1"));
     }
 }

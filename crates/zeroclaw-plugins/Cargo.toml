@@ -39,16 +39,16 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 thiserror = { version = "2.0", optional = true }
 tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "rt", "time", "process", "io-util"] }
 toml = { version = "1.0", optional = true }
-wasmtime = { version = "43", default-features = false, features = [
+wasmtime = { version = "45.0.3", default-features = false, features = [
   "component-model",
   "runtime",
   "std",
   "async",
 ], optional = true }
-wasmtime-wasi = { version = "43", default-features = false, features = [
+wasmtime-wasi = { version = "45.0.3", default-features = false, features = [
   "p2",
 ], optional = true }
-wasmtime-wasi-http = { version = "43", default-features = false, features = [
+wasmtime-wasi-http = { version = "45.0.3", default-features = false, features = [
   "p2",
   "default-send-request",
 ], optional = true }

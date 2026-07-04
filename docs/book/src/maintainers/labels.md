@@ -310,7 +310,8 @@ Applied manually: the auto-response automation that used to handle these was rem
 |---|---|
 | `r:needs-repro` | Incomplete bug report; request a deterministic repro |
 | `r:support` | Usage / help item better handled outside the bug backlog |
-| `stale-candidate` | Dormant PR or issue; candidate for closing |
+| `needs-author-action` | Author response is needed before maintainers can continue the review or merge path. For PRs, this is not a stale warning by itself. |
+| `stale-candidate` | Dormant PR or issue that is a candidate for closing. For PRs, follow the stale ramp in [Reviewer Playbook → PR backlog pruning](./reviewer-playbook.md#pr-backlog-pruning). |
 
 ## Community pickup labels
 
