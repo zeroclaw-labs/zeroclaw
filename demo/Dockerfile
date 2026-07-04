@@ -23,6 +23,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # exchange for a cleanly isolated runtime image.
 COPY . .
 
+# `.dockerignore` strips apps/tauri/src and apps/tauri/build.rs; stub them so
+# Cargo's workspace resolution succeeds. (Same trick the production Dockerfile uses.)
+RUN mkdir -p apps/tauri/src \
+    && printf 'fn main() {}\n' > apps/tauri/src/main.rs \
+    && printf 'fn main() {}\n' > apps/tauri/build.rs
+
 # Debug builds (no --release) — faster compile, fine for a demo.
 # Build the simulator example first, then the main binary.
 # Requires the dev-sim feature (from the split) so /tmp/zc-sim-* paths are allowed.

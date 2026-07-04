@@ -1697,6 +1697,7 @@ fn sse_bytes_to_events_for_contract(
         let mut tool_calls: Vec<StreamToolCallAccumulator> = Vec::new();
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let mut emitted_tool_calls = false;
+        let mut saw_completion = false;
 
         match response.error_for_status_ref() {
             Ok(_) => {}
@@ -1753,7 +1754,14 @@ fn sse_bytes_to_events_for_contract(
 
                         let chunk = match parse_sse_chunk(&line) {
                             Ok(Some(chunk)) => chunk,
-                            Ok(None) => continue,
+                            Ok(None) => {
+                                if line.trim().strip_prefix("data:").map(str::trim)
+                                    == Some("[DONE]")
+                                {
+                                    saw_completion = true;
+                                }
+                                continue;
+                            }
                             Err(e) => {
                                 let _ = tx.send(Err(e)).await;
                                 return;
@@ -1762,6 +1770,9 @@ fn sse_bytes_to_events_for_contract(
 
                         let mut should_emit_tool_calls = false;
                         for choice in &chunk.choices {
+                            if choice.finish_reason.is_some() {
+                                saw_completion = true;
+                            }
                             if let Some(reasoning_delta) = extract_sse_reasoning_delta(choice) {
                                 let reasoning_chunk = StreamChunk::reasoning(reasoning_delta);
                                 if tx
@@ -1847,7 +1858,8 @@ fn sse_bytes_to_events_for_contract(
             }
         }
 
-        let _ = tx.send(Ok(StreamEvent::Final)).await;
+        crate::stream_guard::finish_sse_stream(&tx, saw_completion, "[DONE] or finish_reason")
+            .await;
     });
 
     let guard = AbortOnDrop::new(handle.abort_handle());
@@ -3628,6 +3640,68 @@ mod tests {
         assert!(
             !err_msg.contains("API key not set"),
             "should not get credential error, got: {err_msg}"
+        );
+    }
+
+    fn sse_response(body: &'static str) -> reqwest::Response {
+        reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(reqwest::StatusCode::OK)
+                .body(reqwest::Body::from(body))
+                .expect("test response should build"),
+        )
+    }
+
+    async fn collect_stream_events(body: &'static str) -> Vec<StreamResult<StreamEvent>> {
+        let mut stream = sse_bytes_to_events(sse_response(body), false);
+        let mut events = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.next()).await
+        {
+            events.push(ev);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn eof_after_done_sentinel_emits_final() {
+        let events = collect_stream_events(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        assert!(
+            matches!(events.last(), Some(Ok(StreamEvent::Final))),
+            "got: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_after_finish_reason_without_done_emits_final() {
+        let events = collect_stream_events(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        )
+        .await;
+        assert!(
+            matches!(events.last(), Some(Ok(StreamEvent::Final))),
+            "got: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_before_completion_signal_surfaces_error_not_final() {
+        let events =
+            collect_stream_events("data: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}\n\n")
+                .await;
+        assert!(
+            !events.iter().any(|e| matches!(e, Ok(StreamEvent::Final))),
+            "truncated stream must not emit Final, got: {events:?}"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(Err(StreamError::Http(msg))) if msg.contains("truncated")
+            ),
+            "expected truncation error, got: {events:?}"
         );
     }
 
