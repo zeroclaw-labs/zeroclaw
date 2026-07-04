@@ -56,6 +56,13 @@ pub struct GhIssue {
     pub body: Option<String>,
     pub user: GhUser,
     pub created_at: DateTime<Utc>,
+    /// Last-modified time. GitHub's issues `since` filter keys on this, so
+    /// the Issues stream cursor advances on it (see `fetch_issues`).
+    /// Optional only so older/hand-built fixtures without the field fall
+    /// back to `created_at` via [`GhIssue::updated_at`]; real payloads
+    /// always carry it.
+    #[serde(default, rename = "updated_at")]
+    pub updated_at_raw: Option<DateTime<Utc>>,
     #[serde(default)]
     pub closed_at: Option<DateTime<Utc>>,
     /// Present iff the item is a pull request; `merged_at` inside is set
@@ -69,6 +76,13 @@ pub struct GhIssue {
 impl GhIssue {
     pub fn is_pull_request(&self) -> bool {
         self.pull_request.is_some()
+    }
+
+    /// The effective last-modified time: the payload's `updated_at`, or
+    /// `created_at` when a fixture omits it (an un-updated item has
+    /// `updated_at == created_at`).
+    pub fn updated_at(&self) -> DateTime<Utc> {
+        self.updated_at_raw.unwrap_or(self.created_at)
     }
 }
 

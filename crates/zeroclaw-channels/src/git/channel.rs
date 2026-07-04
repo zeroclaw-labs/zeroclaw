@@ -8,11 +8,12 @@
 //! the provider from config is the only forge-aware step, isolated to
 //! [`build_provider`]; everything else here is identical for any forge.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::GitConfig;
 
@@ -245,6 +246,18 @@ impl GitChannel {
     ) -> Result<bool, GitChannelError> {
         let repo_key = repo.to_string();
         let mut batch: Vec<GitEvent> = Vec::new();
+        // Cursor advances and the fresh feed ETag are STAGED here, not
+        // committed to `state`, until the whole batch has been dispatched.
+        // A fetch error on a later stream (or the rate-limit backoff that
+        // re-enters this function) must not advance a cursor or mark an
+        // event seen for events that were never delivered — otherwise the
+        // next tick skips them permanently.
+        let mut advances: Vec<(PollStream, DateTime<Utc>)> = Vec::new();
+        let mut fresh_etag: Option<String> = None;
+        // Dedup across streams within this tick, since the shared seen-set
+        // is not committed until dispatch: an item surfaced by both a
+        // targeted endpoint and the feed backbone is still admitted once.
+        let mut this_tick: HashSet<String> = HashSet::new();
 
         for stream in self.active_streams(plan) {
             let since = state.since(&repo_key, stream);
@@ -261,19 +274,16 @@ impl GitChannel {
                 continue;
             }
             if let Some(etag) = page.etag {
-                state.set_etag(&repo_key, etag);
+                fresh_etag = Some(etag);
             }
-            // Advance the per-stream cursor from the provider's report,
-            // independent of which events the dedup set ultimately admits
-            // (the cursor covers everything the endpoint returned).
             if let Some(advance_to) = page.advance_to {
-                state.advance(&repo_key, stream, advance_to);
+                advances.push((stream, advance_to));
             }
             for event in page.events {
-                // The seen-set is shared across streams, so an item
-                // surfaced by both a targeted endpoint and the feed
-                // backbone is admitted exactly once.
-                if state.admit(&event.dedup_id(), event.created_at()) {
+                let id = event.dedup_id();
+                // Read-only freshness check + within-tick dedup; the shared
+                // seen-set is committed per event only after it dispatches.
+                if state.is_fresh(&id, event.created_at()) && this_tick.insert(id) {
                     batch.push(event);
                 }
             }
@@ -281,9 +291,22 @@ impl GitChannel {
 
         batch.sort_by_key(GitEvent::created_at);
         for event in batch {
+            let id = event.dedup_id();
             if !self.dispatch_event(event, filter, tx).await {
+                // Receiver hung up (shutdown): commit nothing further, so
+                // the undelivered tail is re-fetched next run, and stop.
                 return Ok(false);
             }
+            state.mark_seen(&id);
+        }
+
+        // Every event was delivered: it is now safe to advance the stream
+        // cursors and remember the feed ETag.
+        if let Some(etag) = fresh_etag {
+            state.set_etag(&repo_key, etag);
+        }
+        for (stream, advance_to) in advances {
+            state.advance(&repo_key, stream, advance_to);
         }
         Ok(true)
     }
@@ -1228,6 +1251,151 @@ mod tests {
                 }
                 other => panic!("expected RateLimited, got {other:?}"),
             }
+        }
+
+        /// Regression: a fetch error on a later stream must not drop events
+        /// already fetched from an earlier one. Before the staged-commit
+        /// fix, `poll_repo` advanced the Issues cursor and marked the issue
+        /// seen the moment the Issues stream returned, so a Comments-stream
+        /// error (the same shape as the rate-limit backoff that re-enters
+        /// this function) permanently lost the already-fetched issue: the
+        /// next tick's cursor had moved past it and the dedup set held it.
+        #[tokio::test]
+        async fn later_stream_error_does_not_drop_earlier_events() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            let now = chrono::Utc::now();
+            let issue = serde_json::json!([{
+                "id": 555,
+                "number": 12,
+                "title": "Flaky test",
+                "body": "@myapp please investigate",
+                "user": {"login": "marc", "type": "User"},
+                "created_at": (now - chrono::Duration::seconds(60)).to_rfc3339(),
+            }]);
+            mount_token_mock(&server).await;
+            Mock::given(method("GET"))
+                .and(path("/repos/octo/repo/issues"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(issue.clone()))
+                .mount(&server)
+                .await;
+            // The Comments stream (polled after Issues) fails mid-tick.
+            Mock::given(method("GET"))
+                .and(path("/repos/octo/repo/issues/comments"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            let key = write_test_key();
+            let ch = mock_channel(base_cfg(&key), server.uri());
+            let filter = test_filter();
+            let plan = default_plan();
+            let floor = now - chrono::Duration::hours(1);
+            let mut state = PollState::new(floor);
+            let repo = RepoRef::parse("octo/repo").unwrap();
+
+            // First tick errors on the Comments stream.
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let err = ch
+                .poll_repo(&repo, &filter, &plan, &mut state, &tx)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, GitChannelError::Api { status: 500, .. }));
+            // The Issues cursor did NOT advance past the undelivered issue.
+            assert_eq!(state.since(&repo.to_string(), PollStream::Issues), floor);
+            drop(tx);
+            assert!(rx.recv().await.is_none());
+
+            // Fix the Comments stream and poll again: the issue is still
+            // delivered (it was never marked seen), proving no event was lost.
+            server.reset().await;
+            mount_token_mock(&server).await;
+            Mock::given(method("GET"))
+                .and(path("/repos/octo/repo/issues"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(issue))
+                .mount(&server)
+                .await;
+            mount_empty(&server, "/repos/octo/repo/issues/comments").await;
+
+            let (tx2, mut rx2) = tokio::sync::mpsc::channel(8);
+            ch.poll_repo(&repo, &filter, &plan, &mut state, &tx2)
+                .await
+                .unwrap();
+            drop(tx2);
+            let msg = rx2.recv().await.unwrap();
+            assert_eq!(msg.id, "ghi_555");
+            assert!(rx2.recv().await.is_none());
+        }
+
+        /// Regression: the Issues stream follows `Link: rel="next"`
+        /// pagination, so items beyond the first 100-item page are still
+        /// delivered. Before this, one unpaginated page let a busy repo's
+        /// older `updated`-matching items saturate the page and starve
+        /// newer ones, livelocking a cursor that advances on the newest
+        /// returned item. Here page one links to page two and both issues
+        /// are forwarded.
+        #[tokio::test]
+        async fn issues_stream_follows_link_pagination() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            let now = chrono::Utc::now();
+            mount_token_mock(&server).await;
+            // Page one points at page two the way GitHub's Link header does.
+            let next_link = format!("<{}/paged/issues/2>; rel=\"next\"", server.uri());
+            Mock::given(method("GET"))
+                .and(path("/repos/octo/repo/issues"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("link", next_link.as_str())
+                        .set_body_json(serde_json::json!([{
+                            "id": 101,
+                            "number": 1,
+                            "title": "First",
+                            "body": "@myapp one",
+                            "user": {"login": "marc", "type": "User"},
+                            "created_at": (now - chrono::Duration::seconds(90)).to_rfc3339(),
+                        }])),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/paged/issues/2"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                        "id": 202,
+                        "number": 2,
+                        "title": "Second",
+                        "body": "@myapp two",
+                        "user": {"login": "marc", "type": "User"},
+                        "created_at": (now - chrono::Duration::seconds(30)).to_rfc3339(),
+                    }])),
+                )
+                .mount(&server)
+                .await;
+            mount_empty(&server, "/repos/octo/repo/issues/comments").await;
+
+            let key = write_test_key();
+            let ch = mock_channel(base_cfg(&key), server.uri());
+            let filter = test_filter();
+            let plan = default_plan();
+            let mut state = PollState::new(now - chrono::Duration::hours(1));
+            let repo = RepoRef::parse("octo/repo").unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            ch.poll_repo(&repo, &filter, &plan, &mut state, &tx)
+                .await
+                .unwrap();
+            drop(tx);
+
+            // Both pages' issues are delivered, oldest first.
+            let first = rx.recv().await.unwrap();
+            assert_eq!(first.id, "ghi_101");
+            let second = rx.recv().await.unwrap();
+            assert_eq!(second.id, "ghi_202");
+            assert!(rx.recv().await.is_none());
         }
     }
 }
