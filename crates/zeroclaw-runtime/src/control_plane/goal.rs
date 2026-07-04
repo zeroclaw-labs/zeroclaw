@@ -637,6 +637,12 @@ pub struct GoalAdmission {
     pub status: TaskStatus,
     /// Localized user-visible status/error text.
     pub message: String,
+    /// Untrusted operator text to include in the next continuation prompt.
+    ///
+    /// This is transient controller output for `/goal resume [reason]`, not
+    /// durable lifecycle state. It must not be persisted into task or goal
+    /// rows.
+    pub continuation_reason: Option<String>,
     /// Whether the channel runtime should synthesize a continuation prompt.
     pub continue_goal: bool,
 }
@@ -1216,6 +1222,7 @@ pub async fn admit_goal_command(
             task_id: None,
             status: TaskStatus::Running,
             message: msg("goal-command-help", &[]),
+            continuation_reason: None,
             continue_goal: false,
         });
     }
@@ -1298,11 +1305,13 @@ pub async fn admit_goal_command(
             .await
         }
         GoalCommandAction::Resume => {
+            let resume_reason = command.resume_reason;
             resume_goal(
                 cp.store.as_ref(),
                 cp.goal_store.as_ref(),
                 &cp.boot_id,
                 &ctx,
+                resume_reason,
                 Some(config),
             )
             .await
@@ -1416,6 +1425,7 @@ pub async fn evaluate_goal_turn_with_verifier(
                     "goal-command-completed",
                     &[("task_id", &task_id), ("budget", &budget)],
                 ),
+                continuation_reason: None,
                 continue_goal: false,
             };
             publish_goal_state_update(&admission);
@@ -1450,6 +1460,7 @@ pub async fn evaluate_goal_turn_with_verifier(
                     "goal-command-continuing",
                     &[("task_id", &task_id), ("budget", &budget)],
                 ),
+                continuation_reason: None,
                 continue_goal: true,
             };
             publish_goal_state_update(&admission);
@@ -1620,6 +1631,7 @@ async fn start_goal(
         task_id: Some(task_id.clone()),
         status,
         message,
+        continuation_reason: None,
         continue_goal,
     })
 }
@@ -1638,6 +1650,7 @@ async fn status_goal(
         task_id: Some(task_goal.task_id().to_string()),
         status: task_goal.status(),
         message: task_goal_status_message(&task_goal, &budget),
+        continuation_reason: None,
         continue_goal: false,
     })
 }
@@ -1696,6 +1709,7 @@ async fn update_goal_budget(
                 "goal-command-budget-updated-paused",
                 &[("task_id", &task_id), ("budget", &budget)],
             ),
+            continuation_reason: None,
             continue_goal: false,
         });
     }
@@ -1728,6 +1742,7 @@ async fn update_goal_budget(
                 task_id: Some(task_id.clone()),
                 status: TaskStatus::Paused,
                 message,
+                continuation_reason: None,
                 continue_goal: false,
             });
         }
@@ -1748,6 +1763,7 @@ async fn update_goal_budget(
                 "goal-command-budget-updated-resumed",
                 &[("task_id", &task_id), ("budget", &budget)],
             ),
+            continuation_reason: None,
             continue_goal: true,
         });
     }
@@ -1759,6 +1775,7 @@ async fn update_goal_budget(
             "goal-command-budget-updated",
             &[("task_id", &task_id), ("budget", &budget)],
         ),
+        continuation_reason: None,
         continue_goal: false,
     })
 }
@@ -1799,6 +1816,7 @@ async fn update_goal_objective(
                 ("budget", &budget),
             ],
         ),
+        continuation_reason: None,
         continue_goal: false,
     })
 }
@@ -1844,6 +1862,7 @@ async fn pause_goal_for_resolved_task_with_budget(
         task_id: Some(task_id.clone()),
         status: TaskStatus::Paused,
         message: msg(message_key, &[("task_id", &task_id), ("budget", &budget)]),
+        continuation_reason: None,
         continue_goal: false,
     })
 }
@@ -1875,6 +1894,7 @@ async fn resume_goal(
     goal_store: &dyn GoalTaskRegistry,
     boot_id: &str,
     ctx: &GoalAdmissionContext,
+    resume_reason: Option<String>,
     config: Option<&Config>,
 ) -> Result<GoalAdmission> {
     let current = resolve_goal(store, goal_store, ctx, None).await?;
@@ -1904,6 +1924,7 @@ async fn resume_goal(
             task_id: Some(task_id.clone()),
             status: TaskStatus::Paused,
             message: msg(message_key, &[("task_id", &task_id), ("budget", &budget)]),
+            continuation_reason: None,
             continue_goal: false,
         });
     }
@@ -1924,6 +1945,7 @@ async fn resume_goal(
             "goal-command-resumed",
             &[("task_id", &task_id), ("budget", &budget)],
         ),
+        continuation_reason: resume_reason,
         continue_goal: true,
     })
 }
@@ -1965,6 +1987,7 @@ async fn cancel_goal(
             "goal-command-cancelled",
             &[("task_id", &task_id), ("budget", &budget)],
         ),
+        continuation_reason: None,
         continue_goal: false,
     })
 }
@@ -2034,6 +2057,7 @@ pub async fn admit_goal_autonomous_turn(
             task_id: Some(resolved.task_id().to_string()),
             status: resolved.status(),
             message: task_goal_status_message(&resolved, &budget),
+            continuation_reason: None,
             continue_goal: false,
         }));
     }
@@ -2188,6 +2212,7 @@ mod tests {
     fn test_config() -> Config {
         let mut config = Config::default();
         config.cost.enabled = false;
+        config.goal.enabled = true;
         config
     }
 
@@ -2798,6 +2823,7 @@ mod tests {
             task_id: Some("goal-1".into()),
             status: TaskStatus::Running,
             message: "Goal `goal-1` started.".into(),
+            continuation_reason: None,
             continue_goal: true,
         };
 
@@ -3946,7 +3972,7 @@ mod tests {
         assert_eq!(goal.pause_reason, Some(GoalPauseReason::NeedsUserInput));
         assert_eq!(goal.blockers.len(), 1);
 
-        let resumed = resume_goal(&store, &store, "boot-resumed", &ctx, None)
+        let resumed = resume_goal(&store, &store, "boot-resumed", &ctx, None, None)
             .await
             .unwrap();
         assert_eq!(resumed.status, TaskStatus::Running);
@@ -3955,6 +3981,64 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Running);
         assert_eq!(task.owner_boot_id, "boot-resumed");
         assert!(goal.pause_reason.is_none());
+        assert!(goal.blockers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resume_reason_survives_as_transient_continuation_input_only() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let ctx = GoalAdmissionContext::new("agent-a");
+        let started = start_goal(
+            &store,
+            "boot-a",
+            ctx.clone(),
+            "ship it".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let task_id = started.task_id.clone().unwrap();
+
+        pause_goal_for_blocker(
+            &store,
+            &store,
+            &ctx,
+            Some(task_id.clone()),
+            None,
+            GoalPauseState {
+                reason: GoalPauseReason::NeedsUserInput,
+                description: Some("need answer".into()),
+                blockers: vec![GoalBlocker {
+                    kind: GoalBlockerKind::NeedsUserInput,
+                    message: "Need operator answer".into(),
+                    payload: Some(serde_json::json!({"prompt": "continue?"})),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+        let resumed = resume_goal(
+            &store,
+            &store,
+            "boot-resumed",
+            &ctx,
+            Some("operator confirmed the external deploy is healthy".into()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(resumed.continue_goal);
+        assert_eq!(
+            resumed.continuation_reason.as_deref(),
+            Some("operator confirmed the external deploy is healthy")
+        );
+        let goal = store.get_goal_task(&task_id).await.unwrap().unwrap();
+        assert!(goal.pause_reason.is_none());
+        assert!(goal.pause_description.is_none());
         assert!(goal.blockers.is_empty());
     }
 

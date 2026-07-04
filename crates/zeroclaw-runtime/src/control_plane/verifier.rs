@@ -225,16 +225,20 @@ fn verifier_provider_ref(config: &Config, agent_alias: &str) -> Result<String> {
 
 fn parse_verifier_decision(text: &str) -> GoalVerifierDecision {
     let trimmed = text.trim();
-    let first_line = trimmed.lines().next().unwrap_or("").trim().to_lowercase();
-    if first_line.starts_with("complete") {
-        return GoalVerifierDecision::Complete {
-            notes: trimmed.to_string(),
-        };
-    }
-    if first_line.starts_with("continue") {
-        return GoalVerifierDecision::Continue {
-            notes: trimmed.to_string(),
-        };
+    let first_line = trimmed.lines().next().unwrap_or("").trim();
+    match first_line {
+        "COMPLETE" => {
+            return GoalVerifierDecision::Complete {
+                notes: trimmed.to_string(),
+            };
+        }
+        "CONTINUE" => {
+            return GoalVerifierDecision::Continue {
+                notes: trimmed.to_string(),
+            };
+        }
+        "BLOCKED" => {}
+        _ => {}
     }
 
     let message = if trimmed.is_empty() {
@@ -308,12 +312,36 @@ mod tests {
             parse_verifier_decision("CONTINUE\nmore autonomous work remains"),
             GoalVerifierDecision::Continue { .. }
         ));
+        let GoalVerifierDecision::Blocked { pause } =
+            parse_verifier_decision("BLOCKED\noperator input required")
+        else {
+            panic!("explicit blocked decision must block");
+        };
+        assert_eq!(pause.reason, GoalPauseReason::VerifierBlocked);
+        assert_eq!(pause.blockers[0].kind, GoalBlockerKind::Verifier);
         let GoalVerifierDecision::Blocked { pause } = parse_verifier_decision("Looks done to me")
         else {
             panic!("non-explicit decision must block");
         };
         assert_eq!(pause.reason, GoalPauseReason::VerifierBlocked);
         assert_eq!(pause.blockers[0].kind, GoalBlockerKind::Verifier);
+    }
+
+    #[test]
+    fn verifier_decision_parser_rejects_lookalike_prefixes() {
+        for output in [
+            "complete-ish\nprobably done",
+            "COMPLETED\nprobably done",
+            "continue-ish\nmore work",
+            "CONTINUED\nmore work",
+            "Complete\nmixed case is not the token",
+        ] {
+            let GoalVerifierDecision::Blocked { pause } = parse_verifier_decision(output) else {
+                panic!("lookalike verifier token must block: {output:?}");
+            };
+            assert_eq!(pause.reason, GoalPauseReason::VerifierBlocked);
+            assert_eq!(pause.blockers[0].kind, GoalBlockerKind::Verifier);
+        }
     }
 
     #[test]

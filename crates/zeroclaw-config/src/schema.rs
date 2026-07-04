@@ -3736,7 +3736,7 @@ pub struct GoalConfig {
     ///
     /// When false, every goal surface must reject `/goal` and model-initiated
     /// goal starts before mutating control-plane state.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enabled: bool,
     /// Emit goal state/status updates into channel threads when goal admission
     /// happens inside a channel turn.
@@ -3785,7 +3785,7 @@ pub struct GoalConfig {
 impl Default for GoalConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             channel_status_updates: true,
             restart_recovery: GoalRestartRecovery::default(),
             allowed_command_surfaces: default_goal_allowed_command_surfaces(),
@@ -21944,7 +21944,12 @@ enabled = false
 
     #[test]
     async fn goal_config_defaults_allow_mention_capable_channels() {
-        let allowed = Config::default().goal.allowed_channel_types;
+        let goal = Config::default().goal;
+        assert!(
+            !goal.enabled,
+            "goal mode must remain opt-in while the feature is experimental"
+        );
+        let allowed = goal.allowed_channel_types;
         for channel_type in [
             "discord",
             "irc",
