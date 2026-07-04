@@ -1,0 +1,237 @@
+# Parity data for the ZeroClaw / OpenClaw / Hermes comparison columns of the
+# feature-and-support matrix. The ZeroClaw column is NOT here: it is walked from
+# the code registries at generation time. This file carries only the two
+# external columns the binary has no knowledge of.
+#
+# Regenerate the page with `cargo generate docs`; drift is gated in CI with
+# `cargo generate docs --check`. A walked ZeroClaw row with no entry here renders
+# `Unknown` in the external columns; fill it in as parity is confirmed. A key
+# here that the source walk no longer produces is a hard error.
+#
+# Status vocabulary matches the page legend: supported | partial | experimental
+# | planned | none | unknown.
+#
+# Sources (checked 2026-07-04):
+#   OpenClaw channels: https://docs.openclaw.ai/channels
+#   Hermes channels/providers: https://hermesagents.net/integrations
+# OpenClaw does not publish a per-slot provider or per-tool inventory in a form
+# that maps cleanly onto ZeroClaw's registries, so those columns stay `unknown`
+# rather than guessed. Update as authoritative sources are confirmed.
+
+# ── Channels ────────────────────────────────────────────────────────────────
+
+[channels.telegram]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.discord]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.slack]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.mattermost]
+openclaw = "supported"
+hermes = "none"
+
+[channels.imessage]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.matrix]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.signal]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.whatsapp]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.whatsapp-web]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.linq]
+openclaw = "none"
+hermes = "none"
+
+[channels.wati]
+openclaw = "none"
+hermes = "none"
+
+[channels.nextcloud]
+openclaw = "supported"
+hermes = "none"
+
+[channels.email]
+openclaw = "none"
+hermes = "supported"
+
+[channels.gmail-push]
+openclaw = "none"
+hermes = "none"
+
+[channels.twitch]
+openclaw = "supported"
+hermes = "none"
+
+[channels.irc]
+openclaw = "supported"
+hermes = "none"
+
+[channels.lark]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.dingtalk]
+openclaw = "none"
+hermes = "none"
+
+[channels.wecom]
+openclaw = "none"
+hermes = "supported"
+
+[channels.wecom-ws]
+openclaw = "none"
+hermes = "supported"
+
+[channels.wechat]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.qq]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.nostr]
+openclaw = "supported"
+hermes = "none"
+
+[channels.clawdtalk]
+openclaw = "none"
+hermes = "none"
+
+[channels.reddit]
+openclaw = "none"
+hermes = "none"
+
+[channels.bluesky]
+openclaw = "none"
+hermes = "none"
+
+[channels.twitter]
+openclaw = "none"
+hermes = "none"
+
+[channels.mochat]
+openclaw = "none"
+hermes = "none"
+
+[channels.line]
+openclaw = "supported"
+hermes = "supported"
+
+[channels.voice-call]
+openclaw = "supported"
+hermes = "none"
+
+[channels.voice-wake]
+openclaw = "none"
+hermes = "none"
+
+[channels.mqtt]
+openclaw = "none"
+hermes = "none"
+
+[channels.amqp]
+openclaw = "none"
+hermes = "none"
+
+[channels.filesystem]
+openclaw = "none"
+hermes = "none"
+
+[channels.webhook]
+openclaw = "partial"
+hermes = "none"
+
+# ── Provider slots ──────────────────────────────────────────────────────────
+# Hermes values reflect its README/integrations provider list; native adapters
+# are `supported`, OpenAI-compatible-only families are `partial` (reachable as a
+# custom endpoint but not a first-party adapter). OpenClaw provider parity is not
+# published per-slot, so it stays `unknown`.
+
+[providers.openai]
+openclaw = "unknown"
+hermes = "supported"
+
+[providers.anthropic]
+openclaw = "unknown"
+hermes = "supported"
+
+[providers.gemini]
+openclaw = "unknown"
+hermes = "supported"
+
+[providers.xai]
+openclaw = "unknown"
+hermes = "supported"
+
+[providers.openrouter]
+openclaw = "unknown"
+hermes = "supported"
+
+[providers.novita]
+openclaw = "unknown"
+hermes = "supported"
+
+[providers.nvidia]
+openclaw = "unknown"
+hermes = "supported"
+
+[providers.glm]
+openclaw = "unknown"
+hermes = "supported"
+
+[providers.moonshot]
+openclaw = "unknown"
+hermes = "supported"
+
+[providers.minimax]
+openclaw = "unknown"
+hermes = "supported"
+
+[providers.mistral]
+openclaw = "unknown"
+hermes = "partial"
+
+[providers.huggingface]
+openclaw = "unknown"
+hermes = "supported"
+
+[providers.deepseek]
+openclaw = "unknown"
+hermes = "partial"
+
+[providers.perplexity]
+openclaw = "unknown"
+hermes = "partial"
+
+[providers.ollama]
+openclaw = "unknown"
+hermes = "supported"
+
+[providers.custom]
+openclaw = "unknown"
+hermes = "supported"
+
+# ── Default tools ───────────────────────────────────────────────────────────
+# The default tool set is generic runtime capability (shell, file, memory,
+# scheduling). Both runtimes ship equivalents, but neither publishes a mapping
+# against ZeroClaw's exact tool names, so these stay `unknown` pending a
+# confirmed source rather than an assumed match.

@@ -7,6 +7,7 @@
 pub mod container;
 pub mod container_base;
 pub mod docker_tags;
+pub mod docs;
 pub mod flake;
 pub mod install_sh;
 pub mod packaging;
@@ -120,6 +121,31 @@ pub fn features(selection_id: &str) -> anyhow::Result<()> {
         })?;
     let list = spec::resolve_feature_list(&workspace_root(), selection)?;
     println!("{}", list.join(","));
+    Ok(())
+}
+
+/// Regenerate documentation surfaces walked from the code registries. Today
+/// this is the feature-and-support matrix; add a row per surface as they land.
+pub fn docs(check: bool) -> anyhow::Result<()> {
+    let root = workspace_root();
+    let file = "docs/book/src/reference/feature-matrix.md";
+    let path = root.join(file);
+    let current = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::Error::msg(format!("{}: {e}", path.display())))?;
+    let rendered = docs::render_file(&root, &current)?;
+    if check {
+        if current != rendered {
+            anyhow::bail!(
+                "DRIFT: {file} is out of sync with the code registries; run `cargo generate docs`"
+            );
+        }
+        println!("ok: feature-matrix in sync");
+    } else if current != rendered {
+        std::fs::write(&path, rendered)?;
+        println!("wrote {}", path.display());
+    } else {
+        println!("unchanged {}", path.display());
+    }
     Ok(())
 }
 
