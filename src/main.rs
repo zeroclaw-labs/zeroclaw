@@ -2635,16 +2635,24 @@ async fn seed_plugin_entry(config: &mut crate::config::schema::Config, name: &st
 /// silently: `config get` showed defaults while the file said otherwise. See
 /// zeroclaw-labs/zeroclaw#8636.
 fn warn_degraded_config_sections(config: &Config) {
-    for path in &config.degraded_sections {
+    for section in config
+        .degraded_sections
+        .iter()
+        .chain(config.degraded_security.iter())
+    {
         eprintln!(
-            "warning: config section `[{path}]` in {} is malformed and was ignored; the values shown/used are DEFAULTS, not what the file says. Run `zeroclaw config migrate` to see the parse error.",
-            config.config_path.display()
-        );
-    }
-    for path in &config.degraded_security {
-        eprintln!(
-            "error: SECURITY-CRITICAL config section `{path}` in {} is malformed and was reset to defaults; the running posture may be weaker than intended. Run `zeroclaw config migrate` to see the parse error.",
-            config.config_path.display()
+            "{}",
+            ta(
+                "cli-config-section-degraded",
+                &[
+                    ("section", section),
+                    ("path", &config.config_path.display().to_string()),
+                ],
+                "warning: config section is malformed and was reset to defaults \
+                 for this run. Values in that section are NOT in effect. Run \
+                 `zeroclaw config migrate` to see the parse error, then repair \
+                 the file."
+            )
         );
     }
 }
