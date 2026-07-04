@@ -32,7 +32,7 @@ GitHub's default squash merge omits the PR number from the commit subject and fo
 
 ## Prerequisites
 
-Requires `gh` CLI ≥ 2.17.0 (for `--subject` and `--body` flags on `gh pr merge`). Verify with:
+Requires `gh` CLI ≥ 2.50.0 (for `--json name,state,bucket` on `gh pr checks`). Verify with:
 
 ```bash
 gh --version
@@ -56,7 +56,7 @@ Then fetch PR metadata:
 
 ```bash
 gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
-  --json number,title,headRefName,baseRefName,headRefOid,state,author,mergeable,mergeStateStatus,reviewDecision,updatedAt
+  --json number,title,headRefName,baseRefName,headRefOid,state,author,mergeable,mergeStateStatus,reviewDecision
 ```
 
 Save `headRefOid` as `$HEAD_SHA` for the confirmation and merge command.
@@ -99,11 +99,12 @@ gh pr checks "$NUMBER" --repo zeroclaw-labs/zeroclaw \
   --json name,state,bucket
 ```
 
-| State | Action |
+| Bucket value | Action |
 |---|---|
-| All required checks, including `CI Required Gate`, are in a passing bucket | Proceed to Step 1c |
-| Any required check is failing, cancelled, timed out, or action-required | Stop — report failing check names; do not merge |
-| Any required check is pending, queued, or in progress | Stop — tell user to wait for CI; offer to retry later |
+| `pass` for every required check, including the repo's required aggregate gate (currently `CI Required Gate`) | Proceed to Step 1c |
+| `fail` or `cancel` for any required check | Stop — report failing or cancelled check names; do not merge |
+| `pending` for any required check | Stop — tell user to wait for CI; offer to retry later |
+| `skipping` for any required check | Stop — report the skipped required check names and ask whether the skip is expected before proceeding |
 | No required checks are configured or returned | Warn and ask user whether to proceed |
 
 Do not merge on red CI unless the user explicitly overrides after seeing the failure list.
@@ -129,7 +130,8 @@ Use one of these freshness bases:
 3. **Exact merge-result smoke** — you locally construct or inspect the exact
    merge result that will be created, then run an appropriate compile/test smoke
    for the touched surface. Use this only after the user approves the validation
-   scope.
+   scope, and see the `BEHIND`/`UNSTABLE` constraint below before choosing it
+   over official CI.
 4. **Explicit stale-risk acceptance** — if checks or merge-result validation are
    stale or unavailable, tell the user exactly what is stale or unverified and
    get explicit approval to accept that risk for this PR.
