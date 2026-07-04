@@ -310,8 +310,14 @@ impl GithubApi {
     }
 
     /// `GET /repos/{owner}/{repo}/issues?since=…` — issues and PRs
-    /// (opening posts), oldest first. `since` filters on `updated_at`;
-    /// callers filter on `created_at` to ignore edits.
+    /// (opening posts plus close/merge transitions), oldest-updated first.
+    /// `since` filters on `updated_at`, so the stream is sorted by
+    /// `updated` and the caller advances its cursor on `updated_at` too
+    /// (see `fetch_issues`): sort, filter, and cursor share one dimension,
+    /// which is what guarantees the per-poll page cap cannot starve later
+    /// pages. Sorting by `created` instead let an old item whose
+    /// `updated_at` matches `since` but whose `created_at` predates the
+    /// cursor saturate the leading pages and stall the watermark forever.
     pub async fn list_issues_since(
         &self,
         token: &str,
@@ -319,7 +325,7 @@ impl GithubApi {
         since: DateTime<Utc>,
     ) -> Result<Vec<GhIssue>, GitChannelError> {
         let url = format!(
-            "{}/repos/{repo}/issues?since={}&state=all&sort=created&direction=asc&per_page=100",
+            "{}/repos/{repo}/issues?since={}&state=all&sort=updated&direction=asc&per_page=100",
             self.base,
             since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         );
