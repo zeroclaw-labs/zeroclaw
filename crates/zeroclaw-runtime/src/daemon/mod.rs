@@ -912,9 +912,26 @@ where
         let mut backoff = initial_backoff_secs.max(1);
         let max_backoff = max_backoff_secs.max(backoff);
 
+        // A run is only treated as "stable" (and therefore allowed to reset
+        // the backoff) if the component stayed up for at least this long. A
+        // component that returns almost immediately — whether `Ok(())` or
+        // `Err` — is a fast-fail: resetting the backoff on those makes the
+        // supervisor hot-loop at `initial_backoff` forever.
+        //
+        // That hot loop is the root cause of #5542: on WSL2, glibc's malloc
+        // retains freed arenas per worker thread rather than returning them to
+        // the OS, so a ~1/sec restart storm churns allocations that never get
+        // reclaimed and RSS climbs until the kernel OOM-kills the process. A
+        // component that exits promptly must therefore back off exponentially,
+        // exactly like an erroring one, instead of spinning.
+        let stable_run = Duration::from_secs(initial_backoff_secs.max(1).saturating_mul(5));
+
         loop {
             crate::health::mark_component_ok(name);
-            match run_component().await {
+            let run_started = std::time::Instant::now();
+            let outcome = run_component().await;
+            let ran_for = run_started.elapsed();
+            match outcome {
                 Ok(()) => {
                     // Distinguish cooperative shutdown (cancel signal
                     // fired) from an unexpected `Ok(())` early return.
@@ -949,11 +966,20 @@ where
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"name": name})),
+                            .with_attrs(::serde_json::json!({
+                                "name": name,
+                                "ran_for_secs": ran_for.as_secs(),
+                            })),
                         &format!("Daemon component '{name}' exited unexpectedly")
                     );
-                    // Clean exit — reset backoff since the component ran successfully
-                    backoff = initial_backoff_secs.max(1);
+                    // Only reset the backoff if the component actually stayed
+                    // up for a meaningful stretch. A component that returns
+                    // `Ok(())` almost immediately is a fast-fail restart storm,
+                    // not a healthy run — resetting here would pin the backoff
+                    // at `initial_backoff` and hot-loop the supervisor (#5542).
+                    if ran_for >= stable_run {
+                        backoff = initial_backoff_secs.max(1);
+                    }
                 }
                 Err(e) => {
                     crate::health::mark_component_error(name, e.to_string());
@@ -961,15 +987,30 @@ where
                         ERROR,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(
-                                ::serde_json::json!({"error": format!("{}", e), "name": name})
-                            ),
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{}", e),
+                                "name": name,
+                                "ran_for_secs": ran_for.as_secs(),
+                            })),
                         &format!("Daemon component '{name}' failed: {e}")
                     );
+                    // A long-lived run that eventually errors is not a
+                    // fast-fail loop; let it reset so a component that ran fine
+                    // for hours and then hit a transient error retries quickly
+                    // rather than inheriting a huge stale backoff.
+                    if ran_for >= stable_run {
+                        backoff = initial_backoff_secs.max(1);
+                    }
                 }
             }
 
             crate::health::bump_component_restart(name);
+            // Return any arena pages the just-exited component freed back to
+            // the kernel before we sleep. On WSL2 with glibc, freed allocations
+            // linger in per-thread arenas and keep RSS pinned; without this a
+            // restart loop's transient allocations accumulate into an OOM
+            // (#5542). No-op off Linux/glibc.
+            crate::util::release_freed_heap();
             tokio::time::sleep(Duration::from_secs(backoff)).await;
             // Double backoff AFTER sleeping so first error uses initial_backoff
             backoff = backoff.saturating_mul(2).min(max_backoff);
@@ -2037,6 +2078,47 @@ mod tests {
             component["restart_count"].as_u64().unwrap_or(0),
             0,
             "cooperative shutdown must not trigger a restart; got snapshot: {component}"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_backs_off_on_fast_ok_exit_loop() {
+        // Regression for #5542: a component that returns `Ok(())` almost
+        // immediately must NOT hot-loop at `initial_backoff` forever. Before
+        // the fix, every unexpected `Ok(())` reset the backoff, so the
+        // supervisor restarted ~1/sec indefinitely — on WSL2 that restart
+        // storm churned glibc arena allocations into an OOM.
+        //
+        // With exponential backoff applied to fast-fail `Ok(())` exits, the
+        // restart count over a fixed window is bounded: 1s + 2s + 4s ... means
+        // only a couple of restarts fit into a few seconds, not dozens.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_inner = Arc::clone(&calls);
+        let handle =
+            spawn_component_supervisor("daemon-test-fastok", 1, 60, cancel.clone(), move || {
+                let calls = Arc::clone(&calls_inner);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    // Return immediately — the fast-fail case.
+                    Ok(())
+                }
+            });
+
+        // Let ~3.5s elapse. With exponential backoff the sleeps are
+        // 1s, 2s, 4s..., so at most ~3 invocations fit. Without the fix the
+        // supervisor would spin at 1s and rack up ~4+ (really unbounded).
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        let n = calls.load(Ordering::SeqCst);
+        assert!(
+            n <= 3,
+            "fast Ok(()) exits must back off exponentially, not hot-loop; got {n} invocations in 3.5s"
         );
     }
 
