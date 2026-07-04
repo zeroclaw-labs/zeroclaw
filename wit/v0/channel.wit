@@ -144,6 +144,15 @@ interface channel {
     /// Human-readable channel name.
     name: func() -> string;
 
+    /// Hand the plugin its resolved configuration section once at load time,
+    /// before any other call. `config` is a JSON object of the plugin's own
+    /// `[channels.<type>.<alias>]` settings, including secrets the host has
+    /// already decrypted. It is supplied only when the manifest grants
+    /// `config-read`; otherwise the host passes `"{}"`. This mirrors the
+    /// `__config` injection tool plugins receive, so a channel never has to
+    /// hardcode its field names into a host surface to be configured.
+    configure: func(config: string) -> result<_, string>;
+
     /// Send a message through this channel.
     send: func(message: send-message) -> result<_, string>;
 
@@ -297,7 +306,7 @@ interface channel {
 
 /// A component that exports `channel` is a messaging-platform channel plugin.
 ///
-/// Required (no Rust default): `name`, `send`, `poll-message`,
+/// Required (no Rust default): `name`, `configure`, `send`, `poll-message`,
 /// `get-channel-capabilities`.
 ///
 /// All other methods are capability-gated; see `channel-capabilities` for the
@@ -305,6 +314,7 @@ interface channel {
 @unstable(feature = plugins-wit-v0)
 world channel-plugin {
     import logging;
+    import inbound;
     export plugin-info;
     export channel;
 }

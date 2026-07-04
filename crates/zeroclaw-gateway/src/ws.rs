@@ -1410,6 +1410,7 @@ async fn process_chat_message(
                     let model_provider = state.model_provider.clone();
                     let model = state.model.clone();
                     let temperature = state.temperature;
+                    let memory_config = state.config.read().memory.clone();
                     let user_msg = content.to_string();
                     let assistant_resp = outcome.response.clone();
                     zeroclaw_spawn::spawn!(async move {
@@ -1418,6 +1419,7 @@ async fn process_chat_message(
                             &model,
                             temperature,
                             mem.as_ref(),
+                            &memory_config,
                             &user_msg,
                             &assistant_resp,
                         )

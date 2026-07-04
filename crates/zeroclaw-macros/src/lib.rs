@@ -53,7 +53,8 @@ fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
 ///
 /// # Attributes
 ///
-/// - `#[secret]` on a `String` or `Option<String>` field marks it as a secret.
+/// - `#[secret]` on a `String`, `Option<String>`, `PathBuf`, or
+///   `Option<PathBuf>` field marks it as a secret.
 /// - `#[nested]` on a nested struct or `Option<StructWithSecrets>` field
 ///   delegates secret discovery and setting to the child.
 /// - `#[prefix = "channels.matrix"]` on the struct sets the dotted path prefix.
@@ -332,14 +333,20 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             let is_hashmap_string_string = extract_hashmap_value_type(shape_ty)
                 .map(|inner| inner.to_token_stream().to_string() == "String")
                 .unwrap_or(false);
+            let is_path_buf = shape_ty.to_token_stream().to_string() == "PathBuf";
             if !is_vec_string && !is_hashmap_string_string {
+                let value_expr = if is_path_buf {
+                    quote! { std::path::PathBuf::from(value) }
+                } else {
+                    quote! { value }
+                };
                 if is_option {
                     set_arms.push(quote! {
-                        #full_name_lit => { self.#field_ident = Some(value); Ok(()) }
+                        #full_name_lit => { self.#field_ident = Some(#value_expr); Ok(()) }
                     });
                 } else {
                     set_arms.push(quote! {
-                        #full_name_lit => { self.#field_ident = value; Ok(()) }
+                        #full_name_lit => { self.#field_ident = #value_expr; Ok(()) }
                     });
                 }
             } else if is_hashmap_string_string {

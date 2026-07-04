@@ -26,12 +26,12 @@ sequenceDiagram
     participant CH as Channel
     participant RT as Runtime
     participant SEC as Security
-    participant MEM as Memory
+    participant MEM as Memory / history
     participant PR as Provider
     participant TL as Tool
 
     CH->>RT: process_message(envelope)
-    RT->>MEM: load_context(conversation_id)
+    RT->>MEM: load_context(session + recalled memory)
     MEM-->>RT: prior messages + retrieved facts
     RT->>PR: chat(system, history, tools)
     loop Streaming
@@ -51,11 +51,11 @@ sequenceDiagram
     end
     RT->>TL: invoke(args)
     TL-->>RT: ToolResult
-    RT->>MEM: append(tool_call, tool_result)
+    RT->>MEM: append to turn/session history
     RT->>PR: chat(..., + tool_result)
     PR-->>RT: StreamEvent::TextDelta (final)
     RT-->>CH: reply(final)
-    RT->>MEM: persist(conversation)
+    RT->>MEM: persist conversation/session history
 ```
 
 Key properties:
@@ -63,11 +63,11 @@ Key properties:
 - **Streaming is end-to-end.** The provider streams tokens. If the channel adapter reports `supports_draft_updates()`, the runtime edits a sent message in place as text arrives. Discord, Slack, and Telegram support this.
 - **Tool calls are mid-stream.** The model can emit a tool call while still generating text. The runtime pauses the stream, validates, invokes, feeds the result back, and resumes.
 - **Security gates every tool call.** `evaluate_tool_access` consults the [autonomy level](../security/autonomy.md), allow/deny lists, and path boundaries. Medium-risk calls under `Supervised` autonomy go to the operator-approval path.
-- **Memory is persistent.** The conversation, tool calls, and tool results are written to the memory backend. (Receipts ride in-band in the conversation text rather than as a separate persisted artifact.)
+- **History and memory are separate.** Session history preserves conversation, tool-call, and tool-result continuity. Explicit memory writes persist selected entries in the memory backend. Receipts ride in-band in the conversation text rather than as a separate persisted artifact. For payload ownership details, see [Memory and payload lifecycle](./memory-payload-lifecycle.md).
 
 ## Tool receipts
 
-Every tool invocation produces an HMAC-SHA256 receipt that is appended to the tool-result text and passed back to the model in the conversation, proving the tool actually ran. The HMAC is keyed by a per-daemon-process key and computed over `tool_name || args || result || timestamp`. Receipts are not written to a separate on-disk log and are not chained; the model can echo them but cannot forge a new valid one without the key. See [Tool receipts](../security/tool-receipts.md).
+Successful tool executions can receive an HMAC-SHA256 receipt that is appended to the tool-result text and passed back to the model in the conversation, proving the signed result came from the runtime. The HMAC is keyed by an ephemeral in-memory key and computed over `tool_name || args || result || timestamp`. Receipts are not written to a separate on-disk log and are not chained; the model can echo them but cannot forge a new valid one without the key. See [Tool receipts](../security/tool-receipts.md).
 
 ## Outbound
 

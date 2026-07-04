@@ -40,36 +40,67 @@ pub trait OperatorIo: Send {
     async fn say(&mut self, text: &str) -> TransportResult<()>;
     async fn hear(&mut self) -> TransportResult<String>;
 
-    /// Ask a yes/no question as a typed selection. The prompt renders the two
-    /// `YesNoAnswer` tokens and only a typed token is accepted; anything else
-    /// re-asks. Confirmation is never inferred from free-text sentiment.
-    async fn ask_user_yes_no(&mut self, question: &str) -> TransportResult<bool> {
-        let rendered = format!("{question} [{}]", YesNoAnswer::tokens().join(", "));
+    /// Ask a fixed set of typed options, rendered in the same numbered-choice
+    /// style as the `ask_user` tool: the question, a numbered list, and a
+    /// reply-with-a-number-or-the-token hint. The reply resolves to exactly one
+    /// option (by 1-based number or by typing its token); anything else
+    /// re-asks. Selection is never inferred from free-text sentiment.
+    async fn ask_user_choice(
+        &mut self,
+        question: &str,
+        options: &[&'static str],
+    ) -> TransportResult<&'static str> {
+        let rendered = format_choice_prompt(question, options);
         loop {
             self.say(&rendered).await?;
             let reply = self.hear().await?;
-            if let Ok(answer) = reply.trim().parse::<YesNoAnswer>() {
-                return Ok(answer.as_bool());
+            if let Some(choice) = resolve_choice(reply.trim(), options) {
+                return Ok(choice);
             }
         }
     }
 
+    /// Ask a yes/no question as a typed selection over `YesNoAnswer` tokens.
+    async fn ask_user_yes_no(&mut self, question: &str) -> TransportResult<bool> {
+        let picked = self
+            .ask_user_choice(question, &YesNoAnswer::tokens())
+            .await?;
+        Ok(picked == YesNoAnswer::Yes.as_str())
+    }
+
     /// Ask the operator to rule on an apply-preview as a typed three-way
-    /// selection (`apply` / `revise` / `cancel`). Only a typed token is
-    /// accepted; anything else re-asks. No free-text approval scanning.
+    /// selection (`apply` / `revise` / `cancel`).
     async fn ask_user_preview_verdict(
         &mut self,
         question: &str,
     ) -> TransportResult<PreviewVerdict> {
-        let rendered = format!("{question} [{}]", PreviewVerdict::tokens().join(", "));
-        loop {
-            self.say(&rendered).await?;
-            let reply = self.hear().await?;
-            if let Ok(verdict) = reply.trim().parse::<PreviewVerdict>() {
-                return Ok(verdict);
-            }
-        }
+        let picked = self
+            .ask_user_choice(question, &PreviewVerdict::tokens())
+            .await?;
+        Ok(picked
+            .parse::<PreviewVerdict>()
+            .expect("resolve_choice returns an owned option token"))
     }
+}
+
+/// Render a fixed choice set the way the `ask_user` tool does: the question,
+/// a numbered list, and the number-or-token hint.
+fn format_choice_prompt(question: &str, options: &[&str]) -> String {
+    let mut lines = vec![question.to_string(), String::new()];
+    for (i, opt) in options.iter().enumerate() {
+        lines.push(format!("{}. {opt}", i + 1));
+    }
+    lines.push(String::new());
+    lines.push("Reply with a number or the option word.".to_string());
+    lines.join("\n")
+}
+
+/// Resolve a reply to exactly one option: a 1-based number or the typed token.
+fn resolve_choice(reply: &str, options: &[&'static str]) -> Option<&'static str> {
+    if let Ok(n) = reply.parse::<usize>() {
+        return options.get(n.checked_sub(1)?).copied();
+    }
+    options.iter().find(|opt| **opt == reply).copied()
 }
 
 /// Terminal operator: guide speaks on stdout, operator replies on stdin.
@@ -240,6 +271,26 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use zeroclaw_runtime::flow::TransportError;
+
+    #[test]
+    fn resolve_choice_accepts_number_or_token_and_rejects_the_rest() {
+        let opts = PreviewVerdict::tokens();
+        assert_eq!(resolve_choice("1", &opts), Some("apply"));
+        assert_eq!(resolve_choice("3", &opts), Some("cancel"));
+        assert_eq!(resolve_choice("revise", &opts), Some("revise"));
+        for reject in ["0", "4", "-1", "app", "yes", "sure, apply it", ""] {
+            assert_eq!(resolve_choice(reject, &opts), None, "rejects {reject:?}");
+        }
+    }
+
+    #[test]
+    fn choice_prompt_renders_numbered_list_and_hint() {
+        let text = format_choice_prompt("Apply this?", &PreviewVerdict::tokens());
+        assert!(text.contains("1. apply"));
+        assert!(text.contains("2. revise"));
+        assert!(text.contains("3. cancel"));
+        assert!(text.contains("Reply with a number or the option word."));
+    }
 
     struct ScriptedTurn {
         replies: VecDeque<String>,
