@@ -2010,6 +2010,28 @@ fn set_scope_override(
     }
 }
 
+/// Per-sender authorization for `/model --agent <model>`. Resolves live
+/// from `Config::peer_groups` via `Config::channel_agent_scope_admins`;
+/// no cache, no per-channel duplicate sender list (consistent with
+/// `AGENTS.md` SINGLE SOURCE OF TRUTH). Default deny
+/// (`RequireExplicit`); operators who want the prior behavior opt in
+/// by marking one or more peer groups `admin_for_agent_scope = true`.
+/// See issue #8044.
+fn is_agent_scope_authorized(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    let channel_type = msg.channel.as_str();
+    let channel_alias = msg
+        .channel_alias
+        .as_deref()
+        .unwrap_or_else(|| msg.channel.as_str());
+    let admins = ctx
+        .prompt_config
+        .channel_agent_scope_admins(channel_type, channel_alias);
+    admins.iter().any(|s| s == msg.sender.as_str())
+}
+
 fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
     ctx.conversation_histories
         .lock()
@@ -2815,12 +2837,65 @@ async fn handle_runtime_command_if_needed(
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
                 "Model ID cannot be empty. Use `/model --user|--agent <model-id>`.".to_string()
+            } else if scope == OverrideScope::Agent
+                && !is_agent_scope_authorized(ctx, msg)
+            {
+                // Per-sender authorization gate for the `--agent` scope only.
+                // `/model --user` is unaffected. See issue #8044.
+                let channel_alias = msg
+                    .channel_alias
+                    .as_deref()
+                    .unwrap_or_else(|| msg.channel.as_str());
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "sender": msg.sender.as_str(),
+                            "agent": ctx.agent_alias.as_str(),
+                            "channel": msg.channel.as_str(),
+                            "channel_alias": channel_alias,
+                            "model_requested": model.as_str(),
+                            "command": "/model --agent",
+                        })),
+                    "agent-scope /model override rejected"
+                );
+                format!(
+                    "Sender `{sender}` is not authorized for `/model --agent` on \
+                     agent `{agent}`. Use `/model --user {model}` for a session-only \
+                     override, or ask an admin to mark a peer group \
+                     `admin_for_agent_scope = true` with you as a member.",
+                    sender = msg.sender,
+                    agent = ctx.agent_alias,
+                    model = model,
+                )
             } else {
                 // Resolve provider+model the same way bare `/model` does, then
                 // write it at the requested scope instead of the per-sender route.
                 let mut next = current.clone();
                 apply_model_ref(&mut next, &ctx.model_routes, &model);
                 set_scope_override(ctx, scope, msg, next.clone(), &defaults_snapshot);
+                if scope == OverrideScope::Agent {
+                    let channel_alias = msg
+                        .channel_alias
+                        .as_deref()
+                        .unwrap_or_else(|| msg.channel.as_str());
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Approve)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "sender": msg.sender.as_str(),
+                                "agent": ctx.agent_alias.as_str(),
+                                "channel": msg.channel.as_str(),
+                                "channel_alias": channel_alias,
+                                "model_provider": next.model_provider.as_str(),
+                                "model": next.model.as_str(),
+                                "command": "/model --agent",
+                            })),
+                        "agent-scope /model override accepted"
+                    );
+                }
                 let mut resp = format!(
                     "Model set to `{}` (model_provider: `{}`) for the **{}** scope. Session-only — resets on restart.",
                     next.model,
