@@ -143,7 +143,7 @@ impl Tool for LinkedInTool {
                 },
                 "generate_image": {
                     "type": "boolean",
-                    "description": "Generate an AI image for the post (requires [linkedin.image] config). Falls back to branded SVG card if all providers fail."
+                    "description": "Generate an AI image for the post (requires [linkedin.image] config). Falls back to branded SVG card if all model_providers fail."
                 },
                 "image_prompt": {
                     "type": "string",
@@ -159,10 +159,16 @@ impl Tool for LinkedInTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required 'action' parameter"))?;
+        let action = args.get("action").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "action"})),
+                "linkedin: missing action parameter"
+            );
+            anyhow::Error::msg("Missing required 'action' parameter")
+        })?;
 
         // Write actions require autonomy check
         if Self::is_write_action(action) && !self.security.can_act() {
@@ -236,10 +242,10 @@ impl Tool for LinkedInTool {
                         .unwrap_or_else(|| {
                             format!(
                                 "Professional, modern illustration for a LinkedIn post about: {}",
-                                if text.len() > 200 {
-                                    &text[..200]
+                                if text.chars().count() > 200 {
+                                    text.chars().take(200).collect::<String>()
                                 } else {
-                                    &text
+                                    text.to_string()
                                 }
                             )
                         });
@@ -277,7 +283,16 @@ impl Tool for LinkedInTool {
                         }
                         Err(e) => {
                             // Image generation failed entirely — post without image
-                            tracing::warn!("Image generation failed, posting without image: {e}");
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                "Image generation failed, posting without image"
+                            );
                         }
                     }
                 }

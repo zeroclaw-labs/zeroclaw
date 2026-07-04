@@ -21,20 +21,40 @@ impl ProxyConfigTool {
 
     fn load_config_without_env(&self) -> anyhow::Result<Config> {
         let contents = fs::read_to_string(&self.config.config_path).map_err(|error| {
-            anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config.config_path.display().to_string(),
+                        "error": format!("{}", error),
+                    })),
+                "proxy_config: failed to read config file"
+            );
+            anyhow::Error::msg(format!(
                 "Failed to read config file {}: {error}",
                 self.config.config_path.display()
-            )
+            ))
         })?;
 
         let mut parsed: Config = toml::from_str(&contents).map_err(|error| {
-            anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config.config_path.display().to_string(),
+                        "error": format!("{}", error),
+                    })),
+                "proxy_config: failed to parse config file"
+            );
+            anyhow::Error::msg(format!(
                 "Failed to parse config file {}: {error}",
                 self.config.config_path.display()
-            )
+            ))
         })?;
         parsed.config_path = self.config.config_path.clone();
-        parsed.workspace_dir = self.config.workspace_dir.clone();
+        parsed.data_dir = self.config.data_dir.clone();
         Ok(parsed)
     }
 
@@ -80,9 +100,16 @@ impl ProxyConfigTool {
         if let Some(array) = raw.as_array() {
             let mut out = Vec::new();
             for item in array {
-                let value = item
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("'{field}' array must only contain strings"))?;
+                let value = item.as_str().ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"field": field})),
+                        "proxy_config: array element must be a string"
+                    );
+                    anyhow::Error::msg(format!("'{field}' array must only contain strings"))
+                })?;
                 let trimmed = value.trim();
                 if !trimmed.is_empty() {
                     out.push(trimmed.to_string());
@@ -105,7 +132,16 @@ impl ProxyConfigTool {
 
         let value = raw
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("'{field}' must be a string or null"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"field": field})),
+                    "proxy_config: field must be a string or null"
+                );
+                anyhow::Error::msg(format!("'{field}' must be a string or null"))
+            })?
             .trim()
             .to_string();
 
@@ -161,7 +197,7 @@ impl ProxyConfigTool {
                 "usage_example": {
                     "action": "set",
                     "scope": "services",
-                    "services": ["provider.openai", "tool.http_request", "channel.telegram"]
+                    "services": ["model_provider.openai", "tool.http_request", "channel.telegram"]
                 }
             }))?,
             error: None,
@@ -175,17 +211,40 @@ impl ProxyConfigTool {
         let mut touched_proxy_url = false;
 
         if let Some(enabled) = args.get("enabled") {
-            proxy.enabled = enabled
-                .as_bool()
-                .ok_or_else(|| anyhow::anyhow!("'enabled' must be a boolean"))?;
+            proxy.enabled = enabled.as_bool().ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "enabled"})),
+                    "proxy_config: enabled must be boolean"
+                );
+                anyhow::Error::msg("'enabled' must be a boolean")
+            })?;
         }
 
         if let Some(scope_raw) = args.get("scope") {
-            let scope = scope_raw
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("'scope' must be a string"))?;
+            let scope = scope_raw.as_str().ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "scope"})),
+                    "proxy_config: scope must be string"
+                );
+                anyhow::Error::msg("'scope' must be a string")
+            })?;
             proxy.scope = Self::parse_scope(scope).ok_or_else(|| {
-                anyhow::anyhow!("Invalid scope '{scope}'. Use environment|zeroclaw|services")
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"scope": scope})),
+                    "proxy_config: invalid scope"
+                );
+                anyhow::Error::msg(format!(
+                    "Invalid scope '{scope}'. Use environment|zeroclaw|services"
+                ))
             })?;
         }
 
@@ -452,7 +511,7 @@ mod tests {
 
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
         let config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
@@ -470,7 +529,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.success);
-        assert!(result.output.contains("provider.openai"));
+        assert!(result.output.contains("model_provider.openai"));
         assert!(result.output.contains("tool.http_request"));
     }
 
@@ -509,7 +568,7 @@ mod tests {
                 "action": "set",
                 "scope": "services",
                 "http_proxy": "http://127.0.0.1:7890",
-                "services": ["provider.openai", "tool.http_request"]
+                "services": ["model_provider.openai", "tool.http_request"]
             }))
             .await
             .unwrap();
@@ -517,7 +576,7 @@ mod tests {
 
         let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
         assert!(get_result.success);
-        assert!(get_result.output.contains("provider.openai"));
+        assert!(get_result.output.contains("model_provider.openai"));
         assert!(get_result.output.contains("services"));
     }
 

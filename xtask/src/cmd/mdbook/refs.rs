@@ -2,15 +2,16 @@ use crate::util::*;
 use std::path::Path;
 use std::process::Command;
 
-pub fn run() -> anyhow::Result<()> {
+pub fn run(_tag: Option<&str>) -> anyhow::Result<()> {
     let root = repo_root();
     require_tool("cargo", "https://rustup.rs")?;
     build_refs(&root)?;
     build_api(&root)?;
-    let api_dest = book_dir(&root).join("book/api");
+    let api_dest = book_dir(&root).join("book").join("api");
     std::fs::create_dir_all(book_dir(&root).join("book"))?;
     let _ = std::fs::remove_dir_all(&api_dest);
-    copy_dir_all(root.join("target/doc"), &api_dest)?;
+    copy_dir_all(doc_dir(&root), &api_dest)?;
+    crate::cmd::mdbook::build::prune_rustdoc_source_view(&api_dest)?;
     println!(
         "==> API reference: {}",
         api_dest.join("index.html").display()
@@ -70,15 +71,11 @@ pub fn build_refs(root: &Path) -> anyhow::Result<()> {
 
 pub fn build_api(root: &Path) -> anyhow::Result<()> {
     println!("==> Generating rustdoc API reference");
+    let target = target_dir(root);
     run_cmd(
         Command::new("cargo")
-            .args([
-                "doc",
-                "--no-deps",
-                "--workspace",
-                "--exclude",
-                "zeroclaw-desktop",
-            ])
+            .args(["doc", "--no-deps", "--workspace", "--target-dir"])
+            .arg(&target)
             .current_dir(root),
     )
 }

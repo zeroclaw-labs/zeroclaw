@@ -83,9 +83,19 @@ impl BrowserDelegateTool {
     /// Only `http` and `https` schemes are permitted. Blocked domains take
     /// precedence over allowed domains when both lists contain the same entry.
     fn validate_url(&self, url: &str) -> anyhow::Result<()> {
-        let parsed = url
-            .parse::<reqwest::Url>()
-            .map_err(|e| anyhow::anyhow!("invalid URL '{}': {}", url, e))?;
+        let parsed = url.parse::<reqwest::Url>().map_err(|e| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "url": url,
+                        "error": format!("{}", e),
+                    })),
+                "browser_delegate: invalid URL"
+            );
+            anyhow::Error::msg(format!("invalid URL '{}': {}", url, e))
+        })?;
 
         // Only allow http/https schemes
         let scheme = parsed.scheme();

@@ -15,7 +15,11 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool_attribution;
+
+tool_attribution!(PicoFlashTool, ToolKind::Plugin);
 
 /// How long to wait for the Pico serial port after flashing (seconds).
 const PORT_WAIT_SECS: u64 = 20;
@@ -103,7 +107,12 @@ impl Tool for PicoFlashTool {
             }
         };
 
-        tracing::info!(mount = %mount.display(), "RPI-RP2 volume found");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"mount": mount.display().to_string()})),
+            "RPI-RP2 volume found"
+        );
 
         // ── 3. Ensure firmware files are extracted ────────────────────────
         let firmware_dir = match uf2::ensure_firmware_dir() {
@@ -150,7 +159,12 @@ impl Tool for PicoFlashTool {
             }
         };
 
-        tracing::info!(port = %port.display(), "Pico serial port online after UF2 flash");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"port": port.display().to_string()})),
+            "Pico serial port online after UF2 flash"
+        );
 
         let final_port = Some(port);
 
@@ -168,12 +182,32 @@ impl Tool for PicoFlashTool {
                         let alias = a.to_string();
                         reg.reconnect(&alias, Some(&port_str)).await
                     }
-                    None => Err(anyhow::anyhow!(
-                        "no pico alias found in registry; cannot reconnect transport"
-                    )),
+                    None => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"port": port_str})),
+                            "no pico alias in registry; cannot reconnect transport after flash"
+                        );
+                        Err(anyhow::Error::msg(
+                            "no pico alias found in registry; cannot reconnect transport",
+                        ))
+                    }
                 }
             }
-            None => Err(anyhow::anyhow!("no serial port to reconnect")),
+            None => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "pico reconnect skipped: no serial port"
+                );
+                Err(anyhow::Error::msg("no serial port to reconnect"))
+            }
         };
 
         // ── 7. Return result ──────────────────────────────────────────────
@@ -182,10 +216,23 @@ impl Tool for PicoFlashTool {
                 let port_str = p.display().to_string();
                 let reconnected = reconnect_result.is_ok();
                 if reconnected {
-                    tracing::info!(port = %port_str, "Pico online — transport reconnected");
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"port": port_str})),
+                        "Pico online — transport reconnected"
+                    );
                 } else {
                     let err = reconnect_result.unwrap_err();
-                    tracing::warn!(port = %port_str, err = %err, "Pico online but reconnect failed");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"port": port_str, "err": err.to_string()})
+                            ),
+                        "Pico online but reconnect failed"
+                    );
                 }
                 let suffix = if reconnected {
                     "pico0 is ready — you can use gpio_write immediately."

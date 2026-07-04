@@ -157,7 +157,7 @@ impl WasmRuntime {
 
         // Read module bytes
         let wasm_bytes = std::fs::read(&module_path)
-            .with_context(|| format!("Failed to read WASM module: {}", module_path.display()))?;
+            .with_context(|| format!("Failed to read WASM module: {}", module_path.display().to_string()))?;
 
         // Validate module size (sanity check)
         if wasm_bytes.len() > 50 * 1024 * 1024 {
@@ -260,7 +260,7 @@ impl WasmRuntime {
 
         let mut modules = Vec::new();
         for entry in std::fs::read_dir(&tools_path)
-            .with_context(|| format!("Failed to read tools dir: {}", tools_path.display()))?
+            .with_context(|| format!("Failed to read tools dir: {}", tools_path.display().to_string()))?
         {
             let entry = entry?;
             let path = entry.path();

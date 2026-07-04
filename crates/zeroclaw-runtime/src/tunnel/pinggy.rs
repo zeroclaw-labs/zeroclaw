@@ -71,14 +71,30 @@ impl Tunnel for PinggyTunnel {
 
         // Pinggy may print the tunnel URL to stdout or stderr depending on
         // SSH mode; read both streams concurrently to catch it either way.
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Failed to capture pinggy stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Failed to capture pinggy stderr"))?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(
+                        ::serde_json::json!({"tunnel_provider": "pinggy", "stream": "stdout"})
+                    ),
+                "tunnel process: failed to capture child stream"
+            );
+            anyhow::Error::msg("Failed to capture pinggy stdout")
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(
+                        ::serde_json::json!({"tunnel_provider": "pinggy", "stream": "stderr"})
+                    ),
+                "tunnel process: failed to capture child stream"
+            );
+            anyhow::Error::msg("Failed to capture pinggy stderr")
+        })?;
 
         let mut stdout_lines = tokio::io::BufReader::new(stdout).lines();
         let mut stderr_lines = tokio::io::BufReader::new(stderr).lines();
@@ -107,7 +123,12 @@ impl Tunnel for PinggyTunnel {
 
             match stream_line {
                 Ok(StreamLine::Stdout(Ok(Some(l))) | StreamLine::Stderr(Ok(Some(l)))) => {
-                    tracing::debug!("pinggy: {l}");
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"l": l})),
+                        "pinggy: "
+                    );
                     // Pinggy prints tunnel URLs like: https://xxxxx.a.free.pinggy.link
                     // Skip non-tunnel URLs (e.g. dashboard.pinggy.io promo links).
                     if let Some(idx) = l.find("https://") {

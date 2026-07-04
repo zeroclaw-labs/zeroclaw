@@ -185,7 +185,16 @@ fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
     let mut reader = std::io::BufReader::new(file);
     let key = rustls_pemfile::private_key(&mut reader)
         .with_context(|| format!("failed to parse private key from {path}"))?
-        .ok_or_else(|| anyhow::anyhow!("no private key found in {path}"))?;
+        .ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"path": path})),
+                "TLS private key file contains no key"
+            );
+            anyhow::Error::msg(format!("no private key found in {path}"))
+        })?;
     Ok(key)
 }
 

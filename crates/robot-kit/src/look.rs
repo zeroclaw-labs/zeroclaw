@@ -156,7 +156,7 @@ impl Tool for LookTool {
     async fn execute(&self, args: Value) -> Result<ToolResult> {
         let action = args["action"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing 'action' parameter"))?;
+            .ok_or_else(|| anyhow::Error::msg("Missing 'action' parameter"))?;
 
         // Capture image
         let image_path = match self.capture_image().await {
@@ -199,7 +199,7 @@ impl Tool for LookTool {
             }
             "find" => {
                 let target = args["prompt"].as_str().ok_or_else(|| {
-                    anyhow::anyhow!("'find' action requires 'prompt' specifying what to find")
+                    anyhow::Error::msg("'find' action requires 'prompt' specifying what to find")
                 })?;
 
                 let prompt = format!(

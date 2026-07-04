@@ -50,15 +50,30 @@ impl Tool for MemoryStoreTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let key = args
-            .get("key")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'key' parameter"))?;
+        let key = args.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "key"})),
+                "memory_store: missing key parameter"
+            );
+            anyhow::Error::msg("Missing 'key' parameter")
+        })?;
 
         let content = args
             .get("content")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'content' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "content"})),
+                    "memory_store: missing content parameter"
+                );
+                anyhow::Error::msg("Missing 'content' parameter")
+            })?;
 
         let category = match args.get("category").and_then(|v| v.as_str()) {
             Some("core") | None => MemoryCategory::Core,
@@ -107,7 +122,7 @@ mod tests {
 
     fn test_mem() -> (TempDir, Arc<dyn Memory>) {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         (tmp, Arc::new(mem))
     }
 

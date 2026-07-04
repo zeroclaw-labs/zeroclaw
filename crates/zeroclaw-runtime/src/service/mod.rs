@@ -8,6 +8,13 @@ use zeroclaw_config::schema::Config;
 const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
 const WINDOWS_TASK_NAME: &str = "ZeroClaw Daemon";
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SystemdUserLinger {
+    Enabled,
+    Disabled { user: String },
+    Unknown,
+}
+
 /// Supported init systems for service management
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InitSystem {
@@ -67,7 +74,7 @@ impl InitSystem {
 #[cfg(target_os = "linux")]
 fn detect_init_system() -> Result<InitSystem> {
     // Check for systemd first (most common on modern Linux)
-    if Path::new("/run/systemd/system").exists() {
+    if linux_systemd_runtime_present() {
         return Ok(InitSystem::Systemd);
     }
 
@@ -85,18 +92,100 @@ fn detect_init_system() -> Result<InitSystem> {
     );
 }
 
+pub(crate) fn linux_systemd_runtime_present() -> bool {
+    cfg!(target_os = "linux") && Path::new("/run/systemd/system").exists()
+}
+
 fn windows_task_name() -> &'static str {
     WINDOWS_TASK_NAME
 }
 
+fn linux_service_base(config: &Config) -> String {
+    let Some(dir_name) = config
+        .config_path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    else {
+        return "zeroclaw".to_string();
+    };
+    let base = dir_name.strip_prefix('.').unwrap_or(dir_name);
+    if base == "zeroclaw" {
+        return base.to_string();
+    }
+    if let Some(suffix) = base.strip_prefix("zeroclaw-")
+        && !suffix.is_empty()
+    {
+        return base.to_string();
+    }
+    "zeroclaw".to_string()
+}
+
+fn linux_systemd_unit(config: &Config) -> String {
+    format!("{}.service", linux_service_base(config))
+}
+
+fn linux_openrc_service(config: &Config) -> String {
+    linux_service_base(config)
+}
+
+fn ensure_linux_default_install_scope(config: &Config, action: &str) -> Result<()> {
+    let service = linux_service_base(config);
+    if service == "zeroclaw" {
+        return Ok(());
+    }
+
+    let config_dir = config
+        .config_path
+        .parent()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| config.config_path.display().to_string());
+    bail!(
+        "Linux service {action} only manages the default zeroclaw service. \
+         Config directory {config_dir} maps to named service {service}; \
+         provide that unit manually, then use service status/start/stop/restart/logs to manage it."
+    );
+}
+
+fn linux_systemd_action_args(config: &Config, action: &str) -> Vec<String> {
+    vec![
+        "--user".to_string(),
+        action.to_string(),
+        linux_systemd_unit(config),
+    ]
+}
+
+fn linux_openrc_action_args(config: &Config, action: &str) -> Vec<String> {
+    vec![linux_openrc_service(config), action.to_string()]
+}
+
+fn linux_journalctl_args(config: &Config, lines: usize, follow: bool) -> Vec<String> {
+    let mut args = vec![
+        "--user".to_string(),
+        "-u".to_string(),
+        linux_systemd_unit(config),
+        "-n".to_string(),
+        lines.to_string(),
+        "--no-pager".to_string(),
+    ];
+    if follow {
+        args.push("-f".to_string());
+    }
+    args
+}
+
+fn linux_openrc_log_dir(config: &Config) -> PathBuf {
+    Path::new("/var/log").join(linux_openrc_service(config))
+}
+
 /// Returns whether the ZeroClaw daemon service is currently running.
-pub fn is_running() -> bool {
+pub fn is_running(config: &Config) -> bool {
     if cfg!(target_os = "macos") {
         run_capture(Command::new("launchctl").arg("list"))
             .map(|out| out.lines().any(|l| l.contains(SERVICE_LABEL)))
             .unwrap_or(false)
     } else if cfg!(target_os = "linux") {
-        is_running_linux()
+        is_running_linux(config)
     } else if cfg!(target_os = "windows") {
         run_capture(Command::new("schtasks").args([
             "/Query",
@@ -112,15 +201,15 @@ pub fn is_running() -> bool {
     }
 }
 
-fn is_running_linux() -> bool {
+fn is_running_linux(config: &Config) -> bool {
     // Try systemd first, then OpenRC — mirrors detect_init_system() order
-    if run_capture(Command::new("systemctl").args(["--user", "is-active", "zeroclaw.service"]))
+    if run_capture(Command::new("systemctl").args(linux_systemd_action_args(config, "is-active")))
         .map(|out| out.trim() == "active")
         .unwrap_or(false)
     {
         return true;
     }
-    run_capture(Command::new("rc-service").args(["zeroclaw", "status"]))
+    run_capture(Command::new("rc-service").args(linux_openrc_action_args(config, "status")))
         .map(|out| out.contains("started"))
         .unwrap_or(false)
 }
@@ -144,7 +233,7 @@ pub fn start(config: &Config, init_system: InitSystem) -> Result<()> {
         // The plist may reference this path for WorkingDirectory and log files.
         let exe = std::env::current_exe().ok();
         if let Some(ref exe_path) = exe
-            && let Some(var_dir) = detect_homebrew_var_dir(exe_path)
+            && let Some(var_dir) = homebrew_var_dir_from_exe(exe_path)
         {
             let _ = fs::create_dir_all(&var_dir);
         }
@@ -155,7 +244,7 @@ pub fn start(config: &Config, init_system: InitSystem) -> Result<()> {
         Ok(())
     } else if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
-        start_linux(resolved)
+        start_linux(config, resolved)
     } else if cfg!(target_os = "windows") {
         let _ = config;
         run_checked(Command::new("schtasks").args(["/Run", "/TN", windows_task_name()]))?;
@@ -167,14 +256,19 @@ pub fn start(config: &Config, init_system: InitSystem) -> Result<()> {
     }
 }
 
-fn start_linux(init_system: InitSystem) -> Result<()> {
+fn start_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
             run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            run_checked(Command::new("systemctl").args(["--user", "start", "zeroclaw.service"]))?;
+            run_checked(
+                Command::new("systemctl").args(linux_systemd_action_args(config, "start")),
+            )?;
+            warn_if_systemd_user_linger_disabled();
         }
         InitSystem::Openrc => {
-            run_checked(Command::new("rc-service").args(["zeroclaw", "start"]))?;
+            run_checked(
+                Command::new("rc-service").args(linux_openrc_action_args(config, "start")),
+            )?;
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
@@ -196,7 +290,7 @@ pub fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
         Ok(())
     } else if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
-        stop_linux(resolved)
+        stop_linux(config, resolved)
     } else if cfg!(target_os = "windows") {
         let _ = config;
         let task_name = windows_task_name();
@@ -209,14 +303,17 @@ pub fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
     }
 }
 
-fn stop_linux(init_system: InitSystem) -> Result<()> {
+fn stop_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            let _ =
-                run_checked(Command::new("systemctl").args(["--user", "stop", "zeroclaw.service"]));
+            let _ = run_checked(
+                Command::new("systemctl").args(linux_systemd_action_args(config, "stop")),
+            );
         }
         InitSystem::Openrc => {
-            let _ = run_checked(Command::new("rc-service").args(["zeroclaw", "stop"]));
+            let _ = run_checked(
+                Command::new("rc-service").args(linux_openrc_action_args(config, "stop")),
+            );
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
@@ -234,7 +331,7 @@ pub fn restart(config: &Config, init_system: InitSystem) -> Result<()> {
 
     if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
-        return restart_linux(resolved);
+        return restart_linux(config, resolved);
     }
 
     if cfg!(target_os = "windows") {
@@ -247,14 +344,18 @@ pub fn restart(config: &Config, init_system: InitSystem) -> Result<()> {
     anyhow::bail!("Service management is supported on macOS and Linux only")
 }
 
-fn restart_linux(init_system: InitSystem) -> Result<()> {
+fn restart_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
             run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            run_checked(Command::new("systemctl").args(["--user", "restart", "zeroclaw.service"]))?;
+            run_checked(
+                Command::new("systemctl").args(linux_systemd_action_args(config, "restart")),
+            )?;
         }
         InitSystem::Openrc => {
-            run_checked(Command::new("rc-service").args(["zeroclaw", "restart"]))?;
+            run_checked(
+                Command::new("rc-service").args(linux_openrc_action_args(config, "restart")),
+            )?;
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
@@ -274,7 +375,7 @@ pub fn status(config: &Config, init_system: InitSystem) -> Result<()> {
                 "❌ not loaded"
             }
         );
-        println!("Unit: {}", macos_service_file()?.display());
+        println!("Unit: {}", macos_service_file()?.display().to_string());
         return Ok(());
     }
 
@@ -314,20 +415,23 @@ pub fn status(config: &Config, init_system: InitSystem) -> Result<()> {
 fn status_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            let out = run_capture(Command::new("systemctl").args([
-                "--user",
-                "is-active",
-                "zeroclaw.service",
-            ]))
+            let out = run_capture(
+                Command::new("systemctl").args(linux_systemd_action_args(config, "is-active")),
+            )
             .unwrap_or_else(|_| "unknown".into());
             println!("Service state: {}", out.trim());
-            println!("Unit: {}", linux_service_file(config)?.display());
+            println!(
+                "Unit: {}",
+                linux_systemd_unit_file(config)?.display().to_string()
+            );
         }
         InitSystem::Openrc => {
-            let out = run_capture(Command::new("rc-service").args(["zeroclaw", "status"]))
-                .unwrap_or_else(|_| "unknown".into());
+            let out = run_capture(
+                Command::new("rc-service").args(linux_openrc_action_args(config, "status")),
+            )
+            .unwrap_or_else(|_| "unknown".into());
             println!("Service state: {}", out.trim());
-            println!("Unit: /etc/init.d/zeroclaw");
+            println!("Unit: /etc/init.d/{}", linux_openrc_service(config));
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
@@ -352,7 +456,7 @@ fn logs_macos(config: &Config, lines: usize, follow: bool) -> Result<()> {
     // Try the launchd log files first (StandardOutPath / StandardErrorPath from the plist).
     // These are the most reliable source since they capture all daemon output.
     let exe = std::env::current_exe().ok();
-    let homebrew_var_dir = exe.as_ref().and_then(|e| detect_homebrew_var_dir(e));
+    let homebrew_var_dir = exe.as_ref().and_then(|e| homebrew_var_dir_from_exe(e));
     let logs_dir = if let Some(ref var_dir) = homebrew_var_dir {
         var_dir.join("logs")
     } else {
@@ -403,17 +507,7 @@ fn logs_macos(config: &Config, lines: usize, follow: bool) -> Result<()> {
 fn logs_linux(config: &Config, init_system: InitSystem, lines: usize, follow: bool) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            let mut args = vec![
-                "--user".to_string(),
-                "-u".to_string(),
-                "zeroclaw.service".to_string(),
-                "-n".to_string(),
-                lines.to_string(),
-                "--no-pager".to_string(),
-            ];
-            if follow {
-                args.push("-f".to_string());
-            }
+            let args = linux_journalctl_args(config, lines, follow);
             let status = Command::new("journalctl")
                 .args(&args)
                 .status()
@@ -423,21 +517,24 @@ fn logs_linux(config: &Config, init_system: InitSystem, lines: usize, follow: bo
             }
         }
         InitSystem::Openrc => {
-            // OpenRC logs go to /var/log/zeroclaw/error.log (as configured in the init script)
-            let log_file = Path::new("/var/log/zeroclaw/error.log");
+            // OpenRC logs go to /var/log/<service>/error.log (as configured in the init script).
+            let log_dir = linux_openrc_log_dir(config);
+            let log_file = log_dir.join("error.log");
             if !log_file.exists() {
                 // Fall back to access log
-                let access_log = Path::new("/var/log/zeroclaw/access.log");
+                let access_log = log_dir.join("access.log");
                 if !access_log.exists() {
-                    bail!("No log files found at /var/log/zeroclaw/. Is the service installed?");
+                    bail!(
+                        "No log files found at {}. Is the service installed?",
+                        log_dir.display()
+                    );
                 }
-                return tail_file(access_log, lines, follow);
+                return tail_file(&access_log, lines, follow);
             }
-            tail_file(log_file, lines, follow)?;
+            tail_file(&log_file, lines, follow)?;
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
-    let _ = config;
     Ok(())
 }
 
@@ -469,7 +566,7 @@ fn logs_windows(config: &Config, lines: usize, follow: bool) -> Result<()> {
                 "-Command",
                 &format!(
                     "Get-Content -Path '{}' -Tail {} -Wait",
-                    log_file.display(),
+                    log_file.display().to_string(),
                     lines
                 ),
             ])
@@ -482,7 +579,11 @@ fn logs_windows(config: &Config, lines: usize, follow: bool) -> Result<()> {
         let status = Command::new("powershell")
             .args([
                 "-Command",
-                &format!("Get-Content -Path '{}' -Tail {}", log_file.display(), lines),
+                &format!(
+                    "Get-Content -Path '{}' -Tail {}",
+                    log_file.display().to_string(),
+                    lines
+                ),
             ])
             .status()
             .context("Failed to run PowerShell Get-Content")?;
@@ -511,35 +612,42 @@ fn tail_file(path: &Path, lines: usize, follow: bool) -> Result<()> {
 }
 
 pub fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
+    if cfg!(target_os = "linux") {
+        let resolved = init_system.resolve()?;
+        ensure_linux_default_install_scope(config, "uninstall")?;
+        stop_linux(config, resolved)?;
+        return uninstall_linux(config, resolved);
+    }
+
     stop(config, init_system)?;
 
     if cfg!(target_os = "macos") {
         let file = macos_service_file()?;
         if file.exists() {
             fs::remove_file(&file)
-                .with_context(|| format!("Failed to remove {}", file.display()))?;
+                .with_context(|| format!("Failed to remove {}", file.display().to_string()))?;
         }
-        println!("✅ Service uninstalled ({})", file.display());
+        println!("✅ Service uninstalled ({})", file.display().to_string());
         return Ok(());
-    }
-
-    if cfg!(target_os = "linux") {
-        let resolved = init_system.resolve()?;
-        return uninstall_linux(config, resolved);
     }
 
     if cfg!(target_os = "windows") {
         let task_name = windows_task_name();
         let _ = run_checked(Command::new("schtasks").args(["/Delete", "/TN", task_name, "/F"]));
-        // Remove the wrapper script
-        let wrapper = config
+        // Remove the wrapper script. It now lives in the config dir root, but
+        // older installs left it under logs/ — clean up both so an upgrade
+        // doesn't strand the legacy copy.
+        let base_dir = config
             .config_path
             .parent()
-            .map_or_else(|| PathBuf::from("."), PathBuf::from)
-            .join("logs")
-            .join("zeroclaw-daemon.cmd");
-        if wrapper.exists() {
-            fs::remove_file(&wrapper).ok();
+            .map_or_else(|| PathBuf::from("."), PathBuf::from);
+        for wrapper in [
+            base_dir.join("zeroclaw-daemon.cmd"),
+            base_dir.join("logs").join("zeroclaw-daemon.cmd"),
+        ] {
+            if wrapper.exists() {
+                fs::remove_file(&wrapper).ok();
+            }
         }
         println!("✅ Service uninstalled");
         return Ok(());
@@ -554,10 +662,10 @@ fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
             let file = linux_service_file(config)?;
             if file.exists() {
                 fs::remove_file(&file)
-                    .with_context(|| format!("Failed to remove {}", file.display()))?;
+                    .with_context(|| format!("Failed to remove {}", file.display().to_string()))?;
             }
             let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
-            println!("✅ Service uninstalled ({})", file.display());
+            println!("✅ Service uninstalled ({})", file.display().to_string());
         }
         InitSystem::Openrc => {
             let init_script = Path::new("/etc/init.d/zeroclaw");
@@ -569,8 +677,9 @@ fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
                         "⚠️  Warning: Could not remove zeroclaw from OpenRC default runlevel: {err}"
                     );
                 }
-                fs::remove_file(init_script)
-                    .with_context(|| format!("Failed to remove {}", init_script.display()))?;
+                fs::remove_file(init_script).with_context(|| {
+                    format!("Failed to remove {}", init_script.display().to_string())
+                })?;
             }
             println!("✅ Service uninstalled (/etc/init.d/zeroclaw)");
         }
@@ -583,40 +692,77 @@ fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
 /// corresponding `var/zeroclaw` directory.
 ///
 /// Homebrew installs binaries into `<prefix>/Cellar/<formula>/<version>/bin/`
-/// and symlinks them to `<prefix>/bin/`. The canonical `var` directory is
-/// `<prefix>/var`.  We check for both layouts.
-fn detect_homebrew_var_dir(exe: &Path) -> Option<PathBuf> {
-    let path_str = exe.to_string_lossy();
+/// and symlinks them through `<prefix>/bin/` and `<prefix>/opt/<formula>/`.
+/// The canonical `var` directory is `<prefix>/var`.
+pub fn homebrew_var_dir_from_exe(exe: &Path) -> Option<PathBuf> {
+    let resolved = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
+    let exe = resolved.as_path();
 
-    // Symlinked binary: <prefix>/bin/zeroclaw
-    // Cellar binary:    <prefix>/Cellar/zeroclaw/<version>/bin/zeroclaw
-    let prefix = if path_str.contains("/Cellar/") {
-        // Walk up from .../Cellar/zeroclaw/<ver>/bin/zeroclaw to the prefix
-        let mut ancestor = exe.to_path_buf();
-        while let Some(parent) = ancestor.parent() {
-            ancestor = parent.to_path_buf();
-            if ancestor.file_name().is_some_and(|n| n == "Cellar") {
-                // prefix is one level above Cellar
-                return ancestor.parent().map(|p| p.join("var").join("zeroclaw"));
-            }
-        }
-        return None;
-    } else if let Some(bin_parent) = exe.parent() {
-        // <prefix>/bin/zeroclaw → check if <prefix>/Cellar exists (Homebrew marker)
-        if let Some(prefix) = bin_parent.parent() {
-            if prefix.join("Cellar").is_dir() {
-                Some(prefix.to_path_buf())
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    if let Some(cellar) = exe
+        .ancestors()
+        .find(|path| path.file_name().is_some_and(|name| name == "Cellar"))
+    {
+        return cellar
+            .parent()
+            .map(|prefix| prefix.join("var").join("zeroclaw"));
+    }
 
-    prefix.map(|p| p.join("var").join("zeroclaw"))
+    let prefix = exe.parent()?.parent()?;
+    prefix
+        .join("Cellar")
+        .is_dir()
+        .then(|| prefix.join("var").join("zeroclaw"))
+}
+
+#[cfg(test)]
+mod homebrew_tests {
+    use super::*;
+
+    #[test]
+    fn homebrew_var_dir_from_exe_detects_cellar_path() {
+        let exe = PathBuf::from("/opt/homebrew/Cellar/zeroclaw/1.2.3/bin/zeroclaw");
+        let var_dir = homebrew_var_dir_from_exe(&exe);
+        assert_eq!(var_dir, Some(PathBuf::from("/opt/homebrew/var/zeroclaw")));
+    }
+
+    #[test]
+    fn homebrew_var_dir_from_exe_detects_intel_cellar_path() {
+        let exe = PathBuf::from("/usr/local/Cellar/zeroclaw/1.0.0/bin/zeroclaw");
+        let var_dir = homebrew_var_dir_from_exe(&exe);
+        assert_eq!(var_dir, Some(PathBuf::from("/usr/local/var/zeroclaw")));
+    }
+
+    #[test]
+    fn homebrew_var_dir_from_exe_ignores_non_homebrew_path() {
+        let exe = PathBuf::from("/home/user/.cargo/bin/zeroclaw");
+        let var_dir = homebrew_var_dir_from_exe(&exe);
+        assert_eq!(var_dir, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn homebrew_var_dir_from_exe_detects_opt_symlink_layout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let prefix = temp.path().join("homebrew");
+        let cellar_bin = prefix.join("Cellar/zeroclaw/1.2.3/bin");
+        std::fs::create_dir_all(&cellar_bin).expect("create Cellar binary dir");
+        let cellar_exe = cellar_bin.join("zeroclaw");
+        std::fs::write(&cellar_exe, "").expect("create fake executable");
+
+        let opt_parent = prefix.join("opt");
+        std::fs::create_dir_all(&opt_parent).expect("create opt dir");
+        std::os::unix::fs::symlink(
+            prefix.join("Cellar/zeroclaw/1.2.3"),
+            opt_parent.join("zeroclaw"),
+        )
+        .expect("create opt symlink");
+
+        let expected_prefix = prefix
+            .canonicalize()
+            .expect("canonicalize fake Homebrew prefix");
+        let var_dir = homebrew_var_dir_from_exe(&prefix.join("opt/zeroclaw/bin/zeroclaw"));
+        assert_eq!(var_dir, Some(expected_prefix.join("var/zeroclaw")));
+    }
 }
 
 fn install_macos(config: &Config) -> Result<()> {
@@ -629,7 +775,7 @@ fn install_macos(config: &Config) -> Result<()> {
 
     // When installed via Homebrew, use the Homebrew var directory for runtime
     // data so that `brew services start zeroclaw` works out of the box.
-    let homebrew_var_dir = detect_homebrew_var_dir(&exe);
+    let homebrew_var_dir = homebrew_var_dir_from_exe(&exe);
     if let Some(ref var_dir) = homebrew_var_dir {
         fs::create_dir_all(var_dir).with_context(|| {
             format!(
@@ -653,9 +799,29 @@ fn install_macos(config: &Config) -> Result<()> {
     let stdout = logs_dir.join("daemon.stdout.log");
     let stderr = logs_dir.join("daemon.stderr.log");
 
+    let plist =
+        render_macos_launch_agent_plist(&exe, &stdout, &stderr, homebrew_var_dir.as_deref());
+
+    fs::write(&file, plist)?;
+    println!("✅ Installed launchd service: {}", file.display());
+    if let Some(ref var_dir) = homebrew_var_dir {
+        println!("   Homebrew var: {}", var_dir.display());
+    }
+    println!("   Start with: zeroclaw service start");
+    Ok(())
+}
+
+/// Renders the macOS LaunchAgent plist; path arguments are XML-escaped before interpolation,
+/// and the caller is responsible for writing the returned XML to the plist path.
+fn render_macos_launch_agent_plist(
+    exe: &Path,
+    stdout: &Path,
+    stderr: &Path,
+    homebrew_var_dir: Option<&Path>,
+) -> String {
     // When running under Homebrew, inject ZEROCLAW_CONFIG_DIR and
     // WorkingDirectory so the daemon finds its data in the Homebrew prefix.
-    let env_section = if let Some(ref var_dir) = homebrew_var_dir {
+    let env_section = if let Some(var_dir) = homebrew_var_dir {
         format!(
             r#"  <key>EnvironmentVariables</key>
   <dict>
@@ -672,10 +838,10 @@ fn install_macos(config: &Config) -> Result<()> {
         String::new()
     };
 
-    let plist = format!(
-        r#"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-<plist version=\"1.0\">
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
 <dict>
   <key>Label</key>
   <string>{label}</string>
@@ -700,18 +866,12 @@ fn install_macos(config: &Config) -> Result<()> {
         env_section = env_section,
         stdout = xml_escape(&stdout.display().to_string()),
         stderr = xml_escape(&stderr.display().to_string())
-    );
-
-    fs::write(&file, plist)?;
-    println!("✅ Installed launchd service: {}", file.display());
-    if let Some(ref var_dir) = homebrew_var_dir {
-        println!("   Homebrew var: {}", var_dir.display());
-    }
-    println!("   Start with: zeroclaw service start");
-    Ok(())
+    )
 }
 
 fn install_linux(config: &Config, init_system: InitSystem) -> Result<()> {
+    ensure_linux_default_install_scope(config, "install")?;
+
     match init_system {
         InitSystem::Systemd => install_linux_systemd(config),
         InitSystem::Openrc => install_linux_openrc(config),
@@ -750,8 +910,12 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
     fs::write(&file, unit)?;
     let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
     let _ = run_checked(Command::new("systemctl").args(["--user", "enable", "zeroclaw.service"]));
-    println!("✅ Installed systemd user service: {}", file.display());
+    println!(
+        "✅ Installed systemd user service: {}",
+        file.display().to_string()
+    );
     println!("   Start with: zeroclaw service start");
+    warn_if_systemd_user_linger_disabled();
     Ok(())
 }
 
@@ -903,7 +1067,7 @@ fn chown_to_zeroclaw(path: &Path) -> Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
             "Failed to change ownership of {} to zeroclaw:zeroclaw: {}",
-            path.display(),
+            path.display().to_string(),
             stderr.trim(),
         );
     }
@@ -926,7 +1090,7 @@ fn chown_recursive_to_zeroclaw(path: &Path) -> Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
             "Failed to recursively change ownership of {} to zeroclaw:zeroclaw: {}",
-            path.display(),
+            path.display().to_string(),
             stderr.trim(),
         );
     }
@@ -940,18 +1104,22 @@ fn chown_recursive_to_zeroclaw(_path: &Path) -> Result<()> {
 }
 
 fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
-    fs::create_dir_all(target)
-        .with_context(|| format!("Failed to create directory {}", target.display()))?;
+    fs::create_dir_all(target).with_context(|| {
+        format!(
+            "Failed to create directory {}",
+            target.display().to_string()
+        )
+    })?;
 
     for entry in fs::read_dir(source)
-        .with_context(|| format!("Failed to read directory {}", source.display()))?
+        .with_context(|| format!("Failed to read directory {}", source.display().to_string()))?
     {
         let entry = entry?;
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
         let file_type = entry
             .file_type()
-            .with_context(|| format!("Failed to inspect {}", source_path.display()))?;
+            .with_context(|| format!("Failed to inspect {}", source_path.display().to_string()))?;
 
         if file_type.is_dir() {
             copy_dir_recursive(&source_path, &target_path)?;
@@ -962,7 +1130,7 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
             fs::copy(&source_path, &target_path).with_context(|| {
                 format!(
                     "Failed to copy file {} -> {}",
-                    source_path.display(),
+                    source_path.display().to_string(),
                     target_path.display()
                 )
             })?;
@@ -1017,7 +1185,7 @@ fn migrate_openrc_runtime_state_if_needed(config_dir: &Path) -> Result<()> {
     copy_dir_recursive(&source_dir, config_dir)?;
     println!(
         "✅ Migrated runtime state from {} to {}",
-        source_dir.display(),
+        source_dir.display().to_string(),
         config_dir.display()
     );
     Ok(())
@@ -1081,7 +1249,7 @@ fn ensure_openrc_runtime_path_writable(path: &Path) -> Result<()> {
         bail!(
             "OpenRC runtime user 'zeroclaw' cannot write {} ({details}). \
              Re-run `sudo zeroclaw service install` and ensure ownership is zeroclaw:zeroclaw.",
-            path.display(),
+            path.display().to_string(),
         );
     }
 
@@ -1117,7 +1285,7 @@ fn warn_if_binary_in_home(exe_path: &Path) {
             "⚠️  Warning: Binary path '{}' appears to be in a user home directory.\n\
              For system-wide OpenRC service, consider installing to /usr/local/bin:\n\
              sudo cp '{}' /usr/local/bin/zeroclaw",
-            exe_path.display(),
+            exe_path.display().to_string(),
             exe_path.display()
         );
     }
@@ -1153,8 +1321,8 @@ start_pre() {{
     checkpath --directory --owner zeroclaw:zeroclaw --mode 0750 /var/lib/zeroclaw
 }}
 "#,
-        exe = exe_path.display(),
-        config_dir = config_dir.display(),
+        exe = exe_path.display().to_string(),
+        config_dir = config_dir.display().to_string(),
     )
 }
 
@@ -1187,27 +1355,37 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
 
     if !config_dir.exists() {
         fs::create_dir_all(config_dir)
-            .with_context(|| format!("Failed to create {}", config_dir.display()))?;
+            .with_context(|| format!("Failed to create {}", config_dir.display().to_string()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(config_dir, fs::Permissions::from_mode(0o755)).with_context(
-                || format!("Failed to set permissions on {}", config_dir.display()),
+                || {
+                    format!(
+                        "Failed to set permissions on {}",
+                        config_dir.display().to_string()
+                    )
+                },
             )?;
         }
-        println!("✅ Created directory: {}", config_dir.display());
+        println!("✅ Created directory: {}", config_dir.display().to_string());
     }
 
     migrate_openrc_runtime_state_if_needed(config_dir)?;
 
     if !workspace_dir.exists() {
         fs::create_dir_all(&workspace_dir)
-            .with_context(|| format!("Failed to create {}", workspace_dir.display()))?;
+            .with_context(|| format!("Failed to create {}", workspace_dir.display().to_string()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&workspace_dir, fs::Permissions::from_mode(0o750)).with_context(
-                || format!("Failed to set permissions on {}", workspace_dir.display()),
+                || {
+                    format!(
+                        "Failed to set permissions on {}",
+                        workspace_dir.display().to_string()
+                    )
+                },
             )?;
         }
         chown_to_zeroclaw(&workspace_dir)?;
@@ -1220,25 +1398,45 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&workspace_dir, fs::Permissions::from_mode(0o750))
-            .with_context(|| format!("Failed to set permissions on {}", workspace_dir.display()))?;
+        fs::set_permissions(&workspace_dir, fs::Permissions::from_mode(0o750)).with_context(
+            || {
+                format!(
+                    "Failed to set permissions on {}",
+                    workspace_dir.display().to_string()
+                )
+            },
+        )?;
     }
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(config_dir, fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("Failed to set permissions on {}", config_dir.display()))?;
+        fs::set_permissions(config_dir, fs::Permissions::from_mode(0o755)).with_context(|| {
+            format!(
+                "Failed to set permissions on {}",
+                config_dir.display().to_string()
+            )
+        })?;
         let config_path = config_dir.join("config.toml");
         if config_path.exists() {
             fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).with_context(
-                || format!("Failed to set permissions on {}", config_path.display()),
+                || {
+                    format!(
+                        "Failed to set permissions on {}",
+                        config_path.display().to_string()
+                    )
+                },
             )?;
         }
         let secret_key_path = config_dir.join(".secret_key");
         if secret_key_path.exists() {
             fs::set_permissions(&secret_key_path, fs::Permissions::from_mode(0o600)).with_context(
-                || format!("Failed to set permissions on {}", secret_key_path.display()),
+                || {
+                    format!(
+                        "Failed to set permissions on {}",
+                        secret_key_path.display().to_string()
+                    )
+                },
             )?;
         }
     }
@@ -1248,12 +1446,16 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     let created_log_dir = !log_dir.exists();
     if created_log_dir {
         fs::create_dir_all(log_dir)
-            .with_context(|| format!("Failed to create {}", log_dir.display()))?;
+            .with_context(|| format!("Failed to create {}", log_dir.display().to_string()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(log_dir, fs::Permissions::from_mode(0o750))
-                .with_context(|| format!("Failed to set permissions on {}", log_dir.display()))?;
+            fs::set_permissions(log_dir, fs::Permissions::from_mode(0o750)).with_context(|| {
+                format!(
+                    "Failed to set permissions on {}",
+                    log_dir.display().to_string()
+                )
+            })?;
         }
     }
 
@@ -1271,13 +1473,17 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     let init_script = generate_openrc_script(&exe, config_dir);
     let init_path = Path::new("/etc/init.d/zeroclaw");
     fs::write(init_path, init_script)
-        .with_context(|| format!("Failed to write {}", init_path.display()))?;
+        .with_context(|| format!("Failed to write {}", init_path.display().to_string()))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(init_path, fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("Failed to set permissions on {}", init_path.display()))?;
+        fs::set_permissions(init_path, fs::Permissions::from_mode(0o755)).with_context(|| {
+            format!(
+                "Failed to set permissions on {}",
+                init_path.display().to_string()
+            )
+        })?;
     }
 
     run_checked(Command::new("rc-update").args(["add", "zeroclaw", "default"]))?;
@@ -1290,22 +1496,25 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
 
 fn install_windows(config: &Config) -> Result<()> {
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
-    let logs_dir = config
+    let base_dir = config
         .config_path
         .parent()
-        .map_or_else(|| PathBuf::from("."), PathBuf::from)
-        .join("logs");
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let logs_dir = base_dir.join("logs");
     fs::create_dir_all(&logs_dir)?;
 
-    // Create a wrapper script that redirects output to log files
-    let wrapper = logs_dir.join("zeroclaw-daemon.cmd");
+    // The launch wrapper is an install artifact, not log output — keep it in
+    // the config dir root so the logs dir holds only `.log` files. (Previously
+    // it landed in logs/, where a `.cmd` next to the daemon's log files reads
+    // as misplaced.)
+    let wrapper = base_dir.join("zeroclaw-daemon.cmd");
     let stdout_log = logs_dir.join("daemon.stdout.log");
     let stderr_log = logs_dir.join("daemon.stderr.log");
 
     let wrapper_content = format!(
         "@echo off\r\n\"{}\" daemon >>\"{}\" 2>>\"{}\"",
-        exe.display(),
-        stdout_log.display(),
+        exe.display().to_string(),
+        stdout_log.display().to_string(),
         stderr_log.display()
     );
     fs::write(&wrapper, &wrapper_content)?;
@@ -1317,6 +1526,12 @@ fn install_windows(config: &Config) -> Result<()> {
         .args(["/Delete", "/TN", task_name, "/F"])
         .output();
 
+    // Run at the invoking user's normal privilege (LIMITED), not HIGHEST.
+    // This is a per-user ONLOGON task driving a user-level daemon; running it
+    // elevated makes the daemon's RPC pipe owned by an elevated token, so a
+    // non-elevated `zerocode` can't connect unless it too is run as admin.
+    // Matching the user's standard token keeps the pipe reachable from the
+    // normal desktop session.
     run_checked(Command::new("schtasks").args([
         "/Create",
         "/TN",
@@ -1324,15 +1539,15 @@ fn install_windows(config: &Config) -> Result<()> {
         "/SC",
         "ONLOGON",
         "/TR",
-        &format!("\"{}\"", wrapper.display()),
+        &format!("\"{}\"", wrapper.display().to_string()),
         "/RL",
-        "HIGHEST",
+        "LIMITED",
         "/F",
     ]))?;
 
     println!("✅ Installed Windows scheduled task: {}", task_name);
-    println!("   Wrapper: {}", wrapper.display());
-    println!("   Logs: {}", logs_dir.display());
+    println!("   Wrapper: {}", wrapper.display().to_string());
+    println!("   Logs: {}", logs_dir.display().to_string());
     println!("   Start with: zeroclaw service start");
     Ok(())
 }
@@ -1351,12 +1566,25 @@ fn linux_service_file(config: &Config) -> Result<PathBuf> {
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
+    // `service install` remains default-instance only; named instances can be
+    // managed when operators provide matching units themselves.
     let _ = config;
     Ok(home
         .join(".config")
         .join("systemd")
         .join("user")
         .join("zeroclaw.service"))
+}
+
+fn linux_systemd_unit_file(config: &Config) -> Result<PathBuf> {
+    let home = directories::UserDirs::new()
+        .map(|u| u.home_dir().to_path_buf())
+        .context("Could not find home directory")?;
+    Ok(home
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join(linux_systemd_unit(config)))
 }
 
 fn run_checked(command: &mut Command) -> Result<()> {
@@ -1383,6 +1611,322 @@ pub fn xml_escape(raw: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(unix)]
+fn current_loginctl_user_target() -> Option<String> {
+    // SAFETY: getuid() has no preconditions and returns the real UID of the
+    // process. loginctl accepts the numeric UID, which avoids trusting $USER.
+    Some(unsafe { libc::getuid() }.to_string())
+}
+
+#[cfg(not(unix))]
+fn current_loginctl_user_target() -> Option<String> {
+    None
+}
+
+fn parse_loginctl_linger_property(output: &str) -> Option<bool> {
+    output.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        if !key.trim().eq_ignore_ascii_case("Linger") {
+            return None;
+        }
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("yes") {
+            Some(true)
+        } else if value.eq_ignore_ascii_case("no") {
+            Some(false)
+        } else {
+            None
+        }
+    })
+}
+
+pub(crate) fn systemd_user_linger_status() -> SystemdUserLinger {
+    let Some(user) = current_loginctl_user_target() else {
+        return SystemdUserLinger::Unknown;
+    };
+
+    let output = Command::new("loginctl")
+        .args(["show-user", user.as_str(), "--property=Linger"])
+        .output();
+
+    match output {
+        Ok(output) => systemd_user_linger_status_from_output(
+            user,
+            output.status.success(),
+            &String::from_utf8_lossy(&output.stdout),
+        ),
+        Err(_) => SystemdUserLinger::Unknown,
+    }
+}
+
+fn systemd_user_linger_status_from_output(
+    user: String,
+    success: bool,
+    stdout: &str,
+) -> SystemdUserLinger {
+    if !success {
+        return SystemdUserLinger::Unknown;
+    }
+
+    match parse_loginctl_linger_property(stdout) {
+        Some(true) => SystemdUserLinger::Enabled,
+        Some(false) => SystemdUserLinger::Disabled { user },
+        None => SystemdUserLinger::Unknown,
+    }
+}
+
+fn systemd_linger_hint(user: &str) -> String {
+    crate::i18n::get_required_cli_string_with_args(
+        "cli-service-systemd-linger-disabled-warning",
+        &[("user", user)],
+    )
+}
+
+fn warn_if_systemd_user_linger_disabled() {
+    if let SystemdUserLinger::Disabled { user } = systemd_user_linger_status() {
+        eprintln!("⚠️  {}", systemd_linger_hint(&user));
+    }
+}
+
+// Plain `#[cfg(test)]` is intentional: these pure renderer tests have no
+// integration dependencies and should run in every zeroclaw-runtime test build.
+#[cfg(test)]
+mod macos_plist_tests {
+    use super::*;
+
+    #[test]
+    fn macos_plist_renderer_uses_plain_xml_quotes() {
+        let plist = render_macos_launch_agent_plist(
+            Path::new("/opt/homebrew/bin/zeroclaw"),
+            Path::new("/opt/homebrew/var/zeroclaw/logs/daemon.stdout.log"),
+            Path::new("/opt/homebrew/var/zeroclaw/logs/daemon.stderr.log"),
+            Some(Path::new("/opt/homebrew/var/zeroclaw")),
+        );
+
+        assert!(!plist.contains(r#"\""#));
+        assert!(plist.starts_with(r#"<?xml version="1.0" encoding="UTF-8"?>"#));
+        assert!(plist.contains(
+            r#"<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">"#
+        ));
+        assert!(plist.contains(r#"<plist version="1.0">"#));
+        assert!(plist.contains("<key>EnvironmentVariables</key>"));
+    }
+
+    #[test]
+    fn macos_plist_renderer_escapes_paths_and_omits_homebrew_section_when_absent() {
+        let plist = render_macos_launch_agent_plist(
+            Path::new("/tmp/Zero<&>\"'Claw/bin/zeroclaw"),
+            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stdout.log"),
+            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stderr.log"),
+            None,
+        );
+
+        assert!(plist.contains("/tmp/Zero&lt;&amp;&gt;&quot;&apos;Claw/bin/zeroclaw"));
+        assert!(plist.contains("/tmp/Zero&lt;&amp;&gt;&quot;&apos;Claw/logs/daemon.stdout.log"));
+        assert!(plist.contains("/tmp/Zero&lt;&amp;&gt;&quot;&apos;Claw/logs/daemon.stderr.log"));
+        assert!(!plist.contains("<key>EnvironmentVariables</key>"));
+        assert!(!plist.contains("<key>WorkingDirectory</key>"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_plist_renderer_emits_plutil_parseable_xml() {
+        let plist = render_macos_launch_agent_plist(
+            Path::new("/tmp/Zero<&>\"'Claw/bin/zeroclaw"),
+            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stdout.log"),
+            Path::new("/tmp/Zero<&>\"'Claw/logs/daemon.stderr.log"),
+            Some(Path::new("/tmp/Zero<&>\"'Claw/var/zeroclaw")),
+        );
+
+        let file = std::env::temp_dir().join(format!(
+            "zeroclaw-launch-agent-plist-{}.plist",
+            std::process::id()
+        ));
+        fs::write(&file, plist).expect("write plist fixture");
+
+        let output = Command::new("plutil")
+            .arg("-lint")
+            .arg(&file)
+            .output()
+            .expect("run plutil");
+        let _ = fs::remove_file(&file);
+
+        assert!(
+            output.status.success(),
+            "plutil failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(test)]
+mod linux_service_tests {
+    use super::*;
+
+    fn config_at(path: &str) -> Config {
+        Config {
+            config_path: PathBuf::from(path),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn linux_service_base_derives_named_instance_from_config_dir() {
+        assert_eq!(
+            linux_service_base(&config_at("/home/user/.zeroclaw-p100-104/config.toml")),
+            "zeroclaw-p100-104"
+        );
+        assert_eq!(
+            linux_service_base(&config_at("/home/user/zeroclaw-prod/config.toml")),
+            "zeroclaw-prod"
+        );
+    }
+
+    #[test]
+    fn linux_service_base_falls_back_for_default_and_unrelated_dirs() {
+        assert_eq!(
+            linux_service_base(&config_at("/home/user/.zeroclaw/config.toml")),
+            "zeroclaw"
+        );
+        assert_eq!(
+            linux_service_base(&config_at("/tmp/scratch/config.toml")),
+            "zeroclaw"
+        );
+        assert_eq!(
+            linux_service_base(&config_at("/home/user/.zeroclaw-/config.toml")),
+            "zeroclaw"
+        );
+        assert_eq!(linux_service_base(&config_at("config.toml")), "zeroclaw");
+    }
+
+    #[test]
+    fn linux_service_control_args_use_named_instance() {
+        let config = config_at("/home/user/.zeroclaw-p100-104/config.toml");
+
+        assert_eq!(
+            linux_systemd_action_args(&config, "start"),
+            ["--user", "start", "zeroclaw-p100-104.service"]
+        );
+        assert_eq!(
+            linux_openrc_action_args(&config, "status"),
+            ["zeroclaw-p100-104", "status"]
+        );
+    }
+
+    #[test]
+    fn linux_openrc_log_dir_uses_named_instance() {
+        assert_eq!(
+            linux_openrc_log_dir(&config_at("/home/user/.zeroclaw/config.toml")),
+            PathBuf::from("/var/log/zeroclaw")
+        );
+        assert_eq!(
+            linux_openrc_log_dir(&config_at("/home/user/.zeroclaw-p100-104/config.toml")),
+            PathBuf::from("/var/log/zeroclaw-p100-104")
+        );
+    }
+
+    #[test]
+    fn linux_install_scope_rejects_named_instances() {
+        assert!(
+            ensure_linux_default_install_scope(
+                &config_at("/home/user/.zeroclaw/config.toml"),
+                "install"
+            )
+            .is_ok()
+        );
+
+        let err = ensure_linux_default_install_scope(
+            &config_at("/home/user/.zeroclaw-p100-104/config.toml"),
+            "install",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("only manages the default zeroclaw service"));
+        assert!(err.contains("zeroclaw-p100-104"));
+    }
+
+    #[test]
+    fn linux_journalctl_args_use_named_instance() {
+        let config = config_at("/home/user/.zeroclaw-p100-104/config.toml");
+
+        assert_eq!(
+            linux_journalctl_args(&config, 50, true),
+            [
+                "--user",
+                "-u",
+                "zeroclaw-p100-104.service",
+                "-n",
+                "50",
+                "--no-pager",
+                "-f"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_loginctl_linger_property_reads_yes_and_no() {
+        assert_eq!(
+            parse_loginctl_linger_property("Linger=yes\nUID=1000\n"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_loginctl_linger_property("UID=1000\nLinger=no\n"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn parse_loginctl_linger_property_is_case_and_whitespace_tolerant() {
+        assert_eq!(
+            parse_loginctl_linger_property("  linger = YeS  \n"),
+            Some(true)
+        );
+        assert_eq!(parse_loginctl_linger_property("LINGER = No\n"), Some(false));
+    }
+
+    #[test]
+    fn parse_loginctl_linger_property_ignores_unusable_output() {
+        assert_eq!(parse_loginctl_linger_property("UID=1000\nName=dan\n"), None);
+        assert_eq!(parse_loginctl_linger_property("Linger=maybe\n"), None);
+        assert_eq!(parse_loginctl_linger_property(""), None);
+    }
+
+    #[test]
+    fn systemd_user_linger_status_requires_successful_loginctl() {
+        assert_eq!(
+            systemd_user_linger_status_from_output("1000".to_string(), false, "Linger=no\n"),
+            SystemdUserLinger::Unknown
+        );
+    }
+
+    #[test]
+    fn systemd_user_linger_status_maps_disabled_user_target() {
+        assert_eq!(
+            systemd_user_linger_status_from_output("1000".to_string(), true, "Linger=no\n"),
+            SystemdUserLinger::Disabled {
+                user: "1000".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn systemd_linger_hint_names_enable_command() {
+        let hint = systemd_linger_hint("1000");
+        assert!(hint.contains("may stop after logout"));
+        assert!(hint.contains("loginctl enable-linger 1000"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn linux_service_file_stays_default_for_install_path() {
+        let file =
+            linux_service_file(&config_at("/home/user/.zeroclaw-p100-104/config.toml")).unwrap();
+        let path = file.to_string_lossy();
+        assert!(path.ends_with(".config/systemd/user/zeroclaw.service"));
+    }
 }
 
 #[cfg(all(test, zeroclaw_root_crate))]
@@ -1615,27 +2159,6 @@ mod tests {
                 "test -w '/etc/zeroclaw'".to_string()
             ]
         );
-    }
-
-    #[test]
-    fn detect_homebrew_var_dir_from_cellar_path() {
-        let exe = PathBuf::from("/opt/homebrew/Cellar/zeroclaw/1.2.3/bin/zeroclaw");
-        let var_dir = detect_homebrew_var_dir(&exe);
-        assert_eq!(var_dir, Some(PathBuf::from("/opt/homebrew/var/zeroclaw")));
-    }
-
-    #[test]
-    fn detect_homebrew_var_dir_intel_cellar_path() {
-        let exe = PathBuf::from("/usr/local/Cellar/zeroclaw/1.0.0/bin/zeroclaw");
-        let var_dir = detect_homebrew_var_dir(&exe);
-        assert_eq!(var_dir, Some(PathBuf::from("/usr/local/var/zeroclaw")));
-    }
-
-    #[test]
-    fn detect_homebrew_var_dir_non_homebrew_path() {
-        let exe = PathBuf::from("/home/user/.cargo/bin/zeroclaw");
-        let var_dir = detect_homebrew_var_dir(&exe);
-        assert_eq!(var_dir, None);
     }
 
     #[cfg(unix)]

@@ -50,6 +50,11 @@ mod tests {
             namespace: "default".into(),
             importance: Some(0.7),
             superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            agent_alias: None,
+            agent_id: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();

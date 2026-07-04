@@ -2,149 +2,54 @@
 
 Channels with working integrations but not yet pulled out into dedicated guides. Each is feature-gated; enable the matching `channel-<name>` feature at build time.
 
-## Discord
+## Pacing outbound replies (`reply_min_interval_secs`)
 
-```toml
-[channels.discord]
-enabled = true
-bot_token = "..."                  # create at https://discord.com/developers/applications
-allowed_guilds = ["123..."]
-allowed_users = []
-reply_to_mentions_only = true
-draft_update_interval_ms = 750     # bump if hitting Discord rate limits
-```
+Every outbound channel accepts an optional `reply_min_interval_secs = N` field (range `0..=REPLY_MIN_INTERVAL_MAX_SECS`, default `0`). When set, the orchestrator wraps the channel in a per-(channel, recipient) pacing layer so consecutive outbound replies to the same peer wait at least `N` seconds apart. `0` (the default) is a passthrough, no wrapper allocated, no overhead.
 
-- **Bot intents needed:** Message Content Intent, Server Members Intent. Set in the Developer Portal.
-- **[Streaming](../providers/streaming.md):** full — edits messages in place and splits long replies into multiple messages.
-- **Tool-call indicator:** typing indicator while tools run; visible code-block preview for shell and browser calls.
+When the floor is active, sends that arrive before the floor elapses enter a bounded FIFO queue. A background worker drains the queue at the floor rate so replies still land in order at the configured cadence. The queue depth defaults to **16** (good for the "agent went briefly bursty" case) and is capped at `REPLY_QUEUE_DEPTH_CEILING` (`1024`). When the queue is full the **newest** send is dropped and a `WARN` is emitted with `channel_alias`, redacted `recipient`, `queue_depth`, `queue_max`, and `dropped_chars`: body content stays out of logs.
 
-## Slack
+Streaming draft updates within a single reply are **not** paced (they would freeze the live preview); only the final `send` (and the terminal `finalize_draft` write) enter the queue. Different recipients are independent: pacing for one peer does not block messages to another. The wrapper retains state for up to `PACING_RECIPIENT_CAP` (1024) distinct peers via idle-state LRU eviction: only rows with no queued work and no in-flight send are reclaimed, so the cap is a target for idle state rather than an unconditional hard bound under an all-active burst.
 
-```toml
-[channels.slack]
-enabled = true
-bot_token = "xoxb-..."            # classic bot token
-app_token = "xapp-..."            # for Socket Mode
-signing_secret = "..."
-allowed_channels = ["C01..."]
-```
+Use case: paired-identity channels where sub-second replies are an AI-tell. Wire-level coverage exists end-to-end across nine channels (Telegram, Discord, Slack, Mattermost, Webhook, iMessage, Matrix, Signal, WhatsApp); integration tests pin the floor + overflow contract on Telegram and WhatsApp Web.
 
-- **Socket Mode** is the default (no public webhook URL needed).
-- For HTTP Events API instead, drop `app_token` and point Slack's event subscription URL at `/slack/events` on the gateway.
-- Supports multi-message streaming, threaded replies, and slash-command ingress.
+> **Webhook caveat:** on a synchronous webhook channel the outbound reply is the HTTP response to the caller's request. A non-zero `reply_min_interval_secs` floor can hold that response open for the floor duration, which may exceed the caller's own request timeout. Set the floor only when the webhook caller tolerates a delayed response, or leave it at `0` and pace upstream.
 
 ## Telegram
 
-```toml
-[channels.telegram]
-enabled = true
-bot_token = "..."                  # from @BotFather
-allowed_users = [123456789]
-allowed_chats = [-100987...]       # group / channel IDs
-use_long_polling = true            # default — no webhook needed
-```
+{{#peer-group telegram}}
 
-- Long polling is the default; no public URL required. Switch to webhook mode by setting `webhook_url` (then expose the gateway).
+- Long polling is the default; no public URL required.
 - Streaming draft edits are supported but capped by Telegram's rate limit. Tune `draft_update_interval_ms` if you see "Too Many Requests".
-
-## Signal
-
-```toml
-[channels.signal]
-enabled = true
-phone_number = "+14155550123"
-signal_cli_rest_url = "http://localhost:8080"   # signal-cli-rest-api service
-```
-
-Signal integration requires running the [signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) container locally — Signal has no official bot API, so we tunnel through `signal-cli`.
 
 ## iMessage (macOS only)
 
-```toml
-[channels.imessage]
-enabled = true
-provider = "linq"                  # Linq Partner API for iMessage/RCS/SMS
-api_key = "..."
-```
+iMessage is bridged through the Linq Partner API (`[channels.linq.<alias>]`):
 
 **macOS-only** and requires either Linq as a third-party relay, or direct AppleScript automation (experimental, requires Full Disk Access and Accessibility grants).
 
-## WeCom (企业微信)
+## WeChat personal iLink Bot (微信个人号 iLink)
 
-```toml
-[channels.wecom]
-enabled = true
-corp_id = "..."
-corp_secret = "..."
-agent_id = 1000001
-```
-
-Chinese enterprise WeChat. Custom app required in the corp admin panel.
+WeChat personal iLink Bot uses QR-code login against the iLink Bot API for personal WeChat conversations.
 
 ## DingTalk
 
-```toml
-[channels.dingtalk]
-enabled = true
-app_key = "..."
-app_secret = "..."
-robot_code = "..."
-```
-
-Alibaba's enterprise messenger. Same bot shape as WeCom.
+Alibaba's enterprise messenger.
 
 ## Lark / Feishu
 
-```toml
-[channels.lark]
-enabled = true
-app_id = "..."
-app_secret = "..."
-```
+Build with `channel-lark` for either Lark or Feishu. The root `channel-feishu` feature is an alias for `channel-lark`; runtime selection still happens through `use_feishu = true`.
 
 ## QQ
-
-```toml
-[channels.qq]
-enabled = true
-bot_id = "..."
-bot_token = "..."
-```
 
 Tencent's consumer messenger. Bot API access requires developer registration.
 
 ## IRC
 
-```toml
-[channels.irc]
-enabled = true
-server = "irc.libera.chat"
-port = 6697
-tls = true
-nickname = "zeroclaw"
-channels = ["#mychannel"]
-nickserv_password = "..."          # optional
-```
-
 Classic IRC. Supports SASL, NickServ auth, and multiple channels.
 
 ## Mochat
 
-```toml
-[channels.mochat]
-enabled = true
-api_key = "..."
-# additional provider-specific fields
-```
-
 ## Notion
-
-```toml
-[channels.notion]
-enabled = true
-integration_token = "..."
-databases = ["..."]                # DB IDs the agent can write to
-```
 
 Treats a Notion database as a message surface. Useful for asynchronous workflows where the "channel" is a task inbox.
 
@@ -154,9 +59,13 @@ Treats a Notion database as a message surface. Useful for asynchronous workflows
 
 Channels with more intricate setup (OAuth flows, end-to-end encryption, multi-device considerations) live in their own pages:
 
-- [Matrix](./matrix.md) — E2EE, device verification, Synapse/Dendrite specifics
+- [Matrix](./matrix.md): E2EE, device verification, Synapse/Dendrite specifics
+- [Discord](./discord.md)
+- [Slack](./slack.md)
 - [Mattermost](./mattermost.md)
 - [LINE](./line.md)
 - [Nextcloud Talk](./nextcloud-talk.md)
+- [Signal](./signal.md)
+- [WhatsApp](./whatsapp.md)
 
 If you run into configuration friction on any channel above, file an issue with the repro and we'll consider promoting it to a dedicated guide.

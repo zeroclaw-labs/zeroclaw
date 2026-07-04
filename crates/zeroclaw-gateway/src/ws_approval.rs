@@ -2,7 +2,7 @@
 //! prompts to the gateway client and waits for the operator's decision.
 //!
 //! The agent's tool loop calls
-//! [`Channel::request_approval`](zeroclaw_api::channel::Channel::request_approval)
+//! [`zeroclaw_api::channel::Channel::request_approval`]
 //! whenever a supervised-mode tool needs operator consent. This struct mints
 //! a `request_id`, emits a [`TurnEvent::ApprovalRequest`] that the existing
 //! forward loop serialises onto the wire, and parks on a oneshot until the
@@ -59,6 +59,17 @@ impl WsApprovalChannel {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for WsApprovalChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::Webhook,
+        )
+    }
+    fn alias(&self) -> &str {
+        "ws_approval"
+    }
+}
+
 #[async_trait]
 impl Channel for WsApprovalChannel {
     fn name(&self) -> &str {
@@ -78,6 +89,16 @@ impl Channel for WsApprovalChannel {
         // channel orchestrator; turns are driven directly by the WS
         // handler loop. Listen is a no-op for this transport.
         Ok(())
+    }
+
+    fn supports_free_form_ask(&self) -> bool {
+        // The gateway WS path only implements structured approval
+        // (request_approval). It cannot transport free-form ask_user
+        // questions through the generic send+listen flow — send() is
+        // a no-op and listen() returns immediately. Returning false
+        // here lets callers fail fast with a clear error instead of
+        // the misleading "Channel closed before receiving a response".
+        false
     }
 
     async fn request_approval(
@@ -120,5 +141,30 @@ impl Channel for WsApprovalChannel {
                 Ok(Some(ChannelApprovalResponse::Deny))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Regression test: WsApprovalChannel only implements structured
+    /// approval (request_approval).  Its generic send() is a no-op and
+    /// listen() returns immediately, so free-form ask_user / escalate
+    /// must fail fast instead of falling through to the misleading
+    /// "Channel closed before receiving a response" error.  This test
+    /// pins the capability bit so the trait default (true) cannot
+    /// silently regress during later channel cleanup.
+    #[test]
+    fn ws_approval_channel_declines_free_form_ask() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let pending = new_pending_approvals();
+        let channel = WsApprovalChannel::new(tx, pending, Duration::from_secs(30));
+        assert!(
+            !channel.supports_free_form_ask(),
+            "WsApprovalChannel must refuse free-form ask_user; \
+             its send() is a no-op and listen() drops immediately"
+        );
     }
 }

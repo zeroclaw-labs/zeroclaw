@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(windows)]
+use zeroclaw_config::platform::native::windows_std_cmd_shell_command;
 
 const TEST_FILE_NAME: &str = "TEST.sh";
 
@@ -98,11 +100,7 @@ fn run_test_case(case: &TestCase, skill_dir: &Path, verbose: bool) -> Option<Tes
         println!("    running: {}", case.command);
     }
 
-    let result = Command::new("sh")
-        .arg("-c")
-        .arg(&case.command)
-        .current_dir(skill_dir)
-        .output();
+    let result = build_test_command(&case.command, skill_dir).output();
 
     let output = match result {
         Ok(o) => o,
@@ -148,6 +146,21 @@ fn run_test_case(case: &TestCase, skill_dir: &Path, verbose: bool) -> Option<Tes
     }
 }
 
+#[cfg(windows)]
+fn build_test_command(command: &str, skill_dir: &Path) -> Command {
+    let mut cmd = windows_std_cmd_shell_command(command);
+    cmd.current_dir(skill_dir);
+    cmd
+}
+
+#[cfg(not(windows))]
+fn build_test_command(command: &str, skill_dir: &Path) -> Command {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(command);
+    cmd.current_dir(skill_dir);
+    cmd
+}
+
 /// Test a single skill by parsing and running its TEST.sh.
 pub fn test_skill(skill_dir: &Path, skill_name: &str, verbose: bool) -> Result<SkillTestResult> {
     let test_file = skill_dir.join(TEST_FILE_NAME);
@@ -161,7 +174,7 @@ pub fn test_skill(skill_dir: &Path, skill_name: &str, verbose: bool) -> Result<S
     }
 
     let content = std::fs::read_to_string(&test_file)
-        .with_context(|| format!("failed to read {}", test_file.display()))?;
+        .with_context(|| format!("failed to read {}", test_file.display().to_string()))?;
 
     let cases: Vec<TestCase> = content.lines().filter_map(parse_test_line).collect();
 
@@ -192,7 +205,7 @@ pub fn test_all_skills(skills_dirs: &[PathBuf], verbose: bool) -> Result<Vec<Ski
         }
 
         let entries = std::fs::read_dir(dir)
-            .with_context(|| format!("failed to read directory {}", dir.display()))?;
+            .with_context(|| format!("failed to read directory {}", dir.display().to_string()))?;
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -209,7 +222,11 @@ pub fn test_all_skills(skills_dirs: &[PathBuf], verbose: bool) -> Result<Vec<Ski
                 .unwrap_or_default();
 
             if verbose {
-                println!("  Testing skill: {} ({})", skill_name, path.display());
+                println!(
+                    "  Testing skill: {} ({})",
+                    skill_name,
+                    path.display().to_string()
+                );
             }
 
             let r = test_skill(&path, &skill_name, verbose)?;
@@ -296,7 +313,11 @@ fn truncate_output(s: &str, max: usize) -> String {
     if trimmed.len() <= max {
         trimmed.replace('\n', " ")
     } else {
-        format!("{}...", &trimmed[..max].replace('\n', " "))
+        // `max` is a byte count; slicing at it directly panics when it lands
+        // inside a multi-byte UTF-8 char (non-ASCII skill output). Round down
+        // to the nearest char boundary first (matches skills/review.rs).
+        let end = trimmed.floor_char_boundary(max);
+        format!("{}...", &trimmed[..end].replace('\n', " "))
     }
 }
 
@@ -304,6 +325,27 @@ fn truncate_output(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn truncate_output_does_not_panic_on_multibyte_boundary() {
+        // Regression for #7828: `max` landing inside a multi-byte UTF-8 char
+        // must not panic. "🦀" is 4 bytes; max=2 is mid-char.
+        let out = truncate_output("🦀🦀🦀", 2);
+        assert!(
+            out.ends_with("..."),
+            "long output must be truncated: {out:?}"
+        );
+        // Whatever is kept must be valid UTF-8 (no byte-boundary split).
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+
+        // A multi-byte string longer than max but whose boundary is mid-char.
+        let out2 = truncate_output("héllo wörld with áccents", 5);
+        assert!(out2.ends_with("..."));
+        assert!(std::str::from_utf8(out2.as_bytes()).is_ok());
+
+        // ASCII within the limit is returned untruncated (newlines flattened).
+        assert_eq!(truncate_output("ok\nfine", 100), "ok fine");
+    }
 
     #[test]
     fn parse_comment_and_empty_lines() {
@@ -403,12 +445,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let skill_dir = dir.path().join("exit-mismatch");
         fs::create_dir_all(&skill_dir).unwrap();
-        fs::write(skill_dir.join("TEST.sh"), "false | 0 | \n").unwrap();
+        fs::write(
+            skill_dir.join("TEST.sh"),
+            format!("{} | 0 | \n", failing_command()),
+        )
+        .unwrap();
 
         let result = test_skill(&skill_dir, "exit-mismatch", false).unwrap();
         assert_eq!(result.tests_run, 1);
         assert_eq!(result.tests_passed, 0);
         assert_eq!(result.failures[0].actual_exit, 1);
+    }
+
+    #[cfg(windows)]
+    fn failing_command() -> &'static str {
+        "exit /B 1"
+    }
+
+    #[cfg(not(windows))]
+    fn failing_command() -> &'static str {
+        "false"
     }
 
     #[test]

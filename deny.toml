@@ -9,6 +9,15 @@ unmaintained = "all"
 yanked = "deny"
 # Ignore known unmaintained transitive deps we cannot easily replace
 ignore = [
+    # bincode -- unmaintained advisory (informational only, no CVE); team ceased
+    # development after a doxxing/harassment incident; advisory affects all
+    # versions including 2.x. In our tree, bincode is pulled in only via
+    # probe-rs 0.31's `builtin-targets` feature (precompiled chip definitions)
+    # behind the optional `probe` cargo feature on zeroclaw-tools and
+    # zeroclaw-hardware. probe-rs is the de facto Rust embedded debug toolchain
+    # with no alternative; replacing builtin-targets requires runtime Registry
+    # construction (separate work). Not in any default build path.
+    { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained (informational, no CVE); transitive via probe-rs `builtin-targets`; behind optional `probe` feature; awaiting probe-rs upstream serialization migration" },
     # rand -- re-entrancy unsoundness via custom global logger; fixed in rand 0.8.6
     # for the 0.8.x copy in our tree; the 0.7.x copy predates rand::rng() entirely
     # and is not affected; the 0.9.x copy is outside the advisory's affected range
@@ -23,26 +32,21 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "rustls-webpki URI name constraints; 0.102.x copy via rumqttc v0.25.1; 0.103.x copy is patched; awaiting rumqttc upgrade" },
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki wildcard name constraints; 0.102.x copy via rumqttc v0.25.1; 0.103.x copy is patched; awaiting rumqttc upgrade" },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL parsing panic; 0.102.x copy via rumqttc v0.25.1 has no fix in 0.102.x series; 0.103.x copy patched at v0.103.13; awaiting rumqttc upgrade" },
-    # glib -- unsoundness in VariantStrIter Iterator/DoubleEndedIterator impls;
-    # transitive via zeroclaw-desktop (tauri -> webkit2gtk); glib 0.18.5 is the
-    # latest compatible version with the GTK3 stack; fix requires gtk-rs series bump
-    { id = "RUSTSEC-2024-0429", reason = "glib VariantStrIter unsoundness; transitive via zeroclaw-desktop/tauri/webkit2gtk; no compatible fix in glib 0.18.x series" },
-    # wasmtime -- multiple advisories via extism 1.21.0 which pins wasmtime 41.x;
-    # all CVEs fixed in wasmtime 42.0.2; extism has not released a version with
-    # wasmtime 42+; plugins are feature-gated behind --features plugins-wasm;
-    # the critical aarch64 sandbox-escape CVEs require the Winch compiler backend
-    # which is not enabled in production (default Cranelift backend is unaffected)
-    { id = "RUSTSEC-2026-0085", reason = "wasmtime flags component panic; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release" },
-    { id = "RUSTSEC-2026-0086", reason = "wasmtime 64-bit table data leakage (Winch); extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release" },
-    { id = "RUSTSEC-2026-0087", reason = "wasmtime f64x2.splat Cranelift segfault; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release" },
-    { id = "RUSTSEC-2026-0088", reason = "wasmtime pooling allocator data leakage; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release" },
-    { id = "RUSTSEC-2026-0089", reason = "wasmtime Winch table.fill panic; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release" },
-    { id = "RUSTSEC-2026-0091", reason = "wasmtime OOB write transcoding strings; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release" },
-    { id = "RUSTSEC-2026-0092", reason = "wasmtime UTF-16 transcoding panic; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release" },
-    { id = "RUSTSEC-2026-0093", reason = "wasmtime heap OOB read UTF-16 transcoding; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release" },
-    { id = "RUSTSEC-2026-0094", reason = "wasmtime Winch table.grow return value; extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release" },
-    { id = "RUSTSEC-2026-0095", reason = "wasmtime Winch aarch64 sandbox escape (critical); extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release; Winch backend not used in production" },
-    { id = "RUSTSEC-2026-0096", reason = "wasmtime Cranelift aarch64 sandbox escape (critical); extism 1.21 pins wasmtime 41.x; fixed in wasmtime 42.0.2; awaiting extism release; default Cranelift backend on x86-64 unaffected" },
+    # audit.toml/deny.toml drift reconcile + wasmtime CVEs; tracking #8519.
+    # RUSTSEC-2026-0149, -0182, -0188 cleared by wasmtime/wasmtime-wasi 43 -> 45.0.3
+    # bump in crates/zeroclaw-plugins. Resolved by #8542.
+    # unic-* unmaintained unicode tables (transitive); tracking #8519.
+    { id = "RUSTSEC-2025-0075", reason = "unic-char-range unmaintained; tracking #8519" },
+    { id = "RUSTSEC-2025-0080", reason = "unic-common unmaintained; tracking #8519" },
+    { id = "RUSTSEC-2025-0081", reason = "unic-char-property unmaintained; tracking #8519" },
+    { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version unmaintained; tracking #8519" },
+    { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident unmaintained; tracking #8519" },
+    # macro/font helpers unmaintained (transitive); tracking #8519.
+    # RUSTSEC-2024-0370 (proc-macro-error) was dropped when zeroclaw-desktop
+    # (Tauri) was removed in PR #8544.
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained; transitive macro helper; tracking #8519" },
+    { id = "RUSTSEC-2024-0388", reason = "derivative unmaintained; transitive derive helper; tracking #8519" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; via pdf-extract -> lopdf; tracking #8519" },
 ]
 
 [licenses]
@@ -67,8 +71,11 @@ allow = [
 unused-allowed-license = "allow"
 
 [bans]
+# TODO: Change to "deny" once duplicate versions are resolved across the
+# workspace (23 duplicates with default features as of 2026-06-22).
+# Tracking: TBD — separate RFC/issue for dep cleanup.
 multiple-versions = "warn"
-wildcards = "allow"
+wildcards = "deny"
 
 [sources]
 unknown-registry = "deny"

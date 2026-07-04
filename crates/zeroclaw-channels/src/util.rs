@@ -9,6 +9,18 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Largest byte index `<= max_bytes` that is still a valid UTF-8 boundary.
+pub fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
+    if max_bytes >= s.len() {
+        return s.len();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 pub const BLOCK_KIT_PREFIX: &str = "__ZEROCLAW_BLOCK_KIT__";
 
 pub fn strip_tool_call_tags(message: &str) -> String {
@@ -78,6 +90,63 @@ pub fn strip_tool_call_tags(message: &str) -> String {
         }
     }
 
+    // Does the tag structure run to the end of the message? A *real* truncated
+    // tool call is the model getting cut off, so the unterminated structure is
+    // the last thing in the message. If natural-language prose resumes after the
+    // tags, this is an inline *example* (the model is discussing tool calls), not
+    // a truncation — so we should keep it. Bias toward keeping: a little leaked
+    // XML beats eating the user's text.
+    fn tool_structure_runs_to_end(inner: &str) -> bool {
+        let mut rest = inner.trim_start();
+        // Consume a run of `<...>` tags (and whitespace between them).
+        while rest.starts_with('<') {
+            match rest.find('>') {
+                Some(gt) => rest = rest[gt + 1..].trim_start(),
+                // Cut off mid-tag (no closing '>') — a classic truncation.
+                None => return true,
+            }
+        }
+        let tail = rest.trim();
+        if tail.is_empty() {
+            // Tags ran cleanly to the end → truncation.
+            return true;
+        }
+        // Non-empty tail: prose ⇒ inline example (keep); otherwise it's a
+        // truncated tag/param value (drop).
+        !looks_like_prose(tail)
+    }
+
+    // Heuristic: does `text` read like resumed natural-language prose (as opposed
+    // to a cut-off parameter value)? True on an internal sentence boundary
+    // (". " / "! " / "? " + a letter) or a multi-word string that ends like a
+    // sentence. Deliberately lenient so ambiguous tails are kept, not dropped.
+    fn looks_like_prose(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        for i in 0..bytes.len().saturating_sub(1) {
+            if matches!(bytes[i], b'.' | b'!' | b'?')
+                && matches!(bytes[i + 1], b' ' | b'\n' | b'\t')
+                && text[i + 1..]
+                    .trim_start()
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphabetic())
+            {
+                return true;
+            }
+        }
+        let trimmed = text.trim_end();
+        let ends_like_sentence = trimmed
+            .chars()
+            .last()
+            .is_some_and(|c| matches!(c, '.' | '!' | '?'))
+            && trimmed
+                .chars()
+                .rev()
+                .nth(1)
+                .is_some_and(|c| c.is_alphabetic());
+        ends_like_sentence && text.trim().contains(' ')
+    }
+
     let mut kept_segments = Vec::new();
     let mut remaining = message;
 
@@ -100,6 +169,27 @@ pub fn strip_tool_call_tags(message: &str) -> String {
         if let Some(consumed_end) = extract_first_json_end(after_open) {
             remaining = strip_leading_close_tags(&after_open[consumed_end..]);
             continue;
+        }
+
+        // Unterminated open tag with no parseable JSON body. Drop the broken
+        // tail ONLY when it looks like tool-call structure (`<invoke>` /
+        // `<parameter>` / `<tool*>` / `<function*>` / `{` / `[`) AND that
+        // structure runs to the end of the message — i.e. a real truncation
+        // where the model was cut off mid-call. If prose resumes after the
+        // structure, the model is showing an *example*, not making a call, so
+        // keep it verbatim (a little leaked XML beats eating the user's reply).
+        // Text that merely mentions a tag is likewise kept.
+        let inner = after_open.trim_start();
+        let inner_lower = inner.to_ascii_lowercase();
+        let looks_like_tool_structure = inner_lower.starts_with("<invoke")
+            || inner_lower.starts_with("<parameter")
+            || inner_lower.starts_with("<tool")
+            || inner_lower.starts_with("<function")
+            || inner.starts_with('{')
+            || inner.starts_with('[');
+        if looks_like_tool_structure && tool_structure_runs_to_end(inner) {
+            remaining = "";
+            break;
         }
 
         kept_segments.push(remaining[start..].to_string());
@@ -176,6 +266,14 @@ pub fn parse_attachment_markers(message: &str) -> (String, Vec<(String, String)>
 /// combinations) — not UUID hex (which would give only 16^6 ≈ 16.7M and
 /// would materially weaken the WhatsApp no-per-sender-check design
 /// described in the PR #6010 security note).
+#[cfg(any(
+    feature = "channel-discord",
+    feature = "channel-signal",
+    feature = "channel-slack",
+    feature = "channel-whatsapp-cloud",
+    feature = "whatsapp-web",
+    test
+))]
 pub(crate) fn new_approval_token() -> String {
     use rand::RngExt;
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
@@ -224,6 +322,62 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floor_char_boundary_handles_mid_codepoint_offset() {
+        let text = "abc😀def";
+
+        assert_eq!(super::floor_char_boundary(text, 5), 3);
+        assert_eq!(super::floor_char_boundary(text, usize::MAX), text.len());
+    }
+
+    #[test]
+    fn strip_drops_truncated_function_calls_envelope_keeps_prose() {
+        // Truncated `<function_calls><invoke …><parameter …` (model cut off):
+        // the broken tail is dropped, the preceding prose survives.
+        let msg = "Here's the result:\n<function_calls>\n<invoke name=\"shell\">\n<parameter name=\"command\">sed -n '1,5p' file.rs";
+        assert_eq!(strip_tool_call_tags(msg), "Here's the result:");
+
+        // Envelope-only (no prose) -> empty.
+        let only = "<function_calls>\n<invoke name=\"shell\">\n<parameter name=\"command\">date";
+        assert_eq!(strip_tool_call_tags(only), "");
+
+        // Complete envelope is still stripped (unchanged behaviour).
+        let complete = "before <function_calls><invoke name=\"shell\"><parameter name=\"command\">date</parameter></invoke></function_calls> after";
+        assert_eq!(strip_tool_call_tags(complete), "before  after");
+    }
+
+    #[test]
+    fn strip_keeps_prose_that_merely_mentions_a_tag() {
+        // An unterminated opener followed by ordinary prose (not tool structure)
+        // is kept — the model is talking about the tag, not calling a tool.
+        let msg =
+            "The bug is that models emit <function_calls> and never close it, hanging the parser.";
+        assert_eq!(strip_tool_call_tags(msg), msg);
+    }
+
+    #[test]
+    fn strip_keeps_unterminated_example_followed_by_prose() {
+        // An unterminated opener IS followed by tool structure, but prose
+        // resumes after it — so it's an inline example, not a truncation.
+        // Keep it verbatim (the EOF rule: a real truncation ends the message).
+        let xml_example = "The model emits <function_calls><invoke name=\"x\"> and then keeps going. This sentence matters.";
+        assert_eq!(strip_tool_call_tags(xml_example), xml_example);
+
+        let json_example = "Emit <tool_call> {then describe the schema} in your docs.";
+        assert_eq!(strip_tool_call_tags(json_example), json_example);
+    }
+
+    #[test]
+    fn strip_still_drops_genuine_truncation_to_end() {
+        // No prose after the structure — the model was cut off mid-call. Drop.
+        let truncated = "Here's the result:\n<function_calls>\n<invoke name=\"shell\">\n<parameter name=\"command\">sed -n '1,5p' file.rs";
+        assert_eq!(strip_tool_call_tags(truncated), "Here's the result:");
+
+        // Cut off mid-tag (no closing '>') is also a truncation.
+        let mid_tag = "Working on it <function_calls><invoke name=\"sh";
+        assert_eq!(strip_tool_call_tags(mid_tag), "Working on it");
+    }
 
     #[test]
     fn parse_attachment_markers_extracts_known_kinds() {

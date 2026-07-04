@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::json;
-use tracing::warn;
 
 use crate::sop::types::{SopEvent, SopRunAction, SopTriggerSource};
 use crate::sop::{SopAuditLogger, SopEngine};
@@ -56,10 +55,17 @@ impl Tool for SopExecuteTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let sop_name = args
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'name' parameter"))?;
+        let sop_name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "name"})),
+                "tool argument validation failed"
+            );
+
+            anyhow::Error::msg("Missing 'name' parameter")
+        })?;
 
         let payload = args
             .get("payload")
@@ -75,10 +81,17 @@ impl Tool for SopExecuteTool {
 
         // Lock engine, start run, snapshot run for audit, then drop lock
         let (action, run_snapshot) = {
-            let mut engine = self
-                .engine
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Engine lock poisoned: {e}"))?;
+            let mut engine = self.engine.lock().map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "SOP engine lock poisoned"
+                );
+
+                anyhow::Error::msg(format!("Engine lock poisoned: {e}"))
+            })?;
 
             match engine.start_run(sop_name, event) {
                 Ok(action) => {
@@ -95,7 +108,21 @@ impl Tool for SopExecuteTool {
             && let Some(ref run) = run_snapshot
             && let Err(e) = audit.log_run_start(run).await
         {
-            warn!("SOP audit log_run_start failed: {e}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "SOP audit log_run_start failed"
+            );
+        }
+
+        if let Ok(ref action) = action {
+            crate::sop::executor::enqueue_live_action(
+                Arc::clone(&self.engine),
+                self.audit.clone(),
+                action,
+            );
         }
 
         match action {
@@ -129,6 +156,14 @@ impl Tool for SopExecuteTool {
                             step.title
                         )
                     }
+                    SopRunAction::Pending {
+                        run_id,
+                        step,
+                        reason,
+                        ..
+                    } => {
+                        format!("SOP run {run_id} pending before step {step}: {reason}")
+                    }
                 };
                 Ok(ToolResult {
                     success: true,
@@ -153,7 +188,8 @@ fn action_run_id(action: &SopRunAction) -> Option<&str> {
         | SopRunAction::Completed { run_id, .. }
         | SopRunAction::Failed { run_id, .. }
         | SopRunAction::DeterministicStep { run_id, .. }
-        | SopRunAction::CheckpointWait { run_id, .. } => Some(run_id),
+        | SopRunAction::CheckpointWait { run_id, .. }
+        | SopRunAction::Pending { run_id, .. } => Some(run_id),
     }
 }
 
@@ -183,6 +219,7 @@ mod tests {
                     requires_confirmation: false,
                     kind: SopStepKind::default(),
                     schema: None,
+                    ..SopStep::default()
                 },
                 SopStep {
                     number: 2,
@@ -192,6 +229,7 @@ mod tests {
                     requires_confirmation: false,
                     kind: SopStepKind::default(),
                     schema: None,
+                    ..SopStep::default()
                 },
             ],
             cooldown_secs: 0,

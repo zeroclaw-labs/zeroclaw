@@ -3,10 +3,9 @@ use std::time::Duration;
 use futures_util::{FutureExt, future::join_all};
 use serde_json::Value;
 use std::panic::AssertUnwindSafe;
-use tracing::info;
 
 use zeroclaw_api::channel::ChannelMessage;
-use zeroclaw_api::provider::{ChatMessage, ChatResponse};
+use zeroclaw_api::model_provider::{ChatMessage, ChatResponse};
 use zeroclaw_api::tool::ToolResult;
 
 use super::traits::{HookHandler, HookResult};
@@ -32,6 +31,19 @@ impl HookRunner {
         Self {
             handlers: Vec::new(),
         }
+    }
+
+    pub fn from_config(hooks: &zeroclaw_config::schema::HooksConfig) -> Self {
+        let mut runner = Self::new();
+        if hooks.builtin.command_logger {
+            runner.register(Box::new(super::builtin::CommandLoggerHook::new()));
+        }
+        if hooks.builtin.webhook_audit.enabled {
+            runner.register(Box::new(super::builtin::WebhookAuditHook::new(
+                hooks.builtin.webhook_audit.clone(),
+            )));
+        }
+        runner
     }
 
     /// Register a handler and re-sort by descending priority.
@@ -128,35 +140,35 @@ impl HookRunner {
 
     pub async fn run_before_model_resolve(
         &self,
-        mut provider: String,
+        mut model_provider: String,
         mut model: String,
     ) -> HookResult<(String, String)> {
         for h in &self.handlers {
             let hook_name = h.name();
-            match AssertUnwindSafe(h.before_model_resolve(provider.clone(), model.clone()))
+            match AssertUnwindSafe(h.before_model_resolve(model_provider.clone(), model.clone()))
                 .catch_unwind()
                 .await
             {
                 Ok(HookResult::Continue((p, m))) => {
-                    provider = p;
+                    model_provider = p;
                     model = m;
                 }
                 Ok(HookResult::Cancel(reason)) => {
-                    info!(
-                        hook = hook_name,
-                        reason, "before_model_resolve cancelled by hook"
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hook": hook_name, "reason": reason.to_string()})), "before_model_resolve cancelled by hook");
                     return HookResult::Cancel(reason);
                 }
                 Err(_) => {
-                    tracing::error!(
-                        hook = hook_name,
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"hook": hook_name})),
                         "before_model_resolve hook panicked; continuing with previous values"
                     );
                 }
             }
         }
-        HookResult::Continue((provider, model))
+        HookResult::Continue((model_provider, model))
     }
 
     pub async fn run_before_prompt_build(&self, mut prompt: String) -> HookResult<String> {
@@ -168,15 +180,15 @@ impl HookRunner {
             {
                 Ok(HookResult::Continue(p)) => prompt = p,
                 Ok(HookResult::Cancel(reason)) => {
-                    info!(
-                        hook = hook_name,
-                        reason, "before_prompt_build cancelled by hook"
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hook": hook_name, "reason": reason.to_string()})), "before_prompt_build cancelled by hook");
                     return HookResult::Cancel(reason);
                 }
                 Err(_) => {
-                    tracing::error!(
-                        hook = hook_name,
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"hook": hook_name})),
                         "before_prompt_build hook panicked; continuing with previous value"
                     );
                 }
@@ -187,35 +199,32 @@ impl HookRunner {
 
     pub async fn run_before_llm_call(
         &self,
-        mut messages: Vec<ChatMessage>,
-        mut model: String,
-    ) -> HookResult<(Vec<ChatMessage>, String)> {
+        messages: &mut Vec<ChatMessage>,
+        model: &mut String,
+    ) -> HookResult<()> {
         for h in &self.handlers {
             let hook_name = h.name();
-            match AssertUnwindSafe(h.before_llm_call(messages.clone(), model.clone()))
+            match AssertUnwindSafe(h.before_llm_call(messages, model))
                 .catch_unwind()
                 .await
             {
-                Ok(HookResult::Continue((m, mdl))) => {
-                    messages = m;
-                    model = mdl;
-                }
+                Ok(HookResult::Continue(())) => {}
                 Ok(HookResult::Cancel(reason)) => {
-                    info!(
-                        hook = hook_name,
-                        reason, "before_llm_call cancelled by hook"
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hook": hook_name, "reason": reason.to_string()})), "before_llm_call cancelled by hook");
                     return HookResult::Cancel(reason);
                 }
                 Err(_) => {
-                    tracing::error!(
-                        hook = hook_name,
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"hook": hook_name})),
                         "before_llm_call hook panicked; continuing with previous values"
                     );
                 }
             }
         }
-        HookResult::Continue((messages, model))
+        HookResult::Continue(())
     }
 
     pub async fn run_before_tool_call(
@@ -234,15 +243,15 @@ impl HookRunner {
                     args = a;
                 }
                 Ok(HookResult::Cancel(reason)) => {
-                    info!(
-                        hook = hook_name,
-                        reason, "before_tool_call cancelled by hook"
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hook": hook_name, "reason": reason.to_string()})), "before_tool_call cancelled by hook");
                     return HookResult::Cancel(reason);
                 }
                 Err(_) => {
-                    tracing::error!(
-                        hook = hook_name,
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"hook": hook_name})),
                         "before_tool_call hook panicked; continuing with previous values"
                     );
                 }
@@ -263,15 +272,15 @@ impl HookRunner {
             {
                 Ok(HookResult::Continue(m)) => message = m,
                 Ok(HookResult::Cancel(reason)) => {
-                    info!(
-                        hook = hook_name,
-                        reason, "on_message_received cancelled by hook"
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hook": hook_name, "reason": reason.to_string()})), "on_message_received cancelled by hook");
                     return HookResult::Cancel(reason);
                 }
                 Err(_) => {
-                    tracing::error!(
-                        hook = hook_name,
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"hook": hook_name})),
                         "on_message_received hook panicked; continuing with previous message"
                     );
                 }
@@ -302,15 +311,15 @@ impl HookRunner {
                     content = ct;
                 }
                 Ok(HookResult::Cancel(reason)) => {
-                    info!(
-                        hook = hook_name,
-                        reason, "on_message_sending cancelled by hook"
-                    );
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hook": hook_name, "reason": reason.to_string()})), "on_message_sending cancelled by hook");
                     return HookResult::Cancel(reason);
                 }
                 Err(_) => {
-                    tracing::error!(
-                        hook = hook_name,
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"hook": hook_name})),
                         "on_message_sending hook panicked; continuing with previous message"
                     );
                 }
@@ -485,5 +494,437 @@ mod tests {
             HookResult::Continue(result) => assert_eq!(result, "HELLO_done"),
             HookResult::Cancel(_) => panic!("should not cancel"),
         }
+    }
+
+    // ── Panic recovery + cancellation propagation (#7688) ────────────────────
+    //
+    // Pinned regression: a hook that panics must not abort the runner or
+    // prevent subsequent handlers in the same `run_*` call from running, and
+    // a hook that returns `HookResult::Cancel(_)` must short-circuit the
+    // remaining handlers in the same call. These contracts are spelled out
+    // at lines 144–156 (cancel) and 148–156 (panic recovery) for
+    // `run_before_model_resolve`, and duplicated in every other `run_*`
+    // method on `HookRunner`. Without focused tests, a future refactor that
+    // drops the catch_unwind arm as "seems redundant because hook code
+    // shouldn't panic" would silently regress runtime control flow.
+    //
+    // We deliberately cover a small representative set of hook families
+    // rather than all six, matching the issue acceptance criteria ("tests
+    // document any intentional asymmetry between hook families").
+
+    /// A hook that panics on a configurable method. Records nothing; its
+    /// only role is to exercise the `catch_unwind` branch in the runner.
+    struct PanickingHook {
+        name: String,
+        priority: i32,
+    }
+
+    #[async_trait]
+    impl HookHandler for PanickingHook {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn priority(&self) -> i32 {
+            self.priority
+        }
+
+        async fn before_model_resolve(
+            &self,
+            _model_provider: String,
+            _model: String,
+        ) -> HookResult<(String, String)> {
+            panic!("simulated before_model_resolve panic");
+        }
+
+        async fn before_tool_call(
+            &self,
+            _name: String,
+            _args: Value,
+        ) -> HookResult<(String, Value)> {
+            panic!("simulated before_tool_call panic");
+        }
+
+        async fn before_llm_call(
+            &self,
+            _messages: &mut Vec<ChatMessage>,
+            _model: &mut String,
+        ) -> HookResult<()> {
+            panic!("simulated before_llm_call panic");
+        }
+
+        async fn on_message_received(
+            &self,
+            _message: ChannelMessage,
+        ) -> HookResult<ChannelMessage> {
+            panic!("simulated on_message_received panic");
+        }
+    }
+
+    /// A hook that cancels the run on a configurable method.
+    struct CancelNonPromptHook {
+        name: String,
+        priority: i32,
+    }
+
+    #[async_trait]
+    impl HookHandler for CancelNonPromptHook {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn priority(&self) -> i32 {
+            self.priority
+        }
+
+        async fn before_llm_call(
+            &self,
+            _messages: &mut Vec<ChatMessage>,
+            _model: &mut String,
+        ) -> HookResult<()> {
+            HookResult::Cancel("blocked by non-prompt cancel hook".into())
+        }
+
+        async fn on_message_received(
+            &self,
+            _message: ChannelMessage,
+        ) -> HookResult<ChannelMessage> {
+            HookResult::Cancel("blocked by non-prompt cancel hook".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_before_model_resolve_does_not_break_subsequent_handler() {
+        let mut runner = HookRunner::new();
+        // Higher priority panics first; lower priority must still run.
+        runner.register(Box::new(PanickingHook {
+            name: "panicker".into(),
+            priority: 10,
+        }));
+        runner.register(Box::new(UppercasePromptHook {
+            name: "upper".into(),
+            priority: 0,
+        }));
+
+        // `before_model_resolve` returns the (provider, model) tuple; the
+        // panicker yields no value so the runner falls back to the prior
+        // (input) values and the subsequent UppercasePromptHook ... wait,
+        // UppercasePromptHook only overrides before_prompt_build. Use a
+        // hook that does override before_model_resolve so the "subsequent
+        // handler ran" assertion is meaningful.
+        struct ModelConstHook {
+            name: String,
+            priority: i32,
+        }
+        #[async_trait]
+        impl HookHandler for ModelConstHook {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn priority(&self) -> i32 {
+                self.priority
+            }
+            async fn before_model_resolve(
+                &self,
+                _provider: String,
+                _model: String,
+            ) -> HookResult<(String, String)> {
+                HookResult::Continue(("const_provider".into(), "const_model".into()))
+            }
+        }
+
+        runner.register(Box::new(ModelConstHook {
+            name: "const".into(),
+            priority: 0,
+        }));
+
+        let result = runner
+            .run_before_model_resolve("openai".into(), "gpt-4o".into())
+            .await;
+        // The panicker panics (catch_unwind recovers), the const hook runs
+        // and overrides the values. Final tuple is the const values.
+        match result {
+            HookResult::Continue((p, m)) => {
+                assert_eq!(p, "const_provider");
+                assert_eq!(m, "const_model");
+            }
+            HookResult::Cancel(_) => panic!("panicking hook must not cancel"),
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_before_tool_call_does_not_break_subsequent_handler() {
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(PanickingHook {
+            name: "panicker".into(),
+            priority: 10,
+        }));
+
+        // A modifying hook that renames the tool call so we can verify it
+        // ran after the panicker.
+        struct RenameToolHook {
+            name: String,
+            priority: i32,
+        }
+        #[async_trait]
+        impl HookHandler for RenameToolHook {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn priority(&self) -> i32 {
+                self.priority
+            }
+            async fn before_tool_call(
+                &self,
+                name: String,
+                _args: Value,
+            ) -> HookResult<(String, Value)> {
+                HookResult::Continue((format!("{name}_renamed"), Value::Null))
+            }
+        }
+
+        runner.register(Box::new(RenameToolHook {
+            name: "renamer".into(),
+            priority: 0,
+        }));
+
+        let result = runner
+            .run_before_tool_call("shell".into(), Value::Null)
+            .await;
+        match result {
+            HookResult::Continue((name, _)) => {
+                assert_eq!(
+                    name, "shell_renamed",
+                    "hook after panicker must run and apply its modification"
+                );
+            }
+            HookResult::Cancel(_) => panic!("panicking hook must not cancel"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_before_llm_call_short_circuits_remaining_handlers() {
+        let mut runner = HookRunner::new();
+        // CancelNonPromptHook overrides before_llm_call to return Cancel.
+        runner.register(Box::new(CancelNonPromptHook {
+            name: "blocker".into(),
+            priority: 10,
+        }));
+
+        // A second hook that overrides before_llm_call; we count its calls
+        // to verify it did NOT run after the canceller.
+        struct LlmCallCounterHook {
+            name: String,
+            priority: i32,
+            count: Arc<AtomicU32>,
+        }
+        #[async_trait]
+        impl HookHandler for LlmCallCounterHook {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn priority(&self) -> i32 {
+                self.priority
+            }
+            async fn before_llm_call(
+                &self,
+                _messages: &mut Vec<ChatMessage>,
+                _model: &mut String,
+            ) -> HookResult<()> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                HookResult::Continue(())
+            }
+        }
+
+        let count = Arc::new(AtomicU32::new(0));
+        runner.register(Box::new(LlmCallCounterHook {
+            name: "counter".into(),
+            priority: 0,
+            count: Arc::clone(&count),
+        }));
+
+        let mut messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let mut model = "gpt-4o".into();
+        let result = runner.run_before_llm_call(&mut messages, &mut model).await;
+
+        assert!(
+            result.is_cancel(),
+            "canceller must short-circuit the run with HookResult::Cancel"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "hooks after the canceller must NOT run"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_on_message_received_short_circuits_remaining_handlers() {
+        // Same contract verified on a non-modifying-family hook to pin
+        // consistent cancellation behavior across hook families.
+        struct CancelMessageHook {
+            name: String,
+            priority: i32,
+        }
+        #[async_trait]
+        impl HookHandler for CancelMessageHook {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn priority(&self) -> i32 {
+                self.priority
+            }
+            async fn on_message_received(
+                &self,
+                _message: ChannelMessage,
+            ) -> HookResult<ChannelMessage> {
+                HookResult::Cancel("blocked by on_message_received cancel".into())
+            }
+        }
+
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(CancelMessageHook {
+            name: "blocker".into(),
+            priority: 10,
+        }));
+
+        // A no-op subsequent handler counted to confirm short-circuit.
+        struct PassThroughMessageHook {
+            name: String,
+            priority: i32,
+            count: Arc<AtomicU32>,
+        }
+        #[async_trait]
+        impl HookHandler for PassThroughMessageHook {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn priority(&self) -> i32 {
+                self.priority
+            }
+            async fn on_message_received(
+                &self,
+                message: ChannelMessage,
+            ) -> HookResult<ChannelMessage> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                HookResult::Continue(message)
+            }
+        }
+
+        let count = Arc::new(AtomicU32::new(0));
+        runner.register(Box::new(PassThroughMessageHook {
+            name: "passthrough".into(),
+            priority: 0,
+            count: Arc::clone(&count),
+        }));
+
+        let result = runner
+            .run_on_message_received(ChannelMessage::default())
+            .await;
+
+        assert!(
+            result.is_cancel(),
+            "on_message_received canceller must short-circuit"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "pass-through hook after the canceller must NOT run"
+        );
+    }
+
+    // ── from_config and lifecycle tests ──────────────────────────
+
+    struct SessionCountingHook {
+        name: String,
+        start_count: Arc<AtomicU32>,
+        end_count: Arc<AtomicU32>,
+    }
+
+    impl SessionCountingHook {
+        fn new(name: &str) -> (Self, Arc<AtomicU32>, Arc<AtomicU32>) {
+            let start = Arc::new(AtomicU32::new(0));
+            let end = Arc::new(AtomicU32::new(0));
+            (
+                Self {
+                    name: name.to_string(),
+                    start_count: start.clone(),
+                    end_count: end.clone(),
+                },
+                start,
+                end,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl HookHandler for SessionCountingHook {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn priority(&self) -> i32 {
+            0
+        }
+        async fn on_session_start(&self, _session_id: &str, _channel: &str) {
+            self.start_count.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn on_session_end(&self, _session_id: &str, _channel: &str) {
+            self.end_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn from_config_disabled_builtins_produces_empty_runner() {
+        let config = zeroclaw_config::schema::HooksConfig {
+            enabled: true,
+            builtin: zeroclaw_config::schema::BuiltinHooksConfig {
+                command_logger: false,
+                webhook_audit: zeroclaw_config::schema::WebhookAuditConfig::default(),
+            },
+        };
+        let runner = HookRunner::from_config(&config);
+        assert!(
+            runner.handlers.is_empty(),
+            "no builtins enabled → runner must be empty"
+        );
+    }
+
+    #[test]
+    fn from_config_registers_command_logger_when_enabled() {
+        let config = zeroclaw_config::schema::HooksConfig {
+            enabled: true,
+            builtin: zeroclaw_config::schema::BuiltinHooksConfig {
+                command_logger: true,
+                webhook_audit: zeroclaw_config::schema::WebhookAuditConfig::default(),
+            },
+        };
+        let runner = HookRunner::from_config(&config);
+        let names: Vec<&str> = runner.handlers.iter().map(|h| h.name()).collect();
+        assert!(
+            names.contains(&"command-logger"),
+            "command-logger enabled → must be registered; got {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle_events_reach_registered_handler() {
+        let mut runner = HookRunner::new();
+        let (hook, start_count, end_count) = SessionCountingHook::new("session-watcher");
+        runner.register(Box::new(hook));
+
+        runner.fire_session_start("sess-1", "rpc").await;
+        assert_eq!(start_count.load(Ordering::SeqCst), 1);
+
+        runner.fire_session_end("sess-1", "rpc").await;
+        assert_eq!(end_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_runner_lifecycle_events_are_noops() {
+        let runner = HookRunner::new();
+        // Must not panic when no handlers are registered.
+        runner.fire_session_start("sess-1", "rpc").await;
+        runner.fire_session_end("sess-1", "rpc").await;
     }
 }

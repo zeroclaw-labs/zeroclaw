@@ -65,6 +65,7 @@ impl LeakDetector {
         self.check_private_keys(content, &mut patterns, &mut redacted);
         self.check_jwt_tokens(content, &mut patterns, &mut redacted);
         self.check_database_urls(content, &mut patterns, &mut redacted);
+        self.check_bot_token(content, &mut patterns, &mut redacted);
         self.check_high_entropy_tokens(content, &mut patterns, &mut redacted);
 
         if patterns.is_empty() {
@@ -102,6 +103,8 @@ impl LeakDetector {
                     Regex::new(r"sk-ant-[a-zA-Z0-9-_]{32,}").unwrap(),
                     "Anthropic API key",
                 ),
+                // Groq
+                (Regex::new(r"gsk_[a-zA-Z0-9]{20,}").unwrap(), "Groq API key"),
                 // Google
                 (
                     Regex::new(r"AIza[a-zA-Z0-9_-]{35}").unwrap(),
@@ -294,6 +297,25 @@ impl LeakDetector {
         }
     }
 
+    /// Check for messaging bot tokens embedded in API URLs.
+    ///
+    /// Telegram bot tokens appear in request URLs as `/bot<id>:<token>` and
+    /// would otherwise reach error logs verbatim. The token half is not
+    /// guaranteed high-entropy, so it needs an explicit pattern rather than
+    /// relying on the entropy scan.
+    fn check_bot_token(&self, content: &str, patterns: &mut Vec<String>, redacted: &mut String) {
+        static BOT_TOKEN_PATTERN: OnceLock<Regex> = OnceLock::new();
+        let regex =
+            BOT_TOKEN_PATTERN.get_or_init(|| Regex::new(r"/bot[0-9]+:[A-Za-z0-9_-]+").unwrap());
+
+        if regex.is_match(content) {
+            patterns.push("Bot token".to_string());
+            *redacted = regex
+                .replace_all(redacted, "/bot[REDACTED_BOT_TOKEN]")
+                .to_string();
+        }
+    }
+
     /// Check for high-entropy tokens that may be leaked credentials.
     ///
     /// Extracts candidate tokens from content (after stripping URLs to avoid
@@ -312,7 +334,7 @@ impl LeakDetector {
         // segments are not mistaken for high-entropy credentials.
         // Media markers like [IMAGE:/path/to/file.png] contain filesystem paths
         // that look like high-entropy tokens when `/` is included in the token
-        // character set (#4604).
+        // character set.
         static URL_PATTERN: OnceLock<Regex> = OnceLock::new();
         let url_re = URL_PATTERN.get_or_init(|| Regex::new(r"https?://\S+").unwrap());
         static MEDIA_MARKER_PATTERN: OnceLock<Regex> = OnceLock::new();
@@ -321,7 +343,7 @@ impl LeakDetector {
         });
         // Tool receipts (zc-receipt-...) are runtime-generated HMAC tokens that
         // intentionally appear in output. Strip them before entropy scanning so
-        // they are not redacted as leaked credentials. See #4830.
+        // they are not redacted as leaked credentials.
         static RECEIPT_PATTERN: OnceLock<Regex> = OnceLock::new();
         let receipt_re =
             RECEIPT_PATTERN.get_or_init(|| Regex::new(r"zc-receipt-\d+-[A-Za-z0-9_-]+").unwrap());
@@ -410,6 +432,21 @@ mod tests {
                 assert!(patterns.iter().any(|p| p.contains("AWS")));
             }
             LeakResult::Clean => panic!("Should detect AWS key"),
+        }
+    }
+
+    #[test]
+    fn detects_groq_api_keys() {
+        let detector = LeakDetector::new();
+        let content = "Groq key: gsk_abcdefghijklmnopqrstuvwxyz123456";
+        let result = detector.scan(content);
+        match result {
+            LeakResult::Detected { patterns, redacted } => {
+                assert!(patterns.iter().any(|p| p.contains("Groq")));
+                assert!(redacted.contains("[REDACTED"));
+                assert!(!redacted.contains("gsk_abcdefghijklmnopqrstuvwxyz123456"));
+            }
+            LeakResult::Clean => panic!("Should detect Groq API key"),
         }
     }
 
@@ -608,5 +645,28 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
         // "ab" repeated: entropy = 1.0 bit
         let e = shannon_entropy("abab");
         assert!((e - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn detects_telegram_bot_token() {
+        let detector = LeakDetector::new();
+        let content = "error sending request for url (https://api.telegram.org/bot123456:ABC-def_GHI/getUpdates)";
+        match detector.scan(content) {
+            LeakResult::Detected { patterns, redacted } => {
+                assert!(patterns.iter().any(|p| p.contains("Bot token")));
+                assert!(redacted.contains("[REDACTED_BOT_TOKEN]"));
+                assert!(!redacted.contains("123456:ABC-def_GHI"));
+            }
+            LeakResult::Clean => panic!("Should detect Telegram bot token"),
+        }
+    }
+
+    #[test]
+    fn bot_token_leaves_unrelated_text_clean() {
+        let detector = LeakDetector::new();
+        assert!(matches!(
+            detector.scan("connection reset by peer"),
+            LeakResult::Clean
+        ));
     }
 }

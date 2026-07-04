@@ -1,21 +1,43 @@
+use crate::helpers::domain_guard;
 use async_trait::async_trait;
 use serde_json::json;
-use std::sync::Arc;
+use std::{process::Stdio, sync::Arc, time::Duration};
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
-/// Open approved HTTPS URLs in the system default browser (no scraping, no DOM automation).
+const BROWSER_OPEN_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Open approved HTTP/HTTPS URLs in the system default browser (no scraping, no DOM automation).
 pub struct BrowserOpenTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
+    allowed_private_hosts: Vec<String>,
 }
 
 impl BrowserOpenTool {
-    pub fn new(security: Arc<SecurityPolicy>, allowed_domains: Vec<String>) -> Self {
-        Self {
+    pub fn new(
+        security: Arc<SecurityPolicy>,
+        allowed_domains: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_private_hosts(security, allowed_domains, Vec::new())
+    }
+
+    pub fn new_with_private_hosts(
+        security: Arc<SecurityPolicy>,
+        allowed_domains: Vec<String>,
+        allowed_private_hosts: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             security,
-            allowed_domains: normalize_allowed_domains(allowed_domains),
-        }
+            allowed_domains: domain_guard::normalize_allowed_domains(
+                allowed_domains,
+                "browser.allowed_domains",
+            )?,
+            allowed_private_hosts: domain_guard::normalize_allowed_domains(
+                allowed_private_hosts,
+                "browser.allowed_private_hosts",
+            )?,
+        })
     }
 
     fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
@@ -29,23 +51,30 @@ impl BrowserOpenTool {
             anyhow::bail!("URL cannot contain whitespace");
         }
 
-        if !url.starts_with("https://") {
-            anyhow::bail!("Only https:// URLs are allowed");
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            anyhow::bail!("Only http:// or https:// URLs are allowed");
         }
 
-        if self.allowed_domains.is_empty() {
+        if self.allowed_domains.is_empty() && self.allowed_private_hosts.is_empty() {
             anyhow::bail!(
                 "Browser tool is enabled but no allowed_domains are configured. Add [browser].allowed_domains in config.toml"
             );
         }
 
         let host = extract_host(url)?;
+        let private_host = domain_guard::is_private_or_local_host(&host);
+        let private_host_allowed = private_host
+            && domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts);
 
-        if is_private_or_local_host(&host) {
+        if private_host && !private_host_allowed {
             anyhow::bail!("Blocked local/private host: {host}");
         }
 
-        if !host_matches_allowlist(&host, &self.allowed_domains) {
+        if private_host_allowed {
+            return Ok(url.to_string());
+        }
+
+        if !domain_guard::host_matches_allowlist(&host, &self.allowed_domains) {
             anyhow::bail!("Host '{host}' is not in browser.allowed_domains");
         }
 
@@ -60,7 +89,7 @@ impl Tool for BrowserOpenTool {
     }
 
     fn description(&self) -> &str {
-        "Open an approved HTTPS URL in the system browser. Security constraints: allowlist-only domains, no local/private hosts, no scraping."
+        "Open an approved HTTP/HTTPS URL in the system browser. Security constraints: allowlist-only domains, no local/private hosts, no scraping."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -69,7 +98,7 @@ impl Tool for BrowserOpenTool {
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "HTTPS URL to open in the system browser"
+                    "description": "HTTP or HTTPS URL to open in the system browser"
                 }
             },
             "required": ["url"]
@@ -77,10 +106,16 @@ impl Tool for BrowserOpenTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let url = args
-            .get("url")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'url' parameter"))?;
+        let url = args.get("url").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "url"})),
+                "browser_open: missing url parameter"
+            );
+            anyhow::Error::msg("Missing 'url' parameter")
+        })?;
 
         if !self.security.can_act() {
             return Ok(ToolResult {
@@ -124,32 +159,47 @@ impl Tool for BrowserOpenTool {
     }
 }
 
+async fn run_browser_launcher(command: tokio::process::Command, label: &str) -> Result<(), String> {
+    run_browser_launcher_with_timeout(command, label, BROWSER_OPEN_LAUNCH_TIMEOUT).await
+}
+
+async fn run_browser_launcher_with_timeout(
+    mut command: tokio::process::Command,
+    label: &str,
+    deadline: Duration,
+) -> Result<(), String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+
+    match tokio::time::timeout(deadline, command.status()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => Err(format!("{label} exited with status {status}")),
+        Ok(Err(error)) => Err(format!("{label} not runnable: {error}")),
+        Err(_) => Err(format!("{label} timed out after {deadline:?}")),
+    }
+}
+
 async fn open_in_system_browser(url: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let primary_error = match tokio::process::Command::new("open").arg(url).status().await {
-            Ok(status) if status.success() => return Ok(()),
-            Ok(status) => format!("open exited with status {status}"),
-            Err(error) => format!("open not runnable: {error}"),
+        let mut command = tokio::process::Command::new("open");
+        command.arg(url);
+        let primary_error = match run_browser_launcher(command, "open").await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
         };
 
         // TODO(compat): remove Brave fallback after default-browser launch has been stable across macOS environments.
         let mut brave_error = String::new();
         for app in ["Brave Browser", "Brave"] {
-            match tokio::process::Command::new("open")
-                .arg("-a")
-                .arg(app)
-                .arg(url)
-                .status()
-                .await
-            {
-                Ok(status) if status.success() => return Ok(()),
-                Ok(status) => {
-                    brave_error = format!("open -a '{app}' exited with status {status}");
-                }
-                Err(error) => {
-                    brave_error = format!("open -a '{app}' not runnable: {error}");
-                }
+            let mut command = tokio::process::Command::new("open");
+            command.arg("-a").arg(app).arg(url);
+            match run_browser_launcher(command, &format!("open -a '{app}'")).await {
+                Ok(()) => return Ok(()),
+                Err(error) => brave_error = error,
             }
         }
 
@@ -173,14 +223,10 @@ async fn open_in_system_browser(url: &str) -> anyhow::Result<()> {
                 command.arg("open");
             }
             command.arg(url);
-            match command.status().await {
-                Ok(status) if status.success() => return Ok(()),
-                Ok(status) => {
-                    last_error = format!("{cmd} exited with status {status}");
-                }
-                Err(error) => {
-                    last_error = format!("{cmd} not runnable: {error}");
-                }
+            let label = if cmd == "gio" { "gio open" } else { cmd };
+            match run_browser_launcher(command, label).await {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = error,
             }
         }
 
@@ -194,28 +240,22 @@ async fn open_in_system_browser(url: &str) -> anyhow::Result<()> {
     {
         // Use direct process invocation (not `cmd /C start`) to avoid shell
         // metacharacter interpretation in URLs (e.g. `&` in query strings).
-        let primary_error = match tokio::process::Command::new("rundll32")
-            .arg("url.dll,FileProtocolHandler")
-            .arg(url)
-            .status()
-            .await
-        {
-            Ok(status) if status.success() => return Ok(()),
-            Ok(status) => format!("rundll32 default-browser launcher exited with status {status}"),
-            Err(error) => format!("rundll32 default-browser launcher not runnable: {error}"),
-        };
+        let mut command = tokio::process::Command::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler").arg(url);
+        let primary_error =
+            match run_browser_launcher(command, "rundll32 default-browser launcher").await {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            };
 
         // TODO(compat): remove Brave fallback after default-browser launch has been stable across Windows environments.
         let mut brave_error = String::new();
         for cmd in ["brave", "brave.exe"] {
-            match tokio::process::Command::new(cmd).arg(url).status().await {
-                Ok(status) if status.success() => return Ok(()),
-                Ok(status) => {
-                    brave_error = format!("{cmd} exited with status {status}");
-                }
-                Err(error) => {
-                    brave_error = format!("{cmd} not runnable: {error}");
-                }
+            let mut command = tokio::process::Command::new(cmd);
+            command.arg(url);
+            match run_browser_launcher(command, cmd).await {
+                Ok(()) => return Ok(()),
+                Err(error) => brave_error = error,
             }
         }
 
@@ -231,54 +271,31 @@ async fn open_in_system_browser(url: &str) -> anyhow::Result<()> {
     }
 }
 
-fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
-    let mut normalized = domains
-        .into_iter()
-        .filter_map(|d| normalize_domain(&d))
-        .collect::<Vec<_>>();
-    normalized.sort_unstable();
-    normalized.dedup();
-    normalized
-}
-
-fn normalize_domain(raw: &str) -> Option<String> {
-    let mut d = raw.trim().to_lowercase();
-    if d.is_empty() {
-        return None;
-    }
-
-    if let Some(stripped) = d.strip_prefix("https://") {
-        d = stripped.to_string();
-    } else if let Some(stripped) = d.strip_prefix("http://") {
-        d = stripped.to_string();
-    }
-
-    if let Some((host, _)) = d.split_once('/') {
-        d = host.to_string();
-    }
-
-    d = d.trim_start_matches('.').trim_end_matches('.').to_string();
-
-    if let Some((host, _)) = d.split_once(':') {
-        d = host.to_string();
-    }
-
-    if d.is_empty() || d.chars().any(char::is_whitespace) {
-        return None;
-    }
-
-    Some(d)
-}
-
 fn extract_host(url: &str) -> anyhow::Result<String> {
     let rest = url
         .strip_prefix("https://")
-        .ok_or_else(|| anyhow::anyhow!("Only https:// URLs are allowed"))?;
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"url": url})),
+                "browser_open: unsupported URL scheme rejected"
+            );
+            anyhow::Error::msg("Only http:// or https:// URLs are allowed")
+        })?;
 
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Invalid URL"))?;
+    let authority = rest.split(['/', '?', '#']).next().ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"url": url})),
+            "browser_open: invalid URL"
+        );
+        anyhow::Error::msg("Invalid URL")
+    })?;
 
     if authority.is_empty() {
         anyhow::bail!("URL must include a host");
@@ -307,55 +324,6 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
     Ok(host)
 }
 
-fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
-    if allowed_domains.iter().any(|domain| domain == "*") {
-        return true;
-    }
-
-    allowed_domains.iter().any(|domain| {
-        host == domain
-            || host
-                .strip_suffix(domain)
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    })
-}
-
-fn is_private_or_local_host(host: &str) -> bool {
-    let has_local_tld = host
-        .rsplit('.')
-        .next()
-        .is_some_and(|label| label == "local");
-
-    if host == "localhost" || host.ends_with(".localhost") || has_local_tld || host == "::1" {
-        return true;
-    }
-
-    if let Some([a, b, _, _]) = parse_ipv4(host) {
-        return a == 0
-            || a == 10
-            || a == 127
-            || (a == 169 && b == 254)
-            || (a == 172 && (16..=31).contains(&b))
-            || (a == 192 && b == 168)
-            || (a == 100 && (64..=127).contains(&b));
-    }
-
-    false
-}
-
-fn parse_ipv4(host: &str) -> Option<[u8; 4]> {
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() != 4 {
-        return None;
-    }
-
-    let mut octets = [0_u8; 4];
-    for (i, part) in parts.iter().enumerate() {
-        octets[i] = part.parse::<u8>().ok()?;
-    }
-    Some(octets)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,22 +339,26 @@ mod tests {
             security,
             allowed_domains.into_iter().map(String::from).collect(),
         )
+        .unwrap()
     }
 
-    #[test]
-    fn normalize_domain_strips_scheme_path_and_case() {
-        let got = normalize_domain("  HTTPS://Docs.Example.com/path ").unwrap();
-        assert_eq!(got, "docs.example.com");
-    }
-
-    #[test]
-    fn normalize_allowed_domains_deduplicates() {
-        let got = normalize_allowed_domains(vec![
-            "example.com".into(),
-            "EXAMPLE.COM".into(),
-            "https://example.com/".into(),
-        ]);
-        assert_eq!(got, vec!["example.com".to_string()]);
+    fn test_tool_with_private(
+        allowed_domains: Vec<&str>,
+        allowed_private_hosts: Vec<&str>,
+    ) -> BrowserOpenTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        BrowserOpenTool::new_with_private_hosts(
+            security,
+            allowed_domains.into_iter().map(String::from).collect(),
+            allowed_private_hosts
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -419,13 +391,42 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_http() {
+    fn validate_accepts_http() {
+        let tool = test_tool(vec!["example.com"]);
+        let got = tool.validate_url("http://example.com/docs").unwrap();
+        assert_eq!(got, "http://example.com/docs");
+    }
+
+    #[test]
+    fn validate_accepts_http_with_port() {
+        let tool = test_tool(vec!["example.com"]);
+        let got = tool
+            .validate_url("http://example.com:8080/path?q=1")
+            .unwrap();
+        assert_eq!(got, "http://example.com:8080/path?q=1");
+    }
+
+    #[test]
+    fn validate_accepts_http_for_wildcard_allowlist() {
+        // Explicit pin of the default posture: with the shipped default
+        // `browser.allowed_domains = ["*"]`, browser_open accepts plain http://
+        // to any public host. This is the same default that web_fetch,
+        // http_request, and the `browser` tool already ship (all default to
+        // `["*"]` and already accept http://); this test makes the
+        // default-posture change for browser_open conscious and reviewable.
+        let tool = test_tool(vec!["*"]);
+        let got = tool.validate_url("http://example.com/page").unwrap();
+        assert_eq!(got, "http://example.com/page");
+    }
+
+    #[test]
+    fn validate_rejects_unsupported_scheme() {
         let tool = test_tool(vec!["example.com"]);
         let err = tool
-            .validate_url("http://example.com")
+            .validate_url("ftp://example.com")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("https://"));
+        assert!(err.contains("http://"));
     }
 
     #[test]
@@ -481,24 +482,12 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserOpenTool::new(security, vec![]);
+        let tool = BrowserOpenTool::new(security, vec![]).unwrap();
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
             .to_string();
         assert!(err.contains("allowed_domains"));
-    }
-
-    #[test]
-    fn parse_ipv4_valid() {
-        assert_eq!(parse_ipv4("1.2.3.4"), Some([1, 2, 3, 4]));
-    }
-
-    #[test]
-    fn parse_ipv4_invalid() {
-        assert_eq!(parse_ipv4("1.2.3"), None);
-        assert_eq!(parse_ipv4("1.2.3.999"), None);
-        assert_eq!(parse_ipv4("not-an-ip"), None);
     }
 
     #[tokio::test]
@@ -507,7 +496,7 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = BrowserOpenTool::new(security, vec!["example.com".into()]);
+        let tool = BrowserOpenTool::new(security, vec!["example.com".into()]).unwrap();
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -522,12 +511,108 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = BrowserOpenTool::new(security, vec!["example.com".into()]);
+        let tool = BrowserOpenTool::new(security, vec!["example.com".into()]).unwrap();
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("rate limit"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launcher_helper_times_out_stalled_process() {
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("60");
+
+        let started = std::time::Instant::now();
+        let error =
+            run_browser_launcher_with_timeout(command, "test launcher", Duration::from_millis(20))
+                .await
+                .unwrap_err();
+
+        assert!(error.contains("timed out"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout helper waited too long: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launcher_helper_allows_successful_process() {
+        let command = tokio::process::Command::new("true");
+
+        run_browser_launcher_with_timeout(command, "test launcher", Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    // ── allowed_private_hosts opt-in tests ──────────────────────
+
+    #[test]
+    fn wildcard_private_allowlist_permits_localhost() {
+        let tool = test_tool_with_private(vec![], vec!["*"]);
+        assert!(tool.validate_url("https://localhost:8443").is_ok());
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_permits_private_ipv4() {
+        let tool = test_tool_with_private(vec![], vec!["*"]);
+        assert!(tool.validate_url("https://192.168.1.5").is_ok());
+    }
+
+    #[test]
+    fn allowed_private_hosts_entry_permits_listed_host() {
+        let tool = test_tool_with_private(vec![], vec!["10.0.0.1"]);
+        assert!(tool.validate_url("https://10.0.0.1").is_ok());
+    }
+
+    #[test]
+    fn allowed_private_hosts_does_not_permit_unlisted_host() {
+        let tool = test_tool_with_private(vec![], vec!["10.0.0.1"]);
+        let err = tool
+            .validate_url("https://10.0.0.2")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn empty_private_allowlist_still_rejects_private() {
+        let tool = test_tool_with_private(vec!["*"], vec![]);
+        let err = tool
+            .validate_url("https://localhost")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_alone_satisfies_allowlist_requirement() {
+        // allowed_domains empty + allowed_private_hosts=["*"] should not surface
+        // the "no allowed_domains configured" error for private hosts.
+        let tool = test_tool_with_private(vec![], vec!["*"]);
+        assert!(tool.validate_url("https://localhost").is_ok());
+    }
+
+    #[test]
+    fn specific_private_host_alone_satisfies_allowlist_requirement() {
+        let tool = test_tool_with_private(vec![], vec!["192.168.1.5"]);
+        assert!(tool.validate_url("https://192.168.1.5").is_ok());
+    }
+
+    #[test]
+    fn listed_private_host_permits_http_scheme() {
+        // `browser_open` accepts `http://` (since it was relaxed to accept
+        // both schemes upstream), so a listed private host can be reached
+        // over plain HTTP — internal services frequently lack a public TLS
+        // cert. The unlisted-host SSRF guard still applies; this test just
+        // pins that the scheme guard does not pre-empt the allowlist for
+        // listed hosts.
+        let tool = test_tool_with_private(vec![], vec!["10.0.0.1"]);
+        assert!(tool.validate_url("http://10.0.0.1").is_ok());
     }
 }

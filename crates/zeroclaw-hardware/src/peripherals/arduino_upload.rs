@@ -7,7 +7,11 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::process::Command;
+use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool_attribution;
+
+tool_attribution!(ArduinoUploadTool, ToolKind::Plugin);
 
 /// Tool: upload Arduino sketch (agent-generated code) to the board.
 pub struct ArduinoUploadTool {
@@ -45,10 +49,16 @@ impl Tool for ArduinoUploadTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let code = args
-            .get("code")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'code' parameter"))?;
+        let code = args.get("code").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "code"})),
+                "arduino_upload tool: missing parameter"
+            );
+            anyhow::Error::msg("Missing 'code' parameter")
+        })?;
 
         if code.trim().is_empty() {
             return Ok(ToolResult {

@@ -275,14 +275,44 @@ impl Tool for BackupTool {
                 let name = args
                     .get("backup_name")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'backup_name' for verify"))?;
+                    .ok_or_else(|| {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "param": "backup_name",
+                                "command": "verify",
+                            })),
+                            "backup_tool: missing backup_name for verify"
+                        );
+                        anyhow::Error::msg("Missing 'backup_name' for verify")
+                    })?;
                 self.cmd_verify(name).await
             }
             "restore" => {
                 let name = args
                     .get("backup_name")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'backup_name' for restore"))?;
+                    .ok_or_else(|| {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "param": "backup_name",
+                                "command": "restore",
+                            })),
+                            "backup_tool: missing backup_name for restore"
+                        );
+                        anyhow::Error::msg("Missing 'backup_name' for restore")
+                    })?;
                 let confirm = args
                     .get("confirm")
                     .and_then(|v| v.as_bool())

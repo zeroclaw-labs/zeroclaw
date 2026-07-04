@@ -26,17 +26,27 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
 
 use matrix_sdk::{
     Client,
-    ruma::{OwnedEventId, OwnedRoomId},
+    ruma::{
+        OwnedEventId, OwnedRoomId, OwnedUserId,
+        api::client::{
+            membership::invite_user::v3::{
+                InvitationRecipient, InviteUserId, Request as InviteUserRequest,
+            },
+            room::{Visibility as MatrixVisibility, create_room::v3::Request as CreateRoomRequest},
+        },
+        events::{InitialStateEvent, room::encryption::RoomEncryptionEventContent},
+    },
 };
 
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, RoomCreationOptions,
+    RoomVisibility, SendMessage,
 };
 use zeroclaw_config::schema::{MatrixConfig, StreamMode, TranscriptionConfig};
 
@@ -189,13 +199,11 @@ mod allowlist {
     /// `@bot:example.org`. ASCII case-insensitive match is the conservative
     /// reading.
     pub(super) fn user_allowed(allowed_users: &[String], sender: &str) -> bool {
-        if allowed_users.is_empty() {
-            return false;
-        }
-        if allowed_users.iter().any(|u| u == "*") {
-            return true;
-        }
-        allowed_users.iter().any(|u| u.eq_ignore_ascii_case(sender))
+        crate::allowlist::is_user_allowed(
+            allowed_users,
+            sender,
+            crate::allowlist::Match::CaseInsensitive,
+        )
     }
 
     pub(super) fn room_allowed_static(allowed_rooms: &[String], room_id: &str) -> bool {
@@ -250,6 +258,59 @@ mod approval {
             _ => return None,
         };
         Some((token.to_uppercase(), response))
+    }
+}
+
+// ─── room management ──────────────────────────────────────────────────────
+mod room_management {
+    use super::*;
+
+    pub(super) fn build_create_room_request(
+        options: &RoomCreationOptions,
+    ) -> Result<CreateRoomRequest> {
+        let mut request = CreateRoomRequest::new();
+        request.name = options.name.clone();
+        request.topic = options.topic.clone();
+        request.invite = options
+            .invites
+            .iter()
+            .map(|user_id| {
+                user_id
+                    .parse::<OwnedUserId>()
+                    .with_context(|| format!("matrix: invalid invite user id '{user_id}'"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(visibility) = options.visibility {
+            request.visibility = match visibility {
+                RoomVisibility::Private => MatrixVisibility::Private,
+                RoomVisibility::Public => MatrixVisibility::Public,
+            };
+        }
+        if options.encryption.unwrap_or(false) {
+            request.initial_state.push(
+                InitialStateEvent::with_empty_state_key(
+                    RoomEncryptionEventContent::with_recommended_defaults(),
+                )
+                .to_raw_any(),
+            );
+        }
+        Ok(request)
+    }
+
+    pub(super) fn build_invite_user_request(
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<InviteUserRequest> {
+        let room_id = room_id
+            .parse::<OwnedRoomId>()
+            .with_context(|| format!("matrix: invalid room id '{room_id}'"))?;
+        let user_id = user_id
+            .parse::<OwnedUserId>()
+            .with_context(|| format!("matrix: invalid user id '{user_id}'"))?;
+        Ok(InviteUserRequest::new(
+            room_id,
+            InvitationRecipient::from(InviteUserId::new(user_id)),
+        ))
     }
 }
 
@@ -314,11 +375,36 @@ mod streaming {
         time::{Duration, Instant},
     };
 
+    use anyhow::{Result, bail};
     use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
 
     use super::markers;
 
-    pub(super) type DraftKey = OwnedRoomId;
+    const MULTI_MESSAGE_SYNTHETIC_PREFIX: &str = "multi_message_synthetic:";
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub(super) struct DraftKey {
+        room_id: OwnedRoomId,
+        draft_id: String,
+    }
+
+    pub(super) fn draft_key(room_id: OwnedRoomId, draft_id: &str) -> Result<DraftKey> {
+        let draft_id = draft_id.trim();
+        if draft_id.is_empty() {
+            bail!("matrix: draft message id is empty");
+        }
+        Ok(DraftKey {
+            room_id,
+            draft_id: draft_id.to_string(),
+        })
+    }
+
+    pub(super) fn new_multi_message_draft_id() -> String {
+        format!(
+            "{MULTI_MESSAGE_SYNTHETIC_PREFIX}{}",
+            uuid::Uuid::new_v4().simple()
+        )
+    }
 
     #[derive(Debug, Clone)]
     pub(super) struct PartialDraft {
@@ -350,6 +436,28 @@ mod streaming {
     pub(super) struct State {
         pub partial: HashMap<DraftKey, PartialDraft>,
         pub multi: HashMap<DraftKey, MultiDraft>,
+    }
+
+    pub(super) fn partial_for_update<'a>(
+        state: &'a mut State,
+        key: &DraftKey,
+    ) -> Option<&'a mut PartialDraft> {
+        state.partial.get_mut(key)
+    }
+
+    pub(super) fn take_partial(state: &mut State, key: &DraftKey) -> Option<PartialDraft> {
+        state.partial.remove(key)
+    }
+
+    pub(super) fn multi_for_update<'a>(
+        state: &'a mut State,
+        key: &DraftKey,
+    ) -> Option<&'a mut MultiDraft> {
+        state.multi.get_mut(key)
+    }
+
+    pub(super) fn take_multi(state: &mut State, key: &DraftKey) -> Option<MultiDraft> {
+        state.multi.remove(key)
     }
 
     pub(super) fn partial_should_edit(
@@ -453,14 +561,30 @@ mod session {
         if !p.exists() {
             return Ok(None);
         }
-        let bytes = std::fs::read(&p)
-            .map_err(|e| anyhow::anyhow!("read matrix session blob {}: {e}", p.display()))?;
+        let bytes = std::fs::read(&p).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": p.display().to_string(),
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to read session blob"
+            );
+            anyhow::Error::msg(format!("read matrix session blob {}: {e}", p.display()))
+        })?;
         match serde_json::from_slice::<SessionBlob>(&bytes) {
             Ok(blob) => Ok(Some(blob)),
             Err(e) => {
-                tracing::warn!(
-                    "matrix: session blob {} is corrupt JSON ({e}); treating as missing so auto-recovery can re-login",
-                    p.display()
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "matrix: session blob {} is corrupt JSON ({e}); treating as missing so auto-recovery can re-login",
+                        p.display()
+                    )
                 );
                 Ok(None)
             }
@@ -468,12 +592,37 @@ mod session {
     }
 
     pub(super) fn save(state_dir: &Path, blob: &SessionBlob) -> anyhow::Result<()> {
-        std::fs::create_dir_all(state_dir)
-            .map_err(|e| anyhow::anyhow!("create matrix state dir {}: {e}", state_dir.display()))?;
+        std::fs::create_dir_all(state_dir).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": state_dir.display().to_string(),
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to create state dir"
+            );
+            anyhow::Error::msg(format!(
+                "create matrix state dir {}: {e}",
+                state_dir.display()
+            ))
+        })?;
         let p = path(state_dir);
         let json = serde_json::to_vec_pretty(blob)?;
-        write_with_owner_only(&p, &json)
-            .map_err(|e| anyhow::anyhow!("write matrix session blob {}: {e}", p.display()))?;
+        write_with_owner_only(&p, &json).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": p.display().to_string(),
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to write session blob"
+            );
+            anyhow::Error::msg(format!("write matrix session blob {}: {e}", p.display()))
+        })?;
         Ok(())
     }
 
@@ -508,20 +657,28 @@ mod client {
         time::Duration,
     };
 
-    use anyhow::{Context as _, Result, anyhow, bail};
+    use anyhow::{Context as _, Result, bail};
     use matrix_sdk::{
         Client, SessionMeta, SessionTokens,
         authentication::matrix::MatrixSession,
+        config::RequestConfig,
         ruma::{OwnedRoomId, RoomAliasId},
     };
     use serde::Deserialize;
     use tokio::sync::RwLock;
-    use tracing::{debug, info, warn};
 
     use super::session;
     use zeroclaw_config::schema::MatrixConfig;
 
     const WHOAMI_ENDPOINT: &str = "_matrix/client/v3/account/whoami";
+
+    /// Per-request HTTP timeout for the Matrix client. Must stay strictly
+    /// greater than [`super::inbound::SYNC_LONGPOLL_TIMEOUT`] so an idle
+    /// `/sync` long-poll always completes server-side before the HTTP layer's
+    /// own deadline fires. Without this, `Client::builder()` falls back to the
+    /// SDK's 30s default request timeout, which races the (unbounded-by-default)
+    /// long-poll and makes every idle sync error out at exactly 30 seconds.
+    pub(super) const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
     const WHOAMI_TIMEOUT: Duration = Duration::from_secs(30);
     const WHOAMI_ERROR_BODY_PREVIEW_BYTES: usize = 4096;
     const WHOAMI_ERROR_BODY_DISPLAY_CHARS: usize = 256;
@@ -580,19 +737,41 @@ mod client {
         if session.exists()
             && let Err(e) = std::fs::remove_file(&session)
         {
-            return Err(anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": session.display().to_string(),
+                        "phase": "corruption_recovery",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to remove session blob during corruption recovery"
+            );
+            return Err(anyhow::Error::msg(format!(
                 "matrix: failed to remove {} during corruption recovery: {e}. Fix permissions or wipe the directory manually.",
                 session.display()
-            ));
+            )));
         }
         let store = store_dir(state_dir);
         if store.exists()
             && let Err(e) = std::fs::remove_dir_all(&store)
         {
-            return Err(anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": store.display().to_string(),
+                        "phase": "corruption_recovery",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to remove store dir during corruption recovery"
+            );
+            return Err(anyhow::Error::msg(format!(
                 "matrix: failed to remove {} during corruption recovery: {e}. Fix permissions or wipe the directory manually.",
                 store.display()
-            ));
+            )));
         }
         Ok(())
     }
@@ -619,6 +798,25 @@ mod client {
         has_password && has_user_id
     }
 
+    /// Decide whether a saved session belongs to a different Matrix account
+    /// than the one this channel block is configured for. Restoring a foreign
+    /// session would run the block as the wrong bot identity. Only a fully
+    /// qualified configured `user_id` (`@local:server`) is compared against the
+    /// saved canonical MXID; a bare localpart or unset `user_id` cannot be
+    /// compared without false positives, so those never flag.
+    pub(super) fn saved_session_is_foreign(
+        config: &MatrixConfig,
+        blob: &session::SessionBlob,
+    ) -> bool {
+        let Some(want) = config.user_id.as_deref().filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        if !want.contains(':') {
+            return false;
+        }
+        want != blob.user_id.as_str()
+    }
+
     async fn build_attempt(
         config: &MatrixConfig,
         state_dir: &Path,
@@ -634,6 +832,25 @@ mod client {
 
         let saved = session::load(state_dir)?;
 
+        // A saved session that belongs to a different account would run this
+        // channel block as the wrong Matrix identity. Wipe and re-login fresh
+        // under the configured account instead of impersonating.
+        if let Some(blob) = saved.as_ref()
+            && saved_session_is_foreign(config, blob)
+        {
+            return recover_or_bail(
+                config,
+                state_dir,
+                recovery_attempts,
+                &format!(
+                    "saved session user_id ({}) does not match configured channels.matrix user_id ({}); store belongs to a different account.",
+                    blob.user_id,
+                    config.user_id.as_deref().unwrap_or_default()
+                ),
+            )
+            .await;
+        }
+
         // The saved device_id is canonical — it's what the server actually
         // assigned at login. config.device_id is only a hint for first-ever
         // login. If they drift (e.g. after auto-recovery generates a fresh
@@ -644,13 +861,18 @@ mod client {
             config.device_id.as_deref().filter(|s| !s.is_empty()),
         ) && want != blob.device_id
         {
-            warn!(
-                "matrix: configured channels.matrix.device-id ({want}) differs from the saved session ({}). \
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "matrix: configured channels.matrix.device-id ({want}) differs from the saved session ({}). \
                  Honoring the saved device_id (canonical, assigned by the homeserver). \
                  Update channels.matrix.device-id to match (or clear it) to silence this warning, \
                  or wipe {} entirely to register a different device.",
-                blob.device_id,
-                state_dir.display(),
+                    blob.device_id,
+                    state_dir.display()
+                )
             );
         }
 
@@ -676,6 +898,10 @@ mod client {
         let client = Client::builder()
             .homeserver_url(&config.homeserver)
             .sqlite_store(&store, None)
+            // Widen the per-request timeout past the sync long-poll window so
+            // an idle `/sync` never trips the SDK's default 30s request
+            // deadline before the homeserver's own long-poll returns.
+            .request_config(RequestConfig::new().timeout(CLIENT_REQUEST_TIMEOUT))
             .build()
             .await
             .context("build matrix client")?;
@@ -698,7 +924,11 @@ mod client {
                 .restore_session(session, matrix_sdk::store::RoomLoadSettings::default())
                 .await
             {
-                Ok(()) => info!("matrix: restored session from session.json"),
+                Ok(()) => ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "matrix: restored session from session.json"
+                ),
                 Err(e) => {
                     // restore_session failed despite a matching device_id —
                     // the access token is probably revoked, or the saved
@@ -748,7 +978,13 @@ mod client {
             if let Some(blob) = session_blob_from(&client)
                 && let Err(e) = session::save(state_dir, &blob)
             {
-                warn!("matrix: failed to persist session.json: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "matrix: failed to persist session.json"
+                );
             }
         }
 
@@ -787,9 +1023,14 @@ mod client {
         reason: &str,
     ) -> Result<Client> {
         if can_password_relogin(config) {
-            warn!(
-                "matrix: {reason} Auto-recovering: wiping {} and re-authenticating with password.",
-                state_dir.display()
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "matrix: {reason} Auto-recovering: wiping {} and re-authenticating with password.",
+                    state_dir.display()
+                )
             );
             wipe_state(state_dir)?;
             return Box::pin(build_attempt(config, state_dir, recovery_attempts + 1)).await;
@@ -811,7 +1052,11 @@ mod client {
         if let Some(pw) = config.password.as_deref().filter(|s| !s.is_empty()) {
             return password_login(client, config, pw).await;
         }
-        if !config.access_token.is_empty() {
+        if config
+            .access_token
+            .as_deref()
+            .is_some_and(|t| !t.is_empty())
+        {
             return access_token_login(client, config).await;
         }
         bail!("matrix login requires either access_token or user_id+password")
@@ -822,7 +1067,15 @@ mod client {
             .user_id
             .clone()
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow!("matrix.user_id is required for password login"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "matrix.user_id is required for password login"
+                );
+                anyhow::Error::msg("matrix.user_id is required for password login")
+            })?;
         let mut login = client
             .matrix_auth()
             .login_username(&user_id, password)
@@ -833,23 +1086,41 @@ mod client {
             login = login.device_id(d);
         }
         login.send().await.context("password login failed")?;
-        info!("matrix: logged in via password");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "matrix: logged in via password"
+        );
         Ok(())
     }
 
     async fn access_token_login(client: &Client, config: &MatrixConfig) -> Result<()> {
         let identity = resolve_access_token_identity(config).await?;
         let user_id = identity.user_id.parse().context("parse matrix.user_id")?;
-        let device_id = identity
-            .device_id
-            .ok_or_else(|| anyhow!("matrix: access-token login requires a Matrix device_id"))?;
+        let device_id = identity.device_id.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "matrix: access-token login requires a Matrix device_id"
+            );
+            anyhow::Error::msg("matrix: access-token login requires a Matrix device_id")
+        })?;
         let session = MatrixSession {
             meta: SessionMeta {
                 user_id,
                 device_id: device_id.into(),
             },
             tokens: SessionTokens {
-                access_token: config.access_token.clone(),
+                access_token: config.access_token.clone().ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "matrix.access_token is required for token login"
+                    );
+                    anyhow::Error::msg("matrix.access_token is required for token login")
+                })?,
                 refresh_token: None,
             },
         };
@@ -858,7 +1129,11 @@ mod client {
             .restore_session(session, matrix_sdk::store::RoomLoadSettings::default())
             .await
             .context("attach matrix session via access_token")?;
-        info!("matrix: logged in via access_token");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "matrix: logged in via access_token"
+        );
         Ok(())
     }
 
@@ -916,13 +1191,17 @@ mod client {
     }
 
     async fn fetch_access_token_whoami(config: &MatrixConfig) -> Result<WhoamiResponse> {
+        let access_token = config
+            .access_token
+            .as_deref()
+            .context("matrix: whoami requires access_token")?;
         let url = matrix_client_api_url(&config.homeserver, WHOAMI_ENDPOINT)?;
         let response = reqwest::Client::builder()
             .timeout(WHOAMI_TIMEOUT)
             .build()
             .context("matrix: build whoami HTTP client")?
             .get(url)
-            .bearer_auth(&config.access_token)
+            .bearer_auth(access_token)
             .send()
             .await
             .context("matrix: whoami request failed")?;
@@ -1051,27 +1330,40 @@ mod client {
     /// length (whitespace-stripped, not the value), and the full error
     /// debug chain (the SDK's `Display` masks fallback errors).
     async fn run_recovery(client: &Client, key: &str) {
+        use matrix_sdk::encryption::recovery::RecoveryState;
+
         let recovery = client.encryption().recovery();
-        if matches!(
-            recovery.state(),
-            matrix_sdk::encryption::recovery::RecoveryState::Enabled
-        ) {
-            debug!("matrix: recovery already enabled, skipping recover()");
+        if matches!(recovery.state(), RecoveryState::Enabled) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "matrix: recovery already enabled, skipping recover()"
+            );
             return;
         }
 
         let stripped_len = key.chars().filter(|c| !c.is_whitespace()).count();
         diagnose_secret_storage(client, stripped_len).await;
 
-        match recovery.recover(key).await {
-            Ok(()) => {
-                info!("matrix: E2EE recovery completed (cross-signing + room keys imported)")
-            }
-            Err(e) => warn!(
-                "matrix: E2EE recovery failed: {e}; full error chain = {e:?}. \
-                 If the input length above is unexpected (base58 keys are typically \
-                 ~58 chars, passphrases vary), the wrong value may be in \
-                 channels.matrix.recovery-key."
+        // Use the operator's configured recovery_key to open secret storage and
+        // import secrets. recover_and_fix_backup additionally repairs the key
+        // backup if the server-side backup is inconsistent with this key
+        // (missing/mismatched backup decryption key) WITHOUT rotating the
+        // recovery key, so the configured channels.matrix.recovery-key stays
+        // valid. This clears the "no backup key was found" loop that occurs
+        // when a backup version exists but the local backup link is broken.
+        match recovery.recover_and_fix_backup(key).await {
+            Ok(()) => ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "matrix: E2EE recovery completed (cross-signing + room keys imported; key backup repaired if inconsistent)"
+            ),
+            Err(e) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                "matrix: E2EE recovery failed: ; full error chain = . If the input length above is unexpected (base58 keys are typically ~58 chars, passphrases vary), the wrong value may be in channels.matrix.recovery-key."
             ),
         }
     }
@@ -1090,18 +1382,34 @@ mod client {
             Ok(Some(raw)) => match raw.deserialize() {
                 Ok(content) => Some(content),
                 Err(e) => {
-                    warn!("matrix: cannot deserialize default secret-storage key event: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "matrix: cannot deserialize default secret-storage key event"
+                    );
                     None
                 }
             },
             Ok(None) => {
-                warn!(
-                    "matrix: server has no m.secret_storage.default_key set; recovery cannot proceed (input_len={input_len}). Set up Secure Backup in Element first."
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"input_len": input_len})),
+                    "matrix: server has no m.secret_storage.default_key set; recovery cannot proceed (input_len=). Set up Secure Backup in Element first."
                 );
                 return;
             }
             Err(e) => {
-                warn!("matrix: failed to fetch default secret-storage key event: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "matrix: failed to fetch default secret-storage key event"
+                );
                 return;
             }
         };
@@ -1119,25 +1427,41 @@ mod client {
                 let json = raw.json().get();
                 let has_passphrase =
                     json.contains("\"passphrase\"") && json.contains("\"iterations\"");
-                info!(
-                    "matrix: secret-storage diagnostics: default_key_id={key_id}, \
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    &format!(
+                        "matrix: secret-storage diagnostics: default_key_id={key_id}, \
                      has_passphrase_info={has_passphrase}, input_len={input_len}. \
                      {}",
-                    if has_passphrase {
-                        "SDK will try passphrase derivation first; if your input is a base58 key the passphrase MAC will fail and the error you see may be the passphrase error rather than the base58 fallback's error."
-                    } else {
-                        "SDK will use base58 decoding directly."
-                    }
+                        if has_passphrase {
+                            "SDK will try passphrase derivation first; if your input is a base58 key the passphrase MAC will fail and the error you see may be the passphrase error rather than the base58 fallback's error."
+                        } else {
+                            "SDK will use base58 decoding directly."
+                        }
+                    )
                 );
                 let _ = SecretStorageKeyEventContent::TYPE; // keep import live
             }
             Ok(None) => {
-                warn!(
-                    "matrix: default key id {key_id} has no corresponding key event on the account — secret storage is in an inconsistent state. Re-running Secure Backup setup in Element will repair this."
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"key_id": key_id})),
+                    "matrix: default key id has no corresponding key event on the account — secret storage is in an inconsistent state. Re-running Secure Backup setup in Element will repair this."
                 );
             }
             Err(e) => {
-                warn!("matrix: failed to fetch key event for {key_id}: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": format!("{}", e), "key_id": key_id})
+                        ),
+                    "matrix: failed to fetch key event for"
+                );
             }
         }
     }
@@ -1167,8 +1491,12 @@ mod client {
     ) -> Result<OwnedRoomId> {
         let (id_or_alias, normalized) = normalize_recipient(id_or_alias);
         if normalized {
-            warn!(
-                "matrix: recipient contains `||`; using {id_or_alias:?} as the room target. Update channels.matrix or cron `delivery.to` to a plain room id/alias to silence this warning."
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"id_or_alias": id_or_alias})),
+                "matrix: recipient contains `||`; using as the room target. Update channels.matrix or cron `delivery.to` to a plain room id/alias to silence this warning."
             );
         }
         if id_or_alias.starts_with('!') {
@@ -1205,7 +1533,7 @@ mod inbound {
             Arc,
             atomic::{AtomicBool, Ordering},
         },
-        time::SystemTime,
+        time::{Duration, SystemTime},
     };
 
     use matrix_sdk::{
@@ -1228,7 +1556,6 @@ mod inbound {
     };
     use serde_json::Value as JsonValue;
     use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
-    use tracing::{debug, error, info, warn};
 
     use super::{allowlist, approval, context as ctx_mod, mention};
     use crate::transcription::TranscriptionManager;
@@ -1238,9 +1565,25 @@ mod inbound {
     };
     use zeroclaw_config::schema::{MatrixConfig, TranscriptionConfig};
 
+    /// Server-side long-poll window for `/sync`. Sent as the `?timeout=`
+    /// parameter so the homeserver holds an idle sync open for this long
+    /// (returning early the moment new events arrive) instead of replying
+    /// immediately and busy-looping. Must stay strictly below
+    /// [`super::client::CLIENT_REQUEST_TIMEOUT`] so the HTTP request deadline
+    /// never fires before the long-poll completes. `SyncSettings::default()`
+    /// leaves this unset, which — combined with the SDK's 30s default request
+    /// timeout — makes every idle sync error out at exactly 30 seconds.
+    pub(super) const SYNC_LONGPOLL_TIMEOUT: Duration = Duration::from_secs(30);
+
     #[derive(Clone)]
     pub(super) struct HandlerCtx {
         pub config: Arc<MatrixConfig>,
+        /// ZeroClaw alias for `[channels.matrix.<alias>]` so session_key
+        /// construction can scope by bot instance.
+        pub alias: String,
+        /// Resolves inbound external peers from canonical state at message-time.
+        /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+        pub peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         pub transcription: Option<Arc<TranscriptionConfig>>,
         pub workspace_dir: Option<Arc<std::path::PathBuf>>,
         pub tx: mpsc::Sender<ChannelMessage>,
@@ -1274,7 +1617,16 @@ mod inbound {
                 let ctx = handler_ctx.clone();
                 async move {
                     if let Err(e) = handle_message(ctx, ev, room, raw).await {
-                        warn!("matrix: handle_message failed: {e}");
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "matrix: handle_message failed"
+                        );
                     }
                 }
             },
@@ -1295,17 +1647,46 @@ mod inbound {
             });
         let _encrypted_handler_guard = client.event_handler_drop_guard(encrypted_handler);
 
-        info!("matrix: starting sync loop");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "matrix: starting sync loop"
+        );
         // Run an initial sync once so the sync token + state are populated,
         // then flip the health flag and enter the long-running sync loop.
-        if let Err(e) = client.sync_once(SyncSettings::default()).await {
-            return Err(anyhow::anyhow!("matrix initial sync failed: {e}"));
+        // Both calls pin an explicit long-poll timeout (see
+        // `SYNC_LONGPOLL_TIMEOUT`) so an idle server doesn't leave the request
+        // hanging until the HTTP client's own deadline trips.
+        let sync_settings = SyncSettings::default().timeout(SYNC_LONGPOLL_TIMEOUT);
+        if let Err(e) = client.sync_once(sync_settings.clone()).await {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "phase": "initial_sync",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: initial sync failed"
+            );
+            return Err(anyhow::Error::msg(format!(
+                "matrix initial sync failed: {e}"
+            )));
         }
         ctx.initial_sync_done.store(true, Ordering::SeqCst);
-        client
-            .sync(SyncSettings::default())
-            .await
-            .map_err(|e| anyhow::anyhow!("matrix sync loop failed: {e}"))
+        client.sync(sync_settings).await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "phase": "sync_loop",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: sync loop failed"
+            );
+            anyhow::Error::msg(format!("matrix sync loop failed: {e}"))
+        })
     }
 
     /// React ❓ on any inbound event the SDK delivered as still-encrypted
@@ -1327,14 +1708,26 @@ mod inbound {
         if already {
             return;
         }
-        debug!(
-            "matrix: reacting ❓ to undecryptable event {} from {}",
-            event_id, ev.sender
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "matrix: reacting ❓ to undecryptable event {} from {}",
+                event_id, ev.sender
+            )
         );
         let content =
             ReactionEventContent::new(Annotation::new(event_id.clone(), "❓".to_string()));
         if let Err(e) = room.send(content).await {
-            warn!("matrix: failed to react ❓ on undecryptable event {event_id}: {e}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(
+                        ::serde_json::json!({"error": format!("{}", e), "event_id": event_id})
+                    ),
+                "matrix: failed to react ❓ on undecryptable event"
+            );
         }
     }
 
@@ -1365,12 +1758,23 @@ mod inbound {
             }
         }
 
-        if !allowlist::user_allowed(&ctx.config.allowed_users, sender) {
-            debug!("matrix: drop message from non-allowed sender {sender}");
+        let allowed_peers = (ctx.peer_resolver)();
+        if !allowlist::user_allowed(&allowed_peers, sender) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"sender": sender})),
+                "matrix: drop message from non-allowed sender"
+            );
             return Ok(());
         }
         if !allowlist::room_allowed_static(&ctx.config.allowed_rooms, room_id) {
-            debug!("matrix: drop message from non-allowed room {room_id}");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"room_id": room_id})),
+                "matrix: drop message from non-allowed room"
+            );
             return Ok(());
         }
 
@@ -1383,7 +1787,12 @@ mod inbound {
                 mention_user_ids.as_deref(),
                 &body,
             ) {
-                debug!("matrix: drop unmentioned message from {sender}");
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"sender": sender})),
+                    "matrix: drop unmentioned message from"
+                );
                 return Ok(());
             }
         }
@@ -1405,7 +1814,13 @@ mod inbound {
                         );
                     }
                 }
-                Err(e) => warn!("matrix: failed to fetch thread root {tid}: {e}"),
+                Err(e) => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e), "tid": tid})),
+                    "matrix: failed to fetch thread root"
+                ),
             }
         }
 
@@ -1482,10 +1897,30 @@ mod inbound {
                         .await;
                     }
                 }
-                Err(e) => debug!("matrix: could not fetch in_reply_to parent {reply_target}: {e}"),
+                Err(e) => {
+                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "reply_target": reply_target})), "matrix: could not fetch in_reply_to parent")
+                }
             }
         }
         let attachments: Vec<MediaAttachment> = Vec::new();
+
+        let outbound_anchor =
+            resolve_outbound_anchor(thread_id.as_ref(), &ev.event_id, ctx.config.reply_in_thread);
+        // When the bot is the one starting the thread, mark its root seen
+        // so the next inbound that lands inside it does not re-fetch and
+        // re-inject a root preamble (the agent already saw the root in this
+        // same turn).
+        if thread_id.is_none() && ctx.config.reply_in_thread {
+            ctx_mod::mark_seen(&ctx.threads_seen, ev.event_id.clone()).await;
+        }
+
+        // Self-anchored roots carry their own event_id as the outbound
+        // anchor. This is a delivery/threading detail — not a conversation
+        // boundary. Strip it from interruption_scope_id so in-flight
+        // cancellation keys match the sender+room scope used by
+        // conversation_history_key.
+        let interruption_scope =
+            interruption_scope_from_anchor(outbound_anchor.as_deref(), &ev.event_id);
 
         let msg = ChannelMessage {
             id: ev.event_id.to_string(),
@@ -1493,28 +1928,27 @@ mod inbound {
             reply_target: room.room_id().to_string(),
             content,
             channel: "matrix".to_string(),
+            channel_alias: Some(ctx.alias.clone()),
             timestamp: SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            // Reply anchor: use the existing thread root when present,
-            // otherwise (when reply_in_thread is on) anchor a brand-new thread
-            // on this very event so the bot's reply opens a thread.
-            thread_ts: thread_id.as_ref().map(|t| t.to_string()).or_else(|| {
-                if ctx.config.reply_in_thread {
-                    Some(ev.event_id.to_string())
-                } else {
-                    None
-                }
-            }),
-            // Interruption scope is for cancellation grouping — only set when
-            // the inbound is genuinely *inside* a reply thread.
-            interruption_scope_id: thread_id.as_ref().map(|t| t.to_string()),
+            thread_ts: outbound_anchor.clone(),
+            interruption_scope_id: interruption_scope,
             attachments,
+            subject: None,
+
+            ..Default::default()
         };
 
         if let Err(e) = ctx.tx.send(msg).await {
-            error!("matrix: failed to forward inbound message: {e}");
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "matrix: failed to forward inbound message"
+            );
         }
         Ok(())
     }
@@ -1532,6 +1966,43 @@ mod inbound {
                 .filter_map(|x| x.as_str().map(|s| s.to_string()))
                 .collect(),
         )
+    }
+
+    /// Decide where the bot should anchor its reply. Carries the existing
+    /// thread root when the inbound is already inside an `m.thread`
+    /// relation. When the inbound is a root timeline event and
+    /// `reply_in_thread` is enabled, anchors a brand-new thread on the
+    /// inbound event itself so the bot's reply opens a thread the user
+    /// can continue the conversation in (matches the schema doc for
+    /// `[channels.matrix.<alias>].reply_in_thread`).
+    pub(super) fn resolve_outbound_anchor(
+        thread_id: Option<&OwnedEventId>,
+        event_id: &OwnedEventId,
+        reply_in_thread: bool,
+    ) -> Option<String> {
+        thread_id.map(ToString::to_string).or_else(|| {
+            if reply_in_thread {
+                Some(event_id.to_string())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// When the resolved outbound anchor points at the inbound event
+    /// itself (a self-anchored root), the anchor is a delivery/threading
+    /// detail — not a conversation boundary. Return `None` so the
+    /// interruption scope falls back to sender+room, matching the key
+    /// used by `conversation_history_key`. For real thread replies the
+    /// anchor is kept as the cancellation scope.
+    pub(super) fn interruption_scope_from_anchor(
+        outbound_anchor: Option<&str>,
+        event_id: &OwnedEventId,
+    ) -> Option<String> {
+        match outbound_anchor {
+            Some(anchor) if anchor == event_id.as_str() => None,
+            other => other.map(ToString::to_string),
+        }
     }
 
     pub(super) fn extract_thread_id(raw: &RawEvent) -> Option<OwnedEventId> {
@@ -1645,12 +2116,27 @@ mod inbound {
                             content = format!("[voice transcript]: {text}\n\n{content}");
                         }
                         Ok(_) => {}
-                        Err(e) => warn!("matrix: voice transcription failed: {e}"),
+                        Err(e) => ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "matrix: voice transcription failed"
+                        ),
                     }
                 }
             }
             Ok(None) => {}
-            Err(e) => warn!("matrix: media handling failed: {e}"),
+            Err(e) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "matrix: media handling failed"
+            ),
         }
         content
     }
@@ -1729,15 +2215,32 @@ mod inbound {
         workspace: Option<&std::path::PathBuf>,
     ) -> anyhow::Result<Option<std::path::PathBuf>> {
         let Some(workspace) = workspace else {
-            warn!(
-                "matrix: cannot persist {} — channels.matrix workspace_dir not configured. Set ZEROCLAW_DIR or run via the orchestrator.",
-                info.file_name
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "matrix: cannot persist {} — channels.matrix workspace_dir not configured. Set ZEROCLAW_DIR or run via the orchestrator.",
+                    info.file_name
+                )
             );
             return Ok(None);
         };
         let dir = workspace.join("matrix_files");
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| anyhow::anyhow!("create {}: {e}", dir.display()))?;
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": dir.display().to_string(),
+                        "phase": "media_dir_create",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to create media dir"
+            );
+            anyhow::Error::msg(format!("create {}: {e}", dir.display()))
+        })?;
         let request = matrix_sdk::media::MediaRequestParameters {
             source: info.source.clone(),
             format: matrix_sdk::media::MediaFormat::File,
@@ -1751,19 +2254,44 @@ mod inbound {
             .media()
             .get_media_content(&request, true)
             .await
-            .map_err(|e| anyhow::anyhow!("get_media_content ({source_kind}): {e}"))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "get_media_content ()"
+                );
+                anyhow::Error::msg(format!("get_media_content ({source_kind}): {e}"))
+            })?;
 
         let safe_name = sanitize_filename(&info.file_name, &info.kind, info.mime.as_deref());
         // Disambiguate by uuid prefix to avoid collisions across messages.
         let unique = format!("{}_{safe_name}", uuid::Uuid::new_v4().simple());
         let path = dir.join(unique);
-        std::fs::write(&path, &bytes)
-            .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
-        info!(
-            "matrix: saved {} bytes ({}) to {}",
-            bytes.len(),
-            source_kind,
-            path.display()
+        std::fs::write(&path, &bytes).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": path.display().to_string(),
+                        "phase": "media_write",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to write media file"
+            );
+            anyhow::Error::msg(format!("write {}: {e}", path.display()))
+        })?;
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "matrix: saved {} bytes ({}) to {}",
+                bytes.len(),
+                source_kind,
+                path.display()
+            )
         );
         Ok(Some(path))
     }
@@ -1834,8 +2362,20 @@ mod inbound {
         path: &std::path::Path,
         file_name: &str,
     ) -> anyhow::Result<String> {
-        let bytes =
-            std::fs::read(path).map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+        let bytes = std::fs::read(path).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": path.display().to_string(),
+                        "phase": "transcription_read",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to read media file for transcription"
+            );
+            anyhow::Error::msg(format!("read {}: {e}", path.display()))
+        })?;
         let manager = TranscriptionManager::new(config)?;
         manager.transcribe(&bytes, file_name).await
     }
@@ -1845,17 +2385,20 @@ mod inbound {
 mod outbound {
     use std::{collections::HashMap, sync::Arc};
 
-    use anyhow::{Context as _, Result, anyhow, bail};
+    use anyhow::{Context as _, Result, bail};
     use futures_util::StreamExt;
     use matrix_sdk::{
         Client, Room, RoomState,
-        attachment::AttachmentConfig,
+        attachment::{
+            AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
+            BaseVideoInfo,
+        },
         room::{
             edit::EditedContent,
             reply::{EnforceThread, Reply},
         },
         ruma::{
-            OwnedEventId, OwnedRoomId,
+            OwnedEventId, OwnedRoomId, UInt,
             events::{
                 reaction::ReactionEventContent,
                 relation::Annotation,
@@ -1871,7 +2414,6 @@ mod outbound {
     use std::sync::OnceLock;
     use std::time::Duration;
     use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
-    use tracing::warn;
 
     use super::{client, context as ctx_mod, markers};
     use zeroclaw_api::{channel::SendMessage, media::MediaAttachment};
@@ -2041,20 +2583,49 @@ mod outbound {
         }
         if target.contains("://") {
             let scheme = target.split("://").next().unwrap_or("?");
-            return Err(ValidateError::Refused(anyhow!(
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "scheme": scheme,
+                        "target": target,
+                    })),
+                "matrix: marker target uses disallowed scheme"
+            );
+            return Err(ValidateError::Refused(anyhow::Error::msg(format!(
                 "matrix: marker target uses disallowed scheme {scheme:?}; only http/https and workspace-relative paths are accepted"
-            )));
+            ))));
         }
         if target.starts_with("data:") || target.starts_with("file:") {
-            return Err(ValidateError::Refused(anyhow!(
-                "matrix: marker target uses disallowed scheme; only http/https and workspace-relative paths are accepted"
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "target": target,
+                    })),
+                "matrix: marker target uses disallowed data: or file: scheme"
+            );
+            return Err(ValidateError::Refused(anyhow::Error::msg(
+                "matrix: marker target uses disallowed scheme; only http/https and workspace-relative paths are accepted",
             )));
         }
 
         let workspace = workspace_dir.ok_or_else(|| {
-            ValidateError::Refused(anyhow!(
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "target": target,
+                        "reason": "no_workspace_dir",
+                    })),
+                "matrix: marker target is local path but channel has no workspace_dir"
+            );
+            ValidateError::Refused(anyhow::Error::msg(format!(
                 "matrix: marker target {target} is a local path but the channel was started without a workspace_dir, refusing for safety"
-            ))
+            )))
         })?;
         let workspace_canon = std::fs::canonicalize(workspace)
             .with_context(|| format!("canonicalize workspace {}", workspace.display()))
@@ -2069,9 +2640,19 @@ mod outbound {
         let target_canon = match std::fs::canonicalize(&absolute) {
             Ok(p) => p,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ValidateError::NotFound(anyhow!(
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "target": target,
+                            "reason": "not_found",
+                        })),
+                    "matrix: marker target not found on disk"
+                );
+                return Err(ValidateError::NotFound(anyhow::Error::msg(format!(
                     "matrix: marker target {target} not found on disk"
-                )));
+                ))));
             }
             Err(e) => {
                 return Err(ValidateError::Refused(
@@ -2081,11 +2662,23 @@ mod outbound {
         };
 
         if !target_canon.starts_with(&workspace_canon) {
-            return Err(ValidateError::Refused(anyhow!(
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "target": target,
+                        "target_canon": target_canon.display().to_string(),
+                        "workspace_canon": workspace_canon.display().to_string(),
+                        "reason": "outside_workspace",
+                    })),
+                "matrix: marker target escapes workspace_dir"
+            );
+            return Err(ValidateError::Refused(anyhow::Error::msg(format!(
                 "matrix: marker target {target} resolves to {} which is outside workspace_dir {}; refusing",
                 target_canon.display(),
                 workspace_canon.display(),
-            )));
+            ))));
         }
         Ok(MarkerTarget::Local(target_canon))
     }
@@ -2186,9 +2779,14 @@ mod outbound {
                         MarkerFailure::Refused => "trust boundary",
                         MarkerFailure::Failed => "not found",
                     };
-                    warn!(
-                        "matrix: skipping outbound marker for {} ({label}): {e}",
-                        marker.target
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!(
+                            "matrix: skipping outbound marker for {} ({label}): {e}",
+                            marker.target
+                        )
                     );
                     failed_markers.push((marker.target.clone(), kind));
                     continue;
@@ -2198,9 +2796,17 @@ mod outbound {
                 MarkerTarget::Local(path) => match tokio::fs::read(&path).await {
                     Ok(b) => b,
                     Err(e) => {
-                        warn!(
-                            "matrix: skipping outbound marker for {} (read failed): {e}",
-                            marker.target
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            &format!(
+                                "matrix: skipping outbound marker for {} (read failed): {e}",
+                                marker.target
+                            )
                         );
                         failed_markers.push((marker.target.clone(), MarkerFailure::Failed));
                         continue;
@@ -2209,9 +2815,17 @@ mod outbound {
                 MarkerTarget::Http(url) => match fetch_http(url).await {
                     Ok(b) => b,
                     Err(e) => {
-                        warn!(
-                            "matrix: skipping outbound marker for {} (http failed): {e}",
-                            marker.target
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            &format!(
+                                "matrix: skipping outbound marker for {} (http failed): {e}",
+                                marker.target
+                            )
                         );
                         failed_markers.push((marker.target.clone(), MarkerFailure::Failed));
                         continue;
@@ -2228,9 +2842,14 @@ mod outbound {
             match upload_attachment(room, &att, kind, thread_anchor).await {
                 Ok(id) => last_attachment_id = Some(id),
                 Err(e) => {
-                    warn!(
-                        "matrix: skipping outbound marker for {} (upload failed): {e}",
-                        marker.target
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!(
+                            "matrix: skipping outbound marker for {} (upload failed): {e}",
+                            marker.target
+                        )
                     );
                     failed_markers.push((marker.target.clone(), MarkerFailure::Failed));
                 }
@@ -2300,8 +2919,15 @@ mod outbound {
                 return Ok(attachment_id);
             }
             SendOutcome::EmptyError => {
-                return Err(anyhow!(
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"phase": "send"})),
                     "matrix: empty message body and no successful attachment"
+                );
+                return Err(anyhow::Error::msg(
+                    "matrix: empty message body and no successful attachment",
                 ));
             }
         }
@@ -2336,7 +2962,15 @@ mod outbound {
             let content =
                 ReactionEventContent::new(Annotation::new(event_id.clone(), emoji.to_string()));
             if let Err(e) = room.send(content).await {
-                warn!("matrix: failed to send {emoji} reaction on outgoing message: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": format!("{}", e), "emoji": emoji})
+                        ),
+                    "matrix: failed to send reaction on outgoing message"
+                );
             }
         }
     }
@@ -2361,7 +2995,16 @@ mod outbound {
                 },
             )
             .await
-            .map_err(|e| anyhow!("make_reply_event failed: {e}"))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "make_reply_event failed"
+                );
+                anyhow::Error::msg(format!("make_reply_event failed: {e}"))
+            })?;
         ctx_mod::mark_seen(threads_seen, anchor).await;
         let resp = room.send(reply_event).await?;
         Ok(resp.response.event_id)
@@ -2375,14 +3018,32 @@ mod outbound {
     ) -> Result<()> {
         let room = client
             .get_room(&room_id.parse::<OwnedRoomId>()?)
-            .ok_or_else(|| anyhow!("matrix: room not joined: {room_id}"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"room_id": room_id})),
+                    "matrix: room not joined"
+                );
+                anyhow::Error::msg(format!("matrix: room not joined: {room_id}"))
+            })?;
         let new_content = RoomMessageEventContentWithoutRelation::new(MessageType::Text(
             TextMessageEventContent::markdown(text),
         ));
         let edit_event = room
             .make_edit_event(event_id, EditedContent::RoomMessage(new_content))
             .await
-            .map_err(|e| anyhow!("make_edit_event failed: {e}"))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "make_edit_event failed"
+                );
+                anyhow::Error::msg(format!("make_edit_event failed: {e}"))
+            })?;
         room.send(edit_event).await?;
         Ok(())
     }
@@ -2395,7 +3056,16 @@ mod outbound {
     ) -> Result<()> {
         let room = client
             .get_room(&room_id.parse::<OwnedRoomId>()?)
-            .ok_or_else(|| anyhow!("matrix: room not joined: {room_id}"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"room_id": room_id})),
+                    "matrix: room not joined"
+                );
+                anyhow::Error::msg(format!("matrix: room not joined: {room_id}"))
+            })?;
         room.redact(event_id, reason.as_deref(), None).await?;
         Ok(())
     }
@@ -2446,16 +3116,24 @@ mod outbound {
         recipient: &str,
     ) -> Result<Room> {
         let id = client::resolve_room(client, cache, recipient).await?;
-        let room = client
-            .get_room(&id)
-            .ok_or_else(|| anyhow!("matrix: bot is not in room {recipient}"))?;
+        let room = client.get_room(&id).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"recipient": recipient})),
+                "matrix: bot is not in room"
+            );
+            anyhow::Error::msg(format!("matrix: bot is not in room {recipient}"))
+        })?;
         if room.state() != RoomState::Joined {
             bail!("matrix: room {recipient} is not in joined state");
         }
         Ok(room)
     }
 
-    enum AttachmentKind {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum AttachmentKind {
         Auto,
         Image,
         Audio,
@@ -2470,18 +3148,34 @@ mod outbound {
         kind: AttachmentKind,
         thread_anchor: Option<&OwnedEventId>,
     ) -> Result<OwnedEventId> {
-        let mime: mime_guess::Mime = match att.mime_type.as_deref() {
-            Some(m) => m
-                .parse()
-                .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM),
-            None => mime_guess::from_path(&att.file_name)
-                .first()
-                .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM),
-        };
+        let mime = attachment_mime(att);
         if matches!(kind, AttachmentKind::Voice) {
             return upload_voice(room, att, &mime, thread_anchor).await;
         }
-        let mut config = AttachmentConfig::new();
+        let config = attachment_config_for(att, kind, &mime, thread_anchor);
+        let resp = room
+            .send_attachment(att.file_name.clone(), &mime, att.data.clone(), config)
+            .await
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "send_attachment failed"
+                );
+                anyhow::Error::msg(format!("send_attachment failed: {e}"))
+            })?;
+        Ok(resp.event_id)
+    }
+
+    pub(super) fn attachment_config_for(
+        att: &MediaAttachment,
+        kind: AttachmentKind,
+        mime: &mime_guess::Mime,
+        thread_anchor: Option<&OwnedEventId>,
+    ) -> AttachmentConfig {
+        let mut config = AttachmentConfig::new().info(attachment_info_for(att, kind, mime));
         if let Some(anchor) = thread_anchor {
             config = config.reply(Some(Reply {
                 event_id: anchor.clone(),
@@ -2489,11 +3183,59 @@ mod outbound {
                 add_mentions: AddMentions::No,
             }));
         }
-        let resp = room
-            .send_attachment(att.file_name.clone(), &mime, att.data.clone(), config)
-            .await
-            .map_err(|e| anyhow!("send_attachment failed: {e}"))?;
-        Ok(resp.event_id)
+        config
+    }
+
+    pub(super) fn attachment_mime(att: &MediaAttachment) -> mime_guess::Mime {
+        match att.mime_type.as_deref() {
+            Some(m) => m
+                .parse()
+                .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM),
+            None => mime_guess::from_path(&att.file_name)
+                .first()
+                .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM),
+        }
+    }
+
+    fn attachment_info_for(
+        att: &MediaAttachment,
+        kind: AttachmentKind,
+        mime: &mime_guess::Mime,
+    ) -> AttachmentInfo {
+        let size = UInt::try_from(att.data.len()).ok();
+        match attachment_info_kind(kind, mime) {
+            AttachmentKind::Image => AttachmentInfo::Image(BaseImageInfo {
+                size,
+                ..Default::default()
+            }),
+            AttachmentKind::Audio => AttachmentInfo::Audio(BaseAudioInfo {
+                size,
+                ..Default::default()
+            }),
+            AttachmentKind::Video => AttachmentInfo::Video(BaseVideoInfo {
+                size,
+                ..Default::default()
+            }),
+            AttachmentKind::Voice => AttachmentInfo::Voice(BaseAudioInfo {
+                size,
+                ..Default::default()
+            }),
+            AttachmentKind::File | AttachmentKind::Auto => {
+                AttachmentInfo::File(BaseFileInfo { size })
+            }
+        }
+    }
+
+    fn attachment_info_kind(kind: AttachmentKind, mime: &mime_guess::Mime) -> AttachmentKind {
+        if kind == AttachmentKind::Voice {
+            return AttachmentKind::Voice;
+        }
+        match mime.type_() {
+            mime_guess::mime::IMAGE => AttachmentKind::Image,
+            mime_guess::mime::AUDIO => AttachmentKind::Audio,
+            mime_guess::mime::VIDEO => AttachmentKind::Video,
+            _ => AttachmentKind::File,
+        }
     }
 
     /// Voice messages need the `org.matrix.msc3245.voice` flag, which the
@@ -2510,7 +3252,16 @@ mod outbound {
             .media()
             .upload(mime, att.data.clone(), None)
             .await
-            .map_err(|e| anyhow!("media upload failed: {e}"))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "media upload failed"
+                );
+                anyhow::Error::msg(format!("media upload failed: {e}"))
+            })?;
         let mut event = json!({
             "msgtype": "m.audio",
             "body": att.file_name,
@@ -2568,6 +3319,12 @@ mod outbound {
 /// Matrix channel.
 pub struct MatrixChannel {
     config: Arc<MatrixConfig>,
+    /// The alias key under `[channels.matrix.<alias>]` this handle is
+    /// bound to. Used to scope peer-group writes and resolver lookups.
+    alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     state_dir: PathBuf,
     workspace_dir: Option<Arc<PathBuf>>,
     transcription: Option<Arc<TranscriptionConfig>>,
@@ -2580,20 +3337,46 @@ pub struct MatrixChannel {
     bot_display_name: Arc<TokioRwLock<Option<String>>>,
     initial_sync_done: Arc<AtomicBool>,
     undecryptable_seen: Arc<TokioMutex<HashSet<OwnedEventId>>>,
+    /// Resolved `ack_reactions` for this Matrix instance — the
+    /// per-channel `MatrixConfig.ack_reactions` override falls back to
+    /// `[channels].ack_reactions` here at construction time, so the
+    /// read site doesn't need to re-resolve on every reaction.
+    ack_reactions: bool,
 }
 
 impl MatrixChannel {
     /// Validate config and prepare the channel. The SDK Client is built lazily
     /// on first `listen()` or `send()` call.
-    pub fn new(config: MatrixConfig, state_dir: PathBuf) -> Result<Self> {
+    pub fn new(
+        config: MatrixConfig,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+        state_dir: PathBuf,
+    ) -> Result<Self> {
         if config.homeserver.trim().is_empty() {
             bail!("matrix: `homeserver` is required");
         }
-        if config.access_token.trim().is_empty() && config.password.is_none() {
+        let has_token = config
+            .access_token
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty());
+        let has_password = config
+            .password
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty());
+        if !has_token && !has_password {
             bail!("matrix: configure either `access_token` or `password`");
         }
+        // Initial resolved value: when the per-channel override is set
+        // we honor it directly; when it's `None`, default to `true`
+        // (the channels-wide default). Orchestrator callers should chain
+        // `.with_ack_reactions(...)` after construction to thread the
+        // actual `[channels].ack_reactions` global through.
+        let ack_reactions = config.ack_reactions.unwrap_or(true);
         Ok(Self {
             config: Arc::new(config),
+            alias: alias.into(),
+            peer_resolver,
             state_dir,
             workspace_dir: None,
             transcription: None,
@@ -2606,7 +3389,25 @@ impl MatrixChannel {
             bot_display_name: Arc::new(TokioRwLock::new(None)),
             initial_sync_done: Arc::new(AtomicBool::new(false)),
             undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+            ack_reactions,
         })
+    }
+
+    /// Return the alias under `[channels.matrix.<alias>]` that this
+    /// channel handle is bound to.
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    /// Override the resolved `ack_reactions` value for this Matrix
+    /// channel. Used by the orchestrator to push the channels-wide
+    /// default down after constructing from per-channel config; the
+    /// orchestrator computes `mx.ack_reactions.unwrap_or(config.channels.ack_reactions)`
+    /// and passes the resolved bool here.
+    #[must_use]
+    pub fn with_ack_reactions(mut self, ack_reactions: bool) -> Self {
+        self.ack_reactions = ack_reactions;
+        self
     }
 
     pub fn with_transcription(mut self, transcription: TranscriptionConfig) -> Self {
@@ -2623,13 +3424,17 @@ impl MatrixChannel {
     }
 
     async fn ensure_client(&self) -> Result<&Client> {
+        use ::zeroclaw_log::__private::tracing::Instrument;
         self.client
-            .get_or_try_init(|| async {
-                let c = client::build(&self.config, &self.state_dir).await?;
-                if let Ok(Some(name)) = c.account().get_display_name().await {
-                    *self.bot_display_name.write().await = Some(name);
+            .get_or_try_init(|| {
+                async {
+                    let c = client::build(&self.config, &self.state_dir).await?;
+                    if let Ok(Some(name)) = c.account().get_display_name().await {
+                        *self.bot_display_name.write().await = Some(name);
+                    }
+                    Ok::<_, anyhow::Error>(c)
                 }
-                Ok::<_, anyhow::Error>(c)
+                .instrument(::zeroclaw_log::attribution_span!(self))
             })
             .await
     }
@@ -2646,15 +3451,15 @@ impl MatrixChannel {
     }
 
     /// Edit-in-place draft update. Rate-limited per the configured interval.
-    async fn partial_update(&self, recipient: &str, text: &str) -> Result<()> {
+    async fn partial_update(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         let client = self.ensure_client().await?;
-        let key = streaming_key(recipient)?;
+        let key = streaming_key(recipient, message_id)?;
         let Some(visible_text) = streaming::partial_visible_text(text) else {
             return Ok(());
         };
         let event_id = {
             let mut state = self.streaming_state.write().await;
-            let Some(draft) = state.partial.get_mut(&key) else {
+            let Some(draft) = streaming::partial_for_update(&mut state, &key) else {
                 return Ok(());
             };
             let now = Instant::now();
@@ -2674,14 +3479,14 @@ impl MatrixChannel {
     /// `\n\n` boundary until the unsent buffer no longer contains a break,
     /// then returns to wait for more accumulated text. Each paragraph posts
     /// as an independent room message threaded under the captured anchor.
-    async fn multi_update(&self, recipient: &str, text: &str) -> Result<()> {
+    async fn multi_update(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         let client = self.ensure_client().await?;
-        let key = streaming_key(recipient)?;
+        let key = streaming_key(recipient, message_id)?;
         let delay = Duration::from_millis(self.config.multi_message_delay_ms);
         loop {
             let (paragraph, thread_anchor) = {
                 let mut state = self.streaming_state.write().await;
-                let Some(multi) = state.multi.get_mut(&key) else {
+                let Some(multi) = streaming::multi_for_update(&mut state, &key) else {
                     return Ok(());
                 };
                 // Detect a buffer reset (e.g. DraftEvent::Clear) and re-anchor
@@ -2705,7 +3510,13 @@ impl MatrixChannel {
                 let mut msg = SendMessage::new(paragraph, recipient);
                 msg.thread_ts = thread_anchor.as_ref().map(|e| e.to_string());
                 if let Err(e) = outbound::send(&self.outbox(client), &msg).await {
-                    tracing::warn!("matrix: multi-message paragraph send failed: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "matrix: multi-message paragraph send failed"
+                    );
                 }
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
@@ -2715,10 +3526,29 @@ impl MatrixChannel {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for MatrixChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Matrix)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[async_trait]
 impl Channel for MatrixChannel {
     fn name(&self) -> &str {
         "matrix"
+    }
+
+    fn self_handle(&self) -> Option<String> {
+        self.client
+            .get()
+            .and_then(|c| c.user_id().map(|u| u.to_string()))
+    }
+
+    fn self_addressed_mention(&self) -> Option<String> {
+        self.self_handle()
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
@@ -2731,10 +3561,20 @@ impl Channel for MatrixChannel {
         let client = self.ensure_client().await?.clone();
         let user_id = client
             .user_id()
-            .ok_or_else(|| anyhow!("matrix: client has no user_id after login"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "matrix: client has no user_id after login"
+                );
+                anyhow::Error::msg("matrix: client has no user_id after login")
+            })?
             .to_owned();
         let ctx = inbound::HandlerCtx {
             config: self.config.clone(),
+            alias: self.alias.clone(),
+            peer_resolver: self.peer_resolver.clone(),
             transcription: self.transcription.clone(),
             workspace_dir: self.workspace_dir.clone(),
             tx,
@@ -2791,7 +3631,7 @@ impl Channel for MatrixChannel {
 
     async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
         let client = self.ensure_client().await?;
-        let key = streaming_key(&message.recipient)?;
+        let room_id = streaming_room(&message.recipient)?;
         match self.config.stream_mode {
             StreamMode::Off => Ok(None),
             StreamMode::Partial => {
@@ -2800,6 +3640,7 @@ impl Channel for MatrixChannel {
                 let event_id = outbound::send(&self.outbox(client), message).await?;
                 let thread_anchor =
                     outbound::thread_anchor_from_message(&self.outbox(client), message);
+                let key = streaming::draft_key(room_id, event_id.as_ref())?;
                 let mut state = self.streaming_state.write().await;
                 state.partial.insert(
                     key,
@@ -2821,6 +3662,8 @@ impl Channel for MatrixChannel {
                     .as_deref()
                     .filter(|s| !s.is_empty())
                     .and_then(|s| s.parse::<OwnedEventId>().ok());
+                let draft_id = streaming::new_multi_message_draft_id();
+                let key = streaming::draft_key(room_id, &draft_id)?;
                 let mut state = self.streaming_state.write().await;
                 state.multi.insert(
                     key,
@@ -2829,16 +3672,16 @@ impl Channel for MatrixChannel {
                         sent_so_far: 0,
                     },
                 );
-                Ok(Some("multi_message_synthetic".to_string()))
+                Ok(Some(draft_id))
             }
         }
     }
 
-    async fn update_draft(&self, recipient: &str, _message_id: &str, text: &str) -> Result<()> {
+    async fn update_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         match self.config.stream_mode {
             StreamMode::Off => Ok(()),
-            StreamMode::Partial => self.partial_update(recipient, text).await,
-            StreamMode::MultiMessage => self.multi_update(recipient, text).await,
+            StreamMode::Partial => self.partial_update(recipient, message_id, text).await,
+            StreamMode::MultiMessage => self.multi_update(recipient, message_id, text).await,
         }
     }
 
@@ -2856,13 +3699,22 @@ impl Channel for MatrixChannel {
         Ok(())
     }
 
-    async fn finalize_draft(&self, recipient: &str, _message_id: &str, text: &str) -> Result<()> {
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        _suppress_voice: bool,
+    ) -> Result<()> {
         let client = self.ensure_client().await?;
-        let key = streaming_key(recipient)?;
+        let key = streaming_key(recipient, message_id)?;
         match self.config.stream_mode {
             StreamMode::Off => Ok(()),
             StreamMode::Partial => {
-                let draft = self.streaming_state.write().await.partial.remove(&key);
+                let draft = {
+                    let mut state = self.streaming_state.write().await;
+                    streaming::take_partial(&mut state, &key)
+                };
                 if let Some(draft) = draft {
                     let room =
                         outbound::resolve_joined_room(client, &self.alias_cache, recipient).await?;
@@ -2888,8 +3740,17 @@ impl Channel for MatrixChannel {
                                 outbound::edit(client, recipient, &draft.event_id, &delivery.text)
                                     .await
                             {
-                                tracing::warn!(
-                                    "matrix: partial finalize edit failed: {edit_err}; sending cleaned text fallback"
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(
+                                        ::serde_json::json!({"edit_err": edit_err.to_string()})
+                                    ),
+                                    "matrix: partial finalize edit failed: ; sending cleaned text fallback"
                                 );
                                 let mut fallback = SendMessage::new(&delivery.text, recipient);
                                 fallback.thread_ts =
@@ -2904,9 +3765,7 @@ impl Channel for MatrixChannel {
                                         .await;
                                     }
                                     Err(send_err) if any_attachment_landed => {
-                                        tracing::warn!(
-                                            "matrix: partial finalize cleaned text fallback failed after attachment upload: {send_err}; suppressing error to avoid duplicate attachment retry"
-                                        );
+                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"send_err": send_err.to_string()})), "matrix: partial finalize cleaned text fallback failed after attachment upload: ; suppressing error to avoid duplicate attachment retry");
                                     }
                                     Err(send_err) => {
                                         return Err(edit_err).with_context(|| {
@@ -2930,14 +3789,31 @@ impl Channel for MatrixChannel {
                             )
                             .await
                             {
-                                tracing::warn!(
-                                    "matrix: partial finalize redaction failed after attachment-only upload: {err}; leaving placeholder to avoid duplicate attachment retry"
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"err": err.to_string()})),
+                                    "matrix: partial finalize redaction failed after attachment-only upload: ; leaving placeholder to avoid duplicate attachment retry"
                                 );
                             }
                         }
                         streaming::PartialFinalizeAction::EmptyError => {
-                            return Err(anyhow!(
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"phase": "partial_finalize"})),
                                 "matrix: empty partial draft body and no successful attachment"
+                            );
+                            return Err(anyhow::Error::msg(
+                                "matrix: empty partial draft body and no successful attachment",
                             ));
                         }
                     }
@@ -2947,7 +3823,10 @@ impl Channel for MatrixChannel {
             StreamMode::MultiMessage => {
                 // Drain the trailing paragraph (or whatever's left after the
                 // last \n\n boundary) as one final message.
-                let multi = self.streaming_state.write().await.multi.remove(&key);
+                let multi = {
+                    let mut state = self.streaming_state.write().await;
+                    streaming::take_multi(&mut state, &key)
+                };
                 let Some(state) = multi else {
                     return Ok(());
                 };
@@ -2966,13 +3845,17 @@ impl Channel for MatrixChannel {
         }
     }
 
-    async fn cancel_draft(&self, recipient: &str, _message_id: &str) -> Result<()> {
+    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> Result<()> {
         let client = self.ensure_client().await?;
-        let key = streaming_key(recipient)?;
+        let key = streaming_key(recipient, message_id)?;
         match self.config.stream_mode {
             StreamMode::Off => Ok(()),
             StreamMode::Partial => {
-                if let Some(d) = self.streaming_state.write().await.partial.remove(&key) {
+                let draft = {
+                    let mut state = self.streaming_state.write().await;
+                    streaming::take_partial(&mut state, &key)
+                };
+                if let Some(d) = draft {
                     let _ = outbound::redact(
                         client,
                         recipient,
@@ -2987,14 +3870,15 @@ impl Channel for MatrixChannel {
                 // Already-sent paragraphs are independent room messages and
                 // are not redacted on cancel — partial output is preferable
                 // to silent disappearance. Just drop our state.
-                self.streaming_state.write().await.multi.remove(&key);
+                let mut state = self.streaming_state.write().await;
+                streaming::take_multi(&mut state, &key);
                 Ok(())
             }
         }
     }
 
     async fn add_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> Result<()> {
-        if !self.config.ack_reactions {
+        if !self.ack_reactions {
             return Ok(());
         }
         let client = self.ensure_client().await?;
@@ -3003,6 +3887,9 @@ impl Channel for MatrixChannel {
     }
 
     async fn remove_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> Result<()> {
+        if !self.ack_reactions {
+            return Ok(());
+        }
         let client = self.ensure_client().await?;
         let event_id: OwnedEventId = message_id.parse()?;
         outbound::unreact(&self.outbox(client), channel_id, &event_id, emoji).await
@@ -3017,6 +3904,20 @@ impl Channel for MatrixChannel {
         let client = self.ensure_client().await?;
         let event_id: OwnedEventId = message_id.parse()?;
         outbound::redact(client, channel_id, &event_id, reason).await
+    }
+
+    async fn create_room(&self, options: &RoomCreationOptions) -> Result<String> {
+        let client = self.ensure_client().await?;
+        let request = room_management::build_create_room_request(options)?;
+        let room = client.create_room(request).await?;
+        Ok(room.room_id().to_string())
+    }
+
+    async fn invite_user(&self, room_id: &str, user_id: &str) -> Result<()> {
+        let client = self.ensure_client().await?;
+        let request = room_management::build_invite_user_request(room_id, user_id)?;
+        client.send(request).await?;
+        Ok(())
     }
 
     async fn request_approval(
@@ -3061,10 +3962,14 @@ impl Channel for MatrixChannel {
     }
 }
 
-fn streaming_key(recipient: &str) -> Result<streaming::DraftKey> {
+fn streaming_room(recipient: &str) -> Result<OwnedRoomId> {
     recipient
         .parse::<OwnedRoomId>()
         .with_context(|| format!("parse recipient room id {recipient}"))
+}
+
+fn streaming_key(recipient: &str, message_id: &str) -> Result<streaming::DraftKey> {
+    streaming::draft_key(streaming_room(recipient)?, message_id)
 }
 
 // ─── tests ─────────────────────────────────────────────────────────────────
@@ -3227,6 +4132,65 @@ mod tests {
         }
     }
 
+    mod room_management {
+        use super::super::room_management::{build_create_room_request, build_invite_user_request};
+        use matrix_sdk::ruma::api::client::room::Visibility as MatrixVisibility;
+        use serde_json::json;
+        use zeroclaw_api::channel::{RoomCreationOptions, RoomVisibility};
+
+        #[test]
+        fn create_room_request_maps_typed_options() {
+            let request = build_create_room_request(&RoomCreationOptions {
+                name: Some("Ops room".into()),
+                topic: Some("Operations".into()),
+                invites: vec!["@alice:example.org".into(), "@bob:example.org".into()],
+                visibility: Some(RoomVisibility::Public),
+                encryption: Some(true),
+            })
+            .expect("request builds");
+
+            assert_eq!(request.name.as_deref(), Some("Ops room"));
+            assert_eq!(request.topic.as_deref(), Some("Operations"));
+            assert_eq!(request.visibility, MatrixVisibility::Public);
+            assert_eq!(request.invite.len(), 2);
+            assert_eq!(request.invite[0].as_str(), "@alice:example.org");
+            assert_eq!(request.invite[1].as_str(), "@bob:example.org");
+            assert_eq!(request.initial_state.len(), 1);
+        }
+
+        #[test]
+        fn create_room_request_rejects_invalid_invite_user() {
+            let err = build_create_room_request(&RoomCreationOptions {
+                invites: vec!["not-a-mxid".into()],
+                ..RoomCreationOptions::default()
+            })
+            .unwrap_err();
+
+            assert!(err.to_string().contains("invalid invite user id"));
+        }
+
+        #[test]
+        fn invite_user_request_parses_room_and_user_ids() {
+            let request =
+                build_invite_user_request("!room:example.org", "@alice:example.org").unwrap();
+
+            assert_eq!(request.room_id.as_str(), "!room:example.org");
+            assert_eq!(
+                serde_json::to_value(&request.recipient).unwrap(),
+                json!({"user_id": "@alice:example.org"})
+            );
+        }
+
+        #[test]
+        fn invite_user_request_rejects_invalid_ids() {
+            let err = build_invite_user_request("not-a-room", "@alice:example.org").unwrap_err();
+            assert!(err.to_string().contains("invalid room id"));
+
+            let err = build_invite_user_request("!room:example.org", "not-a-user").unwrap_err();
+            assert!(err.to_string().contains("invalid user id"));
+        }
+    }
+
     mod mention {
         use super::super::mention::is_mentioned;
         use matrix_sdk::ruma::user_id;
@@ -3342,6 +4306,39 @@ mod tests {
         }
     }
 
+    mod ack_reactions {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+        use zeroclaw_api::channel::Channel;
+        use zeroclaw_config::schema::MatrixConfig;
+
+        use super::super::MatrixChannel;
+
+        #[tokio::test]
+        async fn matrix_remove_reaction_noops_before_parsing_when_ack_disabled() {
+            let config = MatrixConfig {
+                homeserver: "https://matrix.example.com".to_string(),
+                access_token: Some("token".to_string()),
+                ack_reactions: Some(false),
+                ..MatrixConfig::default()
+            };
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                config,
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            channel
+                .remove_reaction("bad-room", "bad-event", "✅")
+                .await
+                .expect("ack-disabled reaction removal should be a no-op");
+        }
+    }
+
     mod context {
         use super::super::context::{claim_first_visit, format_preamble, mark_seen};
         use matrix_sdk::ruma::{OwnedEventId, owned_event_id};
@@ -3382,11 +4379,12 @@ mod tests {
     }
 
     mod streaming {
+        use super::super::streaming;
         use super::super::streaming::{
-            PartialDraft, PartialFinalizeAction, decide_partial_finalize_action,
+            MultiDraft, PartialDraft, PartialFinalizeAction, State, decide_partial_finalize_action,
             partial_should_edit, partial_visible_text,
         };
-        use matrix_sdk::ruma::owned_event_id;
+        use matrix_sdk::ruma::{OwnedEventId, owned_event_id, owned_room_id};
         use std::time::{Duration, Instant};
 
         fn draft(text: &str, last_edit: Instant) -> PartialDraft {
@@ -3395,6 +4393,15 @@ mod tests {
                 thread_anchor: None,
                 last_text: text.to_string(),
                 last_edit,
+            }
+        }
+
+        fn partial_draft(event_id: OwnedEventId, text: &str) -> PartialDraft {
+            PartialDraft {
+                event_id,
+                thread_anchor: None,
+                last_text: text.to_string(),
+                last_edit: Instant::now(),
             }
         }
 
@@ -3478,6 +4485,451 @@ mod tests {
                 PartialFinalizeAction::EmptyError
             );
         }
+
+        #[test]
+        fn draft_keys_include_message_id_for_same_room_concurrency() {
+            let room = owned_room_id!("!room:server");
+            let first = streaming::draft_key(room.clone(), "$draft-a:server").unwrap();
+            let second = streaming::draft_key(room.clone(), "$draft-b:server").unwrap();
+
+            assert_ne!(first, second);
+
+            let mut state = streaming::State::default();
+            state.partial.insert(
+                first.clone(),
+                PartialDraft {
+                    event_id: owned_event_id!("$draft-a:server"),
+                    thread_anchor: None,
+                    last_text: "first".to_string(),
+                    last_edit: Instant::now(),
+                },
+            );
+            state.partial.insert(
+                second.clone(),
+                PartialDraft {
+                    event_id: owned_event_id!("$draft-b:server"),
+                    thread_anchor: None,
+                    last_text: "second".to_string(),
+                    last_edit: Instant::now(),
+                },
+            );
+
+            assert_eq!(state.partial.len(), 2);
+            assert_eq!(
+                state.partial.remove(&second).map(|draft| draft.event_id),
+                Some(owned_event_id!("$draft-b:server"))
+            );
+            assert!(state.partial.contains_key(&first));
+        }
+
+        #[test]
+        fn partial_lifecycle_lookup_isolates_update_finalize_and_cancel_by_message_id() {
+            let recipient = "!room:server";
+            let first = super::super::streaming_key(recipient, "$draft-a:server").unwrap();
+            let second = super::super::streaming_key(recipient, "$draft-b:server").unwrap();
+            let canceled = super::super::streaming_key(recipient, "$draft-c:server").unwrap();
+
+            let mut state = State::default();
+            state.partial.insert(
+                first.clone(),
+                partial_draft(owned_event_id!("$draft-a:server"), "first"),
+            );
+            state.partial.insert(
+                second.clone(),
+                partial_draft(owned_event_id!("$draft-b:server"), "second"),
+            );
+
+            streaming::partial_for_update(&mut state, &second)
+                .expect("second draft remains addressable")
+                .last_text = "second updated".to_string();
+
+            assert_eq!(
+                streaming::partial_for_update(&mut state, &first)
+                    .expect("first draft remains isolated")
+                    .last_text,
+                "first"
+            );
+
+            let finalized = streaming::take_partial(&mut state, &second)
+                .expect("finalize removes only the addressed draft");
+            assert_eq!(finalized.event_id, owned_event_id!("$draft-b:server"));
+            assert!(state.partial.contains_key(&first));
+            assert!(!state.partial.contains_key(&second));
+
+            state.partial.insert(
+                canceled.clone(),
+                partial_draft(owned_event_id!("$draft-c:server"), "cancel me"),
+            );
+            let canceled_draft = streaming::take_partial(&mut state, &canceled)
+                .expect("cancel removes only the addressed draft");
+            assert_eq!(canceled_draft.event_id, owned_event_id!("$draft-c:server"));
+            assert!(state.partial.contains_key(&first));
+            assert!(!state.partial.contains_key(&canceled));
+        }
+
+        #[test]
+        fn multi_message_lifecycle_lookup_isolates_update_finalize_and_cancel_by_message_id() {
+            let recipient = "!room:server";
+            let first =
+                super::super::streaming_key(recipient, "multi_message_synthetic:first").unwrap();
+            let second =
+                super::super::streaming_key(recipient, "multi_message_synthetic:second").unwrap();
+            let canceled =
+                super::super::streaming_key(recipient, "multi_message_synthetic:cancel").unwrap();
+
+            let mut state = State::default();
+            state.multi.insert(
+                first.clone(),
+                MultiDraft {
+                    thread_anchor: None,
+                    sent_so_far: 5,
+                },
+            );
+            state.multi.insert(
+                second.clone(),
+                MultiDraft {
+                    thread_anchor: None,
+                    sent_so_far: 0,
+                },
+            );
+
+            streaming::multi_for_update(&mut state, &second)
+                .expect("second multi-message draft remains addressable")
+                .sent_so_far = 12;
+
+            assert_eq!(
+                streaming::multi_for_update(&mut state, &first)
+                    .expect("first multi-message draft remains isolated")
+                    .sent_so_far,
+                5
+            );
+
+            let finalized = streaming::take_multi(&mut state, &second)
+                .expect("finalize removes only the addressed multi-message draft");
+            assert_eq!(finalized.sent_so_far, 12);
+            assert!(state.multi.contains_key(&first));
+            assert!(!state.multi.contains_key(&second));
+
+            state.multi.insert(
+                canceled.clone(),
+                MultiDraft {
+                    thread_anchor: None,
+                    sent_so_far: 3,
+                },
+            );
+            let canceled_draft = streaming::take_multi(&mut state, &canceled)
+                .expect("cancel removes only the addressed multi-message draft");
+            assert_eq!(canceled_draft.sent_so_far, 3);
+            assert!(state.multi.contains_key(&first));
+            assert!(!state.multi.contains_key(&canceled));
+        }
+
+        #[test]
+        fn multi_message_synthetic_draft_ids_are_unique() {
+            let first = streaming::new_multi_message_draft_id();
+            let second = streaming::new_multi_message_draft_id();
+
+            assert_ne!(first, second);
+            assert!(first.starts_with("multi_message_synthetic:"));
+            assert!(second.starts_with("multi_message_synthetic:"));
+        }
+    }
+
+    mod live_smoke {
+        use std::{
+            env,
+            sync::Arc,
+            time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+        };
+
+        use matrix_sdk::config::SyncSettings;
+        use tempfile::TempDir;
+        use zeroclaw_api::channel::{Channel, SendMessage};
+        use zeroclaw_config::schema::{MatrixConfig, StreamMode};
+
+        use super::super::{MatrixChannel, inbound::SYNC_LONGPOLL_TIMEOUT, streaming_key};
+
+        fn env_first(primary: &str, fallback: &str) -> String {
+            env::var(primary)
+                .or_else(|_| env::var(fallback))
+                .unwrap_or_else(|_| panic!("set {primary} or {fallback} to run Matrix live smoke"))
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Matrix smoke credentials and a disposable test room"]
+        async fn same_room_partial_draft_lifecycle_uses_real_draft_ids() {
+            let homeserver = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_HOMESERVER",
+                "ZEROCLAW_MATRIX_HOMESERVER",
+            );
+            let room_id = env_first("ZEROCLAW_MATRIX_SMOKE_ROOM_ID", "ZEROCLAW_MATRIX_ROOM_ID");
+            let access_token = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_ACCESS_TOKEN",
+                "ZEROCLAW_MATRIX_ACCESS_TOKEN",
+            );
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_secs();
+
+            let config = MatrixConfig {
+                enabled: true,
+                homeserver,
+                access_token: Some(access_token),
+                allowed_rooms: vec![room_id.clone()],
+                stream_mode: StreamMode::Partial,
+                draft_update_interval_ms: 50,
+                multi_message_delay_ms: 0,
+                reply_in_thread: false,
+                ack_reactions: Some(false),
+                approval_timeout_secs: 1,
+                ..MatrixConfig::default()
+            };
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                config,
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default().timeout(SYNC_LONGPOLL_TIMEOUT))
+                .await
+                .expect("initial Matrix sync");
+
+            let first = channel
+                .send_draft(&SendMessage::new(
+                    format!("zeroclaw draft lifecycle smoke {stamp} first"),
+                    &room_id,
+                ))
+                .await
+                .expect("send first draft")
+                .expect("partial mode returns first draft event id");
+            let second = channel
+                .send_draft(&SendMessage::new(
+                    format!("zeroclaw draft lifecycle smoke {stamp} second"),
+                    &room_id,
+                ))
+                .await
+                .expect("send second draft")
+                .expect("partial mode returns second draft event id");
+            assert_ne!(first, second);
+
+            let first_key = streaming_key(&room_id, &first).expect("first draft key");
+            let second_key = streaming_key(&room_id, &second).expect("second draft key");
+            {
+                let state = channel.streaming_state.read().await;
+                assert!(state.partial.contains_key(&first_key));
+                assert!(state.partial.contains_key(&second_key));
+            }
+
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let first_update = format!("zeroclaw draft lifecycle smoke {stamp} first update");
+            channel
+                .update_draft(&room_id, &first, &first_update)
+                .await
+                .expect("update first draft by id");
+            {
+                let state = channel.streaming_state.read().await;
+                assert_eq!(
+                    state
+                        .partial
+                        .get(&first_key)
+                        .map(|draft| draft.last_text.as_str()),
+                    Some(first_update.as_str())
+                );
+                assert!(state.partial.contains_key(&second_key));
+            }
+
+            channel
+                .finalize_draft(
+                    &room_id,
+                    &second,
+                    &format!("zeroclaw draft lifecycle smoke {stamp} second final"),
+                    false,
+                )
+                .await
+                .expect("finalize second draft by id");
+            {
+                let state = channel.streaming_state.read().await;
+                assert!(state.partial.contains_key(&first_key));
+                assert!(!state.partial.contains_key(&second_key));
+            }
+
+            channel
+                .cancel_draft(&room_id, &first)
+                .await
+                .expect("cancel first draft by id");
+            {
+                let state = channel.streaming_state.read().await;
+                assert!(state.partial.is_empty());
+            }
+        }
+
+        /// Reviewer-requested smoke: keep a configured Matrix channel idle for
+        /// longer than 30 seconds and confirm `/sync` no longer errors at the
+        /// 30-second cadence that motivated this PR.
+        ///
+        /// The pre-fix failure mode was two-pronged:
+        ///   1. `SyncSettings::default()` sends no `?timeout=` parameter, so an
+        ///      idle homeserver replies immediately and the SDK busy-polls.
+        ///   2. `Client::builder()` falls back to the SDK's 30s default request
+        ///      timeout, so every 30s window races the HTTP deadline and any
+        ///      idle long-poll that did manage to start errors out at ~30s.
+        ///
+        /// This test exercises both fixes against a real homeserver:
+        ///   * `ensure_client()` builds the client with `CLIENT_REQUEST_TIMEOUT`
+        ///     applied to the underlying `RequestConfig`.
+        ///   * Each `sync_once` call passes `SYNC_LONGPOLL_TIMEOUT` so the
+        ///     homeserver holds the request open.
+        ///
+        /// We then assert three things over a >30s soak window:
+        ///   * No `sync_once` call returns an error (rules out the 30s HTTP
+        ///     deadline tripping mid-long-poll).
+        ///   * Each individual `sync_once` call takes long enough to indicate
+        ///     the server actually long-polled (rules out the busy-poll path
+        ///     where every iteration returns instantly because no `?timeout=`
+        ///     was sent).
+        ///   * The number of round-trips over the soak window stays modest
+        ///     (defense-in-depth against a regression that reintroduces busy
+        ///     polling).
+        ///
+        /// Tunables via env (sensible defaults so the test stays "short" per
+        /// reviewer guidance — ~35s wall-time by default):
+        ///   * `ZEROCLAW_MATRIX_SMOKE_IDLE_SECS` — total soak duration in
+        ///     seconds (default `35`, must be > 30).
+        ///   * `ZEROCLAW_MATRIX_SMOKE_MIN_LONGPOLL_MS` — minimum wall-time a
+        ///     single `sync_once` call must take before we consider it a real
+        ///     long-poll (default `1000`). The homeserver is free to return
+        ///     early when events arrive; this only guards against the pre-fix
+        ///     "every call returns in <100ms" pattern.
+        #[tokio::test]
+        #[ignore = "requires Matrix smoke credentials and a disposable idle test room"]
+        async fn idle_sync_does_not_error_at_30s_cadence() {
+            let homeserver = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_HOMESERVER",
+                "ZEROCLAW_MATRIX_HOMESERVER",
+            );
+            let room_id = env_first("ZEROCLAW_MATRIX_SMOKE_ROOM_ID", "ZEROCLAW_MATRIX_ROOM_ID");
+            let access_token = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_ACCESS_TOKEN",
+                "ZEROCLAW_MATRIX_ACCESS_TOKEN",
+            );
+
+            let idle_secs: u64 = env::var("ZEROCLAW_MATRIX_SMOKE_IDLE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(35);
+            assert!(
+                idle_secs > 30,
+                "idle soak must exceed 30s to exercise the pre-fix failure window; got {idle_secs}s"
+            );
+            let min_longpoll_ms: u64 = env::var("ZEROCLAW_MATRIX_SMOKE_MIN_LONGPOLL_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1_000);
+
+            let config = MatrixConfig {
+                enabled: true,
+                homeserver,
+                access_token: Some(access_token),
+                allowed_rooms: vec![room_id.clone()],
+                stream_mode: StreamMode::Off,
+                reply_in_thread: false,
+                ack_reactions: Some(false),
+                ..MatrixConfig::default()
+            };
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                config,
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            // Building the client exercises `CLIENT_REQUEST_TIMEOUT` on the
+            // underlying `RequestConfig`. If that constant ever regresses below
+            // `SYNC_LONGPOLL_TIMEOUT`, the very first long-poll below will
+            // error out at the HTTP deadline.
+            let client = channel.ensure_client().await.expect("matrix client");
+
+            // Prime the sync token with a single bounded sync_once so the
+            // subsequent loop measures true idle long-poll behavior rather
+            // than the initial state-fetch round-trip.
+            client
+                .sync_once(SyncSettings::default().timeout(SYNC_LONGPOLL_TIMEOUT))
+                .await
+                .expect("initial Matrix sync");
+
+            let soak = Duration::from_secs(idle_secs);
+            let min_longpoll = Duration::from_millis(min_longpoll_ms);
+            let deadline = Instant::now() + soak;
+            let mut call_count: u32 = 0;
+            let mut short_longpoll_count: u32 = 0;
+            let mut max_call: Duration = Duration::from_millis(0);
+
+            while Instant::now() < deadline {
+                let started = Instant::now();
+                let result = client
+                    .sync_once(SyncSettings::default().timeout(SYNC_LONGPOLL_TIMEOUT))
+                    .await;
+                let elapsed = started.elapsed();
+
+                // Primary reviewer assertion: idle `/sync` must not error out.
+                // The pre-fix bug surfaced as a request-deadline error at ~30s
+                // when the HTTP timeout fired before the long-poll returned.
+                result.unwrap_or_else(|e| {
+                    panic!(
+                        "idle sync_once errored after {elapsed:?} (call #{call_count}); this is the 30s-cadence regression \
+                         the PR aims to fix: {e}"
+                    )
+                });
+
+                call_count += 1;
+                if elapsed > max_call {
+                    max_call = elapsed;
+                }
+                if elapsed < min_longpoll {
+                    short_longpoll_count += 1;
+                }
+            }
+
+            // Defense-in-depth against the other half of the pre-fix bug: a
+            // missing `?timeout=` made the homeserver reply instantly, so the
+            // SDK would busy-poll. With `SYNC_LONGPOLL_TIMEOUT` set, an idle
+            // room should produce only a handful of round-trips per 30s.
+            assert!(
+                call_count > 0,
+                "expected at least one sync_once call during the {idle_secs}s soak"
+            );
+            assert!(
+                max_call >= min_longpoll,
+                "every sync_once call returned in <{min_longpoll:?} (max observed: {max_call:?}); \
+                 homeserver appears to be replying without honoring `?timeout=` — likely the pre-fix \
+                 busy-poll regression. call_count={call_count}"
+            );
+            // Allow a couple of legitimate early returns (e.g. presence pings)
+            // but flag anything that smells like a tight busy-poll loop.
+            let busy_poll_budget = ((idle_secs / 5).max(2)) as u32;
+            assert!(
+                short_longpoll_count <= busy_poll_budget,
+                "{short_longpoll_count} of {call_count} sync_once calls returned in <{min_longpoll:?} \
+                 (budget for an idle room over {idle_secs}s is {busy_poll_budget}); this matches the \
+                 pre-fix busy-poll pattern"
+            );
+
+            // Mirror the validation-evidence shape requested on the PR: emit a
+            // concise note so a captured `cargo test -- --nocapture` run reads
+            // like the reviewer's "short Matrix smoke result" ask.
+            eprintln!(
+                "matrix idle-sync smoke: soak={idle_secs}s, sync_once_calls={call_count}, \
+                 max_call={max_call:?}, short_calls={short_longpoll_count}, no errors at 30s cadence"
+            );
+        }
     }
 
     mod session {
@@ -3546,7 +4998,8 @@ mod tests {
         //! corruption-recovery decisions verifiable without touching the SDK.
 
         use super::super::client::{
-            can_password_relogin, resolve_access_token_identity, store_has_orphan_data,
+            can_password_relogin, resolve_access_token_identity, saved_session_is_foreign,
+            store_has_orphan_data,
         };
         use tempfile::TempDir;
         use wiremock::{
@@ -3561,10 +5014,9 @@ mod tests {
             MatrixConfig {
                 enabled: true,
                 homeserver: "https://m.org".into(),
-                access_token: String::new(),
+                access_token: None,
                 user_id: user_id.map(String::from),
                 device_id: None,
-                allowed_users: vec![],
                 allowed_rooms: vec![],
                 interrupt_on_new_message: false,
                 stream_mode: Default::default(),
@@ -3575,14 +5027,17 @@ mod tests {
                 password: password.map(String::from),
                 approval_timeout_secs: 300,
                 reply_in_thread: true,
-                ack_reactions: true,
+                ack_reactions: Some(true),
+                excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             }
         }
 
         fn access_token_cfg(homeserver: String) -> MatrixConfig {
             MatrixConfig {
                 homeserver,
-                access_token: "secret-token".into(),
+                access_token: Some("secret-token".into()),
                 ..cfg(None, None)
             }
         }
@@ -3599,6 +5054,47 @@ mod tests {
         fn relogin_rejects_empty_strings() {
             assert!(!can_password_relogin(&cfg(Some(""), Some("@bot:m"))));
             assert!(!can_password_relogin(&cfg(Some("pw"), Some(""))));
+        }
+
+        fn blob_for(user_id: &str) -> super::super::session::SessionBlob {
+            super::super::session::SessionBlob {
+                user_id: user_id.to_string(),
+                device_id: "DEV1".to_string(),
+                access_token: "secret".to_string(),
+                refresh_token: None,
+            }
+        }
+
+        #[test]
+        fn foreign_session_detected_when_user_ids_differ() {
+            // The collision bug: two matrix blocks shared one state dir, so the
+            // second to start restored the first account's saved session and
+            // ran as the wrong bot. With the configured user_id known, a saved
+            // session for a different account must be flagged so the build flow
+            // wipes and re-logins instead of impersonating.
+            let cfg = cfg(Some("pw"), Some("@clamps-bot:matrix.org"));
+            let foreign = blob_for("@bender-bending-rodriguez-zeroclaw:matrix.org");
+            assert!(saved_session_is_foreign(&cfg, &foreign));
+        }
+
+        #[test]
+        fn matching_session_not_foreign() {
+            let cfg = cfg(Some("pw"), Some("@clamps-bot:matrix.org"));
+            let own = blob_for("@clamps-bot:matrix.org");
+            assert!(!saved_session_is_foreign(&cfg, &own));
+        }
+
+        #[test]
+        fn unset_or_bare_user_id_never_flags() {
+            // No configured user_id, or a bare localpart that cannot be
+            // compared against the canonical MXID, must not false-positive.
+            let any = blob_for("@whoever:matrix.org");
+            assert!(!saved_session_is_foreign(&cfg(Some("pw"), None), &any));
+            assert!(!saved_session_is_foreign(&cfg(Some("pw"), Some("")), &any));
+            assert!(!saved_session_is_foreign(
+                &cfg(Some("pw"), Some("clamps-bot")),
+                &any
+            ));
         }
 
         #[test]
@@ -3788,7 +5284,10 @@ mod tests {
     }
 
     mod thread_extraction {
-        use super::super::inbound::{extract_mentions_user_ids, extract_thread_id};
+        use super::super::inbound::{
+            extract_mentions_user_ids, extract_thread_id, interruption_scope_from_anchor,
+            resolve_outbound_anchor,
+        };
         use matrix_sdk::event_handler::RawEvent;
         use matrix_sdk::ruma::serde::Raw;
 
@@ -3831,6 +5330,81 @@ mod tests {
                 }
             }));
             assert!(extract_thread_id(&r).is_none());
+        }
+
+        #[test]
+        fn root_inbound_starts_new_thread_when_reply_in_thread_enabled() {
+            let event_id = "$root:server".parse().expect("event id");
+            assert_eq!(
+                resolve_outbound_anchor(None, &event_id, true).as_deref(),
+                Some("$root:server")
+            );
+        }
+
+        #[test]
+        fn root_inbound_stays_root_when_reply_in_thread_disabled() {
+            let event_id = "$root:server".parse().expect("event id");
+            assert_eq!(resolve_outbound_anchor(None, &event_id, false), None);
+        }
+
+        #[test]
+        fn threaded_inbound_keeps_existing_thread_root() {
+            let event_id = "$reply:server".parse().expect("event id");
+            let thread_root = "$root:server".parse().expect("thread id");
+            assert_eq!(
+                resolve_outbound_anchor(Some(&thread_root), &event_id, true).as_deref(),
+                Some("$root:server")
+            );
+            assert_eq!(
+                resolve_outbound_anchor(Some(&thread_root), &event_id, false).as_deref(),
+                Some("$root:server")
+            );
+        }
+
+        // ── interruption_scope_from_anchor ──────────────────────────
+
+        #[test]
+        fn self_anchored_root_strips_interruption_scope() {
+            // #7349: when reply_in_thread anchors on the inbound event
+            // itself the anchor is a delivery detail, not a conversation
+            // boundary — interruption_scope_id should be None so
+            // cancellation keys match sender+room.
+            let event_id = "$ev:server".parse().expect("event id");
+            let outbound = resolve_outbound_anchor(None, &event_id, true);
+            // thread_ts stays set to the event_id
+            assert_eq!(outbound.as_deref(), Some("$ev:server"));
+            // interruption_scope_id is stripped
+            assert_eq!(
+                interruption_scope_from_anchor(outbound.as_deref(), &event_id),
+                None
+            );
+        }
+
+        #[test]
+        fn real_thread_reply_preserves_interruption_scope() {
+            // A reply inside an existing thread: outbound anchor is the
+            // thread root, not the inbound event itself.
+            // interruption_scope_id must stay set to the thread root.
+            let event_id = "$reply:server".parse().expect("event id");
+            let thread_root = "$root:server".parse().expect("thread root");
+            let outbound = resolve_outbound_anchor(Some(&thread_root), &event_id, true);
+            assert_eq!(outbound.as_deref(), Some("$root:server"));
+            assert_eq!(
+                interruption_scope_from_anchor(outbound.as_deref(), &event_id).as_deref(),
+                Some("$root:server")
+            );
+        }
+
+        #[test]
+        fn no_anchor_yields_no_interruption_scope() {
+            // reply_in_thread disabled on a root event: no anchor at all.
+            let event_id = "$ev:server".parse().expect("event id");
+            let outbound = resolve_outbound_anchor(None, &event_id, false);
+            assert_eq!(outbound, None);
+            assert_eq!(
+                interruption_scope_from_anchor(outbound.as_deref(), &event_id),
+                None
+            );
         }
 
         #[test]
@@ -4385,6 +5959,110 @@ mod tests {
         fn empty_text_without_attachment_is_error() {
             // True empty-message case: nothing to deliver, surface the error.
             assert_eq!(decide_send_outcome(true, false), SendOutcome::EmptyError);
+        }
+    }
+
+    mod outbound_attachment_info {
+        use super::super::outbound::{AttachmentKind, attachment_config_for};
+        use matrix_sdk::{attachment::AttachmentInfo, ruma::UInt};
+        use zeroclaw_api::media::MediaAttachment;
+
+        fn attachment(file_name: &str, mime_type: &str, len: usize) -> MediaAttachment {
+            MediaAttachment {
+                file_name: file_name.to_string(),
+                data: vec![0; len],
+                mime_type: Some(mime_type.to_string()),
+            }
+        }
+
+        fn info_size(info: AttachmentInfo) -> Option<UInt> {
+            match info {
+                AttachmentInfo::Image(info) => info.size,
+                AttachmentInfo::Video(info) => info.size,
+                AttachmentInfo::Audio(info) | AttachmentInfo::Voice(info) => info.size,
+                AttachmentInfo::File(info) => info.size,
+            }
+        }
+
+        #[test]
+        fn structured_file_attachment_carries_matrix_size_info() {
+            let att = attachment("report.pdf", "application/pdf", 4096);
+
+            let mime = super::super::outbound::attachment_mime(&att);
+            let config = attachment_config_for(&att, AttachmentKind::Auto, &mime, None);
+
+            let info = config.info.expect("attachment info is populated");
+            assert!(matches!(info, AttachmentInfo::File(_)));
+            assert_eq!(info_size(info), UInt::try_from(4096usize).ok());
+        }
+
+        #[test]
+        fn media_markers_use_type_specific_matrix_info_with_size() {
+            let cases = [
+                (
+                    AttachmentKind::Image,
+                    attachment("photo.png", "image/png", 17),
+                    "image",
+                ),
+                (
+                    AttachmentKind::Audio,
+                    attachment("clip.ogg", "audio/ogg", 23),
+                    "audio",
+                ),
+                (
+                    AttachmentKind::Video,
+                    attachment("movie.mp4", "video/mp4", 31),
+                    "video",
+                ),
+            ];
+
+            for (kind, att, expected_kind) in cases {
+                let mime = super::super::outbound::attachment_mime(&att);
+                let config = attachment_config_for(&att, kind, &mime, None);
+                let info = config.info.expect("attachment info is populated");
+                match (&info, expected_kind) {
+                    (AttachmentInfo::Image(_), "image") => {}
+                    (AttachmentInfo::Audio(_), "audio") => {}
+                    (AttachmentInfo::Video(_), "video") => {}
+                    _ => panic!("unexpected attachment info kind {info:?}"),
+                }
+                assert_eq!(info_size(info), UInt::try_from(att.data.len()).ok());
+            }
+        }
+
+        #[test]
+        fn attachment_info_kind_matches_final_mime_type() {
+            let image_named_as_file = attachment("photo.png", "image/png", 47);
+            let mime = super::super::outbound::attachment_mime(&image_named_as_file);
+            let config =
+                attachment_config_for(&image_named_as_file, AttachmentKind::File, &mime, None);
+            let info = config.info.expect("attachment info is populated");
+            assert!(
+                matches!(info, AttachmentInfo::Image(_)),
+                "info must match the MIME-selected Matrix event type"
+            );
+            assert_eq!(
+                info_size(info),
+                UInt::try_from(image_named_as_file.data.len()).ok()
+            );
+
+            let image_marker_with_file_mime = attachment("report.pdf", "application/pdf", 53);
+            let mime = super::super::outbound::attachment_mime(&image_marker_with_file_mime);
+            let config = attachment_config_for(
+                &image_marker_with_file_mime,
+                AttachmentKind::Image,
+                &mime,
+                None,
+            );
+            let info = config.info.expect("attachment info is populated");
+            assert!(
+                matches!(info, AttachmentInfo::File(_)),
+                "file MIME should use file info so SDK preserves size"
+            );
+            assert_eq!(
+                info_size(info),
+                UInt::try_from(image_marker_with_file_mime.data.len()).ok()
+            );
         }
     }
 }

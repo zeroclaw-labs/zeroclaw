@@ -5,11 +5,11 @@
 //! MiniMax `<invoke>` blocks, Perl-style `[TOOL_CALL]` blocks, markdown fences,
 //! OpenAI native format, and more.
 //!
-//! This crate has no dependency on agent state, memory, providers, or channels.
+//! This crate has no dependency on agent state, memory, model_providers, or channels.
 //! It is pure text transformation.
 
 use regex::Regex;
-use std::sync::LazyLock;
+use std::{collections::HashSet, sync::LazyLock};
 
 /// A single parsed tool call extracted from LLM output.
 #[derive(Debug, Clone)]
@@ -17,6 +17,18 @@ pub struct ParsedToolCall {
     pub name: String,
     pub arguments: serde_json::Value,
     pub tool_call_id: Option<String>,
+}
+
+/// Internal tool protocol envelope variants that must not be treated as
+/// user-visible channel text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolProtocolEnvelopeKind {
+    ToolCalls,
+    ToolCallsAlias,
+    FunctionCall,
+    ToolResult,
+    ResponsesFunctionCall,
+    TaggedToolCall,
 }
 
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
@@ -30,7 +42,7 @@ fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
 }
 
 /// Recursively unwrap stringified JSON objects/arrays nested inside tool arguments.
-/// Why: Gemini (and some other providers) sometimes double-encode nested object/array
+/// Why: Gemini (and some other model_providers) sometimes double-encode nested object/array
 /// parameters as JSON strings inside the outer arguments payload, which breaks tools
 /// that expect `Value::Object` / `Value::Array` at those positions.
 fn unwrap_nested_json_strings(value: serde_json::Value) -> serde_json::Value {
@@ -173,6 +185,530 @@ fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedTool
     calls
 }
 
+fn has_non_empty_string(value: &serde_json::Value, key: &str) -> bool {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
+fn has_arguments_signal(value: &serde_json::Value) -> bool {
+    value.get("arguments").is_some() || value.get("parameters").is_some()
+}
+
+fn looks_like_tool_call_object(value: &serde_json::Value) -> bool {
+    if let Some(function) = value.get("function").and_then(serde_json::Value::as_object) {
+        let function = serde_json::Value::Object(function.clone());
+        return has_non_empty_string(&function, "name") && has_arguments_signal(&function);
+    }
+
+    has_non_empty_string(value, "name") && has_arguments_signal(value)
+}
+
+fn tool_call_array_has_protocol_shape(value: &serde_json::Value, key: &str) -> bool {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| !items.is_empty() && items.iter().any(looks_like_tool_call_object))
+}
+
+fn has_tool_protocol_object_signal(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+
+    let has_args = has_arguments_signal(value);
+    let has_call_id = has_non_empty_string(value, "id")
+        || has_non_empty_string(value, "call_id")
+        || has_non_empty_string(value, "tool_call_id");
+
+    object
+        .get("function")
+        .and_then(serde_json::Value::as_object)
+        .is_some()
+        || (has_non_empty_string(value, "name") && has_args)
+        || (has_args && has_call_id)
+}
+
+fn tool_call_array_has_malformed_protocol_signal(value: &serde_json::Value, key: &str) -> bool {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| !items.is_empty() && items.iter().any(has_tool_protocol_object_signal))
+}
+
+fn classify_tool_protocol_json_value(
+    value: &serde_json::Value,
+) -> Option<ToolProtocolEnvelopeKind> {
+    if value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|ty| ty == "function_call")
+        && has_non_empty_string(value, "name")
+        && (has_arguments_signal(value) || has_non_empty_string(value, "call_id"))
+    {
+        return Some(ToolProtocolEnvelopeKind::ResponsesFunctionCall);
+    }
+
+    if tool_call_array_has_protocol_shape(value, "tool_calls") {
+        return Some(ToolProtocolEnvelopeKind::ToolCalls);
+    }
+
+    if tool_call_array_has_protocol_shape(value, "toolcalls") {
+        return Some(ToolProtocolEnvelopeKind::ToolCallsAlias);
+    }
+
+    if value
+        .get("function_call")
+        .is_some_and(looks_like_tool_call_object)
+    {
+        return Some(ToolProtocolEnvelopeKind::FunctionCall);
+    }
+
+    if has_non_empty_string(value, "tool_call_id")
+        && (value.get("content").is_some()
+            || value.get("result").is_some()
+            || value.get("output").is_some())
+    {
+        return Some(ToolProtocolEnvelopeKind::ToolResult);
+    }
+
+    None
+}
+
+fn json_value_mentions_known_tool(
+    value: &serde_json::Value,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    if known_tool_names.is_empty() {
+        return false;
+    }
+
+    let Some(object) = value.as_object() else {
+        return value.as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| json_value_mentions_known_tool(item, known_tool_names))
+        });
+    };
+
+    let name_matches = |candidate: Option<&serde_json::Value>| {
+        candidate
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .is_some_and(|name| known_tool_names.contains(&name.to_ascii_lowercase()))
+    };
+
+    if name_matches(object.get("name")) {
+        return true;
+    }
+
+    if let Some(function) = object
+        .get("function")
+        .and_then(serde_json::Value::as_object)
+    {
+        let function = serde_json::Value::Object(function.clone());
+        if json_value_mentions_known_tool(&function, known_tool_names) {
+            return true;
+        }
+    }
+
+    if let Some(function_call) = object.get("function_call")
+        && json_value_mentions_known_tool(function_call, known_tool_names)
+    {
+        return true;
+    }
+
+    ["tool_calls", "toolcalls"].iter().any(|key| {
+        object
+            .get(*key)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| json_value_mentions_known_tool(item, known_tool_names))
+            })
+    })
+}
+
+pub fn tool_protocol_envelope_mentions_known_tool(
+    text: &str,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    if known_tool_names.is_empty() {
+        return false;
+    }
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if let Some(body) = json_fence_body(trimmed) {
+        return tool_protocol_envelope_mentions_known_tool(body, known_tool_names);
+    }
+
+    if starts_with_tool_protocol_tag_or_fence(trimmed) || contains_tool_protocol_tag_marker(trimmed)
+    {
+        let (_, calls) = parse_tool_calls(trimmed);
+        if calls
+            .iter()
+            .any(|call| known_tool_names.contains(&call.name.to_ascii_lowercase()))
+        {
+            return true;
+        }
+    }
+
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .is_ok_and(|value| json_value_mentions_known_tool(&value, known_tool_names))
+}
+
+fn has_malformed_tool_protocol_json_signal(value: &serde_json::Value) -> bool {
+    // Empty `tool_calls: []` is a valid strict-provider compatibility case;
+    // similar business JSON must also carry protocol-shaped fields before it
+    // is withheld from user-visible output.
+    tool_call_array_has_malformed_protocol_signal(value, "tool_calls")
+        || tool_call_array_has_malformed_protocol_signal(value, "toolcalls")
+        || value
+            .get("function_call")
+            .is_some_and(has_tool_protocol_object_signal)
+        || (value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|ty| ty == "function_call")
+            && (has_non_empty_string(value, "name")
+                || has_non_empty_string(value, "call_id")
+                || has_arguments_signal(value)))
+        || (has_non_empty_string(value, "tool_call_id")
+            && (value.get("content").is_some()
+                || value.get("result").is_some()
+                || value.get("output").is_some()))
+}
+
+fn starts_with_tool_protocol_tag_or_fence(text: &str) -> bool {
+    let lower = text.trim_start().to_ascii_lowercase();
+    lower.starts_with("<tool_call")
+        || lower.starts_with("<toolcall")
+        || lower.starts_with("<tool-call")
+        || lower.starts_with("<invoke")
+        || lower.starts_with("<functioncall")
+        || lower.starts_with("<function_call")
+        || starts_with_tool_protocol_fence_lower(&lower)
+        || lower.starts_with("[tool_call]")
+}
+
+fn starts_with_tool_protocol_fence(text: &str) -> bool {
+    let lower = text.trim_start().to_ascii_lowercase();
+    starts_with_tool_protocol_fence_lower(&lower)
+}
+
+fn starts_with_tool_protocol_fence_lower(lower: &str) -> bool {
+    lower.starts_with("```tool_call")
+        || lower.starts_with("```toolcall")
+        || lower.starts_with("```tool-call")
+        || lower.starts_with("```invoke")
+        || starts_with_tool_name_fence_lower(lower)
+}
+
+fn starts_with_tool_name_fence_lower(lower: &str) -> bool {
+    let Some(rest) = lower.strip_prefix("```tool") else {
+        return false;
+    };
+    matches!(rest.chars().next(), Some(c) if c.is_whitespace() && c != '\n' && c != '\r')
+}
+
+fn contains_tool_protocol_tag_marker(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("<tool_call")
+        || lower.contains("<toolcall")
+        || lower.contains("<tool-call")
+        || lower.contains("<invoke")
+        || lower.contains("<functioncall")
+        || lower.contains("<function_call")
+        || lower.contains("```tool_call")
+        || lower.contains("```toolcall")
+        || lower.contains("```tool-call")
+        || lower.contains("```invoke")
+        || lower.contains("```tool ")
+        || lower.contains("[tool_call]")
+}
+
+pub fn looks_like_tool_protocol_example(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if let Some((body, visible_text)) = leading_json_fence_body_and_trailing_text(trimmed)
+        && classify_tool_protocol_envelope(body).is_some()
+        && has_example_context(visible_text)
+    {
+        return true;
+    }
+
+    if starts_with_tool_protocol_fence(trimmed) || contains_tool_protocol_tag_marker(trimmed) {
+        let (visible_text, calls) = parse_tool_calls(trimmed);
+        if !calls.is_empty() && has_example_context(&visible_text) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn has_example_context(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("example")
+        || lower.contains("sample")
+        || lower.contains("示例")
+        // Common Chinese "for example" / "sample" markers. We keep this list
+        // intentionally small to avoid accidentally exempting real protocol leaks.
+        || lower.contains("例如")
+        || lower.contains("比如")
+        || lower.contains("举例")
+        || lower.contains("例子")
+        || lower.contains("比方说")
+        || lower.contains("譬如")
+}
+
+fn leading_json_fence_body_and_trailing_text(trimmed: &str) -> Option<(&str, &str)> {
+    let rest = trimmed.strip_prefix("```")?;
+    let first_newline = rest.find('\n')?;
+    let language = rest[..first_newline].trim().trim_end_matches('\r');
+    if !language.eq_ignore_ascii_case("json") {
+        return None;
+    }
+
+    let body_with_close = &rest[first_newline + 1..];
+    let close_start = body_with_close.find("```")?;
+    let body = body_with_close[..close_start].trim();
+    let trailing = body_with_close[close_start + 3..].trim();
+    (!body.is_empty() && !trailing.is_empty()).then_some((body, trailing))
+}
+
+pub fn contains_tool_protocol_tag_call(text: &str) -> bool {
+    if !contains_tool_protocol_tag_marker(text) || looks_like_tool_protocol_example(text) {
+        return false;
+    }
+
+    let (_, calls) = parse_tool_calls(text);
+    !calls.is_empty()
+}
+
+fn classify_tagged_tool_protocol_envelope(text: &str) -> Option<ToolProtocolEnvelopeKind> {
+    if !starts_with_tool_protocol_tag_or_fence(text) {
+        return None;
+    }
+    if looks_like_tool_protocol_example(text) {
+        return None;
+    }
+
+    let is_fence = starts_with_tool_protocol_fence(text);
+    let (visible_text, calls) = parse_tool_calls(text);
+    (!calls.is_empty() && (is_fence || visible_text.trim().is_empty()))
+        .then_some(ToolProtocolEnvelopeKind::TaggedToolCall)
+}
+
+fn looks_like_malformed_tagged_tool_protocol_envelope(text: &str) -> bool {
+    if !starts_with_tool_protocol_tag_or_fence(text) {
+        return false;
+    }
+    if looks_like_tool_protocol_example(text) {
+        return false;
+    }
+
+    let (visible_text, calls) = parse_tool_calls(text);
+    if !calls.is_empty() || !visible_text.trim().is_empty() {
+        return false;
+    }
+
+    let lower = text.to_ascii_lowercase();
+    lower.contains("arguments")
+        || lower.contains("parameters")
+        || lower.contains("function")
+        || lower.contains("name")
+        || lower.contains("call_id")
+        || lower.contains("tool_call_id")
+}
+
+fn has_malformed_tool_protocol_text_signal(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    let json_like =
+        trimmed.starts_with('{') || trimmed.starts_with('[') || lower.starts_with("```json");
+    if !json_like {
+        return false;
+    }
+
+    // Malformed text cannot be parsed into a Value, so keep the tool-result
+    // signal close to the valid-envelope shape to avoid business JSON false positives.
+    let has_tool_result_shape = text.contains("\"tool_call_id\"")
+        && (text.contains("\"content\"")
+            || text.contains("\"result\"")
+            || text.contains("\"output\""));
+    let has_protocol_container = text.contains("\"tool_calls\"")
+        || text.contains("\"toolcalls\"")
+        || text.contains("\"function_call\"");
+    let has_arguments = text.contains("\"arguments\"") || text.contains("\"parameters\"");
+    let has_call_id = text.contains("\"call_id\"") || text.contains("\"tool_call_id\"");
+
+    has_tool_result_shape || (has_protocol_container && has_arguments && has_call_id)
+}
+
+fn malformed_text_mentions_known_tool(text: &str, known_tool_names: &HashSet<String>) -> bool {
+    if known_tool_names.is_empty() {
+        return false;
+    }
+
+    static JSON_NAME_FIELD_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#""name"\s*:\s*"([^"]+)""#).expect("JSON_NAME_FIELD_RE regex must compile")
+    });
+
+    JSON_NAME_FIELD_RE.captures_iter(text).any(|cap| {
+        cap.get(1)
+            .map(|name| name.as_str().trim().to_ascii_lowercase())
+            .is_some_and(|name| known_tool_names.contains(&name))
+    })
+}
+
+fn has_malformed_tool_protocol_text_signal_for_known_tools(
+    text: &str,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    if has_malformed_tool_protocol_text_signal(text) {
+        return true;
+    }
+
+    let trimmed = text.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    let json_like =
+        trimmed.starts_with('{') || trimmed.starts_with('[') || lower.starts_with("```json");
+    if !json_like {
+        return false;
+    }
+
+    let has_protocol_container = text.contains("\"tool_calls\"")
+        || text.contains("\"toolcalls\"")
+        || text.contains("\"function_call\"");
+    let has_arguments = text.contains("\"arguments\"") || text.contains("\"parameters\"");
+
+    has_protocol_container
+        && has_arguments
+        && malformed_text_mentions_known_tool(text, known_tool_names)
+}
+
+fn json_fence_body(trimmed: &str) -> Option<&str> {
+    let rest = trimmed.strip_prefix("```")?;
+    let first_newline = rest.find('\n')?;
+    let language = rest[..first_newline].trim().trim_end_matches('\r');
+    if !language.eq_ignore_ascii_case("json") {
+        return None;
+    }
+
+    let body_with_close = &rest[first_newline + 1..];
+    let close_start = body_with_close.rfind("```")?;
+    if !body_with_close[close_start + 3..].trim().is_empty() {
+        return None;
+    }
+    Some(body_with_close[..close_start].trim())
+}
+
+pub fn classify_tool_protocol_envelope(text: &str) -> Option<ToolProtocolEnvelopeKind> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(kind) = classify_tagged_tool_protocol_envelope(trimmed) {
+        return Some(kind);
+    }
+
+    if let Some(body) = json_fence_body(trimmed) {
+        return classify_tool_protocol_envelope(body);
+    }
+
+    let value = serde_json::from_str::<serde_json::Value>(trimmed).ok()?;
+    classify_tool_protocol_json_value(&value)
+}
+
+pub fn looks_like_tool_protocol_envelope(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if classify_tool_protocol_envelope(trimmed).is_some() {
+        return true;
+    }
+
+    if let Some(body) = json_fence_body(trimmed) {
+        return looks_like_tool_protocol_envelope(body);
+    }
+
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .is_ok_and(|value| has_malformed_tool_protocol_json_signal(&value))
+}
+
+pub fn looks_like_malformed_tool_protocol_envelope(text: &str) -> bool {
+    let trimmed = text.trim();
+    if looks_like_tool_protocol_example(trimmed) {
+        return false;
+    }
+
+    if looks_like_malformed_tagged_tool_protocol_envelope(trimmed) {
+        return true;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let json_like =
+        trimmed.starts_with('{') || trimmed.starts_with('[') || lower.starts_with("```json");
+    if trimmed.is_empty() || !json_like {
+        return false;
+    }
+
+    if let Some(body) = json_fence_body(trimmed) {
+        return looks_like_malformed_tool_protocol_envelope(body);
+    }
+
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return false;
+    }
+
+    has_malformed_tool_protocol_text_signal(trimmed)
+}
+
+pub fn looks_like_malformed_tool_protocol_envelope_for_known_tools(
+    text: &str,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    let trimmed = text.trim();
+    if looks_like_tool_protocol_example(trimmed) {
+        return false;
+    }
+
+    if looks_like_malformed_tool_protocol_envelope(trimmed) {
+        return true;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let json_like =
+        trimmed.starts_with('{') || trimmed.starts_with('[') || lower.starts_with("```json");
+    if trimmed.is_empty() || !json_like {
+        return false;
+    }
+
+    if let Some(body) = json_fence_body(trimmed) {
+        return looks_like_malformed_tool_protocol_envelope_for_known_tools(body, known_tool_names);
+    }
+
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return false;
+    }
+
+    has_malformed_tool_protocol_text_signal_for_known_tools(trimmed, known_tool_names)
+}
+
 fn is_xml_meta_tag(tag: &str) -> bool {
     let normalized = tag.to_ascii_lowercase();
     matches!(
@@ -190,21 +726,22 @@ fn is_xml_meta_tag(tag: &str) -> bool {
 }
 
 /// Match opening XML tags: `<tag_name>`.  Does NOT use backreferences.
-static XML_OPEN_TAG_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<([a-zA-Z_][a-zA-Z0-9_-]*)>").unwrap());
+static XML_OPEN_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"<([a-zA-Z_][a-zA-Z0-9_-]*)>").expect("XML_OPEN_TAG_RE regex must compile")
+});
 
 /// MiniMax XML invoke format:
 /// `<invoke name="shell"><parameter name="command">pwd</parameter></invoke>`
 static MINIMAX_INVOKE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)<invoke\b[^>]*\bname\s*=\s*(?:"([^"]+)"|'([^']+)')[^>]*>(.*?)</invoke>"#)
-        .unwrap()
+        .expect("MINIMAX_INVOKE_RE regex must compile")
 });
 
 static MINIMAX_PARAMETER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?is)<parameter\b[^>]*\bname\s*=\s*(?:"([^"]+)"|'([^']+)')[^>]*>(.*?)</parameter>"#,
     )
-    .unwrap()
+    .expect("MINIMAX_PARAMETER_RE regex must compile")
 });
 
 /// Extracts all `<tag>…</tag>` pairs from `input`, returning `(tag_name, inner_content)`.
@@ -388,8 +925,9 @@ fn parse_minimax_invoke_calls(response: &str) -> Option<(String, Vec<ParsedToolC
     Some((text, calls))
 }
 
-const TOOL_CALL_OPEN_TAGS: [&str; 6] = [
+const TOOL_CALL_OPEN_TAGS: [&str; 7] = [
     "<tool_call>",
+    "<tool_calls>",
     "<toolcall>",
     "<tool-call>",
     "<invoke>",
@@ -397,8 +935,9 @@ const TOOL_CALL_OPEN_TAGS: [&str; 6] = [
     "<minimax:toolcall>",
 ];
 
-const TOOL_CALL_CLOSE_TAGS: [&str; 6] = [
+const TOOL_CALL_CLOSE_TAGS: [&str; 7] = [
     "</tool_call>",
+    "</tool_calls>",
     "</toolcall>",
     "</tool-call>",
     "</invoke>",
@@ -495,6 +1034,265 @@ fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
     values
 }
 
+fn skip_json_ws(input: &str, mut idx: usize) -> usize {
+    while let Some(ch) = input[idx..].chars().next() {
+        if !ch.is_whitespace() {
+            break;
+        }
+        idx += ch.len_utf8();
+    }
+    idx
+}
+
+fn find_json_field_value_start(input: &str, field: &str, start: usize) -> Option<usize> {
+    let pattern = format!("\"{field}\"");
+    let mut search_start = start;
+    while let Some(relative) = input[search_start..].find(&pattern) {
+        let key_start = search_start + relative;
+        let after_key = key_start + pattern.len();
+        let colon = skip_json_ws(input, after_key);
+        if input[colon..].starts_with(':') {
+            return Some(colon + 1);
+        }
+        search_start = after_key;
+    }
+    None
+}
+
+fn find_json_string_end(input: &str, quote_start: usize) -> Option<usize> {
+    if !input[quote_start..].starts_with('"') {
+        return None;
+    }
+
+    let mut escaped = false;
+    for (relative, ch) in input[quote_start + 1..].char_indices() {
+        let idx = quote_start + 1 + relative;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(idx),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn parse_json_string_field_after(
+    input: &str,
+    field: &str,
+    start: usize,
+) -> Option<(String, usize)> {
+    let value_start = skip_json_ws(input, find_json_field_value_start(input, field, start)?);
+    let value_end = find_json_string_end(input, value_start)?;
+    let value = serde_json::from_str::<String>(&input[value_start..=value_end]).ok()?;
+    Some((value, value_end + 1))
+}
+
+// Narrow recovery for malformed file_write calls whose content string contains
+// model-emitted unescaped quotes. This is deliberately not a general JSON
+// repair path: content must be the final argument field and the remaining tail
+// must only close the surrounding tool-call protocol envelope.
+fn decode_recovered_json_string_fragment(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('/') => out.push('/'),
+            Some('b') => out.push('\u{0008}'),
+            Some('f') => out.push('\u{000c}'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('u') => {
+                let mut value = 0u32;
+                let mut valid = true;
+                let mut consumed = String::with_capacity(4);
+                for _ in 0..4 {
+                    let Some(hex) = chars.next() else {
+                        valid = false;
+                        break;
+                    };
+                    consumed.push(hex);
+                    if let Some(digit) = hex.to_digit(16) {
+                        value = (value << 4) | digit;
+                    } else {
+                        valid = false;
+                    }
+                }
+                if valid && consumed.len() == 4 {
+                    if let Some(decoded) = char::from_u32(value) {
+                        out.push(decoded);
+                    } else {
+                        out.push_str("\\u");
+                        out.push_str(&consumed);
+                    }
+                } else {
+                    out.push_str("\\u");
+                    out.push_str(&consumed);
+                }
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+
+    out
+}
+
+fn file_write_content_tail_is_unambiguous(input: &str, after_quote: usize) -> bool {
+    let mut idx = skip_json_ws(input, after_quote);
+    if !input[idx..].starts_with('}') {
+        return false;
+    }
+    idx += '}'.len_utf8();
+    idx = skip_json_ws(input, idx);
+
+    while let Some(ch) = input[idx..].chars().next() {
+        match ch {
+            '}' | ']' => {
+                idx += ch.len_utf8();
+                idx = skip_json_ws(input, idx);
+            }
+            _ => break,
+        }
+    }
+
+    let tail = input[idx..].trim_start();
+    tail.is_empty()
+        || tail.starts_with("</tool_call>")
+        || tail.starts_with("</tool_calls>")
+        || tail.starts_with("</toolcall>")
+        || tail.starts_with("</tool-call>")
+        || tail.starts_with("</invoke>")
+        || tail.starts_with("</minimax:tool_call>")
+        || tail.starts_with("</minimax:toolcall>")
+        || tail.starts_with("```")
+}
+
+fn file_write_content_quote_starts_additional_final_field(input: &str, after_quote: usize) -> bool {
+    let mut idx = skip_json_ws(input, after_quote);
+    if !input[idx..].starts_with(',') {
+        return false;
+    }
+
+    idx += ','.len_utf8();
+    idx = skip_json_ws(input, idx);
+
+    let Some(field_end) = find_json_string_end(input, idx) else {
+        return false;
+    };
+
+    idx = skip_json_ws(input, field_end + 1);
+    if !input[idx..].starts_with(':') {
+        return false;
+    }
+
+    idx += ':'.len_utf8();
+    idx = skip_json_ws(input, idx);
+
+    let mut stream =
+        serde_json::Deserializer::from_str(&input[idx..]).into_iter::<serde_json::Value>();
+    let Some(Ok(_)) = stream.next() else {
+        return false;
+    };
+
+    let consumed = stream.byte_offset();
+    consumed > 0 && file_write_content_tail_is_unambiguous(input, idx + consumed)
+}
+
+fn parse_malformed_file_write_content_after(input: &str, start: usize) -> Option<String> {
+    let value_start = skip_json_ws(input, find_json_field_value_start(input, "content", start)?);
+    if !input[value_start..].starts_with('"') {
+        return None;
+    }
+
+    let mut escaped = false;
+    for (relative, ch) in input[value_start + 1..].char_indices() {
+        let idx = value_start + 1 + relative;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '"' if file_write_content_tail_is_unambiguous(input, idx + 1) => {
+                let raw = &input[value_start + 1..idx];
+                return Some(decode_recovered_json_string_fragment(raw));
+            }
+            '"' if file_write_content_quote_starts_additional_final_field(input, idx + 1) => {
+                return None;
+            }
+            '"' => {}
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn parse_malformed_file_write_arguments(input: &str) -> Option<serde_json::Value> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let object_start = skip_json_ws(trimmed, 0);
+    if !trimmed[object_start..].starts_with('{') {
+        return None;
+    }
+
+    let (path, path_end) = parse_json_string_field_after(trimmed, "path", object_start)?;
+    if path.trim().is_empty() {
+        return None;
+    }
+
+    let content = parse_malformed_file_write_content_after(trimmed, path_end)?;
+    Some(serde_json::json!({
+        "path": path,
+        "content": content,
+    }))
+}
+
+fn parse_malformed_file_write_call(input: &str) -> Option<ParsedToolCall> {
+    let trimmed = input.trim();
+    let body = json_fence_body(trimmed).unwrap_or(trimmed).trim();
+    if body.is_empty() || !(body.starts_with('{') || body.starts_with('[')) {
+        return None;
+    }
+
+    let (name, name_end) = parse_json_string_field_after(body, "name", 0)?;
+    if map_tool_name_alias(name.trim()) != "file_write" {
+        return None;
+    }
+
+    let arguments_start = find_json_field_value_start(body, "arguments", name_end)
+        .or_else(|| find_json_field_value_start(body, "parameters", name_end))?;
+    let arguments = parse_malformed_file_write_arguments(&body[arguments_start..])?;
+
+    Some(ParsedToolCall {
+        name: "file_write".to_string(),
+        arguments,
+        tool_call_id: None,
+    })
+}
+
 /// Find the end position of a JSON object by tracking balanced braces.
 fn find_json_end(input: &str) -> Option<usize> {
     let trimmed = input.trim_start();
@@ -532,7 +1330,7 @@ fn find_json_end(input: &str) -> Option<usize> {
 }
 
 /// Parse XML attribute-style tool calls from response text.
-/// This handles MiniMax and similar providers that output:
+/// This handles MiniMax and similar model_providers that output:
 /// ```xml
 /// <minimax:toolcall>
 /// <invoke name="shell">
@@ -545,12 +1343,14 @@ fn parse_xml_attribute_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 
     // Regex to find <invoke name="toolname">...</invoke> blocks
     static INVOKE_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?s)<invoke\s+name="([^"]+)"[^>]*>(.*?)</invoke>"#).unwrap()
+        Regex::new(r#"(?s)<invoke\s+name="([^"]+)"[^>]*>(.*?)</invoke>"#)
+            .expect("INVOKE_RE regex must compile")
     });
 
     // Regex to find <parameter name="paramname">value</parameter>
     static PARAM_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"<parameter\s+name="([^"]+)"[^>]*>([^<]*)</parameter>"#).unwrap()
+        Regex::new(r#"<parameter\s+name="([^"]+)"[^>]*>([^<]*)</parameter>"#)
+            .expect("PARAM_RE regex must compile")
     });
 
     for cap in INVOKE_RE.captures_iter(response) {
@@ -608,22 +1408,24 @@ fn parse_perl_style_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     // Matches both `TOOL_CALL { ... }} /TOOL_CALL` and `[TOOL_CALL]{ ... }}[/TOOL_CALL]`
     static PERL_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?s)(?:\[TOOL_CALL\]|TOOL_CALL)\s*\{(.+?)\}\}\s*(?:\[/TOOL_CALL\]|/TOOL_CALL)")
-            .unwrap()
+            .expect("PERL_RE regex must compile")
     });
 
     // Regex to find tool => "name" in the content
-    static TOOL_NAME_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"tool\s*=>\s*"([^"]+)""#).unwrap());
+    static TOOL_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"tool\s*=>\s*"([^"]+)""#).expect("TOOL_NAME_RE regex must compile")
+    });
 
     // Regex to find args => { ... } block.
     // The closing brace is optional: in the square bracket variant [TOOL_CALL]{...}}[/TOOL_CALL]
     // the outer regex may consume the inner closing brace, so the args content may run to end of string.
-    static ARGS_BLOCK_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?s)args\s*=>\s*\{(.+?)(?:\}|$)").unwrap());
+    static ARGS_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)args\s*=>\s*\{(.+?)(?:\}|$)").expect("ARGS_BLOCK_RE regex must compile")
+    });
 
     // Regex to find --key "value" pairs
     static ARGS_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"--(\w+)\s+"([^"]+)""#).unwrap());
+        LazyLock::new(|| Regex::new(r#"--(\w+)\s+"([^"]+)""#).expect("ARGS_RE regex must compile"));
 
     for cap in PERL_RE.captures_iter(response) {
         let content = cap.get(1).map(|m| m.as_str()).unwrap_or("");
@@ -685,7 +1487,8 @@ fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 
     // Regex to find <FunctionCall> blocks
     static FUNC_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?s)<FunctionCall>\s*(\w+)\s*<code>([^<]+)</code>\s*</FunctionCall>").unwrap()
+        Regex::new(r"(?s)<FunctionCall>\s*(\w+)\s*<code>([^<]+)</code>\s*</FunctionCall>")
+            .expect("FUNC_RE regex must compile")
     });
 
     for cap in FUNC_RE.captures_iter(response) {
@@ -725,7 +1528,7 @@ fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 }
 
 /// Parse GLM-style tool calls from response text.
-/// Map tool name aliases from various LLM providers to ZeroClaw tool names.
+/// Map tool name aliases from various LLM model_providers to ZeroClaw tool names.
 /// This handles variations like "fileread" -> "file_read", "bash" -> "shell", etc.
 fn map_tool_name_alias(tool_name: &str) -> &str {
     // Strip any dotted namespace prefix (keep only the final segment).
@@ -1012,7 +1815,7 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
 
 // ── Tool-Call Parsing ─────────────────────────────────────────────────────
 // LLM responses may contain tool calls in multiple formats depending on
-// the provider. Parsing follows a priority chain:
+// the model_provider. Parsing follows a priority chain:
 //   1. OpenAI-style JSON with `tool_calls` array (native API)
 //   2. XML tags: <tool_call>, <toolcall>, <tool-call>, <invoke>
 //   3. Markdown code blocks with `tool_call` language
@@ -1047,7 +1850,7 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     let mut remaining = response;
 
     // First, try to parse as OpenAI-style JSON response with tool_calls array
-    // This handles providers like Minimax that return tool_calls in native JSON format
+    // This handles model_providers like Minimax that return tool_calls in native JSON format
     if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(response.trim()) {
         calls = parse_tool_calls_from_json_value(&json_value);
         if !calls.is_empty() {
@@ -1059,6 +1862,9 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             }
             return (text_parts.join("\n"), calls);
         }
+    }
+    if let Some(call) = parse_malformed_file_write_call(response.trim()) {
+        return (String::new(), vec![call]);
     }
 
     if let Some((minimax_text, minimax_calls)) = parse_minimax_invoke_calls(response)
@@ -1077,6 +1883,7 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
 
         let Some(close_tag) = (match open_tag {
             "<tool_call>" => Some("</tool_call>"),
+            "<tool_calls>" => Some("</tool_calls>"),
             "<toolcall>" => Some("</toolcall>"),
             "<tool-call>" => Some("</tool-call>"),
             "<invoke>" => Some("</invoke>"),
@@ -1102,6 +1909,11 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 }
             }
 
+            if !parsed_any && let Some(call) = parse_malformed_file_write_call(inner) {
+                calls.push(call);
+                parsed_any = true;
+            }
+
             // If JSON parsing failed, try XML format (DeepSeek/GLM style)
             if !parsed_any && let Some(xml_calls) = parse_xml_tool_calls(inner) {
                 calls.extend(xml_calls);
@@ -1117,7 +1929,10 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             }
 
             if !parsed_any {
-                tracing::warn!(
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                     "Malformed <tool_call>: expected tool-call object in tag body (JSON/XML/GLM)"
                 );
             }
@@ -1140,6 +1955,11 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                         parsed_any = true;
                         calls.extend(parsed_calls);
                     }
+                }
+
+                if !parsed_any && let Some(call) = parse_malformed_file_write_call(inner) {
+                    calls.push(call);
+                    parsed_any = true;
                 }
 
                 // Try XML
@@ -1187,6 +2007,12 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 }
             }
 
+            if let Some(call) = parse_malformed_file_write_call(after_open) {
+                calls.push(call);
+                remaining = "";
+                continue;
+            }
+
             // Last resort: try GLM shortened body on everything after the open tag.
             // The model may have emitted `<tool_call>shell>ls` with no close tag at all.
             let glm_input = after_open.trim();
@@ -1209,7 +2035,7 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             Regex::new(
                 r"(?s)```(?:tool[_-]?call|invoke)\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>|</invoke>|</minimax:toolcall>)",
             )
-            .unwrap()
+            .expect("MD_TOOL_CALL_RE regex must compile")
         });
         let mut md_text_parts: Vec<String> = Vec::new();
         let mut last_end = 0;
@@ -1226,6 +2052,11 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                 let parsed_calls = parse_tool_calls_from_json_value(&value);
                 calls.extend(parsed_calls);
             }
+            if calls.is_empty()
+                && let Some(call) = parse_malformed_file_write_call(inner)
+            {
+                calls.push(call);
+            }
             last_end = full_match.end();
         }
 
@@ -1239,11 +2070,13 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
-    // Try ```tool <name> format used by some providers (e.g., xAI grok)
+    // Try ```tool <name> format used by some model_providers (e.g., xAI grok)
     // Example: ```tool file_write\n{"path": "...", "content": "..."}\n```
     if calls.is_empty() {
-        static MD_TOOL_NAME_RE: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"(?s)```tool\s+(\w+)\s*\n(.*?)(?:```|$)").unwrap());
+        static MD_TOOL_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(?s)```tool\s+(\w+)\s*\n(.*?)(?:```|$)")
+                .expect("MD_TOOL_NAME_RE regex must compile")
+        });
         let mut md_text_parts: Vec<String> = Vec::new();
         let mut last_end = 0;
 
@@ -1259,12 +2092,18 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             // Try to parse the inner content as JSON arguments
             let json_values = extract_json_values(inner);
             if json_values.is_empty() {
-                // Log a warning if we found a tool block but couldn't parse arguments
-                tracing::warn!(
-                    tool_name = %tool_name,
-                    inner = %inner.chars().take(100).collect::<String>(),
-                    "Found ```tool <name> block but could not parse JSON arguments"
-                );
+                if map_tool_name_alias(tool_name) == "file_write"
+                    && let Some(arguments) = parse_malformed_file_write_arguments(inner)
+                {
+                    calls.push(ParsedToolCall {
+                        name: "file_write".to_string(),
+                        arguments,
+                        tool_call_id: None,
+                    });
+                } else {
+                    // Log a warning if we found a tool block but couldn't parse arguments
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"tool_name": tool_name, "inner": inner.chars().take(100).collect::<String>()})), "Found ```tool <name> block but could not parse JSON arguments");
+                }
             } else {
                 for value in json_values {
                     let arguments = if value.is_object() {
@@ -1452,16 +2291,22 @@ pub fn strip_think_tags(s: &str) -> String {
 /// Strip prompt-guided tool artifacts from visible output while preserving
 /// raw model text in history for future turns.
 pub fn strip_tool_result_blocks(text: &str) -> String {
-    static TOOL_RESULT_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?s)<tool_result[^>]*>.*?</tool_result>").unwrap());
-    static THINKING_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?s)<thinking>.*?</thinking>").unwrap());
-    static THINK_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?s)<think>.*?</think>").unwrap());
-    static TOOL_RESULTS_PREFIX_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?m)^\[Tool results\]\s*\n?").unwrap());
+    static TOOL_RESULT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)<tool_result[^>]*>.*?</tool_result>")
+            .expect("TOOL_RESULT_RE regex must compile")
+    });
+    static THINKING_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)<thinking>.*?</thinking>").expect("THINKING_RE regex must compile")
+    });
+    static THINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)<think>.*?</think>").expect("THINK_RE regex must compile")
+    });
+    static TOOL_RESULTS_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)^\[Tool results\]\s*\n?")
+            .expect("TOOL_RESULTS_PREFIX_RE regex must compile")
+    });
     static EXCESS_BLANK_LINES_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
+        LazyLock::new(|| Regex::new(r"\n{3,}").expect("EXCESS_BLANK_LINES_RE regex must compile"));
 
     let result = TOOL_RESULT_RE.replace_all(text, "");
     let result = THINKING_RE.replace_all(&result, "");
@@ -1485,7 +2330,28 @@ pub fn detect_tool_call_parse_issue(
         return None;
     }
 
-    let looks_like_tool_payload = trimmed.contains("<tool_call")
+    if looks_like_tool_protocol_envelope(trimmed) {
+        return Some(
+            "response resembled an internal tool protocol envelope but no valid tool call could be parsed"
+                .into(),
+        );
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return has_malformed_tool_protocol_json_signal(&value).then(|| {
+            "response resembled an internal tool protocol envelope but no valid tool call could be parsed"
+                .into()
+        });
+    }
+
+    if has_malformed_tool_protocol_text_signal(trimmed) {
+        return Some(
+            "response resembled an internal tool protocol envelope but no valid tool call could be parsed"
+                .into(),
+        );
+    }
+
+    let contains_tool_payload_marker = trimmed.contains("<tool_call")
         || trimmed.contains("<toolcall")
         || trimmed.contains("<tool-call")
         || trimmed.contains("```tool_call")
@@ -1496,12 +2362,34 @@ pub fn detect_tool_call_parse_issue(
         || trimmed.contains("```tool web_")
         || trimmed.contains("```tool memory_")
         || trimmed.contains("```tool ") // Generic ```tool <name> pattern
-        || trimmed.contains("\"tool_calls\"")
         || trimmed.contains("TOOL_CALL")
         || trimmed.contains("[TOOL_CALL]")
         || trimmed.contains("<FunctionCall>");
 
-    if looks_like_tool_payload {
+    if contains_tool_payload_marker {
+        if looks_like_tool_protocol_example(trimmed) {
+            return None;
+        }
+        if contains_tool_protocol_tag_call(trimmed) {
+            return Some(
+                "response resembled a tool-call payload but no valid tool call could be parsed"
+                    .into(),
+            );
+        }
+
+        let (visible_text, recovered_calls) = parse_tool_calls(trimmed);
+        if !recovered_calls.is_empty() && !visible_text.trim().is_empty() {
+            return None;
+        }
+        if !recovered_calls.is_empty() || visible_text.trim().is_empty() {
+            return Some(
+                "response resembled a tool-call payload but no valid tool call could be parsed"
+                    .into(),
+            );
+        }
+    }
+
+    if looks_like_malformed_tool_protocol_envelope(trimmed) {
         Some("response resembled a tool-call payload but no valid tool call could be parsed".into())
     } else {
         None
@@ -1513,6 +2401,14 @@ pub fn build_native_assistant_history_from_parsed_calls(
     tool_calls: &[ParsedToolCall],
     reasoning_content: Option<&str>,
 ) -> Option<String> {
+    // Strict provider validators (DeepSeek V4, NVIDIA NIM, ...) reject
+    // assistant messages that carry `tool_calls: []`. When there are no
+    // parsed calls, return None so the caller falls through to a plain
+    // text assistant message. See #6298.
+    if tool_calls.is_empty() {
+        return None;
+    }
+
     let calls_json = tool_calls
         .iter()
         .map(|tc| {
@@ -1548,6 +2444,52 @@ pub fn build_native_assistant_history_from_parsed_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_native_assistant_history_returns_none_for_empty_calls() {
+        // Regression: strict providers (DeepSeek V4, NVIDIA NIM) reject
+        // assistant messages carrying `tool_calls: []`. Empty input must
+        // not produce a serialised assistant message with an empty array.
+        // See #6298.
+        let result = build_native_assistant_history_from_parsed_calls("answer text", &[], None);
+        assert!(
+            result.is_none(),
+            "expected None for empty tool_calls slice, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn build_native_assistant_history_returns_none_for_empty_calls_with_reasoning() {
+        // Even with reasoning_content set, an empty tool_calls slice must
+        // collapse to None — the caller falls back to a plain assistant
+        // message, and the reasoning round-trip happens through a separate
+        // path that does not produce `tool_calls: []`.
+        let result = build_native_assistant_history_from_parsed_calls(
+            "answer text",
+            &[],
+            Some("deep thought"),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn build_native_assistant_history_emits_tool_calls_when_non_empty() {
+        // No-regression check: the normal path with a real parsed call
+        // still produces a serialised assistant message and the
+        // `tool_calls` field is a non-empty array.
+        let calls = vec![ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "pwd"}),
+            tool_call_id: Some("call_1".into()),
+        }];
+        let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None);
+        let s = result.expect("Some(_) for non-empty tool_calls");
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        let arr = parsed["tool_calls"].as_array().expect("tool_calls array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"].as_str(), Some("shell"));
+    }
 
     #[test]
     fn parse_arguments_value_unwraps_nested_object_string() {
@@ -1687,7 +2629,7 @@ After text."#;
 
     #[test]
     fn parse_tool_calls_openai_format_without_content() {
-        // Some providers don't include content field with tool_calls
+        // Some model_providers don't include content field with tool_calls
         let response = r#"{"tool_calls": [{"type": "function", "function": {"name": "memory_recall", "arguments": "{}"}}]}"#;
 
         let (text, calls) = parse_tool_calls(response);
@@ -1794,6 +2736,23 @@ I will now call the tool with this payload:
     }
 
     #[test]
+    fn parse_tool_calls_handles_plural_tool_calls_wrapper() {
+        // Regression: Llama 4 Scout (via Groq) emits a plural `<tool_calls>`
+        // wrapper rather than the singular `<tool_call>`. The parser must
+        // enter it and execute the call instead of exposing raw XML. See #6875.
+        let (text, calls) = parse_tool_calls(
+            "<tool_calls>\n{\"name\":\"myserver__some_tool\",\"arguments\":{\"key\":\"value\"}}\n</tool_calls>",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "myserver__some_tool");
+        assert_eq!(
+            calls[0].arguments.get("key").unwrap().as_str().unwrap(),
+            "value"
+        );
+        assert!(text.is_empty());
+    }
+
+    #[test]
     fn parse_tool_calls_ignores_xml_thinking_wrapper() {
         let response = r#"<tool_call>
 <thinking>Need to inspect memory first</thinking>
@@ -1889,7 +2848,7 @@ Done."#;
 
     #[test]
     fn parse_tool_calls_handles_tool_name_fence_format() {
-        // Issue #1420: xAI grok models use ```tool <name> format
+        //: xAI grok models use ```tool <name> format
         let response = r#"I'll write a test file.
 ```tool file_write
 {"path": "/home/user/test.txt", "content": "Hello world"}
@@ -1908,8 +2867,90 @@ Done."#;
     }
 
     #[test]
+    fn parse_tool_calls_recovers_malformed_file_write_content_quotes() {
+        let response = r#"<tool_call>
+{"name":"file_write","arguments":{"path":"index.html","content":"<section class="hero"><script>const msg = "ok";</script></section>"}}
+</tool_call>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_write");
+        assert_eq!(
+            calls[0].arguments.get("path").unwrap().as_str().unwrap(),
+            "index.html"
+        );
+        assert_eq!(
+            calls[0].arguments.get("content").unwrap().as_str().unwrap(),
+            r#"<section class="hero"><script>const msg = "ok";</script></section>"#
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_recovers_malformed_file_write_tool_name_fence() {
+        let response = r#"```tool file_write
+{"path":"index.html","content":"<div data-kind="card">ok</div>"}
+```"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_write");
+        assert_eq!(
+            calls[0].arguments.get("content").unwrap().as_str().unwrap(),
+            r#"<div data-kind="card">ok</div>"#
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_recovers_malformed_file_write_non_ascii_safely() {
+        let response = r#"说明:
+<tool_call>
+{"name":"file_write","arguments":{"path":"页面.html","content":"<p title="问候">你好，世界 🌏</p>"}}
+</tool_call>
+完成"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.contains("说明"));
+        assert!(text.contains("完成"));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments.get("path").unwrap().as_str().unwrap(),
+            "页面.html"
+        );
+        assert_eq!(
+            calls[0].arguments.get("content").unwrap().as_str().unwrap(),
+            r#"<p title="问候">你好，世界 🌏</p>"#
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_rejects_ambiguous_malformed_file_write() {
+        let response = r#"<tool_call>
+{"name":"file_write","arguments":{"path":"index.html","content":"<section class="hero">","mode":"append"}}
+</tool_call>"#;
+
+        let (_text, calls) = parse_tool_calls(response);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_valid_file_write_json_unchanged() {
+        let response = r#"{"name":"file_write","arguments":{"path":"index.html","content":"<section class=\"hero\">ok</section>"}}"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_write");
+        assert_eq!(
+            calls[0].arguments.get("content").unwrap().as_str().unwrap(),
+            r#"<section class="hero">ok</section>"#
+        );
+    }
+
+    #[test]
     fn parse_tool_calls_handles_tool_name_fence_shell() {
-        // Issue #1420: Test shell command in ```tool shell format
+        //: Test shell command in ```tool shell format
         let response = r#"```tool shell
 {"command": "ls -la"}
 ```"#;
@@ -2312,6 +3353,308 @@ Final answer."#;
     fn detect_tool_call_parse_issue_ignores_normal_text() {
         let issue = detect_tool_call_parse_issue("Thanks, done.", &[]);
         assert!(issue.is_none());
+    }
+
+    #[test]
+    fn detect_tool_call_parse_issue_ignores_empty_tool_calls_array() {
+        let issue = detect_tool_call_parse_issue(r#"{"content":"Hello","tool_calls":[]}"#, &[]);
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn detect_tool_call_parse_issue_ignores_json_fenced_business_tool_calls() {
+        let response = r#"```json
+{"tool_calls":[{"service":"billing","count":2}]}
+```"#;
+        let issue = detect_tool_call_parse_issue(response, &[]);
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn detect_tool_call_parse_issue_ignores_tool_call_fenced_example() {
+        let response = r#"```tool_call
+{"name":"shell","arguments":{"command":"pwd"}}
+```
+This is an example, not an invocation."#;
+
+        let issue = detect_tool_call_parse_issue(response, &[]);
+
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn detect_tool_call_parse_issue_flags_standalone_tool_call_fence() {
+        let response = r#"```tool_call
+{"name":"shell","arguments":{"command":"pwd"}}
+```"#;
+
+        let issue = detect_tool_call_parse_issue(response, &[]);
+
+        assert!(issue.is_some());
+    }
+
+    #[test]
+    fn detect_tool_call_parse_issue_ignores_tool_call_tag_example() {
+        let response = r#"<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>
+This is an example, not an invocation."#;
+
+        let issue = detect_tool_call_parse_issue(response, &[]);
+
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn detect_tool_call_parse_issue_flags_tagged_tool_call_with_trailing_text() {
+        let response = r#"<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>
+Done."#;
+
+        let issue = detect_tool_call_parse_issue(response, &[]);
+
+        assert!(issue.is_some());
+    }
+
+    #[test]
+    fn detect_tool_call_parse_issue_flags_json_fenced_tool_protocol() {
+        let response = r#"```json
+{"tool_calls":[{"name":"shell","arguments":{"command":"pwd"}}]}
+```"#;
+        let issue = detect_tool_call_parse_issue(response, &[]);
+        assert!(issue.is_some());
+    }
+
+    #[test]
+    fn detect_tool_call_parse_issue_flags_malformed_tool_result_envelope() {
+        let response = r#"{"tool_call_id":"call_1","content":"raw tool output""#;
+        let issue = detect_tool_call_parse_issue(response, &[]);
+        assert!(issue.is_some());
+    }
+
+    #[test]
+    fn detect_tool_call_parse_issue_ignores_malformed_tool_call_id_only_json() {
+        let response = r#"{"tool_call_id":"support-case-1""#;
+        let issue = detect_tool_call_parse_issue(response, &[]);
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn detect_tool_call_parse_issue_flags_malformed_nonempty_tool_calls_array() {
+        let issue = detect_tool_call_parse_issue(
+            r#"{"content":null,"tool_calls":[{"call_id":"call_1","arguments":"{}"}]}"#,
+            &[],
+        );
+        assert!(issue.is_some());
+    }
+
+    #[test]
+    fn detect_tool_call_parse_issue_ignores_malformed_business_tool_calls_without_call_id() {
+        for response in [
+            r#"{"tool_calls":[{"name":"support_case","arguments":{"id":"A1"}}"#,
+            r#"{"toolcalls":[{"name":"support_case","arguments":{"id":"A1"}}"#,
+        ] {
+            let issue = detect_tool_call_parse_issue(response, &[]);
+
+            assert!(
+                issue.is_none(),
+                "business JSON without a tool call id must not be treated as internal protocol: {response}"
+            );
+            assert!(
+                !looks_like_malformed_tool_protocol_envelope(response),
+                "business JSON without a tool call id must not be classified as malformed protocol: {response}"
+            );
+        }
+    }
+
+    #[test]
+    fn looks_like_tool_protocol_envelope_flags_malformed_nonempty_tool_calls_array() {
+        assert!(looks_like_tool_protocol_envelope(
+            r#"{"content":null,"tool_calls":[{"call_id":"call_1","arguments":"{}"}]}"#
+        ));
+        assert!(!looks_like_tool_protocol_envelope(
+            r#"{"content":"Hello","tool_calls":[]}"#
+        ));
+    }
+
+    #[test]
+    fn classify_tool_protocol_envelope_flags_internal_json_variants() {
+        assert_eq!(
+            classify_tool_protocol_envelope(
+                r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{}"}]}"#
+            ),
+            Some(ToolProtocolEnvelopeKind::ToolCalls)
+        );
+        assert_eq!(
+            classify_tool_protocol_envelope(
+                r#"{"toolcalls":[{"name":"shell","arguments":{"command":"pwd"}}]}"#
+            ),
+            Some(ToolProtocolEnvelopeKind::ToolCallsAlias)
+        );
+        assert_eq!(
+            classify_tool_protocol_envelope(r#"{"tool_calls":[{"name":"shell","arguments":{}}]}"#),
+            Some(ToolProtocolEnvelopeKind::ToolCalls)
+        );
+        assert_eq!(
+            classify_tool_protocol_envelope(r#"{"toolcalls":[{"name":"shell","arguments":{}}]}"#),
+            Some(ToolProtocolEnvelopeKind::ToolCallsAlias)
+        );
+        assert_eq!(
+            classify_tool_protocol_envelope(
+                r#"{"function_call":{"name":"shell","arguments":"{\"command\":\"pwd\"}"}}"#
+            ),
+            Some(ToolProtocolEnvelopeKind::FunctionCall)
+        );
+        assert_eq!(
+            classify_tool_protocol_envelope(
+                r#"{"tool_call_id":"call_1","content":"command output"}"#
+            ),
+            Some(ToolProtocolEnvelopeKind::ToolResult)
+        );
+        assert_eq!(
+            classify_tool_protocol_envelope(
+                r#"{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}"#
+            ),
+            Some(ToolProtocolEnvelopeKind::ResponsesFunctionCall)
+        );
+        assert_eq!(
+            classify_tool_protocol_envelope(
+                r#"```json
+{"tool_calls":[{"name":"shell","arguments":{"command":"pwd"}}]}
+```"#
+            ),
+            Some(ToolProtocolEnvelopeKind::ToolCalls)
+        );
+    }
+
+    #[test]
+    fn classify_tool_protocol_envelope_preserves_tool_call_examples() {
+        let fenced_example = r#"```tool_call
+{"name":"shell","arguments":{"command":"pwd"}}
+```
+This is an example, not an invocation."#;
+        let embedded_fenced_example = r#"Here is an example:
+```tool_call
+{"name":"shell","arguments":{"command":"pwd"}}
+```"#;
+        let embedded_fenced_example_cn = r#"例如：
+```tool_call
+{"name":"shell","arguments":{"command":"pwd"}}
+```"#;
+        let tag_example = r#"<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>
+This is an example, not an invocation."#;
+        let tag_example_cn = r#"比如：
+<tool_call>
+{"name":"shell","arguments":{"command":"pwd"}}
+</tool_call>"#;
+
+        assert_eq!(classify_tool_protocol_envelope(fenced_example), None);
+        assert!(!looks_like_tool_protocol_envelope(fenced_example));
+        assert_eq!(
+            classify_tool_protocol_envelope(embedded_fenced_example),
+            None
+        );
+        assert!(!looks_like_tool_protocol_envelope(embedded_fenced_example));
+        assert!(looks_like_tool_protocol_example(embedded_fenced_example));
+        assert_eq!(
+            classify_tool_protocol_envelope(embedded_fenced_example_cn),
+            None
+        );
+        assert!(!looks_like_tool_protocol_envelope(
+            embedded_fenced_example_cn
+        ));
+        assert!(looks_like_tool_protocol_example(embedded_fenced_example_cn));
+        assert_eq!(classify_tool_protocol_envelope(tag_example), None);
+        assert!(!looks_like_tool_protocol_envelope(tag_example));
+        assert_eq!(classify_tool_protocol_envelope(tag_example_cn), None);
+        assert!(!looks_like_tool_protocol_envelope(tag_example_cn));
+        assert!(looks_like_tool_protocol_example(tag_example_cn));
+    }
+
+    #[test]
+    fn contains_tool_protocol_tag_call_flags_embedded_tool_call_fences() {
+        let embedded = r#"Let me call it:
+```tool_call
+{"name":"shell","arguments":{"command":"pwd"}}
+```
+Done."#;
+
+        assert!(contains_tool_protocol_tag_call(embedded));
+    }
+
+    #[test]
+    fn classify_tool_protocol_envelope_flags_standalone_tool_fences() {
+        let tool_call_fence = r#"```tool_call
+{"name":"shell","arguments":{"command":"pwd"}}
+```"#;
+        let invoke_fence = r#"```invoke
+{"name":"shell","arguments":{"command":"pwd"}}
+```"#;
+        let tool_name_fence = r#"```tool shell
+{"command":"pwd"}
+```"#;
+
+        assert_eq!(
+            classify_tool_protocol_envelope(tool_call_fence),
+            Some(ToolProtocolEnvelopeKind::TaggedToolCall)
+        );
+        assert!(looks_like_tool_protocol_envelope(tool_call_fence));
+        assert_eq!(
+            classify_tool_protocol_envelope(invoke_fence),
+            Some(ToolProtocolEnvelopeKind::TaggedToolCall)
+        );
+        assert!(looks_like_tool_protocol_envelope(invoke_fence));
+        assert_eq!(
+            classify_tool_protocol_envelope(tool_name_fence),
+            Some(ToolProtocolEnvelopeKind::TaggedToolCall)
+        );
+        assert!(looks_like_tool_protocol_envelope(tool_name_fence));
+    }
+
+    #[test]
+    fn classify_tool_protocol_envelope_preserves_top_level_arrays_without_protocol_marker() {
+        assert!(!looks_like_tool_protocol_envelope(
+            r#"[{"service":"billing","count":2}]"#
+        ));
+
+        assert!(!looks_like_tool_protocol_envelope(
+            r#"[{"name":"shell","arguments":{}}]"#
+        ));
+    }
+
+    #[test]
+    fn classify_tool_protocol_envelope_preserves_top_level_schema_array() {
+        let schema = r#"[{"name":"planner","parameters":{"goal":"string"}}]"#;
+
+        assert_eq!(classify_tool_protocol_envelope(schema), None);
+        assert!(!looks_like_tool_protocol_envelope(schema));
+    }
+
+    #[test]
+    fn classify_tool_protocol_envelope_preserves_plain_user_json() {
+        let profile = r#"{"name":"profile","parameters":{"timezone":"UTC"}}"#;
+        assert_eq!(classify_tool_protocol_envelope(profile), None);
+        assert!(!looks_like_tool_protocol_envelope(profile));
+    }
+
+    #[test]
+    fn looks_like_tool_protocol_envelope_preserves_plain_json_with_similar_keys() {
+        let config = r#"{"function_call":false,"description":"disable the feature"}"#;
+        assert!(!looks_like_tool_protocol_envelope(config));
+
+        let audit_log = r#"{"tool_calls":[{"service":"billing","count":2}]}"#;
+        assert!(!looks_like_tool_protocol_envelope(audit_log));
+
+        let queued_case =
+            r#"{"tool_calls":[{"id":"case-1","status":"queued","service":"billing"}]}"#;
+        assert!(!looks_like_tool_protocol_envelope(queued_case));
+
+        let named_record =
+            r#"{"tool_calls":[{"name":"planner","status":"queued","service":"workflow"}]}"#;
+        assert!(!looks_like_tool_protocol_envelope(named_record));
     }
 
     #[test]

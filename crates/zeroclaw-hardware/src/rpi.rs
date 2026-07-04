@@ -20,7 +20,14 @@ use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::fs;
 use std::time::Duration;
+use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool_attribution;
+
+tool_attribution!(GpioRpiWriteTool, ToolKind::Plugin);
+tool_attribution!(GpioRpiReadTool, ToolKind::Plugin);
+tool_attribution!(GpioRpiBlinkTool, ToolKind::Plugin);
+tool_attribution!(RpiSystemInfoTool, ToolKind::Plugin);
 
 // ─── LED sysfs helpers ──────────────────────────────────────────────────────
 
@@ -281,16 +288,33 @@ impl RpiSystemContext {
         };
         let devices_dir = home.join(".zeroclaw").join("hardware").join("devices");
         if let Err(e) = fs::create_dir_all(&devices_dir) {
-            tracing::warn!("Failed to create hardware devices dir: {e}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Failed to create hardware devices dir"
+            );
             return;
         }
 
         let path = devices_dir.join("rpi0.md");
         let content = self.device_profile_markdown();
         if let Err(e) = fs::write(&path, &content) {
-            tracing::warn!("Failed to write rpi0.md: {e}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Failed to write rpi0.md"
+            );
         } else {
-            tracing::debug!(path = %path.display(), "Wrote rpi0.md hardware context file");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"path": path.display().to_string()})),
+                "Wrote rpi0.md hardware context file"
+            );
         }
     }
 
@@ -376,21 +400,40 @@ impl Tool for GpioRpiWriteTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let pin = args
-            .get("pin")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'pin' parameter"))? as u8;
-        let value = args
-            .get("value")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'value' parameter"))?;
+        let pin = args.get("pin").and_then(|v| v.as_u64()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "pin"})),
+                "rpi gpio tool: missing 'pin' parameter"
+            );
+            anyhow::Error::msg("Missing 'pin' parameter")
+        })? as u8;
+        let value = args.get("value").and_then(|v| v.as_u64()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "value"})),
+                "rpi gpio tool: missing 'value' parameter"
+            );
+            anyhow::Error::msg("Missing 'value' parameter")
+        })?;
         let state = if value == 0 { "LOW" } else { "HIGH" };
 
         // Onboard ACT LED → Linux LED subsystem (sysfs)
         if is_onboard_led(pin) {
             let brightness = if value == 0 { "0" } else { "1" };
-            let path = led_brightness_path()
-                .ok_or_else(|| anyhow::anyhow!("ACT LED sysfs path not found"))?;
+            let path = led_brightness_path().ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "ACT LED sysfs path not found"
+                );
+                anyhow::Error::msg("ACT LED sysfs path not found")
+            })?;
             ensure_led_trigger_none();
             fs::write(path, brightness)?;
             return Ok(ToolResult {
@@ -453,15 +496,28 @@ impl Tool for GpioRpiReadTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let pin = args
-            .get("pin")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'pin' parameter"))? as u8;
+        let pin = args.get("pin").and_then(|v| v.as_u64()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "pin"})),
+                "rpi gpio tool: missing 'pin' parameter"
+            );
+            anyhow::Error::msg("Missing 'pin' parameter")
+        })? as u8;
 
         // Onboard ACT LED → read from sysfs
         if is_onboard_led(pin) {
-            let path = led_brightness_path()
-                .ok_or_else(|| anyhow::anyhow!("ACT LED sysfs path not found"))?;
+            let path = led_brightness_path().ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "ACT LED sysfs path not found"
+                );
+                anyhow::Error::msg("ACT LED sysfs path not found")
+            })?;
             let raw = fs::read_to_string(path)?.trim().to_string();
             let value: u8 = if raw == "0" { 0 } else { 1 };
             let state = if value == 0 { "LOW" } else { "HIGH" };
@@ -534,10 +590,16 @@ impl Tool for GpioRpiBlinkTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let pin = args
-            .get("pin")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'pin' parameter"))? as u8;
+        let pin = args.get("pin").and_then(|v| v.as_u64()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "pin"})),
+                "rpi gpio tool: missing 'pin' parameter"
+            );
+            anyhow::Error::msg("Missing 'pin' parameter")
+        })? as u8;
         let times = args
             .get("times")
             .and_then(|v| v.as_u64())
@@ -556,8 +618,15 @@ impl Tool for GpioRpiBlinkTool {
 
         // Onboard ACT LED → Linux LED subsystem (async-friendly, no spawn_blocking)
         if is_onboard_led(pin) {
-            let path = led_brightness_path()
-                .ok_or_else(|| anyhow::anyhow!("ACT LED sysfs path not found"))?;
+            let path = led_brightness_path().ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "ACT LED sysfs path not found"
+                );
+                anyhow::Error::msg("ACT LED sysfs path not found")
+            })?;
             ensure_led_trigger_none();
             for _ in 0..times {
                 fs::write(path, "1")?;
@@ -622,8 +691,15 @@ impl Tool for RpiSystemInfoTool {
     }
 
     async fn execute(&self, _args: Value) -> anyhow::Result<ToolResult> {
-        let ctx = RpiSystemContext::discover()
-            .ok_or_else(|| anyhow::anyhow!("Not running on a Raspberry Pi"))?;
+        let ctx = RpiSystemContext::discover().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "rpi peripheral refused: host is not a Raspberry Pi"
+            );
+            anyhow::Error::msg("Not running on a Raspberry Pi")
+        })?;
 
         let info = json!({
             "model": ctx.model.display_name(),

@@ -226,6 +226,23 @@ pub async fn poll_device_code_tokens(
 }
 
 pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> Result<String> {
+    // OAuth callback receiver has no concrete provider alias at this
+    // level (it's a low-level helper used during the OAuth dance,
+    // before the provider is constructed). Attribute with the provider
+    // type so on-disk events still slot under the right
+    // model_provider_type bucket. The "oauth" alias is a sentinel for
+    // "this happened during the OAuth dance".
+    ::zeroclaw_log::scope!(
+        model_provider_type: "openai",
+        model_provider_alias: "oauth",
+        => async move {
+            receive_loopback_code_inner(expected_state, timeout).await
+        }
+    )
+    .await
+}
+
+async fn receive_loopback_code_inner(expected_state: &str, timeout: Duration) -> Result<String> {
     let listener = TcpListener::bind("127.0.0.1:1455")
         .await
         .context("Failed to bind callback listener at 127.0.0.1:1455")?;
@@ -243,15 +260,27 @@ pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> R
         .context("Failed to read callback request")?;
 
     let request = String::from_utf8_lossy(&buffer[..bytes_read]);
-    let first_line = request
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Malformed callback request"))?;
+    let first_line = request.lines().next().ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"oauth_provider": "openai"})),
+            "openai_oauth: malformed callback request"
+        );
+        anyhow::Error::msg("Malformed callback request")
+    })?;
 
-    let path = first_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("Callback request missing path"))?;
+    let path = first_line.split_whitespace().nth(1).ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"oauth_provider": "openai"})),
+            "openai_oauth: callback request missing path"
+        );
+        anyhow::Error::msg("Callback request missing path")
+    })?;
 
     let code = parse_code_from_redirect(path, Some(expected_state))?;
 
@@ -321,12 +350,30 @@ pub fn extract_account_id_from_jwt(token: &str) -> Option<String> {
         .ok()?;
     let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
 
+    // Prefer the flat chatgpt_account_id claim when present.
+    if let Some(value) = claims.get("chatgpt_account_id").and_then(|v| v.as_str())
+        && !value.trim().is_empty()
+    {
+        return Some(value.to_string());
+    }
+
+    // Real OpenAI OAuth tokens namespace custom claims under
+    // https://api.openai.com/auth as a JSON object, not a flat dotted key.
+    if let Some(value) = claims
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(|v| v.as_str())
+        && !value.trim().is_empty()
+    {
+        return Some(value.to_string());
+    }
+
     for key in [
         "account_id",
         "accountId",
         "acct",
-        "sub",
         "https://api.openai.com/account_id",
+        "sub",
     ] {
         if let Some(value) = claims.get(key).and_then(|v| v.as_str())
             && !value.trim().is_empty()
@@ -376,6 +423,92 @@ async fn parse_token_response(response: reqwest::Response) -> Result<TokenSet> {
         token_type: token.token_type,
         scope: token.scope,
     })
+}
+
+/// Import an existing OpenAI Codex auth-profile JSON (the file
+/// `~/.codex/auth.json` produced by the upstream Codex CLI) into
+/// ZeroClaw's auth store. Replaces the `import_openai_codex_auth_profile`
+/// helper formerly in `src/main.rs`.
+pub async fn import_codex_auth_profile(
+    auth_service: &super::AuthService,
+    profile: &str,
+    import_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    ::zeroclaw_log::scope!(
+        model_provider_type: "openai",
+        model_provider_alias: profile,
+        => async move {
+            import_codex_auth_profile_inner(auth_service, profile, import_path).await
+        }
+    )
+    .await
+}
+
+async fn import_codex_auth_profile_inner(
+    auth_service: &super::AuthService,
+    profile: &str,
+    import_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    #[derive(serde::Deserialize)]
+    struct CodexAuthTokens {
+        access_token: String,
+        #[serde(default)]
+        refresh_token: Option<String>,
+        #[serde(default)]
+        id_token: Option<String>,
+        #[serde(default)]
+        account_id: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CodexAuthFile {
+        tokens: CodexAuthTokens,
+    }
+
+    let raw = std::fs::read_to_string(import_path).with_context(|| {
+        format!(
+            "Failed to read import file {}",
+            import_path.display().to_string()
+        )
+    })?;
+    let imported: CodexAuthFile = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "Failed to parse import file {}",
+            import_path.display().to_string()
+        )
+    })?;
+    let expires_at = extract_expiry_from_jwt(&imported.tokens.access_token);
+
+    let token_set = crate::auth::profiles::TokenSet {
+        access_token: imported.tokens.access_token,
+        refresh_token: imported.tokens.refresh_token,
+        id_token: imported.tokens.id_token,
+        expires_at,
+        token_type: Some("Bearer".to_string()),
+        scope: None,
+    };
+
+    let account_id = imported
+        .tokens
+        .account_id
+        .or_else(|| extract_account_id_from_jwt(&token_set.access_token));
+    if account_id.is_none() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Could not extract OpenAI account id from imported access token; \
+             requests may fail until re-authentication."
+        );
+    }
+
+    auth_service
+        .store_openai_tokens(profile, token_set, account_id, true)
+        .await?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -434,5 +567,41 @@ mod tests {
 
         let account = extract_account_id_from_jwt(&token);
         assert_eq!(account.as_deref(), Some("acct_123"));
+    }
+
+    #[test]
+    fn extract_account_id_from_chatgpt_account_id_claim() {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{}");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode("{\"chatgpt_account_id\":\"chatgpt_acct_456\"}");
+        let token = format!("{header}.{payload}.sig");
+
+        let account = extract_account_id_from_jwt(&token);
+        assert_eq!(account.as_deref(), Some("chatgpt_acct_456"));
+    }
+
+    #[test]
+    fn extract_account_id_from_nested_auth_object() {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{}");
+        // https://api.openai.com/auth is an object with a chatgpt_account_id field
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode("{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"nested_chatgpt_acct_789\"}}");
+        let token = format!("{header}.{payload}.sig");
+
+        let account = extract_account_id_from_jwt(&token);
+        assert_eq!(account.as_deref(), Some("nested_chatgpt_acct_789"));
+    }
+
+    #[test]
+    fn extract_account_id_prefers_chatgpt_account_id_over_generic() {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{}");
+        // When both chatgpt_account_id and account_id are present, prefer chatgpt_account_id
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            "{\"chatgpt_account_id\":\"chatgpt_acct_first\",\"account_id\":\"generic_acct\"}",
+        );
+        let token = format!("{header}.{payload}.sig");
+
+        let account = extract_account_id_from_jwt(&token);
+        assert_eq!(account.as_deref(), Some("chatgpt_acct_first"));
     }
 }

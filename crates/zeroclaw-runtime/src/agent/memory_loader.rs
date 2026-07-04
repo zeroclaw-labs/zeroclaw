@@ -1,12 +1,25 @@
 use async_trait::async_trait;
 use std::fmt::Write;
+use std::time::Instant;
 use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, decay};
+
+use crate::observability::{Observer, ObserverEvent};
+
+use super::loop_::make_query_summary;
 
 #[async_trait]
 pub trait MemoryLoader: Send + Sync {
+    /// Loads a memory-context preamble for a user message.
+    ///
+    /// Implementations MUST emit a `ObserverEvent::MemoryRecall` event via
+    /// `observer` for every recall call they perform — both on success and
+    /// failure paths — so OTel/log observers can attribute per-turn memory
+    /// cost. The agent runtime relies on this for end-to-end visibility
+    /// of the implicit recall that runs at the start of each turn.
     async fn load_context(
         &self,
         memory: &dyn Memory,
+        observer: &dyn Observer,
         user_message: &str,
         session_id: Option<&str>,
     ) -> anyhow::Result<String>;
@@ -40,12 +53,41 @@ impl MemoryLoader for DefaultMemoryLoader {
     async fn load_context(
         &self,
         memory: &dyn Memory,
+        observer: &dyn Observer,
         user_message: &str,
         session_id: Option<&str>,
     ) -> anyhow::Result<String> {
-        let mut entries = memory
+        let backend = memory.name().to_string();
+        let query_summary = make_query_summary(user_message);
+
+        let start = Instant::now();
+        let recall_result = memory
             .recall(user_message, self.limit, session_id, None, None)
-            .await?;
+            .await;
+        let duration = start.elapsed();
+
+        let mut entries = match recall_result {
+            Ok(entries) => {
+                observer.record_event(&ObserverEvent::MemoryRecall {
+                    query_summary,
+                    duration,
+                    num_entries: entries.len(),
+                    backend,
+                    success: true,
+                });
+                entries
+            }
+            Err(e) => {
+                observer.record_event(&ObserverEvent::MemoryRecall {
+                    query_summary,
+                    duration,
+                    num_entries: 0,
+                    backend,
+                    success: false,
+                });
+                return Err(e);
+            }
+        };
         if entries.is_empty() {
             return Ok(String::new());
         }
@@ -92,6 +134,7 @@ impl MemoryLoader for DefaultMemoryLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observability::NoopObserver;
     use std::sync::Arc;
     use zeroclaw_memory::{
         MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, MemoryCategory, MemoryEntry,
@@ -136,6 +179,11 @@ mod tests {
                 namespace: "default".into(),
                 importance: None,
                 superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
+                agent_alias: None,
+                agent_id: None,
             }])
         }
 
@@ -155,6 +203,10 @@ mod tests {
             Ok(true)
         }
 
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
         async fn count(&self) -> anyhow::Result<usize> {
             Ok(0)
         }
@@ -165,6 +217,41 @@ mod tests {
 
         fn name(&self) -> &str {
             "mock"
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for MockMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "MockMemory"
         }
     }
 
@@ -207,6 +294,10 @@ mod tests {
             Ok(true)
         }
 
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
         async fn count(&self) -> anyhow::Result<usize> {
             Ok(self.entries.len())
         }
@@ -218,13 +309,48 @@ mod tests {
         fn name(&self) -> &str {
             "mock-with-entries"
         }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for MockMemoryWithEntries {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "MockMemoryWithEntries"
+        }
     }
 
     #[tokio::test]
     async fn default_loader_formats_context() {
         let loader = DefaultMemoryLoader::default();
         let context = loader
-            .load_context(&MockMemory, "hello", None)
+            .load_context(&MockMemory, &NoopObserver, "hello", None)
             .await
             .unwrap();
         assert_eq!(
@@ -249,6 +375,11 @@ mod tests {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
+                    agent_alias: None,
+                    agent_id: None,
                 },
                 MemoryEntry {
                     id: "2".into(),
@@ -261,12 +392,17 @@ mod tests {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
+                    agent_alias: None,
+                    agent_id: None,
                 },
             ]),
         };
 
         let context = loader
-            .load_context(&memory, "answer style", None)
+            .load_context(&memory, &NoopObserver, "answer style", None)
             .await
             .unwrap();
         assert!(context.contains("user_fact"));
@@ -290,6 +426,11 @@ mod tests {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
+                    agent_alias: None,
+                    agent_id: None,
                 },
                 MemoryEntry {
                     id: "2".into(),
@@ -302,12 +443,17 @@ mod tests {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
+                    agent_alias: None,
+                    agent_id: None,
                 },
             ]),
         };
 
         let context = loader
-            .load_context(&memory, "answer style", None)
+            .load_context(&memory, &NoopObserver, "answer style", None)
             .await
             .unwrap();
         assert!(context.contains("user_fact"));

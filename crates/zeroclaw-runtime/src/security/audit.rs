@@ -74,6 +74,15 @@ pub struct AuditEvent {
     pub action: Option<Action>,
     pub result: Option<ExecutionResult>,
     pub security: SecurityContext,
+    /// Owning agent's alias. `None` on system-level events (boot,
+    /// migration, scheduler ticks not bound to any specific agent) and
+    /// on legacy entries written before the field existed. Audit
+    /// storage stays at `<install>/audit/` (global, not per-agent), so
+    /// an agent delete does NOT remove its prior audit trail; this
+    /// field lets queries reconstruct per-agent activity after the
+    /// fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_alias: Option<String>,
 
     /// Monotonically increasing sequence number.
     #[serde(default)]
@@ -105,6 +114,7 @@ impl AuditEvent {
                 rate_limit_remaining: None,
                 sandbox_backend: None,
             },
+            agent_alias: None,
             sequence: 0,
             prev_hash: String::new(),
             entry_hash: String::new(),
@@ -124,6 +134,16 @@ impl AuditEvent {
             user_id,
             username,
         });
+        self
+    }
+
+    /// Set the owning agent's alias for multi-agent attribution.
+    /// Builder method so existing AuditEvent construction sites can
+    /// add the alias without an explicit field assignment. Pass the
+    /// alias bound at agent-loop entry.
+    #[must_use]
+    pub fn with_agent_alias(mut self, agent_alias: impl Into<String>) -> Self {
+        self.agent_alias = Some(agent_alias.into());
         self
     }
 
@@ -233,11 +253,24 @@ impl AuditLogger {
         // Load and validate signing key if sign_events enabled
         let signing_key = if config.sign_events {
             let key_hex = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY").map_err(|_| {
-                anyhow::anyhow!("sign_events enabled but ZEROCLAW_AUDIT_SIGNING_KEY not set")
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "audit log: sign_events=true but ZEROCLAW_AUDIT_SIGNING_KEY env var not set"
+                );
+                anyhow::Error::msg("sign_events enabled but ZEROCLAW_AUDIT_SIGNING_KEY not set")
             })?;
 
-            let key_bytes = hex::decode(&key_hex)
-                .map_err(|_| anyhow::anyhow!("ZEROCLAW_AUDIT_SIGNING_KEY must be hex-encoded"))?;
+            let key_bytes = hex::decode(&key_hex).map_err(|_| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "audit log: ZEROCLAW_AUDIT_SIGNING_KEY env var must be hex-encoded"
+                );
+                anyhow::Error::msg("ZEROCLAW_AUDIT_SIGNING_KEY must be hex-encoded")
+            })?;
 
             if key_bytes.len() != 32 {
                 bail!(
@@ -268,8 +301,15 @@ impl AuditLogger {
             use hmac::{Hmac, Mac};
             use sha2::Sha256;
 
-            let mut mac = Hmac::<Sha256>::new_from_slice(key_bytes)
-                .map_err(|_| anyhow::anyhow!("Invalid HMAC key length"))?;
+            let mut mac = Hmac::<Sha256>::new_from_slice(key_bytes).map_err(|_| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "audit log: HMAC-SHA256 init rejected key length"
+                );
+                anyhow::Error::msg("Invalid HMAC key length")
+            })?;
             mac.update(entry_hash.as_bytes());
 
             Ok(Some(hex::encode(mac.finalize().into_bytes())))
@@ -367,12 +407,12 @@ impl AuditLogger {
     /// Rotate the log file
     fn rotate(&self) -> Result<()> {
         for i in (1..10).rev() {
-            let old_name = format!("{}.{}.log", self.log_path.display(), i);
-            let new_name = format!("{}.{}.log", self.log_path.display(), i + 1);
+            let old_name = format!("{}.{}.log", self.log_path.display().to_string(), i);
+            let new_name = format!("{}.{}.log", self.log_path.display().to_string(), i + 1);
             let _ = std::fs::rename(&old_name, &new_name);
         }
 
-        let rotated = format!("{}.1.log", self.log_path.display());
+        let rotated = format!("{}.1.log", self.log_path.display().to_string());
         std::fs::rename(&self.log_path, &rotated)?;
         Ok(())
     }
@@ -482,8 +522,15 @@ pub fn verify_chain(log_path: &Path) -> Result<u64> {
             use hmac::{Hmac, Mac};
             use sha2::Sha256;
 
-            let mut mac = Hmac::<Sha256>::new_from_slice(key_bytes)
-                .map_err(|_| anyhow::anyhow!("Invalid HMAC key length during verification"))?;
+            let mut mac = Hmac::<Sha256>::new_from_slice(key_bytes).map_err(|_| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "audit log: HMAC-SHA256 verify rejected key length"
+                );
+                anyhow::Error::msg("Invalid HMAC key length during verification")
+            })?;
             mac.update(entry.entry_hash.as_bytes());
             let expected_sig = hex::encode(mac.finalize().into_bytes());
 
@@ -664,7 +711,7 @@ mod tests {
         let event = AuditEvent::new(AuditEventType::CommandExecution);
         logger.log(&event)?;
 
-        let rotated = format!("{}.1.log", log_path.display());
+        let rotated = format!("{}.1.log", log_path.display().to_string());
         assert!(
             std::path::Path::new(&rotated).exists(),
             "rotation must create .1.log backup"

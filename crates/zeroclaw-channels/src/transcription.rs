@@ -4,7 +4,11 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
 
-use zeroclaw_config::schema::TranscriptionConfig;
+use zeroclaw_config::providers::TranscriptionProviderEntry;
+use zeroclaw_config::schema::{
+    AssemblyAiSttConfig, Config, DeepgramSttConfig, GoogleSttConfig, LocalWhisperConfig,
+    OpenAiSttConfig, TranscriptionConfig,
+};
 
 /// Maximum upload size accepted by most Whisper-compatible APIs (25 MB).
 const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
@@ -49,10 +53,17 @@ fn resolve_audio_format(file_name: &str) -> Result<(String, &'static str)> {
         .map(|(_, e)| e)
         .unwrap_or("");
     let mime = mime_for_audio(extension).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Unsupported audio format '.{extension}' — \
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"extension": extension})),
+            "transcription: unsupported audio format"
+        );
+        anyhow::Error::msg(format!(
+            "Unsupported audio format '.{extension}'. \
              accepted: flac, mp3, mp4, mpeg, mpga, m4a, ogg, opus, wav, webm"
-        )
+        ))
     })?;
     Ok((normalized_name, mime))
 }
@@ -72,10 +83,10 @@ fn validate_audio(audio_data: &[u8], file_name: &str) -> Result<(String, &'stati
 
 // ── TranscriptionProvider trait ─────────────────────────────────
 
-/// Trait for speech-to-text provider implementations.
+/// Trait for speech-to-text transcription_provider implementations.
 #[async_trait]
-pub trait TranscriptionProvider: Send + Sync {
-    /// Human-readable provider name (e.g. "groq", "openai").
+pub trait TranscriptionProvider: Send + Sync + ::zeroclaw_api::attribution::Attributable {
+    /// Human-readable transcription_provider name (e.g. "groq", "openai").
     fn name(&self) -> &str;
 
     /// Transcribe raw audio bytes. `file_name` includes the extension for
@@ -95,8 +106,9 @@ pub trait TranscriptionProvider: Send + Sync {
 
 // ── GroqProvider ────────────────────────────────────────────────
 
-/// Groq Whisper API provider (default, backward-compatible with existing config).
+/// Groq Whisper API transcription_provider (default, backward-compatible with existing config).
 pub struct GroqProvider {
+    alias: String,
     api_url: String,
     model: String,
     api_key: String,
@@ -107,30 +119,56 @@ impl GroqProvider {
     /// Build from the existing `TranscriptionConfig` fields.
     ///
     /// Credential resolution order:
-    /// 1. `config.api_key`
-    /// 2. `GROQ_API_KEY` environment variable (backward compatibility)
-    pub fn from_config(config: &TranscriptionConfig) -> Result<Self> {
+    /// Reads `config.api_key` (set via `[transcription].api_key` or the
+    /// schema-mirror env grammar `ZEROCLAW_transcription__api_key=...`).
+    /// The legacy `GROQ_API_KEY` env-var fallback was eradicated in V0.8.0.
+    pub fn from_config(alias: &str, config: &TranscriptionConfig) -> Result<Self> {
         let api_key = config
             .api_key
             .as_deref()
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(ToOwned::to_owned)
-            .or_else(|| {
-                std::env::var("GROQ_API_KEY")
-                    .ok()
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty())
-            })
             .context(
-                "Missing transcription API key: set [transcription].api_key or GROQ_API_KEY environment variable",
+                "Missing transcription API key: set `[transcription].api_key` (or via the \
+                 schema-mirror grammar `ZEROCLAW_transcription__api_key=...`).",
             )?;
 
         Ok(Self {
+            alias: alias.to_string(),
             api_url: config.api_url.clone(),
             model: config.model.clone(),
             api_key,
             language: config.language.clone(),
+        })
+    }
+
+    /// Build from a typed `[providers.transcription.groq.<alias>]` entry.
+    pub fn from_typed_config(
+        alias: &str,
+        cfg: &zeroclaw_config::schema::GroqTranscriptionProviderConfig,
+    ) -> Result<Self> {
+        let api_key = cfg
+            .base
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "Missing API key for [providers.transcription.groq.{alias}]"
+                ))
+            })?;
+        Ok(Self {
+            alias: alias.to_string(),
+            api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
+            model: cfg
+                .model
+                .clone()
+                .unwrap_or_else(|| "whisper-large-v3-turbo".to_string()),
+            api_key,
+            language: cfg.base.language.clone(),
         })
     }
 }
@@ -174,14 +212,18 @@ impl TranscriptionProvider for GroqProvider {
 
 // ── OpenAiWhisperProvider ───────────────────────────────────────
 
-/// OpenAI Whisper API provider.
+/// OpenAI Whisper API transcription_provider.
 pub struct OpenAiWhisperProvider {
+    alias: String,
     api_key: String,
     model: String,
 }
 
 impl OpenAiWhisperProvider {
-    pub fn from_config(config: &zeroclaw_config::schema::OpenAiSttConfig) -> Result<Self> {
+    pub fn from_config(
+        alias: &str,
+        config: &zeroclaw_config::schema::OpenAiSttConfig,
+    ) -> Result<Self> {
         let api_key = config
             .api_key
             .as_deref()
@@ -191,8 +233,33 @@ impl OpenAiWhisperProvider {
             .context("Missing OpenAI STT API key: set [transcription.openai].api_key")?;
 
         Ok(Self {
+            alias: alias.to_string(),
             api_key,
             model: config.model.clone(),
+        })
+    }
+
+    /// Build from a typed `[providers.transcription.openai.<alias>]` entry.
+    pub fn from_typed_config(
+        alias: &str,
+        cfg: &zeroclaw_config::schema::OpenAiTranscriptionProviderConfig,
+    ) -> Result<Self> {
+        let api_key = cfg
+            .base
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "Missing API key for [providers.transcription.openai.{alias}]"
+                ))
+            })?;
+        Ok(Self {
+            alias: alias.to_string(),
+            api_key,
+            model: cfg.model.clone().unwrap_or_else(|| "whisper-1".to_string()),
         })
     }
 }
@@ -232,14 +299,18 @@ impl TranscriptionProvider for OpenAiWhisperProvider {
 
 // ── DeepgramProvider ────────────────────────────────────────────
 
-/// Deepgram STT API provider.
+/// Deepgram STT API transcription_provider.
 pub struct DeepgramProvider {
+    alias: String,
     api_key: String,
     model: String,
 }
 
 impl DeepgramProvider {
-    pub fn from_config(config: &zeroclaw_config::schema::DeepgramSttConfig) -> Result<Self> {
+    pub fn from_config(
+        alias: &str,
+        config: &zeroclaw_config::schema::DeepgramSttConfig,
+    ) -> Result<Self> {
         let api_key = config
             .api_key
             .as_deref()
@@ -249,8 +320,33 @@ impl DeepgramProvider {
             .context("Missing Deepgram API key: set [transcription.deepgram].api_key")?;
 
         Ok(Self {
+            alias: alias.to_string(),
             api_key,
             model: config.model.clone(),
+        })
+    }
+
+    /// Build from a typed `[providers.transcription.deepgram.<alias>]` entry.
+    pub fn from_typed_config(
+        alias: &str,
+        cfg: &zeroclaw_config::schema::DeepgramTranscriptionProviderConfig,
+    ) -> Result<Self> {
+        let api_key = cfg
+            .base
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "Missing API key for [providers.transcription.deepgram.{alias}]"
+                ))
+            })?;
+        Ok(Self {
+            alias: alias.to_string(),
+            api_key,
+            model: cfg.model.clone().unwrap_or_else(|| "nova-2".to_string()),
         })
     }
 }
@@ -306,13 +402,17 @@ impl TranscriptionProvider for DeepgramProvider {
 
 // ── AssemblyAiProvider ──────────────────────────────────────────
 
-/// AssemblyAI STT API provider.
+/// AssemblyAI STT API transcription_provider.
 pub struct AssemblyAiProvider {
+    alias: String,
     api_key: String,
 }
 
 impl AssemblyAiProvider {
-    pub fn from_config(config: &zeroclaw_config::schema::AssemblyAiSttConfig) -> Result<Self> {
+    pub fn from_config(
+        alias: &str,
+        config: &zeroclaw_config::schema::AssemblyAiSttConfig,
+    ) -> Result<Self> {
         let api_key = config
             .api_key
             .as_deref()
@@ -321,7 +421,33 @@ impl AssemblyAiProvider {
             .map(ToOwned::to_owned)
             .context("Missing AssemblyAI API key: set [transcription.assemblyai].api_key")?;
 
-        Ok(Self { api_key })
+        Ok(Self {
+            alias: alias.to_string(),
+            api_key,
+        })
+    }
+
+    /// Build from a typed `[providers.transcription.assemblyai.<alias>]` entry.
+    pub fn from_typed_config(
+        alias: &str,
+        cfg: &zeroclaw_config::schema::AssemblyAiTranscriptionProviderConfig,
+    ) -> Result<Self> {
+        let api_key = cfg
+            .base
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "Missing API key for [providers.transcription.assemblyai.{alias}]"
+                ))
+            })?;
+        Ok(Self {
+            alias: alias.to_string(),
+            api_key,
+        })
     }
 }
 
@@ -449,14 +575,18 @@ impl TranscriptionProvider for AssemblyAiProvider {
 
 // ── GoogleSttProvider ───────────────────────────────────────────
 
-/// Google Cloud Speech-to-Text API provider.
+/// Google Cloud Speech-to-Text API transcription_provider.
 pub struct GoogleSttProvider {
+    alias: String,
     api_key: String,
     language_code: String,
 }
 
 impl GoogleSttProvider {
-    pub fn from_config(config: &zeroclaw_config::schema::GoogleSttConfig) -> Result<Self> {
+    pub fn from_config(
+        alias: &str,
+        config: &zeroclaw_config::schema::GoogleSttConfig,
+    ) -> Result<Self> {
         let api_key = config
             .api_key
             .as_deref()
@@ -466,8 +596,37 @@ impl GoogleSttProvider {
             .context("Missing Google STT API key: set [transcription.google].api_key")?;
 
         Ok(Self {
+            alias: alias.to_string(),
             api_key,
             language_code: config.language_code.clone(),
+        })
+    }
+
+    /// Build from a typed `[providers.transcription.google.<alias>]` entry.
+    pub fn from_typed_config(
+        alias: &str,
+        cfg: &zeroclaw_config::schema::GoogleTranscriptionProviderConfig,
+    ) -> Result<Self> {
+        let api_key = cfg
+            .base
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "Missing API key for [providers.transcription.google.{alias}]"
+                ))
+            })?;
+        Ok(Self {
+            alias: alias.to_string(),
+            api_key,
+            language_code: cfg
+                .base
+                .language
+                .clone()
+                .unwrap_or_else(|| "en-US".to_string()),
         })
     }
 }
@@ -554,13 +713,14 @@ impl TranscriptionProvider for GoogleSttProvider {
 
 // ── LocalWhisperProvider ────────────────────────────────────────
 
-/// Self-hosted faster-whisper-compatible STT provider.
+/// Self-hosted faster-whisper-compatible STT transcription_provider.
 ///
 /// POSTs audio as `multipart/form-data` (field name `file`) to a configurable
 /// HTTP endpoint (e.g. `http://localhost:8000` or a private network host). The endpoint
 /// must return `{"text": "..."}`. No cloud API key required. Size limit is
 /// configurable — not constrained by the 25 MB cloud API cap.
 pub struct LocalWhisperProvider {
+    alias: String,
     url: String,
     bearer_token: String,
     max_audio_bytes: usize,
@@ -571,7 +731,10 @@ impl LocalWhisperProvider {
     /// Build from config. Fails if `url` or `bearer_token` is empty, if `url`
     /// is not a valid HTTP/HTTPS URL (scheme must be `http` or `https`), if
     /// `max_audio_bytes` is zero, or if `timeout_secs` is zero.
-    pub fn from_config(config: &zeroclaw_config::schema::LocalWhisperConfig) -> Result<Self> {
+    pub fn from_config(
+        alias: &str,
+        config: &zeroclaw_config::schema::LocalWhisperConfig,
+    ) -> Result<Self> {
         let url = config.url.trim().to_string();
         anyhow::ensure!(!url.is_empty(), "local_whisper: `url` must not be empty");
         let parsed = url
@@ -600,11 +763,28 @@ impl LocalWhisperProvider {
         );
 
         Ok(Self {
+            alias: alias.to_string(),
             url,
             bearer_token,
             max_audio_bytes: config.max_audio_bytes,
             timeout_secs: config.timeout_secs,
         })
+    }
+
+    /// Build from a typed `[providers.transcription.local_whisper.<alias>]` entry.
+    /// Delegates validation to `from_config` via a bridge — the typed config
+    /// uses `uri` instead of `url` but is otherwise identical.
+    pub fn from_typed_config(
+        alias: &str,
+        cfg: &zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig,
+    ) -> Result<Self> {
+        let bridge = zeroclaw_config::schema::LocalWhisperConfig {
+            url: cfg.uri.clone(),
+            bearer_token: cfg.bearer_token.clone(),
+            max_audio_bytes: cfg.max_audio_bytes,
+            timeout_secs: cfg.timeout_secs,
+        };
+        Self::from_config(alias, &bridge)
     }
 }
 
@@ -677,251 +857,563 @@ async fn parse_whisper_response(resp: reqwest::Response) -> Result<String> {
 
 // ── TranscriptionManager ────────────────────────────────────────
 
-/// Manages multiple STT providers and routes transcription requests.
+/// Manages multiple transcription / STT providers and routes transcription
+/// requests. The manager is implicitly per-agent: the runtime-active
+/// agent's `transcription_provider` reference is the resolved alias for
+/// `transcribe()` calls. there is no global default-provider concept.
 pub struct TranscriptionManager {
-    providers: HashMap<String, Box<dyn TranscriptionProvider>>,
-    default_provider: String,
+    transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>>,
+    max_audio_bytes: Option<usize>,
+    /// Resolved alias for the agent that owns this manager. Empty when
+    /// the agent has no transcription preference (opt-out).
+    agent_transcription_provider: String,
 }
 
 impl TranscriptionManager {
-    /// Build a `TranscriptionManager` from config.
-    ///
-    /// Always attempts to register the Groq provider from existing config fields.
-    /// Additional providers are registered when their config sections are present.
-    ///
-    /// Provider keys with missing API keys are silently skipped — the error
-    /// surfaces at transcribe-time so callers that target a different default
-    /// provider are not blocked.
+    /// Empty manager with no providers. Used as a base when only typed
+    /// `[providers.transcription.<family>.<alias>]` config is present and
+    /// there is no legacy `[transcription]` block to seed from.
+    pub fn empty() -> Self {
+        Self {
+            transcription_providers: HashMap::new(),
+            max_audio_bytes: None,
+            agent_transcription_provider: String::new(),
+        }
+    }
+
+    /// Build a `TranscriptionManager` from a `TranscriptionConfig`. The
+    /// resolved agent alias starts empty; orchestrators that wire the
+    /// manager to a specific agent should call
+    /// `with_agent_transcription_provider` to set it.
     pub fn new(config: &TranscriptionConfig) -> Result<Self> {
-        let mut providers: HashMap<String, Box<dyn TranscriptionProvider>> = HashMap::new();
-
-        if let Ok(groq) = GroqProvider::from_config(config) {
-            providers.insert("groq".to_string(), Box::new(groq));
+        if matches!(config.max_audio_bytes, Some(0)) {
+            bail!("transcription.max_audio_bytes must be greater than zero");
         }
 
-        if let Some(ref openai_cfg) = config.openai
-            && let Ok(p) = OpenAiWhisperProvider::from_config(openai_cfg)
-        {
-            providers.insert("openai".to_string(), Box::new(p));
-        }
+        let mut transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>> =
+            HashMap::new();
 
-        if let Some(ref deepgram_cfg) = config.deepgram
-            && let Ok(p) = DeepgramProvider::from_config(deepgram_cfg)
-        {
-            providers.insert("deepgram".to_string(), Box::new(p));
-        }
+        Self::register_legacy_providers(&mut transcription_providers, config);
 
-        if let Some(ref assemblyai_cfg) = config.assemblyai
-            && let Ok(p) = AssemblyAiProvider::from_config(assemblyai_cfg)
-        {
-            providers.insert("assemblyai".to_string(), Box::new(p));
-        }
-
-        if let Some(ref google_cfg) = config.google
-            && let Ok(p) = GoogleSttProvider::from_config(google_cfg)
-        {
-            providers.insert("google".to_string(), Box::new(p));
-        }
-
-        if let Some(ref local_cfg) = config.local_whisper {
-            match LocalWhisperProvider::from_config(local_cfg) {
-                Ok(p) => {
-                    providers.insert("local_whisper".to_string(), Box::new(p));
-                }
-                Err(e) => {
-                    tracing::warn!("local_whisper config invalid, provider skipped: {e}");
-                }
-            }
-        }
-
-        let default_provider = config.default_provider.clone();
-
-        if config.enabled && !providers.contains_key(&default_provider) {
-            let available: Vec<&str> = providers.keys().map(|k| k.as_str()).collect();
+        if config.enabled && transcription_providers.is_empty() {
             bail!(
-                "Default transcription provider '{}' is not configured. Available: {available:?}",
-                default_provider
+                "Transcription is enabled but no transcription provider registered \
+                 successfully. Configure at least one of: [transcription] (Groq) \
+                 with api_key + api_url; [transcription.openai]; [transcription.deepgram]; \
+                 [transcription.assemblyai]; [transcription.google]; [transcription.local_whisper]; \
+                 or [providers.transcription.<type>.<alias>]."
             );
         }
 
         Ok(Self {
-            providers,
-            default_provider,
+            transcription_providers,
+            max_audio_bytes: config.max_audio_bytes,
+            agent_transcription_provider: String::new(),
         })
     }
 
-    /// Transcribe audio using the default provider.
+    /// Build a manager bound to a specific agent's dotted
+    /// `transcription_provider` reference.
+    ///
+    /// Current v0.8 config stores STT provider instances under
+    /// `[providers.transcription.<type>.<alias>]`, and agents reference them
+    /// as `<type>.<alias>`. This constructor preserves the legacy
+    /// `TranscriptionConfig` registrations while also registering current
+    /// typed provider instances under their dotted aliases.
+    pub fn from_config_for_agent(config: &Config, agent_alias: Option<&str>) -> Result<Self> {
+        if matches!(config.transcription.max_audio_bytes, Some(0)) {
+            bail!("transcription.max_audio_bytes must be greater than zero");
+        }
+
+        let mut transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>> =
+            HashMap::new();
+
+        Self::register_legacy_providers(&mut transcription_providers, &config.transcription);
+        Self::register_typed_providers(&mut transcription_providers, config);
+
+        if config.transcription.enabled && transcription_providers.is_empty() {
+            bail!(
+                "Transcription is enabled but no transcription provider registered \
+                 successfully. Configure at least one of: [providers.transcription.<type>.<alias>], \
+                 [transcription] (Groq) with api_key + api_url, [transcription.openai], \
+                 [transcription.deepgram], [transcription.assemblyai], [transcription.google], \
+                 or [transcription.local_whisper]."
+            );
+        }
+
+        let agent_transcription_provider = agent_alias
+            .or_else(|| config.resolved_runtime_agent_alias())
+            .and_then(|alias| config.agents.get(alias))
+            .map(|a| a.transcription_provider.as_str().to_string())
+            .unwrap_or_default();
+
+        Ok(Self {
+            transcription_providers,
+            max_audio_bytes: config.transcription.max_audio_bytes,
+            agent_transcription_provider,
+        })
+    }
+
+    fn register_legacy_providers(
+        transcription_providers: &mut HashMap<String, Box<dyn TranscriptionProvider>>,
+        config: &TranscriptionConfig,
+    ) {
+        if let Ok(groq) = GroqProvider::from_config("groq", config) {
+            transcription_providers.insert("groq".to_string(), Box::new(groq));
+        }
+
+        if let Some(ref openai_cfg) = config.openai
+            && let Ok(p) = OpenAiWhisperProvider::from_config("openai", openai_cfg)
+        {
+            transcription_providers.insert("openai".to_string(), Box::new(p));
+        }
+
+        if let Some(ref deepgram_cfg) = config.deepgram
+            && let Ok(p) = DeepgramProvider::from_config("deepgram", deepgram_cfg)
+        {
+            transcription_providers.insert("deepgram".to_string(), Box::new(p));
+        }
+
+        if let Some(ref assemblyai_cfg) = config.assemblyai
+            && let Ok(p) = AssemblyAiProvider::from_config("assemblyai", assemblyai_cfg)
+        {
+            transcription_providers.insert("assemblyai".to_string(), Box::new(p));
+        }
+
+        if let Some(ref google_cfg) = config.google
+            && let Ok(p) = GoogleSttProvider::from_config("google", google_cfg)
+        {
+            transcription_providers.insert("google".to_string(), Box::new(p));
+        }
+
+        if let Some(ref local_cfg) = config.local_whisper {
+            match LocalWhisperProvider::from_config("local_whisper", local_cfg) {
+                Ok(p) => {
+                    transcription_providers.insert("local_whisper".to_string(), Box::new(p));
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "local_whisper config invalid, provider skipped"
+                    );
+                }
+            }
+        }
+    }
+
+    fn register_typed_providers(
+        transcription_providers: &mut HashMap<String, Box<dyn TranscriptionProvider>>,
+        config: &Config,
+    ) {
+        for (family, alias, entry) in config.providers.transcription.iter_entries() {
+            let dotted = format!("{family}.{alias}");
+            let (log_invalid_config, result): (bool, Result<Box<dyn TranscriptionProvider>>) =
+                match entry {
+                    TranscriptionProviderEntry::Groq(provider_config) => {
+                        let groq_config = TranscriptionConfig {
+                            enabled: config.transcription.enabled,
+                            api_key: provider_config.base.api_key.clone(),
+                            api_url: "https://api.groq.com/openai/v1/audio/transcriptions"
+                                .to_string(),
+                            model: provider_config
+                                .model
+                                .clone()
+                                .filter(|model| !model.trim().is_empty())
+                                .unwrap_or_else(|| "whisper-large-v3-turbo".to_string()),
+                            language: provider_config.base.language.clone(),
+                            initial_prompt: provider_config.base.initial_prompt.clone(),
+                            max_audio_bytes: config.transcription.max_audio_bytes,
+                            max_duration_secs: config.transcription.max_duration_secs,
+                            openai: None,
+                            deepgram: None,
+                            assemblyai: None,
+                            google: None,
+                            local_whisper: None,
+                            transcribe_non_ptt_audio: config.transcription.transcribe_non_ptt_audio,
+                        };
+                        (
+                            false,
+                            GroqProvider::from_config(alias, &groq_config)
+                                .map(|p| Box::new(p) as _),
+                        )
+                    }
+                    TranscriptionProviderEntry::OpenAi(provider_config) => {
+                        let openai_config = OpenAiSttConfig {
+                            api_key: provider_config.base.api_key.clone(),
+                            model: provider_config
+                                .model
+                                .clone()
+                                .filter(|model| !model.trim().is_empty())
+                                .unwrap_or_else(|| "whisper-1".to_string()),
+                        };
+                        (
+                            false,
+                            OpenAiWhisperProvider::from_config(alias, &openai_config)
+                                .map(|p| Box::new(p) as _),
+                        )
+                    }
+                    TranscriptionProviderEntry::Deepgram(provider_config) => {
+                        let deepgram_config = DeepgramSttConfig {
+                            api_key: provider_config.base.api_key.clone(),
+                            model: provider_config
+                                .model
+                                .clone()
+                                .filter(|model| !model.trim().is_empty())
+                                .unwrap_or_else(|| "nova-2".to_string()),
+                        };
+                        (
+                            false,
+                            DeepgramProvider::from_config(alias, &deepgram_config)
+                                .map(|p| Box::new(p) as _),
+                        )
+                    }
+                    TranscriptionProviderEntry::AssemblyAi(provider_config) => {
+                        let assemblyai_config = AssemblyAiSttConfig {
+                            api_key: provider_config.base.api_key.clone(),
+                        };
+                        (
+                            false,
+                            AssemblyAiProvider::from_config(alias, &assemblyai_config)
+                                .map(|p| Box::new(p) as _),
+                        )
+                    }
+                    TranscriptionProviderEntry::Google(provider_config) => {
+                        let google_config = GoogleSttConfig {
+                            api_key: provider_config.base.api_key.clone(),
+                            language_code: provider_config
+                                .base
+                                .language
+                                .clone()
+                                .filter(|language| !language.trim().is_empty())
+                                .unwrap_or_else(|| "en-US".to_string()),
+                        };
+                        (
+                            false,
+                            GoogleSttProvider::from_config(alias, &google_config)
+                                .map(|p| Box::new(p) as _),
+                        )
+                    }
+                    TranscriptionProviderEntry::LocalWhisper(provider_config) => {
+                        let local_config = LocalWhisperConfig {
+                            url: provider_config.uri.clone(),
+                            bearer_token: provider_config.bearer_token.clone(),
+                            max_audio_bytes: provider_config.max_audio_bytes,
+                            timeout_secs: provider_config.timeout_secs,
+                        };
+                        (
+                            true,
+                            LocalWhisperProvider::from_config(alias, &local_config)
+                                .map(|p| Box::new(p) as _),
+                        )
+                    }
+                };
+
+            match result {
+                Ok(provider) => {
+                    transcription_providers.insert(dotted, provider);
+                }
+                Err(e) if log_invalid_config => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"error": format!("{}", e), "dotted": dotted})
+                            ),
+                        "typed local_whisper config invalid, provider skipped"
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Register providers from the typed `[providers.transcription.<family>.<alias>]`
+    /// config alongside the legacy ones built by `new()`. Each provider is keyed
+    /// as `"<family>.<alias>"` so that `agent.transcription_provider = "groq.default"`
+    /// resolves correctly. Entries already present (e.g. the bare `"groq"` key from
+    /// the legacy block) are left untouched — legacy config owns bare keys; typed
+    /// config owns dotted keys.
+    #[must_use]
+    pub fn with_typed_providers(
+        mut self,
+        typed: &zeroclaw_config::providers::TranscriptionProviders,
+    ) -> Self {
+        macro_rules! register_typed {
+            ($family:ident, $family_str:literal, $from_typed:path) => {
+                for (alias, cfg) in &typed.$family {
+                    let key = format!("{}.{}", $family_str, alias);
+                    if !self.transcription_providers.contains_key(&key) {
+                        match $from_typed(alias, cfg) {
+                            Ok(p) => {
+                                self.transcription_providers.insert(key, Box::new(p));
+                            }
+                            Err(e) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note,
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({
+                                        "provider": format!("{}.{}", $family_str, alias),
+                                        "error": format!("{e}"),
+                                    })),
+                                    "typed transcription provider skipped (config error)"
+                                );
+                            }
+                        }
+                    }
+                }
+            };
+        }
+        register_typed!(groq, "groq", GroqProvider::from_typed_config);
+        register_typed!(openai, "openai", OpenAiWhisperProvider::from_typed_config);
+        register_typed!(deepgram, "deepgram", DeepgramProvider::from_typed_config);
+        register_typed!(
+            assemblyai,
+            "assemblyai",
+            AssemblyAiProvider::from_typed_config
+        );
+        register_typed!(google, "google", GoogleSttProvider::from_typed_config);
+        register_typed!(
+            local_whisper,
+            "local_whisper",
+            LocalWhisperProvider::from_typed_config
+        );
+        self
+    }
+
+    /// Set the resolved agent `transcription_provider` alias. Called by
+    /// orchestrators that bind this manager to a specific agent at startup.
+    /// Subsequent `transcribe` calls dispatch to this alias.
+    #[must_use]
+    pub fn with_agent_transcription_provider(mut self, alias: impl Into<String>) -> Self {
+        self.agent_transcription_provider = alias.into();
+        self
+    }
+
+    /// Transcribe audio using the runtime-active agent's resolved
+    /// `transcription_provider`. Fails loud when the agent has no
+    /// transcription_provider configured — there is no global default.
     pub async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String> {
-        self.transcribe_with_provider(audio_data, file_name, &self.default_provider)
+        let provider_alias = self.agent_transcription_provider.as_str();
+        if provider_alias.is_empty() {
+            bail!(
+                "Agent has no transcription_provider configured. Set \
+                 `agent.<alias>.transcription_provider = \"<type>.<alias>\"` \
+                 referencing a configured transcription provider."
+            );
+        }
+        self.transcribe_with_provider(audio_data, file_name, provider_alias)
             .await
     }
 
-    /// Transcribe audio using a specific named provider.
+    /// Transcribe audio using a specific named transcription_provider.
     pub async fn transcribe_with_provider(
         &self,
         audio_data: &[u8],
         file_name: &str,
-        provider: &str,
+        transcription_provider: &str,
     ) -> Result<String> {
-        let p = self.providers.get(provider).ok_or_else(|| {
-            let available: Vec<&str> = self.providers.keys().map(|k| k.as_str()).collect();
-            anyhow::anyhow!(
-                "Transcription provider '{provider}' not configured. Available: {available:?}"
-            )
+        let p = self.transcription_providers.get(transcription_provider).ok_or_else(|| {
+            let available: Vec<&str> = self.transcription_providers.keys().map(|k| k.as_str()).collect();
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "transcription_provider": transcription_provider,
+                        "available": available,
+                    })),
+                "transcription: provider not configured"
+            );
+            anyhow::Error::msg(format!(
+                "Transcription transcription_provider '{transcription_provider}' not configured. Available: {available:?}"
+            ))
         })?;
 
-        p.transcribe(audio_data, file_name).await
+        self.enforce_global_audio_limit(audio_data)?;
+
+        use ::zeroclaw_log::Instrument;
+        let span = ::zeroclaw_log::attribution_span!(p.as_ref());
+        p.transcribe(audio_data, file_name).instrument(span).await
     }
 
-    /// List registered provider names.
+    fn enforce_global_audio_limit(&self, audio_data: &[u8]) -> Result<()> {
+        if let Some(max_audio_bytes) = self.max_audio_bytes
+            && audio_data.len() > max_audio_bytes
+        {
+            bail!(
+                "Audio file too large ({} bytes, global max {})",
+                audio_data.len(),
+                max_audio_bytes
+            );
+        }
+        Ok(())
+    }
+
+    /// List registered transcription_provider names.
     pub fn available_providers(&self) -> Vec<&str> {
-        self.providers.keys().map(|k| k.as_str()).collect()
+        self.transcription_providers
+            .keys()
+            .map(|k| k.as_str())
+            .collect()
     }
 }
 
-// ── Backward-compatible convenience function ────────────────────
+// `transcribe_audio` (the legacy free function that dispatched against
+// `config.default_transcription_provider`) was deleted in #6273. There is
+// no global default-provider concept anymore; transcription routes through
+// `TranscriptionManager` whose resolved alias comes from the per-agent
+// `transcription_provider` field (`agent.<X>.transcription_provider`).
 
-/// Transcribe audio bytes via a Whisper-compatible transcription API.
-///
-/// Returns the transcribed text on success.
-///
-/// This is the backward-compatible entry point that preserves the original
-/// function signature. It uses the Groq provider directly, matching the
-/// original single-provider behavior.
-///
-/// Credential resolution order:
-/// 1. `config.transcription.api_key`
-/// 2. `GROQ_API_KEY` environment variable (backward compatibility)
-///
-/// The caller is responsible for enforcing duration limits *before* downloading
-/// the file; this function enforces the byte-size cap.
-pub async fn transcribe_audio(
-    audio_data: Vec<u8>,
-    file_name: &str,
-    config: &TranscriptionConfig,
-) -> Result<String> {
-    // Validate audio before resolving credentials so that size/format errors
-    // are reported before missing-key errors (preserves original behavior).
-    validate_audio(&audio_data, file_name)?;
+impl ::zeroclaw_api::attribution::Attributable for GroqProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Transcription(
+                ::zeroclaw_api::attribution::TranscriptionProviderKind::Groq,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
 
-    match config.default_provider.as_str() {
-        "groq" => {
-            let groq = GroqProvider::from_config(config)?;
-            groq.transcribe(&audio_data, file_name).await
-        }
-        "openai" => {
-            let openai_cfg = config.openai.as_ref().context(
-                "Default transcription provider 'openai' is not configured. Add [transcription.openai]",
-            )?;
-            let openai = OpenAiWhisperProvider::from_config(openai_cfg)?;
-            openai.transcribe(&audio_data, file_name).await
-        }
-        "deepgram" => {
-            let deepgram_cfg = config.deepgram.as_ref().context(
-                "Default transcription provider 'deepgram' is not configured. Add [transcription.deepgram]",
-            )?;
-            let deepgram = DeepgramProvider::from_config(deepgram_cfg)?;
-            deepgram.transcribe(&audio_data, file_name).await
-        }
-        "assemblyai" => {
-            let assemblyai_cfg = config.assemblyai.as_ref().context(
-                "Default transcription provider 'assemblyai' is not configured. Add [transcription.assemblyai]",
-            )?;
-            let assemblyai = AssemblyAiProvider::from_config(assemblyai_cfg)?;
-            assemblyai.transcribe(&audio_data, file_name).await
-        }
-        "google" => {
-            let google_cfg = config.google.as_ref().context(
-                "Default transcription provider 'google' is not configured. Add [transcription.google]",
-            )?;
-            let google = GoogleSttProvider::from_config(google_cfg)?;
-            google.transcribe(&audio_data, file_name).await
-        }
-        other => bail!("Unsupported transcription provider '{other}'"),
+impl ::zeroclaw_api::attribution::Attributable for OpenAiWhisperProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Transcription(
+                ::zeroclaw_api::attribution::TranscriptionProviderKind::OpenAi,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for DeepgramProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Transcription(
+                ::zeroclaw_api::attribution::TranscriptionProviderKind::Deepgram,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for AssemblyAiProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Transcription(
+                ::zeroclaw_api::attribution::TranscriptionProviderKind::AssemblyAi,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for GoogleSttProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Transcription(
+                ::zeroclaw_api::attribution::TranscriptionProviderKind::Google,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for LocalWhisperProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Transcription(
+                ::zeroclaw_api::attribution::TranscriptionProviderKind::Whisper,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
-    #[tokio::test]
-    async fn rejects_oversized_audio() {
-        let big = vec![0u8; MAX_AUDIO_BYTES + 1];
-        let config = TranscriptionConfig::default();
-
-        let err = transcribe_audio(big, "test.ogg", &config)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("too large"),
-            "expected size error, got: {err}"
-        );
+    struct StaticTranscriptionProvider {
+        calls: Arc<AtomicUsize>,
     }
 
-    #[tokio::test]
-    async fn rejects_missing_api_key() {
-        // Ensure all candidate keys are absent for this test.
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("GROQ_API_KEY") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("OPENAI_API_KEY") };
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("TRANSCRIPTION_API_KEY") };
+    #[async_trait]
+    impl TranscriptionProvider for StaticTranscriptionProvider {
+        fn name(&self) -> &str {
+            "static"
+        }
 
-        let data = vec![0u8; 100];
-        let config = TranscriptionConfig::default();
-
-        let err = transcribe_audio(data, "test.ogg", &config)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("transcription API key"),
-            "expected missing-key error, got: {err}"
-        );
+        async fn transcribe(&self, _audio_data: &[u8], _file_name: &str) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("under cap".to_string())
+        }
     }
 
-    #[tokio::test]
-    async fn uses_config_api_key_without_groq_env() {
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("GROQ_API_KEY") };
+    impl ::zeroclaw_api::attribution::Attributable for StaticTranscriptionProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Transcription(
+                    ::zeroclaw_api::attribution::TranscriptionProviderKind::Groq,
+                ),
+            )
+        }
 
-        let data = vec![0u8; 100];
-        let config = TranscriptionConfig {
-            api_key: Some("transcription-key".to_string()),
-            ..TranscriptionConfig::default()
-        };
-
-        // Keep invalid extension so we fail before network, but after key resolution.
-        let err = transcribe_audio(data, "recording.aac", &config)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("Unsupported audio format"),
-            "expected unsupported-format error, got: {err}"
-        );
+        fn alias(&self) -> &str {
+            "static"
+        }
     }
 
-    #[tokio::test]
-    async fn openai_default_provider_uses_openai_config() {
-        let data = vec![0u8; 100];
-        let config = TranscriptionConfig {
-            default_provider: "openai".to_string(),
-            openai: Some(zeroclaw_config::schema::OpenAiSttConfig {
-                api_key: None,
-                model: "gpt-4o-mini-transcribe".to_string(),
+    fn manager_with_static_provider(
+        max_audio_bytes: Option<usize>,
+    ) -> (TranscriptionManager, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>> =
+            HashMap::new();
+        transcription_providers.insert(
+            "static".to_string(),
+            Box::new(StaticTranscriptionProvider {
+                calls: Arc::clone(&calls),
             }),
-            ..TranscriptionConfig::default()
-        };
-
-        let err = transcribe_audio(data, "test.ogg", &config)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("[transcription.openai].api_key"),
-            "expected openai-specific missing-key error, got: {err}"
         );
+        (
+            TranscriptionManager {
+                transcription_providers,
+                max_audio_bytes,
+                agent_transcription_provider: String::new(),
+            },
+            calls,
+        )
     }
+
+    // Tests for the deleted `transcribe_audio` free function were removed
+    // alongside the function in #6273. Equivalent coverage lives on
+    // `TranscriptionManager` (`manager_creation_with_default_config`,
+    // `manager_registers_groq_with_key`, `manager_rejects_unconfigured_provider`).
 
     #[test]
     fn mime_for_audio_maps_accepted_formats() {
@@ -980,14 +1472,12 @@ mod tests {
         assert_eq!(normalize_audio_filename("voice"), "voice");
     }
 
-    #[tokio::test]
-    async fn rejects_unsupported_audio_format() {
+    #[test]
+    fn rejects_unsupported_audio_format() {
+        // Without the legacy `transcribe_audio` free function, exercise the
+        // format-rejection path directly via `validate_audio`.
         let data = vec![0u8; 100];
-        let config = TranscriptionConfig::default();
-
-        let err = transcribe_audio(data, "recording.aac", &config)
-            .await
-            .unwrap_err();
+        let err = validate_audio(&data, "recording.aac").unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("Unsupported audio format"),
@@ -1008,9 +1498,12 @@ mod tests {
 
         let config = TranscriptionConfig::default();
         let manager = TranscriptionManager::new(&config).unwrap();
-        assert_eq!(manager.default_provider, "groq");
+        // the manager's agent_transcription_provider starts empty
+        // until an orchestrator wires it via `with_agent_transcription_provider`.
+        // No global default-provider concept.
+        assert!(manager.agent_transcription_provider.is_empty());
         // Groq won't be registered without a key.
-        assert!(manager.providers.is_empty());
+        assert!(manager.transcription_providers.is_empty());
     }
 
     #[test]
@@ -1024,8 +1517,8 @@ mod tests {
         };
 
         let manager = TranscriptionManager::new(&config).unwrap();
-        assert!(manager.providers.contains_key("groq"));
-        assert_eq!(manager.providers["groq"].name(), "groq");
+        assert!(manager.transcription_providers.contains_key("groq"));
+        assert_eq!(manager.transcription_providers["groq"].name(), "groq");
     }
 
     #[test]
@@ -1047,9 +1540,9 @@ mod tests {
         };
 
         let manager = TranscriptionManager::new(&config).unwrap();
-        assert!(manager.providers.contains_key("groq"));
-        assert!(manager.providers.contains_key("openai"));
-        assert!(manager.providers.contains_key("deepgram"));
+        assert!(manager.transcription_providers.contains_key("groq"));
+        assert!(manager.transcription_providers.contains_key("openai"));
+        assert!(manager.transcription_providers.contains_key("deepgram"));
         assert_eq!(manager.available_providers().len(), 3);
     }
 
@@ -1075,12 +1568,11 @@ mod tests {
     }
 
     #[test]
-    fn manager_default_provider_from_config() {
+    fn manager_agent_transcription_provider_via_setter() {
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("GROQ_API_KEY") };
 
         let config = TranscriptionConfig {
-            default_provider: "openai".to_string(),
             openai: Some(zeroclaw_config::schema::OpenAiSttConfig {
                 api_key: Some("test-openai-key".to_string()),
                 model: "whisper-1".to_string(),
@@ -1088,8 +1580,103 @@ mod tests {
             ..TranscriptionConfig::default()
         };
 
-        let manager = TranscriptionManager::new(&config).unwrap();
-        assert_eq!(manager.default_provider, "openai");
+        let manager = TranscriptionManager::new(&config)
+            .unwrap()
+            .with_agent_transcription_provider("openai");
+        assert_eq!(manager.agent_transcription_provider, "openai");
+    }
+
+    #[test]
+    fn manager_from_config_for_agent_registers_dotted_provider_refs() {
+        let mut config = zeroclaw_config::schema::Config {
+            transcription: TranscriptionConfig {
+                enabled: true,
+                ..TranscriptionConfig::default()
+            },
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.providers.transcription.groq.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::GroqTranscriptionProviderConfig {
+                base: zeroclaw_config::schema::TranscriptionProviderConfig {
+                    api_key: Some("test-groq-key".to_string()),
+                    ..zeroclaw_config::schema::TranscriptionProviderConfig::default()
+                },
+                ..zeroclaw_config::schema::GroqTranscriptionProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                transcription_provider: "groq.default".into(),
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+
+        let manager = TranscriptionManager::from_config_for_agent(&config, None).unwrap();
+
+        assert_eq!(manager.agent_transcription_provider, "groq.default");
+        assert!(manager.available_providers().contains(&"groq.default"));
+    }
+
+    #[test]
+    fn manager_rejects_zero_global_max_audio_bytes() {
+        let config = TranscriptionConfig {
+            max_audio_bytes: Some(0),
+            ..TranscriptionConfig::default()
+        };
+
+        let err = match TranscriptionManager::new(&config) {
+            Ok(_) => panic!("expected zero max_audio_bytes to fail manager construction"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("transcription.max_audio_bytes must be greater than zero"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_global_max_audio_bytes_rejects_over_limit_before_provider_dispatch() {
+        let (manager, calls) = manager_with_static_provider(Some(3));
+        let err = manager
+            .transcribe_with_provider(&[0u8; 4], "voice.ogg", "static")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Audio file too large"),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("global max 3"), "got: {err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn manager_global_max_audio_bytes_allows_exact_limit() {
+        let (manager, calls) = manager_with_static_provider(Some(4));
+        let result = manager
+            .transcribe_with_provider(&[0u8; 4], "voice.ogg", "static")
+            .await
+            .unwrap();
+        assert_eq!(result, "under cap");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn manager_transcribe_enforces_global_max_audio_bytes() {
+        let (manager, calls) = manager_with_static_provider(Some(2));
+        let manager = manager.with_agent_transcription_provider("static");
+        let err = manager
+            .transcribe(&[0u8; 3], "voice.ogg")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Audio file too large"),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("global max 2"), "got: {err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1129,7 +1716,8 @@ mod tests {
         assert!(config.api_key.is_none());
         assert!(config.api_url.contains("groq.com"));
         assert_eq!(config.model, "whisper-large-v3-turbo");
-        assert_eq!(config.default_provider, "groq");
+        // TranscriptionConfig has no global default-provider field;
+        // per-agent `transcription_provider` is the only selector.
         assert!(config.openai.is_none());
         assert!(config.deepgram.is_none());
         assert!(config.assemblyai.is_none());
@@ -1153,7 +1741,9 @@ mod tests {
     fn local_whisper_rejects_empty_url() {
         let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
         cfg.url = String::new();
-        let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
+        let err = LocalWhisperProvider::from_config("local_whisper", &cfg)
+            .err()
+            .unwrap();
         assert!(
             err.to_string().contains("`url` must not be empty"),
             "got: {err}"
@@ -1164,7 +1754,9 @@ mod tests {
     fn local_whisper_rejects_invalid_url() {
         let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
         cfg.url = "not-a-url".to_string();
-        let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
+        let err = LocalWhisperProvider::from_config("local_whisper", &cfg)
+            .err()
+            .unwrap();
         assert!(err.to_string().contains("invalid `url`"), "got: {err}");
     }
 
@@ -1172,7 +1764,9 @@ mod tests {
     fn local_whisper_rejects_non_http_url() {
         let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
         cfg.url = "ftp://10.10.0.1:8001/v1/transcribe".to_string();
-        let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
+        let err = LocalWhisperProvider::from_config("local_whisper", &cfg)
+            .err()
+            .unwrap();
         assert!(err.to_string().contains("http or https"), "got: {err}");
     }
 
@@ -1180,7 +1774,9 @@ mod tests {
     fn local_whisper_rejects_empty_bearer_token() {
         let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
         cfg.bearer_token = Some(String::new());
-        let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
+        let err = LocalWhisperProvider::from_config("local_whisper", &cfg)
+            .err()
+            .unwrap();
         assert!(
             err.to_string().contains("`bearer_token` must not be empty"),
             "got: {err}"
@@ -1191,7 +1787,9 @@ mod tests {
     fn local_whisper_rejects_missing_bearer_token() {
         let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
         cfg.bearer_token = None;
-        let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
+        let err = LocalWhisperProvider::from_config("local_whisper", &cfg)
+            .err()
+            .unwrap();
         assert!(
             err.to_string().contains("`bearer_token` must be set"),
             "got: {err}"
@@ -1202,7 +1800,9 @@ mod tests {
     fn local_whisper_rejects_zero_max_audio_bytes() {
         let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
         cfg.max_audio_bytes = 0;
-        let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
+        let err = LocalWhisperProvider::from_config("local_whisper", &cfg)
+            .err()
+            .unwrap();
         assert!(
             err.to_string()
                 .contains("`max_audio_bytes` must be greater than zero"),
@@ -1214,7 +1814,9 @@ mod tests {
     fn local_whisper_rejects_zero_timeout() {
         let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
         cfg.timeout_secs = 0;
-        let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
+        let err = LocalWhisperProvider::from_config("local_whisper", &cfg)
+            .err()
+            .unwrap();
         assert!(
             err.to_string()
                 .contains("`timeout_secs` must be greater than zero"),
@@ -1226,7 +1828,6 @@ mod tests {
     fn local_whisper_registered_when_config_present() {
         let config = TranscriptionConfig {
             local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
-            default_provider: "local_whisper".to_string(),
             ..TranscriptionConfig::default()
         };
 
@@ -1241,22 +1842,22 @@ mod tests {
     #[test]
     fn local_whisper_misconfigured_section_fails_manager_construction() {
         // A misconfigured local_whisper section logs a warning and skips
-        // registration. When local_whisper is also the default_provider and
-        // transcription is enabled, the safety net in TranscriptionManager
-        // surfaces the error: "not configured".
+        // registration. When transcription is enabled and no other provider
+        // section is set, the safety net in TranscriptionManager surfaces
+        // the error rather than returning a useless empty manager.
         let mut bad_cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
         bad_cfg.bearer_token = Some(String::new());
         let config = TranscriptionConfig {
             local_whisper: Some(bad_cfg),
             enabled: true,
-            default_provider: "local_whisper".to_string(),
             ..TranscriptionConfig::default()
         };
 
         let err = TranscriptionManager::new(&config).err().unwrap();
         assert!(
-            err.to_string().contains("not configured"),
-            "expected 'not configured' from manager safety net, got: {err}"
+            err.to_string()
+                .contains("no transcription provider registered"),
+            "expected 'no transcription provider registered' from manager safety net, got: {err}"
         );
     }
 
@@ -1273,18 +1874,26 @@ mod tests {
     #[tokio::test]
     async fn local_whisper_rejects_oversized_audio() {
         let cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
-        let provider = LocalWhisperProvider::from_config(&cfg).unwrap();
+        let transcription_provider =
+            LocalWhisperProvider::from_config("local_whisper", &cfg).unwrap();
         let big = vec![0u8; cfg.max_audio_bytes + 1];
-        let err = provider.transcribe(&big, "voice.ogg").await.unwrap_err();
+        let err = transcription_provider
+            .transcribe(&big, "voice.ogg")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("too large"), "got: {err}");
     }
 
     #[tokio::test]
     async fn local_whisper_rejects_unsupported_format() {
         let cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
-        let provider = LocalWhisperProvider::from_config(&cfg).unwrap();
+        let transcription_provider =
+            LocalWhisperProvider::from_config("local_whisper", &cfg).unwrap();
         let data = vec![0u8; 100];
-        let err = provider.transcribe(&data, "voice.aiff").await.unwrap_err();
+        let err = transcription_provider
+            .transcribe(&data, "voice.aiff")
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("Unsupported audio format"),
             "got: {err}"
@@ -1311,9 +1920,10 @@ mod tests {
             .await;
 
         let cfg = local_whisper_config(&format!("{}/v1/transcribe", server.uri()));
-        let provider = LocalWhisperProvider::from_config(&cfg).unwrap();
+        let transcription_provider =
+            LocalWhisperProvider::from_config("local_whisper", &cfg).unwrap();
 
-        let result = provider
+        let result = transcription_provider
             .transcribe(b"fake-audio", "voice.ogg")
             .await
             .unwrap();
@@ -1337,9 +1947,10 @@ mod tests {
             .await;
 
         let cfg = local_whisper_config(&format!("{}/v1/transcribe", server.uri()));
-        let provider = LocalWhisperProvider::from_config(&cfg).unwrap();
+        let transcription_provider =
+            LocalWhisperProvider::from_config("local_whisper", &cfg).unwrap();
 
-        let result = provider
+        let result = transcription_provider
             .transcribe(b"fake-audio", "voice.ogg")
             .await
             .unwrap();
@@ -1364,9 +1975,10 @@ mod tests {
             .await;
 
         let cfg = local_whisper_config(&format!("{}/v1/transcribe", server.uri()));
-        let provider = LocalWhisperProvider::from_config(&cfg).unwrap();
+        let transcription_provider =
+            LocalWhisperProvider::from_config("local_whisper", &cfg).unwrap();
 
-        let err = provider
+        let err = transcription_provider
             .transcribe(b"fake-audio", "voice.ogg")
             .await
             .unwrap_err();
@@ -1394,9 +2006,10 @@ mod tests {
             .await;
 
         let cfg = local_whisper_config(&format!("{}/v1/transcribe", server.uri()));
-        let provider = LocalWhisperProvider::from_config(&cfg).unwrap();
+        let transcription_provider =
+            LocalWhisperProvider::from_config("local_whisper", &cfg).unwrap();
 
-        let err = provider
+        let err = transcription_provider
             .transcribe(b"fake-audio", "voice.ogg")
             .await
             .unwrap_err();
@@ -1404,6 +2017,52 @@ mod tests {
         assert!(
             err.to_string().contains("Bad Gateway"),
             "expected plain-text body in error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_typed_providers_registers_dotted_alias_keys() {
+        use zeroclaw_config::providers::TranscriptionProviders;
+        use zeroclaw_config::schema::{
+            GroqTranscriptionProviderConfig, TranscriptionProviderConfig,
+        };
+
+        let mut typed = TranscriptionProviders::default();
+        typed.groq.insert(
+            "default".to_string(),
+            GroqTranscriptionProviderConfig {
+                base: TranscriptionProviderConfig {
+                    api_key: Some("gsk_test_key".to_string()),
+                    language: None,
+                    initial_prompt: None,
+                },
+                model: Some("whisper-large-v3-turbo".to_string()),
+            },
+        );
+
+        // new() would fail (transcription.enabled=false, no api_key) — build
+        // an empty manager shell directly, then apply typed providers.
+        let manager = TranscriptionManager {
+            transcription_providers: std::collections::HashMap::new(),
+            max_audio_bytes: None,
+            agent_transcription_provider: String::new(),
+        }
+        .with_typed_providers(&typed);
+
+        // The typed groq.default must be reachable under the dotted key.
+        assert!(
+            manager.transcription_providers.contains_key("groq.default"),
+            "typed provider must be registered under 'groq.default'"
+        );
+
+        // Binding the dotted alias and calling transcribe must reach the
+        // provider (not fail with "no transcription_provider configured").
+        let manager = manager.with_agent_transcription_provider("groq.default");
+        let result = manager.transcribe(b"", "voice.wav").await;
+        let err = result.unwrap_err().to_string();
+        assert!(
+            !err.contains("no transcription_provider configured"),
+            "dotted alias must resolve; got: {err}"
         );
     }
 }

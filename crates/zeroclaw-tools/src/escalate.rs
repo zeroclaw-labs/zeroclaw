@@ -7,9 +7,7 @@
 
 use crate::ask_user::ChannelMapHandle;
 use async_trait::async_trait;
-use parking_lot::RwLock;
 use serde_json::json;
-use std::collections::HashMap;
 use std::sync::Arc;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_api::tool::{Tool, ToolResult};
@@ -28,17 +26,16 @@ pub struct EscalateToHumanTool {
 }
 
 impl EscalateToHumanTool {
-    pub fn new(security: Arc<SecurityPolicy>, alert_channels: Vec<String>) -> Self {
+    pub fn new(
+        security: Arc<SecurityPolicy>,
+        alert_channels: Vec<String>,
+        channel_map: ChannelMapHandle,
+    ) -> Self {
         Self {
             security,
-            channel_map: Arc::new(RwLock::new(HashMap::new())),
+            channel_map,
             alert_channels,
         }
-    }
-
-    /// Return the shared handle so callers can populate it after channel init.
-    pub fn channel_map_handle(&self) -> ChannelMapHandle {
-        Arc::clone(&self.channel_map)
     }
 
     /// Format the escalation message with urgency prefix.
@@ -77,8 +74,15 @@ impl EscalateToHumanTool {
                     if let Some(ch) = channels.get(name) {
                         Some((name.clone(), Arc::clone(ch)))
                     } else {
-                        tracing::warn!(
-                            "escalate_to_human: alert channel '{name}' not found in channel map"
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"name": name})),
+                            "escalate_to_human: alert channel '' not found in channel map"
                         );
                         None
                     }
@@ -88,7 +92,13 @@ impl EscalateToHumanTool {
         for (name, ch) in targets {
             let msg = SendMessage::new(text, "");
             if let Err(e) = ch.send(&msg).await {
-                tracing::warn!("escalate_to_human: alert to channel '{name}' failed: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e), "name": name})),
+                    "escalate_to_human: alert to channel '' failed"
+                );
             }
         }
     }
@@ -156,7 +166,16 @@ impl Tool for EscalateToHumanTool {
             .and_then(|v| v.as_str())
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'summary' parameter"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "summary"})),
+                    "escalate: missing summary parameter"
+                );
+                anyhow::Error::msg("Missing 'summary' parameter")
+            })?
             .to_string();
 
         let context = args
@@ -206,24 +225,32 @@ impl Tool for EscalateToHumanTool {
                 });
             }
             let (name, ch) = channels.iter().next().ok_or_else(|| {
-                anyhow::anyhow!("No channels available. Configure at least one channel.")
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"missing": "channels"})),
+                    "escalate: no channels configured"
+                );
+                anyhow::Error::msg("No channels available. Configure at least one channel.")
             })?;
             (name.clone(), ch.clone())
         };
 
-        // Channels without free-form `listen` support (e.g. ACP today, until
-        // the elicitation RFD lands) can't deliver the human's reply. Fail
+        // Channels without free-form `listen` support (e.g. ACP in Phase 1
+        // of the elicitation rollout) can't deliver the human's reply. Fail
         // fast so the agent can route the escalation differently or proceed
         // without blocking — the alternative is silently timing out for
-        // `timeout_secs` seconds.
-        // RFD: https://github.com/zed-industries/agent-client-protocol/blob/main/docs/rfds/elicitation.mdx
+        // `timeout_secs` seconds. Phase 2 of the elicitation rollout will
+        // flip ACP's `supports_free_form_ask` to true.
+        // ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation
         if wait_for_response && !channel.supports_free_form_ask() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
                     "Channel '{channel_name}' cannot receive a free-form reply, \
-                     so `wait_for_response` is unsupported (awaits ACP elicitation RFD). \
+                     so `wait_for_response` is unsupported (awaits ACP elicitation Phase 2). \
                      Retry with `wait_for_response: false`."
                 )),
             });
@@ -252,7 +279,8 @@ impl Tool for EscalateToHumanTool {
             let timeout = std::time::Duration::from_secs(timeout_secs);
 
             let listen_channel = Arc::clone(&channel);
-            let listen_handle = tokio::spawn(async move { listen_channel.listen(tx).await });
+            let listen_handle =
+                zeroclaw_spawn::spawn!(async move { listen_channel.listen(tx).await });
 
             let response = tokio::time::timeout(timeout, rx.recv()).await;
             listen_handle.abort();
@@ -295,6 +323,8 @@ impl Tool for EscalateToHumanTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
 
     /// A stub channel that records sent messages but never produces incoming messages.
     struct SilentChannel {
@@ -308,6 +338,17 @@ mod tests {
                 channel_name: name.to_string(),
                 sent: Arc::new(RwLock::new(Vec::new())),
             }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SilentChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
         }
     }
 
@@ -349,6 +390,17 @@ mod tests {
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for RespondingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
     #[async_trait]
     impl Channel for RespondingChannel {
         fn name(&self) -> &str {
@@ -370,10 +422,14 @@ mod tests {
                 reply_target: "human".to_string(),
                 content: self.response.clone(),
                 channel: self.channel_name.clone(),
+                channel_alias: None,
                 timestamp: 1000,
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
+
+                ..Default::default()
             };
             let _ = tx.send(msg).await;
             Ok(())
@@ -381,7 +437,11 @@ mod tests {
     }
 
     fn make_tool_with_channels(channels: Vec<(&str, Arc<dyn Channel>)>) -> EscalateToHumanTool {
-        let tool = EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), vec![]);
+        let tool = EscalateToHumanTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec![],
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         let map: HashMap<String, Arc<dyn Channel>> = channels
             .into_iter()
             .map(|(name, ch)| (name.to_string(), ch))
@@ -394,7 +454,11 @@ mod tests {
 
     #[test]
     fn test_tool_metadata() {
-        let tool = EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), vec![]);
+        let tool = EscalateToHumanTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec![],
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         assert_eq!(tool.name(), "escalate_to_human");
         assert!(!tool.description().is_empty());
         assert!(tool.description().to_lowercase().contains("escalat"));
@@ -404,7 +468,11 @@ mod tests {
 
     #[test]
     fn test_parameters_schema() {
-        let tool = EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), vec![]);
+        let tool = EscalateToHumanTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec![],
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["summary"].is_object());
@@ -568,6 +636,17 @@ mod tests {
                 channel_name: name.to_string(),
                 sent: Arc::new(RwLock::new(Vec::new())),
             }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StructuredOnlyChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
         }
     }
 

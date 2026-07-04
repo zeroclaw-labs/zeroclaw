@@ -1,87 +1,35 @@
-# Model Providers — Overview
+# Model Providers: Overview
 
-Model providers are ZeroClaw's abstraction over any LLM endpoint the agent can call. Every chat-completion request goes through a `Provider` trait implementation (`zeroclaw-api::Provider`), whether the target is a remote API, a self-hosted inference server, or a local Ollama model.
+Model providers are ZeroClaw's abstraction over any LLM endpoint the agent can call. Every chat-completion request goes through a `ModelProvider` trait implementation (`zeroclaw-api::ModelProvider`), whether the target is a remote API, a self-hosted inference server, or a local Ollama model.
 
-Why "model" provider? We use the phrase "model provider" consistently — there may be other kinds of providers in the future (memory providers, tool providers, etc.) and keeping the word specific avoids ambiguity.
+An agent reaches a provider by referencing it; see [Agents](../agents/overview.md) for how that wiring fits together.
 
-## Supported providers
-
-Three categories:
-
-### Native
-
-One-off implementations that talk to a provider's native API:
-
-- **Anthropic** — Claude models. Supports OAuth (`sk-ant-oat*`) and API keys.
-- **OpenAI** — GPT and o-series models.
-- **Ollama** — local inference. Native `/api/chat` endpoint with schema-based structured output.
-- **Bedrock** — AWS foundation models (Claude, Llama, Titan, etc.). IAM-authenticated.
-- **Gemini** — Google's API. Separate `gemini_cli` provider for CLI-based auth.
-- **Azure OpenAI** — Microsoft's Azure-hosted OpenAI endpoint.
-- **Copilot** — GitHub Copilot as a chat model. OAuth flow built in.
-- **Claude Code** — Anthropic MCP proxy that lets the agent delegate to a Claude Code session.
-- **Telnyx** — voice AI over Telnyx's platform.
-- **KiloCLI** — local inference via KiloCLI.
-
-### OpenAI-compatible (single implementation, 20+ endpoints)
-
-One Rust implementation (`compatible.rs`) handles every OpenAI-compatible endpoint. A partial list:
-
-- Groq, Mistral, xAI, DeepSeek
-- OpenRouter (also exposes provider-routing semantics — see [Fallback & routing](./fallback-and-routing.md))
-- Venice, Moonshot, Synthetic, OpenCode, Z.AI, GLM, MiniMax, Qianfan
-- Vercel Gateway, Cloudflare Gateway
-- Any SaaS or self-hosted endpoint that speaks OpenAI's chat-completions API
-
-To add one of these, you don't implement a new provider — you add a config entry pointing at its base URL.
-
-### Meta providers
-
-- **`reliable`** — wraps any provider with a fallback chain. First failure falls to the next provider in the list.
-- **`router`** — a multi-provider router that picks a backend based on per-request hints (`hint:reasoning`, `hint:cheap`, `hint:vision`, etc.).
+Why "model" provider? We use the phrase "model provider" consistently, there are also TTS providers and transcription providers, and keeping the qualifier specific avoids ambiguity.
 
 ## Configuration shape
 
-Every provider is configured under `[providers.models.<name>]`:
+Providers are typed by family, addressed as `providers.models.<type>.<alias>`. `<type>` is a canonical family slot (see the [Catalog](./catalog.md#all-slots) for every slot). There is one slot per vendor, with no synonyms: `azure_openai`, `azure-openai`, and `claude` (for Anthropic) are not accepted.
 
-```toml
-[providers.models.claude]
-kind = "anthropic"
-model = "claude-haiku-4-5-20251001"
-api_key = "sk-ant-..."
+`<alias>` is your operator-assigned instance name, and you can define **as many aliases per type as you want**. Run several profiles of the same vendor family side by side: same `type`, different aliases, each with its own key, model, and settings. For example, two Anthropic accounts as `anthropic.personal` and `anthropic.work` (each with its own `api_key` and `model`), where an agent picks one with `model_provider = "anthropic.personal"` (or `"anthropic.work"`). Add and edit these through the surfaces below, not by hand:
 
-[providers.models.local]
-kind = "ollama"
-base_url = "http://localhost:11434"
-model = "qwen3.6:35b-a3b"
+{{#config-where providers.models}}
 
-[providers.models.groq]
-kind = "openai-compatible"
-base_url = "https://api.groq.com/openai"
-model = "llama-3.3-70b-versatile"
-api_key = "gsk_..."
-```
+See [Configuration](./configuration.md) for the full schema and [Catalog](./catalog.md) for a worked example per family.
 
-See [Configuration](./configuration.md) for the full schema.
+## Per-agent dispatch: there are no global defaults
 
-## Selecting a provider
+A provider entry on its own does nothing. To use it, an agent references it by `model_provider` (along with a `risk_profile` and optional `runtime_profile`). `risk_profile` and `runtime_profile` reference independent alias maps, so their names need not match. `Config::validate()` fails loud at startup if any reference doesn't resolve. Every callsite picks a configured alias or opts out; there is no global "default provider" or "default model" knob.
 
-Two mechanisms:
+For multi-agent deployments, give each agent its own `model_provider`. Channels that ingest messages bind to one agent at a time via the agent's `channels` list; see [Channels](../channels/overview.md) for the full picture.
 
-1. **`default_model`** in the top-level config picks which provider the agent loop uses by default.
-2. **Channels and tools can override.** A channel config can specify `provider = "claude"` to use Claude for that channel's responses while `default_model` stays set to a cheaper option for the rest.
+## Per-agent voice (TTS) and transcription
 
-## Why provider-agnostic matters
+Voice synthesis and speech-to-text follow the same pattern: a typed-family provider entry, then a per-agent reference. There are no global TTS or transcription selector fields. Each agent that wants voice sets its own routing.
 
-Two practical reasons:
+## Where to next
 
-- **Vendor lock-in is a liability.** If OpenAI changes their pricing, throttles you, or deprecates a model, you swap `kind = "openai"` for `kind = "anthropic"` in one file. The rest of the system doesn't care.
-- **Cost/performance routing.** A fallback chain of `[sonnet, haiku, local]` means you use the best model when it's available, fall back to cheaper hosted when it's not, and keep running on local Ollama during an API outage.
-
-## What's next
-
-- [Configuration](./configuration.md) — the full `[providers.*]` schema
-- [Streaming](./streaming.md) — how tokens, tool calls, and reasoning deltas flow
-- [Fallback & routing](./fallback-and-routing.md) — reliable and router meta-providers
-- [Provider catalog](./catalog.md) — every supported provider, its config shape, and notes
-- [Custom providers](./custom.md) — implementing a new one
+- [Configuration](./configuration.md): the full `[providers.*]` schema, Azure typed config, regional and OAuth variants
+- [Streaming](./streaming.md): how tokens, tool calls, and reasoning deltas flow
+- [Routing](./routing.md): multi-agent dispatch and OpenRouter as a routing layer
+- [Provider catalog](./catalog.md): every supported family with a worked TOML example
+- [Custom providers](./custom.md): pointing the `custom` slot at an OpenAI-compatible endpoint, or implementing the `ModelProvider` trait

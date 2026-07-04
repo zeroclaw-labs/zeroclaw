@@ -71,7 +71,7 @@ mod tests {
         }
 
         // Test case 4: skills_dir function edge cases
-        let workspace_with_trailing_slash = format!("{}/", workspace_dir.display());
+        let workspace_with_trailing_slash = format!("{}/", workspace_dir.display().to_string());
         let path_from_str = skills_dir(Path::new(&workspace_with_trailing_slash));
         assert_eq!(path_from_str, skills_path);
 

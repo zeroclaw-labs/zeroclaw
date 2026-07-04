@@ -1,0 +1,29 @@
+{
+  "tab_size": 2,
+  "hard_tabs": false,
+  "ensure_final_newline_on_save": true,
+  "line_ending": "enforce_lf",
+  "preferred_line_length": 80,
+  "languages": {
+    "Rust": {
+      "tab_size": 4,
+      "preferred_line_length": 100,
+    },
+    "Markdown": {
+      "preferred_line_length": 80,
+    },
+    "TOML": {
+      "tab_size": 2,
+    },
+    "YAML": {
+      "tab_size": 2,
+    },
+    "Python": {
+      "tab_size": 4,
+      "preferred_line_length": 100,
+    },
+    "JSON": {
+      "tab_size": 2,
+    },
+  },
+}

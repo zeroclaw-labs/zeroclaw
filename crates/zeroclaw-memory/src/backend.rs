@@ -49,7 +49,7 @@ const MARKDOWN_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
 
 const POSTGRES_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "postgres",
-    label: "PostgreSQL — remote durable storage via [storage.provider.config]",
+    label: "PostgreSQL — remote durable storage via [storage.model_provider.config]",
     auto_save_default: true,
     uses_sqlite_hygiene: false,
     sqlite_based: false,
@@ -181,5 +181,38 @@ mod tests {
         assert_eq!(profile.key, "custom");
         assert!(profile.auto_save_default);
         assert!(!profile.uses_sqlite_hygiene);
+    }
+
+    #[test]
+    fn classify_recognizes_qdrant_even_though_it_is_not_selectable() {
+        // Qdrant is a known backend kind but is omitted from the onboarding
+        // list, so it was missing from the classify coverage above.
+        assert_eq!(classify_memory_backend("qdrant"), MemoryBackendKind::Qdrant);
+        assert!(
+            !selectable_memory_backends()
+                .iter()
+                .any(|b| b.key == "qdrant"),
+            "qdrant is configurable but not an onboarding option"
+        );
+    }
+
+    #[test]
+    fn each_known_backend_profile_carries_a_matching_key() {
+        for name in ["sqlite", "lucid", "postgres", "qdrant", "markdown", "none"] {
+            assert_eq!(
+                memory_backend_profile(name).key,
+                name,
+                "profile for {name} should carry a matching key"
+            );
+        }
+    }
+
+    #[test]
+    fn default_backend_key_is_sqlite_and_listed_first() {
+        assert_eq!(default_memory_backend_key(), "sqlite");
+        assert_eq!(
+            selectable_memory_backends()[0].key,
+            default_memory_backend_key()
+        );
     }
 }

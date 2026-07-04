@@ -9,6 +9,13 @@ use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_config::schema::ClaudeCodeRunnerConfig;
 
 /// Environment variables safe to pass through to the `claude` subprocess.
+///
+/// Note: This runner is Unix/WSL-only because it depends on `tmux` for session
+/// management. Windows native execution should use the foreground
+/// [`ClaudeCodeTool`](super::claude_code::ClaudeCodeTool) which handles the
+/// Windows-specific binary resolution and environment allowlist. The
+/// `clean_verbatim_path()` call in this runner is purely path hygiene for
+/// tmux compatibility and does not provide Windows subprocess launch support.
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
@@ -105,14 +112,8 @@ impl Tool for ClaudeCodeRunnerTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        // Rate limit check
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
+        // Rate limiting is applied by the RateLimitedTool wrapper at
+        // registration time (see zeroclaw-runtime::tools::mod).
 
         // Enforce act policy
         if let Err(error) = self
@@ -127,14 +128,30 @@ impl Tool for ClaudeCodeRunnerTool {
         }
 
         // Extract prompt (required)
-        let prompt = args
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'prompt' parameter"))?;
+        let prompt = args.get("prompt").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "prompt"})),
+                "claude_code_runner: missing prompt parameter"
+            );
+            anyhow::Error::msg("Missing 'prompt' parameter")
+        })?;
 
         // Validate working directory
         let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
             let wd_path = std::path::PathBuf::from(wd);
+            // Resolve relative working_directory against workspace_dir, NOT
+            // the daemon's current working directory. This prevents the bug
+            // where an external coding tool's relative working_directory
+            // would silently resolve to a path outside the workspace when
+            // the daemon cwd differs from workspace_dir.
+            let wd_path = if wd_path.is_relative() {
+                self.security.workspace_dir.join(&wd_path)
+            } else {
+                wd_path
+            };
             let workspace = &self.security.workspace_dir;
             let canonical_wd = match wd_path.canonicalize() {
                 Ok(p) => p,
@@ -183,15 +200,6 @@ impl Tool for ClaudeCodeRunnerTool {
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        // Record action budget
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
-
         // Generate a unique session ID
         let session_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let session_name = self.session_name(&session_id);
@@ -234,7 +242,11 @@ impl Tool for ClaudeCodeRunnerTool {
         let create_result = Command::new("tmux")
             .args(["new-session", "-d", "-s", &session_name])
             .arg("-c")
-            .arg(work_dir.to_str().unwrap_or("."))
+            .arg(
+                crate::util_helpers::clean_verbatim_path(&work_dir)
+                    .to_str()
+                    .unwrap_or("."),
+            )
             .output()
             .await;
 
@@ -291,14 +303,16 @@ impl Tool for ClaudeCodeRunnerTool {
         // Schedule session TTL cleanup
         let ttl = self.config.session_ttl;
         let cleanup_session = session_name.clone();
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             tokio::time::sleep(std::time::Duration::from_secs(ttl)).await;
             let _ = Command::new("tmux")
                 .args(["kill-session", "-t", &cleanup_session])
                 .output()
                 .await;
-            tracing::info!(
-                session = cleanup_session,
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"session": cleanup_session})),
                 "Claude Code runner session TTL expired, cleaned up"
             );
         });

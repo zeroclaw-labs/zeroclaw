@@ -58,14 +58,23 @@ curl -X POST "https://${ROUTE}/webhook" \
 
 ## Configuration
 
-Edit `configmap.yaml` to change runtime settings:
+The shape of `configmap.yaml`'s embedded `config.toml` follows the canonical
+[Provider Configuration → Minimal working example](../docs/book/src/providers/configuration.md#minimal-working-example).
+The sample's aliases are `cloud` (provider entry) and `assistant` (agent +
+risk profile) — substitute your own. Common edit points:
 
-| Setting | Field | Default |
-| ------- | ----- | ------- |
-| LLM provider | `default_provider` | `anthropic` |
-| Model | `default_model` | `claude-sonnet-4-20250514` |
-| Temperature | `default_temperature` | `0.7` |
-| Autonomy level | `autonomy.level` | `supervised` |
+| Setting | Path in `config.toml` | Sample value |
+| ------- | --------------------- | ------------ |
+| Model | `providers.models.anthropic.cloud.model` | `claude-sonnet-4-20250514` |
+| Temperature | `providers.models.anthropic.cloud.temperature` | `0.7` |
+| Autonomy level | `risk_profiles.assistant.level` | `supervised` |
+| Agent → provider link | `agents.assistant.model_provider` | `anthropic.cloud` |
+
+To swap to a different provider type (OpenAI, OpenRouter, Ollama, etc.),
+replace the `[providers.models.anthropic.cloud]` block with a
+`[providers.models.<type>.<alias>]` entry from
+[providers/catalog](../docs/book/src/providers/catalog.md) and update
+`agents.assistant.model_provider` to match.
 
 After editing, re-apply and restart the pod:
 

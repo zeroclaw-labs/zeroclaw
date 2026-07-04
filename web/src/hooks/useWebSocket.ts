@@ -31,7 +31,7 @@ export interface UseWebSocketOptions extends WebSocketClientOptions {
  * messages, and cleans up on unmount.
  */
 export function useWebSocket(
-  options: UseWebSocketOptions = {},
+  options: UseWebSocketOptions,
 ): UseWebSocketResult {
   const { autoConnect = true, ...wsOptions } = options;
 

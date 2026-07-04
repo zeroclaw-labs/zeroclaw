@@ -54,7 +54,7 @@ impl TokenSet {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AuthProfile {
     pub id: String,
-    pub provider: String,
+    pub model_provider: String,
     pub profile_name: String,
     pub kind: AuthProfileKind,
     #[serde(default)]
@@ -75,7 +75,7 @@ impl std::fmt::Debug for AuthProfile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthProfile")
             .field("id", &self.id)
-            .field("provider", &self.provider)
+            .field("model_provider", &self.model_provider)
             .field("profile_name", &self.profile_name)
             .field("kind", &self.kind)
             .field("workspace_id", &self.workspace_id)
@@ -87,12 +87,12 @@ impl std::fmt::Debug for AuthProfile {
 }
 
 impl AuthProfile {
-    pub fn new_oauth(provider: &str, profile_name: &str, token_set: TokenSet) -> Self {
+    pub fn new_oauth(model_provider: &str, profile_name: &str, token_set: TokenSet) -> Self {
         let now = Utc::now();
-        let id = profile_id(provider, profile_name);
+        let id = profile_id(model_provider, profile_name);
         Self {
             id,
-            provider: provider.to_string(),
+            model_provider: model_provider.to_string(),
             profile_name: profile_name.to_string(),
             kind: AuthProfileKind::OAuth,
             account_id: None,
@@ -105,12 +105,12 @@ impl AuthProfile {
         }
     }
 
-    pub fn new_token(provider: &str, profile_name: &str, token: String) -> Self {
+    pub fn new_token(model_provider: &str, profile_name: &str, token: String) -> Self {
         let now = Utc::now();
-        let id = profile_id(provider, profile_name);
+        let id = profile_id(model_provider, profile_name);
         Self {
             id,
-            provider: provider.to_string(),
+            model_provider: model_provider.to_string(),
             profile_name: profile_name.to_string(),
             kind: AuthProfileKind::Token,
             account_id: None,
@@ -179,7 +179,7 @@ impl AuthProfilesStore {
 
         if set_active {
             data.active_profiles
-                .insert(profile.provider.clone(), profile.id.clone());
+                .insert(profile.model_provider.clone(), profile.id.clone());
         }
 
         data.profiles.insert(profile.id.clone(), profile);
@@ -204,7 +204,7 @@ impl AuthProfilesStore {
         Ok(true)
     }
 
-    pub async fn set_active_profile(&self, provider: &str, profile_id: &str) -> Result<()> {
+    pub async fn set_active_profile(&self, model_provider: &str, profile_id: &str) -> Result<()> {
         let _lock = self.acquire_lock().await?;
         let mut data = self.load_locked().await?;
 
@@ -213,15 +213,15 @@ impl AuthProfilesStore {
         }
 
         data.active_profiles
-            .insert(provider.to_string(), profile_id.to_string());
+            .insert(model_provider.to_string(), profile_id.to_string());
         data.updated_at = Utc::now();
         self.save_locked(&data).await
     }
 
-    pub async fn clear_active_profile(&self, provider: &str) -> Result<()> {
+    pub async fn clear_active_profile(&self, model_provider: &str) -> Result<()> {
         let _lock = self.acquire_lock().await?;
         let mut data = self.load_locked().await?;
-        data.active_profiles.remove(provider);
+        data.active_profiles.remove(model_provider);
         data.updated_at = Utc::now();
         self.save_locked(&data).await
     }
@@ -233,10 +233,16 @@ impl AuthProfilesStore {
         let _lock = self.acquire_lock().await?;
         let mut data = self.load_locked().await?;
 
-        let profile = data
-            .profiles
-            .get_mut(profile_id)
-            .ok_or_else(|| anyhow::anyhow!("Auth profile not found: {profile_id}"))?;
+        let profile = data.profiles.get_mut(profile_id).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"profile_id": profile_id})),
+                "auth_profiles: profile not found for update"
+            );
+            anyhow::Error::msg(format!("Auth profile not found: {profile_id}"))
+        })?;
 
         updater(profile)?;
         profile.updated_at = Utc::now();
@@ -280,7 +286,20 @@ impl AuthProfilesStore {
             let token_set = match kind {
                 AuthProfileKind::OAuth => {
                     let access = access_token.ok_or_else(|| {
-                        anyhow::anyhow!("OAuth profile missing access_token: {id}")
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "profile_id": id,
+                                "missing": "access_token",
+                            })),
+                            "auth_profiles: OAuth profile missing access_token"
+                        );
+                        anyhow::Error::msg(format!("OAuth profile missing access_token: {id}"))
                     })?;
                     Some(TokenSet {
                         access_token: access,
@@ -298,7 +317,7 @@ impl AuthProfilesStore {
                 id.clone(),
                 AuthProfile {
                     id: id.clone(),
-                    provider: p.provider.clone(),
+                    model_provider: p.model_provider.clone(),
                     profile_name: p.profile_name.clone(),
                     kind,
                     account_id: p.account_id.clone(),
@@ -351,7 +370,7 @@ impl AuthProfilesStore {
             persisted.profiles.insert(
                 id.clone(),
                 PersistedAuthProfile {
-                    provider: profile.provider.clone(),
+                    model_provider: profile.model_provider.clone(),
                     profile_name: profile.profile_name.clone(),
                     kind: profile_kind_to_string(profile.kind).to_string(),
                     account_id: profile.account_id.clone(),
@@ -469,7 +488,10 @@ impl AuthProfilesStore {
     async fn acquire_lock(&self) -> Result<AuthProfileLockGuard> {
         if let Some(parent) = self.lock_path.parent() {
             fs::create_dir_all(parent).await.with_context(|| {
-                format!("Failed to create lock directory at {}", parent.display())
+                format!(
+                    "Failed to create lock directory at {}",
+                    parent.display().to_string()
+                )
             })?;
         }
 
@@ -488,7 +510,16 @@ impl AuthProfilesStore {
                         fs::remove_file(&self.lock_path)
                             .await
                             .inspect(|e| {
-                                tracing::error!("Failed to remove auth profile lock file: {e:?}");
+                                ::zeroclaw_log::record!(
+                                    ERROR,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({"e": format!("{:?}", e)})),
+                                    "Failed to remove auth profile lock file: "
+                                );
                             })
                             .ok();
                         return Err(e).with_context(|| {
@@ -560,7 +591,7 @@ impl Default for PersistedAuthProfiles {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PersistedAuthProfile {
-    provider: String,
+    model_provider: String,
     profile_name: String,
     kind: String,
     #[serde(default)]
@@ -626,8 +657,8 @@ fn parse_datetime_with_fallback(value: &str) -> DateTime<Utc> {
     parse_datetime(value).unwrap_or_else(|_| Utc::now())
 }
 
-pub fn profile_id(provider: &str, profile_name: &str) -> String {
-    format!("{}:{}", provider.trim(), profile_name.trim())
+pub fn profile_id(model_provider: &str, profile_name: &str) -> String {
+    format!("{}:{}", model_provider.trim(), profile_name.trim())
 }
 
 #[cfg(test)]
@@ -682,7 +713,7 @@ mod tests {
         let data = store.load().await.unwrap();
         let loaded = data.profiles.get(&profile.id).unwrap();
 
-        assert_eq!(loaded.provider, "openai-codex");
+        assert_eq!(loaded.model_provider, "openai-codex");
         assert_eq!(loaded.profile_name, "default");
         assert_eq!(loaded.account_id.as_deref(), Some("acct_123"));
         assert_eq!(

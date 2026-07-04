@@ -1,0 +1,441 @@
+//! Shared JSON-RPC 2.0 types for the ACP server and runtime RPC layer.
+//!
+//! Extracted from `zeroclaw-channels::orchestrator::acp_server` so both the
+//! ACP stdio channel and the Unix socket RPC transport can share the same
+//! wire types without cross-crate dependency.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{mpsc, oneshot};
+
+// ── Protocol constants ───────────────────────────────────────────
+
+/// JSON-RPC protocol version string. Used in every frame's `jsonrpc` field.
+pub const JSONRPC_VERSION: &str = "2.0";
+
+/// Prefix for server-originated outbound request IDs, disjoint from any
+/// client-issued id space.
+pub const OUTBOUND_ID_PREFIX: &str = "zc-out-";
+
+// ── Wire field name constants ────────────────────────────────────
+// Used when parsing raw `Value` frames (e.g. in the client read loop).
+
+pub mod field {
+    pub const JSONRPC: &str = "jsonrpc";
+    pub const METHOD: &str = "method";
+    pub const PARAMS: &str = "params";
+    pub const ID: &str = "id";
+    pub const RESULT: &str = "result";
+    pub const ERROR: &str = "error";
+}
+
+// ── Wire types ───────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JsonRpcRequest {
+    pub jsonrpc: String,
+    pub method: String,
+    #[serde(default)]
+    pub params: Value,
+    pub id: Option<Value>,
+}
+
+impl JsonRpcRequest {
+    /// Build a request with an auto-incremented numeric id.
+    pub fn new(method: &str, params: Value, id: Value) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: method.to_string(),
+            params,
+            id: Some(id),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct JsonRpcResponse {
+    pub jsonrpc: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<JsonRpcError>,
+    pub id: Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JsonRpcNotification {
+    pub jsonrpc: &'static str,
+    pub method: &'static str,
+    pub params: Value,
+}
+
+impl JsonRpcNotification {
+    pub fn new(method: &'static str, params: Value) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION,
+            method,
+            params,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonRpcError {
+    pub code: i32,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+// ── Error codes ──────────────────────────────────────────────────
+
+pub mod error_codes {
+    // Standard JSON-RPC 2.0
+    pub const PARSE_ERROR: i32 = -32700;
+    pub const INVALID_REQUEST: i32 = -32600;
+    pub const METHOD_NOT_FOUND: i32 = -32601;
+    pub const INVALID_PARAMS: i32 = -32602;
+    pub const INTERNAL_ERROR: i32 = -32603;
+
+    // ZeroClaw custom
+    pub const SESSION_NOT_FOUND: i32 = -32000;
+    pub const SESSION_LIMIT_REACHED: i32 = -32001;
+    pub const SESSION_BUSY: i32 = -32002;
+    pub const SESSION_NOT_OWNED: i32 = -32003;
+    pub const AUTH_REQUIRED: i32 = -32010;
+    pub const VERSION_MISMATCH: i32 = -32011;
+
+    // Filesystem RPC errors (internal numeric codes; wire uses string codes e.g. "fs.not_found")
+    pub const FS_NOT_FOUND: i32 = 4001;
+    pub const FS_PERMISSION_DENIED: i32 = 4002;
+    pub const FS_INVALID_PATH: i32 = 4003;
+
+    // String error codes for fs.* methods
+    pub const FS_NOT_FOUND_STR: &str = "fs.not_found";
+    pub const FS_PERMISSION_DENIED_STR: &str = "fs.permission_denied";
+    pub const FS_INVALID_PATH_STR: &str = "fs.invalid_path";
+}
+
+pub const ACP_PROTOCOL_VERSION: u64 = 1;
+
+// ── Outbound RPC plumbing ────────────────────────────────────────
+
+type PendingResponder = oneshot::Sender<std::result::Result<Value, JsonRpcError>>;
+
+/// Writer + outbound-call tracker shared between server loops and
+/// per-session bridges (e.g. AcpChannel, RpcDispatcher).
+///
+/// All writes go through `writer_tx` so concurrent notifications and
+/// outbound requests cannot interleave bytes. Outbound requests get string
+/// ids (`zc-out-<n>`) disjoint from any client-issued id space.
+#[derive(Debug)]
+pub struct RpcOutbound {
+    writer_tx: mpsc::Sender<String>,
+    pending: std::sync::Mutex<HashMap<String, PendingResponder>>,
+    next_id: AtomicU64,
+}
+
+struct PendingRequestGuard<'a> {
+    pending: &'a std::sync::Mutex<HashMap<String, PendingResponder>>,
+    id: String,
+}
+
+impl Drop for PendingRequestGuard<'_> {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+impl RpcOutbound {
+    pub fn new(writer_tx: mpsc::Sender<String>) -> Self {
+        Self {
+            writer_tx,
+            pending: std::sync::Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+        }
+    }
+
+    /// Send a raw pre-serialized JSON line. Returns `true` on success.
+    pub async fn send_raw(&self, json: String) -> bool {
+        self.writer_tx.send(json).await.is_ok()
+    }
+
+    /// Resolve when the writer end is closed (peer dropped). Useful for
+    /// long-lived forwarders that need to exit on disconnect even when
+    /// there is no payload to send.
+    pub async fn closed(&self) {
+        self.writer_tx.closed().await;
+    }
+
+    /// Send a JSON-RPC notification (no `id`, no response expected).
+    pub async fn notify(&self, method: &'static str, params: Value) {
+        let n = JsonRpcNotification::new(method, params);
+        if let Ok(s) = serde_json::to_string(&n) {
+            let _ = self.writer_tx.send(s).await;
+        }
+    }
+
+    /// Send a JSON-RPC request and await the response.
+    pub async fn request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> std::result::Result<Value, JsonRpcError> {
+        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = format!("{OUTBOUND_ID_PREFIX}{n}");
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.insert(id.clone(), tx);
+        }
+        let _pending_guard = PendingRequestGuard {
+            pending: &self.pending,
+            id: id.clone(),
+        };
+        let req = JsonRpcRequest::new(method, params, Value::String(id));
+        let body = match serde_json::to_string(&req) {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(JsonRpcError {
+                    code: error_codes::INTERNAL_ERROR,
+                    message: format!("Failed to encode request: {e}"),
+                    data: None,
+                });
+            }
+        };
+        if self.writer_tx.send(body).await.is_err() {
+            return Err(JsonRpcError {
+                code: error_codes::INTERNAL_ERROR,
+                message: "Writer task closed".to_string(),
+                data: None,
+            });
+        }
+        rx.await.unwrap_or_else(|_| {
+            Err(JsonRpcError {
+                code: error_codes::INTERNAL_ERROR,
+                message: "Outbound RPC dropped".to_string(),
+                data: None,
+            })
+        })
+    }
+
+    /// Route an inbound JSON-RPC response to its pending caller.
+    pub fn dispatch_response(
+        &self,
+        id_str: &str,
+        result: Option<Value>,
+        error: Option<JsonRpcError>,
+    ) {
+        let responder = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id_str);
+        if let Some(tx) = responder {
+            let payload = if let Some(err) = error {
+                Err(err)
+            } else {
+                Ok(result.unwrap_or(Value::Null))
+            };
+            let _ = tx.send(payload);
+        }
+    }
+
+    /// Number of in-flight outbound requests awaiting responses.
+    pub fn pending_count(&self) -> usize {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
+// ── Locale RPC types ─────────────────────────────────────────────
+
+/// One selectable locale from the build's embedded `locales.toml` registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocaleOption {
+    pub code: String,
+    pub label: String,
+}
+
+/// Response for `locales/list` — the in-memory locale registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalesListResponse {
+    pub locales: Vec<LocaleOption>,
+}
+
+/// Request payload for `locales/fetch`. `catalog` restricts which catalogues
+/// are downloaded; `None`/empty means all. The daemon validates `locale`
+/// against the embedded registry and `catalog` against the fixed catalog set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalesFetchRequest {
+    pub locale: String,
+    #[serde(default)]
+    pub catalog: Vec<String>,
+}
+
+/// One fetched catalogue's bytes, returned over the wire so the client writes
+/// them into its own config dir (keeping the write in the caller's permission
+/// scope).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FetchedCatalog {
+    pub name: String,
+    /// Output filename (e.g. `cli.ftl`).
+    pub filename: String,
+    /// The FTL file contents.
+    pub content: String,
+}
+
+/// Response for `locales/fetch`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalesFetchResponse {
+    pub locale: String,
+    pub catalogs: Vec<FetchedCatalog>,
+    /// Catalogue names that had no file on upstream and were skipped.
+    pub skipped: Vec<String>,
+}
+
+// ── Filesystem RPC types ─────────────────────────────────────────
+
+/// Request payload for `fs.list_dir`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsListDirRequest {
+    /// Relative or absolute path within the agent workspace.
+    pub path: String,
+    #[serde(default)]
+    pub show_hidden: bool,
+}
+
+/// Response for `fs.list_dir`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsListDirResponse {
+    pub entries: Vec<FsEntry>,
+    pub cwd: String,
+}
+
+/// A single directory entry returned by `fs.list_dir`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsEntry {
+    pub name: String,
+    pub full_path: String,
+    pub is_dir: bool,
+    pub is_hidden: bool,
+    pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<u64>,
+}
+
+/// Filesystem stat result (success case). Matches FsEntry shape with extra fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsStatResult {
+    pub name: String,
+    pub full_path: String,
+    pub is_dir: bool,
+    pub is_hidden: bool,
+    pub size: u64,
+    pub mtime: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+}
+
+/// Filesystem stat error payload (used inside `JsonRpcError.data`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsStatError {
+    pub path: String,
+    pub code: &'static str, // e.g. "fs.not_found"
+    pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn request_new_sets_version_and_wraps_id() {
+        let req = JsonRpcRequest::new("ping", json!({"x": 1}), json!(7));
+        assert_eq!(req.jsonrpc, JSONRPC_VERSION);
+        assert_eq!(req.method, "ping");
+        assert_eq!(req.params, json!({"x": 1}));
+        assert_eq!(req.id, Some(json!(7)));
+    }
+
+    #[test]
+    fn request_deserializes_with_default_params_when_omitted() {
+        let req: JsonRpcRequest =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"m","id":1}"#).unwrap();
+        assert_eq!(req.method, "m");
+        assert_eq!(req.params, Value::Null);
+        assert_eq!(req.id, Some(json!(1)));
+    }
+
+    #[test]
+    fn notification_new_sets_version_and_carries_no_id() {
+        let n = JsonRpcNotification::new("event", json!([1, 2]));
+        assert_eq!(n.jsonrpc, JSONRPC_VERSION);
+        assert_eq!(n.method, "event");
+        let v = serde_json::to_value(&n).unwrap();
+        assert!(v.get("id").is_none(), "notifications carry no id");
+        assert_eq!(v["jsonrpc"].as_str(), Some(JSONRPC_VERSION));
+    }
+
+    #[test]
+    fn response_omits_none_result_and_error() {
+        let ok = JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: Some(json!("ok")),
+            error: None,
+            id: json!(1),
+        };
+        let v = serde_json::to_value(&ok).unwrap();
+        assert_eq!(v["result"], json!("ok"));
+        assert!(v.get("error").is_none(), "error omitted when None");
+
+        let err = JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: None,
+            error: Some(JsonRpcError {
+                code: error_codes::METHOD_NOT_FOUND,
+                message: "nope".to_string(),
+                data: None,
+            }),
+            id: json!(2),
+        };
+        let v = serde_json::to_value(&err).unwrap();
+        assert!(v.get("result").is_none(), "result omitted when None");
+        assert_eq!(
+            v["error"]["code"].as_i64(),
+            Some(error_codes::METHOD_NOT_FOUND as i64)
+        );
+        assert!(
+            v["error"].get("data").is_none(),
+            "error.data omitted when None"
+        );
+    }
+
+    #[test]
+    fn standard_error_codes_match_jsonrpc_spec() {
+        assert_eq!(error_codes::PARSE_ERROR, -32700);
+        assert_eq!(error_codes::INVALID_REQUEST, -32600);
+        assert_eq!(error_codes::METHOD_NOT_FOUND, -32601);
+        assert_eq!(error_codes::INVALID_PARAMS, -32602);
+        assert_eq!(error_codes::INTERNAL_ERROR, -32603);
+    }
+
+    #[test]
+    fn error_roundtrips_through_serde() {
+        let e = JsonRpcError {
+            code: error_codes::INVALID_PARAMS,
+            message: "bad".to_string(),
+            data: Some(json!({"field": "x"})),
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        let back: JsonRpcError = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.code, error_codes::INVALID_PARAMS);
+        assert_eq!(back.message, "bad");
+        assert_eq!(back.data, Some(json!({"field": "x"})));
+    }
+}

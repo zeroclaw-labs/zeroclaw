@@ -1,26 +1,45 @@
 # Dockerfile.ci — CI/release image using pre-built binaries.
 # Used by release workflows to skip the ~60 min Rust compilation.
 # The main Dockerfile is still used for local dev builds.
+#
+# Variants:
+#   distroless (default): docker build -f Dockerfile.ci .
+#   debian:               docker build -f Dockerfile.ci --build-arg VARIANT=debian .
 
-# ── Runtime (Distroless) ─────────────────────────────────────
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7
+ARG VARIANT=distroless
+
+# ── Base variants ────────────────────────────────────────────
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7 AS base-distroless
+
+FROM debian:bookworm-slim AS base-debian
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        curl \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Runtime ──────────────────────────────────────────────────
+FROM base-${VARIANT} AS runtime
 
 ARG TARGETARCH
 
 # Copy the pre-built binary for this platform (amd64 or arm64)
 COPY bin/${TARGETARCH}/zeroclaw /usr/local/bin/zeroclaw
+COPY bin/${TARGETARCH}/zerocode /usr/local/bin/zerocode
 
 # Copy the web dashboard bundled alongside the binary in the release tarball.
-# The dashboard was decoupled from the binary in #5665 and is now served from
-# disk at `gateway.web_dist_dir`; without this COPY the distroless image has
-# no `/zeroclaw-data/web/dist` and `GET /` returns HTTP 503.
-COPY bin/${TARGETARCH}/web/dist /zeroclaw-data/web/dist
+# Installed at /usr/share/zeroclawlabs/web/dist (outside the documented
+# /zeroclaw-data mount) so a bind mount on /zeroclaw-data cannot shadow it
+# (#6400). The dashboard was decoupled from the binary in #5665 and is now
+# served from disk at `gateway.web_dist_dir`.
+COPY bin/${TARGETARCH}/web/dist /usr/share/zeroclawlabs/web/dist
 
 # Runtime directory structure and default config
 COPY --chown=65534:65534 zeroclaw-data/ /zeroclaw-data/
 
 ENV LANG=C.UTF-8
-ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
+ENV ZEROCLAW_DATA_DIR=/zeroclaw-data/data
 ENV HOME=/zeroclaw-data
 ENV ZEROCLAW_GATEWAY_PORT=42617
 

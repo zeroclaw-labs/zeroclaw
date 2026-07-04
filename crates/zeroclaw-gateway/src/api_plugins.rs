@@ -27,23 +27,26 @@ pub mod plugin_routes {
             }
         }
 
-        let config = state.config.lock();
+        let config = state.config.read();
         let plugins_enabled = config.plugins.enabled;
         let plugins_dir = config.plugins.plugins_dir.clone();
+        let plugin_path = config.plugins.resolved_plugins_dir();
+        let signature_mode_raw = config.plugins.security.signature_mode.clone();
+        let trusted_publisher_keys = config.plugins.security.trusted_publisher_keys.clone();
         drop(config);
 
         let plugins: Vec<serde_json::Value> = if plugins_enabled {
-            let plugin_path = if plugins_dir.starts_with("~/") {
-                directories::UserDirs::new()
-                    .map(|u| u.home_dir().join(&plugins_dir[2..]))
-                    .unwrap_or_else(|| std::path::PathBuf::from(&plugins_dir))
-            } else {
-                std::path::PathBuf::from(&plugins_dir)
-            };
-
             if plugin_path.exists() {
-                match zeroclaw_plugins::host::PluginHost::new(
-                    plugin_path.parent().unwrap_or(&plugin_path),
+                // Resolve the configured policy so the listing matches the
+                // runtime tool path exactly: a plugin the agent refuses to load
+                // in strict mode must not appear here as `loaded: true`. An
+                // unrecognized value fails safe to strict, same as the runtime.
+                let signature_mode =
+                    zeroclaw_plugins::host::PluginHost::resolve_signature_mode(&signature_mode_raw);
+                match zeroclaw_plugins::host::PluginHost::from_plugins_dir_with_security(
+                    &plugin_path,
+                    signature_mode,
+                    trusted_publisher_keys,
                 ) {
                     Ok(host) => host
                         .list_plugins()

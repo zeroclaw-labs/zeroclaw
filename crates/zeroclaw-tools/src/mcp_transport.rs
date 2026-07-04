@@ -2,14 +2,14 @@
 
 use std::borrow::Cow;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::time::{Duration, timeout};
 use tokio_stream::StreamExt;
 
-use crate::mcp_protocol::{INTERNAL_ERROR, JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+use crate::mcp_protocol::{JsonRpcRequest, JsonRpcResponse};
 use zeroclaw_config::schema::{McpServerConfig, McpTransport};
 
 /// Maximum bytes for a single JSON-RPC response.
@@ -65,6 +65,25 @@ fn apply_request_timeout(
     }
 }
 
+// ── Transport Errors ───────────────────────────────────────────────────────
+
+/// Transport-level failures that are recoverable by reconnecting — resetting
+/// the session and re-running the MCP handshake — rather than surfacing to the
+/// caller. Distinct from a genuine tool/application error, which must be
+/// reported as-is and never retried.
+#[derive(Debug, thiserror::Error)]
+pub enum McpTransportError {
+    /// The server no longer recognizes our session (typically after it
+    /// restarted). Surfaced from HTTP 404/410 responses.
+    #[error("MCP session is stale (HTTP {status})")]
+    StaleSession { status: u16 },
+
+    /// The underlying stream/connection dropped before a response arrived
+    /// (e.g. SSE EOF or connection reset).
+    #[error("MCP transport connection closed")]
+    TransportClosed,
+}
+
 // ── Transport Trait ──────────────────────────────────────────────────────
 
 /// Abstract transport for MCP communication.
@@ -72,6 +91,12 @@ fn apply_request_timeout(
 pub trait McpTransportConn: Send + Sync {
     /// Send a JSON-RPC request and receive the response.
     async fn send_and_recv(&mut self, request: &JsonRpcRequest) -> Result<JsonRpcResponse>;
+
+    /// Reset per-connection session state so the next operation re-establishes
+    /// a fresh session. Default is a no-op for stateless transports (stdio).
+    async fn reset(&mut self) -> Result<()> {
+        Ok(())
+    }
 
     /// Close the connection.
     async fn close(&mut self) -> Result<()>;
@@ -98,14 +123,32 @@ impl StdioTransport {
             .spawn()
             .with_context(|| format!("failed to spawn MCP server `{}`", config.name))?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("no stdin on MCP server `{}`", config.name))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("no stdout on MCP server `{}`", config.name))?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "mcp_server": &config.name,
+                        "missing": "stdin",
+                    })),
+                "mcp_transport: no stdin on spawned MCP server"
+            );
+            anyhow::Error::msg(format!("no stdin on MCP server `{}`", config.name))
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "mcp_server": &config.name,
+                        "missing": "stdout",
+                    })),
+                "mcp_transport: no stdout on spawned MCP server"
+            );
+            anyhow::Error::msg(format!("no stdout on MCP server `{}`", config.name))
+        })?;
         let stdout_lines = BufReader::new(stdout).lines();
 
         Ok(Self {
@@ -129,11 +172,15 @@ impl StdioTransport {
     }
 
     async fn recv_raw(&mut self) -> Result<String> {
-        let line = self
-            .stdout_lines
-            .next_line()
-            .await?
-            .ok_or_else(|| anyhow!("MCP server closed stdout"))?;
+        let line = self.stdout_lines.next_line().await?.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "mcp_transport: MCP server closed stdout"
+            );
+            anyhow::Error::msg("MCP server closed stdout")
+        })?;
         if line.len() > MAX_LINE_BYTES {
             bail!("MCP response too large: {} bytes", line.len());
         }
@@ -168,7 +215,9 @@ impl McpTransportConn for StdioTransport {
             if resp.id.is_none() {
                 // Server-sent notification (e.g. `notifications/initialized`) — skip and
                 // keep waiting for the actual response to our request.
-                tracing::debug!(
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                     "MCP stdio: skipping server notification while waiting for response"
                 );
                 continue;
@@ -203,7 +252,19 @@ impl HttpTransport {
         let url = config
             .url
             .as_ref()
-            .ok_or_else(|| anyhow!("URL required for HTTP transport"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "mcp_server": &config.name,
+                            "transport": "http",
+                        })),
+                    "mcp_transport: HTTP transport requires URL"
+                );
+                anyhow::Error::msg("URL required for HTTP transport")
+            })?
             .clone();
 
         let client = reqwest::Client::builder()
@@ -274,7 +335,21 @@ impl McpTransportConn for HttpTransport {
             .context("HTTP request to MCP server failed")?;
 
         if !resp.status().is_success() {
-            bail!("MCP server returned HTTP {}", resp.status());
+            let status = resp.status();
+            // A 404/410 only means "stale session" when this request carried an
+            // `Mcp-Session-Id` the server no longer recognizes (MCP spec 2025-06-18,
+            // Session Management). Without a session id, a 404 is just a missing
+            // endpoint (typo'd `url`, wrong path, proxy misroute) — surface it as a
+            // plain error so `call_tool` doesn't burn a reconnect on it.
+            if self.session_id.is_some()
+                && (status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE)
+            {
+                return Err(McpTransportError::StaleSession {
+                    status: status.as_u16(),
+                }
+                .into());
+            }
+            bail!("MCP server returned HTTP {}", status);
         }
 
         self.update_session_id_from_headers(resp.headers());
@@ -304,12 +379,26 @@ impl McpTransportConn for HttpTransport {
             } else {
                 read_response.await?
             };
-            return maybe_resp
-                .ok_or_else(|| anyhow!("MCP server returned no response in SSE stream"));
+            return maybe_resp.ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "mcp_transport: MCP server returned no response in SSE stream"
+                );
+                anyhow::Error::msg("MCP server returned no response in SSE stream")
+            });
         }
 
         let resp_text = resp.text().await.context("failed to read HTTP response")?;
         parse_jsonrpc_response_text(&resp_text)
+    }
+
+    async fn reset(&mut self) -> Result<()> {
+        // Drop the stale session so the next request re-initializes and the
+        // server issues a fresh `Mcp-Session-Id`.
+        self.session_id = None;
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<()> {
@@ -345,7 +434,19 @@ impl SseTransport {
         let sse_url = config
             .url
             .as_ref()
-            .ok_or_else(|| anyhow!("URL required for SSE transport"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "mcp_server": &config.name,
+                            "transport": "sse",
+                        })),
+                    "mcp_transport: SSE transport requires URL"
+                );
+                anyhow::Error::msg("URL required for SSE transport")
+            })?
             .clone();
 
         let client = reqwest::Client::builder()
@@ -401,7 +502,18 @@ impl SseTransport {
             return Ok(());
         }
         if !resp.status().is_success() {
-            return Err(anyhow!("MCP server returned HTTP {}", resp.status()));
+            let status = resp.status();
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"status": status.as_u16()})),
+                "mcp_transport: MCP server returned non-success HTTP"
+            );
+            return Err(anyhow::Error::msg(format!(
+                "MCP server returned HTTP {}",
+                status
+            )));
         }
         let is_event_stream = resp
             .headers()
@@ -421,7 +533,7 @@ impl SseTransport {
         let sse_url = self.sse_url.clone();
         let server_name = self.server_name.clone();
 
-        self.reader_task = Some(tokio::spawn(async move {
+        self.reader_task = Some(zeroclaw_spawn::spawn!(async move {
             let stream = resp
                 .bytes_stream()
                 .map(|item| item.map_err(std::io::Error::other));
@@ -473,22 +585,14 @@ impl SseTransport {
                 }
             }
 
+            // Stream closed: drop every pending sender so each waiter observes a
+            // `RecvError`, which `send_and_recv` maps to
+            // `McpTransportError::TransportClosed` to trigger a reconnect.
             let pending = {
                 let mut guard = shared.lock().await;
                 std::mem::take(&mut guard.pending)
             };
-            for (_, tx) in pending {
-                let _ = tx.send(JsonRpcResponse {
-                    jsonrpc: crate::mcp_protocol::JSONRPC_VERSION.to_string(),
-                    id: None,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: INTERNAL_ERROR,
-                        message: "SSE connection closed".to_string(),
-                        data: None,
-                    }),
-                });
-            }
+            drop(pending);
         }));
         self.stream_state = SseStreamState::Connected;
 
@@ -504,33 +608,22 @@ impl SseTransport {
 
         let derived = derive_message_url(&self.sse_url, "messages")
             .or_else(|| derive_message_url(&self.sse_url, "message"))
-            .ok_or_else(|| anyhow!("invalid SSE URL"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"sse_url": &self.sse_url})),
+                    "mcp_transport: invalid SSE URL"
+                );
+                anyhow::Error::msg("invalid SSE URL")
+            })?;
         let mut guard = self.shared.lock().await;
         if guard.message_url.is_none() {
             guard.message_url = Some(derived.clone());
             guard.message_url_from_endpoint = false;
         }
         Ok((derived, false))
-    }
-
-    #[allow(dead_code)] // WIP: alternate message URL fallback
-    fn maybe_try_alternate_message_url(
-        &self,
-        current_url: &str,
-        from_endpoint: bool,
-    ) -> Option<String> {
-        if from_endpoint {
-            return None;
-        }
-        let alt = if current_url.ends_with("/messages") {
-            derive_message_url(&self.sse_url, "message")
-        } else {
-            derive_message_url(&self.sse_url, "messages")
-        }?;
-        if alt == current_url {
-            return None;
-        }
-        Some(alt)
     }
 }
 
@@ -616,10 +709,13 @@ async fn handle_sse_event(
     if let Some(tx) = tx {
         let _ = tx.send(resp);
     } else {
-        tracing::debug!(
-            "MCP SSE `{}` received response for unknown id {}",
-            server_name,
-            id
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "MCP SSE `{}` received response for unknown id {}",
+                server_name, id
+            )
         );
     }
 }
@@ -935,6 +1031,12 @@ impl McpTransportConn for SseTransport {
 
         if let Some(status) = last_status {
             if !status.is_success() {
+                if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
+                    return Err(McpTransportError::StaleSession {
+                        status: status.as_u16(),
+                    }
+                    .into());
+                }
                 bail!("MCP server returned HTTP {}", status);
             }
         } else {
@@ -945,7 +1047,28 @@ impl McpTransportConn for SseTransport {
             bail!("MCP server returned no response");
         };
 
-        rx.await.map_err(|_| anyhow!("SSE response channel closed"))
+        // A dropped receiver means the SSE reader task tore down the stream
+        // before our response arrived — recoverable via reconnect.
+        rx.await
+            .map_err(|_| McpTransportError::TransportClosed.into())
+    }
+
+    async fn reset(&mut self) -> Result<()> {
+        // Tear down the reader task and clear the cached endpoint/session state
+        // so the next send re-handshakes: a fresh GET stream and a new
+        // `endpoint` event from the (possibly restarted) server.
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(task) = self.reader_task.take() {
+            task.abort();
+        }
+        self.stream_state = SseStreamState::Unknown;
+        let mut guard = self.shared.lock().await;
+        guard.message_url = None;
+        guard.message_url_from_endpoint = false;
+        guard.pending.clear();
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<()> {
@@ -1420,5 +1543,117 @@ mod tests {
             .build()
             .expect("build request");
         assert!(req.headers().get(MCP_SESSION_ID_HEADER).is_none());
+    }
+
+    #[tokio::test]
+    async fn http_transport_reset_clears_session_id() {
+        let config = McpServerConfig {
+            name: "test-http".into(),
+            transport: McpTransport::Http,
+            url: Some("http://localhost/mcp".into()),
+            ..Default::default()
+        };
+        let mut transport = HttpTransport::new(&config).expect("build transport");
+        transport.session_id = Some("stale-session".into());
+        transport.reset().await.expect("reset");
+        assert!(transport.session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn http_transport_maps_404_to_stale_session() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let config = McpServerConfig {
+            name: "test-http".into(),
+            transport: McpTransport::Http,
+            url: Some(server.uri()),
+            ..Default::default()
+        };
+        let mut transport = HttpTransport::new(&config).expect("build transport");
+        // A 404 only signals a stale session when the request carried a session id.
+        transport.session_id = Some("sess-1".into());
+        let req = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
+        let err = transport
+            .send_and_recv(&req)
+            .await
+            .expect_err("404 should error");
+        match err.downcast_ref::<McpTransportError>() {
+            Some(McpTransportError::StaleSession { status }) => assert_eq!(*status, 404),
+            other => panic!("expected StaleSession, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_transport_404_without_session_is_plain_error() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let config = McpServerConfig {
+            name: "test-http".into(),
+            transport: McpTransport::Http,
+            url: Some(server.uri()),
+            ..Default::default()
+        };
+        // No session id was ever issued (stateless server, or a misconfigured url):
+        // a 404 here is a missing endpoint, not a stale session — it must NOT map to
+        // StaleSession (which would make `call_tool` burn a wasted reconnect).
+        let mut transport = HttpTransport::new(&config).expect("build transport");
+        assert!(transport.session_id.is_none());
+        let req = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
+        let err = transport
+            .send_and_recv(&req)
+            .await
+            .expect_err("404 should error");
+        assert!(
+            !matches!(
+                err.downcast_ref::<McpTransportError>(),
+                Some(McpTransportError::StaleSession { .. })
+            ),
+            "sessionless 404 must not be classified as StaleSession, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("MCP server returned HTTP 404"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_transport_reset_clears_session_and_endpoint_state() {
+        let config = McpServerConfig {
+            name: "test-sse".into(),
+            transport: McpTransport::Sse,
+            url: Some("http://localhost:1/sse".into()),
+            ..Default::default()
+        };
+        let mut transport = SseTransport::new(&config).expect("build transport");
+        transport.stream_state = SseStreamState::Connected;
+        {
+            let mut guard = transport.shared.lock().await;
+            guard.message_url = Some("http://localhost:1/messages".into());
+            guard.message_url_from_endpoint = true;
+            let (tx, _rx) = oneshot::channel();
+            guard.pending.insert(7, tx);
+        }
+
+        transport.reset().await.expect("reset");
+
+        assert_eq!(transport.stream_state, SseStreamState::Unknown);
+        let guard = transport.shared.lock().await;
+        assert!(guard.message_url.is_none());
+        assert!(!guard.message_url_from_endpoint);
+        assert!(guard.pending.is_empty());
     }
 }

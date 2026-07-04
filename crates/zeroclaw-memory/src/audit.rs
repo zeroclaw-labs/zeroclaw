@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 /// Audit log entry operations.
@@ -20,6 +20,7 @@ pub enum AuditOp {
     Get,
     List,
     Forget,
+    Purge,
     StoreProcedural,
 }
 
@@ -31,6 +32,7 @@ impl std::fmt::Display for AuditOp {
             Self::Get => write!(f, "get"),
             Self::List => write!(f, "list"),
             Self::Forget => write!(f, "forget"),
+            Self::Purge => write!(f, "purge"),
             Self::StoreProcedural => write!(f, "store_procedural"),
         }
     }
@@ -40,8 +42,15 @@ impl std::fmt::Display for AuditOp {
 pub struct AuditedMemory<M: Memory> {
     inner: M,
     audit_conn: Arc<Mutex<Connection>>,
-    #[allow(dead_code)]
-    db_path: PathBuf,
+}
+
+impl<M: Memory> ::zeroclaw_api::attribution::Attributable for AuditedMemory<M> {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        self.inner.role()
+    }
+    fn alias(&self) -> &str {
+        self.inner.alias()
+    }
 }
 
 impl<M: Memory> AuditedMemory<M> {
@@ -71,7 +80,6 @@ impl<M: Memory> AuditedMemory<M> {
         Ok(Self {
             inner,
             audit_conn: Arc::new(Mutex::new(conn)),
-            db_path,
         })
     }
 
@@ -113,12 +121,31 @@ impl<M: Memory> AuditedMemory<M> {
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         Ok(count as usize)
     }
+
+    /// The wrapped backend (test-only introspection).
+    #[cfg(test)]
+    pub(crate) fn inner(&self) -> &M {
+        &self.inner
+    }
 }
 
 #[async_trait]
 impl<M: Memory> Memory for AuditedMemory<M> {
     fn name(&self) -> &str {
         self.inner.name()
+    }
+
+    fn refresh_embedder(
+        &self,
+        model_provider: &str,
+        api_key: Option<&str>,
+        model: &str,
+        dimensions: usize,
+    ) {
+        // Transparent decorator: forward the embedder refresh to the wrapped
+        // backend like every other method (#8359).
+        self.inner
+            .refresh_embedder(model_provider, api_key, model, dimensions);
     }
 
     async fn store(
@@ -157,6 +184,21 @@ impl<M: Memory> Memory for AuditedMemory<M> {
         self.inner.get(key).await
     }
 
+    async fn get_for_agent(
+        &self,
+        key: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        self.log_audit(
+            AuditOp::Get,
+            Some(key),
+            None,
+            None,
+            Some(&format!("agent_id={agent_id}")),
+        );
+        self.inner.get_for_agent(key, agent_id).await
+    }
+
     async fn list(
         &self,
         category: Option<&MemoryCategory>,
@@ -169,6 +211,34 @@ impl<M: Memory> Memory for AuditedMemory<M> {
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
         self.log_audit(AuditOp::Forget, Some(key), None, None, None);
         self.inner.forget(key).await
+    }
+
+    async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool> {
+        self.log_audit(
+            AuditOp::Forget,
+            Some(key),
+            None,
+            None,
+            Some(&format!("agent_id={agent_id}")),
+        );
+        self.inner.forget_for_agent(key, agent_id).await
+    }
+
+    async fn purge_session_for_agent(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<usize> {
+        self.log_audit(
+            AuditOp::Purge,
+            None,
+            None,
+            Some(session_id),
+            Some(&format!("agent_id={agent_id}")),
+        );
+        self.inner
+            .purge_session_for_agent(session_id, agent_id)
+            .await
     }
 
     async fn count(&self) -> anyhow::Result<usize> {
@@ -229,6 +299,49 @@ impl<M: Memory> Memory for AuditedMemory<M> {
             .store_with_metadata(key, content, category, session_id, namespace, importance)
             .await
     }
+
+    async fn store_with_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        namespace: Option<&str>,
+        importance: Option<f64>,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.log_audit(AuditOp::Store, Some(key), namespace, session_id, None);
+        self.inner
+            .store_with_agent(
+                key, content, category, session_id, namespace, importance, agent_id,
+            )
+            .await
+    }
+
+    async fn recall_for_agents(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.log_audit(
+            AuditOp::Recall,
+            None,
+            None,
+            session_id,
+            Some(&format!("query={query}")),
+        );
+        self.inner
+            .recall_for_agents(allowed_agent_ids, query, limit, session_id, since, until)
+            .await
+    }
+
+    async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
+        self.inner.ensure_agent_uuid(alias).await
+    }
 }
 
 #[cfg(test)]
@@ -237,10 +350,34 @@ mod tests {
     use crate::none::NoneMemory;
     use tempfile::TempDir;
 
+    /// The audit decorator must forward `refresh_embedder` to its wrapped
+    /// backend like every other method (#8359).
+    #[test]
+    fn refresh_embedder_forwards_to_inner_backend() {
+        let tmp = TempDir::new().unwrap();
+        let inner = crate::sqlite::SqliteMemory::new("test", tmp.path()).unwrap();
+        let audited = AuditedMemory::new(inner, tmp.path()).unwrap();
+        assert_eq!(audited.inner().embedder_dimensions(), 0);
+
+        Memory::refresh_embedder(
+            &audited,
+            "openai",
+            Some("sk-test"),
+            "text-embedding-3-small",
+            1536,
+        );
+
+        assert_eq!(
+            audited.inner().embedder_dimensions(),
+            1536,
+            "AuditedMemory must forward refresh_embedder to the wrapped backend"
+        );
+    }
+
     #[tokio::test]
     async fn audited_memory_logs_store_operation() {
         let tmp = TempDir::new().unwrap();
-        let inner = NoneMemory::new();
+        let inner = NoneMemory::new("none");
         let audited = AuditedMemory::new(inner, tmp.path()).unwrap();
 
         audited
@@ -254,7 +391,7 @@ mod tests {
     #[tokio::test]
     async fn audited_memory_logs_recall_operation() {
         let tmp = TempDir::new().unwrap();
-        let inner = NoneMemory::new();
+        let inner = NoneMemory::new("none");
         let audited = AuditedMemory::new(inner, tmp.path()).unwrap();
 
         let _ = audited.recall("query", 10, None, None, None).await;
@@ -265,7 +402,7 @@ mod tests {
     #[tokio::test]
     async fn audited_memory_prune_works() {
         let tmp = TempDir::new().unwrap();
-        let inner = NoneMemory::new();
+        let inner = NoneMemory::new("none");
         let audited = AuditedMemory::new(inner, tmp.path()).unwrap();
 
         audited
@@ -283,7 +420,7 @@ mod tests {
     #[tokio::test]
     async fn audited_memory_delegates_correctly() {
         let tmp = TempDir::new().unwrap();
-        let inner = NoneMemory::new();
+        let inner = NoneMemory::new("none");
         let audited = AuditedMemory::new(inner, tmp.path()).unwrap();
 
         assert_eq!(audited.name(), "none");

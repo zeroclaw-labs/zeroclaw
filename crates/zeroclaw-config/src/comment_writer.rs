@@ -5,7 +5,7 @@
 //! strips comment lines from the existing prefix.
 //!
 //! Single source of truth — neither the gateway nor the CLI should re-implement
-//! this logic. Issue #6175.
+//! this logic.
 
 use std::path::Path;
 

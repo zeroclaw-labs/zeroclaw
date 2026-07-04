@@ -23,7 +23,8 @@ Read these files at the start of every session. They are authoritative.
 
 - `AGENTS.md` — risk tiers, high-risk paths, anti-patterns, commands
 - `docs/book/src/contributing/pr-review-protocol.md` — **the full review protocol**;
-  follow it exactly for every PR, including the review-body Markdown format
+  follow it exactly for every PR, including template completeness,
+  public-artifact truthfulness, and the review-body Markdown format
 - `.github/pull_request_template.md` — required PR body sections; used to
   check template completeness
 - `docs/book/src/foundations/fnd-003-governance.md` — label taxonomy, tracking
@@ -96,6 +97,8 @@ The protocol specifies:
 - **Label hygiene** — fix obvious label mismatches yourself when the active
   reviewer has label permissions, after approval for the public-state mutation;
   do not ask authors to update labels they may not be allowed to edit
+- **Template and public-artifact checks** — run the checks defined in the
+  protocol before approving
 - **The verdict decision tree** — which flag to use based on review state
 - **The feedback taxonomy** (🔴 / 🟡 / ✅ / 🔵 / 🟢), including the required
   H3 review-body heading format that starts each formal finding with the
@@ -161,7 +164,8 @@ the handoff.
    |---|---|
    | PR fits a milestone (any type) | Assign that milestone → go to step 5 |
    | No scope match + break-fix or docs | Assign the **earliest open milestone** by version order → go to step 5 |
-   | No scope match + feature | Tag @JordanTheJet → go to step 6 |
+   | No scope match + feature, and PR is not yet approved/clean/merge-ready | Ask the milestone owners: default @singlerider; use @JordanTheJet only for hardware, edge-deployment, or project-lead scope → go to step 6 |
+   | No scope match + feature, but PR is approved, clean, labels/body are aligned, required checks are green, and the reviewer is preparing merge | Assign the **earliest open milestone** by version order → go to step 5 |
 
    "Earliest open milestone" means the lowest semver among all currently open
    milestones (e.g. v0.7.6 before v0.7.7 before v0.8.0). Sort by the version
@@ -204,12 +208,22 @@ the handoff.
         --body-file tmp/tracking-<milestone-title>.md
       ```
 
-6. **Jordan trapdoor — feature with no scope match:**
+6. **Milestone-owner fallback — feature with no scope match and not
+   merge-ready:**
 
-   Post a comment on the PR tagging @JordanTheJet for milestone alignment:
+   Post a comment on the PR tagging the milestone owners for alignment. Default
+   to @singlerider; use @JordanTheJet only when the unclear
+   placement is primarily about hardware, edge deployments, or project-lead
+   scope. Do this only when the PR is not otherwise ready to merge. If the PR is
+   approved, clean, labels/body are aligned, required checks are green, and the
+   reviewer is preparing merge, assign the earliest open milestone by version
+   order instead, update any tracker if one exists, and continue to the normal
+   exact squash-merge approval flow.
+
+   Example comment:
    ```bash
    gh pr comment <number> --repo zeroclaw-labs/zeroclaw \
-     --body "@JordanTheJet — milestone alignment needed: this PR does not clearly fit within the scope boundary of any open milestone. Please advise on placement or deferral."
+     --body "@singlerider — milestone alignment needed: this PR does not clearly fit within the scope boundary of any open milestone. Please advise on placement or deferral."
    ```
 
    Note this in `tmp/handoff.md` so the next session knows alignment is
@@ -222,7 +236,7 @@ After every posted review, update `tmp/handoff.md`:
 - Mark the PR with the verdict posted, the commit reviewed (`head.sha`), and
   what remains open (if anything).
 - Record the milestone alignment action taken (milestone set, tracking issue
-  updated, @JordanTheJet tagged, or skipped with reason).
+  updated, milestone owner tagged, or skipped with reason).
 - If the PR queue changed (e.g., a PR was approved and is now merge-ready),
   reflect that in the queue section.
 - Keep the handoff accurate enough that a new session starting cold can pick
@@ -279,9 +293,12 @@ These norms are documented in
    documented no-milestone type (`chore:`/`deps:` prefix or deps-only diff).
    Note the skip reason in the handoff when bypassing. Break-fix (`fix:`
    prefix or `bug` label) and docs (`docs:` prefix) PRs with no scope match
-   are assigned the earliest open milestone by version order — do not tag
-   @JordanTheJet for those. @JordanTheJet is only the fallback for feature
-   PRs with no scope match.
+   are assigned the earliest open milestone by version order. Feature PRs with
+   no clear scope match ask the milestone owners only while they are still in
+   the review lane. Once a feature PR is approved, clean, labels/body are
+   aligned, all required checks are green, and the reviewer is preparing merge,
+   assign the earliest open milestone by version order and continue the merge
+   flow instead of blocking on a placement comment.
 8. **Always update `tmp/handoff.md` after posting.** The handoff is useless if
    it's not current. Include the milestone alignment outcome.
 9. **Never merge.** Never push to contributor branches.

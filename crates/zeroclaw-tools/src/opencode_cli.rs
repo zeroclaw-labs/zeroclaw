@@ -60,14 +60,8 @@ impl Tool for OpenCodeCliTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        // Rate limit check
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
+        // Rate limiting is applied by the RateLimitedTool wrapper at
+        // registration time (see zeroclaw-runtime::tools::mod).
 
         // Enforce act policy
         if let Err(error) = self
@@ -82,10 +76,16 @@ impl Tool for OpenCodeCliTool {
         }
 
         // Extract prompt (required)
-        let prompt = args
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'prompt' parameter"))?;
+        let prompt = args.get("prompt").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "prompt"})),
+                "opencode_cli: missing prompt parameter"
+            );
+            anyhow::Error::msg("Missing 'prompt' parameter")
+        })?;
 
         // Validate working directory — require both paths to exist (reject
         // non-existent paths instead of falling back to the raw value, which
@@ -93,6 +93,16 @@ impl Tool for OpenCodeCliTool {
         // specially-crafted path components).
         let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
             let wd_path = std::path::PathBuf::from(wd);
+            // Resolve relative working_directory against workspace_dir, NOT
+            // the daemon's current working directory. This prevents the bug
+            // where an external coding tool's relative working_directory
+            // would silently resolve to a path outside the workspace when
+            // the daemon cwd differs from workspace_dir.
+            let wd_path = if wd_path.is_relative() {
+                self.security.workspace_dir.join(&wd_path)
+            } else {
+                wd_path
+            };
             let workspace = &self.security.workspace_dir;
             let canonical_wd = match wd_path.canonicalize() {
                 Ok(p) => p,
@@ -135,15 +145,6 @@ impl Tool for OpenCodeCliTool {
         } else {
             self.security.workspace_dir.clone()
         };
-
-        // Record action budget
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
 
         // Build CLI command
         let mut cmd = Command::new("opencode");

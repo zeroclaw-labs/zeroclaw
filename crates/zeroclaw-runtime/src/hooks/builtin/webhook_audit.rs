@@ -115,8 +115,11 @@ impl WebhookAuditHook {
     pub fn new(config: WebhookAuditConfig) -> Self {
         // Warn if enabled but no URL configured.
         if config.enabled && config.url.is_empty() {
-            tracing::warn!(
-                hook = "webhook-audit",
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"hook": "webhook-audit"})),
                 "webhook-audit hook is enabled but no URL is configured — audit events will be dropped"
             );
         }
@@ -125,7 +128,15 @@ impl WebhookAuditHook {
         if !config.url.is_empty()
             && let Err(e) = validate_webhook_url(&config.url)
         {
-            tracing::error!(hook = "webhook-audit", error = %e, "webhook URL validation failed");
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(
+                        ::serde_json::json!({"hook": "webhook-audit", "error": format!("{}", e)})
+                    ),
+                "webhook URL validation failed"
+            );
             panic!("webhook-audit: {e}");
         }
 
@@ -248,7 +259,12 @@ impl HookHandler for WebhookAuditHook {
 
     async fn before_tool_call(&self, name: String, args: Value) -> HookResult<(String, Value)> {
         if self.config.include_args && matches_any_pattern(&self.config.tool_patterns, &name) {
-            tracing::debug!(hook = "webhook-audit", tool = %name, "capturing args for audit");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"hook": "webhook-audit", "tool": name})),
+                "capturing args for audit"
+            );
             self.pending_args
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -312,25 +328,15 @@ impl HookHandler for WebhookAuditHook {
         let url = self.config.url.clone();
 
         // Fire-and-forget — never block the agent loop.
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             match client.post(&url).json(&payload).send().await {
                 Ok(resp) => {
                     if !resp.status().is_success() {
-                        tracing::error!(
-                            hook = "webhook-audit",
-                            url = %url,
-                            status = %resp.status(),
-                            "webhook endpoint returned non-success status"
-                        );
+                        ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"hook": "webhook-audit", "url": url, "status": resp.status().to_string()})), "webhook endpoint returned non-success status");
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        hook = "webhook-audit",
-                        url = %url,
-                        error = %e,
-                        "failed to POST audit payload"
-                    );
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"hook": "webhook-audit", "url": url, "error": format!("{}", e)})), "failed to POST audit payload");
                 }
             }
         });

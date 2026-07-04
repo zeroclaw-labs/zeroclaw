@@ -5,7 +5,6 @@ import {
   getCronJobs,
   getIntegrations,
   getMemory,
-  getCost,
   getCliTools,
   getHealth,
   runDoctor,
@@ -16,7 +15,6 @@ import type {
   CronJob,
   Integration,
   MemoryEntry,
-  CostSummary,
   CliTool,
   HealthSnapshot,
   DiagResult,
@@ -113,11 +111,6 @@ export function useMemory(
     [query, category],
   );
   return useApiCall(fetcher, [query, category]);
-}
-
-/** Fetch cost summary from /api/cost. */
-export function useCost(): UseApiResult<CostSummary> {
-  return useApiCall(getCost);
 }
 
 /** Fetch CLI tools from /api/cli-tools. */

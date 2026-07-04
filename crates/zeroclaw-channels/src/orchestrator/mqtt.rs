@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
-use tracing::{info, warn};
 
 use zeroclaw_config::schema::MqttConfig;
+use zeroclaw_runtime::security::cap_untrusted;
 use zeroclaw_runtime::sop::audit::SopAuditLogger;
 use zeroclaw_runtime::sop::dispatch::{dispatch_sop_event, process_headless_results};
 use zeroclaw_runtime::sop::engine::{SopEngine, now_iso8601};
@@ -40,7 +40,11 @@ pub async fn run_mqtt_sop_listener(
     // Configure TLS transport when mqtts:// scheme is used
     if config.use_tls {
         mqtt_options.set_transport(Transport::tls_with_default_config());
-        info!("MQTT SOP listener: TLS transport enabled");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "MQTT SOP listener: TLS transport enabled"
+        );
     }
 
     let (client, mut eventloop) = AsyncClient::new(mqtt_options, 64);
@@ -54,7 +58,12 @@ pub async fn run_mqtt_sop_listener(
     // Subscribe to all configured topics
     for topic in &config.topics {
         client.subscribe(topic, qos).await?;
-        info!("MQTT SOP listener: subscribed to '{topic}'");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"topic": topic})),
+            "MQTT SOP listener: subscribed to ''"
+        );
     }
 
     zeroclaw_runtime::health::mark_component_ok("mqtt");
@@ -62,8 +71,42 @@ pub async fn run_mqtt_sop_listener(
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::Publish(msg))) => {
-                let topic = msg.topic.clone();
-                let payload = String::from_utf8_lossy(&msg.payload).to_string();
+                let max_bytes = match engine.lock() {
+                    Ok(eng) => eng.config().untrusted_payload_max_bytes,
+                    Err(e) => {
+                        zeroclaw_runtime::health::mark_component_error(
+                            "mqtt",
+                            format!("SOP engine lock poisoned: {e}"),
+                        );
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "MQTT SOP listener: engine lock poisoned while reading SOP safety config"
+                        );
+                        continue;
+                    }
+                };
+                let (topic, topic_truncated) = cap_mqtt_text(&msg.topic, max_bytes);
+                let payload_raw = String::from_utf8_lossy(&msg.payload);
+                let (payload, payload_truncated) = cap_mqtt_text(&payload_raw, max_bytes);
+                if topic_truncated || payload_truncated {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "topic_truncated": topic_truncated,
+                                "payload_truncated": payload_truncated,
+                                "max_bytes": max_bytes,
+                            })),
+                        "MQTT SOP listener: capped oversized untrusted publish"
+                    );
+                }
 
                 let event = SopEvent {
                     source: SopTriggerSource::Mqtt,
@@ -77,14 +120,24 @@ pub async fn run_mqtt_sop_listener(
             }
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 zeroclaw_runtime::health::mark_component_ok("mqtt");
-                info!("MQTT SOP listener: connected to broker");
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "MQTT SOP listener: connected to broker"
+                );
             }
             Ok(_) => {
                 // Other events (PingResp, SubAck, etc.) — ignore
             }
             Err(e) => {
                 zeroclaw_runtime::health::mark_component_error("mqtt", e.to_string());
-                warn!("MQTT SOP listener: connection error: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "MQTT SOP listener: connection error"
+                );
                 // rumqttc handles auto-reconnect; loop continues
             }
         }
@@ -119,6 +172,10 @@ fn broker_port(url: &str) -> u16 {
         .unwrap_or(default_port)
 }
 
+fn cap_mqtt_text(content: &str, max_bytes: usize) -> (String, bool) {
+    cap_untrusted(content, max_bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,6 +192,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("qos must be 0, 1, or 2"));
@@ -152,6 +210,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("mqtt://"));
@@ -169,6 +228,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("at least one topic"));
@@ -186,6 +246,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("client_id must not be empty"));
@@ -203,6 +264,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         assert!(config.validate().is_ok());
     }
@@ -219,6 +281,7 @@ mod tests {
             password: None,
             use_tls: true,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("use_tls is true"));
@@ -236,6 +299,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("mqtts://"));
@@ -253,6 +317,7 @@ mod tests {
             password: None,
             use_tls: true,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         assert!(config.validate().is_ok());
     }
@@ -280,5 +345,13 @@ mod tests {
     #[test]
     fn broker_port_defaults_8883_for_mqtts() {
         assert_eq!(broker_port("mqtts://secure.example.com"), 8883);
+    }
+
+    #[test]
+    fn cap_mqtt_text_truncates_on_char_boundary() {
+        let (capped, truncated) = cap_mqtt_text("abc😀def", 5);
+
+        assert!(truncated);
+        assert_eq!(capped, "abc...[truncated 7 bytes]");
     }
 }

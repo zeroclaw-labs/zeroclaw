@@ -153,7 +153,7 @@ mod tests {
 
     fn seeded_discord_mem() -> (TempDir, Arc<dyn Memory>) {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new_named(tmp.path(), "discord").unwrap();
+        let mem = SqliteMemory::new_named("test", tmp.path(), "discord").unwrap();
         (tmp, Arc::new(mem))
     }
 

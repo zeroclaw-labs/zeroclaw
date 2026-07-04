@@ -4,7 +4,6 @@ use std::time::Instant;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde_json::json;
-use tracing::warn;
 
 use super::types::{SopRun, SopRunStatus, SopStepStatus};
 use zeroclaw_memory::traits::{Memory, MemoryCategory};
@@ -92,6 +91,24 @@ impl SopMetricsCollector {
         }
     }
 
+    /// Process-wide shared collector (production). The engine feeds it
+    /// (`record_run_complete` in `finish_run`) and the SOP tools report from it
+    /// (`sop_status`) / feed it (`sop_approve`), so they observe one set of
+    /// metrics. Tests use a fresh `new()` per engine for isolation.
+    pub fn shared() -> std::sync::Arc<SopMetricsCollector> {
+        static SHARED: std::sync::OnceLock<std::sync::Arc<SopMetricsCollector>> =
+            std::sync::OnceLock::new();
+        SHARED
+            .get_or_init(|| std::sync::Arc::new(SopMetricsCollector::new()))
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_for_test(&self) {
+        let mut state = self.inner.write().expect("metrics collector lock poisoned");
+        *state = CollectorState::default();
+    }
+
     // ── Push methods (sync, write lock) ────────────────────────
 
     /// Record a terminal run (Completed/Failed/Cancelled).
@@ -99,7 +116,12 @@ impl SopMetricsCollector {
     /// Call after `audit.log_run_complete()`.
     pub fn record_run_complete(&self, run: &SopRun) {
         let Ok(mut state) = self.inner.write() else {
-            warn!("SOP metrics collector lock poisoned in record_run_complete");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "SOP metrics collector lock poisoned in record_run_complete"
+            );
             return;
         };
 
@@ -131,10 +153,16 @@ impl SopMetricsCollector {
 
     /// Record a human approval event.
     ///
-    /// Call after `audit.log_approval()`.
+    /// Call after the gate resolves (the append-only ledger row is written inside
+    /// `engine.resolve_gate`).
     pub fn record_approval(&self, sop_name: &str, run_id: &str) {
         let Ok(mut state) = self.inner.write() else {
-            warn!("SOP metrics collector lock poisoned in record_approval");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "SOP metrics collector lock poisoned in record_approval"
+            );
             return;
         };
         state.global.counters.human_approvals += 1;
@@ -154,10 +182,16 @@ impl SopMetricsCollector {
 
     /// Record a timeout auto-approval event.
     ///
-    /// Call after `audit.log_timeout_auto_approve()`.
+    /// Call after the timeout action resolves the gate (the `system`-attributed
+    /// `gate_resolved` ledger row is written inside `engine.resolve_gate`).
     pub fn record_timeout_auto_approve(&self, sop_name: &str, run_id: &str) {
         let Ok(mut state) = self.inner.write() else {
-            warn!("SOP metrics collector lock poisoned in record_timeout_auto_approve");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "SOP metrics collector lock poisoned in record_timeout_auto_approve"
+            );
             return;
         };
         state.global.counters.timeout_auto_approvals += 1;
@@ -177,50 +211,80 @@ impl SopMetricsCollector {
 
     // ── Warm-start (async) ─────────────────────────────────────
 
-    /// Rebuild collector state from Memory backend (single-pass O(n)).
+    /// Rebuild collector state after a restart from the durable persistence
+    /// layers.
     ///
-    /// Scans all entries in `MemoryCategory::Custom("sop")`.
-    /// Falls back to empty collector on failure.
+    /// Terminal run records come from the `Memory` run audit
+    /// (`MemoryCategory::Custom("sop")`, `sop_run_*` snapshots). The approval and
+    /// timeout-auto-approval counters come from the append-only gate ledger in the
+    /// run-store (EPIC C's `gate_resolved` rows), NOT the retired
+    /// `sop_approval_*` / `sop_timeout_approve_*` Memory keys: a `gate_resolved`
+    /// row with `decision == "approve"` is a human approval unless its
+    /// `source == "system"`, which marks a timeout auto-approval.
     ///
-    /// For approval entries whose run_id does **not** match a terminal run,
-    /// populates `pending_approvals` / `pending_timeout_approvals` so that
-    /// if the run completes via live push after restart, approval flags are
-    /// correctly propagated to the `RunSnapshot`.
-    pub async fn rebuild_from_memory(memory: &dyn Memory) -> anyhow::Result<Self> {
+    /// For approvals whose run_id does **not** match a terminal run (the gate
+    /// cleared but the run is still live), populates `pending_approvals` /
+    /// `pending_timeout_approvals` so that if the run completes via live push
+    /// after restart, approval flags are correctly propagated to the
+    /// `RunSnapshot`. Falls back to an empty collector on failure.
+    pub async fn rebuild_from_persistence(
+        memory: &dyn Memory,
+        store: &dyn super::store::SopRunStore,
+    ) -> anyhow::Result<Self> {
         let category = MemoryCategory::Custom("sop".into());
         let entries = memory.list(Some(&category), None).await?;
 
-        // Pass 1: collect terminal runs and count approvals per run_id
+        // Pass 1: terminal run snapshots from the Memory run audit.
         let mut runs: HashMap<String, SopRun> = HashMap::new();
-        let mut approval_counts: HashMap<String, u64> = HashMap::new();
-        let mut timeout_counts: HashMap<String, u64> = HashMap::new();
-        // Track sop_name per run_id for approval entries (needed for pending + per-SOP counters)
+        // sop_name per run_id, for the pending maps + per-SOP counters.
         let mut approval_sop_names: HashMap<String, String> = HashMap::new();
-
         for entry in &entries {
-            if entry.key.starts_with("sop_run_") {
-                if let Ok(run) = serde_json::from_str::<SopRun>(&entry.content)
-                    && matches!(
-                        run.status,
-                        SopRunStatus::Completed | SopRunStatus::Failed | SopRunStatus::Cancelled
-                    )
-                {
-                    runs.insert(run.run_id.clone(), run);
-                }
-            } else if entry.key.starts_with("sop_approval_") {
-                if let Ok(run) = serde_json::from_str::<SopRun>(&entry.content) {
-                    *approval_counts.entry(run.run_id.clone()).or_default() += 1;
-                    approval_sop_names
-                        .entry(run.run_id.clone())
-                        .or_insert(run.sop_name);
-                }
-            } else if entry.key.starts_with("sop_timeout_approve_")
+            if entry.key.starts_with("sop_run_")
                 && let Ok(run) = serde_json::from_str::<SopRun>(&entry.content)
+                && matches!(
+                    run.status,
+                    SopRunStatus::Completed | SopRunStatus::Failed | SopRunStatus::Cancelled
+                )
             {
-                *timeout_counts.entry(run.run_id.clone()).or_default() += 1;
                 approval_sop_names
                     .entry(run.run_id.clone())
-                    .or_insert(run.sop_name);
+                    .or_insert_with(|| run.sop_name.clone());
+                runs.insert(run.run_id.clone(), run);
+            }
+        }
+
+        // The run_ids whose gate ledgers we scan: terminal runs above, plus any
+        // still-active run in the store (a gate approved before the run finished
+        // is still counted, mirroring the old pending-approvals handling).
+        if let Ok(active) = store.load_active_runs() {
+            for pr in active {
+                approval_sop_names
+                    .entry(pr.run.run_id.clone())
+                    .or_insert_with(|| pr.run.sop_name.clone());
+            }
+        }
+
+        // Pass 2: approval / timeout-auto-approval counts from the append-only
+        // gate ledger (the audit of record). A `gate_resolved` approve attributed
+        // to the `system` source is a timeout auto-approval; any other source is a
+        // human approval. Denials and escalations are not approvals.
+        let mut approval_counts: HashMap<String, u64> = HashMap::new();
+        let mut timeout_counts: HashMap<String, u64> = HashMap::new();
+        for run_id in approval_sop_names.keys() {
+            let Ok(events) = store.list_events(run_id) else {
+                continue;
+            };
+            for ev in &events {
+                if ev.kind != "gate_resolved"
+                    || ev.payload.get("decision").and_then(|d| d.as_str()) != Some("approve")
+                {
+                    continue;
+                }
+                if ev.payload.get("source").and_then(|s| s.as_str()) == Some("system") {
+                    *timeout_counts.entry(run_id.clone()).or_default() += 1;
+                } else {
+                    *approval_counts.entry(run_id.clone()).or_default() += 1;
+                }
             }
         }
 
@@ -475,7 +539,13 @@ fn parse_completed_at(ts: &str) -> Option<DateTime<Utc>> {
         return Some(n.and_utc());
     }
     // Last resort
-    warn!("SOP metrics: could not parse completed_at timestamp: {ts}");
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({"ts": ts})),
+        "SOP metrics: could not parse completed_at timestamp: "
+    );
     None
 }
 
@@ -591,7 +661,29 @@ fn counters_to_json(sop: &SopCounters) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sop::store::model::{PersistedRun, SopEventRecord};
+    use crate::sop::store::{InMemoryRunStore, SopRunStore};
     use crate::sop::types::{SopEvent, SopStepResult, SopTriggerSource};
+
+    /// A `gate_resolved` approve ledger row as the engine writes it. `source` is
+    /// the principal source: `"system"` marks a timeout auto-approval, any other
+    /// value (`"cli"`, `"gateway"`, ...) a human approval.
+    fn gate_approve_event(run_id: &str, source: &str) -> SopEventRecord {
+        SopEventRecord {
+            run_id: run_id.into(),
+            seq: 0,
+            ts: "2026-02-19T12:00:00Z".into(),
+            kind: "gate_resolved".into(),
+            actor: Some(source.into()),
+            reason: None,
+            payload: json!({
+                "step": 1,
+                "source": source,
+                "channel": serde_json::Value::Null,
+                "decision": "approve",
+            }),
+        }
+    }
 
     fn make_event() -> SopEvent {
         SopEvent {
@@ -616,6 +708,7 @@ mod tests {
             run_id: run_id.into(),
             sop_name: sop_name.into(),
             trigger_event: make_event(),
+            frame_marker_id: format!("marker-{run_id}"),
             status,
             current_step: total_steps,
             total_steps,
@@ -1143,9 +1236,15 @@ mod tests {
         );
         audit.log_run_start(&run).await.unwrap();
         audit.log_run_complete(&run).await.unwrap();
-        audit.log_approval(&run, 1).await.unwrap();
 
-        let collector = SopMetricsCollector::rebuild_from_memory(memory.as_ref())
+        // The approval is sourced from the append-only gate ledger, not a Memory
+        // audit key: a human (cli) approve row.
+        let store = InMemoryRunStore::new();
+        store
+            .append_event(&gate_approve_event("r1", "cli"))
+            .unwrap();
+
+        let collector = SopMetricsCollector::rebuild_from_persistence(memory.as_ref(), &store)
             .await
             .unwrap();
 
@@ -1179,6 +1278,7 @@ mod tests {
             run_id: "r1".into(),
             sop_name: "test-sop".into(),
             trigger_event: make_event(),
+            frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Running,
             current_step: 1,
             total_steps: 3,
@@ -1190,7 +1290,8 @@ mod tests {
         };
         audit.log_run_start(&run).await.unwrap();
 
-        let collector = SopMetricsCollector::rebuild_from_memory(memory.as_ref())
+        let store = InMemoryRunStore::new();
+        let collector = SopMetricsCollector::rebuild_from_persistence(memory.as_ref(), &store)
             .await
             .unwrap();
 
@@ -1211,7 +1312,8 @@ mod tests {
             zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap(),
         );
 
-        let collector = SopMetricsCollector::rebuild_from_memory(memory.as_ref())
+        let store = InMemoryRunStore::new();
+        let collector = SopMetricsCollector::rebuild_from_persistence(memory.as_ref(), &store)
             .await
             .unwrap();
 
@@ -1241,10 +1343,16 @@ mod tests {
             vec![make_step(1, SopStepStatus::Completed)],
         );
         audit.log_run_start(&run).await.unwrap();
-        audit.log_timeout_auto_approve(&run, 1).await.unwrap();
         audit.log_run_complete(&run).await.unwrap();
 
-        let collector = SopMetricsCollector::rebuild_from_memory(memory.as_ref())
+        // A timeout auto-approval is a `gate_resolved` approve attributed to the
+        // `system` source.
+        let store = InMemoryRunStore::new();
+        store
+            .append_event(&gate_approve_event("r1", "system"))
+            .unwrap();
+
+        let collector = SopMetricsCollector::rebuild_from_persistence(memory.as_ref(), &store)
             .await
             .unwrap();
 
@@ -1275,11 +1383,14 @@ mod tests {
 
         let audit = crate::sop::SopAuditLogger::new(memory.clone());
 
-        // Store a Running (non-terminal) run with an approval
+        // A Running (non-terminal) run with an approval. The run is discovered as
+        // active from the store (`load_active_runs`); its approval comes from the
+        // store gate ledger.
         let running_run = SopRun {
             run_id: "r1".into(),
             sop_name: "test-sop".into(),
             trigger_event: make_event(),
+            frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Running,
             current_step: 1,
             total_steps: 3,
@@ -1290,10 +1401,21 @@ mod tests {
             llm_calls_saved: 0,
         };
         audit.log_run_start(&running_run).await.unwrap();
-        audit.log_approval(&running_run, 1).await.unwrap();
+
+        let store = InMemoryRunStore::new();
+        store
+            .save_run(&PersistedRun::new(
+                running_run.clone(),
+                "2026-02-19T12:00:00Z".into(),
+                SopTriggerSource::Manual,
+            ))
+            .unwrap();
+        store
+            .append_event(&gate_approve_event("r1", "cli"))
+            .unwrap();
 
         // Warm-start: run is non-terminal, approval should go into pending
-        let collector = SopMetricsCollector::rebuild_from_memory(memory.as_ref())
+        let collector = SopMetricsCollector::rebuild_from_persistence(memory.as_ref(), &store)
             .await
             .unwrap();
 
