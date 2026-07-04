@@ -117,8 +117,7 @@ pub struct CronAddBody {
     pub allowed_tools: Option<Vec<String>>,
     pub delete_after_run: Option<bool>,
     /// If false, disable memory recall for this agent cron job (default: true).
-    #[serde(default)]
-    pub uses_memory: bool,
+    pub uses_memory: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -461,7 +460,7 @@ pub async fn handle_api_cron_add(
             delivery,
             delete_after_run,
             allowed_tools,
-            uses_memory,
+            uses_memory.unwrap_or(true),
         )
     } else {
         let command = match command.as_deref() {
