@@ -58,14 +58,14 @@ tag push.
 1. Contributor opens or updates a PR targeting `master`.
 2. `ci.yml` runs:
    - `lint`: `cargo fmt --all -- --check`, `cargo clippy --workspace
-     --all-targets --features ci-all -- -D warnings`
+     --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`
      (PRs only).
    - `build`: matrix across `x86_64-unknown-linux-gnu`,
      `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`.
    - `check`: matrix: all features + no default features.
    - `check-32bit`: `i686-unknown-linux-gnu`, no default features.
    - `bench`: benchmarks compile check.
-   - `test`: `cargo nextest run --locked --workspace` on `ubuntu-latest`.
+   - `test`: `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on `ubuntu-latest`.
    - `security`: `cargo deny check`.
    - `CI Required Gate`: composite job; branch protection requires this.
 3. Maintainer reviews. Once the gate is green and review policy is satisfied,
