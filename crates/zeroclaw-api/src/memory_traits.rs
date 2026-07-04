@@ -631,11 +631,16 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
 #[async_trait]
 pub trait MemoryStrategy: Send + Sync {
     /// Load and format relevant memory context for a conversation turn.
+    ///
+    /// `turn` carries borrowed turn-correlation metadata; implementations
+    /// must forward it onto every `ObserverEvent::MemoryRecall` they emit
+    /// so the recall span can join the active turn trace.
     async fn load_context(
         &self,
         observer: &dyn crate::observability_traits::Observer,
         query: &str,
         session_id: Option<&str>,
+        turn: crate::observability_traits::TurnMetaRef<'_>,
     ) -> anyhow::Result<String>;
 
     /// Consolidate a conversation turn into long-term memory.

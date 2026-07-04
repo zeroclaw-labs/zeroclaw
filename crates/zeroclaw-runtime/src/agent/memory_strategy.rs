@@ -82,10 +82,11 @@ impl MemoryStrategy for DefaultMemoryStrategy {
         observer: &dyn Observer,
         query: &str,
         session_id: Option<&str>,
+        turn: zeroclaw_api::observability_traits::TurnMetaRef<'_>,
     ) -> anyhow::Result<String> {
         let loader = DefaultMemoryLoader::new(self.limit, self.min_relevance_score);
         loader
-            .load_context(self.memory.as_ref(), observer, query, session_id)
+            .load_context(self.memory.as_ref(), observer, query, session_id, turn)
             .await
     }
 

@@ -136,6 +136,7 @@ impl MemoryStrategy for StaticMemoryStrategy {
         _observer: &dyn Observer,
         _query: &str,
         _session_id: Option<&str>,
+        _turn: zeroclaw_api::observability_traits::TurnMetaRef<'_>,
     ) -> anyhow::Result<String> {
         Ok(self.context.clone())
     }

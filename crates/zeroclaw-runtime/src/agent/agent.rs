@@ -1087,6 +1087,7 @@ impl Agent {
                 &*self.observer,
                 user_message,
                 self.memory_session_id.as_deref(),
+                zeroclaw_api::observability_traits::TurnMetaRef::default(),
             )
             .await
             .unwrap_or_default();
@@ -2285,6 +2286,7 @@ impl Agent {
                 &*self.observer,
                 user_message,
                 self.memory_session_id.as_deref(),
+                zeroclaw_api::observability_traits::TurnMetaRef::default(),
             )
             .await
             .unwrap_or_default();

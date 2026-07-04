@@ -19,7 +19,7 @@ pub use noop::NoopObserver;
 pub use otel::OtelObserver;
 #[cfg(feature = "observability-prometheus")]
 pub use prometheus::PrometheusObserver;
-pub use traits::{Observer, ObserverEvent};
+pub use traits::{Observer, ObserverEvent, TurnMetaRef};
 #[allow(unused_imports)]
 pub use verbose::VerboseObserver;
 

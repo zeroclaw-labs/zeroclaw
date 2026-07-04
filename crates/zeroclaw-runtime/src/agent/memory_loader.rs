@@ -3,7 +3,7 @@ use std::fmt::Write;
 use std::time::Instant;
 use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, decay};
 
-use crate::observability::{Observer, ObserverEvent};
+use crate::observability::{Observer, ObserverEvent, TurnMetaRef};
 
 use super::loop_::make_query_summary;
 
@@ -22,6 +22,7 @@ pub trait MemoryLoader: Send + Sync {
         observer: &dyn Observer,
         user_message: &str,
         session_id: Option<&str>,
+        turn: TurnMetaRef<'_>,
     ) -> anyhow::Result<String>;
 }
 
@@ -56,6 +57,7 @@ impl MemoryLoader for DefaultMemoryLoader {
         observer: &dyn Observer,
         user_message: &str,
         session_id: Option<&str>,
+        turn: TurnMetaRef<'_>,
     ) -> anyhow::Result<String> {
         let backend = memory.name().to_string();
         let query_summary = make_query_summary(user_message);
@@ -74,9 +76,9 @@ impl MemoryLoader for DefaultMemoryLoader {
                     num_entries: entries.len(),
                     backend,
                     success: true,
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    channel: turn.channel.map(str::to_string),
+                    agent_alias: turn.agent_alias.map(str::to_string),
+                    turn_id: turn.turn_id.map(str::to_string),
                 });
                 entries
             }
@@ -87,9 +89,9 @@ impl MemoryLoader for DefaultMemoryLoader {
                     num_entries: 0,
                     backend,
                     success: false,
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    channel: turn.channel.map(str::to_string),
+                    agent_alias: turn.agent_alias.map(str::to_string),
+                    turn_id: turn.turn_id.map(str::to_string),
                 });
                 return Err(e);
             }
@@ -356,7 +358,13 @@ mod tests {
     async fn default_loader_formats_context() {
         let loader = DefaultMemoryLoader::default();
         let context = loader
-            .load_context(&MockMemory, &NoopObserver, "hello", None)
+            .load_context(
+                &MockMemory,
+                &NoopObserver,
+                "hello",
+                None,
+                TurnMetaRef::default(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -408,7 +416,13 @@ mod tests {
         };
 
         let context = loader
-            .load_context(&memory, &NoopObserver, "answer style", None)
+            .load_context(
+                &memory,
+                &NoopObserver,
+                "answer style",
+                None,
+                TurnMetaRef::default(),
+            )
             .await
             .unwrap();
         assert!(context.contains("user_fact"));
@@ -459,11 +473,70 @@ mod tests {
         };
 
         let context = loader
-            .load_context(&memory, &NoopObserver, "answer style", None)
+            .load_context(
+                &memory,
+                &NoopObserver,
+                "answer style",
+                None,
+                TurnMetaRef::default(),
+            )
             .await
             .unwrap();
         assert!(context.contains("user_fact"));
         assert!(!context.contains("user_msg_e5f6g7h8"));
         assert!(!context.contains("embedding prior context"));
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver(std::sync::Mutex<Vec<ObserverEvent>>);
+
+    impl Observer for RecordingObserver {
+        fn record_event(&self, event: &ObserverEvent) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+
+        fn record_metric(&self, _metric: &crate::observability::traits::ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "recording"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn loader_forwards_turn_meta_onto_recall_events() {
+        let loader = DefaultMemoryLoader::default();
+        let observer = RecordingObserver::default();
+        let turn = TurnMetaRef {
+            channel: Some("cli"),
+            agent_alias: Some("default"),
+            turn_id: Some("turn-42"),
+        };
+        loader
+            .load_context(&MockMemory, &observer, "hello", None, turn)
+            .await
+            .unwrap();
+
+        let events = observer.0.lock().unwrap();
+        let recall = events
+            .iter()
+            .find(|e| matches!(e, ObserverEvent::MemoryRecall { .. }))
+            .expect("loader must emit MemoryRecall");
+        match recall {
+            ObserverEvent::MemoryRecall {
+                channel,
+                agent_alias,
+                turn_id,
+                ..
+            } => {
+                assert_eq!(channel.as_deref(), Some("cli"));
+                assert_eq!(agent_alias.as_deref(), Some("default"));
+                assert_eq!(turn_id.as_deref(), Some("turn-42"));
+            }
+            _ => unreachable!(),
+        }
     }
 }
