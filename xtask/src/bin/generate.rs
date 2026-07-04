@@ -27,12 +27,6 @@ enum Cmd {
         #[arg(long)]
         selection: String,
     },
-    /// Regenerate docs surfaces walked from the code registries (feature
-    /// matrix). Use --check for the CI drift gate; writes nothing on --check.
-    Docs {
-        #[arg(long)]
-        check: bool,
-    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -40,6 +34,5 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Cmd::Installers { targets, check } => xtask::generate::run(&targets, check),
         Cmd::Features { selection } => xtask::generate::features(&selection),
-        Cmd::Docs { check } => xtask::generate::docs(check),
     }
 }

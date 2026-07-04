@@ -16,6 +16,9 @@
 /docs/book/src/_snippets/hardware-release-targets.md
 /docs/book/src/_snippets/hardware-pi-targets.md
 /docs/book/src/_snippets/hardware-lowmem-lto.md
+/docs/book/src/_snippets/feature-matrix-channels.md
+/docs/book/src/_snippets/feature-matrix-providers.md
+/docs/book/src/_snippets/feature-matrix-tools.md
 /docs/book/theme/lang-switcher.js
 /docs/book/theme/pc-themes.css
 /docs/superpowers/plans
