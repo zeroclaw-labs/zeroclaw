@@ -105,6 +105,14 @@ pub struct ScopedAssembly<'a> {
     pub connect_peripherals: bool,
     /// Documented divergence: ACP excludes persistent memory tools.
     pub exclude_memory: bool,
+    /// Emit the per-step assembly diagnostics (peripheral count, the built-in
+    /// filter before/after audit line, and the MCP init/deferred/eager counts) as
+    /// INFO records. Execution paths (`run`, `process_message`, ...) pass `true` so
+    /// operators keep the "why didn't my tool appear / did policy drop tools"
+    /// breadcrumbs the sites used to log inline; listing-only surfaces (gateway
+    /// `/api/tools`, ACP) pass `false` so a registry no turn runs against does not
+    /// emit spurious "MCP: N registered" / "Peripheral tools added" lines.
+    pub emit_assembly_logs: bool,
 }
 
 /// Output of [`ScopedToolRegistry::assemble`]: the scoped registry plus the
@@ -140,6 +148,7 @@ impl ScopedToolRegistry {
             connect_mcp,
             connect_peripherals,
             exclude_memory,
+            emit_assembly_logs,
         } = spec;
 
         let AllToolsResult {
@@ -159,12 +168,37 @@ impl ScopedToolRegistry {
         //    enumerate without holding devices.
         if connect_peripherals {
             let peripheral_tools = load_peripheral_tools(config.peripherals.clone()).await;
+            if emit_assembly_logs && !peripheral_tools.is_empty() {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_attrs(::serde_json::json!({"count": peripheral_tools.len()})),
+                    "Peripheral tools added"
+                );
+            }
             tools_registry.extend(peripheral_tools);
         }
 
         // 2. Built-in allow/deny filter (uniform: the gateway used to skip it entirely).
         //    `caller_allowed` narrows on top of the policy, for the `run` path only.
+        let before_filter = tools_registry.len();
         apply_policy_tool_filter(&mut tools_registry, Some(security.as_ref()), caller_allowed);
+        if emit_assembly_logs && tools_registry.len() != before_filter {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_attrs(::serde_json::json!({
+                        "before": before_filter,
+                        "retained": tools_registry.len(),
+                        "policy_allowed": security.allowed_tools.as_ref().map(|v| v.len()),
+                        "policy_excluded": security.excluded_tools.as_ref().map(|v| v.len()),
+                        "caller_allowed": caller_allowed.map(|v| v.len()),
+                    })),
+                "Applied capability-based tool access filter"
+            );
+        }
 
         // 3. Documented divergence: ACP strips persistent memory tools.
         if exclude_memory {
@@ -184,6 +218,17 @@ impl ScopedToolRegistry {
             Vec::new()
         };
         if !agent_mcp_servers.is_empty() {
+            if emit_assembly_logs {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                        .with_category(::zeroclaw_log::EventCategory::Tool),
+                    &format!(
+                        "Initializing MCP client - {} server(s) granted via mcp_bundles",
+                        agent_mcp_servers.len()
+                    )
+                );
+            }
             match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
                 Ok(registry) => {
                     let registry = Arc::new(registry);
@@ -213,6 +258,21 @@ impl ScopedToolRegistry {
                     if config.mcp.deferred_loading {
                         let deferred_set =
                             tools::DeferredMcpToolSet::from_registry(Arc::clone(&registry)).await;
+                        if emit_assembly_logs {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Load
+                                )
+                                .with_category(::zeroclaw_log::EventCategory::Tool),
+                                &format!(
+                                    "MCP deferred: {} tool stub(s) from {} server(s)",
+                                    deferred_set.len(),
+                                    registry.server_count()
+                                )
+                            );
+                        }
                         let allowed_stub_count = mcp_allowed_tool_count(
                             deferred_set
                                 .stubs
@@ -252,8 +312,11 @@ impl ScopedToolRegistry {
                         }
                     } else {
                         let names = registry.tool_names();
+                        let mut registered = 0usize;
+                        let mut skipped = 0usize;
                         for name in names {
                             if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
+                                skipped += 1;
                                 continue;
                             }
                             if let Some(def) = registry.get_tool_def(&name).await {
@@ -262,13 +325,31 @@ impl ScopedToolRegistry {
                                     def,
                                     Arc::clone(&registry),
                                 ));
-                                register_eager_mcp_tool_if_allowed(
+                                if register_eager_mcp_tool_if_allowed(
                                     wrapper,
                                     &mut tools_registry,
                                     delegate_handle.as_ref(),
                                     mcp_policy.as_ref(),
-                                );
+                                ) {
+                                    registered += 1;
+                                }
                             }
+                        }
+                        if emit_assembly_logs {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Register
+                                )
+                                .with_category(::zeroclaw_log::EventCategory::Tool),
+                                &format!(
+                                    "MCP: {} tool(s) registered from {} server(s), {} skipped by policy",
+                                    registered,
+                                    registry.server_count(),
+                                    skipped
+                                )
+                            );
                         }
                     }
                     // Pinned MCP resources ride the same prompt section in both
@@ -393,6 +474,7 @@ mod tests {
             connect_mcp: false, // exercise the filter path without MCP fixtures
             connect_peripherals: false,
             exclude_memory: false,
+            emit_assembly_logs: false,
         })
         .await;
         out.registry.iter().map(|t| t.name().to_string()).collect()
@@ -486,6 +568,7 @@ mod tests {
                 connect_mcp: true,
                 connect_peripherals: false,
                 exclude_memory: false,
+                emit_assembly_logs: false,
             }),
         )
         .await

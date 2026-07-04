@@ -125,6 +125,7 @@ pub(crate) fn live_channel_registry() -> Option<tools::PerToolChannelHandle> {
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
+use crate::tools::scoped;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -1393,14 +1394,36 @@ pub async fn run(
             sop_audit,
             None,
         );
-        let mut tools_registry = all_tools_result.tools;
-        let delegate_handle = all_tools_result.delegate_handle;
-        let unfiltered_tool_arcs = all_tools_result.unfiltered_tool_arcs;
-        let ask_user_handle = all_tools_result.ask_user_handle;
-        let channel_room_handle = all_tools_result.channel_room_handle;
-        let reaction_handle = all_tools_result.reaction_handle;
-        let poll_handle = all_tools_result.poll_handle;
-        let escalate_handle = all_tools_result.escalate_handle;
+        let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
+        // Route the per-agent tool registry through the one gated seam
+        // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
+        // to the behavior this path hand-rolled. `caller_allowed` carries the
+        // run() per-run allowlist; connect_peripherals is true (execution path).
+        let scoped::ScopedAssembled {
+            registry,
+            delegate_handle: _,
+            ask_user_handle,
+            reaction_handle,
+            poll_handle,
+            escalate_handle,
+            channel_room_handle,
+            deferred_section,
+            activated_handle,
+        } = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+            config: &config,
+            agent_alias,
+            security: &security,
+            built: all_tools_result,
+            skills: &skills,
+            runtime: runtime.clone(),
+            caller_allowed: allowed_tools.as_deref(),
+            connect_mcp: true,
+            connect_peripherals: true,
+            exclude_memory: false,
+            emit_assembly_logs: true,
+        })
+        .await;
+        let tools_registry = registry.into_inner();
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
@@ -1418,223 +1441,6 @@ pub async fn run(
                     .with_attrs(::serde_json::json!({"count": count})),
                 &format!("Registered {} channel(s) for CLI agent", count),
             );
-        }
-
-        let peripheral_tools: Vec<Box<dyn Tool>> = if let Some(f) = PERIPHERAL_TOOLS_FN.get() {
-            f(config.peripherals.clone()).await.unwrap_or_default()
-        } else {
-            vec![]
-        };
-        if !peripheral_tools.is_empty() {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
-                    .with_category(::zeroclaw_log::EventCategory::Tool)
-                    .with_attrs(::serde_json::json!({"count": peripheral_tools.len()})),
-                "Peripheral tools added"
-            );
-            tools_registry.extend(peripheral_tools);
-        }
-
-        // ── Capability-based tool access control ─────────────────────
-        // Two-gate filter: parent agent's SecurityPolicy
-        // (`allowed_tools` + `excluded_tools`) AND the caller-supplied
-        // `allowed_tools` parameter. Both must admit a tool name for
-        // the tool to survive. `None` on either gate is unrestricted
-        // for that gate alone.
-        let before_filter = tools_registry.len();
-        apply_policy_tool_filter(
-            &mut tools_registry,
-            Some(security.as_ref()),
-            allowed_tools.as_deref(),
-        );
-        if tools_registry.len() != before_filter {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
-                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_attrs(::serde_json::json!({
-                        "before": before_filter,
-                        "retained": tools_registry.len(),
-                        "policy_allowed": security.allowed_tools.as_ref().map(|v| v.len()),
-                        "policy_excluded": security.excluded_tools.as_ref().map(|v| v.len()),
-                        "caller_allowed": allowed_tools.as_ref().map(|v| v.len()),
-                    })),
-                "Applied capability-based tool access filter"
-            );
-        }
-
-        // ── Wire MCP tools (non-fatal) — CLI path ────────────────────
-        // NOTE: MCP tools are injected after built-in tool filtering
-        // (filter_primary_agent_tools_or_fail / agent.allowed_tools / agent.denied_tools).
-        // MCP registration and deferred discovery then apply the same policy
-        // explicitly so denied MCP tools never surface in context or delegate handles.
-        //
-        // When `deferred_loading` is enabled, MCP tools are NOT added to the registry
-        // eagerly. Instead, a `tool_search` built-in is registered so the LLM can
-        // fetch schemas on demand. This reduces context window waste.
-        let mut deferred_section = String::new();
-        let mut activated_handle: Option<
-            std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
-        > = None;
-        // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
-        let mut mcp_elevation_arcs: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
-        // Secure by default: only the MCP servers granted by this agent's
-        // `mcp_bundles` (omission is not a grant).
-        let agent_mcp_servers = if config.mcp.enabled {
-            config.mcp_servers_for_agent(agent_alias)
-        } else {
-            Vec::new()
-        };
-        if !agent_mcp_servers.is_empty() {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
-                    .with_category(::zeroclaw_log::EventCategory::Tool),
-                &format!(
-                    "Initializing MCP client - {} server(s) granted via mcp_bundles",
-                    agent_mcp_servers.len()
-                )
-            );
-            match crate::tools::McpRegistry::connect_all(&agent_mcp_servers).await {
-                Ok(registry) => {
-                    let registry = std::sync::Arc::new(registry);
-                    mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
-                    let mcp_policy =
-                        mcp_tool_access_policy(security.as_ref(), allowed_tools.as_deref());
-                    // Register the generic MCP resource/prompt capability tools
-                    // (policy-gated, both deferred and eager modes).
-                    for tool in
-                        crate::tools::build_mcp_capability_tools(&registry, mcp_policy.as_ref())
-                    {
-                        register_eager_mcp_tool_if_allowed(
-                            tool,
-                            &mut tools_registry,
-                            delegate_handle.as_ref(),
-                            mcp_policy.as_ref(),
-                        );
-                    }
-                    let pinned_section = crate::tools::mcp_context::build_pinned_resources_section(
-                        &registry,
-                        &agent_mcp_servers,
-                        mcp_policy.as_ref(),
-                    )
-                    .await;
-                    if config.mcp.deferred_loading {
-                        // Deferred path: build stubs and register tool_search
-                        let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
-                            std::sync::Arc::clone(&registry),
-                        )
-                        .await;
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Load
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Tool),
-                            &format!(
-                                "MCP deferred: {} tool stub(s) from {} server(s)",
-                                deferred_set.len(),
-                                registry.server_count()
-                            )
-                        );
-                        let allowed_stub_count = mcp_allowed_tool_count(
-                            deferred_set
-                                .stubs
-                                .iter()
-                                .map(|stub| stub.prefixed_name.as_str()),
-                            mcp_policy.as_ref(),
-                        );
-                        deferred_section = crate::tools::build_deferred_tools_section_filtered(
-                            &deferred_set,
-                            mcp_policy.as_ref(),
-                        );
-                        if allowed_stub_count > 0 {
-                            let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                                crate::tools::ActivatedToolSet::new(),
-                            ));
-                            activated_handle = Some(std::sync::Arc::clone(&activated));
-                            let mut tool_search =
-                                crate::tools::ToolSearchTool::new(deferred_set, activated);
-                            if let Some(policy) = mcp_policy {
-                                tool_search = tool_search.with_access_policy(policy);
-                            }
-                            if let Some(ref handle) = delegate_handle {
-                                let delegate_tools = std::sync::Arc::clone(handle);
-                                tool_search = tool_search.with_activation_hook(
-                                    std::sync::Arc::new(move |tool| {
-                                        let mut tools = delegate_tools.write();
-                                        let already_registered = tools
-                                            .iter()
-                                            .any(|existing| existing.name() == tool.name());
-                                        if !already_registered {
-                                            tools.push(tool);
-                                        }
-                                    }),
-                                );
-                            }
-                            tools_registry.push(Box::new(tool_search));
-                        }
-                    } else {
-                        // Eager path: register only MCP tools admitted by the
-                        // same policy used by deferred MCP discovery.
-                        let names = registry.tool_names();
-                        let mut registered = 0usize;
-                        let mut skipped = 0usize;
-                        for name in names {
-                            if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
-                                skipped += 1;
-                                continue;
-                            }
-                            if let Some(def) = registry.get_tool_def(&name).await {
-                                let wrapper: std::sync::Arc<dyn Tool> =
-                                    std::sync::Arc::new(crate::tools::McpToolWrapper::new(
-                                        name,
-                                        def,
-                                        std::sync::Arc::clone(&registry),
-                                    ));
-                                if register_eager_mcp_tool_if_allowed(
-                                    wrapper,
-                                    &mut tools_registry,
-                                    delegate_handle.as_ref(),
-                                    mcp_policy.as_ref(),
-                                ) {
-                                    registered += 1;
-                                }
-                            }
-                        }
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Register
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Tool),
-                            &format!(
-                                "MCP: {} tool(s) registered from {} server(s), {} skipped by policy",
-                                registered,
-                                registry.server_count(),
-                                skipped
-                            )
-                        );
-                    }
-                    // Append pinned MCP resources unconditionally, after both the
-                    // deferred and eager branches, so the deferred-path reassignment
-                    // of `deferred_section` does not clobber them.
-                    append_pinned_mcp_section(&mut deferred_section, &pinned_section);
-                }
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "MCP registry failed to initialize"
-                    );
-                }
-            }
         }
 
         // ── Resolve model_provider ─────────────────────────────────────────
@@ -1749,26 +1555,6 @@ pub async fn run(
             .map(ToString::to_string)
             .unwrap_or_else(crate::i18n::detect_locale);
         crate::i18n::init(&i18n_locale);
-
-        // ── Build system prompt from workspace MD files (OpenClaw framework) ──
-        let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
-
-        // Register skill-defined tools as callable tool specs in the tool registry
-        // so the LLM can invoke them via native function calling, not just XML prompts.
-        // Resolution registry = built-in arcs + resolution-only MCP wrappers, so
-        // skill elevation (kind = "builtin" / "mcp") can resolve either target.
-        let skill_resolution_registry: Vec<std::sync::Arc<dyn Tool>> = unfiltered_tool_arcs
-            .iter()
-            .cloned()
-            .chain(mcp_elevation_arcs.iter().cloned())
-            .collect();
-        tools::register_skill_tools_with_context_and_runtime(
-            &mut tools_registry,
-            &skills,
-            security.clone(),
-            &skill_resolution_registry,
-            runtime,
-        );
 
         let mut tool_descs: Vec<(&str, &str)> = vec![
             (
