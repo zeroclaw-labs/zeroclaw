@@ -975,8 +975,11 @@ pub async fn agent_turn(
     max_tool_result_chars: usize,
     context_token_budget: usize,
     channel: Option<&dyn Channel>,
+    turn_id: Option<&str>,
 ) -> Result<String> {
-    let turn_id = uuid::Uuid::new_v4().to_string();
+    let turn_id = turn_id
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     run_tool_call_loop(ToolLoop {
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
@@ -3595,6 +3598,7 @@ pub async fn process_message(
             return Ok(suggestion);
         }
 
+        let turn_id = uuid::Uuid::new_v4().to_string();
         // process_message is the channel entrypoint (Discord, Telegram, gateway,
         // etc.) — recall is scoped to the channel's session_id, so retrieving the
         // user's own Conversation history within their session is intended.
@@ -3605,7 +3609,11 @@ pub async fn process_message(
             config.memory.min_relevance_score,
             session_id,
             false,
-            TurnMetaRef::default(),
+            TurnMetaRef {
+                channel: Some("daemon"),
+                agent_alias: Some(agent_alias),
+                turn_id: Some(&turn_id),
+            },
         )
         .await;
         let rag_limit = if eff_compact_context { 2 } else { 5 };
@@ -3618,7 +3626,11 @@ pub async fn process_message(
                     effective_msg_ref,
                     &board_names,
                     rag_limit,
-                    TurnMetaRef::default(),
+                    TurnMetaRef {
+                        channel: Some("daemon"),
+                        agent_alias: Some(agent_alias),
+                        turn_id: Some(&turn_id),
+                    },
                 )
             })
             .unwrap_or_default();
@@ -3693,6 +3705,7 @@ pub async fn process_message(
                     // profile sets `approval_route` and channels are live, else
                     // `None` (today's channel-less auto-deny). See above.
                     routed_approval_channel_ref,
+                    Some(&turn_id),
                 ),
             )
             .await
@@ -11527,6 +11540,7 @@ This is an example, not an invocation."#;
                 0,     // max_tool_result_chars: disabled for test
                 0,     // context_token_budget: disabled for test
                 None,  // channel
+                None,
             )
             .await
             .expect("wrapper path should execute activated tools");
@@ -11595,6 +11609,7 @@ This is an example, not an invocation."#;
                 0,     // max_tool_result_chars: disabled for test
                 0,     // context_token_budget: disabled for test
                 None,  // channel
+                None,
             )
             .await
             .expect("strict wrapper path should preserve fallback-looking text");
@@ -11724,6 +11739,7 @@ This is an example, not an invocation."#;
                 100, // max_tool_result_chars: truncate at 100 chars
                 0,   // context_token_budget: disabled
                 None,
+                None,
             )
             .await
             .expect("agent_turn should complete");
@@ -11801,6 +11817,7 @@ This is an example, not an invocation."#;
                 false,
                 0, // max_tool_result_chars: disabled (no truncation)
                 0, // context_token_budget: disabled
+                None,
                 None,
             )
             .await
