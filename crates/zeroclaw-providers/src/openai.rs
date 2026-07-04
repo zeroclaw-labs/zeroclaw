@@ -881,7 +881,12 @@ pub(crate) async fn run_responses_sse(
         let _ = tx.send(Ok(StreamEvent::TextDelta(chunk))).await;
     }
 
-    let _ = tx.send(Ok(StreamEvent::Final)).await;
+    crate::stream_guard::finish_sse_stream(
+        tx,
+        state.saw_completion,
+        "response.completed or [DONE]",
+    )
+    .await;
 }
 
 pub struct OpenAiResponsesModelProvider {

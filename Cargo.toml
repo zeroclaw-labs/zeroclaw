@@ -404,7 +404,10 @@ metrics = ["observability-prometheus"]
 # surface will be unavailable in the agent runtime.
 #
 # Each feature adds a WASM execution strategy; enable the smallest set your targets
-# need. `plugins-wasm-runtime-only` is implied by the other two.
+# need. `plugins-wasm-runtime-only` is implied by the other two. Every backend
+# feature also implies `plugins-wasm` itself, so enabling any execution strategy
+# always carries the plugin host and its CLI surface; a backend-only build
+# cannot silently produce a binary without the `plugin` subcommand.
 #
 # - `plugins-wasm-runtime-only`: Fastest startup for plugins and smallest binary size,
 #   but requires plugin authors to compile a specific version for each target
@@ -417,9 +420,9 @@ metrics = ["observability-prometheus"]
 # - `plugins-wasm-pulley`: Most flexible, supports JIT compilation on targets
 #   where Cranelift isn't available (e.g., ARM32), but has the slowest runtime
 #   performance.
-plugins-wasm-runtime-only = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
-plugins-wasm-cranelift    = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasm-cranelift"]
-plugins-wasm-pulley       = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasm-pulley"]
+plugins-wasm-runtime-only = ["plugins-wasm", "zeroclaw-plugins/plugins-wasmtime"]
+plugins-wasm-cranelift    = ["plugins-wasm", "zeroclaw-plugins/plugins-wasm-cranelift"]
+plugins-wasm-pulley       = ["plugins-wasm", "zeroclaw-plugins/plugins-wasm-pulley"]
 
 # CI meta-feature
 ci-all = [
