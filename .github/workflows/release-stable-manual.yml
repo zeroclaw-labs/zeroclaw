@@ -377,9 +377,64 @@ jobs:
           path: zeroclaw-${{ matrix.target }}.${{ matrix.ext }}
           retention-days: 14
 
+  build-desktop:
+    name: Build Desktop App (macOS Universal)
+    needs: [validate]
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
+        with:
+          toolchain: 1.93.0
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          prefix-key: macos-tauri
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked
+
+      - name: Sync Tauri version with Cargo.toml
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          cd apps/tauri
+          if command -v jq >/dev/null 2>&1; then
+            jq --arg v "$VERSION" '.version = $v' tauri.conf.json > tmp.json && mv tmp.json tauri.conf.json
+          else
+            sed -i '' "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" tauri.conf.json
+          fi
+          echo "Tauri version set to: $VERSION"
+
+      - name: Build Tauri app (universal binary)
+        working-directory: apps/tauri
+        run: cargo tauri build --target universal-apple-darwin
+
+      - name: Prepare desktop release assets
+        run: |
+          mkdir -p desktop-assets
+          find target -name '*.dmg' -exec cp {} desktop-assets/ZeroClaw.dmg \; 2>/dev/null || true
+          find target -name '*.app.tar.gz' -exec cp {} desktop-assets/ZeroClaw-macos.app.tar.gz \; 2>/dev/null || true
+          find target -name '*.app.tar.gz.sig' -exec cp {} desktop-assets/ZeroClaw-macos.app.tar.gz.sig \; 2>/dev/null || true
+          echo "--- Desktop assets ---"
+          ls -lh desktop-assets/
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-macos
+          path: desktop-assets/*
+          retention-days: 14
+
   publish:
     name: Publish Stable Release
-    needs: [validate, release-notes, build]
+    needs: [validate, release-notes, build, build-desktop]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -398,6 +453,11 @@ jobs:
           pattern: zeroclaw-*
           path: artifacts
 
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: desktop-macos
+          path: artifacts/desktop-macos
+
       - name: Verify required release assets
         shell: bash
         run: |
@@ -412,6 +472,7 @@ jobs:
             "zeroclaw-x86_64-apple-darwin.tar.gz"
             "zeroclaw-aarch64-linux-android.tar.gz"
             "zeroclaw-x86_64-pc-windows-msvc.zip"
+            "ZeroClaw.dmg"
           )
           missing=0
           for asset in "${required_assets[@]}"; do
@@ -693,7 +754,7 @@ jobs:
   # ── Post-publish: signing, SBOM, and SLSA provenance ─────────────────
   hash-artifacts:
     name: Hash Release Artifacts
-    needs: [validate, build]
+    needs: [validate, build, build-desktop]
     runs-on: ubuntu-latest
     outputs:
       hashes: ${{ steps.hash.outputs.hashes }}
@@ -703,13 +764,18 @@ jobs:
           pattern: zeroclaw-*
           path: artifacts/bins
 
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: desktop-macos
+          path: artifacts/desktop
+
       - name: Compute SHA256 hashes (base64, SLSA input format)
         id: hash
         run: |
           set -euo pipefail
           cd artifacts
-          # Collect all release archives; strip leading directory
-          hashes=$(find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) \
+          # Collect all release archives and desktop artifacts; strip leading directory
+          hashes=$(find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' \) \
             -exec sha256sum {} + \
             | sed 's|  \./[^/]*/|  |' \
             | base64 -w0)

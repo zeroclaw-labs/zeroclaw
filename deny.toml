@@ -32,9 +32,24 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "rustls-webpki URI name constraints; 0.102.x copy via rumqttc v0.25.1; 0.103.x copy is patched; awaiting rumqttc upgrade" },
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki wildcard name constraints; 0.102.x copy via rumqttc v0.25.1; 0.103.x copy is patched; awaiting rumqttc upgrade" },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL parsing panic; 0.102.x copy via rumqttc v0.25.1 has no fix in 0.102.x series; 0.103.x copy patched at v0.103.13; awaiting rumqttc upgrade" },
+    # glib -- unsoundness in VariantStrIter Iterator/DoubleEndedIterator impls;
+    # transitive via zeroclaw-desktop (tauri -> webkit2gtk); glib 0.18.5 is the
+    # latest compatible version with the GTK3 stack; fix requires gtk-rs series bump
+    { id = "RUSTSEC-2024-0429", reason = "glib VariantStrIter unsoundness; transitive via zeroclaw-desktop/tauri/webkit2gtk; no compatible fix in glib 0.18.x series" },
     # audit.toml/deny.toml drift reconcile + wasmtime CVEs; tracking #8519.
     # RUSTSEC-2026-0149, -0182, -0188 cleared by wasmtime/wasmtime-wasi 43 -> 45.0.3
     # bump in crates/zeroclaw-plugins. Resolved by #8542.
+    # GTK3 stack unmaintained via zeroclaw-desktop (tauri -> webkit2gtk); tracking #8519.
+    { id = "RUSTSEC-2024-0411", reason = "gdkwayland-sys unmaintained gtk-rs GTK3 bindings; tracking #8519" },
+    { id = "RUSTSEC-2024-0412", reason = "gdk unmaintained gtk-rs GTK3 bindings; tracking #8519" },
+    { id = "RUSTSEC-2024-0413", reason = "atk unmaintained gtk-rs GTK3 bindings; tracking #8519" },
+    { id = "RUSTSEC-2024-0414", reason = "gdkx11-sys unmaintained gtk-rs GTK3 bindings; tracking #8519" },
+    { id = "RUSTSEC-2024-0415", reason = "gtk unmaintained gtk-rs GTK3 bindings; tracking #8519" },
+    { id = "RUSTSEC-2024-0416", reason = "atk-sys unmaintained gtk-rs GTK3 bindings; tracking #8519" },
+    { id = "RUSTSEC-2024-0417", reason = "gdkx11 unmaintained gtk-rs GTK3 bindings; tracking #8519" },
+    { id = "RUSTSEC-2024-0418", reason = "gdk-sys unmaintained gtk-rs GTK3 bindings; tracking #8519" },
+    { id = "RUSTSEC-2024-0419", reason = "gtk3-macros unmaintained gtk-rs GTK3 bindings; tracking #8519" },
+    { id = "RUSTSEC-2024-0420", reason = "gtk-sys unmaintained gtk-rs GTK3 bindings; tracking #8519" },
     # unic-* unmaintained unicode tables (transitive); tracking #8519.
     { id = "RUSTSEC-2025-0075", reason = "unic-char-range unmaintained; tracking #8519" },
     { id = "RUSTSEC-2025-0080", reason = "unic-common unmaintained; tracking #8519" },

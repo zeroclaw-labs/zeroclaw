@@ -121,12 +121,14 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     touch web/dist/.gitkeep
     cargo fmt --all -- --check
     # --features ci-all matches CI's Lint job — validates all feature-gated code.
+    # --exclude zeroclaw-desktop: needs GTK/WebKit (not in StageX).
     # --exclude zerocode: inkjet/tree-sitter needs C++ compiler (not in StageX).
-    cargo clippy --workspace --exclude zerocode --all-targets --features ci-all --locked -- -D warnings
+    cargo clippy --workspace --exclude zeroclaw-desktop --exclude zerocode --all-targets --features ci-all --locked -- -D warnings
 EOF
 
 # Test (needs loopback for wiremock — no --network=none)
 # --offline prevents cargo from fetching even if network is available.
+# --exclude zeroclaw-desktop: requires GTK/GLib (tauri + tray-icon), not in StageX.
 # --exclude zerocode: tree-sitter/inkjet inject -lstdc++ and need real C++ runtime
 #   symbols (operator new/delete, __cxa_throw, etc.) for YAML scanner code.
 #   The build stage succeeds because it uses -static + libstdc++.a stub, but test
@@ -146,7 +148,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     <<-EOF
     set -e
     export RUSTFLAGS="-C target-feature=-crt-static"
-    cargo test --workspace --lib --bins --tests --exclude zerocode --exclude xtask --exclude zeroclaw-tools --offline --locked
+    cargo test --workspace --lib --bins --tests --exclude zeroclaw-desktop --exclude zerocode --exclude xtask --exclude zeroclaw-tools --offline --locked
 EOF
 
 # ── Stage: build (zeroclaw + zerocode, default channels) ────
