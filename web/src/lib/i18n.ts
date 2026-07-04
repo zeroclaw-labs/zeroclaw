@@ -73,6 +73,13 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.message_error': '消息错误',
     'agent.failed_switch_model': '切换模型失败',
     'agent.model_switch_timeout': '模型切换超时，请检查网络后重试',
+    'agent.clear_all': '全部清除',
+    'agent.delete_message': '删除消息',
+    'agent.compact_mode': '紧凑',
+    'agent.tool_activity_show': '显示工具活动',
+    'agent.tool_activity_hide': '隐藏工具活动',
+    'agent.running': '运行中…',
+    'agent.stop': '停止',
 
     // Supervised-mode tool approval (#6522)
     'agent.approval_title': '需要授权工具调用',
