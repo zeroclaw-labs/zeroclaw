@@ -330,6 +330,89 @@ mod tests {
     }
 
     #[test]
+    fn derived_field_kinds_match_the_pinned_table() {
+        // The TriggerFields derive infers each field's kind by convention
+        // (name `condition` -> expression, `Vec<XxxKind>` -> options,
+        // other `Vec<_>` -> list, else text). Those conventions are implicit,
+        // so this table is the explicit contract: a new field that trips a
+        // convention the wrong way fails here with a named source and field.
+        use crate::sop::types::SopTriggerSource;
+
+        let expected: &[(SopTriggerSource, &[(&str, TriggerFieldKind)])] = &[
+            (
+                SopTriggerSource::Mqtt,
+                &[
+                    ("topic", TriggerFieldKind::Text),
+                    ("condition", TriggerFieldKind::Expression),
+                ],
+            ),
+            (
+                SopTriggerSource::Amqp,
+                &[
+                    ("routing_key", TriggerFieldKind::Text),
+                    ("condition", TriggerFieldKind::Expression),
+                ],
+            ),
+            (
+                SopTriggerSource::Webhook,
+                &[("path", TriggerFieldKind::Text)],
+            ),
+            (
+                SopTriggerSource::Cron,
+                &[("expression", TriggerFieldKind::Text)],
+            ),
+            (
+                SopTriggerSource::Peripheral,
+                &[
+                    ("board", TriggerFieldKind::Text),
+                    ("signal", TriggerFieldKind::Text),
+                    ("condition", TriggerFieldKind::Expression),
+                ],
+            ),
+            (
+                SopTriggerSource::Filesystem,
+                &[
+                    ("path", TriggerFieldKind::Text),
+                    ("events", TriggerFieldKind::List),
+                    ("condition", TriggerFieldKind::Expression),
+                ],
+            ),
+            (
+                SopTriggerSource::Calendar,
+                &[
+                    ("calendar_source", TriggerFieldKind::Text),
+                    ("calendar_ids", TriggerFieldKind::List),
+                ],
+            ),
+            (SopTriggerSource::Manual, &[]),
+        ];
+
+        for (source, fields) in expected {
+            let got = source.field_specs();
+            let got_pairs: Vec<(&str, TriggerFieldKind)> =
+                got.iter().map(|f| (f.name.as_str(), f.kind)).collect();
+            let want_pairs: Vec<(&str, TriggerFieldKind)> = fields.to_vec();
+            assert_eq!(
+                got_pairs, want_pairs,
+                "derived field kinds for source {source} drifted from the pinned \
+                 table; a variant field tripped a derive convention",
+            );
+        }
+
+        // Every non-channel source must appear in the table, so adding a
+        // source cannot skip the kind contract silently.
+        for source in SopTriggerSource::iter() {
+            if source == SopTriggerSource::Channel {
+                continue;
+            }
+            assert!(
+                expected.iter().any(|(s, _)| *s == source),
+                "trigger source {source} is missing from the field-kind table; add it"
+            );
+        }
+    }
+
+    #[test]
     fn channels_walk_inbound_capable_kinds_only() {
         let registry = build_registry(&[]);
         assert!(!registry.channels.is_empty());
