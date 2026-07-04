@@ -723,6 +723,21 @@ struct FileEditorState {
     cursor_col: usize,
 }
 
+fn personality_file_needs_template(agent: &AgentModal, filename: &str) -> bool {
+    agent
+        .files
+        .get(filename)
+        .map(|content| content.trim().is_empty())
+        .unwrap_or(true)
+}
+
+fn advance_agent_modal_after_file(agent: &mut AgentModal) {
+    let row_count = agent.filenames.len() + 2;
+    if agent.cursor + 1 < row_count {
+        agent.cursor += 1;
+    }
+}
+
 impl FileEditorState {
     fn new(filename: String, content: String) -> Self {
         let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
@@ -1677,6 +1692,29 @@ impl QuickstartPane {
                         self.active_modal = None;
                         self.revalidate().await;
                         self.advance_after_completed(Selector::Agent);
+                    }
+                    Some(QuickstartModalAction::Confirm) if on_file => {
+                        let filename = a.filenames[a.cursor - 1].clone();
+                        if !personality_file_needs_template(a, &filename) {
+                            advance_agent_modal_after_file(a);
+                            return;
+                        }
+                        let agent_name = a.name.trim().to_string();
+                        let templated = self
+                            .fetch_personality_template(&filename, Some(agent_name.as_str()))
+                            .await;
+                        match templated {
+                            Some(content) => {
+                                if let Some(Modal::Agent(a)) = self.active_modal.as_mut() {
+                                    a.files.insert(filename, content);
+                                    advance_agent_modal_after_file(a);
+                                }
+                                self.last_errors.clear();
+                            }
+                            None => {
+                                self.last_errors = vec![missing_template_error(&filename)];
+                            }
+                        }
                     }
                     Some(QuickstartModalAction::NextField) | Some(QuickstartModalAction::Down)
                         if a.cursor + 1 < row_count =>
@@ -3329,6 +3367,43 @@ mod tests {
         assert_eq!(err.step, QuickstartStep::Agent);
         assert_eq!(err.field, "MEMORY.md");
         assert!(err.message.contains("MEMORY.md"));
+    }
+
+    fn test_agent_modal() -> AgentModal {
+        AgentModal {
+            cursor: 1,
+            name: "scout".into(),
+            files: std::collections::BTreeMap::new(),
+            filenames: vec!["MEMORY.md".into(), "SKILL.md".into()],
+            editor: None,
+        }
+    }
+
+    #[test]
+    fn agent_file_enter_loads_template_when_unset() {
+        let agent = test_agent_modal();
+
+        assert!(personality_file_needs_template(&agent, "MEMORY.md"));
+    }
+
+    #[test]
+    fn agent_file_enter_advances_when_content_already_set() {
+        let mut agent = test_agent_modal();
+        agent.files.insert("MEMORY.md".into(), "custom".into());
+
+        assert!(!personality_file_needs_template(&agent, "MEMORY.md"));
+        advance_agent_modal_after_file(&mut agent);
+        assert_eq!(agent.cursor, 2);
+    }
+
+    #[test]
+    fn last_agent_file_enter_advances_to_save_row() {
+        let mut agent = test_agent_modal();
+        agent.cursor = 2;
+        agent.files.insert("SKILL.md".into(), "custom".into());
+
+        advance_agent_modal_after_file(&mut agent);
+        assert_eq!(agent.cursor, 3);
     }
 
     fn err(step: QuickstartStep) -> QuickstartError {
