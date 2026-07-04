@@ -9,6 +9,7 @@ pub mod component;
 mod component_logging;
 pub mod error;
 pub mod host;
+pub mod registry;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod runtime;
 pub mod signature;

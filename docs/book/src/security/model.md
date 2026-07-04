@@ -55,9 +55,9 @@ Docs: [Sandboxing](./sandboxing.md).
 
 ## Tool receipts
 
-Every tool invocation, whether it executed, was blocked, or required approval, produces a signed receipt in a chain. Each receipt includes the hash of the previous one, so tampering with any receipt invalidates the rest.
+Tool receipts provide HMAC evidence that a successful tool call and its result passed through the runtime. When receipts are enabled, successful tool outputs receive an HMAC-SHA256 receipt over the call and result, and the receipt is fed back into the conversation with the tool result.
 
-Receipts are the source of truth for "what did the agent do yesterday". They're readable, greppable, and durable.
+Receipts help catch fabricated tool claims. They are not a chained or durable audit log today: receipt keys are ephemeral, receipts are not cross-signed with the conversation hash, and persistent receipt storage is still future work.
 
 Docs: [Tool receipts](./tool-receipts.md).
 
