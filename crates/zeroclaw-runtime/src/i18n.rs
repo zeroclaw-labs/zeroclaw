@@ -422,25 +422,40 @@ mod tests {
             ),
         ];
 
-        for (source, locale) in [
-            (include_str!("../locales/en/cli.ftl"), "en"),
-            (include_str!("../locales/es/cli.ftl"), "es"),
-            (include_str!("../locales/fr/cli.ftl"), "fr"),
-            (include_str!("../locales/ja/cli.ftl"), "ja"),
-            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
-        ] {
+        let sources = [
+            ("en", include_str!("../locales/en/cli.ftl")),
+            ("es", include_str!("../locales/es/cli.ftl")),
+            ("fr", include_str!("../locales/fr/cli.ftl")),
+            ("ja", include_str!("../locales/ja/cli.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/cli.ftl")),
+        ]
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(sources.len(), available_locales().len());
+
+        for locale in available_locales() {
+            let source = sources.get(locale.code.as_str()).unwrap_or_else(|| {
+                panic!(
+                    "{} in locales.toml has no cli.ftl source wired into this test",
+                    locale.code
+                )
+            });
             for (key, args, expected_parts) in keys {
-                let value = format_ftl_message(source, locale, key, args)
-                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                let value = format_ftl_message(source, locale.code.as_str(), key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {}", locale.code));
                 for expected_part in expected_parts {
                     assert!(
                         value.contains(expected_part),
-                        "{key} in {locale} should contain {expected_part:?}, got {value:?}"
+                        "{} in {} should contain {expected_part:?}, got {value:?}",
+                        key,
+                        locale.code
                     );
                 }
                 assert!(
                     !value.contains('{'),
-                    "{key} in {locale} should not leak a missing Fluent placeholder: {value:?}"
+                    "{} in {} should not leak a missing Fluent placeholder: {value:?}",
+                    key,
+                    locale.code
                 );
             }
         }
