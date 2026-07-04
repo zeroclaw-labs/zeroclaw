@@ -212,12 +212,25 @@ pub async fn handle_sop_create(
 pub async fn handle_sop_save(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(_name): Path<String>,
-    Json(sop): Json<zeroclaw_runtime::sop::Sop>,
+    Path(name): Path<String>,
+    Json(mut sop): Json<zeroclaw_runtime::sop::Sop>,
 ) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+    if !sop.name.is_empty() && sop.name != name {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "body name '{}' does not match URL name '{name}'",
+                    sop.name
+                )
+            })),
+        )
+            .into_response();
+    }
+    sop.name = name;
     let (dir, _mode) = sops_dir_and_mode(&state);
     match zeroclaw_runtime::sop::save_sop(&dir, &sop) {
         Ok(()) => Json(serde_json::json!({ "saved": sop.name })).into_response(),

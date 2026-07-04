@@ -123,6 +123,23 @@ pub fn resolve_sops_dir(workspace_dir: &Path, config_dir: Option<&str>) -> PathB
     }
 }
 
+/// Resolve `<sops_dir>/<name>`, accepting only a single normal path
+/// component so caller-controlled names cannot escape the SOP root.
+fn resolve_sop_dir(sops_dir: &Path, name: &str) -> Result<PathBuf> {
+    let mut components = Path::new(name).components();
+    let single_normal = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if single_normal && !name.contains(['/', '\\', '\0']) {
+        Ok(sops_dir.join(name))
+    } else {
+        anyhow::bail!(
+            "invalid SOP name '{name}': must be a single path component (no separators, '.', '..', or absolute paths)"
+        )
+    }
+}
+
 // ── SOP loading ─────────────────────────────────────────────────
 
 /// Load all SOPs from the configured directory.
@@ -142,13 +159,13 @@ pub fn load_sop_by_name(
     name: &str,
     default_execution_mode: SopExecutionMode,
 ) -> Result<Sop> {
-    load_sop(&sops_dir.join(name), default_execution_mode)
+    load_sop(&resolve_sop_dir(sops_dir, name)?, default_execution_mode)
 }
 
 /// Delete an SOP's directory (manifest, steps, everything). Errors if no
 /// SOP with that name exists.
 pub fn delete_sop(sops_dir: &Path, name: &str) -> Result<()> {
-    let dir = sops_dir.join(name);
+    let dir = resolve_sop_dir(sops_dir, name)?;
     if !dir.exists() {
         anyhow::bail!("SOP '{name}' not found");
     }
@@ -159,7 +176,7 @@ pub fn delete_sop(sops_dir: &Path, name: &str) -> Result<()> {
 /// Create a new SOP on disk, refusing to overwrite an existing one. Same
 /// normalization and validation as `save_sop`.
 pub fn create_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
-    if sops_dir.join(&sop.name).exists() {
+    if resolve_sop_dir(sops_dir, &sop.name)?.exists() {
         anyhow::bail!("SOP '{}' already exists", sop.name);
     }
     save_sop(sops_dir, sop)
@@ -728,7 +745,7 @@ pub fn save_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
         anyhow::bail!("SOP rejected: {}", validation.blocking.join("; "));
     }
 
-    let sop_dir = sops_dir.join(&sop.name);
+    let sop_dir = resolve_sop_dir(sops_dir, &sop.name)?;
     std::fs::create_dir_all(&sop_dir)?;
 
     let manifest = SopManifest::from_sop(sop);
@@ -1040,6 +1057,43 @@ mod tests {
 
         delete_sop(dir.path(), "authoring").unwrap();
         assert!(load_sop_by_name(dir.path(), "authoring", SopExecutionMode::Supervised).is_err());
+    }
+
+    #[test]
+    fn sop_name_path_traversal_is_rejected_across_all_helpers() {
+        let dir = tempfile::tempdir().unwrap();
+        let hostile = [
+            "../escape",
+            "..",
+            ".",
+            "/etc/shadow",
+            "a/b",
+            "a\\b",
+            "../../etc/cron.d/evil",
+            "",
+        ];
+        for name in hostile {
+            assert!(
+                load_sop_by_name(dir.path(), name, SopExecutionMode::Supervised).is_err(),
+                "load must reject {name:?}"
+            );
+            assert!(
+                delete_sop(dir.path(), name).is_err(),
+                "delete must reject {name:?}"
+            );
+            let mut sop = authoring_sop(vec![titled_step(1, "First")]);
+            sop.name = name.into();
+            assert!(
+                save_sop(dir.path(), &sop).is_err(),
+                "save must reject {name:?}"
+            );
+            assert!(
+                create_sop(dir.path(), &sop).is_err(),
+                "create must reject {name:?}"
+            );
+        }
+        let escape = dir.path().parent().unwrap().join("escape");
+        assert!(!escape.exists(), "no write may land outside the SOP root");
     }
 
     #[test]
