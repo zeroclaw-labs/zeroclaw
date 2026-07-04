@@ -1188,9 +1188,18 @@ async fn connect_heartbeat_mcp_registry(
     if servers.is_empty() {
         return Ok(None);
     }
-    let registry = crate::tools::McpRegistry::connect_all(&servers)
-        .await
-        .map_err(|e| {
+    // Fail-open, mirroring the per-run `agent::run` MCP path (see
+    // `agent/loop_.rs`, "MCP registry failed to initialize"): a granted
+    // MCP server being unreachable must NOT take the heartbeat worker
+    // down under supervisor backoff. On connect failure we log and
+    // return `Ok(None)`; each tick then falls back to the per-run path
+    // (which itself fails open). Because the connection failed there is
+    // no stdio child to leak, so #5903's "construct the registry once
+    // per worker" guarantee still holds whenever the registry IS
+    // reachable — the healthy case this PR targets.
+    match crate::tools::McpRegistry::connect_all(&servers).await {
+        Ok(registry) => Ok(Some(std::sync::Arc::new(registry))),
+        Err(e) => {
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -1199,11 +1208,11 @@ async fn connect_heartbeat_mcp_registry(
                         "agent": agent_alias,
                         "error": format!("{:#}", e),
                     })),
-                "heartbeat worker: failed to connect shared MCP registry"
+                "heartbeat worker: failed to connect shared MCP registry;                  continuing without MCP tools"
             );
-            e
-        })?;
-    Ok(Some(std::sync::Arc::new(registry)))
+            Ok(None)
+        }
+    }
 }
 
 async fn run_heartbeat_worker(config: Config) -> Result<()> {
