@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -27,6 +28,7 @@ use std::time::{Duration, Instant};
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
+use regex::Regex;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -93,6 +95,14 @@ pub struct CallMeta {
     pub agent_email: Option<String>,
     /// Our own phone number, when the agent has one.
     pub agent_phone: Option<String>,
+    /// Whether this agent has the shared Inkbox iMessage line enabled. Drives the
+    /// shared-line guidance so the model knows it may be on a shared line and
+    /// never states or promises that line's Inkbox-managed number.
+    pub agent_imessage_enabled: bool,
+    /// The inbound caller's phone number (from the call record), surfaced to the
+    /// model so it can look up an unknown caller. Distinct from `remote_number`,
+    /// which is the number we dialed on an outbound call.
+    pub remote_phone_number: Option<String>,
 }
 
 const OPENAI_REALTIME_URL: &str = "wss://api.openai.com/v1/realtime";
@@ -170,6 +180,23 @@ fn build_instructions(meta: &CallMeta) -> String {
     }
     if let Some(p) = meta.agent_phone.as_deref().filter(|p| !p.is_empty()) {
         lines.push(format!("Your phone number: {p}."));
+    }
+    if meta.agent_imessage_enabled {
+        lines.push(
+            "You also have a shared Inkbox iMessage line — voice calls and iMessage with people \
+             connected to you over iMessage. Its number is managed by Inkbox: never state or \
+             promise a number for it. The current call may be running over either line; calls \
+             follow the conversation's channel (iMessage contacts are called over the shared \
+             line, SMS/phone contacts over your dedicated number)."
+                .into(),
+        );
+    }
+    if let Some(n) = meta
+        .remote_phone_number
+        .as_deref()
+        .filter(|n| !n.is_empty())
+    {
+        lines.push(format!("Caller is calling from: {n}."));
     }
     match meta
         .contact_name
@@ -618,6 +645,9 @@ pub(super) async fn run_realtime_bridge(
                 ),
                 None => (handle.clone(), None, None, None),
             };
+            // Whether this agent is reachable over the shared iMessage line, so
+            // the model gets the shared-line guidance (never state its number).
+            let imessage_enabled = ident.as_ref().map(|i| i.imessage_enabled()).unwrap_or(false);
             let mut caller_name = None;
             let mut caller_card = None;
             let mut direction = String::new();
@@ -644,6 +674,14 @@ pub(super) async fn run_realtime_bridge(
                 }
             } else {
                 dialed.unwrap_or_default()
+            };
+            // Inbound calls carry a call_id; surface that caller's number to the
+            // model so it can look up an unknown caller (common on the shared
+            // iMessage line). Outbound legs already carry the dialed number.
+            let inbound_caller = if !call_id.is_empty() && !remote.is_empty() {
+                Some(remote.clone())
+            } else {
+                None
             };
             if !remote.is_empty() {
                 // Surface SDK errors: a failed lookup here is the difference
@@ -682,14 +720,27 @@ pub(super) async fn run_realtime_bridge(
                     ),
                 }
             }
-            (agent_handle, agent_email, agent_phone, caller_name, caller_card, direction)
+            (
+                agent_handle,
+                agent_email,
+                agent_phone,
+                caller_name,
+                caller_card,
+                direction,
+                imessage_enabled,
+                inbound_caller,
+            )
         })
         .await;
         match resolved {
-            Ok((ah, ae, ap, cn, card, dir)) => {
+            Ok((ah, ae, ap, cn, card, dir, imsg, caller)) => {
                 meta.agent_handle = ah;
                 meta.agent_email = ae;
                 meta.agent_phone = ap;
+                meta.agent_imessage_enabled = imsg;
+                if caller.is_some() {
+                    meta.remote_phone_number = caller;
+                }
                 if cn.is_some() {
                     meta.contact_name = cn;
                 }
@@ -745,6 +796,9 @@ pub(super) async fn run_realtime_bridge(
     let mut transcript: Vec<(String, String)> = Vec::new();
     let mut post_call_actions: Vec<(String, String)> = Vec::new();
     let mut pending: HashMap<String, PendingCall> = HashMap::new();
+    // Dedupe registry for in-call SMS/text consults (shared with the async
+    // completion tasks each consult spawns).
+    let consult_dedupe = Arc::new(Mutex::new(ConsultDedupe::default()));
     let mut hangup_armed_at: Option<Instant> = None;
     let mut closing = false;
     // Reason captured on the confirmed hang_up_call, sent with the hangup frame.
@@ -818,6 +872,9 @@ pub(super) async fn run_realtime_bridge(
                         if hangup_armed_at.is_some() {
                             tokio::time::sleep(Duration::from_secs(HANGUP_CLOSE_DELAY_SECS)).await;
                             let mut stop = json!({ "event": "stop" });
+                            if let Some(sid) = &stream_id {
+                                stop["stream_id"] = json!(sid);
+                            }
                             if !hangup_reason.is_empty() {
                                 stop["reason"] = json!(hangup_reason);
                             }
@@ -897,7 +954,15 @@ pub(super) async fn run_realtime_bridge(
                         let output: Value = match pc.name.as_str() {
                             "consult_agent" => {
                                 send_output = false; // the spawned task posts the output
-                                dispatch_consult(&args, &pc.call_id, &tx, &alias, &meta, &out_tx);
+                                dispatch_consult(
+                                    &args,
+                                    &pc.call_id,
+                                    &tx,
+                                    &alias,
+                                    &meta,
+                                    &out_tx,
+                                    &consult_dedupe,
+                                );
                                 json!({})
                             }
                             "register_post_call_action" => {
@@ -967,6 +1032,9 @@ pub(super) async fn run_realtime_bridge(
                             // `stop`, then close the socket as a backstop.
                             tokio::time::sleep(Duration::from_secs(HANGUP_CLOSE_DELAY_SECS)).await;
                             let mut stop = json!({ "event": "stop" });
+                            if let Some(sid) = &stream_id {
+                                stop["stream_id"] = json!(sid);
+                            }
                             if !hangup_reason.is_empty() {
                                 stop["reason"] = json!(hangup_reason);
                             }
@@ -998,6 +1066,63 @@ pub(super) async fn run_realtime_bridge(
 /// Dispatch an `consult_agent`: emit the query as a `ChannelMessage` the agent
 /// answers, send the model an interim "one moment", and post the answer back as
 /// the tool output once it arrives (with a timeout).
+/// Per-call dedupe state for `consult_agent`. A realtime model can fire the
+/// same "text +1555… saying X" consult twice; this lets us short-circuit an
+/// in-flight or already-completed duplicate so we never double-send. Mirrors the
+/// hermes plugin's `pending_consult_keys` + `consult_results`.
+#[derive(Default)]
+struct ConsultDedupe {
+    /// dedupe key -> the tool call_id currently handling it.
+    pending: HashMap<String, String>,
+    /// (dedupe key, result text) for consults completed this call.
+    results: Vec<(String, String)>,
+}
+
+/// Lowercase, strip to `[a-z0-9+]`, collapse whitespace — mirrors hermes'
+/// `_normalize_consult_text`.
+fn normalize_consult_text(value: &str) -> String {
+    static NON_ALNUM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[^a-z0-9+]+").unwrap());
+    static WS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
+    let lowered = value.to_lowercase();
+    let spaced = NON_ALNUM.replace_all(&lowered, " ");
+    WS.replace_all(spaced.trim(), " ").into_owned()
+}
+
+/// The first 8–280 char quoted span in `value`, normalized — mirrors hermes'
+/// `_quoted_consult_text`.
+fn quoted_consult_text(value: &str) -> Option<String> {
+    static QUOTED: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new("[\"\u{201c}]([^\"\u{201d}]{8,280})[\"\u{201d}]").unwrap());
+    let cap = QUOTED.captures(value)?;
+    let normalized = normalize_consult_text(cap.get(1)?.as_str());
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+/// Dedupe key for an SMS/text consult: `sms:<phone>:<quoted-or-generic>`, or
+/// `None` when the request isn't a phone+text send. Mirrors hermes'
+/// `_realtime_consult_dedupe_key`.
+fn consult_dedupe_key(request: &str) -> Option<String> {
+    static PHONE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\+\d{8,15}").unwrap());
+    static IS_SMS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b(sms|text|message)\b").unwrap());
+    let normalized = normalize_consult_text(request);
+    let phone = PHONE.find(&normalized)?;
+    if !IS_SMS.is_match(&normalized) {
+        return None;
+    }
+    let quoted = quoted_consult_text(request).unwrap_or_else(|| "generic".to_string());
+    Some(format!("sms:{}:{}", phone.as_str(), quoted))
+}
+
+/// Whether the request explicitly asks for another/repeat message, which
+/// bypasses dedupe. Mirrors hermes' `_realtime_consult_allows_repeat`.
+fn consult_allows_repeat(request: &str) -> bool {
+    static REPEAT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(again|another|different|new|repeat|second)\b").unwrap()
+    });
+    REPEAT.is_match(request)
+}
+
 fn dispatch_consult(
     args: &Value,
     call_id: &str,
@@ -1005,6 +1130,7 @@ fn dispatch_consult(
     alias: &str,
     meta: &CallMeta,
     out_tx: &mpsc::UnboundedSender<WsMessage>,
+    dedupe: &Arc<Mutex<ConsultDedupe>>,
 ) {
     let query = args
         .get("query")
@@ -1020,6 +1146,49 @@ fn dispatch_consult(
         let _ = out_tx.send(response_create_empty());
         return;
     }
+
+    // Dedupe SMS/text consults: short-circuit an in-flight or already-completed
+    // duplicate so a model that fires the same "text +1555 saying X" twice does
+    // not double-send. A request that explicitly asks for another/repeat message
+    // bypasses this.
+    let dedupe_key = consult_dedupe_key(&query).filter(|_| !consult_allows_repeat(&query));
+    if let Some(key) = dedupe_key.as_deref() {
+        let mut guard = dedupe.lock();
+        if let Some(existing) = guard.pending.get(key).cloned() {
+            drop(guard);
+            let _ = out_tx.send(function_call_output(
+                call_id,
+                &json!({
+                    "status": "already_running",
+                    "existing_tool_call_id": existing,
+                    "answer": "You are already handling this same in-call request. Do not call the consult tool again or queue a duplicate post-call action; wait briefly for the existing result.",
+                }),
+            ));
+            let _ = out_tx.send(response_create_empty());
+            return;
+        }
+        if let Some(result) = guard
+            .results
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, r)| r.clone())
+        {
+            drop(guard);
+            let _ = out_tx.send(function_call_output(
+                call_id,
+                &json!({
+                    "status": "already_handled",
+                    "answer": format!("You already handled this same in-call request: {result}. Do not send it again unless the caller explicitly asks for another, repeat, or different message."),
+                }),
+            ));
+            let _ = out_tx.send(response_create_empty());
+            return;
+        }
+        // Mark this key in flight against the current tool call id.
+        guard.pending.insert(key.to_string(), call_id.to_string());
+    }
+
     let id = format!("rc{}", CONSULT_SEQ.fetch_add(1, Ordering::Relaxed));
     let (otx, orx) = oneshot::channel::<String>();
     consult_sinks().lock().insert(id.clone(), otx);
@@ -1051,6 +1220,7 @@ fn dispatch_consult(
 
     let out_tx = out_tx.clone();
     let call_id = call_id.to_string();
+    let dedupe = dedupe.clone();
     zeroclaw_spawn::spawn!(async move {
         let answer = match tokio::time::timeout(Duration::from_secs(CONSULT_TIMEOUT_SECS), orx)
             .await
@@ -1067,6 +1237,20 @@ fn dispatch_consult(
                 "I couldn't reach the assistant just now — let's continue.".to_string()
             }
         };
+        // Record the completed result and clear the in-flight marker so a later
+        // identical consult short-circuits with `already_handled`.
+        if let Some(key) = &dedupe_key {
+            let mut guard = dedupe.lock();
+            guard.results.push((key.clone(), answer.clone()));
+            if guard
+                .pending
+                .get(key)
+                .map(|v| v == &call_id)
+                .unwrap_or(false)
+            {
+                guard.pending.remove(key);
+            }
+        }
         let output = json!({ "status": "ok", "answer": answer, "instructions": "Read this answer back to the caller, naturally." });
         let _ = out_tx.send(function_call_output(&call_id, &output));
         let _ = out_tx.send(response_create_empty());
