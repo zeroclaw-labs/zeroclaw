@@ -1140,6 +1140,16 @@ pub struct AgentRunOverrides {
     /// underway. Default `false` keeps top-level / cron-launched /
     /// CLI-launched agents at depth 0.
     pub is_subagent: bool,
+    /// Pre-built MCP registry supplied by the caller. The daemon heartbeat
+    /// worker constructs this once at worker start and shares it across
+    /// every tick so that stdio MCP children live for the daemon's
+    /// lifetime rather than being orphaned and re-spawned per
+    /// `agent::run` call (#5903). When `Some`, the loop MUST use this
+    /// `Arc<McpRegistry>` and MUST NOT call `McpRegistry::connect_all`
+    /// itself. `None` preserves the legacy per-call connect path
+    /// (CLI / one-shot), which is correct for callers that have no
+    /// cross-turn reuse contract.
+    pub mcp_registry: Option<Arc<crate::tools::McpRegistry>>,
 }
 
 /// Build the dotted provider ref (`"openai.qwertfoozp"`) from the agent's
@@ -1496,144 +1506,160 @@ pub async fn run(
                     agent_mcp_servers.len()
                 )
             );
-            match crate::tools::McpRegistry::connect_all(&agent_mcp_servers).await {
-                Ok(registry) => {
-                    let registry = std::sync::Arc::new(registry);
-                    mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
-                    let mcp_policy =
-                        mcp_tool_access_policy(security.as_ref(), allowed_tools.as_deref());
-                    // Register the generic MCP resource/prompt capability tools
-                    // (policy-gated, both deferred and eager modes).
-                    for tool in
-                        crate::tools::build_mcp_capability_tools(&registry, mcp_policy.as_ref())
-                    {
-                        register_eager_mcp_tool_if_allowed(
-                            tool,
-                            &mut tools_registry,
-                            delegate_handle.as_ref(),
-                            mcp_policy.as_ref(),
-                        );
-                    }
-                    let pinned_section = crate::tools::mcp_context::build_pinned_resources_section(
-                        &registry,
-                        &agent_mcp_servers,
-                        mcp_policy.as_ref(),
-                    )
-                    .await;
-                    if config.mcp.deferred_loading {
-                        // Deferred path: build stubs and register tool_search
-                        let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
-                            std::sync::Arc::clone(&registry),
-                        )
-                        .await;
+            // Caller-supplied registry wins: the daemon heartbeat worker
+            // constructs the registry once and reuses it across every
+            // tick so stdio MCP children live for the daemon lifetime
+            // (#5903). Falling back to per-call `connect_all` keeps the
+            // legacy CLI / one-shot path intact.
+            let registry = if let Some(shared) = overrides.mcp_registry.as_ref() {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Tool),
+                    "MCP client: reusing caller-supplied registry (one child per daemon)"
+                );
+                Some(std::sync::Arc::clone(shared))
+            } else {
+                match crate::tools::McpRegistry::connect_all(&agent_mcp_servers).await {
+                    Ok(registry) => Some(std::sync::Arc::new(registry)),
+                    Err(e) => {
                         ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Load
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Tool),
-                            &format!(
-                                "MCP deferred: {} tool stub(s) from {} server(s)",
-                                deferred_set.len(),
-                                registry.server_count()
-                            )
+                            ERROR,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                .with_category(::zeroclaw_log::EventCategory::Agent)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "MCP registry failed to initialize"
                         );
-                        let allowed_stub_count = mcp_allowed_tool_count(
-                            deferred_set
-                                .stubs
-                                .iter()
-                                .map(|stub| stub.prefixed_name.as_str()),
-                            mcp_policy.as_ref(),
-                        );
-                        deferred_section = crate::tools::build_deferred_tools_section_filtered(
-                            &deferred_set,
-                            mcp_policy.as_ref(),
-                        );
-                        if allowed_stub_count > 0 {
-                            let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                                crate::tools::ActivatedToolSet::new(),
-                            ));
-                            activated_handle = Some(std::sync::Arc::clone(&activated));
-                            let mut tool_search =
-                                crate::tools::ToolSearchTool::new(deferred_set, activated);
-                            if let Some(policy) = mcp_policy {
-                                tool_search = tool_search.with_access_policy(policy);
-                            }
-                            if let Some(ref handle) = delegate_handle {
-                                let delegate_tools = std::sync::Arc::clone(handle);
-                                tool_search = tool_search.with_activation_hook(
-                                    std::sync::Arc::new(move |tool| {
-                                        let mut tools = delegate_tools.write();
-                                        let already_registered = tools
-                                            .iter()
-                                            .any(|existing| existing.name() == tool.name());
-                                        if !already_registered {
-                                            tools.push(tool);
-                                        }
-                                    }),
-                                );
-                            }
-                            tools_registry.push(Box::new(tool_search));
-                        }
-                    } else {
-                        // Eager path: register only MCP tools admitted by the
-                        // same policy used by deferred MCP discovery.
-                        let names = registry.tool_names();
-                        let mut registered = 0usize;
-                        let mut skipped = 0usize;
-                        for name in names {
-                            if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
-                                skipped += 1;
-                                continue;
-                            }
-                            if let Some(def) = registry.get_tool_def(&name).await {
-                                let wrapper: std::sync::Arc<dyn Tool> =
-                                    std::sync::Arc::new(crate::tools::McpToolWrapper::new(
-                                        name,
-                                        def,
-                                        std::sync::Arc::clone(&registry),
-                                    ));
-                                if register_eager_mcp_tool_if_allowed(
-                                    wrapper,
-                                    &mut tools_registry,
-                                    delegate_handle.as_ref(),
-                                    mcp_policy.as_ref(),
-                                ) {
-                                    registered += 1;
-                                }
-                            }
-                        }
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Register
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Tool),
-                            &format!(
-                                "MCP: {} tool(s) registered from {} server(s), {} skipped by policy",
-                                registered,
-                                registry.server_count(),
-                                skipped
-                            )
-                        );
+                        None
                     }
-                    // Append pinned MCP resources unconditionally, after both the
-                    // deferred and eager branches, so the deferred-path reassignment
-                    // of `deferred_section` does not clobber them.
-                    append_pinned_mcp_section(&mut deferred_section, &pinned_section);
                 }
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "MCP registry failed to initialize"
+            };
+            if let Some(registry) = registry {
+                mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
+                let mcp_policy =
+                    mcp_tool_access_policy(security.as_ref(), allowed_tools.as_deref());
+                // Register the generic MCP resource/prompt capability tools
+                // (policy-gated, both deferred and eager modes).
+                for tool in
+                    crate::tools::build_mcp_capability_tools(&registry, mcp_policy.as_ref())
+                {
+                    register_eager_mcp_tool_if_allowed(
+                        tool,
+                        &mut tools_registry,
+                        delegate_handle.as_ref(),
+                        mcp_policy.as_ref(),
                     );
                 }
+                let pinned_section = crate::tools::mcp_context::build_pinned_resources_section(
+                    &registry,
+                    &agent_mcp_servers,
+                    mcp_policy.as_ref(),
+                )
+                .await;
+                if config.mcp.deferred_loading {
+                    // Deferred path: build stubs and register tool_search
+                    let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
+                        std::sync::Arc::clone(&registry),
+                    )
+                    .await;
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Load
+                        )
+                        .with_category(::zeroclaw_log::EventCategory::Tool),
+                        &format!(
+                            "MCP deferred: {} tool stub(s) from {} server(s)",
+                            deferred_set.len(),
+                            registry.server_count()
+                        )
+                    );
+                    let allowed_stub_count = mcp_allowed_tool_count(
+                        deferred_set
+                            .stubs
+                            .iter()
+                            .map(|stub| stub.prefixed_name.as_str()),
+                        mcp_policy.as_ref(),
+                    );
+                    deferred_section = crate::tools::build_deferred_tools_section_filtered(
+                        &deferred_set,
+                        mcp_policy.as_ref(),
+                    );
+                    if allowed_stub_count > 0 {
+                        let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                            crate::tools::ActivatedToolSet::new(),
+                        ));
+                        activated_handle = Some(std::sync::Arc::clone(&activated));
+                        let mut tool_search =
+                            crate::tools::ToolSearchTool::new(deferred_set, activated);
+                        if let Some(policy) = mcp_policy {
+                            tool_search = tool_search.with_access_policy(policy);
+                        }
+                        if let Some(ref handle) = delegate_handle {
+                            let delegate_tools = std::sync::Arc::clone(handle);
+                            tool_search = tool_search.with_activation_hook(
+                                std::sync::Arc::new(move |tool| {
+                                    let mut tools = delegate_tools.write();
+                                    let already_registered = tools
+                                        .iter()
+                                        .any(|existing| existing.name() == tool.name());
+                                    if !already_registered {
+                                        tools.push(tool);
+                                    }
+                                }),
+                            );
+                        }
+                        tools_registry.push(Box::new(tool_search));
+                    }
+                } else {
+                    // Eager path: register only MCP tools admitted by the
+                    // same policy used by deferred MCP discovery.
+                    let names = registry.tool_names();
+                    let mut registered = 0usize;
+                    let mut skipped = 0usize;
+                    for name in names {
+                        if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
+                            skipped += 1;
+                            continue;
+                        }
+                        if let Some(def) = registry.get_tool_def(&name).await {
+                            let wrapper: std::sync::Arc<dyn Tool> =
+                                std::sync::Arc::new(crate::tools::McpToolWrapper::new(
+                                    name,
+                                    def,
+                                    std::sync::Arc::clone(&registry),
+                                ));
+                            if register_eager_mcp_tool_if_allowed(
+                                wrapper,
+                                &mut tools_registry,
+                                delegate_handle.as_ref(),
+                                mcp_policy.as_ref(),
+                            ) {
+                                registered += 1;
+                            }
+                        }
+                    }
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Register
+                        )
+                        .with_category(::zeroclaw_log::EventCategory::Tool),
+                        &format!(
+                            "MCP: {} tool(s) registered from {} server(s), {} skipped by policy",
+                            registered,
+                            registry.server_count(),
+                            skipped
+                        )
+                    );
+                }
+                // Append pinned MCP resources unconditionally, after both the
+                // deferred and eager branches, so the deferred-path reassignment
+                // of `deferred_section` does not clobber them.
+                append_pinned_mcp_section(&mut deferred_section, &pinned_section);
             }
         }
 

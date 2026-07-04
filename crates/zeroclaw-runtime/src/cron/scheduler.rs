@@ -917,6 +917,7 @@ async fn run_agent_job(
         security: Some(Arc::new(run_security)),
         memory: None,
         is_subagent: false,
+        mcp_registry: None,
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {

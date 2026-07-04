@@ -214,6 +214,7 @@ impl Tool for SpawnSubagentTool {
             security: Some(subagent_ctx.policy.clone()),
             memory: None,
             is_subagent: true,
+            mcp_registry: None,
         };
         let parent_alias = subagent_ctx.parent_alias.clone();
 

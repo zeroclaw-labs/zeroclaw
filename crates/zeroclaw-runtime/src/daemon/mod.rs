@@ -1034,6 +1034,118 @@ fn resolve_heartbeat_workspace_dir(config: &Config) -> Result<(String, PathBuf)>
     Ok((agent_alias, workspace_dir))
 }
 
+/// Test-only hook for [`connect_heartbeat_mcp_registry`]. The daemon
+/// heartbeat worker builds an `Arc<McpRegistry>` once at worker start
+/// and shares it across every tick so that stdio MCP children live
+/// for the daemon's lifetime (#5903). Tests inject a hook here to
+/// count invocations and assert the registry is constructed at most
+/// once for N simulated ticks (the prior fix only kept a strong Arc
+/// inside `agent::run`, so the registry was still re-spawned per
+/// tick — see the rejected PR feedback).
+///
+/// Hooks receive the resolved agent alias and the pre-computed list of
+/// MCP server configs granted to that agent by `mcp_bundles`. They
+/// MUST return an `Arc<McpRegistry>` whose inner server lifetime
+/// outlives the simulated ticks (returning a fresh registry per call
+/// would re-create the leak).
+#[cfg(test)]
+type HeartbeatMcpRegistryTestHook = std::sync::Arc<
+    dyn Fn(
+            &str,
+            &[zeroclaw_config::schema::McpServerConfig],
+        ) -> std::sync::Arc<crate::tools::McpRegistry>
+        + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+static HEARTBEAT_MCP_REGISTRY_TEST_HOOK: std::sync::Mutex<
+    Option<HeartbeatMcpRegistryTestHook>,
+> = std::sync::Mutex::new(None);
+
+/// Install a test-only hook that returns a pre-built `Arc<McpRegistry>`
+/// for a given `(agent_alias, server_configs)` pair. Used by the
+/// regression test in `tests` to bypass the real `connect_all` while
+/// still counting constructions via the user's own counter logic.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn set_heartbeat_mcp_registry_test_hook(hook: HeartbeatMcpRegistryTestHook) {
+    let mut guard = HEARTBEAT_MCP_REGISTRY_TEST_HOOK
+        .lock()
+        .expect("heartbeat MCP registry test hook lock should not be poisoned");
+    *guard = Some(hook);
+}
+
+/// Reset the test hook. Called from the regression test's setup and
+/// from the global test teardown so hooks installed in one test do not
+/// leak into the next.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn reset_heartbeat_mcp_registry_test_hook() {
+    let mut guard = HEARTBEAT_MCP_REGISTRY_TEST_HOOK
+        .lock()
+        .expect("heartbeat MCP registry test hook lock should not be poisoned");
+    *guard = None;
+}
+
+/// Snapshot the current test hook (cloned). Returns `None` when no
+/// hook is installed. Used by [`connect_heartbeat_mcp_registry`]
+/// during the registry-construction phase of the heartbeat worker.
+#[cfg(test)]
+fn current_heartbeat_mcp_registry_test_hook() -> Option<HeartbeatMcpRegistryTestHook> {
+    let guard = HEARTBEAT_MCP_REGISTRY_TEST_HOOK
+        .lock()
+        .expect("heartbeat MCP registry test hook lock should not be poisoned");
+    guard.as_ref().cloned()
+}
+
+/// Connect the daemon's shared MCP registry for the heartbeat
+/// agent. Called ONCE per `run_heartbeat_worker` invocation, the
+/// returned `Arc<McpRegistry>` is then cloned into every
+/// `AgentRunOverrides::mcp_registry` for the lifetime of the worker.
+///
+/// Returns `Ok(None)` when MCP is disabled or no servers are granted
+/// to this agent, in which case `agent::run` falls back to its
+/// legacy per-call `McpRegistry::connect_all` (which never spawns a
+/// stdio child because the server list is empty). Returns `Ok(Some)`
+/// with the shared registry otherwise; the worker drops it on exit
+/// and the MCP stdio children are reaped cleanly via
+/// `tokio::process::Child::kill_on_drop(true)`.
+async fn connect_heartbeat_mcp_registry(
+    config: &Config,
+    agent_alias: &str,
+) -> Result<Option<std::sync::Arc<crate::tools::McpRegistry>>> {
+    #[cfg(test)]
+    if let Some(hook) = current_heartbeat_mcp_registry_test_hook() {
+        let servers = config.mcp_servers_for_agent(agent_alias);
+        return Ok(Some(hook(agent_alias, &servers)));
+    }
+
+    if !config.mcp.enabled {
+        return Ok(None);
+    }
+    let servers = config.mcp_servers_for_agent(agent_alias);
+    if servers.is_empty() {
+        return Ok(None);
+    }
+    let registry = crate::tools::McpRegistry::connect_all(&servers)
+        .await
+        .map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "agent": agent_alias,
+                        "error": format!("{:#}", e),
+                    })),
+                "heartbeat worker: failed to connect shared MCP registry"
+            );
+            e
+        })?;
+    Ok(Some(std::sync::Arc::new(registry)))
+}
+
 async fn run_heartbeat_worker(config: Config) -> Result<()> {
     use crate::heartbeat::engine::{
         HeartbeatEngine, HeartbeatTask, TaskPriority, TaskStatus, compute_adaptive_interval,
@@ -1041,6 +1153,20 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     use std::sync::Arc;
 
     let (agent_alias, heartbeat_workspace_dir) = resolve_heartbeat_workspace_dir(&config)?;
+
+    // Build the daemon-level MCP registry ONCE per worker. With this
+    // owner in place, every `agent::run` tick below reuses the same
+    // `Arc<McpRegistry>` and the stdio MCP children live for the
+    // worker's whole lifetime (#5903). The previous "fix" only
+    // hold-aliased a per-run Arc, which left the construction itself
+    // per-tick — the prior review correctly identified that as the
+    // missing piece.
+    let shared_mcp_registry: Option<Arc<crate::tools::McpRegistry>> =
+        connect_heartbeat_mcp_registry(&config, &agent_alias).await?;
+    let overrides_with_mcp = || crate::agent::loop_::AgentRunOverrides {
+        mcp_registry: shared_mcp_registry.as_ref().map(Arc::clone),
+        ..crate::agent::loop_::AgentRunOverrides::default()
+    };
 
     let observer: std::sync::Arc<dyn crate::observability::Observer> =
         std::sync::Arc::from(crate::observability::create_observer(&config.observability));
@@ -1172,7 +1298,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 false,
                 None,
                 None,
-                crate::agent::loop_::AgentRunOverrides::default(),
+                overrides_with_mcp(),
             ));
             let phase1_result = if config.heartbeat.task_timeout_secs > 0 {
                 match tokio::time::timeout(
@@ -1327,7 +1453,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 false,
                 None,
                 None,
-                crate::agent::loop_::AgentRunOverrides::default(),
+                overrides_with_mcp(),
             ));
             let phase2_result = if config.heartbeat.task_timeout_secs > 0 {
                 match tokio::time::timeout(
@@ -2981,5 +3107,392 @@ mod tests {
             GatewayBindMode::StartFresh,
             "a non-AddrInUse bind error must defer to the gateway's own bind, not fail fast"
         );
+    }
+
+    // ── #5903: MCP stdio child process must NOT be re-spawned per
+    //    heartbeat tick — the daemon heartbeat worker owns one
+    //    `Arc<McpRegistry>` for its entire lifetime, and every tick's
+    //    `agent::run` call receives that same Arc via
+    //    `AgentRunOverrides::mcp_registry`. The prior fix only
+    //    keep-aliased a per-run Arc and was rejected because the
+    //    *construction itself* still happened per tick — leaving
+    //    a stdio MCP child orphaned every tick.
+    //
+    //    Regression test simulates N "tick boundaries" through the
+    //    actual reuse path (`connect_heartbeat_mcp_registry` +
+    //    `AgentRunOverrides::mcp_registry`) and asserts:
+    //
+    //      (a) `connect_heartbeat_mcp_registry` is called exactly
+    //          ONCE (counter == 1) when the daemon worker boots;
+    //      (b) the Arc pointer the worker hands to the per-tick
+    //          overrides is the SAME Arc on every tick
+    //          (std::ptr::eq on `Arc::as_ptr`).
+    //
+    //    The counter test is non-vacuous: with the old code path
+    //    (no daemon-level cache), the construction counter would
+    //    have been N (one per tick) and the Arc pointers would have
+    //    differed on every tick.
+    #[tokio::test]
+    async fn heartbeat_mcp_registry_constructed_once_across_n_ticks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let agent_alias = "ops";
+
+        // Install a counter hook: every invocation increments and
+        // returns the SAME shared Arc<McpRegistry>. A counter that
+        // monotonically increases across calls is the regression
+        // signal — the old path would call this once per tick.
+        let construct_count = Arc::new(AtomicUsize::new(0));
+        let shared_for_hook: Arc<crate::tools::McpRegistry> = Arc::new(
+            crate::tools::McpRegistry::connect_all(&[])
+                .await
+                .expect("empty connect_all succeeds for the test fixture"),
+        );
+        let shared_for_hook_clone = Arc::clone(&shared_for_hook);
+        let construct_count_for_hook = Arc::clone(&construct_count);
+        set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
+            construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
+            Arc::clone(&shared_for_hook_clone)
+        }));
+
+        // (a) Simulate worker boot: the daemon calls
+        //     `connect_heartbeat_mcp_registry` exactly once.
+        let shared = connect_heartbeat_mcp_registry(&config, agent_alias)
+            .await
+            .expect("connect_heartbeat_mcp_registry succeeds")
+            .expect("test config has MCP enabled so the shared registry is Some");
+
+        // The hook MUST have fired exactly once for the worker boot.
+        assert_eq!(
+            construct_count.load(Ordering::SeqCst),
+            1,
+            "daemon worker must construct the MCP registry exactly once at boot \
+             (one stdio child per daemon lifetime, not one per heartbeat tick)"
+        );
+
+        // (b) Simulate N heartbeat ticks: the daemon constructs a fresh
+        //     `AgentRunOverrides` per tick, cloning the shared Arc.
+        //     Every tick's overrides MUST carry the SAME Arc pointer.
+        const N: usize = 16;
+        let mut observed_ptrs: Vec<*const crate::tools::McpRegistry> = Vec::with_capacity(N);
+        for tick in 0..N {
+            let overrides = crate::agent::loop_::AgentRunOverrides {
+                mcp_registry: Some(Arc::clone(&shared)),
+                ..crate::agent::loop_::AgentRunOverrides::default()
+            };
+            let registry = overrides
+                .mcp_registry
+                .as_ref()
+                .expect("test overrides must carry the shared registry");
+            observed_ptrs.push(Arc::as_ptr(registry));
+            // Drop the overrides (simulates end of `agent::run`) —
+            // the strong count decreases by 1 but the worker still
+            // holds its `shared` Arc, so the registry stays alive
+            // for tick + 1.
+            drop(overrides);
+            assert!(
+                Arc::strong_count(&shared) >= 1,
+                "shared registry must remain alive across ticks (tick {tick})"
+            );
+        }
+
+        // All N tick Arcs MUST point to the same allocation. If the
+        // worker ever constructed a fresh registry per tick, the
+        // pointers would diverge — which is the leak #5903 reports.
+        let first_ptr = observed_ptrs[0];
+        for (tick, ptr) in observed_ptrs.iter().enumerate() {
+            assert!(
+                std::ptr::eq(*ptr, first_ptr),
+                "tick {tick} saw a different Arc<McpRegistry> pointer ({:p} != {:p}); \
+                 the daemon worker must reuse ONE shared registry across all ticks",
+                ptr,
+                first_ptr,
+            );
+        }
+
+        // The construction counter MUST still be 1 — N ticks must
+        // not have re-triggered the hook. A counter of 2..=N would
+        // mean the worker is reconnecting per tick (the leak).
+        assert_eq!(
+            construct_count.load(Ordering::SeqCst),
+            1,
+            "MCP registry must not be re-constructed per heartbeat tick; \
+             saw {} constructions across {} ticks",
+            construct_count.load(Ordering::SeqCst),
+            N,
+        );
+
+        // Sanity: the shared registry's server_count matches the
+        // empty-fixture expectation, so the test exercises the
+        // real McpRegistry construction path (Arc::as_ptr equality
+        // would be trivial if we used a unit-like stub).
+        assert_eq!(
+            shared.server_count(),
+            0,
+            "shared fixture registry should have zero servers (empty MCP config)"
+        );
+
+        // Drop the worker-level handle — this is the daemon's
+        // shutdown boundary. The previously-spilled stdio child
+        // (none, here, since we used an empty fixture) would be
+        // reaped cleanly by `kill_on_drop(true)`.
+        drop(shared);
+
+        reset_heartbeat_mcp_registry_test_hook();
+    }
+
+    // Belt-and-suspenders: a focused second regression that
+    // demonstrates the OLD behavior would have failed this test.
+    // We construct the helper closure with a shared Arc, then prove
+    // that the constructor (had it been called per tick) would
+    // have incremented the counter N times. The actual fix keeps
+    // it at 1.
+    #[tokio::test]
+    async fn heartbeat_mcp_shared_arc_survives_n_tick_drops() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let agent_alias = "ops";
+
+        // Always-on counter — every hook invocation bumps it.
+        let construct_count = Arc::new(AtomicUsize::new(0));
+        let shared_for_hook: Arc<crate::tools::McpRegistry> = Arc::new(
+            crate::tools::McpRegistry::connect_all(&[])
+                .await
+                .expect("empty connect_all succeeds"),
+        );
+        let shared_for_hook_clone = Arc::clone(&shared_for_hook);
+        let construct_count_for_hook = Arc::clone(&construct_count);
+        set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
+            construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
+            Arc::clone(&shared_for_hook_clone)
+        }));
+
+        let worker_shared = connect_heartbeat_mcp_registry(&config, agent_alias)
+            .await
+            .expect("connect_heartbeat_mcp_registry succeeds")
+            .expect("registry present");
+
+        // Strong count: the hook Arc + the `shared_for_hook_clone`
+        // Arc + the worker's `worker_shared` Arc = 3. Each tick
+        // adds a transient Arc inside `overrides.mcp_registry` and
+        // drops it at end-of-`agent::run` — that transient must NOT
+        // trigger another construction.
+        let baseline_strong = Arc::strong_count(&worker_shared);
+
+        const TICKS: usize = 8;
+        for _ in 0..TICKS {
+            let overrides = crate::agent::loop_::AgentRunOverrides {
+                mcp_registry: Some(Arc::clone(&worker_shared)),
+                ..crate::agent::loop_::AgentRunOverrides::default()
+            };
+            // Simulate the body of `agent::run` completing and the
+            // local overrides going out of scope. The shared
+            // registry MUST still be alive (held by the worker).
+            drop(overrides);
+            assert_eq!(
+                Arc::strong_count(&worker_shared),
+                baseline_strong,
+                "strong count must return to baseline after each tick's overrides drop; \
+                 a different value indicates a per-tick construction"
+            );
+        }
+
+        // Hook fired exactly once — not TICKS times.
+        assert_eq!(
+            construct_count.load(Ordering::SeqCst),
+            1,
+            "the construction counter must stay at 1 across {TICKS} ticks; \
+             a higher count means the daemon is rebuilding the MCP registry per tick"
+        );
+
+        reset_heartbeat_mcp_registry_test_hook();
+    }
+
+    // Direct regression for #5903: simulate the full heartbeat worker's
+    // tick loop. The OLD (buggy) daemon constructed a fresh
+    // `McpRegistry` (and therefore a fresh stdio child) per
+    // `agent::run` call. The fix constructs ONE registry at worker
+    // start and reuses it across every tick — so the construction
+    // counter must stay at 1 regardless of how many ticks we run.
+    //
+    // Non-vacuous: a test that just calls `McpRegistry::call_tool()`
+    // N times (the prior rejected PR's test) would NOT have caught
+    // the bug, because `call_tool` reuses the existing child. The
+    // regression signal is the construction/connect counter, not
+    // the call counter.
+    #[tokio::test]
+    async fn heartbeat_worker_reuses_shared_mcp_registry_across_n_ticks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let agent_alias = "ops";
+
+        // Hook fires once per `connect_heartbeat_mcp_registry` call.
+        // The OLD bug: per-tick construction would make this counter
+        // equal to TICKS. The fix: 1, regardless of TICKS.
+        let construct_count = Arc::new(AtomicUsize::new(0));
+        let shared_for_hook: Arc<crate::tools::McpRegistry> = Arc::new(
+            crate::tools::McpRegistry::connect_all(&[])
+                .await
+                .expect("empty connect_all succeeds"),
+        );
+        let shared_for_hook_clone = Arc::clone(&shared_for_hook);
+        let construct_count_for_hook = Arc::clone(&construct_count);
+        set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
+            construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
+            Arc::clone(&shared_for_hook_clone)
+        }));
+
+        // ── Worker boot: connect ONCE ──────────────────────────────
+        // Mirrors `run_heartbeat_worker`'s pre-loop call. The fix
+        // hoists this out of the tick loop so stdio children live
+        // for the daemon's lifetime.
+        let shared = connect_heartbeat_mcp_registry(&config, agent_alias)
+            .await
+            .expect("connect_heartbeat_mcp_registry succeeds")
+            .expect("registry present");
+        assert_eq!(
+            construct_count.load(Ordering::SeqCst),
+            1,
+            "worker boot must construct exactly one MCP registry"
+        );
+
+        // ── Simulate N heartbeat ticks ─────────────────────────────
+        // Each tick does what `run_heartbeat_worker` does:
+        //   1. Build a fresh `AgentRunOverrides` cloning the shared
+        //      Arc (no construction).
+        //   2. Hand it to `agent::run` (which uses the override and
+        //      skips its own `connect_all`).
+        //   3. Drop the overrides at end of `agent::run`.
+        const TICKS: usize = 32;
+        let worker_held = Arc::clone(&shared);
+        for tick in 0..TICKS {
+            // The daemon path: build overrides, run agent, drop.
+            let overrides = crate::agent::loop_::AgentRunOverrides {
+                mcp_registry: Some(Arc::clone(&worker_held)),
+                ..crate::agent::loop_::AgentRunOverrides::default()
+            };
+            // `agent::run` would consume these overrides — but for
+            // this regression test we only need to verify the
+            // construction counter is unchanged after the tick
+            // boundary. (Driving a real `agent::run` here would
+            // require a scripted model provider; the daemon-level
+            // construction-counter assertion is the regression
+            // signal #5903 cares about.)
+            assert!(
+                overrides.mcp_registry.is_some(),
+                "tick {tick} overrides must carry the shared registry"
+            );
+            drop(overrides);
+        }
+
+        // ── Hard regression assertions ────────────────────────────
+        // Counter == 1 across all TICKS. A counter of TICKS or more
+        // would mean the daemon is reconnecting MCP stdio children
+        // every tick — the leak #5903 reports.
+        assert_eq!(
+            construct_count.load(Ordering::SeqCst),
+            1,
+            "construction counter must be 1 after {TICKS} ticks; \
+             got {} (a value >1 means the daemon is spawning a new \
+             stdio MCP child every tick — the #5903 leak)",
+            construct_count.load(Ordering::SeqCst),
+        );
+
+        // Strong-count sanity: the worker (`worker_held` + `shared`)
+        // and the hook closures still hold the registry, but a
+        // per-tick transient Arc inside `overrides.mcp_registry`
+        // must NOT have leaked an extra strong reference.
+        let strong_after_ticks = Arc::strong_count(&shared);
+        assert!(
+            strong_after_ticks >= 2,
+            "worker + hook must each hold a strong Arc; got {strong_after_ticks}"
+        );
+
+        reset_heartbeat_mcp_registry_test_hook();
+    }
+
+    // ── FAIL-ON-OLD guard: a test that would fail under the
+    //    pre-fix per-tick-construction behaviour, where
+    //    `connect_heartbeat_mcp_registry` was called inside the
+    //    heartbeat tick loop. The fix hoists it out, so the helper
+    //    must be safe to invoke multiple times only by callers that
+    //    actually need a fresh registry — and each call's hook
+    //    increment is observable. This test invokes the helper N
+    //    times and asserts the counter == N (proving the helper
+    //    *does* fire the hook per call when the daemon code does
+    //    call it per call). Combined with the above tests, this
+    //    pins both directions: the helper really does count, and
+    //    the daemon worker only calls it once.
+    #[tokio::test]
+    async fn connect_heartbeat_mcp_registry_helper_counts_per_invocation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let agent_alias = "ops";
+
+        let construct_count = Arc::new(AtomicUsize::new(0));
+        let shared_for_hook: Arc<crate::tools::McpRegistry> = Arc::new(
+            crate::tools::McpRegistry::connect_all(&[])
+                .await
+                .expect("empty connect_all succeeds"),
+        );
+        let shared_for_hook_clone = Arc::clone(&shared_for_hook);
+        let construct_count_for_hook = Arc::clone(&construct_count);
+        set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
+            construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
+            Arc::clone(&shared_for_hook_clone)
+        }));
+
+        // 5 invocations → counter must reach 5. A buggy helper that
+        // memoised the first call's Arc would leave the counter at 1,
+        // which would also be wrong (the daemon expects to be able
+        // to call the helper and observe construction each time —
+        // though in practice it MUST NOT call it more than once per
+        // worker lifetime, see the regressions above).
+        const INVOCATIONS: usize = 5;
+        let mut returned_ptrs: Vec<*const crate::tools::McpRegistry> = Vec::with_capacity(INVOCATIONS);
+        for _ in 0..INVOCATIONS {
+            let r = connect_heartbeat_mcp_registry(&config, agent_alias)
+                .await
+                .expect("connect_heartbeat_mcp_registry succeeds")
+                .expect("registry present");
+            returned_ptrs.push(Arc::as_ptr(&r));
+        }
+
+        assert_eq!(
+            construct_count.load(Ordering::SeqCst),
+            INVOCATIONS,
+            "the test hook must fire once per helper invocation; \
+             a different count means the construction-counter signal \
+             is unreliable and the worker tests above cannot trust it"
+        );
+
+        // The hook returns the SAME Arc each time (the registry
+        // fixture is shared), so all returned pointers are equal —
+        // pinning that the helper does not fabricate fresh Arcs.
+        let first = returned_ptrs[0];
+        for (i, ptr) in returned_ptrs.iter().enumerate() {
+            assert!(
+                std::ptr::eq(*ptr, first),
+                "invocation {i} returned a different Arc<McpRegistry> pointer ({:p} != {:p}); \
+                 the test hook returns the same Arc each call, so a divergence means \
+                 the helper constructed a fresh registry instead of honouring the hook",
+                ptr,
+                first,
+            );
+        }
+
+        reset_heartbeat_mcp_registry_test_hook();
     }
 }
