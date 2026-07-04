@@ -951,6 +951,8 @@ pub use super::tool_execution::{ToolExecutionOutcome, should_execute_tools_in_pa
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
+/// `turn_id` is the correlation id for this turn; `None` makes `agent_turn`
+/// mint its own, leaving pre-existing callers unchanged.
 #[allow(clippy::too_many_arguments)]
 pub async fn agent_turn(
     model_provider: &dyn ModelProvider,
@@ -3599,6 +3601,7 @@ pub async fn process_message(
         }
 
         let turn_id = uuid::Uuid::new_v4().to_string();
+        let channel_name = "daemon";
         // process_message is the channel entrypoint (Discord, Telegram, gateway,
         // etc.) — recall is scoped to the channel's session_id, so retrieving the
         // user's own Conversation history within their session is intended.
@@ -3610,7 +3613,7 @@ pub async fn process_message(
             session_id,
             false,
             TurnMetaRef {
-                channel: Some("daemon"),
+                channel: Some(channel_name),
                 agent_alias: Some(agent_alias),
                 turn_id: Some(&turn_id),
             },
@@ -3627,7 +3630,7 @@ pub async fn process_message(
                     &board_names,
                     rag_limit,
                     TurnMetaRef {
-                        channel: Some("daemon"),
+                        channel: Some(channel_name),
                         agent_alias: Some(agent_alias),
                         turn_id: Some(&turn_id),
                     },
@@ -3688,7 +3691,7 @@ pub async fn process_message(
                     &model_name,
                     effective_temperature,
                     true,
-                    "daemon",
+                    channel_name,
                     None,
                     &config.multimodal,
                     agent.resolved.max_tool_iterations,
