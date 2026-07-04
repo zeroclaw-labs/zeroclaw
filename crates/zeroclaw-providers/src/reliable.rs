@@ -658,6 +658,13 @@ pub(crate) struct ReliableModelProviderEntry {
     display_name: String,
     cooldown_key: String,
     provider: Box<dyn ModelProvider>,
+    /// Model this entry actually serves when it wraps a
+    /// [`crate::model_pin::ModelPinnedProvider`]. The pin swaps the model
+    /// INSIDE the provider, so without this the failover loop cannot tell
+    /// that the served model differs from the requested one and never
+    /// records the model downgrade. `None` for unpinned entries (the
+    /// requested model flows through unchanged).
+    pinned_model: Option<String>,
 }
 
 impl ReliableModelProviderEntry {
@@ -670,7 +677,37 @@ impl ReliableModelProviderEntry {
             display_name: display_name.into(),
             cooldown_key: cooldown_key.into(),
             provider,
+            pinned_model: None,
         }
+    }
+
+    /// Build an entry that serves `pinned_model` regardless of the requested
+    /// model. Constructs the [`crate::model_pin::ModelPinnedProvider`] wrapper
+    /// itself so the pinned model string has a single assignment site (the
+    /// entry field and the pin wrapper cannot drift).
+    pub(crate) fn new_pinned(
+        display_name: impl Into<String>,
+        cooldown_key: impl Into<String>,
+        alias: &str,
+        pinned_model: &str,
+        inner: Box<dyn ModelProvider>,
+    ) -> Self {
+        Self {
+            display_name: display_name.into(),
+            cooldown_key: cooldown_key.into(),
+            provider: Box::new(crate::model_pin::ModelPinnedProvider::new(
+                alias,
+                pinned_model,
+                inner,
+            )),
+            pinned_model: Some(pinned_model.to_string()),
+        }
+    }
+
+    /// Model this entry serves for `requested_model`: the pinned model when
+    /// the entry is model-pinned, otherwise the requested model unchanged.
+    fn served_model<'a>(&'a self, requested_model: &'a str) -> &'a str {
+        self.pinned_model.as_deref().unwrap_or(requested_model)
     }
 }
 
@@ -959,15 +996,16 @@ impl ModelProvider for ReliableModelProvider {
                                 .await;
                                 continue;
                             }
+                            let served_model = entry.served_model(current_model);
                             if attempt > 0
-                                || *current_model != model
+                                || served_model != model
                                 || self
                                     .model_providers
                                     .first()
                                     .map(|entry| entry.display_name.as_str())
                                     != Some(provider_name)
                             {
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "attempt": attempt, "original_model": model})), "ModelProvider recovered (failover/retry)");
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "attempt": attempt, "original_model": model})), "ModelProvider recovered (failover/retry)");
                                 let primary = self
                                     .model_providers
                                     .first()
@@ -977,7 +1015,7 @@ impl ModelProvider for ReliableModelProvider {
                                     primary,
                                     model,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                 );
                             }
                             return Ok(resp);
@@ -1157,8 +1195,9 @@ impl ModelProvider for ReliableModelProvider {
                                 .await;
                                 continue;
                             }
+                            let served_model = entry.served_model(current_model);
                             if attempt > 0
-                                || *current_model != model
+                                || served_model != model
                                 || context_truncated
                                 || self
                                     .model_providers
@@ -1166,7 +1205,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .map(|entry| entry.display_name.as_str())
                                     != Some(provider_name)
                             {
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "attempt": attempt, "original_model": model, "context_truncated": context_truncated})), "ModelProvider recovered (failover/retry)");
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "attempt": attempt, "original_model": model, "context_truncated": context_truncated})), "ModelProvider recovered (failover/retry)");
                                 let primary = self
                                     .model_providers
                                     .first()
@@ -1176,7 +1215,7 @@ impl ModelProvider for ReliableModelProvider {
                                     primary,
                                     model,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                 );
                             }
                             return Ok(resp);
@@ -1376,8 +1415,9 @@ impl ModelProvider for ReliableModelProvider {
                                 .await;
                                 continue;
                             }
+                            let served_model = entry.served_model(current_model);
                             if attempt > 0
-                                || *current_model != model
+                                || served_model != model
                                 || context_truncated
                                 || self
                                     .model_providers
@@ -1385,7 +1425,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .map(|entry| entry.display_name.as_str())
                                     != Some(provider_name)
                             {
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "attempt": attempt, "original_model": model, "context_truncated": context_truncated})), "ModelProvider recovered (failover/retry)");
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "attempt": attempt, "original_model": model, "context_truncated": context_truncated})), "ModelProvider recovered (failover/retry)");
                                 let primary = self
                                     .model_providers
                                     .first()
@@ -1395,7 +1435,7 @@ impl ModelProvider for ReliableModelProvider {
                                     primary,
                                     model,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                 );
                             }
                             return Ok(resp);
@@ -1585,8 +1625,9 @@ impl ModelProvider for ReliableModelProvider {
                                 .await;
                                 continue;
                             }
+                            let served_model = entry.served_model(current_model);
                             if attempt > 0
-                                || *current_model != model
+                                || served_model != model
                                 || context_truncated
                                 || self
                                     .model_providers
@@ -1594,7 +1635,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .map(|entry| entry.display_name.as_str())
                                     != Some(provider_name)
                             {
-                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "attempt": attempt, "original_model": model, "context_truncated": context_truncated})), "ModelProvider recovered (failover/retry)");
+                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "attempt": attempt, "original_model": model, "context_truncated": context_truncated})), "ModelProvider recovered (failover/retry)");
                                 let primary = self
                                     .model_providers
                                     .first()
@@ -1604,7 +1645,7 @@ impl ModelProvider for ReliableModelProvider {
                                     primary,
                                     model,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                 );
                             }
                             return Ok(resp);
@@ -2186,6 +2227,105 @@ mod tests {
         assert_eq!(result, "from fallback");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A `fallback_models` downgrade uses model-PINNED entries on one
+    /// provider: the model swap happens inside `ModelPinnedProvider`, so the
+    /// failover loop must read the entry's pinned model to record the
+    /// downgrade. Regression test for the case where the requested model's
+    /// entry fails and a sibling entry pinned to another model serves the
+    /// turn: the recorded fallback must name the SERVED model.
+    #[tokio::test]
+    async fn pinned_model_fallback_records_served_model() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "mock",
+            vec![
+                ReliableModelProviderEntry::new_pinned(
+                    "openai",
+                    "openai.mock",
+                    "mock",
+                    "model-primary",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&primary_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "primary model down",
+                    }),
+                ),
+                ReliableModelProviderEntry::new_pinned(
+                    "openai",
+                    "openai.mock",
+                    "mock",
+                    "model-served",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: 0,
+                        response: "from pinned fallback",
+                        error: "unused",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let (result, fallback) = scope_provider_fallback(async {
+            let result = model_provider
+                .simple_chat("hello", "model-primary", Some(0.0))
+                .await;
+            (result, take_last_provider_fallback())
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), "from pinned fallback");
+        let fallback = fallback.expect("pinned-model downgrade must be recorded");
+        assert_eq!(fallback.requested_model, "model-primary");
+        assert_eq!(
+            fallback.actual_model, "model-served",
+            "the record must carry the model the pinned entry actually served"
+        );
+        assert_eq!(fallback.requested_provider, fallback.actual_provider);
+    }
+
+    /// The requested model served by its own pinned entry (attempt 0, first
+    /// entry) is not a fallback — nothing may be recorded.
+    #[tokio::test]
+    async fn pinned_primary_success_records_nothing() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "mock",
+            vec![ReliableModelProviderEntry::new_pinned(
+                "openai",
+                "openai.mock",
+                "mock",
+                "model-primary",
+                Box::new(MockModelProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: 0,
+                    response: "ok",
+                    error: "unused",
+                }),
+            )],
+            0,
+            1,
+        );
+
+        let (result, fallback) = scope_provider_fallback(async {
+            let result = model_provider
+                .simple_chat("hello", "model-primary", Some(0.0))
+                .await;
+            (result, take_last_provider_fallback())
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), "ok");
+        assert!(
+            fallback.is_none(),
+            "primary pinned entry serving the requested model is not a fallback"
+        );
     }
 
     /// Returns an empty completion (blank `chat_with_system` text, which the
