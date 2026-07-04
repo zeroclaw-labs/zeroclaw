@@ -129,7 +129,7 @@ Scoped path labels do not guarantee a same-prefix base label. Because `pr-path-l
 | `security:bubblewrap` | `bubblewrap.rs` |
 | `security:docker` | `docker.rs` |
 | `security:leak-detector` | LeakDetector redaction and sensitive-output scanning |
-| `security:pairing` | pairing security, gateway pairing API, and web pairing page |
+| `security:pairing` | pairing security, gateway pairing API, Tauri pairing command, and web pairing page |
 | `security:policy` | runtime security policy, IAM policy, and config policy files |
 | `security:secrets` | runtime and config secrets handling |
 | `security:traits` | shared security trait and interface definitions |
