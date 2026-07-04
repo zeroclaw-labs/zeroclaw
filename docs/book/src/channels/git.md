@@ -6,7 +6,7 @@ With the GitHub provider, ZeroClaw authenticates as a **GitHub App** and replies
 
 With the Gitea/Forgejo provider, ZeroClaw authenticates with a personal access token against the instance's Gitea-compatible API and replies as the token owner.
 
-> **Build note:** the git channel is **not included** in the lean default build. Build with `--features channel-git` (or `channels-full`). GitHub and Gitea/Forgejo providers are on by default under `channel-git`; build a forge subset with `--features channel-git` plus the desired `provider-*` features.
+> **Build note:** the git channel is **not included** in the lean default build. Build with `--features channel-git` (or `channels-full`). `channel-git` bundles both providers (it enables `provider-github` and `provider-gitea` for Gitea/Forgejo together), so a single build serves every supported forge; there is no smaller per-provider subset to select.
 
 ## How it works
 
