@@ -160,8 +160,9 @@ It grows one surface at a time and asserts only what no other test covers:
   cross-path parity assertion, which is the property no per-primitive test makes.
 
 Until a surface has a single resolution seam, there is nothing to assert parity
-against, so its row stays in the divergence record (or as an ignored spec plus a
-divergence characterization) rather than as a premature green test.
+against, so its row stays in the divergence record as an always-running
+divergence characterization rather than as a premature green test - never as an
+`#[ignore]`d spec, consistent with the no-ignored-specs rule above.
 
 ## Adding a surface (the workflow each future surface PR follows)
 
