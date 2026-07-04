@@ -1,5 +1,5 @@
 use crate::AppState;
-use axum::extract::Path;
+use axum::extract::Extension;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event, Sse};
 use axum::{Json, extract::State, response::IntoResponse};
@@ -220,7 +220,7 @@ fn make_stop_chunk(id: &str, created: u64, model: &str) -> Event {
 
 pub async fn handle_openai_models(
     State(state): State<AppState>,
-    Path(_alias): Path<String>,
+    Extension(_alias): Extension<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Err(e) = check_auth(&state, &headers) {
@@ -246,7 +246,7 @@ pub async fn handle_openai_models(
 
 pub async fn handle_openai_chat_completion_stream(
     State(state): State<AppState>,
-    Path(alias): Path<String>,
+    Extension(alias): Extension<String>,
     headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {

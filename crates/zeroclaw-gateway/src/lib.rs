@@ -2072,6 +2072,7 @@ pub async fn run_gateway(
             );
         let openai_router: Router = openai_router
             .with_state(state.clone())
+            .layer(axum::Extension(alias.clone()))
             .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
             .layer(TimeoutLayer::with_status_code(
                 StatusCode::REQUEST_TIMEOUT,
