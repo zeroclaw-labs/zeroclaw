@@ -347,7 +347,7 @@ pub async fn handle_openai_chat_completion_stream(
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
 
-    tokio::spawn(async move {
+    zeroclaw_spawn::spawn!(async move {
         if let Err(e) = agent.turn_streamed(&prompt, event_tx, None).await {
             ::zeroclaw_log::record!(
                 ERROR,
