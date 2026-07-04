@@ -131,6 +131,12 @@ pub(crate) async fn prepare_messages_for_iteration(
     degrade_strip_images: bool,
     image_cache: Option<&mut multimodal::LocalImageCache>,
 ) -> Result<multimodal::PreparedMessages> {
+    // Enforce the universal leading-turn-order invariant before any provider
+    // sees the history: strict providers reject a first non-system turn that is
+    // not `user`, which context trims and session restores can produce.
+    let mut sanitized = history.to_vec();
+    ChatMessage::sanitize_leading_turn_order(&mut sanitized);
+    let history = sanitized.as_slice();
     if degrade_strip_images {
         // Text-only fallback: replace every media marker with a
         // `[media attachment]` placeholder so no filesystem path or data
@@ -205,5 +211,32 @@ mod tests {
             .await
             .unwrap();
         assert!(uncached.contains_images);
+    }
+
+    /// Regression: a history whose first non-system turn is an assistant
+    /// tool-call (context trim / restore decapitated the anchoring user turn)
+    /// must be sanitized before any provider sees it, so strict providers no
+    /// longer reject the leading tool-call turn.
+    #[tokio::test]
+    async fn prepare_strips_leading_assistant_tool_call() {
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant("[tool_call] fire"),
+            ChatMessage::tool("result"),
+            ChatMessage::user("actual user"),
+        ];
+        let cfg = MultimodalConfig::default();
+        let prepared = prepare_messages_for_iteration(&history, &cfg, false, None)
+            .await
+            .unwrap();
+        let first_non_system = prepared
+            .messages
+            .iter()
+            .find(|m| m.role != "system")
+            .expect("a non-system turn survives");
+        assert_eq!(
+            first_non_system.role, "user",
+            "leading non-user turns must be dropped before dispatch"
+        );
     }
 }
