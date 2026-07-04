@@ -221,6 +221,41 @@ impl std::fmt::Debug for ResolvedEmbeddingConfig {
     }
 }
 
+/// Embedding provider settings resolved from the canonical config, returned to
+/// callers that need to rebuild an embedder after a provider profile changes at
+/// runtime (`config/set`) — e.g. the runtime's memory-embedder refresh hook for
+/// #8359. `model_provider` is the literal factory input
+/// (`openai` / `openrouter` / `custom:<url>` / `none`), not a dotted catalog ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingSettings {
+    pub model_provider: String,
+    pub model: String,
+    pub dimensions: usize,
+    pub api_key: Option<String>,
+}
+
+/// Resolve the embedding settings a memory backend would use right now, from
+/// the live `[memory]` config, `[[embedding_routes]]`, and provider catalog.
+///
+/// This mirrors the resolution performed when the backend is first constructed
+/// (dotted `<type>.<alias>` refs → concrete endpoint/key), so a long-lived
+/// memory handle can be refreshed after a `config/set` provider-profile change
+/// without a daemon restart. Pair with [`Memory::refresh_embedder`].
+pub fn resolve_embedding_settings(
+    config: &MemoryConfig,
+    embedding_routes: &[EmbeddingRouteConfig],
+    api_key: Option<&str>,
+    providers: Option<&ModelProviders>,
+) -> EmbeddingSettings {
+    let resolved = resolve_embedding_config(config, embedding_routes, api_key, providers);
+    EmbeddingSettings {
+        model_provider: resolved.model_provider,
+        model: resolved.model,
+        dimensions: resolved.dimensions,
+        api_key: resolved.api_key,
+    }
+}
+
 fn resolve_embedding_config(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
@@ -982,6 +1017,29 @@ mod tests {
         assert_eq!(
             resolved,
             ResolvedEmbeddingConfig {
+                model_provider: "openai".into(),
+                model: "text-embedding-3-small".into(),
+                dimensions: 1536,
+                api_key: Some("base-key".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_embedding_settings_exposes_resolved_values_for_runtime_refresh() {
+        // The public runtime entry point (#8359) must surface the same resolved
+        // literal provider/model/dims/key the constructor would use.
+        let cfg = MemoryConfig {
+            embedding_provider: "openai".into(),
+            embedding_model: "text-embedding-3-small".into(),
+            embedding_dimensions: 1536,
+            ..MemoryConfig::default()
+        };
+
+        let settings = resolve_embedding_settings(&cfg, &[], Some("base-key"), None);
+        assert_eq!(
+            settings,
+            EmbeddingSettings {
                 model_provider: "openai".into(),
                 model: "text-embedding-3-small".into(),
                 dimensions: 1536,
