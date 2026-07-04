@@ -119,7 +119,7 @@ impl Tool for HardwareBoardInfoTool {
                 Ok(info) => {
                     return Ok(ToolResult {
                         success: true,
-                        output: info,
+                        output: info.into(),
                         error: None,
                     });
                 }

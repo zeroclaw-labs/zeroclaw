@@ -107,14 +107,14 @@ impl Tool for HardwareMemoryReadTool {
                 Ok(output) => {
                     return Ok(ToolResult {
                         success: true,
-                        output,
+                        output: output.into(),
                         error: None,
                     });
                 }
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: String::new().into(),
                         error: Some(format!(
                             "probe-rs read failed: {}. Ensure Nucleo is connected via USB and built with --features probe.",
                             e

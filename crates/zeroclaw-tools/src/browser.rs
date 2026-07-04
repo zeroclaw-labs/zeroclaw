@@ -784,7 +784,9 @@ impl BrowserTool {
 
             Ok(ToolResult {
                 success: true,
-                output: serde_json::to_string_pretty(&output).unwrap_or_default(),
+                output: serde_json::to_string_pretty(&output)
+                    .unwrap_or_default()
+                    .into(),
                 error: None,
             })
         }

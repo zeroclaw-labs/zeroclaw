@@ -170,14 +170,14 @@ impl Tool for PdfReadTool {
                 Ok(Err(e)) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: String::new().into(),
                         error: Some(format!("PDF extraction failed: {e}")),
                     });
                 }
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: String::new().into(),
                         error: Some(format!("PDF extraction task panicked: {e}")),
                     });
                 }
@@ -205,7 +205,7 @@ impl Tool for PdfReadTool {
 
             return Ok(ToolResult {
                 success: true,
-                output,
+                output: output.into(),
                 error: None,
             });
         }
