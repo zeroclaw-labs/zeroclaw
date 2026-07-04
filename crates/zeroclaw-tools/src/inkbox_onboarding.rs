@@ -260,14 +260,21 @@ pub fn provision_phone(base_url: &str, api_key: &str, handle: &str) -> anyhow::R
 /// # Arguments
 /// * `base_url` - Inkbox API base URL.
 /// * `api_key` - the key to act as.
+/// * `handle` - the agent handle to create/rotate the signing key for.
 ///
 /// # Returns
 /// The `whsec_…` signing key string (shown once).
-pub fn create_signing_key(base_url: &str, api_key: &str) -> anyhow::Result<String> {
-    let (key, base) = (api_key.to_string(), base_url.to_string());
+pub fn create_signing_key(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result<String> {
+    let (key, base, h) = (
+        api_key.to_string(),
+        base_url.to_string(),
+        handle.to_string(),
+    );
+    // Signing keys are per agent identity in the current SDK — create or rotate
+    // this identity's key rather than the deprecated org-wide one.
     let sk = off_runtime(move || {
         let client = Inkbox::builder(key).base_url(base).build()?;
-        client.create_signing_key()
+        client.signing_keys().create_or_rotate(&h)
     })?;
     Ok(sk.signing_key)
 }
@@ -374,7 +381,18 @@ pub fn enable_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::R
     off_runtime(move || {
         let client = Arc::new(Inkbox::builder(key).base_url(base).build()?);
         let id = client.get_identity(&h)?;
-        id.update(None, Unset::Omit, Unset::Omit, Some(true), None, None)
+        // (new_handle, display_name, description, imessage_enabled,
+        //  imessage_filter_mode, mail_filter_mode, phone_filter_mode, status)
+        id.update(
+            None,
+            Unset::Omit,
+            Unset::Omit,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+        )
     })
 }
 

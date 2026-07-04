@@ -19,6 +19,7 @@ use inkbox::contacts::resources::contacts::{
 };
 use inkbox::contacts::types::{ContactEmail, ContactPhone};
 use inkbox::phone::resources::texts::TextRecipients;
+use inkbox::phone::types::CallOrigin;
 use inkbox::{AgentIdentity, Inkbox, InkboxError};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -451,7 +452,9 @@ impl Tool for InkboxPlaceCall {
                         format!("{u}{sep}context_token={token}")
                     });
                 }
-                let call = id.place_call(&to_number, ws.as_deref())?;
+                // Ride this identity's dedicated number; shared-iMessage-line
+                // origination is wired separately.
+                let call = id.place_call(&to_number, CallOrigin::DedicatedNumber, ws.as_deref())?;
                 Ok(serde_json::to_value(call)?)
             })
             .await)

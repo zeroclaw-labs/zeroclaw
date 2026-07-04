@@ -609,7 +609,7 @@ pub(super) async fn run_realtime_bridge(
         let dialed = meta.remote_number.clone();
         let resolved = tokio::task::spawn_blocking(move || {
             let ident = client.get_identity(&handle).ok();
-            let (agent_handle, agent_email, agent_phone, phone_id) = match &ident {
+            let (agent_handle, agent_email, agent_phone, _phone_id) = match &ident {
                 Some(i) => (
                     i.agent_handle(),
                     i.email_address(),
@@ -623,8 +623,11 @@ pub(super) async fn run_realtime_bridge(
             let mut direction = String::new();
             // The remote party's number: from the call record on inbound (which
             // also gives us the direction), or the dialed number on outbound.
-            let remote = if !call_id.is_empty() && let Some(pid) = phone_id.as_deref() {
-                match client.calls().get(pid, &call_id) {
+            // Calls are identity-scoped now — look the record up by call_id
+            // alone (works for shared-iMessage-line calls with no dedicated
+            // number too).
+            let remote = if !call_id.is_empty() {
+                match client.calls().get(&call_id) {
                     Ok(call) => {
                         direction = call.direction;
                         call.remote_phone_number

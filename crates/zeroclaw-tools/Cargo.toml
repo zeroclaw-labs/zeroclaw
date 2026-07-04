@@ -55,7 +55,7 @@ webpki-roots = "1.0.6"
 
 # Inkbox SDK (REST surface only — the tunnel data plane lives in the channel).
 # Published crate from crates.io.
-inkbox = { version = "0.4.10", default-features = false, optional = true }
+inkbox = { version = "0.4.15", default-features = false, optional = true }
 
 [features]
 default = []

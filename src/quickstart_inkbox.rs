@@ -97,7 +97,7 @@ pub(crate) fn run() -> anyhow::Result<Option<(String, BTreeMap<String, String>)>
         setup_realtime(&mut fields)?;
     }
 
-    setup_signing_key(&base_url, &api_key, &mut fields)?;
+    setup_signing_key(&base_url, &api_key, &handle, &mut fields)?;
 
     let alias = match prompt_alias()? {
         Some(a) => a,
@@ -642,6 +642,7 @@ fn create_new_identity(base_url: &str, api_key: &str) -> anyhow::Result<Option<S
 fn setup_signing_key(
     base_url: &str,
     api_key: &str,
+    handle: &str,
     fields: &mut BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
     println!(
@@ -713,7 +714,7 @@ fn setup_signing_key(
         ),
         true,
     )? {
-        match ob::create_signing_key(base_url, api_key) {
+        match ob::create_signing_key(base_url, api_key, handle) {
             Ok(key) => {
                 fields.insert("signing_key".into(), key);
                 println!(
