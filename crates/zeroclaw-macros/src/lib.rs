@@ -127,6 +127,7 @@ fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
         integration,
         resource_key,
         credential_class,
+        quickstart,
         natural_key,
         tab,
         group
@@ -257,6 +258,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             Some(variant) => quote! { crate::config::ConfigTab::#variant },
             None => quote! { crate::config::ConfigTab::None },
         };
+        let quickstart_token = extract_quickstart(&field.attrs);
 
         // ── Secret handling ──
         //
@@ -381,6 +383,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 derived_from_secret: false,
                                 credential_class: #credential_class_expr,
                                 tab: #tab_token,
+                                quickstart: crate::config::QuickstartVisibility::Hidden,
                                 alias_source: None,
                             });
                         }
@@ -2269,6 +2272,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         derived_from_secret: #derived_from_secret,
                         credential_class: #credential_class_expr,
                         tab: #tab_token,
+                        quickstart: #quickstart_token,
                         alias_source: #alias_source_expr,
                     }
                 }
@@ -2290,6 +2294,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     #tab_token,
                     &<#inner_ty as crate::config::HasPropKind>::display_secret_terminals(),
                     #alias_source_expr,
+                    #quickstart_token,
                 )
             });
         }
@@ -2616,6 +2621,26 @@ fn extract_prefix(input: &DeriveInput) -> String {
 
 fn has_attr(field: &syn::Field, name: &str) -> bool {
     field.attrs.iter().any(|attr| attr.path().is_ident(name))
+}
+
+/// Parse `#[quickstart]` / `#[quickstart(optional)]` into a QuickstartVisibility
+/// token. Absent → Hidden. Bare → Required. `(optional)` → Optional.
+fn extract_quickstart(attrs: &[syn::Attribute]) -> proc_macro2::TokenStream {
+    for attr in attrs {
+        if attr.path().is_ident("quickstart") {
+            // Bare `#[quickstart]` has no args (parse_args errors); `(optional)` parses.
+            let is_optional = attr
+                .parse_args::<syn::Ident>()
+                .map(|id| id == "optional")
+                .unwrap_or(false);
+            return if is_optional {
+                quote! { crate::config::QuickstartVisibility::Optional }
+            } else {
+                quote! { crate::config::QuickstartVisibility::Required }
+            };
+        }
+    }
+    quote! { crate::config::QuickstartVisibility::Hidden }
 }
 
 fn snake_to_kebab(s: &str) -> String {

@@ -12780,20 +12780,24 @@ pub struct InkboxConfig {
     /// Inkbox API key (`X-API-Key`). Agent-scoped keys are recommended.
     #[secret]
     #[tab(Connection)]
+    #[quickstart]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: String,
     /// Inkbox agent identity handle. Also the tunnel name the data plane opens.
     #[tab(Connection)]
+    #[quickstart]
     pub identity: String,
     /// Webhook signing key (`whsec_...`) used to verify inbound events. When
     /// empty, inbound events fail verification and are dropped.
     #[secret]
     #[tab(Connection)]
+    #[quickstart(optional)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default)]
     pub signing_key: String,
     /// Inkbox API base URL. Defaults to `https://inkbox.ai`.
     #[tab(Connection)]
+    #[quickstart(optional)]
     #[serde(default = "default_inkbox_base_url")]
     pub base_url: String,
     /// Tools excluded from this channel's tool spec.

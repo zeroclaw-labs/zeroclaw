@@ -366,6 +366,7 @@ fn lookup_prop_field(
                         zeroclaw_config::traits::CredentialSurfaceClass::EncryptedSecret,
                     ),
                     tab: zeroclaw_config::traits::ConfigTab::None,
+                    quickstart: zeroclaw_config::traits::QuickstartVisibility::Hidden,
                     alias_source: None,
                 }
             })

@@ -711,12 +711,18 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
     }
     let leaf_prefix = format!("{section_path}.{SYNTHETIC_ALIAS}.");
 
+    use zeroclaw_config::traits::QuickstartVisibility;
     let mut out = Vec::new();
     for info in probe.prop_fields() {
         let Some(field_path) = info.name.strip_prefix(&leaf_prefix) else {
             continue;
         };
-        if !essentials.contains(&field_path) {
+        // A field is surfaced when the schema marks it `#[quickstart]` (the
+        // registry drives it — no per-channel list to keep in sync) or it is a
+        // legacy essential still carried in the section allowlist below.
+        let shown =
+            info.quickstart != QuickstartVisibility::Hidden || essentials.contains(&field_path);
+        if !shown {
             continue;
         }
         // `display_value` already masks secrets as `****`; we want
@@ -743,19 +749,21 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
             kind: info.kind,
             is_secret: info.is_secret,
             enum_variants: info.enum_variants.map(|f| f()),
-            // `uri` is an override-only field — operators set it only
-            // when pointing at a self-hosted gateway. `requires_openai_auth`
-            // and `wire_api` are OpenAI Codex subscription fields — optional
-            // for all providers, meaningful only for OpenAI. `api_key` is
-            // left non-required because local providers (Ollama) and Codex
-            // subscription auth don't need one — the runtime surfaces a
-            // clear error at request time if a remote provider is missing
-            // its key. Everything else in the essentials list is required
-            // to actually issue a request.
-            required: !matches!(
-                field_path,
-                "uri" | "api_key" | "requires_openai_auth" | "wire_api"
-            ),
+            // A `#[quickstart]`-annotated field carries its own required/optional
+            // designation from the registry. Legacy essentials (no annotation)
+            // keep the historical rule: `uri` is an override-only self-hosted
+            // gateway field; `requires_openai_auth` / `wire_api` are OpenAI Codex
+            // subscription fields; `api_key` is optional because local providers
+            // (Ollama) and Codex subscription auth don't need one. Everything
+            // else in the allowlist is required to actually issue a request.
+            required: match info.quickstart {
+                QuickstartVisibility::Required => true,
+                QuickstartVisibility::Optional => false,
+                QuickstartVisibility::Hidden => !matches!(
+                    field_path,
+                    "uri" | "api_key" | "requires_openai_auth" | "wire_api"
+                ),
+            },
             default,
         });
     }
@@ -779,18 +787,11 @@ const MODEL_PROVIDER_ESSENTIALS: &[&str] = &[
     "requires_openai_auth",
     "wire_api",
 ];
-const CHANNEL_ESSENTIALS: &[&str] = &[
-    "bot_token",
-    "token",
-    "webhook_url",
-    "allowed_users",
-    // Inkbox needs more than a single secret — surface its core fields so the
-    // TUI field-form (and CLI fallback) can collect them.
-    "api_key",
-    "identity",
-    "signing_key",
-    "base_url",
-];
+// Legacy per-section allowlist for channels that predate the `#[quickstart]`
+// registry attribute. New channels (e.g. Inkbox) mark their fields in the schema
+// instead of adding a name here, so the surface never carries a private copy of
+// "the fields channel X needs" that can drift from the schema.
+const CHANNEL_ESSENTIALS: &[&str] = &["bot_token", "token", "webhook_url", "allowed_users"];
 const PEER_GROUP_ESSENTIALS: &[&str] = &["channel", "external_peers", "agents", "ignore"];
 
 /// Runtime profile the Quickstart silently installs. The Runtime Profile
@@ -2122,6 +2123,35 @@ mod tests {
                 "`api_key` must be non-required for `{kind}` (Codex subscription / local providers don't need one)",
             );
         }
+    }
+
+    #[test]
+    fn field_shape_inkbox_is_registry_driven() {
+        // Inkbox carries NO entry in CHANNEL_ESSENTIALS; its Quickstart fields
+        // come entirely from `#[quickstart]` annotations in the schema. This
+        // proves Inkbox onboards through the same schema-walked field-form as
+        // every other channel — no bespoke wizard, no hardcoded field list.
+        assert!(
+            !super::CHANNEL_ESSENTIALS.contains(&"api_key"),
+            "Inkbox's fields must NOT be typed into the CHANNEL_ESSENTIALS surface",
+        );
+        let rows = super::field_shape(super::FieldSection::Channel, "inkbox");
+        let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+        for expected in ["api_key", "identity", "signing_key", "base_url"] {
+            assert!(
+                keys.contains(&expected),
+                "`{expected}` must surface via its `#[quickstart]` annotation; got {keys:?}",
+            );
+        }
+        // required/optional is carried by the annotation, not a hardcoded rule.
+        let req = |k: &str| rows.iter().find(|r| r.key == k).unwrap().required;
+        assert!(req("api_key"), "api_key is `#[quickstart]` (required)");
+        assert!(req("identity"), "identity is `#[quickstart]` (required)");
+        assert!(
+            !req("signing_key"),
+            "signing_key is `#[quickstart(optional)]`"
+        );
+        assert!(!req("base_url"), "base_url is `#[quickstart(optional)]`");
     }
 
     async fn apply_to_temp(submission: BuilderSubmission) -> (tempfile::TempDir, Config) {

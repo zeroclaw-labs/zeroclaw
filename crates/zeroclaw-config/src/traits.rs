@@ -361,6 +361,21 @@ impl std::fmt::Display for ConfigTab {
     }
 }
 
+/// Whether a config field appears in the CLI Quickstart field-form, and if so
+/// whether the form requires a value. Set via `#[quickstart]` /
+/// `#[quickstart(optional)]` on a `#[derive(Configurable)]` field; the default
+/// (`Hidden`) means the field is not surfaced in Quickstart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QuickstartVisibility {
+    /// Not shown in the Quickstart field-form.
+    #[default]
+    Hidden,
+    /// Shown and required (the form insists on a value).
+    Required,
+    /// Shown but optional (the form accepts an empty value).
+    Optional,
+}
+
 /// Describes a single property field discovered via `#[derive(Configurable)]`.
 #[derive(Clone)]
 pub struct PropFieldInfo {
@@ -394,6 +409,8 @@ pub struct PropFieldInfo {
     /// Tab grouping for this field. `ConfigTab::None` when the field has
     /// no tab annotation (flat display, no tab bar).
     pub tab: ConfigTab,
+    /// Whether/how this field appears in the CLI Quickstart field-form.
+    pub quickstart: QuickstartVisibility,
     /// Alias namespace for `PropKind::AliasRef` fields; `None` otherwise.
     pub alias_source: Option<AliasSource>,
 }
