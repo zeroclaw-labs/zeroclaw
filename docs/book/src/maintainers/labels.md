@@ -73,6 +73,7 @@ New or manual applications should use the canonical no-space labels below. Exist
 | `type:dependencies` | Dependency or lockfile maintenance |
 | `type:docs` | Documentation-only or docs-primary work |
 | `type:rfc` | RFC issue or proposal; protected from stale closure while active |
+| `type:test` | Test-only or test-primary work |
 
 ## Path labels
 
@@ -127,9 +128,18 @@ Scoped path labels do not guarantee a same-prefix base label. Because `pr-path-l
 | `runtime:wasm` | runtime WASM platform and first-party WASM plugin host files |
 | `security:bubblewrap` | `bubblewrap.rs` |
 | `security:docker` | `docker.rs` |
-| `security:pairing` | pairing security, gateway pairing API, Tauri pairing command, and web pairing page |
+| `security:pairing` | pairing security, gateway pairing API, and web pairing page |
 | `security:policy` | runtime security policy, IAM policy, and config policy files |
 | `security:secrets` | runtime and config secrets handling |
+| `memory:backend` | memory backend selection and storage implementation files |
+
+### Manual component labels
+
+Some scoped component labels are manual routing labels rather than synchronized path labels.
+
+`agent:prompt` is for provider-visible prompt, context, and response-guidance policy. Use it when the work is about system-prompt content, tool-call formatting guidance, prompt-cache-sensitive context, channel response guidance, or other model-visible instruction surfaces that cross the base `agent`, `channel`, `memory`, `provider`, or `runtime` labels. Apply it in addition to applicable base or scope labels; it does not replace them. Do not apply it to every `crates/zeroclaw-runtime/src/agent/**` change; use the base `agent` label for ordinary agent runtime changes.
+
+`agent:loop` is retired. For agent-loop routing, use base `agent` plus any matching `runtime`, provider, channel, tool, or risk labels.
 
 Do not apply legacy `observability: runtime_trace` to new issues or PRs. Use `observability:otel` when the work is about OpenTelemetry tracing, add base `observability` only when the issue or PR also matches that base surface, and decide any future runtime-trace-specific canonical label in a separate create/migrate packet.
 
@@ -139,9 +149,12 @@ Gateway subarea labels such as `gateway: api`, `gateway: sse`, `gateway:local_br
 
 Each channel gets a `channel:<name>` label in addition to the base `channel` label when the change touches channel crate paths. Cross-surface channel labels such as `channel:acp` may instead pair with the matching base surface label, such as `gateway`, `docs`, or app/web scope labels.
 
+`channel:core` is the shared channel API and orchestrator label. Use it for work on channel trait contracts, channel orchestration, delivery hooks, routing/session behavior, runtime-command handling, and cross-channel behavior that would be misleading under a single platform label.
+
 | Label | Matches |
 |---|---|
 | `channel:acp` | `acp_channel.rs`, `acp_server.rs`, `zeroclaw-acp-bridge.rs`, `acp_session_store.rs`, `channels/acp.md`, selected ACP gateway/app/web entrypoints |
+| `channel:core` | `crates/zeroclaw-api/src/channel.rs`, `crates/zeroclaw-channels/src/lib.rs`, `crates/zeroclaw-channels/src/orchestrator/**`, `src/channels/mod.rs` |
 | `channel:bluesky` | `bluesky.rs` |
 | `channel:clawdtalk` | `clawdtalk.rs` |
 | `channel:cli` | `cli.rs` |
@@ -151,6 +164,7 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 | `channel:imessage` | `imessage.rs` |
 | `channel:irc` | `irc.rs` |
 | `channel:lark` | `lark.rs` |
+| `channel:line` | `line.rs`, `channels/line.md` |
 | `channel:linq` | `linq.rs` |
 | `channel:matrix` | `matrix.rs` |
 | `channel:mattermost` | `mattermost.rs` |
@@ -296,7 +310,8 @@ Applied manually: the auto-response automation that used to handle these was rem
 |---|---|
 | `r:needs-repro` | Incomplete bug report; request a deterministic repro |
 | `r:support` | Usage / help item better handled outside the bug backlog |
-| `stale-candidate` | Dormant PR or issue; candidate for closing |
+| `needs-author-action` | Author response is needed before maintainers can continue the review or merge path. For PRs, this is not a stale warning by itself. |
+| `stale-candidate` | Dormant PR or issue that is a candidate for closing. For PRs, follow the stale ramp in [Reviewer Playbook → PR backlog pruning](./reviewer-playbook.md#pr-backlog-pruning). |
 
 ## Community pickup labels
 

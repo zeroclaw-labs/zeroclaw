@@ -97,9 +97,6 @@ playground/
 # Temporary rustc output
 rust_out
 
-# Auto-generated Tauri schemas
-apps/tauri/gen/schemas/
-
 # Generated TypeScript client (rebuild via cargo web gen-api)
 web/src/lib/api-generated.ts
 

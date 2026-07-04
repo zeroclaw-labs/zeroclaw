@@ -28,6 +28,7 @@ pub mod file_read;
 pub mod model_switch;
 pub mod read_skill;
 pub mod schedule;
+pub mod scoped;
 pub mod security_ops;
 pub mod send_message_to_peer;
 pub mod shell;
@@ -86,6 +87,7 @@ pub use zeroclaw_tools::knowledge_tool::KnowledgeTool;
 pub use zeroclaw_tools::linkedin::LinkedInTool;
 pub use zeroclaw_tools::llm_task::LlmTaskTool;
 pub use zeroclaw_tools::mcp_client::McpRegistry;
+pub use zeroclaw_tools::mcp_context;
 pub use zeroclaw_tools::mcp_deferred::{
     ActivatedToolSet, DeferredMcpToolSet, build_deferred_tools_section,
     build_deferred_tools_section_filtered,
@@ -112,6 +114,9 @@ pub use zeroclaw_tools::pushover::PushoverTool;
 pub use zeroclaw_tools::reaction::ReactionTool;
 pub use zeroclaw_tools::report_template_tool::ReportTemplateTool;
 pub use zeroclaw_tools::screenshot::ScreenshotTool;
+pub use zeroclaw_tools::send_via::{
+    AgentPeerGroupResolver, SendViaTool, TURN_ROUTING, TurnRoutingHandle,
+};
 pub use zeroclaw_tools::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
@@ -512,6 +517,7 @@ pub fn all_tools(
         tui_env,
         None,
         None,
+        None,
     )
 }
 
@@ -561,6 +567,20 @@ fn owned_inkbox_channel<'a>(
         .find(|c| c.enabled)
 }
 
+/// Peer groups that include `agent_alias`, cloned from `config`. Used as the
+/// live resolver body for `send_via` authority (and the snapshot fallback).
+fn filter_agent_peer_groups(
+    config: &Config,
+    agent_alias: &str,
+) -> HashMap<String, zeroclaw_config::multi_agent::PeerGroupConfig> {
+    config
+        .peer_groups
+        .iter()
+        .filter(|(_, pg)| pg.agents.iter().any(|a| a.as_str() == agent_alias))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 /// Create full tool registry including memory tools and optional Composio.
 #[allow(
     clippy::implicit_hasher,
@@ -588,6 +608,10 @@ pub fn all_tools_with_runtime(
     tui_env: Option<HashMap<String, String>>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
+    // Live config handle for `send_via` peer-group authority. `Some` from the
+    // channel daemon (so reloads take effect); `None` for one-shot / non-channel
+    // callers, which fall back to a snapshot of `root_config`.
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
@@ -1303,6 +1327,27 @@ pub fn all_tools_with_runtime(
         AskUserTool::new(security.clone(), ask_user_handle.as_ref().cloned().unwrap());
     tool_arcs.push(Arc::new(ask_user_tool));
 
+    // Per-turn routing tool — shares ask_user's channel map (populated by
+    // start_channels). Peer-group authority is resolved live from config at call
+    // time so a reload (membership / external_peers / channel alias / modality)
+    // takes effect without rebuilding the registry; callers without a live config
+    // handle (one-shot / non-channel paths) fall back to a snapshot. The per-turn
+    // routing handle is scoped into TURN_ROUTING by the orchestrator, not held here.
+    {
+        let agent_peer_groups: AgentPeerGroupResolver = if let Some(live) = live_config.clone() {
+            let alias = agent_alias.to_string();
+            Arc::new(move || filter_agent_peer_groups(&live.read(), &alias))
+        } else {
+            let snapshot = filter_agent_peer_groups(root_config, agent_alias);
+            Arc::new(move || snapshot.clone())
+        };
+        tool_arcs.push(Arc::new(SendViaTool::new(
+            security.clone(),
+            ask_user_handle.as_ref().cloned().unwrap(),
+            agent_peer_groups,
+        )));
+    }
+
     // Human escalation tool — always registered; owns its own late-bound channel map.
     let escalate_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
     let escalate_tool = EscalateToHumanTool::new(
@@ -1502,6 +1547,16 @@ pub fn all_tools_with_runtime(
                 Ok(host) => {
                     let details = host.tool_plugin_details();
                     let count = details.len();
+                    let plugin_limits = zeroclaw_plugins::component::PluginLimits {
+                        call_fuel: config.plugins.limits.call_fuel,
+                        max_memory_bytes: config
+                            .plugins
+                            .limits
+                            .max_memory_mb
+                            .saturating_mul(1024 * 1024),
+                        max_table_elements: config.plugins.limits.max_table_elements,
+                        max_instances: config.plugins.limits.max_instances,
+                    };
                     for (manifest, wasm_path) in details {
                         // SSOT: `config` is the snapshot the whole tool set is
                         // built from, identical to every other tool here. A
@@ -1522,6 +1577,7 @@ pub fn all_tools_with_runtime(
                             manifest.name.clone(),
                             manifest.description.clone().unwrap_or_default(),
                             plugin_config,
+                            plugin_limits,
                         )));
                     }
                     ::zeroclaw_log::record!(
@@ -1809,6 +1865,7 @@ mod tests {
             None,
             Some(engine),
             None,
+            None,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -1878,6 +1935,7 @@ mod tests {
             None,
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
+            None,
         );
         let session_b = all_tools_with_runtime(
             Arc::new(Config::default()),
@@ -1900,6 +1958,7 @@ mod tests {
             None,
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
+            None,
         );
 
         for tools in [&session_a.tools, &session_b.tools] {
@@ -1977,6 +2036,7 @@ mod tests {
             &root_config,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -2313,6 +2373,7 @@ mod tests {
                 None,
                 Some(sop_engine),
                 Some(sop_audit),
+                None,
             )
             .tools
         };
