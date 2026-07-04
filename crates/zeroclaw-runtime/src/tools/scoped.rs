@@ -26,12 +26,15 @@
 //! Per-site variation is expressed as DATA, never as "skip a security step": the
 //! knobs are documented divergences - a per-run caller allowlist that only narrows,
 //! `connect_mcp` (ACP fast-boot), `connect_peripherals` (listing-only surfaces must
-//! not open hardware), and the ACP memory-tool strip. One known cross-path
-//! divergence remains OUTSIDE the seam: `process_message` filters built-ins via
-//! `filter_channel_builtin_tools`, which admits the canonical read-only defaults
-//! past `allowed_tools` at non-Full autonomy; `assemble` applies the plain policy
-//! filter (as `run` and the orchestrator do). Unifying that semantic into the seam
-//! is a tracked follow-up of the parity program.
+//! not open hardware), the ACP memory-tool strip, and `emit_assembly_logs` (only
+//! execution paths emit the assembly audit records; listing surfaces stay quiet).
+//! With `process_message` now routed through `assemble`, every construction path
+//! shares one built-in filter: the plain `allowed_tools`/`excluded_tools` policy
+//! filter that `run` and the orchestrator already used. This retired the former
+//! `filter_channel_builtin_tools`, which admitted the canonical read-only defaults
+//! past `allowed_tools` at non-Full autonomy on the gateway live-chat and
+//! peer-delegation paths - a narrowing, since no construction path now bypasses
+//! `allowed_tools`.
 
 use std::sync::Arc;
 
