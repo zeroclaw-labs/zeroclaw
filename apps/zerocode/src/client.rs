@@ -93,6 +93,7 @@ pub mod method {
     pub const HEALTH: &str = "health";
     pub const DOCTOR_RUN: &str = "doctor/run";
     pub const COST_QUERY: &str = "cost/query";
+    pub const COST_ORG: &str = "cost/org";
     pub const SESSION_LIST: &str = "session/list";
     pub const SESSION_LIST_ACP: &str = "session/list-acp";
     pub const AGENTS_STATUS: &str = "agents/status";
@@ -1319,6 +1320,35 @@ impl RpcClient {
             .await
     }
 
+    /// Optional organization-level billed-cost snapshot from the daemon's
+    /// `<data_dir>/org_cost.json`. Returns `None` when the file is absent (a
+    /// vanilla build never writes it), so the dashboard simply omits the
+    /// organization row. An integrator can populate it via an external sync.
+    pub async fn cost_org(&self) -> Result<Option<OrgCost>> {
+        let v: serde_json::Value = self.call(method::COST_ORG, serde_json::json!({})).await?;
+        if v.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_value(v)?))
+    }
+
+    /// Cost summary scoped to a `[from, to)` window (RFC3339). The daemon rolls
+    /// up only records in the window, so `session_cost_usd` / `total_tokens` /
+    /// `by_model` reflect that period — used by the Cost tab's day/month/
+    /// quarter/YTD breakdown.
+    pub async fn cost_query_window(
+        &self,
+        from: &str,
+        to: &str,
+        agent: Option<&str>,
+    ) -> Result<CostSummaryResult> {
+        self.call(
+            method::COST_QUERY,
+            serde_json::json!({ "from": from, "to": to, "agent": agent }),
+        )
+        .await
+    }
+
     pub async fn session_list(&self, query: Option<&str>) -> Result<SessionListResult> {
         self.call(method::SESSION_LIST, serde_json::json!({ "query": query }))
             .await
@@ -2088,6 +2118,44 @@ pub struct CostSummaryResult {
     pub by_model: std::collections::HashMap<String, ModelStats>,
     #[serde(default)]
     pub by_agent: std::collections::HashMap<String, AgentCostStats>,
+}
+
+/// One calendar month of organization spend (oldest first; the last entry may
+/// be the partial current month).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct OrgMonthCost {
+    #[serde(default)]
+    pub cost_usd: f64,
+}
+
+/// Year-to-date billed totals for a single scope (the user, or the whole org).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct OrgScopeStat {
+    #[serde(default)]
+    pub ytd_cost_usd: f64,
+    #[serde(default)]
+    pub ytd_tokens: u64,
+    #[serde(default)]
+    pub monthly: Vec<OrgMonthCost>,
+}
+
+/// Organization-level billed snapshot returned by `cost/org`, deserialized from
+/// the daemon's `org_cost.json`. Mirrors a typical billing-export cache shape
+/// but is vendor-neutral here; absent on vanilla builds.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct OrgCost {
+    #[serde(default)]
+    pub year: i32,
+    #[serde(default)]
+    pub generated: String,
+    /// Display label for the organization scope (e.g. "Acme"). Falls back to
+    /// "Organization" when absent.
+    #[serde(default)]
+    pub org_label: Option<String>,
+    #[serde(default)]
+    pub personal: Option<OrgScopeStat>,
+    #[serde(default)]
+    pub org: Option<OrgScopeStat>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

@@ -237,6 +237,32 @@ impl SopRunStore for SqliteRunStore {
         }
     }
 
+    fn last_terminal_completed_at(&self, sop_name: &str) -> Result<Option<String>, StoreError> {
+        let g = self.lock()?;
+        // `completed_at` lives inside the run JSON, not a column. Pull the terminal
+        // rows for this SOP (bounded by retention) and take the max completion.
+        // ISO-8601 UTC ("...Z") timestamps sort lexically in completion order.
+        let mut stmt = g
+            .prepare("SELECT json FROM sop_runs WHERE terminal=1")
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(sql_err)?;
+        let mut latest: Option<String> = None;
+        for row in rows {
+            let pr: PersistedRun = serde_json::from_str(&row.map_err(sql_err)?)?;
+            if pr.run.sop_name != sop_name {
+                continue;
+            }
+            if let Some(completed) = pr.run.completed_at
+                && latest.as_deref().is_none_or(|cur| cur < completed.as_str())
+            {
+                latest = Some(completed);
+            }
+        }
+        Ok(latest)
+    }
+
     fn try_claim_run(
         &self,
         run_id: &str,
@@ -303,6 +329,50 @@ impl SopRunStore for SqliteRunStore {
         )
         .map_err(sql_err)?;
         Ok(Some(token))
+    }
+
+    fn renew_claim_for_restore(
+        &self,
+        run_id: &str,
+        sop_name: &str,
+    ) -> Result<ClaimToken, StoreError> {
+        let g = self.lock()?;
+        // No cap check: a restored run was already admitted before the restart.
+        // Upsert so a re-run of restore is idempotent and a stale lease is refreshed.
+        let now = Utc::now();
+        let token = ClaimToken {
+            run_id: run_id.to_string(),
+            sop_name: sop_name.to_string(),
+            claimed_at: now.to_rfc3339(),
+            lease_expires: (now + Duration::seconds(DEFAULT_CLAIM_LEASE_SECS)).to_rfc3339(),
+            holder: format!("pid-{}", std::process::id()),
+        };
+        let json = serde_json::to_string(&token)?;
+        g.execute(
+            "INSERT INTO sop_claims (run_id, sop_name, lease_expires, json) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(run_id) DO UPDATE SET
+                 sop_name=excluded.sop_name,
+                 lease_expires=excluded.lease_expires,
+                 json=excluded.json",
+            params![token.run_id, token.sop_name, token.lease_expires, json],
+        )
+        .map_err(sql_err)?;
+        Ok(token)
+    }
+
+    fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError> {
+        let g = self.lock()?;
+        let per_sop: i64 = g
+            .query_row(
+                "SELECT COUNT(*) FROM sop_claims WHERE sop_name=?1",
+                params![sop_name],
+                |r| r.get(0),
+            )
+            .map_err(sql_err)?;
+        let total: i64 = g
+            .query_row("SELECT COUNT(*) FROM sop_claims", [], |r| r.get(0))
+            .map_err(sql_err)?;
+        Ok((per_sop as usize, total as usize))
     }
 
     fn heartbeat_claim(&self, token: &ClaimToken) -> Result<(), StoreError> {

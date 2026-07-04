@@ -236,3 +236,4 @@ Dev-operational contracts — files consumed by AI coding skills and development
 - `@docs/book/src/developing/extension-examples.md` — adding providers, channels, tools, peripherals; tool shared-state contract; architecture boundary rules
 - `@docs/book/src/contributing/privacy.md` — privacy rules and neutral-placeholder palette
 - `@docs/book/src/maintainers/superseding.md` — superseded-PR attribution, PR/commit templates, handoff template
+- `@docs/maintainers/audit-policy.md` — `.cargo/audit.toml` / `deny.toml` ignore rationale and add/remove workflow (tracks #8519, #8059)
