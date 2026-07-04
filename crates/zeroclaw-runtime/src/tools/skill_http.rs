@@ -101,7 +101,7 @@ impl Tool for SkillHttpTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("Invalid URL: {e}")),
                 });
             }
@@ -109,7 +109,7 @@ impl Tool for SkillHttpTool {
         if !parsed.username().is_empty() || parsed.password().is_some() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("URL userinfo is not allowed".to_string()),
             });
         }
