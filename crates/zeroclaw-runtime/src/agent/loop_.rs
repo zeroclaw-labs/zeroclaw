@@ -164,6 +164,85 @@ pub use super::history::{
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
+/// Maximum bytes of an interactive stdin line accepted by the
+/// ZeroClaw REPL. Caps the per-line allocation so a pipe of
+/// `head -c 10G /dev/zero | zeroclaw chat` cannot blow up RSS; the
+/// line is truncated to this size and the user is warned. Matches
+/// the size class of the gateway HTTP body cap (64 KiB) and the
+/// largest per-message cap in the channel orchestrator (4 KiB notify
+/// detail × 128-deep queue = 512 KiB).
+pub(crate) const MAX_INTERACTIVE_INPUT_BYTES: usize = 1024 * 1024; // 1 MiB
+
+/// Result of [`read_capped_line`].
+#[derive(Debug)]
+pub(crate) enum CappedLine {
+    /// A full line under the cap, with the trailing `\n` stripped.
+    Line(String),
+    /// The physical line exceeded `cap`. The remainder has been
+    /// drained to the next `\n` or EOF, so the caller must treat this
+    /// as a discarded line and must not feed it into the model path.
+    Truncated,
+    /// EOF with no bytes read.
+    Eof,
+}
+
+/// Read a single line from `reader` bounded at `cap` bytes. Returns
+/// the line with the trailing `\n` stripped (lossily decoded, since
+/// PTY transport can split multi-byte characters at frame boundaries)
+/// or [`CappedLine::Truncated`] when the cap was hit. When truncated,
+/// the rest of the physical line is drained using a fixed-size scratch
+/// buffer so the next call starts at the next line and no unbounded
+/// allocation occurs (Audacity88 review #8463).
+pub(crate) fn read_capped_line<R: std::io::BufRead>(
+    reader: R,
+    cap: usize,
+) -> std::io::Result<CappedLine> {
+    let mut raw = Vec::new();
+    // +1 headroom so the cap detection is unambiguous: a buffer that
+    // reaches exactly `cap` bytes without a `\n` was truncated; a
+    // buffer shorter than `cap` has the full line.
+    let mut limited = reader.take((cap + 1) as u64);
+    std::io::BufRead::read_until(&mut limited, b'\n', &mut raw)?;
+    let truncated = raw.len() > cap;
+    if truncated {
+        // Drain the rest of the physical line without accumulating it
+        // in memory; `read_until` into a `Vec` would re-introduce the
+        // original OOM vector.
+        let mut inner = limited.into_inner();
+        discard_until_newline(&mut inner)?;
+        return Ok(CappedLine::Truncated);
+    } else if raw.last() == Some(&b'\n') {
+        // Strip the trailing `\n` that `read_until` leaves behind. The
+        // lossy decode runs after the strip so the result has no
+        // trailing newline regardless of the cap path.
+        raw.pop();
+    }
+    if raw.is_empty() {
+        return Ok(CappedLine::Eof);
+    }
+    Ok(CappedLine::Line(String::from_utf8_lossy(&raw).into_owned()))
+}
+
+/// Discard bytes from `reader` until the next `\n` or EOF, using only
+/// `BufRead::fill_buf` / `consume`. This avoids the unbounded allocation
+/// that `read_until(..., &mut Vec::new())` would incur on an oversized
+/// physical line, and it stops exactly at the newline so the next line
+/// is not consumed.
+fn discard_until_newline<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<()> {
+    loop {
+        let buf = reader.fill_buf()?;
+        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            reader.consume(pos + 1);
+            return Ok(());
+        }
+        let len = buf.len();
+        if len == 0 {
+            return Ok(());
+        }
+        reader.consume(len);
+    }
+}
+
 /// Global model switch request state - used for runtime model switching via model_switch tool.
 /// This is set by the model_switch tool and checked by the agent loop.
 #[allow(clippy::type_complexity)]
@@ -2298,16 +2377,26 @@ pub async fn run(
                 // Read raw bytes to avoid UTF-8 validation errors when PTY
                 // transport splits multi-byte characters at frame boundaries
                 // (e.g. CJK input with spaces over kubectl exec / SSH).
-                let mut raw = Vec::new();
-                match std::io::BufRead::read_until(&mut std::io::stdin().lock(), b'\n', &mut raw) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(e) => {
-                        eprintln!("\nError reading input: {e}\n");
-                        break;
+                // Capped at MAX_INTERACTIVE_INPUT_BYTES so a pipe of
+                // `head -c 10G /dev/zero | zeroclaw chat` cannot blow up RSS.
+                let input = {
+                    let stdin = std::io::stdin().lock();
+                    match read_capped_line(stdin, MAX_INTERACTIVE_INPUT_BYTES) {
+                        Ok(CappedLine::Eof) => break,
+                        Ok(CappedLine::Line(s)) => s,
+                        Ok(CappedLine::Truncated) => {
+                            eprintln!(
+                                "\nWarning: input line exceeds {} bytes and was discarded.",
+                                MAX_INTERACTIVE_INPUT_BYTES
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("\nError reading input: {e}\n");
+                            break;
+                        }
                     }
-                }
-                let input = String::from_utf8_lossy(&raw).into_owned();
+                };
 
                 let user_input = input.trim().to_string();
                 if user_input.is_empty() {
@@ -2333,17 +2422,16 @@ pub async fn run(
                         print!("Continue? [y/N] ");
                         let _ = std::io::stdout().flush();
 
-                        let mut confirm_raw = Vec::new();
-                        if std::io::BufRead::read_until(
-                            &mut std::io::stdin().lock(),
-                            b'\n',
-                            &mut confirm_raw,
-                        )
-                        .is_err()
-                        {
-                            continue;
-                        }
-                        let confirm = String::from_utf8_lossy(&confirm_raw);
+                        let confirm = {
+                            let stdin = std::io::stdin().lock();
+                            match read_capped_line(stdin, MAX_INTERACTIVE_INPUT_BYTES) {
+                                Ok(CappedLine::Line(s)) => s,
+                                Ok(CappedLine::Truncated) | Ok(CappedLine::Eof) | Err(_) => {
+                                    println!("Cancelled.\n");
+                                    continue;
+                                }
+                            }
+                        };
                         if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
                             println!("Cancelled.\n");
                             continue;
@@ -15208,5 +15296,176 @@ Let me check the result."#;
             filtered.contains(&"file_read"),
             "file_read in allowed_tools must survive, got {filtered:?}"
         );
+    }
+
+    /// `read_capped_line` returns a full line and [`CappedLine::Line`]
+    /// when the input is under the cap. EOF with no bytes returns
+    /// [`CappedLine::Eof`]. Regression guard for the happy path.
+    #[test]
+    fn read_capped_line_returns_full_line_under_cap() {
+        let mut cursor = std::io::Cursor::new(b"hello\n".to_vec());
+        match read_capped_line(&mut cursor, 1024).unwrap() {
+            CappedLine::Line(line) => assert_eq!(line, "hello"),
+            other => panic!("expected Line, got {other:?}"),
+        }
+
+        // EOF without any bytes.
+        let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+        assert!(matches!(
+            read_capped_line(&mut cursor, 1024).unwrap(),
+            CappedLine::Eof
+        ));
+
+        // EOF with bytes but no trailing newline.
+        let mut cursor = std::io::Cursor::new(b"no newline at eof".to_vec());
+        match read_capped_line(&mut cursor, 1024).unwrap() {
+            CappedLine::Line(line) => assert_eq!(line, "no newline at eof"),
+            other => panic!("expected Line, got {other:?}"),
+        }
+    }
+
+    /// `read_capped_line` returns [`CappedLine::Truncated`] for a line
+    /// that exceeds the cap, regardless of whether a trailing newline is
+    /// present. This is the property that prevents a
+    /// `head -c 10G | zeroclaw chat` pipe from blowing up RSS.
+    #[test]
+    fn read_capped_line_truncates_at_cap() {
+        let cap = 64usize;
+
+        // A line that exceeds the cap and ends with a newline.
+        let mut input = vec![b'a'; cap + 100];
+        input.push(b'\n');
+        assert!(matches!(
+            read_capped_line(&mut std::io::Cursor::new(input), cap).unwrap(),
+            CappedLine::Truncated
+        ));
+
+        // A line that exceeds the cap with no newline.
+        let input = vec![b'a'; cap + 100];
+        assert!(matches!(
+            read_capped_line(&mut std::io::Cursor::new(input), cap).unwrap(),
+            CappedLine::Truncated
+        ));
+    }
+
+    /// `read_capped_line` correctly handles a cap that lands mid-UTF-8
+    /// codepoint. The important invariant is that the call does not panic
+    /// and reports [`CappedLine::Truncated`] instead of returning a
+    /// partial, invalid string.
+    #[test]
+    fn read_capped_line_truncates_inside_multibyte_chars_safely() {
+        // "🦀" is 4 bytes; cap of 5 will land mid-codepoint.
+        let cap = 5usize;
+        let input = "🦀".repeat(10);
+        let bytes = input.as_bytes();
+        assert!(matches!(
+            read_capped_line(&mut std::io::Cursor::new(bytes.to_vec()), cap).unwrap(),
+            CappedLine::Truncated
+        ));
+    }
+
+    /// `read_capped_line` returns the full input unchanged when the
+    /// input is exactly the cap. This pins the off-by-one boundary:
+    /// the +1 headroom in the `take(cap + 1)` wrapper means a buffer
+    /// that fills exactly to `cap` bytes is NOT considered truncated.
+    #[test]
+    fn read_capped_line_at_exact_cap_is_not_truncated() {
+        let cap = 8usize;
+        let input: Vec<u8> = vec![b'x'; cap];
+        match read_capped_line(&mut std::io::Cursor::new(input), cap).unwrap() {
+            CappedLine::Line(line) => {
+                assert_eq!(line.len(), cap);
+            }
+            other => panic!("expected Line, got {other:?}"),
+        }
+    }
+
+    /// Regression for #8463 (Audacity88 review): after truncating an
+    /// oversized line, the rest of the line is drained so the next call
+    /// starts at the next line instead of chunking the same oversized
+    /// line into repeated prompts.
+    #[test]
+    fn read_capped_line_drains_truncated_line_remainder() {
+        let cap = 8usize;
+        // One oversized line + one normal line.
+        let oversized_line = vec![b'a'; cap * 3];
+        let second_line = b"short\n";
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(&oversized_line);
+        input.push(b'\n');
+        input.extend_from_slice(second_line);
+
+        let mut cursor = std::io::Cursor::new(input);
+
+        // First call: should cap and drain the rest of the line.
+        assert!(matches!(
+            read_capped_line(&mut cursor, cap).unwrap(),
+            CappedLine::Truncated
+        ));
+
+        // Second call: should see the second line, not more 'a's.
+        match read_capped_line(&mut cursor, cap).unwrap() {
+            CappedLine::Line(line) => assert_eq!(line, "short"),
+            other => panic!("expected Line, got {other:?}"),
+        }
+    }
+
+    /// After truncation, the next line is still readable even when it
+    /// is close to the cap (boundary condition on the drain).
+    #[test]
+    fn read_capped_line_drain_does_not_eat_next_line() {
+        let cap = 8usize;
+        // Oversized line (no trailing \n in mid-data), then a line
+        // right up to the cap.
+        let oversized = vec![b'x'; cap * 2];
+        let second: Vec<u8> = vec![b'y'; cap]; // exactly 'cap' bytes, no \n
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(&oversized);
+        input.push(b'\n');
+        input.extend_from_slice(&second);
+        // The second line has no trailing \n — it is the last line
+        // before EOF.
+
+        let mut cursor = std::io::Cursor::new(input);
+
+        assert!(matches!(
+            read_capped_line(&mut cursor, cap).unwrap(),
+            CappedLine::Truncated
+        ));
+
+        match read_capped_line(&mut cursor, cap).unwrap() {
+            CappedLine::Line(line) => {
+                assert_eq!(line.len(), second.len());
+                assert_eq!(line.as_bytes(), &second);
+            }
+            other => panic!("expected Line, got {other:?}"),
+        }
+    }
+
+    /// Regression for #8463: the bounded drain must not allocate an
+    /// unbounded buffer. We verify this indirectly by ensuring that a
+    /// line much larger than the cap is discarded and the next line is
+    /// still readable.
+    #[test]
+    fn read_capped_line_bounded_drain_preserves_next_line() {
+        let cap = 64usize;
+        let oversized = vec![b'z'; cap * 100];
+        let next = b"next-line\n";
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(&oversized);
+        input.push(b'\n');
+        input.extend_from_slice(next);
+
+        let mut cursor = std::io::Cursor::new(input);
+
+        assert!(matches!(
+            read_capped_line(&mut cursor, cap).unwrap(),
+            CappedLine::Truncated
+        ));
+
+        match read_capped_line(&mut cursor, cap).unwrap() {
+            CappedLine::Line(line) => assert_eq!(line, "next-line"),
+            other => panic!("expected Line, got {other:?}"),
+        }
     }
 }
