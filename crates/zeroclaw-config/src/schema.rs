@@ -114,6 +114,13 @@ pub struct Config {
     /// instance until repaired. Never serialized — a load-time signal.
     #[serde(skip)]
     pub degraded_security: Vec<String>,
+    /// Non-security sections the resilient loader reset to `Default`
+    /// because the on-disk block was malformed (e.g. `[plugins.entries]`
+    /// written where `[[plugins.entries]]` was meant). Never serialized;
+    /// a load-time signal the CLI surfaces on stderr so a silently-dropped
+    /// section is impossible to miss.
+    #[serde(skip)]
+    pub degraded_sections: Vec<String>,
     /// Config file schema version.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
@@ -16285,6 +16292,7 @@ impl Default for Config {
             onepassword_reference_snapshots: std::collections::HashMap::new(),
             dirty_paths: std::collections::HashSet::new(),
             degraded_security: Vec::new(),
+            degraded_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::Providers::default(),
             model_routes: Vec::new(),
@@ -17306,6 +17314,7 @@ impl Config {
             let salvage = crate::migration::migrate_to_current_salvaged(&contents);
             let mut config: Config = salvage.config;
             config.degraded_security = salvage.dropped_security;
+            config.degraded_sections = salvage.dropped;
             if let Some(from_version) = stale_version {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -22436,6 +22445,7 @@ auto_save = true
         let config = Config {
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             degraded_security: Vec::new(),
+            degraded_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: {
                 let mut p = crate::providers::Providers::default();
@@ -23213,6 +23223,7 @@ default_temperature = 0.7
         let config = Config {
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             degraded_security: Vec::new(),
+            degraded_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
             model_routes: Vec::new(),
@@ -25915,6 +25926,34 @@ audit = "should-be-a-table-not-a-string"
             unsafe { std::env::remove_var("HOME") };
         }
         let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    async fn salvage_reports_dropped_plugins_section_for_malformed_entries() {
+        // `[plugins.entries]` written as a table instead of an array of
+        // tables (`[[plugins.entries]]`) drops the whole [plugins] section
+        // to defaults on the resilient path. That drop must land on
+        // `ResilientLoad::dropped`; load_or_init copies it onto
+        // `degraded_sections` so the CLI surfaces it on stderr instead of
+        // the operator discovering `enabled = false` by accident.
+        let raw = r#"schema_version = 3
+
+[plugins]
+enabled = true
+
+[plugins.entries]
+name = "weather-tool"
+"#;
+        let load = crate::migration::migrate_to_current_salvaged(raw);
+        assert!(
+            load.dropped.iter().any(|s| s == "plugins"),
+            "a malformed [plugins] section must be reported on dropped, got {:?}",
+            load.dropped
+        );
+        assert!(
+            !load.config.plugins.enabled,
+            "the malformed section must have been reset to defaults"
+        );
     }
 
     #[test]
@@ -29786,6 +29825,50 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         assert_eq!(
             config.mcp.servers[0].name, "github",
             "new entry must carry the supplied key as its name field"
+        );
+    }
+
+    #[test]
+    async fn create_map_key_seeds_plugin_entry_and_routes_config_set() {
+        // The `zeroclaw plugin install` seeding path: a fresh
+        // `[[plugins.entries]]` entry named after the plugin must make
+        // `config set plugins.entries.<name>.config.<key>` routable;
+        // natural-key path routing only matches keys already present in
+        // live config.
+        let mut config = Config::default();
+        let created = config
+            .create_map_key("plugins.entries", "weather-tool")
+            .expect("plugins.entries must accept new natural-key entries");
+        assert!(created, "first add should report created=true");
+        assert_eq!(config.plugins.entries.len(), 1);
+        assert_eq!(config.plugins.entries[0].name, "weather-tool");
+
+        config
+            .set_prop("plugins.entries.weather-tool.config.api_key", "sk-test")
+            .expect("config set must route through the seeded entry");
+        assert_eq!(
+            config
+                .plugins
+                .entry_config("weather-tool")
+                .and_then(|c| c.get("api_key"))
+                .map(String::as_str),
+            Some("sk-test")
+        );
+
+        // Idempotent: reinstalling must not clobber operator values.
+        let again = config
+            .create_map_key("plugins.entries", "weather-tool")
+            .expect("second add still resolves the section");
+        assert!(!again, "duplicate add should report created=false");
+        assert_eq!(config.plugins.entries.len(), 1);
+        assert_eq!(
+            config
+                .plugins
+                .entry_config("weather-tool")
+                .and_then(|c| c.get("api_key"))
+                .map(String::as_str),
+            Some("sk-test"),
+            "re-seeding must leave existing config values untouched"
         );
     }
 
