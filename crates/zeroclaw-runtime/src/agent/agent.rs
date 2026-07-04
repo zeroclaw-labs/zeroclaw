@@ -366,6 +366,14 @@ pub struct Agent {
     /// (`trust="untrusted-external"`). Empty when no pins are configured or all
     /// were skipped. Appended to the system prompt in `build_system_prompt`.
     mcp_pinned_section: String,
+    /// Pre-rendered deferred-MCP-tools system-prompt section, built once at
+    /// construction when `mcp.deferred_loading` is enabled. It enumerates the
+    /// policy-admitted `<server>__<tool>` stubs and instructs the model to call
+    /// `tool_search` to activate them. Empty when deferred loading is off or no
+    /// stubs are admitted. Appended to the system prompt in
+    /// `build_system_prompt` so TUI Chat sessions surface the same deferred MCP
+    /// affordance the gateway and channel/webhook paths already expose (#8193).
+    mcp_deferred_section: String,
     /// Hook runner for tool-call auditing and lifecycle side effects.
     /// See issue #5462.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
@@ -508,6 +516,7 @@ pub struct AgentBuilder {
     approval_route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     mcp_pinned_section: Option<String>,
+    mcp_deferred_section: Option<String>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     approval_manager: Option<Arc<ApprovalManager>>,
     agent_alias: Option<String>,
@@ -555,6 +564,7 @@ impl AgentBuilder {
             approval_route: None,
             activated_tools: None,
             mcp_pinned_section: None,
+            mcp_deferred_section: None,
             hook_runner: None,
             approval_manager: None,
             agent_alias: None,
@@ -737,6 +747,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn mcp_deferred_section(mut self, section: Option<String>) -> Self {
+        self.mcp_deferred_section = section;
+        self
+    }
+
     pub fn hook_runner(mut self, runner: Option<Arc<crate::hooks::HookRunner>>) -> Self {
         self.hook_runner = runner;
         self
@@ -900,6 +915,7 @@ impl AgentBuilder {
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
             mcp_pinned_section: self.mcp_pinned_section.unwrap_or_default(),
+            mcp_deferred_section: self.mcp_deferred_section.unwrap_or_default(),
             hook_runner: self.hook_runner,
             approval_manager: self.approval_manager,
             agent_alias: self.agent_alias.unwrap_or_default(),
@@ -1130,6 +1146,23 @@ impl Agent {
         self.temperature = temperature;
     }
 
+    /// Refresh this agent's memory embedder after a provider-profile
+    /// `config/set`/`config/delete`, so a live session's per-agent memory stops
+    /// embedding against a stale endpoint/key without a daemon restart (#8359).
+    /// Forwards through any memory wrappers (e.g. `AgentScopedMemory`) to the
+    /// embedding backend; a no-op for backends that do not embed. `&self` —
+    /// the swap is interior to the memory handle.
+    pub fn refresh_memory_embedder(
+        &self,
+        model_provider: &str,
+        api_key: Option<&str>,
+        model: &str,
+        dimensions: usize,
+    ) {
+        self.memory
+            .refresh_embedder(model_provider, api_key, model, dimensions);
+    }
+
     #[cfg(test)]
     pub fn temperature_for_test(&self) -> Option<f64> {
         self.temperature
@@ -1169,6 +1202,14 @@ impl Agent {
     #[cfg(test)]
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.iter().map(|t| t.name()).collect()
+    }
+
+    /// Render the current system prompt. Test-only — lets regression tests
+    /// assert on prompt-injected sections (e.g. the deferred-MCP-tools section
+    /// that advertises `tool_search`) without driving a full turn (#8193).
+    #[cfg(test)]
+    pub fn system_prompt_for_test(&self) -> Result<String> {
+        self.build_system_prompt()
     }
 
     /// Hydrate the agent with prior chat messages (e.g. from a session backend).
@@ -1522,6 +1563,12 @@ impl Agent {
         // Provenance-wrapped MCP pinned-resource system-prompt section, read
         // once at construction (capability- and policy-gated).
         let mut mcp_pinned_section = String::new();
+        // Deferred-MCP-tools system-prompt section (deferred_loading only). Built
+        // from the policy-admitted stubs so the model is told the deferred MCP
+        // tools exist and to call `tool_search` to activate them. Without this,
+        // TUI Chat sessions register `tool_search` but never advertise it, so the
+        // agent reports it has no MCP tools / no `tool_search` (#8193).
+        let mut mcp_deferred_section = String::new();
         // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
         let mut mcp_elevation_arcs: Vec<Arc<dyn tools::Tool>> = Vec::new();
         // Secure by default: only the MCP servers granted by this agent's
@@ -1586,6 +1633,16 @@ impl Agent {
                                 .stubs
                                 .iter()
                                 .map(|stub| stub.prefixed_name.as_str()),
+                            mcp_policy.as_ref(),
+                        );
+                        // Build the system-prompt section describing the
+                        // policy-admitted deferred stubs BEFORE `mcp_policy` is
+                        // moved into `tool_search.with_access_policy`. Mirrors the
+                        // channel/webhook (`loop_.rs`) and gateway paths so TUI
+                        // Chat sessions advertise the same deferred MCP tools and
+                        // the `tool_search` affordance (#8193).
+                        mcp_deferred_section = tools::build_deferred_tools_section_filtered(
+                            &deferred_set,
                             mcp_policy.as_ref(),
                         );
                         if allowed_stub_count > 0 {
@@ -1783,6 +1840,7 @@ impl Agent {
             .approval_route(risk_profile.approval_route.clone())
             .activated_tools(activated_tools)
             .mcp_pinned_section(Some(mcp_pinned_section))
+            .mcp_deferred_section(Some(mcp_deferred_section))
             .hook_runner(if config.hooks.enabled {
                 Some(Arc::new(crate::hooks::HookRunner::from_config(
                     &config.hooks,
@@ -2017,6 +2075,10 @@ impl Agent {
         let receipts = &self.config.resolved.tool_receipts;
         if receipts.enabled && receipts.inject_system_prompt {
             prompt.push_str(crate::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
+        }
+        if !self.mcp_deferred_section.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&self.mcp_deferred_section);
         }
         if !self.mcp_pinned_section.is_empty() {
             prompt.push_str("\n\n");
