@@ -42,6 +42,7 @@
   - [CLI](./reference/cli.md)
   - [Config](./reference/config.md)
   - [Environment variables](./reference/env-vars.md)
+  - [Feature and support matrix](./reference/feature-matrix.md)
   - [API (rustdoc)](./api.md)
   - [Gateway HTTP API](./gateway/api.md)
   - [A2A agent discovery](./gateway/a2a-discovery.md)
