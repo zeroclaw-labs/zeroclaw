@@ -793,7 +793,7 @@ mod tests {
 
     #[async_trait]
     impl FlowTransport for SteeredTransport {
-        async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
+        async fn ask_user(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
             self.asks.push(prompt.text.clone());
             if prompt.text.contains("Bind this channel into a peer group?") {
                 return Ok(ResponseValue::Choice(self.decision.clone()));
@@ -926,7 +926,7 @@ mod tests {
 
     #[async_trait]
     impl FlowTransport for PersonalitySteeredTransport {
-        async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
+        async fn ask_user(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
             self.asks.push(prompt.text.clone());
             Ok(match &prompt.response_type {
                 ResponseType::Choice { options } => {

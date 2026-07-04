@@ -92,6 +92,108 @@ impl PromptSigil {
     }
 }
 
+/// The canonical typed answer to a `YesNo` prompt. Parsing goes through
+/// `FromStr` so no surface string-matches the accepted spellings: the enum owns
+/// its canonical tokens (`yes` / `no`) and their rendering, and both transports
+/// parse into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YesNoAnswer {
+    Yes,
+    No,
+}
+
+impl YesNoAnswer {
+    #[must_use]
+    pub fn as_bool(self) -> bool {
+        matches!(self, YesNoAnswer::Yes)
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            YesNoAnswer::Yes => "yes",
+            YesNoAnswer::No => "no",
+        }
+    }
+
+    #[must_use]
+    pub fn tokens() -> [&'static str; 2] {
+        [YesNoAnswer::Yes.as_str(), YesNoAnswer::No.as_str()]
+    }
+}
+
+impl std::str::FromStr for YesNoAnswer {
+    type Err = ();
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        if raw == YesNoAnswer::Yes.as_str() {
+            Ok(YesNoAnswer::Yes)
+        } else if raw == YesNoAnswer::No.as_str() {
+            Ok(YesNoAnswer::No)
+        } else {
+            Err(())
+        }
+    }
+}
+
+/// The typed three-way verdict on a freeform apply-preview. A selection, not a
+/// free-text sentiment scan: the enum owns its tokens and parsing, so the
+/// confirmation is `apply` / `revise` / `cancel` and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewVerdict {
+    Apply,
+    Revise,
+    Cancel,
+}
+
+impl PreviewVerdict {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PreviewVerdict::Apply => "apply",
+            PreviewVerdict::Revise => "revise",
+            PreviewVerdict::Cancel => "cancel",
+        }
+    }
+
+    #[must_use]
+    pub fn tokens() -> [&'static str; 3] {
+        [
+            PreviewVerdict::Apply.as_str(),
+            PreviewVerdict::Revise.as_str(),
+            PreviewVerdict::Cancel.as_str(),
+        ]
+    }
+}
+
+impl std::str::FromStr for PreviewVerdict {
+    type Err = ();
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let trimmed = raw.trim();
+        if trimmed == PreviewVerdict::Apply.as_str() {
+            Ok(PreviewVerdict::Apply)
+        } else if trimmed == PreviewVerdict::Revise.as_str() {
+            Ok(PreviewVerdict::Revise)
+        } else if trimmed == PreviewVerdict::Cancel.as_str() {
+            Ok(PreviewVerdict::Cancel)
+        } else {
+            Err(())
+        }
+    }
+}
+
+/// The single sentinel word that leaves a field unset: the typed word `skip`.
+/// Whether a bare Enter also skips is the caller's policy: an optional
+/// non-secret field treats empty as skip, a secret does not (an accidental
+/// Enter must re-ask, never silently drop a credential).
+pub const SKIP_TOKEN: &str = "skip";
+
+#[must_use]
+pub fn is_skip_token(raw: &str) -> bool {
+    raw.trim() == SKIP_TOKEN
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseExpectation {

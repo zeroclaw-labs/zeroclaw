@@ -151,7 +151,7 @@ impl Spec {
                 .nodes
                 .get(&current)
                 .ok_or_else(|| WalkError::UnknownNode(current.clone()))?;
-            let response = transport.ask(&node.prompt).await?;
+            let response = transport.ask_user(&node.prompt).await?;
 
             // An empty secret on a REQUIRED secret node is an explicit
             // deferral: transports only produce it from a typed 'later'
@@ -428,7 +428,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl FlowTransport for ScriptedTransport {
-        async fn ask(&mut self, _prompt: &Prompt) -> TransportResult<ResponseValue> {
+        async fn ask_user(&mut self, _prompt: &Prompt) -> TransportResult<ResponseValue> {
             self.scripted.pop_front().ok_or(TransportError::Closed)
         }
 

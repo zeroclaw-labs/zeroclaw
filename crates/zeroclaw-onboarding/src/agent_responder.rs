@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use zeroclaw_runtime::flow::TransportResult;
-use zeroclaw_runtime::response_type::FollowOn;
+use zeroclaw_runtime::response_type::{FollowOn, PreviewVerdict, YesNoAnswer};
 
 use crate::llm_transport::LlmResponder;
 
@@ -39,6 +39,37 @@ impl AgentTurn for InProcessAgentTurn {
 pub trait OperatorIo: Send {
     async fn say(&mut self, text: &str) -> TransportResult<()>;
     async fn hear(&mut self) -> TransportResult<String>;
+
+    /// Ask a yes/no question as a typed selection. The prompt renders the two
+    /// `YesNoAnswer` tokens and only a typed token is accepted; anything else
+    /// re-asks. Confirmation is never inferred from free-text sentiment.
+    async fn ask_user_yes_no(&mut self, question: &str) -> TransportResult<bool> {
+        let rendered = format!("{question} [{}]", YesNoAnswer::tokens().join(", "));
+        loop {
+            self.say(&rendered).await?;
+            let reply = self.hear().await?;
+            if let Ok(answer) = reply.trim().parse::<YesNoAnswer>() {
+                return Ok(answer.as_bool());
+            }
+        }
+    }
+
+    /// Ask the operator to rule on an apply-preview as a typed three-way
+    /// selection (`apply` / `revise` / `cancel`). Only a typed token is
+    /// accepted; anything else re-asks. No free-text approval scanning.
+    async fn ask_user_preview_verdict(
+        &mut self,
+        question: &str,
+    ) -> TransportResult<PreviewVerdict> {
+        let rendered = format!("{question} [{}]", PreviewVerdict::tokens().join(", "));
+        loop {
+            self.say(&rendered).await?;
+            let reply = self.hear().await?;
+            if let Ok(verdict) = reply.trim().parse::<PreviewVerdict>() {
+                return Ok(verdict);
+            }
+        }
+    }
 }
 
 /// Terminal operator: guide speaks on stdout, operator replies on stdin.
@@ -135,7 +166,7 @@ their answer even if it is vague or non-technical. Ask a follow-up question if y
 When you are confident, reply with a line starting with `ANSWER:` followed by ONLY the value: \
 `ANSWER: yes` or `ANSWER: no` for yes/no fields, `ANSWER: 42` for numbers, \
 `ANSWER: <option>` (exactly one offered option) for choices, `ANSWER: <value>` for free text. \
-If the field is optional and the person does not want it, reply `ANSWER: none`. \
+If the field is optional and the person does not want it, reply `ANSWER: skip`. \
 If the person does not care, defers to you, or says anything like 'whatever' or 'I don't know', \
 pick the safest sensible default yourself, tell them in one short sentence what you chose, and \
 emit the ANSWER line; do not interrogate an indifferent person. \

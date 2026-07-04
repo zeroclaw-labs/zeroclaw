@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use zeroclaw_runtime::flow::{FlowTransport, Outcome, Prompt, TransportResult};
-use zeroclaw_runtime::response_type::{ResponseType, ResponseValue, SecretValue};
+use zeroclaw_runtime::response_type::{
+    ResponseType, ResponseValue, SecretValue, YesNoAnswer, is_skip_token,
+};
 
 #[async_trait]
 pub trait LlmResponder: Send {
@@ -72,24 +74,14 @@ pub(crate) fn parse_raw(prompt: &Prompt, raw: &str) -> Option<ResponseValue> {
             }
         }
         ResponseType::Number => ResponseValue::parse_number(trimmed),
-        ResponseType::YesNo => parse_yes_no(trimmed).map(ResponseValue::YesNo),
+        ResponseType::YesNo => trimmed
+            .parse::<YesNoAnswer>()
+            .ok()
+            .map(|answer| ResponseValue::YesNo(answer.as_bool())),
         ResponseType::Choice { options } => options
             .iter()
             .find(|option| option.value == trimmed)
             .map(|option| ResponseValue::Choice(option.value.clone())),
-    }
-}
-
-pub(crate) fn parse_yes_no(raw: &str) -> Option<bool> {
-    let normalized = raw.to_ascii_lowercase();
-    let affirmative = ["y", "yes", "true"];
-    let negative = ["n", "no", "false"];
-    if affirmative.contains(&normalized.as_str()) {
-        Some(true)
-    } else if negative.contains(&normalized.as_str()) {
-        Some(false)
-    } else {
-        None
     }
 }
 
@@ -98,10 +90,7 @@ pub(crate) fn parse_yes_no(raw: &str) -> Option<bool> {
 /// the property unwritten. Without this an optional `Option<_>` or optional
 /// list field re-prompts forever, because no concrete value means "no value".
 fn is_skip_sentinel(raw: &str) -> bool {
-    let trimmed = raw.trim();
-    trimmed.is_empty()
-        || trimmed.eq_ignore_ascii_case("none")
-        || trimmed.eq_ignore_ascii_case("skip")
+    raw.trim().is_empty() || is_skip_token(raw)
 }
 
 /// An empty response carrier matching the prompt's type, so the walk recognizes
@@ -137,19 +126,22 @@ fn answer_contract(prompt: &Prompt) -> String {
             }
             text
         }
-        ResponseType::YesNo => "\nThe ANSWER line must be exactly `yes` or `no`.".to_string(),
+        ResponseType::YesNo => format!(
+            "\nThe ANSWER line must be exactly one of: {}.",
+            YesNoAnswer::tokens().join(", ")
+        ),
         ResponseType::Number => "\nThe ANSWER line must be a bare number.".to_string(),
         ResponseType::FreeformText | ResponseType::Secret => String::new(),
     };
     if prompt.optional {
-        contract.push_str("\nThis field is optional: `ANSWER: none` leaves it unset.");
+        contract.push_str("\nThis field is optional: `ANSWER: skip` leaves it unset.");
     }
     contract
 }
 
 #[async_trait]
 impl<L: LlmResponder, S: SecretReader> FlowTransport for LlmTransport<L, S> {
-    async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
+    async fn ask_user(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
         let prompt_text = crate::i18n::resolve_prompt_text(prompt);
         if prompt.routes_secret() {
             loop {
@@ -265,7 +257,7 @@ mod tests {
         let mut transport =
             LlmTransport::new(PanicResponder, RecordingSecretReader::new(vec!["sk-live"]));
         let prompt = Prompt::new("API key", ResponseType::Secret);
-        let value = transport.ask(&prompt).await.unwrap();
+        let value = transport.ask_user(&prompt).await.unwrap();
         match value {
             ResponseValue::Secret(secret) => assert_eq!(secret.expose(), "sk-live"),
             other => panic!("expected secret, got {other:?}"),
@@ -275,9 +267,9 @@ mod tests {
     #[tokio::test]
     async fn secret_deferral_yields_empty_secret_without_retry_loop() {
         let mut transport =
-            LlmTransport::new(PanicResponder, RecordingSecretReader::new(vec!["later"]));
+            LlmTransport::new(PanicResponder, RecordingSecretReader::new(vec!["skip"]));
         let prompt = Prompt::new("API key", ResponseType::Secret);
-        let value = transport.ask(&prompt).await.unwrap();
+        let value = transport.ask_user(&prompt).await.unwrap();
         match value {
             ResponseValue::Secret(secret) => {
                 assert!(secret.expose().is_empty(), "'later' defers the secret");
@@ -293,11 +285,11 @@ mod tests {
         let secret_reader = RecordingSecretReader::new(vec![SECRET]);
         let mut transport = LlmTransport::new(responder, secret_reader);
         transport
-            .ask(&Prompt::new("API key", ResponseType::Secret))
+            .ask_user(&Prompt::new("API key", ResponseType::Secret))
             .await
             .unwrap();
         transport
-            .ask(&Prompt::new("Agent name", ResponseType::FreeformText))
+            .ask_user(&Prompt::new("Agent name", ResponseType::FreeformText))
             .await
             .unwrap();
         responder = transport.into_responder();
@@ -312,7 +304,7 @@ mod tests {
         let mut transport =
             LlmTransport::new(ScriptedResponder::new(vec!["yes"]), PanicSecretReader);
         let prompt = Prompt::new("Proceed?", ResponseType::YesNo);
-        let value = transport.ask(&prompt).await.unwrap();
+        let value = transport.ask_user(&prompt).await.unwrap();
         assert_eq!(value, ResponseValue::YesNo(true));
     }
 
@@ -323,7 +315,7 @@ mod tests {
             PanicSecretReader,
         );
         let prompt = Prompt::new("Proceed?", ResponseType::YesNo);
-        let value = transport.ask(&prompt).await.unwrap();
+        let value = transport.ask_user(&prompt).await.unwrap();
         assert_eq!(value, ResponseValue::YesNo(false));
     }
 
@@ -340,16 +332,16 @@ mod tests {
                 }],
             },
         );
-        let value = transport.ask(&prompt).await.unwrap();
+        let value = transport.ask_user(&prompt).await.unwrap();
         assert_eq!(value, ResponseValue::Choice("partial".into()));
     }
 
     #[tokio::test]
     async fn optional_field_skips_on_a_none_reply_instead_of_looping() {
         let mut transport =
-            LlmTransport::new(ScriptedResponder::new(vec!["none"]), PanicSecretReader);
+            LlmTransport::new(ScriptedResponder::new(vec!["skip"]), PanicSecretReader);
         let prompt = Prompt::new("Display name", ResponseType::FreeformText).with_optional(true);
-        let value = transport.ask(&prompt).await.unwrap();
+        let value = transport.ask_user(&prompt).await.unwrap();
         assert_eq!(
             value,
             ResponseValue::FreeformText(String::new()),
@@ -371,7 +363,7 @@ mod tests {
             },
         )
         .with_optional(true);
-        let value = transport.ask(&prompt).await.unwrap();
+        let value = transport.ask_user(&prompt).await.unwrap();
         assert_eq!(value, ResponseValue::Choice(String::new()));
     }
 
@@ -382,7 +374,7 @@ mod tests {
             PanicSecretReader,
         );
         let prompt = Prompt::new("Proceed?", ResponseType::YesNo);
-        let error = transport.ask(&prompt).await.unwrap_err();
+        let error = transport.ask_user(&prompt).await.unwrap_err();
         assert!(
             matches!(error, TransportError::Agent { .. }),
             "a non-progressing walk must surface a bounded Agent error, got {error:?}"
@@ -408,7 +400,7 @@ mod tests {
                 ],
             },
         );
-        transport.ask(&prompt).await.unwrap();
+        transport.ask_user(&prompt).await.unwrap();
         responder = transport.into_responder();
         let sent = &responder.calls[0];
         assert!(
@@ -419,7 +411,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejected_reply_gets_corrective_feedback_instead_of_the_same_prompt() {
-        let mut responder = ScriptedResponder::new(vec!["none", "skip"]);
+        let mut responder = ScriptedResponder::new(vec!["not-a-valid-option", "skip"]);
         let mut transport = LlmTransport::new(responder, PanicSecretReader);
         let prompt = Prompt::new(
             "Bind this channel into a peer group?",
@@ -430,7 +422,7 @@ mod tests {
                 }],
             },
         );
-        let value = transport.ask(&prompt).await.unwrap();
+        let value = transport.ask_user(&prompt).await.unwrap();
         assert_eq!(value, ResponseValue::Choice("skip".into()));
         responder = transport.into_responder();
         assert!(

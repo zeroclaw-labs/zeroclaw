@@ -120,7 +120,7 @@ pub async fn select_locale(
     use zeroclaw_runtime::response_type::ResponseValue;
 
     let prompt = locale_prompt();
-    let response = transport.ask(&prompt).await?;
+    let response = transport.ask_user(&prompt).await?;
     let code = match response {
         ResponseValue::Choice(value) => value,
         _ => zeroclaw_runtime::i18n::detect_locale(),
@@ -165,7 +165,7 @@ mod tests {
 
     #[async_trait]
     impl FlowTransport for ScriptedTransport {
-        async fn ask(&mut self, _prompt: &Prompt) -> TransportResult<ResponseValue> {
+        async fn ask_user(&mut self, _prompt: &Prompt) -> TransportResult<ResponseValue> {
             self.answers.pop_front().ok_or(TransportError::Closed)
         }
 
@@ -208,7 +208,7 @@ mod tests {
 
     #[async_trait]
     impl FlowTransport for AutoTransport {
-        async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
+        async fn ask_user(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
             Ok(answer_for(prompt))
         }
 
@@ -365,7 +365,7 @@ mod tests {
         }
         #[async_trait]
         impl FlowTransport for CapturingTransport {
-            async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
+            async fn ask_user(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
                 if let zeroclaw_runtime::response_type::ResponseType::Choice { options } =
                     &prompt.response_type
                 {

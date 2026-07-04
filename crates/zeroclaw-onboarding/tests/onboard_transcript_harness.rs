@@ -184,7 +184,7 @@ impl RecordingTransport {
 
 #[async_trait]
 impl FlowTransport for RecordingTransport {
-    async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
+    async fn ask_user(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
         self.asked += 1;
         let _ = writeln!(
             self.transcript,
@@ -591,6 +591,64 @@ impl SecretReader for ScriptedSecret {
     }
 }
 
+/// Types `later` so the transport's secret branch leaves the credential unset.
+struct DeferringSecret;
+
+#[async_trait]
+impl SecretReader for DeferringSecret {
+    async fn read_secret(&mut self, _prompt_text: &str) -> TransportResult<String> {
+        Ok("later".to_string())
+    }
+}
+
+/// Answers one field with an unparseable value, then correctly on the re-ask.
+struct BadThenGoodGuidedTurn {
+    inner: MemoryScriptedTurn,
+    emitted_bad: bool,
+}
+
+impl BadThenGoodGuidedTurn {
+    fn new() -> Self {
+        Self {
+            inner: MemoryScriptedTurn::new(),
+            emitted_bad: false,
+        }
+    }
+}
+
+#[async_trait]
+impl zeroclaw_onboarding::AgentTurn for BadThenGoodGuidedTurn {
+    async fn run_single(&mut self, message: &str) -> TransportResult<String> {
+        if !self.emitted_bad {
+            self.emitted_bad = true;
+            return Ok("ANSWER: \u{1}\u{1}not-a-valid-value-for-any-field".to_string());
+        }
+        self.inner.run_single(message).await
+    }
+}
+
+/// Opens a conversation, then the operator read fails so the walk ends unwritten.
+struct AbandonGuidedTurn {
+    opened: bool,
+}
+
+impl AbandonGuidedTurn {
+    fn new() -> Self {
+        Self { opened: false }
+    }
+}
+
+#[async_trait]
+impl zeroclaw_onboarding::AgentTurn for AbandonGuidedTurn {
+    async fn run_single(&mut self, _message: &str) -> TransportResult<String> {
+        if !self.opened {
+            self.opened = true;
+            return Ok("Before we start, which homeserver do you use?".to_string());
+        }
+        Err(TransportError::Closed)
+    }
+}
+
 struct GuidedWalk {
     outcome_token: String,
     transcript: String,
@@ -606,6 +664,19 @@ async fn run_guided_walk<T: zeroclaw_onboarding::AgentTurn>(
     turn: T,
     operator_replies: Vec<&'static str>,
 ) -> GuidedWalk {
+    run_guided_walk_with_secret(cell, turn, operator_replies, ScriptedSecret).await
+}
+
+async fn run_guided_walk_with_secret<T, S>(
+    cell: &Path,
+    turn: T,
+    operator_replies: Vec<&'static str>,
+    secret_reader: S,
+) -> GuidedWalk
+where
+    T: zeroclaw_onboarding::AgentTurn,
+    S: SecretReader,
+{
     std::fs::create_dir_all(cell).expect("create guided cell folder");
     let mut config = seed_config_copy(cell);
 
@@ -622,7 +693,7 @@ async fn run_guided_walk<T: zeroclaw_onboarding::AgentTurn>(
         turn: 0,
     };
     let secret = RecordingSecretReader {
-        inner: ScriptedSecret,
+        inner: secret_reader,
         log: std::sync::Arc::clone(&log),
     };
     let mut transport = LlmTransport::new(responder, secret);
@@ -637,29 +708,20 @@ async fn run_guided_walk<T: zeroclaw_onboarding::AgentTurn>(
     }
 }
 
-async fn run_guided_offline_cell(base: &Path) {
-    let cell = base.join("inproc").join("guided").join("happy");
-    let GuidedWalk {
-        outcome_token,
-        transcript,
-        config,
-    } = run_guided_walk(
-        &cell,
-        MemoryScriptedTurn::new(),
-        vec!["oh um, whatever the normal thing is? i just want it to work"],
-    )
-    .await;
-
-    let walked = config
+/// Render the walked config with secrets redacted, write it plus meta.
+fn write_guided_cell_artifacts(cell: &Path, config: &Config, path: &str, outcome_token: &str) {
+    let mut instance_table = config
         .channels
         .matrix
         .get(INSTANCE)
-        .expect("walked matrix instance present");
-    let walked_table = toml::Value::try_from(walked).expect("serialize walked matrix instance");
-    let mut instance_table = walked_table
-        .as_table()
-        .expect("matrix instance serializes to a table")
-        .clone();
+        .map(|walked| {
+            toml::Value::try_from(walked)
+                .expect("serialize walked matrix instance")
+                .as_table()
+                .expect("matrix instance serializes to a table")
+                .clone()
+        })
+        .unwrap_or_default();
     for secret_key in ["access_token", "password", "recovery_key"] {
         if instance_table.contains_key(secret_key) {
             instance_table.insert(
@@ -676,14 +738,39 @@ async fn run_guided_offline_cell(base: &Path) {
     let mut meta = BTreeMap::new();
     meta.insert("transport", "inproc".to_string());
     meta.insert("mode", "guided".to_string());
-    meta.insert("path", "happy".to_string());
+    meta.insert("path", path.to_string());
     meta.insert(
         "model_provider",
         "scripted (offline conversational)".to_string(),
     );
-    meta.insert("outcome", outcome_token.clone());
+    meta.insert("outcome", outcome_token.to_string());
     std::fs::write(cell.join("config.toml"), &rendered_config).expect("write walked config");
-    write_meta(&cell, &meta);
+    write_meta(cell, &meta);
+}
+
+/// Drive the offline guided path across its full matrix: happy, secret
+/// deferral, bad-input recovery, operator cancel.
+async fn run_guided_offline_cell(base: &Path) {
+    run_guided_happy(base).await;
+    run_guided_secret_deferral(base).await;
+    run_guided_bad_input_then_good(base).await;
+    run_guided_cancel(base).await;
+}
+
+async fn run_guided_happy(base: &Path) {
+    let cell = base.join("inproc").join("guided").join("happy");
+    let GuidedWalk {
+        outcome_token,
+        transcript,
+        config,
+    } = run_guided_walk(
+        &cell,
+        MemoryScriptedTurn::new(),
+        vec!["oh um, whatever the normal thing is? i just want it to work"],
+    )
+    .await;
+
+    write_guided_cell_artifacts(&cell, &config, "happy", &outcome_token);
 
     assert_eq!(
         outcome_token, "completed",
@@ -700,6 +787,94 @@ async fn run_guided_offline_cell(base: &Path) {
     assert!(
         transcript.contains("i just want it to work"),
         "the operator's vague plain-language reply must appear in the transcript"
+    );
+}
+
+async fn run_guided_secret_deferral(base: &Path) {
+    let cell = base.join("inproc").join("guided").join("secret-deferral");
+    let GuidedWalk {
+        outcome_token,
+        transcript,
+        config,
+    } = run_guided_walk_with_secret(
+        &cell,
+        MemoryScriptedTurn::new(),
+        vec!["not sure, whatever is normal"],
+        DeferringSecret,
+    )
+    .await;
+
+    write_guided_cell_artifacts(&cell, &config, "secret-deferral", &outcome_token);
+
+    assert_eq!(
+        outcome_token, "completed",
+        "deferring a secret must not block the guided walk"
+    );
+    let walked = config
+        .channels
+        .matrix
+        .get(INSTANCE)
+        .expect("walked matrix instance present");
+    assert!(
+        walked.access_token.as_deref().unwrap_or("").is_empty(),
+        "a deferred secret must be left unset, not populated"
+    );
+    assert!(
+        transcript.contains("SECRET-ASK"),
+        "the transcript must show the secret was asked operator-side, off the model path"
+    );
+}
+
+async fn run_guided_bad_input_then_good(base: &Path) {
+    let cell = base
+        .join("inproc")
+        .join("guided")
+        .join("bad-input-then-good");
+    let GuidedWalk {
+        outcome_token,
+        transcript,
+        config,
+    } = run_guided_walk(
+        &cell,
+        BadThenGoodGuidedTurn::new(),
+        vec!["no idea, do the normal thing"],
+    )
+    .await;
+
+    write_guided_cell_artifacts(&cell, &config, "bad-input-then-good", &outcome_token);
+
+    assert_eq!(
+        outcome_token, "completed",
+        "the guided walk must recover from a rejected value and complete"
+    );
+    assert!(
+        transcript.contains("not accepted"),
+        "the transcript must show the transport rejecting the bad value and re-asking"
+    );
+}
+
+async fn run_guided_cancel(base: &Path) {
+    let cell = base.join("inproc").join("guided").join("cancel");
+    let GuidedWalk {
+        outcome_token,
+        config,
+        ..
+    } = run_guided_walk(&cell, AbandonGuidedTurn::new(), vec![]).await;
+
+    write_guided_cell_artifacts(&cell, &config, "cancel", &outcome_token);
+
+    assert_eq!(
+        outcome_token, "transport-error",
+        "an abandoned guided walk must end without completing"
+    );
+    let walked = config
+        .channels
+        .matrix
+        .get(INSTANCE)
+        .expect("seeded instance still present");
+    assert!(
+        walked.homeserver.is_empty(),
+        "an abandoned guided walk must not have written field values"
     );
 }
 
@@ -826,7 +1001,7 @@ impl PersonalityRecordingTransport {
 
 #[async_trait]
 impl FlowTransport for PersonalityRecordingTransport {
-    async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
+    async fn ask_user(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
         let _ = writeln!(
             self.transcript,
             "ASK [{}] {}",

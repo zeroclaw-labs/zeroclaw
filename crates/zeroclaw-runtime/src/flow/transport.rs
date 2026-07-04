@@ -97,7 +97,7 @@ pub type TransportResult<T> = Result<T, TransportError>;
 
 #[async_trait]
 pub trait FlowTransport: Send {
-    async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue>;
+    async fn ask_user(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue>;
     async fn emit(&mut self, outcome: &Outcome) -> TransportResult<()>;
 }
 
@@ -168,7 +168,7 @@ mod tests {
 
     #[async_trait]
     impl FlowTransport for RoutingTransport {
-        async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
+        async fn ask_user(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
             let answer = self.scripted.pop_front().ok_or(TransportError::Closed)?;
             if prompt.routes_secret() {
                 if let ResponseValue::Secret(_) = &answer {
@@ -194,7 +194,7 @@ mod tests {
         ];
         let mut answers = Vec::new();
         for prompt in sequence {
-            answers.push(transport.ask(&prompt).await.unwrap());
+            answers.push(transport.ask_user(&prompt).await.unwrap());
         }
         answers
     }

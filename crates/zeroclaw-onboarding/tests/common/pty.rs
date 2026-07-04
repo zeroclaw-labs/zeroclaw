@@ -16,7 +16,7 @@ use super::spec::{INSTANCE, LAYER, SECTION, matrix_spec};
 pub fn stub_answer(response_type: &ResponseType) -> String {
     match response_type {
         ResponseType::Secret => "sk-token".to_string(),
-        ResponseType::YesNo => "y".to_string(),
+        ResponseType::YesNo => "yes".to_string(),
         ResponseType::Number => "100".to_string(),
         ResponseType::Choice { options } => options[0].value.clone(),
         ResponseType::FreeformText => "https://walked.test".to_string(),

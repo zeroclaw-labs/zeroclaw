@@ -1,16 +1,15 @@
 use async_trait::async_trait;
 use std::io::{BufRead, Write};
 use zeroclaw_runtime::flow::{FlowTransport, Outcome, Prompt, TransportError, TransportResult};
-use zeroclaw_runtime::response_type::{ResponseType, ResponseValue, SecretValue};
+use zeroclaw_runtime::response_type::{
+    ResponseType, ResponseValue, SecretValue, YesNoAnswer, is_skip_token,
+};
 
-/// The operator wants this secret left unset for now. Deliberately a typed
+/// The operator wants this secret left unset for now. Deliberately the typed
 /// word, not bare Enter: an accidental Enter on a masked prompt must re-ask,
 /// not silently skip a credential.
 pub fn is_secret_deferral(raw: &str) -> bool {
-    let trimmed = raw.trim();
-    trimmed.eq_ignore_ascii_case("later")
-        || trimmed.eq_ignore_ascii_case("skip")
-        || trimmed.eq_ignore_ascii_case("not yet")
+    is_skip_token(raw)
 }
 
 #[async_trait]
@@ -98,14 +97,27 @@ impl<R: BufRead + Send, W: Write + Send, S: CliSecretSource> CliTransport<R, W, 
 
     fn prompt_line(&self, prompt: &Prompt) -> String {
         let hint = if prompt.routes_secret() {
-            " (type 'later' to leave it unset for now)"
+            " (type 'skip' to leave it unset for now)"
         } else {
             ""
         };
+        let choices = match &prompt.response_type {
+            ResponseType::Choice { options } => {
+                let rendered = options
+                    .iter()
+                    .map(|option| option.value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(" [{rendered}]")
+            }
+            ResponseType::YesNo => format!(" [{}]", YesNoAnswer::tokens().join(", ")),
+            _ => String::new(),
+        };
         format!(
-            "{}{} {}\n",
+            "{}{}{} {}\n",
             crate::i18n::resolve_prompt_text(prompt),
             hint,
+            choices,
             prompt.sigil().as_str()
         )
     }
@@ -154,7 +166,10 @@ impl<R: BufRead + Send, W: Write + Send, S: CliSecretSource> CliTransport<R, W, 
                 }
             }
             ResponseType::Number => ResponseValue::parse_number(raw),
-            ResponseType::YesNo => parse_yes_no(raw).map(ResponseValue::YesNo),
+            ResponseType::YesNo => raw
+                .parse::<YesNoAnswer>()
+                .ok()
+                .map(|answer| ResponseValue::YesNo(answer.as_bool())),
             ResponseType::Choice { options } => options
                 .iter()
                 .find(|option| option.value == raw)
@@ -163,16 +178,21 @@ impl<R: BufRead + Send, W: Write + Send, S: CliSecretSource> CliTransport<R, W, 
     }
 }
 
-fn parse_yes_no(raw: &str) -> Option<bool> {
-    let normalized = raw.to_ascii_lowercase();
-    let affirmative = ["y", "yes"];
-    let negative = ["n", "no"];
-    if affirmative.contains(&normalized.as_str()) {
-        Some(true)
-    } else if negative.contains(&normalized.as_str()) {
-        Some(false)
-    } else {
-        None
+/// An optional non-secret field's way of being left unset: a bare Enter or the
+/// typed word `skip`. The walk's empty-response skip-path then leaves the
+/// property unwritten instead of re-asking forever.
+fn is_optional_skip(raw: &str) -> bool {
+    raw.trim().is_empty() || is_skip_token(raw)
+}
+
+fn empty_response_for(prompt: &Prompt) -> ResponseValue {
+    match &prompt.response_type {
+        ResponseType::Number => ResponseValue::Number(String::new()),
+        ResponseType::Choice { .. } => ResponseValue::Choice(String::new()),
+        ResponseType::Secret => ResponseValue::Secret(SecretValue::new(String::new())),
+        ResponseType::FreeformText | ResponseType::YesNo => {
+            ResponseValue::FreeformText(String::new())
+        }
     }
 }
 
@@ -180,7 +200,7 @@ fn parse_yes_no(raw: &str) -> Option<bool> {
 impl<R: BufRead + Send, W: Write + Send, S: CliSecretSource> FlowTransport
     for CliTransport<R, W, S>
 {
-    async fn ask(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
+    async fn ask_user(&mut self, prompt: &Prompt) -> TransportResult<ResponseValue> {
         loop {
             let line = self.prompt_line(prompt);
             self.writer
@@ -195,6 +215,9 @@ impl<R: BufRead + Send, W: Write + Send, S: CliSecretSource> FlowTransport
             } else {
                 self.read_line()?
             };
+            if !prompt.routes_secret() && prompt.optional && is_optional_skip(&raw) {
+                return Ok(empty_response_for(prompt));
+            }
             if let Some(value) = Self::parse(prompt, &raw) {
                 return Ok(value);
             }
@@ -249,80 +272,296 @@ mod tests {
         }
     }
 
-    fn visible_only(
-        reader: Cursor<Vec<u8>>,
-        writer: &mut Vec<u8>,
-    ) -> CliTransport<Cursor<Vec<u8>>, &mut Vec<u8>, ScriptedSecretSource> {
-        CliTransport::with_secret_source(reader, writer, ScriptedSecretSource::new(Vec::new()))
+    fn transport<'a>(
+        input: &str,
+        output: &'a mut Vec<u8>,
+    ) -> CliTransport<Cursor<Vec<u8>>, &'a mut Vec<u8>, ScriptedSecretSource> {
+        CliTransport::with_secret_source(
+            Cursor::new(input.as_bytes().to_vec()),
+            output,
+            ScriptedSecretSource::new(Vec::new()),
+        )
     }
 
+    fn choice(values: &[&str]) -> ResponseType {
+        ResponseType::Choice {
+            options: values
+                .iter()
+                .map(|value| ChoiceOption {
+                    value: (*value).into(),
+                    label: (*value).into(),
+                })
+                .collect(),
+        }
+    }
+
+    fn optional(prompt: Prompt) -> Prompt {
+        Prompt {
+            optional: true,
+            ..prompt
+        }
+    }
+
+    // yes/no
+
     #[tokio::test]
-    async fn yes_no_prompt_uses_angle_sigil_and_parses_affirmative() {
-        let mut output: Vec<u8> = Vec::new();
-        let mut transport = visible_only(Cursor::new(b"yes\n".to_vec()), &mut output);
-        let prompt = Prompt::new("Proceed?", ResponseType::YesNo);
-        let value = transport.ask(&prompt).await.unwrap();
+    async fn yes_no_parses_affirmative_and_renders_angle_sigil() {
+        let mut out = Vec::new();
+        let mut t = transport("yes\n", &mut out);
+        let value = t
+            .ask_user(&Prompt::new("Proceed?", ResponseType::YesNo))
+            .await
+            .unwrap();
         assert_eq!(value, ResponseValue::YesNo(true));
-        assert_eq!(String::from_utf8(output).unwrap(), "Proceed? >\n");
+        assert_eq!(String::from_utf8(out).unwrap(), "Proceed? [yes, no] >\n");
     }
 
     #[tokio::test]
-    async fn secret_prompt_writes_its_sigil_line_but_never_the_value() {
-        let mut output: Vec<u8> = Vec::new();
-        let mut transport = CliTransport::with_secret_source(
+    async fn yes_no_accepts_only_the_two_typed_tokens() {
+        for (input, want) in [("yes\n", true), ("no\n", false)] {
+            let mut out = Vec::new();
+            let mut t = transport(input, &mut out);
+            let value = t
+                .ask_user(&Prompt::new("Proceed?", ResponseType::YesNo))
+                .await
+                .unwrap();
+            assert_eq!(value, ResponseValue::YesNo(want), "input {input:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn yes_no_rejects_loose_text_and_aliases() {
+        for alias in ["y\n", "Y\n", "YES\n", "Yes\n", "true\n", "false\n", "1\n"] {
+            let mut out = Vec::new();
+            // pair the rejected alias with a valid token so the loop terminates
+            let script = format!("{alias}yes\n");
+            let mut t = transport(&script, &mut out);
+            let value = t
+                .ask_user(&Prompt::new("Proceed?", ResponseType::YesNo))
+                .await
+                .unwrap();
+            assert_eq!(
+                value,
+                ResponseValue::YesNo(true),
+                "alias {alias:?} must be rejected and re-asked, then `yes` accepted"
+            );
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                "Proceed? [yes, no] >\nProceed? [yes, no] >\n",
+                "the rejected alias must re-ask"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn required_yes_no_reprompts_until_valid() {
+        let mut out = Vec::new();
+        let mut t = transport("maybe\nno\n", &mut out);
+        let value = t
+            .ask_user(&Prompt::new("Proceed?", ResponseType::YesNo))
+            .await
+            .unwrap();
+        assert_eq!(value, ResponseValue::YesNo(false));
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "Proceed? [yes, no] >\nProceed? [yes, no] >\n"
+        );
+    }
+
+    // optional fields: the bug a user hit (re-ask forever) must never return
+
+    #[tokio::test]
+    async fn optional_yes_no_blank_line_skips_instead_of_reasking() {
+        let mut out = Vec::new();
+        let mut t = transport("\n", &mut out);
+        let value = t
+            .ask_user(&optional(Prompt::new("ack override?", ResponseType::YesNo)))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&value, ResponseValue::FreeformText(s) if s.is_empty()),
+            "optional blank must yield an empty response, got {value:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_yes_no_skip_word_skips() {
+        let mut out = Vec::new();
+        let mut t = transport("skip\n", &mut out);
+        let value = t
+            .ask_user(&optional(Prompt::new("ack override?", ResponseType::YesNo)))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&value, ResponseValue::FreeformText(s) if s.is_empty()),
+            "optional `skip` must skip, got {value:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_yes_no_still_accepts_a_real_value() {
+        let mut out = Vec::new();
+        let mut t = transport("no\n", &mut out);
+        let value = t
+            .ask_user(&optional(Prompt::new("ack override?", ResponseType::YesNo)))
+            .await
+            .unwrap();
+        assert_eq!(value, ResponseValue::YesNo(false));
+    }
+
+    #[tokio::test]
+    async fn optional_number_blank_skips() {
+        let mut out = Vec::new();
+        let mut t = transport("\n", &mut out);
+        let value = t
+            .ask_user(&optional(Prompt::new("pacing?", ResponseType::Number)))
+            .await
+            .unwrap();
+        assert_eq!(value, ResponseValue::Number(String::new()));
+    }
+
+    // choice: options must be visible, and the walk must not loop on valid intent
+
+    #[tokio::test]
+    async fn choice_prompt_lists_its_options() {
+        let mut out = Vec::new();
+        let mut t = transport("off\n", &mut out);
+        let value = t
+            .ask_user(&Prompt::new(
+                "Mode",
+                choice(&["off", "partial", "multi_message"]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(value, ResponseValue::Choice("off".into()));
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "Mode [off, partial, multi_message] >\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn choice_reprompts_on_unlisted_value_then_accepts_a_listed_one() {
+        let mut out = Vec::new();
+        let mut t = transport("yes\nskip\n", &mut out);
+        let value = t
+            .ask_user(&Prompt::new("Bind?", choice(&["skip", "create"])))
+            .await
+            .unwrap();
+        assert_eq!(value, ResponseValue::Choice("skip".into()));
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "Bind? [skip, create] >\nBind? [skip, create] >\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_choice_blank_skips_without_looping() {
+        let mut out = Vec::new();
+        let mut t = transport("\n", &mut out);
+        let value = t
+            .ask_user(&optional(Prompt::new("Mode", choice(&["off", "partial"]))))
+            .await
+            .unwrap();
+        assert_eq!(value, ResponseValue::Choice(String::new()));
+    }
+
+    // number
+
+    #[tokio::test]
+    async fn number_parses_and_reprompts_on_garbage() {
+        let mut out = Vec::new();
+        let mut t = transport("abc\n250\n", &mut out);
+        let value = t
+            .ask_user(&Prompt::new("Seconds", ResponseType::Number))
+            .await
+            .unwrap();
+        assert_eq!(value, ResponseValue::Number("250".into()));
+    }
+
+    // secrets: masked, deferrable, never echoed, and closing errors
+
+    #[tokio::test]
+    async fn secret_prompt_masks_sigil_and_never_echoes_value() {
+        let mut out = Vec::new();
+        let mut t = CliTransport::with_secret_source(
             Cursor::new(Vec::new()),
-            &mut output,
+            &mut out,
             ScriptedSecretSource::new(vec!["sk-secret"]),
         );
-        let prompt = Prompt::new("Token", ResponseType::Secret);
-        let value = transport.ask(&prompt).await.unwrap();
+        let value = t
+            .ask_user(&Prompt::new("Token", ResponseType::Secret))
+            .await
+            .unwrap();
         match value {
             ResponseValue::Secret(secret) => assert_eq!(secret.expose(), "sk-secret"),
             other => panic!("expected secret, got {other:?}"),
         }
-        let rendered = String::from_utf8(output).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
         assert_eq!(
             rendered,
-            "Token (type 'later' to leave it unset for now) #\n"
+            "Token (type 'skip' to leave it unset for now) #\n"
         );
         assert!(!rendered.contains("sk-secret"));
     }
 
     #[tokio::test]
-    async fn invalid_yes_no_reprompts() {
-        let mut output: Vec<u8> = Vec::new();
-        let mut transport = visible_only(Cursor::new(b"maybe\nno\n".to_vec()), &mut output);
-        let prompt = Prompt::new("Proceed?", ResponseType::YesNo);
-        let value = transport.ask(&prompt).await.unwrap();
-        assert_eq!(value, ResponseValue::YesNo(false));
-        assert_eq!(
-            String::from_utf8(output).unwrap(),
-            "Proceed? >\nProceed? >\n"
+    async fn secret_deferral_yields_empty_secret() {
+        let mut out = Vec::new();
+        let mut t = CliTransport::with_secret_source(
+            Cursor::new(Vec::new()),
+            &mut out,
+            ScriptedSecretSource::new(vec!["skip"]),
         );
+        let value = t
+            .ask_user(&Prompt::new("Token", ResponseType::Secret))
+            .await
+            .unwrap();
+        let ResponseValue::Secret(secret) = value else {
+            panic!("secret prompt yields a secret value");
+        };
+        assert!(secret.expose().is_empty(), "'skip' defers the credential");
     }
 
     #[tokio::test]
-    async fn choice_parses_matching_option_value() {
-        let mut output: Vec<u8> = Vec::new();
-        let mut transport = visible_only(Cursor::new(b"partial\n".to_vec()), &mut output);
-        let prompt = Prompt::new(
-            "Mode",
-            ResponseType::Choice {
-                options: vec![
-                    ChoiceOption {
-                        value: "full".into(),
-                        label: "Full".into(),
-                    },
-                    ChoiceOption {
-                        value: "partial".into(),
-                        label: "Partial".into(),
-                    },
-                ],
-            },
-        );
-        let value = transport.ask(&prompt).await.unwrap();
-        assert_eq!(value, ResponseValue::Choice("partial".into()));
+    async fn closed_secret_source_errors() {
+        let mut out = Vec::new();
+        let mut t = transport("", &mut out);
+        let result = t
+            .ask_user(&Prompt::new("Token", ResponseType::Secret))
+            .await;
+        assert!(matches!(result, Err(TransportError::Closed)));
     }
+
+    #[test]
+    fn secret_deferral_matrix() {
+        for defer in ["skip", " skip "] {
+            assert!(is_secret_deferral(defer), "should defer: {defer}");
+        }
+        for keep in [
+            "",
+            "later",
+            "none",
+            "not yet",
+            "SKIP",
+            "sk-real-token",
+            "skipperoo",
+        ] {
+            assert!(!is_secret_deferral(keep), "should NOT defer: {keep}");
+        }
+    }
+
+    #[test]
+    fn optional_skip_matrix() {
+        for skip in ["", " ", "skip", " skip "] {
+            assert!(is_optional_skip(skip), "should skip: {skip:?}");
+        }
+        for keep in ["none", "None", "later", "yes", "no", "0", "skipper"] {
+            assert!(!is_optional_skip(keep), "should NOT skip: {keep:?}");
+        }
+    }
+
+    // freeform + editor seam
 
     struct ScriptedEditor {
         seen_seed: std::sync::Arc<std::sync::Mutex<Option<String>>>,
@@ -338,94 +577,53 @@ mod tests {
 
     #[tokio::test]
     async fn freeform_with_seed_routes_through_editor_when_enabled() {
-        let mut output: Vec<u8> = Vec::new();
+        let mut out = Vec::new();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
         let editor = ScriptedEditor {
             seen_seed: seen.clone(),
             returns: "edited body".to_string(),
         };
-        let mut transport = CliTransport::with_secret_source(
+        let mut t = CliTransport::with_secret_source(
             Cursor::new(Vec::new()),
-            &mut output,
+            &mut out,
             ScriptedSecretSource::new(Vec::new()),
         )
         .with_editor(Box::new(editor));
         let prompt = Prompt::new("Write SOUL.md", ResponseType::FreeformText)
             .with_editor_seed("template seed");
-        let value = transport.ask(&prompt).await.unwrap();
+        let value = t.ask_user(&prompt).await.unwrap();
         assert_eq!(value, ResponseValue::FreeformText("edited body".into()));
         assert_eq!(seen.lock().unwrap().as_deref(), Some("template seed"));
     }
 
     #[tokio::test]
     async fn freeform_with_seed_reads_line_when_editor_disabled() {
-        let mut output: Vec<u8> = Vec::new();
-        let mut transport = visible_only(Cursor::new(b"typed inline\n".to_vec()), &mut output);
+        let mut out = Vec::new();
+        let mut t = transport("typed inline\n", &mut out);
         let prompt = Prompt::new("Write SOUL.md", ResponseType::FreeformText)
             .with_editor_seed("template seed");
-        let value = transport.ask(&prompt).await.unwrap();
+        let value = t.ask_user(&prompt).await.unwrap();
         assert_eq!(value, ResponseValue::FreeformText("typed inline".into()));
     }
 
-    #[tokio::test]
-    async fn closed_secret_source_errors() {
-        let mut output: Vec<u8> = Vec::new();
-        let mut transport = visible_only(Cursor::new(Vec::new()), &mut output);
-        let prompt = Prompt::new("Token", ResponseType::Secret);
-        let result = transport.ask(&prompt).await;
-        assert!(matches!(result, Err(TransportError::Closed)));
-    }
-
-    #[tokio::test]
-    async fn secret_deferral_yields_empty_secret() {
-        let mut output: Vec<u8> = Vec::new();
-        let mut transport = CliTransport::with_secret_source(
-            Cursor::new(Vec::new()),
-            &mut output,
-            ScriptedSecretSource::new(vec!["later"]),
-        );
-        let prompt = Prompt::new("Token", ResponseType::Secret);
-        let value = transport.ask(&prompt).await.unwrap();
-        let ResponseValue::Secret(secret) = value else {
-            panic!("secret prompt yields a secret value");
-        };
-        assert!(secret.expose().is_empty(), "'later' defers the credential");
-        let rendered = String::from_utf8(output).unwrap();
-        assert!(
-            rendered.contains("type 'later'"),
-            "prompt advertises the deferral escape: {rendered}"
-        );
-    }
-
-    #[test]
-    fn secret_deferral_matrix() {
-        for defer in ["later", "LATER", "skip", "not yet", " later "] {
-            assert!(is_secret_deferral(defer), "should defer: {defer}");
-        }
-        for keep in ["", "sk-real-token", "laterx", "skipperoo"] {
-            assert!(!is_secret_deferral(keep), "should NOT defer: {keep}");
-        }
-    }
+    // emit
 
     #[tokio::test]
     async fn emit_renders_localized_message_and_structural_token() {
-        let mut output: Vec<u8> = Vec::new();
-        let mut transport = visible_only(Cursor::new(Vec::new()), &mut output);
+        let mut out = Vec::new();
+        let mut t = transport("", &mut out);
         let outcome = Outcome::Completed {
             configured: vec![ConfiguredItem {
                 layer: "channel".into(),
                 instance: "matrix".into(),
             }],
         };
-        transport.emit(&outcome).await.unwrap();
-        let rendered = String::from_utf8(output).unwrap();
+        t.emit(&outcome).await.unwrap();
+        let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("[completed: channel:matrix]"),
-            "structural token must survive for transcript matching, got:\n{rendered}"
+            "{rendered}"
         );
-        assert!(
-            rendered.contains("channel:matrix"),
-            "localized message must carry the items arg, got:\n{rendered}"
-        );
+        assert!(rendered.contains("channel:matrix"), "{rendered}");
     }
 }

@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use zeroclaw_runtime::flow::{
     Outcome, PlannedAction, PrefilledError, PrefilledPlan, Prompt, Spec, TransportResult,
 };
-use zeroclaw_runtime::response_type::{ResponseType, ResponseValue};
+use zeroclaw_runtime::response_type::{PreviewVerdict, ResponseType, ResponseValue, is_skip_token};
 
 use crate::agent_responder::{AgentTurn, OperatorIo};
 use crate::llm_transport::{SecretReader, parse_raw};
@@ -244,10 +244,7 @@ fn vet_submission(spec: &Spec, submission_json: &str) -> Vetted {
 }
 
 fn is_decline(raw: &str) -> bool {
-    let trimmed = raw.trim();
-    trimmed.is_empty()
-        || trimmed.eq_ignore_ascii_case("none")
-        || trimmed.eq_ignore_ascii_case("skip")
+    raw.trim().is_empty() || is_skip_token(raw)
 }
 
 /// Flatten a submitted JSON value into the raw string the prompt parser
@@ -318,65 +315,13 @@ fn display_value(value: &ResponseValue) -> String {
     }
 }
 
-fn is_approval(reply: &str) -> bool {
-    if let Some(flag) = crate::llm_transport::parse_yes_no(reply.trim()) {
-        return flag;
-    }
-    // Real operators approve in sentences ("all good, apply it", "yes please
-    // go ahead"). Approve only when an affirmative word is present AND no
-    // hedge/change word is: "yes but disable shell" must NOT apply.
-    let mut affirmative = false;
-    for word in reply
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .map(str::to_ascii_lowercase)
-    {
-        if APPROVAL_BLOCKERS.contains(&word.as_str()) {
-            return false;
-        }
-        if APPROVAL_WORDS.contains(&word.as_str()) {
-            affirmative = true;
-        }
-    }
-    affirmative
-}
-
-const APPROVAL_WORDS: &[&str] = &[
-    "yes",
-    "yep",
-    "yeah",
-    "yup",
-    "ok",
-    "okay",
-    "sure",
-    "apply",
-    "approve",
-    "approved",
-    "confirm",
-    "confirmed",
-    "good",
-    "perfect",
-    "lgtm",
-    "proceed",
-    "go",
-];
-
-const APPROVAL_BLOCKERS: &[&str] = &[
-    "no", "not", "nope", "dont", "don", "but", "except", "change", "changes", "instead", "wait",
-    "hold", "stop", "cancel", "remove", "add", "actually", "wrong", "fix", "edit", "adjust",
-    "swap", "rather", "unless", "however",
-];
-
-/// A hard operator abort. Checked deterministically on every operator reply
-/// so a person can always leave the session without convincing the guide.
+/// A hard operator abort during free conversation: the single typed `cancel`
+/// token (the same `PreviewVerdict::Cancel` spelling). A person can always
+/// leave the session without convincing the guide.
 fn is_cancel(reply: &str) -> bool {
-    let word = reply
-        .trim()
-        .trim_end_matches(['.', '!'])
-        .to_ascii_lowercase();
     matches!(
-        word.as_str(),
-        "cancel" | "quit" | "abort" | "exit" | "/quit"
+        reply.trim().parse::<PreviewVerdict>(),
+        Ok(PreviewVerdict::Cancel)
     )
 }
 
@@ -475,20 +420,23 @@ where
             Vetted::Plan(plan, _values) => {
                 invalid_submissions = 0;
                 io.say(&render_preview(spec, &plan)).await?;
-                let verdict = io.hear().await?;
-                if is_cancel(&verdict) {
-                    return Ok(Outcome::Cancelled);
+                match io
+                    .ask_user_preview_verdict("Apply this configuration?")
+                    .await?
+                {
+                    PreviewVerdict::Apply => {
+                        let collected = collect_secrets(spec, &plan, secrets).await?;
+                        let outcome = spec.apply_prefilled(&plan, &collected, config)?;
+                        return Ok(outcome);
+                    }
+                    PreviewVerdict::Cancel => return Ok(Outcome::Cancelled),
+                    PreviewVerdict::Revise => {
+                        message = String::from(
+                            "The person reviewed the preview and chose to revise. Adjust the \
+                             values accordingly and resubmit, or ask them a clarifying question.",
+                        );
+                    }
                 }
-                if is_approval(&verdict) {
-                    let collected = collect_secrets(spec, &plan, secrets).await?;
-                    let outcome = spec.apply_prefilled(&plan, &collected, config)?;
-                    return Ok(outcome);
-                }
-                message = format!(
-                    "The person reviewed the preview and did not approve. They said: \
-                     \"{verdict}\". Adjust the values accordingly and resubmit, or ask \
-                     them a clarifying question."
-                );
             }
         }
     }
@@ -502,6 +450,7 @@ mod tests {
     use std::collections::VecDeque;
     use zeroclaw_config::schema::{Config, MatrixConfig};
     use zeroclaw_runtime::flow::TransportError;
+    use zeroclaw_runtime::response_type::YesNoAnswer;
 
     struct ScriptedTurn {
         replies: VecDeque<String>,
@@ -645,7 +594,7 @@ mod tests {
         let spec = matrix_spec(&config);
         let submission = format!("All set!\nSUBMIT: {}", full_submission(&spec));
         let mut turn = ScriptedTurn::new(vec!["Hi! What server do you use?", &submission]);
-        let mut io = ScriptedOperator::new(vec!["matrix.example.com please", "yes"]);
+        let mut io = ScriptedOperator::new(vec!["matrix.example.com please", "apply"]);
         let mut secrets = ScriptedSecrets::new(vec![]);
 
         let outcome = run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
@@ -680,7 +629,7 @@ mod tests {
         let spec = spec_for(&config, "channels.discord.main", "main");
         let submission = format!("SUBMIT: {}", full_submission(&spec));
         let mut turn = ScriptedTurn::new(vec![&submission]);
-        let mut io = ScriptedOperator::new(vec!["yes"]);
+        let mut io = ScriptedOperator::new(vec!["apply"]);
         let mut secrets = ScriptedSecrets::new(vec!["dsc-live-token"]);
 
         let outcome = run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
@@ -718,7 +667,7 @@ mod tests {
             r#"SUBMIT: {"channels.matrix.home.enabled": "absolutely"}"#,
             &good,
         ]);
-        let mut io = ScriptedOperator::new(vec!["yes"]);
+        let mut io = ScriptedOperator::new(vec!["apply"]);
         let mut secrets = ScriptedSecrets::new(vec!["tok"]);
 
         run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
@@ -736,8 +685,8 @@ mod tests {
         );
         assert_eq!(
             io.heard.len(),
-            1,
-            "operator saw only the preview, never the machine error"
+            2,
+            "operator saw the preview and the verdict prompt, never the machine error"
         );
     }
 
@@ -754,7 +703,7 @@ mod tests {
         let bad = format!(r#"SUBMIT: {{"{secret_id}": "sk-leaked"}}"#);
         let good = format!("SUBMIT: {}", full_submission(&spec));
         let mut turn = ScriptedTurn::new(vec![&bad, &good]);
-        let mut io = ScriptedOperator::new(vec!["yes"]);
+        let mut io = ScriptedOperator::new(vec!["apply"]);
         let mut secrets = ScriptedSecrets::new(vec!["tok"]);
 
         run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
@@ -778,8 +727,8 @@ mod tests {
         let spec = spec_for(&config, "channels.discord.main", "main");
         let submission = format!("SUBMIT: {}", full_submission(&spec));
         let mut turn = ScriptedTurn::new(vec![&submission]);
-        let mut io = ScriptedOperator::new(vec!["yes"]);
-        let mut secrets = ScriptedSecrets::new(vec!["later"]);
+        let mut io = ScriptedOperator::new(vec!["apply"]);
+        let mut secrets = ScriptedSecrets::new(vec!["skip"]);
 
         let outcome = run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
             .await
@@ -797,12 +746,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operator_rejection_routes_feedback_to_guide_and_resubmits() {
+    async fn operator_revise_routes_feedback_to_guide_and_resubmits() {
         let mut config = matrix_config();
         let spec = matrix_spec(&config);
         let submission = format!("SUBMIT: {}", full_submission(&spec));
         let mut turn = ScriptedTurn::new(vec![&submission, &submission]);
-        let mut io = ScriptedOperator::new(vec!["no, change the server", "yes"]);
+        let mut io = ScriptedOperator::new(vec!["revise", "apply"]);
         let mut secrets = ScriptedSecrets::new(vec!["tok"]);
 
         run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
@@ -810,41 +759,22 @@ mod tests {
             .unwrap();
 
         assert!(
-            turn.seen[1].contains("did not approve"),
-            "operator objection went back to the guide: {}",
-            turn.seen[1]
-        );
-        assert_eq!(io.heard.len(), 2, "operator saw both previews");
-    }
-
-    #[tokio::test]
-    async fn hedged_approval_does_not_apply() {
-        let mut config = matrix_config();
-        let spec = matrix_spec(&config);
-        let submission = format!("SUBMIT: {}", full_submission(&spec));
-        let mut turn = ScriptedTurn::new(vec![&submission, &submission]);
-        let mut io = ScriptedOperator::new(vec!["yes but change the server to matrix.org", "yes"]);
-        let mut secrets = ScriptedSecrets::new(vec![]);
-
-        run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
-            .await
-            .unwrap();
-
-        assert!(
-            turn.seen[1].contains("did not approve"),
-            "hedged yes routed back to the guide, not applied: {}",
+            turn.seen[1].contains("chose to revise"),
+            "revise verdict went back to the guide: {}",
             turn.seen[1]
         );
     }
 
     #[tokio::test]
-    async fn sentence_approval_applies() {
+    async fn non_token_verdict_reasks_until_a_typed_token() {
         let mut config = matrix_config();
         let spec = matrix_spec(&config);
         let submission = format!("SUBMIT: {}", full_submission(&spec));
         let mut turn = ScriptedTurn::new(vec![&submission]);
-        let mut io = ScriptedOperator::new(vec!["all good, apply it"]);
-        let mut secrets = ScriptedSecrets::new(vec![]);
+        // Free-text sentiment is not a verdict: it re-asks, then a typed token
+        // resolves. "yes but change it" never applies on its own.
+        let mut io = ScriptedOperator::new(vec!["yes but change it", "all good", "apply"]);
+        let mut secrets = ScriptedSecrets::new(vec!["tok"]);
 
         let outcome = run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
             .await
@@ -875,7 +805,7 @@ mod tests {
         let mut config = matrix_config();
         let spec = matrix_spec(&config);
         let mut turn = ScriptedTurn::new(vec!["What server do you folks use?"]);
-        let mut io = ScriptedOperator::new(vec!["quit"]);
+        let mut io = ScriptedOperator::new(vec!["cancel"]);
         let mut secrets = ScriptedSecrets::new(vec![]);
 
         let outcome = run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
@@ -901,7 +831,7 @@ mod tests {
         let bad = format!(r#"SUBMIT: {{"{required_text_id}": "skip"}}"#);
         let good = format!("SUBMIT: {}", full_submission(&spec));
         let mut turn = ScriptedTurn::new(vec![&bad, &good]);
-        let mut io = ScriptedOperator::new(vec!["yes"]);
+        let mut io = ScriptedOperator::new(vec!["apply"]);
         let mut secrets = ScriptedSecrets::new(vec![]);
 
         run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
@@ -936,7 +866,7 @@ mod tests {
         }
         let submission = format!("SUBMIT: {}", serde_json::Value::Object(map));
         let mut turn = ScriptedTurn::new(vec![&submission]);
-        let mut io = ScriptedOperator::new(vec!["yes"]);
+        let mut io = ScriptedOperator::new(vec!["apply"]);
         let mut secrets = ScriptedSecrets::new(vec![]);
 
         let outcome = run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
@@ -958,7 +888,7 @@ mod tests {
             full_submission(&spec)
         );
         let mut turn = ScriptedTurn::new(vec![&submission]);
-        let mut io = ScriptedOperator::new(vec!["yes"]);
+        let mut io = ScriptedOperator::new(vec!["apply"]);
         let mut secrets = ScriptedSecrets::new(vec![]);
 
         let outcome = run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
@@ -975,7 +905,7 @@ mod tests {
             "SUBMIT: {\"channels.matrix.home.homeserver\": \"https://x.com\\nfake_line = true\"}";
         let good = format!("SUBMIT: {}", full_submission(&spec));
         let mut turn = ScriptedTurn::new(vec![bad, &good]);
-        let mut io = ScriptedOperator::new(vec!["yes"]);
+        let mut io = ScriptedOperator::new(vec!["apply"]);
         let mut secrets = ScriptedSecrets::new(vec![]);
 
         run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
@@ -995,7 +925,7 @@ mod tests {
         let spec = matrix_spec(&config);
         let submission = format!("SUBMIT: {}", full_submission(&spec));
         let mut turn = ScriptedTurn::new(vec!["   ", &submission]);
-        let mut io = ScriptedOperator::new(vec!["yes"]);
+        let mut io = ScriptedOperator::new(vec!["apply"]);
         let mut secrets = ScriptedSecrets::new(vec![]);
 
         let outcome = run_freeform(&spec, &mut config, &mut turn, &mut io, &mut secrets)
@@ -1008,7 +938,11 @@ mod tests {
             "blank turn bounced to guide: {}",
             turn.seen[1]
         );
-        assert_eq!(io.heard.len(), 1, "operator only ever saw the preview");
+        assert_eq!(
+            io.heard.len(),
+            2,
+            "operator saw the preview and the verdict prompt"
+        );
     }
 
     #[tokio::test]
@@ -1028,43 +962,37 @@ mod tests {
     }
 
     #[test]
-    fn approval_parser_matrix() {
-        for approve in [
-            "yes",
-            "y",
-            "Yes please",
-            "yep looks good",
-            "ok apply it",
-            "all good, apply it",
-            "sure go ahead",
-            "LGTM",
-        ] {
-            assert!(is_approval(approve), "should approve: {approve}");
-        }
-        for reject in [
-            "no",
-            "yes but change the port",
-            "ok wait",
-            "looks wrong",
-            "apply it except the shell thing",
-            "hmm",
-            "add archiving first",
-            "dont",
-            "",
-        ] {
-            assert!(!is_approval(reject), "should NOT approve: {reject}");
+    fn approval_is_a_yes_no_selection() {
+        // Approval now goes through OperatorIo::ask_user_yes_no, which only
+        // accepts the typed YesNoAnswer tokens. Verify the type owns that.
+        assert!("yes".parse::<YesNoAnswer>().unwrap().as_bool());
+        assert!(!"no".parse::<YesNoAnswer>().unwrap().as_bool());
+        for reject in ["y", "Yes please", "ok apply it", "sure", "LGTM", "hmm", ""] {
+            assert!(
+                reject.parse::<YesNoAnswer>().is_err(),
+                "only typed tokens select: {reject:?}"
+            );
         }
     }
 
     #[test]
-    fn cancel_parser_matrix() {
-        for cancel in [
-            "cancel", "Cancel", "quit", "abort", "exit", "/quit", "cancel.",
+    fn cancel_is_the_single_typed_token() {
+        assert!(is_cancel("cancel"));
+        assert!(is_cancel(" cancel "));
+        for keep in [
+            "Cancel",
+            "quit",
+            "abort",
+            "exit",
+            "/quit",
+            "cancel.",
+            "cancel the archive bit",
+            "no",
         ] {
-            assert!(is_cancel(cancel), "should cancel: {cancel}");
-        }
-        for keep in ["cancel the archive bit", "no", "quit asking me stuff"] {
-            assert!(!is_cancel(keep), "should NOT cancel: {keep}");
+            assert!(
+                !is_cancel(keep),
+                "only the typed `cancel` token cancels: {keep}"
+            );
         }
     }
 }
