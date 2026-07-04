@@ -909,6 +909,7 @@ impl WhatsAppWebChannel {
                 attachments,
                 subject: None,
                 passive_context,
+                explicitly_addressed: false,
                 conversation_scope,
             })
             .await
