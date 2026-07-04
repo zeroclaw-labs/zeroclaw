@@ -188,6 +188,7 @@ default-channels = [
   "channel-discord",
   "channel-email",
   "channel-filesystem",
+  "channel-openai",
   "channel-telegram",
   "channel-webhook",
 ]
@@ -282,6 +283,7 @@ channel-wecom = []
 channel-wecom-ws = ["dep:aes", "dep:cbc"]
 channel-clawdtalk = []
 channel-webhook = []
+channel-openai = []
 channel-whatsapp-cloud = []
 channel-voice-call = []
 channel-acp-server = []

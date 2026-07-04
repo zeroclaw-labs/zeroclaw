@@ -305,7 +305,7 @@ agent-runtime = [
 default-channels = [
     "channel-acp-server", "channel-webhook",
     "channel-email", "channel-telegram", "channel-discord",
-    "channel-filesystem",
+    "channel-filesystem", "channel-openai",
 ]
 
 # Historical broad channel bundle. Use this for builds that should preserve the
@@ -364,6 +364,7 @@ channel-wecom = ["zeroclaw-channels/channel-wecom"]
 channel-wecom-ws = ["zeroclaw-channels/channel-wecom-ws"]
 channel-clawdtalk = ["zeroclaw-channels/channel-clawdtalk"]
 channel-webhook = ["zeroclaw-channels/channel-webhook"]
+channel-openai = ["zeroclaw-channels/channel-openai"]
 channel-acp-server = ["zeroclaw-channels/channel-acp-server", "zeroclaw-gateway?/channel-acp-server"]
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud", "zeroclaw-gateway?/channel-whatsapp-cloud"]
 channel-voice-call = ["zeroclaw-channels/channel-voice-call"]
