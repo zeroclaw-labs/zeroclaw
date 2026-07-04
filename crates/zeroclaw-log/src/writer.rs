@@ -407,11 +407,19 @@ pub fn llm_request_payload_policy() -> Option<(LlmRequestPayloadPolicy, usize)> 
 /// If persistence is enabled, hands the serialized value to the disk
 /// worker via a bounded `try_send`. The hot path performs no file I/O.
 ///
+/// The broadcast copy carries `ephemeral_attributes` deep-merged into
+/// `attributes` (live SSE consumers may render short-lived pairing
+/// credentials); the persisted copy never does — `LogEvent` marks the
+/// field `serde(skip)`, so the serialized value below is credential-free
+/// by construction.
+///
 /// This is the function the `record!` macro expands into. Direct callers
 /// (the schema migration tool, tests) can invoke it too, but production
 /// code should go through the macro so the `tracing::event!` carries the
 /// correct `file:line` source info.
 pub fn record_event(event: LogEvent) {
+    // `serde(skip)` on `ephemeral_attributes` keeps this value — the one
+    // that reaches disk — free of broadcast-only secrets.
     let value = match serde_json::to_value(&event) {
         Ok(v) => v,
         Err(err) => {
@@ -427,7 +435,11 @@ pub fn record_event(event: LogEvent) {
     observer_bridge::forward(&event);
 
     if let Some(hook) = current_broadcast_hook() {
-        let _ = hook.send(value.clone());
+        let mut broadcast_value = value.clone();
+        if !event.ephemeral_attributes.is_null() {
+            merge_ephemeral_into_attributes(&mut broadcast_value, &event.ephemeral_attributes);
+        }
+        let _ = hook.send(broadcast_value);
     }
 
     let Some(state) = current_state() else {
@@ -461,6 +473,38 @@ pub fn record_event(event: LogEvent) {
             // re-introduce the very fsync-on-hot-path we just removed,
             // and the worker will not come back.
             state.worker_dead.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Deep-merge the event's `ephemeral_attributes` into the broadcast
+/// value's `attributes` object. Ephemeral keys win on conflict (they are
+/// the fresher, call-site-provided data). Only object-into-object merges
+/// recurse; any other shape replaces wholesale.
+fn merge_ephemeral_into_attributes(broadcast_value: &mut Value, ephemeral: &Value) {
+    let Some(root) = broadcast_value.as_object_mut() else {
+        return;
+    };
+    let attributes = root
+        .entry("attributes".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    deep_merge(attributes, ephemeral);
+}
+
+fn deep_merge(target: &mut Value, incoming: &Value) {
+    match (target, incoming) {
+        (Value::Object(target_map), Value::Object(incoming_map)) => {
+            for (key, incoming_child) in incoming_map {
+                match target_map.get_mut(key) {
+                    Some(target_child) => deep_merge(target_child, incoming_child),
+                    None => {
+                        target_map.insert(key.clone(), incoming_child.clone());
+                    }
+                }
+            }
+        }
+        (target_slot, incoming_value) => {
+            *target_slot = incoming_value.clone();
         }
     }
 }
@@ -864,6 +908,68 @@ mod tests {
             let v: Value = serde_json::from_str(line).unwrap();
             assert_eq!(v["message"].as_str().unwrap(), format!("event-{}", idx + 7));
         }
+    }
+
+    #[test]
+    fn ephemeral_attributes_reach_broadcast_but_never_disk() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 10);
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        crate::broadcast::set_broadcast_hook(tx);
+
+        let mut ev = LogEvent::new(Severity::Info, "test", EventCategory::Channel);
+        ev.message = Some("qr ready".to_string());
+        ev.attributes = serde_json::json!({
+            "login": { "state": "qr", "channel": "wechat.assistant" }
+        });
+        ev.ephemeral_attributes = serde_json::json!({
+            "login": { "qr_payload": "SECRET-QR-PAYLOAD" }
+        });
+        record_event(ev);
+
+        // Broadcast copy: ephemeral fields deep-merged into attributes.
+        let broadcast = rx.try_recv().expect("broadcast copy delivered");
+        assert_eq!(
+            broadcast["attributes"]["login"]["qr_payload"],
+            "SECRET-QR-PAYLOAD"
+        );
+        assert_eq!(broadcast["attributes"]["login"]["state"], "qr");
+
+        // Persisted copy: the credential never lands on disk.
+        let path = runtime_trace_path().unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(
+            !contents.contains("SECRET-QR-PAYLOAD"),
+            "persisted JSONL must not contain ephemeral credentials: {contents}"
+        );
+        assert!(
+            contents.contains("\"state\":\"qr\""),
+            "persisted JSONL keeps the lifecycle state: {contents}"
+        );
+        let line: Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+        assert!(line["attributes"]["login"].get("qr_payload").is_none());
+        assert!(line.get("ephemeral_attributes").is_none());
+
+        crate::broadcast::clear_broadcast_hook();
+    }
+
+    #[test]
+    fn deep_merge_prefers_ephemeral_on_conflict_and_recurses() {
+        let mut target = serde_json::json!({
+            "login": { "state": "qr", "attempt": 1 },
+            "other": "kept"
+        });
+        let incoming = serde_json::json!({
+            "login": { "qr_payload": "p", "attempt": 2 }
+        });
+        deep_merge(&mut target, &incoming);
+        assert_eq!(target["login"]["state"], "qr");
+        assert_eq!(target["login"]["qr_payload"], "p");
+        assert_eq!(target["login"]["attempt"], 2);
+        assert_eq!(target["other"], "kept");
     }
 
     #[test]

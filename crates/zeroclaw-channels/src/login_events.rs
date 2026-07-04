@@ -8,9 +8,8 @@
 //!
 //! [`LoginEvent::emit`] publishes the same lifecycle as structured
 //! `record!` events. Each event carries an `attributes.login` object with a
-//! stable machine-readable shape, so gateway SSE (`/api/events`) and JSONL
-//! log consumers can render the QR code client-side and track connection
-//! state:
+//! stable machine-readable shape, so gateway SSE (`/api/events`) consumers
+//! can render the QR code client-side and track connection state:
 //!
 //! ```json
 //! {
@@ -33,9 +32,16 @@
 //! with `expired` on QR refresh, `failed` when the flow gives up, and
 //! `logged_out` when a previously linked session is revoked remotely.
 //!
-//! QR payloads and pair codes are short-lived pairing credentials that the
-//! affected channels already print to the terminal; carrying them in the
-//! operator-scoped log/event stream keeps the trust boundary unchanged.
+//! ## Credential handling
+//!
+//! QR payloads and pair codes are short-lived device-linking credentials.
+//! They ride as **ephemeral attributes** (`Event::with_ephemeral_attrs`):
+//! the live broadcast copy — the bearer-authenticated SSE `/api/events`
+//! stream, shown above — carries them so a dashboard can render the QR,
+//! but they are never serialized into the persisted JSONL trace, so
+//! `/api/logs`, log rotation/retention, and any log shipping or backup
+//! never capture them at rest. Persisted events keep only the lifecycle
+//! `state`, channel identity, and attempt counters.
 
 use serde_json::Value;
 use zeroclaw_log::{Action, Event, EventCategory, EventOutcome, record};
@@ -84,8 +90,10 @@ impl LoginEvent<'_> {
         }
     }
 
-    /// Build the `attributes` payload. Channel identity is derived from the
-    /// caller's values at emission time — nothing is cached here.
+    /// Build the persisted `attributes` payload: lifecycle state, channel
+    /// identity, and counters only — never pairing credentials. Channel
+    /// identity is derived from the caller's values at emission time —
+    /// nothing is cached here.
     fn attrs(&self, channel_type: &str, channel_alias: &str) -> Value {
         let mut login = serde_json::json!({
             "state": self.state(),
@@ -95,24 +103,16 @@ impl LoginEvent<'_> {
         });
         match self {
             Self::Qr {
-                payload,
-                image_url,
                 attempt,
                 max_attempts,
+                ..
             } => {
-                login["qr_payload"] = (*payload).into();
-                if let Some(url) = image_url {
-                    login["qr_image_url"] = (*url).into();
-                }
                 if let Some(attempt) = attempt {
                     login["attempt"] = (*attempt).into();
                 }
                 if let Some(max) = max_attempts {
                     login["max_attempts"] = (*max).into();
                 }
-            }
-            Self::PairCode { code } => {
-                login["pair_code"] = (*code).into();
             }
             Self::Expired {
                 attempt,
@@ -124,13 +124,40 @@ impl LoginEvent<'_> {
             Self::Failed { reason } => {
                 login["reason"] = (*reason).into();
             }
-            Self::Scanned | Self::Connected | Self::LoggedOut => {}
+            Self::PairCode { .. } | Self::Scanned | Self::Connected | Self::LoggedOut => {}
         }
         serde_json::json!({ "login": login })
     }
 
-    /// Emit this lifecycle point as a structured log event so SSE and JSONL
-    /// consumers can drive pairing UIs remotely.
+    /// Build the broadcast-only payload carrying the short-lived pairing
+    /// credentials (QR payload / image URL, pair code). Deep-merged into
+    /// `attributes.login` on the SSE copy by the log writer; never lands
+    /// in the persisted JSONL trace. `None` for credential-free states.
+    fn ephemeral_attrs(&self) -> Option<Value> {
+        let login = match self {
+            Self::Qr {
+                payload, image_url, ..
+            } => {
+                let mut login = serde_json::json!({ "qr_payload": payload });
+                if let Some(url) = image_url {
+                    login["qr_image_url"] = (*url).into();
+                }
+                login
+            }
+            Self::PairCode { code } => serde_json::json!({ "pair_code": code }),
+            Self::Scanned
+            | Self::Expired { .. }
+            | Self::Connected
+            | Self::Failed { .. }
+            | Self::LoggedOut => return None,
+        };
+        Some(serde_json::json!({ "login": login }))
+    }
+
+    /// Emit this lifecycle point as a structured log event. Live SSE
+    /// consumers can drive pairing UIs remotely (credentials ride the
+    /// broadcast-only ephemeral path); JSONL consumers see lifecycle
+    /// state and identity without the pairing credentials.
     pub fn emit(&self, channel_type: &str, channel_alias: &str, message: &str) {
         let attrs = self.attrs(channel_type, channel_alias);
         match self {
@@ -164,13 +191,15 @@ impl LoginEvent<'_> {
                     .with_attrs(attrs),
                 message
             ),
-            Self::Qr { .. } | Self::PairCode { .. } | Self::Scanned => record!(
-                INFO,
-                Event::new(module_path!(), Action::Note)
+            Self::Qr { .. } | Self::PairCode { .. } | Self::Scanned => {
+                let mut payload = Event::new(module_path!(), Action::Note)
                     .with_category(EventCategory::Channel)
-                    .with_attrs(attrs),
-                message
-            ),
+                    .with_attrs(attrs);
+                if let Some(ephemeral) = self.ephemeral_attrs() {
+                    payload = payload.with_ephemeral_attrs(ephemeral);
+                }
+                record!(INFO, payload, message);
+            }
         }
     }
 }
@@ -207,45 +236,85 @@ mod tests {
     }
 
     #[test]
-    fn qr_attrs_carry_payload_and_channel_identity() {
-        let attrs = LoginEvent::Qr {
+    fn qr_attrs_carry_identity_and_counters_but_never_credentials() {
+        let event = LoginEvent::Qr {
             payload: "https://example.invalid/qr",
             image_url: Some("https://example.invalid/qr.png"),
             attempt: Some(2),
             max_attempts: Some(3),
-        }
-        .attrs("wechat", "assistant");
+        };
+        let attrs = event.attrs("wechat", "assistant");
 
         let login = &attrs["login"];
         assert_eq!(login["state"], "qr");
         assert_eq!(login["channel"], "wechat.assistant");
         assert_eq!(login["channel_type"], "wechat");
         assert_eq!(login["channel_alias"], "assistant");
-        assert_eq!(login["qr_payload"], "https://example.invalid/qr");
-        assert_eq!(login["qr_image_url"], "https://example.invalid/qr.png");
         assert_eq!(login["attempt"], 2);
         assert_eq!(login["max_attempts"], 3);
+        // Credentials must never appear on the persisted payload.
+        assert!(login.get("qr_payload").is_none());
+        assert!(login.get("qr_image_url").is_none());
+    }
+
+    #[test]
+    fn qr_ephemeral_attrs_carry_credentials() {
+        let event = LoginEvent::Qr {
+            payload: "https://example.invalid/qr",
+            image_url: Some("https://example.invalid/qr.png"),
+            attempt: Some(2),
+            max_attempts: Some(3),
+        };
+        let ephemeral = event.ephemeral_attrs().expect("qr has ephemeral attrs");
+        assert_eq!(
+            ephemeral["login"]["qr_payload"],
+            "https://example.invalid/qr"
+        );
+        assert_eq!(
+            ephemeral["login"]["qr_image_url"],
+            "https://example.invalid/qr.png"
+        );
     }
 
     #[test]
     fn qr_attrs_omit_absent_optional_fields() {
-        let attrs = LoginEvent::Qr {
+        let event = LoginEvent::Qr {
             payload: "payload",
             image_url: None,
             attempt: None,
             max_attempts: None,
-        }
-        .attrs("whatsapp", "assistant");
-        assert!(attrs["login"].get("qr_image_url").is_none());
+        };
+        let attrs = event.attrs("whatsapp", "assistant");
         assert!(attrs["login"].get("attempt").is_none());
         assert!(attrs["login"].get("max_attempts").is_none());
+        let ephemeral = event.ephemeral_attrs().expect("qr has ephemeral attrs");
+        assert!(ephemeral["login"].get("qr_image_url").is_none());
     }
 
     #[test]
-    fn pair_code_attrs_carry_code() {
-        let attrs = LoginEvent::PairCode { code: "ABCD-1234" }.attrs("whatsapp", "assistant");
+    fn pair_code_rides_only_the_ephemeral_path() {
+        let event = LoginEvent::PairCode { code: "ABCD-1234" };
+        let attrs = event.attrs("whatsapp", "assistant");
         assert_eq!(attrs["login"]["state"], "pair_code");
-        assert_eq!(attrs["login"]["pair_code"], "ABCD-1234");
+        assert!(attrs["login"].get("pair_code").is_none());
+        let ephemeral = event.ephemeral_attrs().expect("pair code is ephemeral");
+        assert_eq!(ephemeral["login"]["pair_code"], "ABCD-1234");
+    }
+
+    #[test]
+    fn credential_free_states_have_no_ephemeral_attrs() {
+        for event in [
+            LoginEvent::Scanned,
+            LoginEvent::Expired {
+                attempt: 1,
+                max_attempts: 3,
+            },
+            LoginEvent::Connected,
+            LoginEvent::Failed { reason: "r" },
+            LoginEvent::LoggedOut,
+        ] {
+            assert!(event.ephemeral_attrs().is_none(), "{:?}", event.state());
+        }
     }
 
     #[test]
