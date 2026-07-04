@@ -138,6 +138,7 @@ pub(crate) fn live_channel_registry() -> Option<tools::PerToolChannelHandle> {
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
+use crate::tools::scoped;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -176,6 +177,85 @@ pub use super::history::{
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+
+/// Maximum bytes of an interactive stdin line accepted by the
+/// ZeroClaw REPL. Caps the per-line allocation so a pipe of
+/// `head -c 10G /dev/zero | zeroclaw chat` cannot blow up RSS; the
+/// line is truncated to this size and the user is warned. Matches
+/// the size class of the gateway HTTP body cap (64 KiB) and the
+/// largest per-message cap in the channel orchestrator (4 KiB notify
+/// detail × 128-deep queue = 512 KiB).
+pub(crate) const MAX_INTERACTIVE_INPUT_BYTES: usize = 1024 * 1024; // 1 MiB
+
+/// Result of [`read_capped_line`].
+#[derive(Debug)]
+pub(crate) enum CappedLine {
+    /// A full line under the cap, with the trailing `\n` stripped.
+    Line(String),
+    /// The physical line exceeded `cap`. The remainder has been
+    /// drained to the next `\n` or EOF, so the caller must treat this
+    /// as a discarded line and must not feed it into the model path.
+    Truncated,
+    /// EOF with no bytes read.
+    Eof,
+}
+
+/// Read a single line from `reader` bounded at `cap` bytes. Returns
+/// the line with the trailing `\n` stripped (lossily decoded, since
+/// PTY transport can split multi-byte characters at frame boundaries)
+/// or [`CappedLine::Truncated`] when the cap was hit. When truncated,
+/// the rest of the physical line is drained using a fixed-size scratch
+/// buffer so the next call starts at the next line and no unbounded
+/// allocation occurs (Audacity88 review #8463).
+pub(crate) fn read_capped_line<R: std::io::BufRead>(
+    reader: R,
+    cap: usize,
+) -> std::io::Result<CappedLine> {
+    let mut raw = Vec::new();
+    // +1 headroom so the cap detection is unambiguous: a buffer that
+    // reaches exactly `cap` bytes without a `\n` was truncated; a
+    // buffer shorter than `cap` has the full line.
+    let mut limited = reader.take((cap + 1) as u64);
+    std::io::BufRead::read_until(&mut limited, b'\n', &mut raw)?;
+    let truncated = raw.len() > cap;
+    if truncated {
+        // Drain the rest of the physical line without accumulating it
+        // in memory; `read_until` into a `Vec` would re-introduce the
+        // original OOM vector.
+        let mut inner = limited.into_inner();
+        discard_until_newline(&mut inner)?;
+        return Ok(CappedLine::Truncated);
+    } else if raw.last() == Some(&b'\n') {
+        // Strip the trailing `\n` that `read_until` leaves behind. The
+        // lossy decode runs after the strip so the result has no
+        // trailing newline regardless of the cap path.
+        raw.pop();
+    }
+    if raw.is_empty() {
+        return Ok(CappedLine::Eof);
+    }
+    Ok(CappedLine::Line(String::from_utf8_lossy(&raw).into_owned()))
+}
+
+/// Discard bytes from `reader` until the next `\n` or EOF, using only
+/// `BufRead::fill_buf` / `consume`. This avoids the unbounded allocation
+/// that `read_until(..., &mut Vec::new())` would incur on an oversized
+/// physical line, and it stops exactly at the newline so the next line
+/// is not consumed.
+fn discard_until_newline<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<()> {
+    loop {
+        let buf = reader.fill_buf()?;
+        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            reader.consume(pos + 1);
+            return Ok(());
+        }
+        let len = buf.len();
+        if len == 0 {
+            return Ok(());
+        }
+        reader.consume(len);
+    }
+}
 
 /// Global model switch request state - used for runtime model switching via model_switch tool.
 /// This is set by the model_switch tool and checked by the agent loop.
@@ -305,62 +385,6 @@ pub fn register_eager_mcp_tool_if_allowed(
     true
 }
 
-/// Apply the SecurityPolicy built-in tool filter on the channel/daemon
-/// (`process_message`) path.
-///
-/// Extracted as a named seam so the production filtering of the eager
-/// built-in registry is regression-testable without driving the full agent
-/// loop (see `process_message_policy_filters_eager_builtins`). The channel
-/// path has no caller-supplied allowlist, so only the agent's own
-/// `SecurityPolicy` (`allowed_tools` + `excluded_tools`) gates here; the
-/// `run()` path additionally composes a caller-supplied `allowed_tools` gate.
-pub(crate) fn filter_channel_builtin_tools(
-    tools_registry: &mut Vec<Box<dyn Tool>>,
-    security: &zeroclaw_config::policy::SecurityPolicy,
-) {
-    let before_filter = tools_registry.len();
-
-    // At non-Full autonomy, the known default read-only auto-approve
-    // tools (web_search_tool, web_fetch, calculator, etc.) are always
-    // accessible on channels so the bot can fetch real-time information.
-    // Only the canonical builtin default set bypasses allowed_tools;
-    // operator-added auto_approve entries (e.g. shell) still require
-    // explicit allowlisting via allowed_tools.
-    if security.autonomy != AutonomyLevel::Full {
-        let defaults = zeroclaw_config::schema::default_auto_approve();
-        let safe_defaults: HashSet<&str> = defaults.iter().map(String::as_str).collect();
-        tools_registry.retain(|t| {
-            let name = t.name();
-            if safe_defaults.contains(name) {
-                // Builtin read-only tool: admit past allowed_tools but
-                // still respect the excluded_tools denylist.
-                return security
-                    .excluded_tools
-                    .as_ref()
-                    .is_none_or(|list| !list.iter().any(|ex| ex == name));
-            }
-            security.is_tool_allowed(name)
-        });
-    } else {
-        apply_policy_tool_filter(tools_registry, Some(security), None);
-    }
-
-    if tools_registry.len() != before_filter {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
-                .with_category(::zeroclaw_log::EventCategory::Agent)
-                .with_attrs(::serde_json::json!({
-                    "before": before_filter,
-                    "retained": tools_registry.len(),
-                    "policy_allowed": security.allowed_tools.as_ref().map(|v| v.len()),
-                    "policy_excluded": security.excluded_tools.as_ref().map(|v| v.len()),
-                })),
-            "Applied capability-based tool access filter (process_message)"
-        );
-    }
-}
-
 /// Returns the subset of `tool_specs` that should be sent to the LLM for this turn.
 ///
 /// Rules (mirrors NullClaw `filterToolSpecsForTurn`):
@@ -486,7 +510,7 @@ fn compute_excluded_mcp_tools(
         .collect()
 }
 
-fn native_tool_specs_present_for_turn(
+pub fn native_tool_specs_present_for_turn(
     model_provider: &dyn ModelProvider,
     tools_registry: &[Box<dyn Tool>],
     excluded_tools: &[String],
@@ -528,7 +552,7 @@ fn elide_image_data(content: &str) -> String {
 /// xoxb-/…) and `scrub_credentials` (key=value / bearer=) are disjoint; neither
 /// alone covers free-form content. Residual secrets/PII may remain — this is
 /// disclosed in the PR/docs, not eliminated.
-fn scrub_for_export(content: &str) -> String {
+pub(crate) fn scrub_for_export(content: &str) -> String {
     scrub_credentials(&zeroclaw_providers::scrub_secret_patterns(
         &elide_image_data(content),
     ))
@@ -541,6 +565,14 @@ fn scrub_for_export(content: &str) -> String {
 /// builds pay no cloning/scrubbing cost. The system message is split into
 /// `system_instructions`; the rest become `input`. Every string passes through
 /// [`scrub_for_export`] (image elision + dual credential scrub).
+///
+/// This function does NOT consult any OTel content policy — it only constructs
+/// a credential-scrubbed snapshot when the `observability-otel` feature is
+/// enabled. Whether that snapshot is actually exported (and at what privacy
+/// level: `off` / `redacted` / `full`) is decided by the owning
+/// `OtelObserver`'s instance content config at the OTel export boundary, not
+/// here. Keeping the policy out of the capture path avoids process-global
+/// mutable state and the cross-observer drift it caused.
 pub(crate) fn capture_llm_messages(
     messages: &[ChatMessage],
     output_text: Option<&str>,
@@ -1327,14 +1359,36 @@ pub async fn run(
             sop_audit,
             None,
         );
-        let mut tools_registry = all_tools_result.tools;
-        let delegate_handle = all_tools_result.delegate_handle;
-        let unfiltered_tool_arcs = all_tools_result.unfiltered_tool_arcs;
-        let ask_user_handle = all_tools_result.ask_user_handle;
-        let channel_room_handle = all_tools_result.channel_room_handle;
-        let reaction_handle = all_tools_result.reaction_handle;
-        let poll_handle = all_tools_result.poll_handle;
-        let escalate_handle = all_tools_result.escalate_handle;
+        let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
+        // Route the per-agent tool registry through the one gated seam
+        // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
+        // to the behavior this path hand-rolled. `caller_allowed` carries the
+        // run() per-run allowlist; connect_peripherals is true (execution path).
+        let scoped::ScopedAssembled {
+            registry,
+            delegate_handle: _,
+            ask_user_handle,
+            reaction_handle,
+            poll_handle,
+            escalate_handle,
+            channel_room_handle,
+            deferred_section,
+            activated_handle,
+        } = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+            config: &config,
+            agent_alias,
+            security: &security,
+            built: all_tools_result,
+            skills: &skills,
+            runtime: runtime.clone(),
+            caller_allowed: allowed_tools.as_deref(),
+            connect_mcp: true,
+            connect_peripherals: true,
+            exclude_memory: false,
+            emit_assembly_logs: true,
+        })
+        .await;
+        let tools_registry = registry.into_inner();
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
@@ -1352,223 +1406,6 @@ pub async fn run(
                     .with_attrs(::serde_json::json!({"count": count})),
                 &format!("Registered {} channel(s) for CLI agent", count),
             );
-        }
-
-        let peripheral_tools: Vec<Box<dyn Tool>> = if let Some(f) = PERIPHERAL_TOOLS_FN.get() {
-            f(config.peripherals.clone()).await.unwrap_or_default()
-        } else {
-            vec![]
-        };
-        if !peripheral_tools.is_empty() {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
-                    .with_category(::zeroclaw_log::EventCategory::Tool)
-                    .with_attrs(::serde_json::json!({"count": peripheral_tools.len()})),
-                "Peripheral tools added"
-            );
-            tools_registry.extend(peripheral_tools);
-        }
-
-        // ── Capability-based tool access control ─────────────────────
-        // Two-gate filter: parent agent's SecurityPolicy
-        // (`allowed_tools` + `excluded_tools`) AND the caller-supplied
-        // `allowed_tools` parameter. Both must admit a tool name for
-        // the tool to survive. `None` on either gate is unrestricted
-        // for that gate alone.
-        let before_filter = tools_registry.len();
-        apply_policy_tool_filter(
-            &mut tools_registry,
-            Some(security.as_ref()),
-            allowed_tools.as_deref(),
-        );
-        if tools_registry.len() != before_filter {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
-                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_attrs(::serde_json::json!({
-                        "before": before_filter,
-                        "retained": tools_registry.len(),
-                        "policy_allowed": security.allowed_tools.as_ref().map(|v| v.len()),
-                        "policy_excluded": security.excluded_tools.as_ref().map(|v| v.len()),
-                        "caller_allowed": allowed_tools.as_ref().map(|v| v.len()),
-                    })),
-                "Applied capability-based tool access filter"
-            );
-        }
-
-        // ── Wire MCP tools (non-fatal) — CLI path ────────────────────
-        // NOTE: MCP tools are injected after built-in tool filtering
-        // (filter_primary_agent_tools_or_fail / agent.allowed_tools / agent.denied_tools).
-        // MCP registration and deferred discovery then apply the same policy
-        // explicitly so denied MCP tools never surface in context or delegate handles.
-        //
-        // When `deferred_loading` is enabled, MCP tools are NOT added to the registry
-        // eagerly. Instead, a `tool_search` built-in is registered so the LLM can
-        // fetch schemas on demand. This reduces context window waste.
-        let mut deferred_section = String::new();
-        let mut activated_handle: Option<
-            std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
-        > = None;
-        // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
-        let mut mcp_elevation_arcs: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
-        // Secure by default: only the MCP servers granted by this agent's
-        // `mcp_bundles` (omission is not a grant).
-        let agent_mcp_servers = if config.mcp.enabled {
-            config.mcp_servers_for_agent(agent_alias)
-        } else {
-            Vec::new()
-        };
-        if !agent_mcp_servers.is_empty() {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
-                    .with_category(::zeroclaw_log::EventCategory::Tool),
-                &format!(
-                    "Initializing MCP client - {} server(s) granted via mcp_bundles",
-                    agent_mcp_servers.len()
-                )
-            );
-            match crate::tools::McpRegistry::connect_all(&agent_mcp_servers).await {
-                Ok(registry) => {
-                    let registry = std::sync::Arc::new(registry);
-                    mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
-                    let mcp_policy =
-                        mcp_tool_access_policy(security.as_ref(), allowed_tools.as_deref());
-                    // Register the generic MCP resource/prompt capability tools
-                    // (policy-gated, both deferred and eager modes).
-                    for tool in
-                        crate::tools::build_mcp_capability_tools(&registry, mcp_policy.as_ref())
-                    {
-                        register_eager_mcp_tool_if_allowed(
-                            tool,
-                            &mut tools_registry,
-                            delegate_handle.as_ref(),
-                            mcp_policy.as_ref(),
-                        );
-                    }
-                    let pinned_section = crate::tools::mcp_context::build_pinned_resources_section(
-                        &registry,
-                        &agent_mcp_servers,
-                        mcp_policy.as_ref(),
-                    )
-                    .await;
-                    if config.mcp.deferred_loading {
-                        // Deferred path: build stubs and register tool_search
-                        let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
-                            std::sync::Arc::clone(&registry),
-                        )
-                        .await;
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Load
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Tool),
-                            &format!(
-                                "MCP deferred: {} tool stub(s) from {} server(s)",
-                                deferred_set.len(),
-                                registry.server_count()
-                            )
-                        );
-                        let allowed_stub_count = mcp_allowed_tool_count(
-                            deferred_set
-                                .stubs
-                                .iter()
-                                .map(|stub| stub.prefixed_name.as_str()),
-                            mcp_policy.as_ref(),
-                        );
-                        deferred_section = crate::tools::build_deferred_tools_section_filtered(
-                            &deferred_set,
-                            mcp_policy.as_ref(),
-                        );
-                        if allowed_stub_count > 0 {
-                            let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                                crate::tools::ActivatedToolSet::new(),
-                            ));
-                            activated_handle = Some(std::sync::Arc::clone(&activated));
-                            let mut tool_search =
-                                crate::tools::ToolSearchTool::new(deferred_set, activated);
-                            if let Some(policy) = mcp_policy {
-                                tool_search = tool_search.with_access_policy(policy);
-                            }
-                            if let Some(ref handle) = delegate_handle {
-                                let delegate_tools = std::sync::Arc::clone(handle);
-                                tool_search = tool_search.with_activation_hook(
-                                    std::sync::Arc::new(move |tool| {
-                                        let mut tools = delegate_tools.write();
-                                        let already_registered = tools
-                                            .iter()
-                                            .any(|existing| existing.name() == tool.name());
-                                        if !already_registered {
-                                            tools.push(tool);
-                                        }
-                                    }),
-                                );
-                            }
-                            tools_registry.push(Box::new(tool_search));
-                        }
-                    } else {
-                        // Eager path: register only MCP tools admitted by the
-                        // same policy used by deferred MCP discovery.
-                        let names = registry.tool_names();
-                        let mut registered = 0usize;
-                        let mut skipped = 0usize;
-                        for name in names {
-                            if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
-                                skipped += 1;
-                                continue;
-                            }
-                            if let Some(def) = registry.get_tool_def(&name).await {
-                                let wrapper: std::sync::Arc<dyn Tool> =
-                                    std::sync::Arc::new(crate::tools::McpToolWrapper::new(
-                                        name,
-                                        def,
-                                        std::sync::Arc::clone(&registry),
-                                    ));
-                                if register_eager_mcp_tool_if_allowed(
-                                    wrapper,
-                                    &mut tools_registry,
-                                    delegate_handle.as_ref(),
-                                    mcp_policy.as_ref(),
-                                ) {
-                                    registered += 1;
-                                }
-                            }
-                        }
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Register
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Tool),
-                            &format!(
-                                "MCP: {} tool(s) registered from {} server(s), {} skipped by policy",
-                                registered,
-                                registry.server_count(),
-                                skipped
-                            )
-                        );
-                    }
-                    // Append pinned MCP resources unconditionally, after both the
-                    // deferred and eager branches, so the deferred-path reassignment
-                    // of `deferred_section` does not clobber them.
-                    append_pinned_mcp_section(&mut deferred_section, &pinned_section);
-                }
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "MCP registry failed to initialize"
-                    );
-                }
-            }
         }
 
         // ── Resolve model_provider ─────────────────────────────────────────
@@ -1682,26 +1519,6 @@ pub async fn run(
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
             .unwrap_or_else(crate::i18n::detect_locale);
-
-        // ── Build system prompt from workspace MD files (OpenClaw framework) ──
-        let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
-
-        // Register skill-defined tools as callable tool specs in the tool registry
-        // so the LLM can invoke them via native function calling, not just XML prompts.
-        // Resolution registry = built-in arcs + resolution-only MCP wrappers, so
-        // skill elevation (kind = "builtin" / "mcp") can resolve either target.
-        let skill_resolution_registry: Vec<std::sync::Arc<dyn Tool>> = unfiltered_tool_arcs
-            .iter()
-            .cloned()
-            .chain(mcp_elevation_arcs.iter().cloned())
-            .collect();
-        tools::register_skill_tools_with_context_and_runtime(
-            &mut tools_registry,
-            &skills,
-            security.clone(),
-            &skill_resolution_registry,
-            runtime,
-        );
 
         let mut tool_descs: Vec<(&str, &str)> = vec![
             (
@@ -2310,16 +2127,26 @@ pub async fn run(
                 // Read raw bytes to avoid UTF-8 validation errors when PTY
                 // transport splits multi-byte characters at frame boundaries
                 // (e.g. CJK input with spaces over kubectl exec / SSH).
-                let mut raw = Vec::new();
-                match std::io::BufRead::read_until(&mut std::io::stdin().lock(), b'\n', &mut raw) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(e) => {
-                        eprintln!("\nError reading input: {e}\n");
-                        break;
+                // Capped at MAX_INTERACTIVE_INPUT_BYTES so a pipe of
+                // `head -c 10G /dev/zero | zeroclaw chat` cannot blow up RSS.
+                let input = {
+                    let stdin = std::io::stdin().lock();
+                    match read_capped_line(stdin, MAX_INTERACTIVE_INPUT_BYTES) {
+                        Ok(CappedLine::Eof) => break,
+                        Ok(CappedLine::Line(s)) => s,
+                        Ok(CappedLine::Truncated) => {
+                            eprintln!(
+                                "\nWarning: input line exceeds {} bytes and was discarded.",
+                                MAX_INTERACTIVE_INPUT_BYTES
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("\nError reading input: {e}\n");
+                            break;
+                        }
                     }
-                }
-                let input = String::from_utf8_lossy(&raw).into_owned();
+                };
 
                 let user_input = input.trim().to_string();
                 if user_input.is_empty() {
@@ -2345,17 +2172,16 @@ pub async fn run(
                         print!("Continue? [y/N] ");
                         let _ = std::io::stdout().flush();
 
-                        let mut confirm_raw = Vec::new();
-                        if std::io::BufRead::read_until(
-                            &mut std::io::stdin().lock(),
-                            b'\n',
-                            &mut confirm_raw,
-                        )
-                        .is_err()
-                        {
-                            continue;
-                        }
-                        let confirm = String::from_utf8_lossy(&confirm_raw);
+                        let confirm = {
+                            let stdin = std::io::stdin().lock();
+                            match read_capped_line(stdin, MAX_INTERACTIVE_INPUT_BYTES) {
+                                Ok(CappedLine::Line(s)) => s,
+                                Ok(CappedLine::Truncated) | Ok(CappedLine::Eof) | Err(_) => {
+                                    println!("Cancelled.\n");
+                                    continue;
+                                }
+                            }
+                        };
                         if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
                             println!("Cancelled.\n");
                             continue;
@@ -3041,22 +2867,48 @@ pub async fn process_message(
             sop_audit,
             None,
         );
-        let mut tools_registry = all_tools_result_pm.tools;
-        let delegate_handle_pm = all_tools_result_pm.delegate_handle;
-        let unfiltered_tool_arcs_pm = all_tools_result_pm.unfiltered_tool_arcs;
-        let ask_user_handle_pm = all_tools_result_pm.ask_user_handle;
-        let channel_room_handle_pm = all_tools_result_pm.channel_room_handle;
-        let reaction_handle_pm = all_tools_result_pm.reaction_handle;
-        let poll_handle_pm = all_tools_result_pm.poll_handle;
-        let escalate_handle_pm = all_tools_result_pm.escalate_handle;
+        let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
+        // Route the per-agent tool registry through the one gated seam - the same
+        // seam run() uses. This UNIFIES process_message's built-in filter with every
+        // other construction path: `assemble` applies the plain policy filter
+        // (allowed_tools + excluded_tools), replacing filter_channel_builtin_tools,
+        // which admitted the canonical read-only defaults past allowed_tools at
+        // non-Full autonomy. Only process_message (i.e. gateway live chat and peer
+        // delegation) had that admit; the real channels already use the plain filter.
+        // See the PR body for the hardening rationale.
+        let scoped::ScopedAssembled {
+            registry,
+            delegate_handle: _,
+            ask_user_handle,
+            reaction_handle,
+            poll_handle,
+            escalate_handle,
+            channel_room_handle,
+            mut deferred_section,
+            activated_handle: activated_handle_pm,
+        } = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+            config: &config,
+            agent_alias,
+            security: &security,
+            built: all_tools_result_pm,
+            skills: &skills,
+            runtime: runtime.clone(),
+            caller_allowed: None,
+            connect_mcp: true,
+            connect_peripherals: true,
+            exclude_memory: false,
+            emit_assembly_logs: true,
+        })
+        .await;
+        let tools_registry = registry.into_inner();
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
-            &ask_user_handle_pm,
-            &channel_room_handle_pm,
-            &reaction_handle_pm,
-            &poll_handle_pm,
-            &escalate_handle_pm,
+            &ask_user_handle,
+            &channel_room_handle,
+            &reaction_handle,
+            &poll_handle,
+            &escalate_handle,
         );
         if count > 0 {
             ::zeroclaw_log::record!(
@@ -3066,182 +2918,6 @@ pub async fn process_message(
                     .with_attrs(::serde_json::json!({"count": count})),
                 &format!("Registered {} channel(s) for process_message agent", count),
             );
-        }
-        let peripheral_tools: Vec<Box<dyn Tool>> = if let Some(f) = PERIPHERAL_TOOLS_FN.get() {
-            f(config.peripherals.clone()).await.unwrap_or_default()
-        } else {
-            vec![]
-        };
-        tools_registry.extend(peripheral_tools);
-
-        // ── Capability-based tool access control ─────────────────────
-        // Mirror the `run()` path: apply the SecurityPolicy filter
-        // (allowed_tools + excluded_tools) so daemon-provisioned agents get
-        // the same restriction as CLI-invoked agents. Extracted into
-        // `filter_channel_builtin_tools` so the production path is
-        // regression-tested (see process_message_policy_filters_eager_builtins).
-        filter_channel_builtin_tools(&mut tools_registry, security.as_ref());
-
-        // ── Wire MCP tools (non-fatal) — process_message path ────────
-        // NOTE: Same ordering contract as the CLI path above. MCP tools are
-        // initialized after built-in filtering, then registration/discovery is
-        // gated explicitly by the agent's security policy.
-        let mut deferred_section = String::new();
-        let mut activated_handle_pm: Option<
-            std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
-        > = None;
-        // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
-        let mut mcp_elevation_arcs: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
-        // Secure by default: only the MCP servers granted by this agent's
-        // `mcp_bundles` (omission is not a grant).
-        let agent_mcp_servers = if config.mcp.enabled {
-            config.mcp_servers_for_agent(agent_alias)
-        } else {
-            Vec::new()
-        };
-        if !agent_mcp_servers.is_empty() {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
-                    .with_category(::zeroclaw_log::EventCategory::Tool),
-                &format!(
-                    "Initializing MCP client - {} server(s) granted via mcp_bundles",
-                    agent_mcp_servers.len()
-                )
-            );
-            match crate::tools::McpRegistry::connect_all(&agent_mcp_servers).await {
-                Ok(registry) => {
-                    let registry = std::sync::Arc::new(registry);
-                    mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
-                    let mcp_policy_pm = mcp_tool_access_policy(security.as_ref(), None);
-                    for tool in
-                        crate::tools::build_mcp_capability_tools(&registry, mcp_policy_pm.as_ref())
-                    {
-                        register_eager_mcp_tool_if_allowed(
-                            tool,
-                            &mut tools_registry,
-                            delegate_handle_pm.as_ref(),
-                            mcp_policy_pm.as_ref(),
-                        );
-                    }
-                    let pinned_section = crate::tools::mcp_context::build_pinned_resources_section(
-                        &registry,
-                        &agent_mcp_servers,
-                        mcp_policy_pm.as_ref(),
-                    )
-                    .await;
-                    if config.mcp.deferred_loading {
-                        let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
-                            std::sync::Arc::clone(&registry),
-                        )
-                        .await;
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Load
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Tool),
-                            &format!(
-                                "MCP deferred: {} tool stub(s) from {} server(s)",
-                                deferred_set.len(),
-                                registry.server_count()
-                            )
-                        );
-                        let allowed_stub_count_pm = mcp_allowed_tool_count(
-                            deferred_set
-                                .stubs
-                                .iter()
-                                .map(|stub| stub.prefixed_name.as_str()),
-                            mcp_policy_pm.as_ref(),
-                        );
-                        deferred_section = crate::tools::build_deferred_tools_section_filtered(
-                            &deferred_set,
-                            mcp_policy_pm.as_ref(),
-                        );
-                        if allowed_stub_count_pm > 0 {
-                            let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                                crate::tools::ActivatedToolSet::new(),
-                            ));
-                            activated_handle_pm = Some(std::sync::Arc::clone(&activated));
-                            let mut tool_search_pm =
-                                crate::tools::ToolSearchTool::new(deferred_set, activated);
-                            if let Some(policy) = mcp_policy_pm {
-                                tool_search_pm = tool_search_pm.with_access_policy(policy);
-                            }
-                            if let Some(ref handle) = delegate_handle_pm {
-                                let delegate_tools = std::sync::Arc::clone(handle);
-                                tool_search_pm = tool_search_pm.with_activation_hook(
-                                    std::sync::Arc::new(move |tool| {
-                                        let mut tools = delegate_tools.write();
-                                        let already_registered = tools
-                                            .iter()
-                                            .any(|existing| existing.name() == tool.name());
-                                        if !already_registered {
-                                            tools.push(tool);
-                                        }
-                                    }),
-                                );
-                            }
-                            tools_registry.push(Box::new(tool_search_pm));
-                        }
-                    } else {
-                        let names = registry.tool_names();
-                        let mut registered = 0usize;
-                        let mut skipped = 0usize;
-                        for name in names {
-                            if !eager_mcp_tool_allowed(&name, mcp_policy_pm.as_ref()) {
-                                skipped += 1;
-                                continue;
-                            }
-                            if let Some(def) = registry.get_tool_def(&name).await {
-                                let wrapper: std::sync::Arc<dyn Tool> =
-                                    std::sync::Arc::new(crate::tools::McpToolWrapper::new(
-                                        name,
-                                        def,
-                                        std::sync::Arc::clone(&registry),
-                                    ));
-                                if register_eager_mcp_tool_if_allowed(
-                                    wrapper,
-                                    &mut tools_registry,
-                                    delegate_handle_pm.as_ref(),
-                                    mcp_policy_pm.as_ref(),
-                                ) {
-                                    registered += 1;
-                                }
-                            }
-                        }
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Register
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Tool),
-                            &format!(
-                                "MCP: {} tool(s) registered from {} server(s), {} skipped by policy",
-                                registered,
-                                registry.server_count(),
-                                skipped
-                            )
-                        );
-                    }
-                    // Append pinned MCP resources unconditionally, after both the
-                    // deferred and eager branches, so the deferred-path reassignment
-                    // of `deferred_section` does not clobber them.
-                    append_pinned_mcp_section(&mut deferred_section, &pinned_section);
-                }
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "MCP registry failed to initialize"
-                    );
-                }
-            }
         }
 
         let model_name = match agent_model_provider
@@ -3297,23 +2973,6 @@ pub async fn process_message(
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
             .unwrap_or_else(crate::i18n::detect_locale);
-
-        let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
-
-        // Register skill-defined tools as callable tool specs (process_message path).
-        // Resolution registry = built-in arcs + resolution-only MCP wrappers.
-        let skill_resolution_registry: Vec<std::sync::Arc<dyn Tool>> = unfiltered_tool_arcs_pm
-            .iter()
-            .cloned()
-            .chain(mcp_elevation_arcs.iter().cloned())
-            .collect();
-        tools::register_skill_tools_with_context_and_runtime(
-            &mut tools_registry,
-            &skills,
-            security.clone(),
-            &skill_resolution_registry,
-            runtime,
-        );
 
         let mut tool_descs: Vec<(&str, &str)> = vec![
             ("shell", "Execute terminal commands."),
@@ -14794,19 +14453,17 @@ Let me check the result."#;
         );
     }
 
-    // ── process_message() path regression (#6959) ─────────────────
-    //
-    // The bug was not that `apply_policy_tool_filter` filtered wrong; it
-    // was that the daemon/channel `process_message` path never called it,
-    // so a restrictive SecurityPolicy did not apply when the same agent was
-    // reached through a channel. This drives the exact seam that path now
-    // calls (`filter_channel_builtin_tools`) against the *real* eager
-    // built-in registry produced by `all_tools`, and proves an agent
-    // allowlisted to `file_read` does not get raw `shell` / `file_write`.
-    #[test]
-    fn process_message_policy_filters_eager_builtins() {
-        use std::sync::Arc;
-
+    /// Characterization of the unified `process_message` built-in filter
+    /// (replaces the deleted `filter_channel_builtin_tools` safe-defaults tests,
+    /// #6959). `process_message` now routes its real eager registry through
+    /// `ScopedToolRegistry::assemble` with `caller_allowed: None` - the plain
+    /// `allowed_tools`/`excluded_tools` policy filter. At non-Full autonomy a
+    /// canonical read-only default (`web_search_tool`) that is NOT in a
+    /// restrictive `allowed_tools` is now DROPPED, where the removed admit
+    /// retained it. This positively pins the narrowing this path lands: on the
+    /// gateway-chat and peer paths `allowed_tools` is honored strictly.
+    #[tokio::test]
+    async fn process_message_seam_narrows_safe_defaults_outside_allowed_tools() {
         let config = zeroclaw_config::schema::Config::default();
         let security = Arc::new(TestPolicy {
             workspace_dir: std::env::temp_dir(),
@@ -14816,7 +14473,8 @@ Let me check the result."#;
         let mem: Arc<dyn zeroclaw_memory::Memory> =
             Arc::new(zeroclaw_memory::NoneMemory::new("test"));
 
-        let mut registry = crate::tools::all_tools(
+        // Build the real eager built-in registry, as process_message does.
+        let built = crate::tools::all_tools(
             Arc::new(config.clone()),
             &security,
             &risk,
@@ -14834,81 +14492,53 @@ Let me check the result."#;
             None,
             false,
             None,
-        )
-        .tools;
-
-        // Sanity: the unrestricted channel registry exposes the dangerous
-        // eager built-ins a restrictive policy is expected to remove.
-        let unrestricted = tool_names(&registry);
-        assert!(
-            unrestricted.contains(&"file_read"),
-            "expected file_read in unrestricted registry, got {unrestricted:?}"
-        );
-        assert!(
-            unrestricted.contains(&"shell"),
-            "expected shell in unrestricted registry, got {unrestricted:?}"
-        );
-        assert!(
-            unrestricted.contains(&"file_write"),
-            "expected file_write in unrestricted registry, got {unrestricted:?}"
         );
 
-        // Allowlist the agent to `file_read` only, then run the exact filter
-        // `process_message` applies.
-        let policy = TestPolicy {
-            allowed_tools: Some(vec!["file_read".into()]),
+        let before = tool_names(&built.tools);
+        assert!(
+            before.contains(&"web_search_tool"),
+            "precondition: web_search_tool in the eager registry, got {before:?}"
+        );
+        assert!(
+            before.contains(&"shell"),
+            "precondition: shell in the eager registry, got {before:?}"
+        );
+
+        // Restrict allowed_tools to shell only, at non-Full autonomy - the exact
+        // scenario where the removed admit diverged from the plain filter.
+        let policy = Arc::new(TestPolicy {
+            workspace_dir: std::env::temp_dir(),
+            allowed_tools: Some(vec!["shell".into()]),
+            autonomy: crate::security::AutonomyLevel::Supervised,
             ..TestPolicy::default()
-        };
-        super::filter_channel_builtin_tools(&mut registry, &policy);
+        });
 
-        let filtered = tool_names(&registry);
-        assert!(
-            filtered.contains(&"file_read"),
-            "allowlisted tool must survive on process_message path, got {filtered:?}"
-        );
-        assert!(
-            !filtered.contains(&"shell"),
-            "shell must be filtered out on process_message path, got {filtered:?}"
-        );
-        assert!(
-            !filtered.contains(&"file_write"),
-            "file_write must be filtered out on process_message path, got {filtered:?}"
-        );
-
-        // Denylist variant: an exclusion drops only the named tool.
-        let mut registry2 = crate::tools::all_tools(
-            Arc::new(config.clone()),
-            &security,
-            &risk,
-            "test",
-            Arc::new(zeroclaw_memory::NoneMemory::new("test")),
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
+        let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
+            crate::tools::scoped::ScopedAssembly {
+                config: &config,
+                agent_alias: "test",
+                security: &policy,
+                built,
+                skills: &[],
+                runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                caller_allowed: None, // process_message has no caller allowlist
+                connect_mcp: false,   // exercise the filter without MCP fixtures
+                connect_peripherals: false,
+                exclude_memory: false,
+                emit_assembly_logs: false,
+            },
         )
-        .tools;
-        let deny = TestPolicy {
-            excluded_tools: Some(vec!["shell".into()]),
-            ..TestPolicy::default()
-        };
-        super::filter_channel_builtin_tools(&mut registry2, &deny);
-        let after_deny = tool_names(&registry2);
+        .await;
+
+        let filtered: Vec<&str> = assembled.registry.iter().map(|t| t.name()).collect();
         assert!(
-            !after_deny.contains(&"shell"),
-            "excluded shell must be removed on process_message path, got {after_deny:?}"
+            !filtered.contains(&"web_search_tool"),
+            "unified filter must DROP a read-only default outside allowed_tools \
+             (the removed safe-defaults admit retained it), got {filtered:?}"
         );
         assert!(
-            after_deny.contains(&"file_read"),
-            "non-excluded file_read must remain, got {after_deny:?}"
+            filtered.contains(&"shell"),
+            "shell in allowed_tools must survive, got {filtered:?}"
         );
     }
 
@@ -15122,140 +14752,174 @@ Let me check the result."#;
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("cli"));
     }
 
-    // ── filter_channel_builtin_tools safe-default bypass ─────────
-    //
-    // At non-Full autonomy the known read-only defaults
-    // (web_search_tool, web_fetch, calculator, etc.) bypass
-    // allowed_tools so the bot can always fetch real-time info.
-    // Operator-added auto_approve entries (e.g. shell) do NOT get
-    // the same bypass — they must be explicitly allowlisted.
-
+    /// `read_capped_line` returns a full line and [`CappedLine::Line`]
+    /// when the input is under the cap. EOF with no bytes returns
+    /// [`CappedLine::Eof`]. Regression guard for the happy path.
     #[test]
-    fn channel_safe_defaults_survive_restrictive_allowed_tools() {
-        let config = zeroclaw_config::schema::Config::default();
-        let security = Arc::new(TestPolicy {
-            workspace_dir: std::env::temp_dir(),
-            ..TestPolicy::default()
-        });
-        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
-        let mem: Arc<dyn zeroclaw_memory::Memory> =
-            Arc::new(zeroclaw_memory::NoneMemory::new("test"));
+    fn read_capped_line_returns_full_line_under_cap() {
+        let mut cursor = std::io::Cursor::new(b"hello\n".to_vec());
+        match read_capped_line(&mut cursor, 1024).unwrap() {
+            CappedLine::Line(line) => assert_eq!(line, "hello"),
+            other => panic!("expected Line, got {other:?}"),
+        }
 
-        // Restrict allowed_tools to shell only — nothing else is
-        // admitted by the policy itself.
-        let policy = TestPolicy {
-            allowed_tools: Some(vec!["shell".into()]),
-            autonomy: AutonomyLevel::Supervised,
-            ..TestPolicy::default()
-        };
+        // EOF without any bytes.
+        let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+        assert!(matches!(
+            read_capped_line(&mut cursor, 1024).unwrap(),
+            CappedLine::Eof
+        ));
 
-        let mut registry = crate::tools::all_tools(
-            Arc::new(config.clone()),
-            &security,
-            &risk,
-            "test",
-            mem,
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
-        )
-        .tools;
-
-        let before = tool_names(&registry);
-        assert!(
-            before.contains(&"web_search_tool"),
-            "precondition: web_search_tool in registry, got {before:?}"
-        );
-        assert!(
-            before.contains(&"shell"),
-            "precondition: shell in registry, got {before:?}"
-        );
-
-        super::filter_channel_builtin_tools(&mut registry, &policy);
-
-        let filtered = tool_names(&registry);
-        assert!(
-            filtered.contains(&"web_search_tool"),
-            "safe default web_search_tool must survive restrictive allowed_tools, got {filtered:?}"
-        );
-        assert!(
-            filtered.contains(&"shell"),
-            "shell in allowed_tools must survive, got {filtered:?}"
-        );
+        // EOF with bytes but no trailing newline.
+        let mut cursor = std::io::Cursor::new(b"no newline at eof".to_vec());
+        match read_capped_line(&mut cursor, 1024).unwrap() {
+            CappedLine::Line(line) => assert_eq!(line, "no newline at eof"),
+            other => panic!("expected Line, got {other:?}"),
+        }
     }
 
+    /// `read_capped_line` returns [`CappedLine::Truncated`] for a line
+    /// that exceeds the cap, regardless of whether a trailing newline is
+    /// present. This is the property that prevents a
+    /// `head -c 10G | zeroclaw chat` pipe from blowing up RSS.
     #[test]
-    fn channel_operator_auto_approve_gated_by_allowed_tools() {
-        let config = zeroclaw_config::schema::Config::default();
-        let security = Arc::new(TestPolicy {
-            workspace_dir: std::env::temp_dir(),
-            ..TestPolicy::default()
-        });
-        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
-        let mem: Arc<dyn zeroclaw_memory::Memory> =
-            Arc::new(zeroclaw_memory::NoneMemory::new("test"));
+    fn read_capped_line_truncates_at_cap() {
+        let cap = 64usize;
 
-        // Operator added shell to auto_approve but allowed_tools
-        // only lists file_read. Under the safe-defaults gate,
-        // shell (NOT a canonical safe default) must still pass
-        // is_tool_allowed — which means it's dropped.
-        let policy = TestPolicy {
-            allowed_tools: Some(vec!["file_read".into()]),
-            auto_approve: vec!["shell".into()],
-            autonomy: AutonomyLevel::Supervised,
-            ..TestPolicy::default()
-        };
+        // A line that exceeds the cap and ends with a newline.
+        let mut input = vec![b'a'; cap + 100];
+        input.push(b'\n');
+        assert!(matches!(
+            read_capped_line(&mut std::io::Cursor::new(input), cap).unwrap(),
+            CappedLine::Truncated
+        ));
 
-        let mut registry = crate::tools::all_tools(
-            Arc::new(config.clone()),
-            &security,
-            &risk,
-            "test",
-            mem,
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
-        )
-        .tools;
+        // A line that exceeds the cap with no newline.
+        let input = vec![b'a'; cap + 100];
+        assert!(matches!(
+            read_capped_line(&mut std::io::Cursor::new(input), cap).unwrap(),
+            CappedLine::Truncated
+        ));
+    }
 
-        let before = tool_names(&registry);
-        assert!(
-            before.contains(&"shell"),
-            "precondition: shell in registry, got {before:?}"
-        );
-        assert!(
-            before.contains(&"file_read"),
-            "precondition: file_read in registry, got {before:?}"
-        );
+    /// `read_capped_line` correctly handles a cap that lands mid-UTF-8
+    /// codepoint. The important invariant is that the call does not panic
+    /// and reports [`CappedLine::Truncated`] instead of returning a
+    /// partial, invalid string.
+    #[test]
+    fn read_capped_line_truncates_inside_multibyte_chars_safely() {
+        // "🦀" is 4 bytes; cap of 5 will land mid-codepoint.
+        let cap = 5usize;
+        let input = "🦀".repeat(10);
+        let bytes = input.as_bytes();
+        assert!(matches!(
+            read_capped_line(&mut std::io::Cursor::new(bytes.to_vec()), cap).unwrap(),
+            CappedLine::Truncated
+        ));
+    }
 
-        super::filter_channel_builtin_tools(&mut registry, &policy);
+    /// `read_capped_line` returns the full input unchanged when the
+    /// input is exactly the cap. This pins the off-by-one boundary:
+    /// the +1 headroom in the `take(cap + 1)` wrapper means a buffer
+    /// that fills exactly to `cap` bytes is NOT considered truncated.
+    #[test]
+    fn read_capped_line_at_exact_cap_is_not_truncated() {
+        let cap = 8usize;
+        let input: Vec<u8> = vec![b'x'; cap];
+        match read_capped_line(&mut std::io::Cursor::new(input), cap).unwrap() {
+            CappedLine::Line(line) => {
+                assert_eq!(line.len(), cap);
+            }
+            other => panic!("expected Line, got {other:?}"),
+        }
+    }
 
-        let filtered = tool_names(&registry);
-        assert!(
-            !filtered.contains(&"shell"),
-            "operator-added auto_approve shell must be dropped when not in allowed_tools, got {filtered:?}"
-        );
-        assert!(
-            filtered.contains(&"file_read"),
-            "file_read in allowed_tools must survive, got {filtered:?}"
-        );
+    /// Regression for #8463 (Audacity88 review): after truncating an
+    /// oversized line, the rest of the line is drained so the next call
+    /// starts at the next line instead of chunking the same oversized
+    /// line into repeated prompts.
+    #[test]
+    fn read_capped_line_drains_truncated_line_remainder() {
+        let cap = 8usize;
+        // One oversized line + one normal line.
+        let oversized_line = vec![b'a'; cap * 3];
+        let second_line = b"short\n";
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(&oversized_line);
+        input.push(b'\n');
+        input.extend_from_slice(second_line);
+
+        let mut cursor = std::io::Cursor::new(input);
+
+        // First call: should cap and drain the rest of the line.
+        assert!(matches!(
+            read_capped_line(&mut cursor, cap).unwrap(),
+            CappedLine::Truncated
+        ));
+
+        // Second call: should see the second line, not more 'a's.
+        match read_capped_line(&mut cursor, cap).unwrap() {
+            CappedLine::Line(line) => assert_eq!(line, "short"),
+            other => panic!("expected Line, got {other:?}"),
+        }
+    }
+
+    /// After truncation, the next line is still readable even when it
+    /// is close to the cap (boundary condition on the drain).
+    #[test]
+    fn read_capped_line_drain_does_not_eat_next_line() {
+        let cap = 8usize;
+        // Oversized line (no trailing \n in mid-data), then a line
+        // right up to the cap.
+        let oversized = vec![b'x'; cap * 2];
+        let second: Vec<u8> = vec![b'y'; cap]; // exactly 'cap' bytes, no \n
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(&oversized);
+        input.push(b'\n');
+        input.extend_from_slice(&second);
+        // The second line has no trailing \n — it is the last line
+        // before EOF.
+
+        let mut cursor = std::io::Cursor::new(input);
+
+        assert!(matches!(
+            read_capped_line(&mut cursor, cap).unwrap(),
+            CappedLine::Truncated
+        ));
+
+        match read_capped_line(&mut cursor, cap).unwrap() {
+            CappedLine::Line(line) => {
+                assert_eq!(line.len(), second.len());
+                assert_eq!(line.as_bytes(), &second);
+            }
+            other => panic!("expected Line, got {other:?}"),
+        }
+    }
+
+    /// Regression for #8463: the bounded drain must not allocate an
+    /// unbounded buffer. We verify this indirectly by ensuring that a
+    /// line much larger than the cap is discarded and the next line is
+    /// still readable.
+    #[test]
+    fn read_capped_line_bounded_drain_preserves_next_line() {
+        let cap = 64usize;
+        let oversized = vec![b'z'; cap * 100];
+        let next = b"next-line\n";
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(&oversized);
+        input.push(b'\n');
+        input.extend_from_slice(next);
+
+        let mut cursor = std::io::Cursor::new(input);
+
+        assert!(matches!(
+            read_capped_line(&mut cursor, cap).unwrap(),
+            CappedLine::Truncated
+        ));
+
+        match read_capped_line(&mut cursor, cap).unwrap() {
+            CappedLine::Line(line) => assert_eq!(line, "next-line"),
+            other => panic!("expected Line, got {other:?}"),
+        }
     }
 }

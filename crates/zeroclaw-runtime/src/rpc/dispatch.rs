@@ -333,6 +333,21 @@ fn model_provider_ref_from_provider_profile_prop(prop: &str) -> Option<String> {
     }
 }
 
+/// Whether memory embeddings resolve from the given `<type>.<alias>` provider
+/// profile — either the base `[memory].embedding_provider` reference or any
+/// `[[embedding_routes]]` entry. Gates the memory-embedder refresh on a
+/// `config/set` provider-profile change (#8359).
+fn memory_embeddings_use_provider(
+    config: &zeroclaw_config::schema::Config,
+    model_provider_ref: &str,
+) -> bool {
+    config.memory.embedding_provider.trim() == model_provider_ref
+        || config
+            .embedding_routes
+            .iter()
+            .any(|route| route.model_provider.trim() == model_provider_ref)
+}
+
 fn rename_error_to_rpc(
     path: &str,
     from: &str,
@@ -2623,12 +2638,75 @@ impl RpcDispatcher {
         }
         self.flush_config().await?;
         if let Some(model_provider_ref) = refresh_model_provider_ref {
+            self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
             self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
         }
         to_result(ConfigSetResult {
             prop: req.prop,
             set: true,
         })
+    }
+
+    /// Hot-swap the long-lived RPC memory handle's embedder when a `config/set`
+    /// provider-profile change touches the profile memory embeddings resolve
+    /// from. Without this, the install-wide memory handle keeps its
+    /// construction-time endpoint/key until a daemon restart (#8359). Mirrors
+    /// the live-session refresh's "only when the changed provider is in use"
+    /// gate; a no-op for backends that don't hot-swap their embedder.
+    fn refresh_memory_embedder_for_model_provider(&self, model_provider_ref: &str) {
+        let resolved = {
+            let config = self.ctx.config.read();
+            if !memory_embeddings_use_provider(&config, model_provider_ref) {
+                return;
+            }
+            // Match daemon-boot resolution (`create_memory_with_storage_and_routes`
+            // is called with `api_key = None`): keys come from the per-route /
+            // `[memory]` override or the referenced profile, never an inherited seed.
+            zeroclaw_memory::resolve_embedding_settings(
+                &config.memory,
+                &config.embedding_routes,
+                None,
+                Some(&config.providers.models),
+            )
+        };
+        // 1. Install-wide RPC memory handle.
+        if let Some(memory) = self.ctx.memory.as_ref() {
+            memory.refresh_embedder(
+                &resolved.model_provider,
+                resolved.api_key.as_deref(),
+                &resolved.model,
+                resolved.dimensions,
+            );
+        }
+        // 2. Live per-agent session memory handles. Each active agent holds its
+        //    own backend instance (built by `create_memory_for_agent`) that
+        //    resolves embeddings from the same global `[memory]` config, so the
+        //    same resolved settings apply — otherwise an in-flight session keeps
+        //    embedding against the stale endpoint/key until it is rebuilt.
+        self.schedule_live_agent_memory_refresh(resolved);
+    }
+
+    fn schedule_live_agent_memory_refresh(&self, resolved: zeroclaw_memory::EmbeddingSettings) {
+        let ctx = Arc::clone(&self.ctx);
+        zeroclaw_spawn::spawn!(async move {
+            Self::refresh_live_agent_memory(ctx, resolved).await;
+        });
+    }
+
+    async fn refresh_live_agent_memory(
+        ctx: Arc<RpcContext>,
+        resolved: zeroclaw_memory::EmbeddingSettings,
+    ) {
+        for session_id in ctx.sessions.list_ids().await {
+            if let Some(agent) = ctx.sessions.get_agent(&session_id).await {
+                agent.lock().await.refresh_memory_embedder(
+                    &resolved.model_provider,
+                    resolved.api_key.as_deref(),
+                    &resolved.model,
+                    resolved.dimensions,
+                );
+            }
+        }
     }
 
     fn schedule_live_sessions_refresh_for_model_provider(&self, model_provider_ref: String) {
@@ -2825,6 +2903,7 @@ impl RpcDispatcher {
         }
         self.flush_config().await?;
         if let Some(model_provider_ref) = refresh_model_provider_ref {
+            self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
             self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
         }
         to_result(ConfigDeleteResult {
@@ -4016,6 +4095,31 @@ mod tests {
     }
 
     #[test]
+    fn memory_embeddings_use_provider_matches_base_ref_and_routes() {
+        use zeroclaw_config::schema::{Config, EmbeddingRouteConfig};
+
+        let mut config = Config::default();
+        config.memory.embedding_provider = "openai.default".into();
+        config.embedding_routes = vec![EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            model_provider: "openrouter.alt".into(),
+            model: "embed".into(),
+            dimensions: Some(1024),
+            api_key: None,
+        }];
+
+        // Base `[memory].embedding_provider` reference.
+        assert!(memory_embeddings_use_provider(&config, "openai.default"));
+        // Any `[[embedding_routes]]` reference.
+        assert!(memory_embeddings_use_provider(&config, "openrouter.alt"));
+        // An unrelated provider must not trigger a memory-embedder refresh.
+        assert!(!memory_embeddings_use_provider(
+            &config,
+            "anthropic.default"
+        ));
+    }
+
+    #[test]
     fn session_initializes_mcp_for_chat_but_not_acp() {
         use crate::rpc::types::ChatMode;
         // Chat sessions must initialize MCP so the Zerocode TUI sees the same
@@ -4153,6 +4257,54 @@ mod tests {
         assert!(
             names.contains(&"tool_search"),
             "Chat session with deferred MCP must expose `tool_search`; tools: {names:?}"
+        );
+    }
+
+    /// Regression for #8193. Registering `tool_search` is not enough: the TUI
+    /// Chat `session/new` agent must also *advertise* the deferred MCP tools in
+    /// its system prompt so the model knows they exist and to call
+    /// `tool_search`. Before the fix, `agent.rs` pushed `tool_search` but never
+    /// built the deferred-tools section, so the agent reported it had no MCP
+    /// tools / no `tool_search`. This asserts the section (and the concrete
+    /// dotted `<server>__<tool>` stub) reaches the system prompt.
+    #[tokio::test]
+    async fn chat_session_new_advertises_deferred_mcp_section_in_system_prompt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let config = make_mcp_granting_config(&tmp, server.uri(), true);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-deferred-prompt-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-deferred-prompt-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let prompt = agent
+            .system_prompt_for_test()
+            .expect("system prompt must render");
+        assert!(
+            prompt.contains("## Deferred Tools"),
+            "system prompt must include the deferred-tools section; prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("tool_search"),
+            "system prompt must instruct the model to call `tool_search`; prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("remote__domains.list"),
+            "system prompt must advertise the dotted `<server>__<tool>` stub; prompt: {prompt}"
         );
     }
 
@@ -5990,6 +6142,247 @@ mod tests {
             stored.as_deref(),
             Some("sk-real-test-key"),
             "real secret must land in memory as plaintext"
+        );
+    }
+
+    /// End-to-end (#8359): a `config/set` on the provider profile memory
+    /// embeddings resolve from must refresh the long-lived RPC memory handle's
+    /// embedder in place — no daemon restart, no rebuilt handle. Drives the real
+    /// `handle_config_set` path and observes the live handle flip from the Noop
+    /// embedder (dims 0) to the resolved provider's embedder (dims 1536).
+    #[tokio::test]
+    async fn config_set_refreshes_memory_embedder_on_provider_change() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        cfg.create_map_key("providers.models.openai", "default")
+            .expect("create openai.default");
+        // Memory embeddings resolve from openai.default.
+        cfg.memory.embedding_provider = "openai.default".into();
+        cfg.memory.embedding_model = "text-embedding-3-small".into();
+        cfg.memory.embedding_dimensions = 1536;
+
+        // Long-lived handle constructed with the Noop embedder (dims 0), exactly
+        // the stale state the bug leaves behind.
+        let mem = Arc::new(zeroclaw_memory::SqliteMemory::new("default", tmp.path()).unwrap());
+        assert_eq!(mem.embedder_dimensions(), 0, "starts on the Noop embedder");
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_memory(
+            cfg,
+            Arc::clone(&sessions),
+            Arc::clone(&mem) as Arc<dyn zeroclaw_api::memory_traits::Memory>,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.authenticated = true;
+
+        let params = json!({
+            "prop": "providers.models.openai.default.api_key",
+            "value": "sk-rotated-key"
+        });
+        let res = dispatcher.handle_config_set(&params).await;
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        assert_eq!(
+            mem.embedder_dimensions(),
+            1536,
+            "config/set on the memory embedding provider must hot-swap the live \
+             handle's embedder to the resolved provider (#8359)"
+        );
+    }
+
+    /// End-to-end (#8359), proving the *endpoint and key* — not just dimensions
+    /// — reach the embed path: point the memory embedding provider at mock A,
+    /// then `config/set` its `uri` + `api_key` to mock B, and assert the next
+    /// embed HTTP request lands on mock B with the new bearer token. A refresh
+    /// that ignored the new uri/key would keep hitting mock A and fail this.
+    #[tokio::test]
+    async fn config_set_routes_memory_embeds_to_new_endpoint_and_key() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::memory_traits::{Memory, MemoryCategory};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let mock_a = MockServer::start().await;
+        let mock_b = MockServer::start().await;
+        let embed_body = serde_json::json!({ "data": [{ "embedding": [0.1, 0.2, 0.3] }] });
+        for server in [&mock_a, &mock_b] {
+            Mock::given(method("POST"))
+                .and(path("/v1/embeddings"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(embed_body.clone()))
+                .mount(server)
+                .await;
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        cfg.create_map_key("providers.models.openai", "default")
+            .expect("create openai.default");
+        cfg.set_prop_persistent("providers.models.openai.default.uri", &mock_a.uri())
+            .expect("set initial uri");
+        cfg.set_prop_persistent("providers.models.openai.default.api_key", "key-a")
+            .expect("set initial key");
+        cfg.memory.embedding_provider = "openai.default".into();
+        cfg.memory.embedding_model = "text-embedding-3-small".into();
+        cfg.memory.embedding_dimensions = 3;
+
+        // Long-lived handle built via the real factory → embedder points at A.
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory_with_storage_and_routes(
+                &cfg.memory,
+                &cfg.embedding_routes,
+                cfg.resolve_active_storage(),
+                &cfg.data_dir,
+                None,
+                Some(&cfg.providers.models),
+            )
+            .expect("build memory"),
+        );
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_memory(cfg, Arc::clone(&sessions), Arc::clone(&mem));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.authenticated = true;
+
+        // Rotate the provider profile's endpoint + key through config/set.
+        for (prop, value) in [
+            ("providers.models.openai.default.uri", mock_b.uri()),
+            (
+                "providers.models.openai.default.api_key",
+                "key-b".to_string(),
+            ),
+        ] {
+            let res = dispatcher
+                .handle_config_set(&json!({ "prop": prop, "value": value }))
+                .await;
+            assert!(res.is_ok(), "config/set {prop} must succeed: {res:?}");
+        }
+
+        // Next embed must go to the NEW endpoint with the NEW key.
+        mem.store("k1", "hello wiremock", MemoryCategory::Core, None)
+            .await
+            .expect("store");
+
+        let b_reqs = mock_b
+            .received_requests()
+            .await
+            .expect("request recording enabled");
+        let hit = b_reqs
+            .iter()
+            .find(|r| r.url.path() == "/v1/embeddings")
+            .expect("new endpoint (mock B) must receive the embed after config/set");
+        let auth = hit
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(auth, "Bearer key-b", "embed must carry the rotated api key");
+
+        let a_reqs = mock_a.received_requests().await.unwrap_or_default();
+        assert!(
+            a_reqs.iter().all(|r| r.url.path() != "/v1/embeddings"),
+            "stale endpoint (mock A) must not receive embeds after the refresh"
+        );
+    }
+
+    /// A live chat session holds its own per-agent memory backend, separate
+    /// from `ctx.memory`. Drives the FULL `handle_config_set` path (parse →
+    /// gate → resolve → spawn) with a registered session whose agent memory is
+    /// `AgentScopedMemory(SQLite)`, and waits for the spawned refresh to reach
+    /// it — otherwise an in-flight session keeps embedding against the stale
+    /// endpoint/key (#8359).
+    #[tokio::test]
+    async fn config_set_refreshes_live_agent_session_memory() {
+        use zeroclaw_api::memory_traits::Memory;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        cfg.create_map_key("providers.models.openai", "default")
+            .expect("create openai.default");
+        cfg.memory.embedding_provider = "openai.default".into();
+        cfg.memory.embedding_model = "text-embedding-3-small".into();
+        cfg.memory.embedding_dimensions = 1536;
+
+        // The agent's memory: AgentScopedMemory wrapping a concrete SQLite
+        // backend (Noop, dims 0) — the stale state config/set must repair.
+        let sqlite = Arc::new(zeroclaw_memory::SqliteMemory::new("agent", tmp.path()).unwrap());
+        assert_eq!(sqlite.embedder_dimensions(), 0);
+        let scoped: Arc<dyn Memory> = Arc::new(zeroclaw_memory::AgentScopedMemory::new(
+            Arc::clone(&sqlite) as Arc<dyn Memory>,
+            "agent-uuid",
+            Vec::<String>::new(),
+        ));
+
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(DummyModelProvider))
+            .tools(vec![])
+            .memory(scoped)
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .build()
+            .expect("agent builds");
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        sessions
+            .insert(
+                "s1".into(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "agent",
+                    ".",
+                    crate::rpc::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let ctx = RpcContext::minimal(cfg, Arc::clone(&sessions));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.authenticated = true;
+
+        // Full RPC path: this schedules the live-agent memory refresh.
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.default.api_key",
+                "value": "sk-rotated"
+            }))
+            .await;
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        // The agent refresh is spawned; wait (bounded) for it to land.
+        let mut dims = 0;
+        for _ in 0..200 {
+            dims = sqlite.embedder_dimensions();
+            if dims == 1536 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            dims, 1536,
+            "config/set must refresh the live session's per-agent memory embedder \
+             through the AgentScopedMemory wrapper (#8359)"
         );
     }
 
