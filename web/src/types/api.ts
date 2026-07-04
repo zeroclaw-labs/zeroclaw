@@ -263,7 +263,6 @@ export interface WsMessage {
   max_context_tokens?: number;
   input_tokens?: number;
   output_tokens?: number;
-  context_source?: "Config" | "ProviderApi" | "RuntimeProfile" | "Default";
 }
 
 export type ApprovalDecision = "approve" | "deny" | "always";
