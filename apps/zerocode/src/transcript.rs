@@ -30,6 +30,7 @@ use crate::jsonrpc::RpcOutbound;
 use crate::mouse;
 use crate::theme;
 use crate::turn_status::TurnStatus;
+use crate::ui_render_spec::{RailMode, ThoughtMode, UiRenderSpec};
 use zeroclaw_api::tool::ToolPresentation;
 
 // Height of the approval popup anchored to the bottom of the content area.
@@ -3533,14 +3534,12 @@ fn render_tool_entry(
     input_json: &str,
     presentation: ToolPresentation,
     result: Option<&str>,
-    is_selected: bool,
-    is_collapsed: bool,
-    show_actions: bool,
+    ctx: EntryRenderContext<'_>,
 ) {
-    let selection = selection_modifier(is_selected);
+    let selection = selection_modifier(ctx.selected);
     let parsed: Option<serde_json::Value> = serde_json::from_str(input_json).ok();
-    let title = tool_title(name, presentation, parsed.as_ref());
-    let actions = if show_actions {
+    let title = tool_title(name, presentation, parsed.as_ref(), ctx.spec);
+    let actions = if ctx.show_actions {
         TOOL_MESSAGE_ACTIONS
     } else {
         &[]
@@ -3550,11 +3549,12 @@ fn render_tool_entry(
         &title,
         selection,
         actions,
-        is_collapsed,
+        ctx.collapsed,
+        ctx.spec,
     ));
 
     let body_start = lines.len();
-    if is_collapsed {
+    if ctx.collapsed {
         lines.push(Line::from(Span::styled(
             tool_summary(name, input_json, result),
             theme::dim_style().add_modifier(selection),
@@ -3567,7 +3567,22 @@ fn render_tool_entry(
     for line in &mut lines[body_start..] {
         *line = apply_line_selection(std::mem::take(line), selection);
     }
-    prepend_rail_to_lines(&mut lines[body_start..], TranscriptRail::Tool, selection);
+    prepend_rail_to_lines(
+        &mut lines[body_start..],
+        TranscriptRail::Tool,
+        selection,
+        ctx.spec,
+    );
+}
+
+#[derive(Clone, Copy)]
+struct EntryRenderContext<'a> {
+    spec: &'a UiRenderSpec,
+    width: u16,
+    selected: bool,
+    collapsed: bool,
+    show_actions: bool,
+    show_thoughts: bool,
 }
 
 /// Render a single committed entry into `lines`.
@@ -3575,26 +3590,23 @@ fn render_tool_entry(
 /// `rebuild_lines` share identical rendering logic.
 fn render_entry_into(
     entry: &TranscriptEntry,
-    is_selected: bool,
-    show_actions: bool,
-    show_thoughts: bool,
-    width: u16,
-    is_collapsed: bool,
+    ctx: EntryRenderContext<'_>,
     lines: &mut Vec<Line<'static>>,
 ) {
-    let selection = selection_modifier(is_selected);
+    let selection = selection_modifier(ctx.selected);
     match entry {
         TranscriptEntry::UserMessage { text, attachments } => {
             lines.push(rail_header_line(
                 TranscriptRail::User,
                 &crate::i18n::t("zc-code-label-you"),
                 selection,
-                if show_actions {
+                if ctx.show_actions {
                     message_actions_for_entry(entry)
                 } else {
                     &[]
                 },
                 false,
+                ctx.spec,
             ));
             let body_style = theme::body_style().add_modifier(selection);
             let text_lines: Vec<&str> = text.as_deref().unwrap_or("").split('\n').collect();
@@ -3604,6 +3616,7 @@ fn render_entry_into(
                     line_text,
                     body_style,
                     selection,
+                    ctx.spec,
                 ));
             }
             if !attachments.is_empty() {
@@ -3617,6 +3630,7 @@ fn render_entry_into(
                     &format!("[{label}]"),
                     theme::warn_style().add_modifier(Modifier::ITALIC | selection),
                     selection,
+                    ctx.spec,
                 ));
             }
             lines.push(Line::default());
@@ -3626,27 +3640,29 @@ fn render_entry_into(
                 TranscriptRail::Agent,
                 &crate::i18n::t("zc-code-label-agent"),
                 selection,
-                if show_actions {
+                if ctx.show_actions {
                     message_actions_for_entry(entry)
                 } else {
                     &[]
                 },
                 false,
+                ctx.spec,
             ));
             let body_style = theme::body_style().add_modifier(selection);
-            let md_lines = markdown_to_lines(text.as_ref(), width);
+            let md_lines = markdown_to_lines(text.as_ref(), ctx.width);
             for line in md_lines {
                 lines.push(rail_body_line(
                     TranscriptRail::Agent,
                     apply_line_selection(line, selection),
                     body_style,
                     selection,
+                    ctx.spec,
                 ));
             }
             lines.push(Line::default());
         }
         TranscriptEntry::AgentThought(text) => {
-            if show_thoughts {
+            if ctx.show_thoughts && ctx.spec.transcript.thoughts != ThoughtMode::Hidden {
                 lines.push(Line::from(vec![
                     Span::styled(
                         "(thinking) ",
@@ -3677,9 +3693,7 @@ fn render_entry_into(
                 input_json.as_ref(),
                 *presentation,
                 result.as_deref().map(|s| s as &str),
-                is_selected,
-                is_collapsed,
-                show_actions,
+                ctx,
             );
         }
     }
@@ -3690,10 +3704,11 @@ fn message_action_rects(
     row: u16,
     actions: &[MessageAction],
     is_collapsed: bool,
+    spec: &UiRenderSpec,
 ) -> Vec<(MessageAction, Rect)> {
     use unicode_width::UnicodeWidthStr;
 
-    let mut x = body_area.x + 2;
+    let mut x = body_area.x + rail_header_width(spec);
     actions
         .iter()
         .copied()
@@ -3777,11 +3792,26 @@ fn rail_glow_span(rail: TranscriptRail, selection: Modifier) -> Span<'static> {
     rail_span(rail, selection, 0.28)
 }
 
-fn rail_prefix(rail: TranscriptRail, selection: Modifier, body_line: bool) -> Vec<Span<'static>> {
-    let mut spans = vec![
-        rail_span(rail, selection, 1.0),
-        rail_glow_span(rail, selection),
-    ];
+fn rail_header_width(spec: &UiRenderSpec) -> u16 {
+    match spec.transcript.rails {
+        RailMode::None => 0,
+        RailMode::Typed => 2,
+    }
+}
+
+fn rail_prefix(
+    rail: TranscriptRail,
+    selection: Modifier,
+    body_line: bool,
+    spec: &UiRenderSpec,
+) -> Vec<Span<'static>> {
+    let mut spans = match spec.transcript.rails {
+        RailMode::None => Vec::new(),
+        RailMode::Typed => vec![
+            rail_span(rail, selection, 1.0),
+            rail_glow_span(rail, selection),
+        ],
+    };
     if body_line {
         spans.push(Span::raw(" "));
     }
@@ -3813,10 +3843,11 @@ fn rail_header_line(
     selection: Modifier,
     actions: &[MessageAction],
     is_collapsed: bool,
+    spec: &UiRenderSpec,
 ) -> Line<'static> {
     let muted = theme::dim_style().add_modifier(selection);
     let action_style = theme::accent_style().add_modifier(selection | Modifier::BOLD);
-    let mut spans = rail_prefix(rail, selection, false);
+    let mut spans = rail_prefix(rail, selection, false, spec);
     for action in actions {
         spans.push(Span::styled(
             message_action_label(*action, is_collapsed),
@@ -3835,25 +3866,30 @@ fn tool_title(
     name: &str,
     presentation: ToolPresentation,
     input: Option<&serde_json::Value>,
+    spec: &UiRenderSpec,
 ) -> String {
     let string_field = |key: &str| {
         input
             .and_then(|value| value.get(key))
             .and_then(|value| value.as_str())
     };
+    let icon = |icon: &'static str| match spec.tools.semantic_icons {
+        crate::ui_render_spec::IconMode::Semantic => icon,
+        crate::ui_render_spec::IconMode::None => "",
+    };
     match presentation {
         ToolPresentation::Shell => string_field("command")
-            .map(|command| format!("$ {command}"))
-            .unwrap_or_else(|| format!("$ {name}")),
+            .map(|command| format!("{}{}", icon("$ "), command))
+            .unwrap_or_else(|| format!("{}{}", icon("$ "), name)),
         ToolPresentation::File | ToolPresentation::Diff => string_field("path")
             .or_else(|| string_field("filePath"))
             .map(|path| format!("{name} {path}"))
-            .unwrap_or_else(|| format!("⚙ {name}")),
+            .unwrap_or_else(|| format!("{}{}", icon("⚙ "), name)),
         ToolPresentation::Search => string_field("pattern")
             .or_else(|| string_field("query"))
-            .map(|pattern| format!("✱ {pattern}"))
-            .unwrap_or_else(|| format!("✱ {name}")),
-        ToolPresentation::Generic => format!("⚙ {name}"),
+            .map(|pattern| format!("{}{}", icon("✱ "), pattern))
+            .unwrap_or_else(|| format!("{}{}", icon("✱ "), name)),
+        ToolPresentation::Generic => format!("{}{}", icon("⚙ "), name),
     }
 }
 
@@ -3862,8 +3898,9 @@ fn rail_body_line(
     mut line: Line<'static>,
     style: Style,
     selection: Modifier,
+    spec: &UiRenderSpec,
 ) -> Line<'static> {
-    let mut spans = rail_prefix(rail, selection, true);
+    let mut spans = rail_prefix(rail, selection, true, spec);
     spans.append(&mut line.spans);
     Line::from(spans).style(style)
 }
@@ -3873,15 +3910,22 @@ fn rail_plain_body_line(
     text: &str,
     style: Style,
     selection: Modifier,
+    spec: &UiRenderSpec,
 ) -> Line<'static> {
-    let mut spans = rail_prefix(rail, selection, true);
+    let mut spans = rail_prefix(rail, selection, true, spec);
     spans.push(Span::styled(text.to_string(), style));
     Line::from(spans)
 }
 
-fn prepend_rail_to_lines(lines: &mut [Line<'static>], rail: TranscriptRail, selection: Modifier) {
+fn prepend_rail_to_lines(
+    lines: &mut [Line<'static>],
+    rail: TranscriptRail,
+    selection: Modifier,
+    spec: &UiRenderSpec,
+) {
     for line in lines {
-        line.spans.splice(0..0, rail_prefix(rail, selection, true));
+        line.spans
+            .splice(0..0, rail_prefix(rail, selection, true, spec));
     }
 }
 
@@ -3897,13 +3941,14 @@ fn apply_line_selection(mut line: Line<'static>, selection: Modifier) -> Line<'s
     line
 }
 
-fn render_streaming_agent_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+fn render_streaming_agent_lines(text: &str, width: u16, spec: &UiRenderSpec) -> Vec<Line<'static>> {
     let mut lines = vec![rail_header_line(
         TranscriptRail::Agent,
         &crate::i18n::t("zc-code-label-agent"),
         Modifier::empty(),
         &[],
         false,
+        spec,
     )];
     lines.extend(markdown_to_lines(text, width).into_iter().map(|line| {
         rail_body_line(
@@ -3911,6 +3956,7 @@ fn render_streaming_agent_lines(text: &str, width: u16) -> Vec<Line<'static>> {
             line,
             theme::body_style(),
             Modifier::empty(),
+            spec,
         )
     }));
     lines
@@ -3935,6 +3981,8 @@ fn render_conversation(f: &mut Frame, state: &mut TranscriptState, area: Rect) {
     // Width must be computed before cache rebuild — table column budgets
     // depend on it, and a width change invalidates cached layouts.
     let inner_width = area.width;
+
+    let spec = state.render_spec();
 
     // ── Rebuild cached lines only when entries changed ────────
     if state.dirty != LinesDirty::Clean || state.cached_render_width != inner_width {
@@ -3987,6 +4035,7 @@ fn render_conversation(f: &mut Frame, state: &mut TranscriptState, area: Rect) {
             lines.extend(render_streaming_agent_lines(
                 &state.streaming_text,
                 inner_width,
+                &spec,
             ));
         }
         if has_stream_thought {
@@ -4079,6 +4128,7 @@ fn render_conversation(f: &mut Frame, state: &mut TranscriptState, area: Rect) {
                 y,
                 actions,
                 state.collapsed_tool_entries.contains(&entry_idx),
+                &spec,
             ) {
                 state
                     .message_action_hit_regions
@@ -5267,6 +5317,10 @@ pub struct TranscriptState {
 }
 
 impl TranscriptState {
+    fn render_spec(&self) -> UiRenderSpec {
+        UiRenderSpec::minimal()
+    }
+
     pub fn new(session_id: String, agent_alias: String) -> Self {
         Self {
             session_id,
@@ -5625,6 +5679,8 @@ impl TranscriptState {
             natural_start
         };
 
+        let spec = self.render_spec();
+
         // Incremental append path.
         if self.dirty == LinesDirty::Appended && start == self.cached_render_start {
             let render_from = start + self.cached_entry_count;
@@ -5637,11 +5693,14 @@ impl TranscriptState {
                 let highlighted = self.is_entry_highlighted(abs_idx);
                 render_entry_into(
                     entry,
-                    highlighted,
-                    highlighted,
-                    show_thoughts,
-                    width,
-                    self.collapsed_tool_entries.contains(&abs_idx),
+                    EntryRenderContext {
+                        spec: &spec,
+                        width,
+                        selected: highlighted,
+                        collapsed: self.collapsed_tool_entries.contains(&abs_idx),
+                        show_actions: highlighted,
+                        show_thoughts,
+                    },
                     &mut new_lines,
                 );
                 let after = new_lines.len();
@@ -5673,11 +5732,14 @@ impl TranscriptState {
             let highlighted = self.is_entry_highlighted(abs_idx);
             render_entry_into(
                 entry,
-                highlighted,
-                highlighted,
-                show_thoughts,
-                width,
-                self.collapsed_tool_entries.contains(&abs_idx),
+                EntryRenderContext {
+                    spec: &spec,
+                    width,
+                    selected: highlighted,
+                    collapsed: self.collapsed_tool_entries.contains(&abs_idx),
+                    show_actions: highlighted,
+                    show_thoughts,
+                },
                 &mut lines,
             );
             let after = lines.len();
@@ -6769,9 +6831,43 @@ mod tests {
         );
     }
 
-    fn rendered_entry(entry: &TranscriptEntry, width: u16) -> String {
+    const TEST_SPEC: UiRenderSpec = UiRenderSpec::rich();
+
+    fn test_render_context(
+        width: u16,
+        selected: bool,
+        show_actions: bool,
+        show_thoughts: bool,
+        collapsed: bool,
+    ) -> EntryRenderContext<'static> {
+        EntryRenderContext {
+            spec: &TEST_SPEC,
+            width,
+            selected,
+            collapsed,
+            show_actions,
+            show_thoughts,
+        }
+    }
+
+    fn rendered_entry_with_spec(
+        entry: &TranscriptEntry,
+        width: u16,
+        spec: &UiRenderSpec,
+    ) -> String {
         let mut lines = Vec::new();
-        render_entry_into(entry, false, true, true, width, false, &mut lines);
+        render_entry_into(
+            entry,
+            EntryRenderContext {
+                spec,
+                width,
+                selected: false,
+                collapsed: false,
+                show_actions: true,
+                show_thoughts: true,
+            },
+            &mut lines,
+        );
         lines
             .into_iter()
             .map(|line| {
@@ -6782,6 +6878,10 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn rendered_entry(entry: &TranscriptEntry, width: u16) -> String {
+        rendered_entry_with_spec(entry, width, &TEST_SPEC)
     }
 
     #[test]
@@ -6803,7 +6903,11 @@ mod tests {
     fn message_rails_are_background_cells_not_glyphs() {
         let entry = TranscriptEntry::AgentMessage(Arc::<str>::from("world"));
         let mut lines = Vec::new();
-        render_entry_into(&entry, false, true, true, 80, false, &mut lines);
+        render_entry_into(
+            &entry,
+            test_render_context(80, false, true, true, false),
+            &mut lines,
+        );
 
         assert_eq!(lines[0].spans[0].content.as_ref(), " ");
         assert_eq!(lines[0].spans[1].content.as_ref(), " ");
@@ -6839,7 +6943,11 @@ mod tests {
 
         let rail_background = |entry: &TranscriptEntry| {
             let mut lines = Vec::new();
-            render_entry_into(entry, false, true, true, 80, false, &mut lines);
+            render_entry_into(
+                entry,
+                test_render_context(80, false, true, true, false),
+                &mut lines,
+            );
             lines[0].spans[0].style.bg
         };
 
@@ -6873,7 +6981,11 @@ mod tests {
             result: Some(Arc::<str>::from("hi")),
         };
         let mut lines = Vec::new();
-        render_entry_into(&entry, false, true, true, 80, false, &mut lines);
+        render_entry_into(
+            &entry,
+            test_render_context(80, false, true, true, false),
+            &mut lines,
+        );
 
         let tool_rail = rail_span(TranscriptRail::Tool, Modifier::empty(), 1.0)
             .style
@@ -6884,7 +6996,8 @@ mod tests {
 
     #[test]
     fn streaming_agent_output_uses_agent_rail() {
-        let lines = render_streaming_agent_lines("hello", 80);
+        let spec = UiRenderSpec::rich();
+        let lines = render_streaming_agent_lines("hello", 80, &spec);
         let agent_rail = rail_span(TranscriptRail::Agent, Modifier::empty(), 1.0)
             .style
             .bg;
@@ -6894,7 +7007,7 @@ mod tests {
     }
 
     #[test]
-    fn visual_snapshot_renders_entry_rails() {
+    fn visual_snapshot_renders_minimal_entries() {
         use ratatui::{Terminal, backend::TestBackend};
 
         let mut state = state();
@@ -6930,7 +7043,7 @@ mod tests {
 
         assert!(snapshot.contains("You:"), "{snapshot}");
         assert!(snapshot.contains("Agent:"), "{snapshot}");
-        assert!(snapshot.contains("$ cargo test"), "{snapshot}");
+        assert!(snapshot.contains("cargo test"), "{snapshot}");
         assert!(!snapshot.contains("copy  md"), "{snapshot}");
         assert!(snapshot.contains("→ ok"), "{snapshot}");
     }
@@ -7007,7 +7120,13 @@ mod tests {
 
     #[test]
     fn message_action_rects_track_label_widths() {
-        let rects = message_action_rects(Rect::new(10, 0, 80, 10), 3, COPY_MESSAGE_ACTIONS, false);
+        let rects = message_action_rects(
+            Rect::new(10, 0, 80, 10),
+            3,
+            COPY_MESSAGE_ACTIONS,
+            false,
+            &UiRenderSpec::rich(),
+        );
         assert_eq!(
             rects[0],
             (MessageAction::Copy(CopyFormat::Raw), Rect::new(12, 3, 4, 1))
@@ -7023,7 +7142,13 @@ mod tests {
 
     #[test]
     fn message_action_rects_clip_to_body_width() {
-        let rects = message_action_rects(Rect::new(10, 0, 7, 10), 3, COPY_MESSAGE_ACTIONS, false);
+        let rects = message_action_rects(
+            Rect::new(10, 0, 7, 10),
+            3,
+            COPY_MESSAGE_ACTIONS,
+            false,
+            &UiRenderSpec::rich(),
+        );
         assert_eq!(
             rects,
             vec![(MessageAction::Copy(CopyFormat::Raw), Rect::new(12, 3, 4, 1))]
@@ -7037,6 +7162,7 @@ mod tests {
             3,
             EDITABLE_USER_MESSAGE_ACTIONS,
             false,
+            &UiRenderSpec::rich(),
         );
         let actions = rects
             .into_iter()
@@ -7071,7 +7197,11 @@ mod tests {
         };
 
         let mut plain = Vec::new();
-        render_entry_into(&entry, false, false, true, 80, false, &mut plain);
+        render_entry_into(
+            &entry,
+            test_render_context(80, false, false, true, false),
+            &mut plain,
+        );
         let plain_text = plain
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
@@ -7079,7 +7209,11 @@ mod tests {
         assert!(!plain_text.contains("hide"));
 
         let mut highlighted = Vec::new();
-        render_entry_into(&entry, true, true, true, 80, false, &mut highlighted);
+        render_entry_into(
+            &entry,
+            test_render_context(80, true, true, true, false),
+            &mut highlighted,
+        );
         let highlighted_text = highlighted
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
@@ -7098,7 +7232,11 @@ mod tests {
             result: Some(Arc::<str>::from("wrote file")),
         };
         let mut expanded = Vec::new();
-        render_entry_into(&entry, true, true, true, 80, false, &mut expanded);
+        render_entry_into(
+            &entry,
+            test_render_context(80, true, true, true, false),
+            &mut expanded,
+        );
         let expanded_text = expanded
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
@@ -7106,13 +7244,48 @@ mod tests {
         assert!(expanded_text.contains("fn main"));
 
         let mut collapsed = Vec::new();
-        render_entry_into(&entry, true, true, true, 80, true, &mut collapsed);
+        render_entry_into(
+            &entry,
+            test_render_context(80, true, true, true, true),
+            &mut collapsed,
+        );
         let collapsed_text = collapsed
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
             .collect::<String>();
         assert!(collapsed_text.contains("show"));
         assert!(!collapsed_text.contains("fn main"));
+    }
+
+    #[test]
+    fn minimal_spec_keeps_semantic_tool_rendering() {
+        let entry = TranscriptEntry::Tool {
+            tool_call_id: Arc::<str>::from("tool-1"),
+            name: Arc::<str>::from("file_write"),
+            input_json: Arc::<str>::from(r#"{"path":"a.rs","content":"fn main() {}"}"#),
+            presentation: ToolPresentation::File,
+            result: None,
+        };
+
+        let text = rendered_entry_with_spec(&entry, 80, &UiRenderSpec::minimal());
+        assert!(text.contains("fn main"), "{text}");
+        assert!(!text.contains("⚙"), "{text}");
+    }
+
+    #[test]
+    fn minimal_action_rects_start_at_body_edge() {
+        let rects = message_action_rects(
+            Rect::new(10, 0, 80, 10),
+            3,
+            COPY_MESSAGE_ACTIONS,
+            false,
+            &UiRenderSpec::minimal(),
+        );
+
+        assert_eq!(
+            rects[0],
+            (MessageAction::Copy(CopyFormat::Raw), Rect::new(10, 3, 4, 1))
+        );
     }
 
     #[test]
@@ -7420,19 +7593,39 @@ mod tests {
         let search = serde_json::json!({ "pattern": "PaneKind" });
 
         assert_eq!(
-            tool_title("shell", ToolPresentation::Shell, Some(&shell)),
+            tool_title(
+                "shell",
+                ToolPresentation::Shell,
+                Some(&shell),
+                &UiRenderSpec::rich()
+            ),
             "$ cargo test"
         );
         assert_eq!(
-            tool_title("file_read", ToolPresentation::File, Some(&read)),
+            tool_title(
+                "file_read",
+                ToolPresentation::File,
+                Some(&read),
+                &UiRenderSpec::rich()
+            ),
             "file_read Cargo.toml"
         );
         assert_eq!(
-            tool_title("content_search", ToolPresentation::Search, Some(&search)),
+            tool_title(
+                "content_search",
+                ToolPresentation::Search,
+                Some(&search),
+                &UiRenderSpec::rich()
+            ),
             "✱ PaneKind"
         );
         assert_eq!(
-            tool_title("sop_execute", ToolPresentation::Generic, None),
+            tool_title(
+                "sop_execute",
+                ToolPresentation::Generic,
+                None,
+                &UiRenderSpec::rich()
+            ),
             "⚙ sop_execute"
         );
     }

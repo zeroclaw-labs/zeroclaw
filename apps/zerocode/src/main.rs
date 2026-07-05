@@ -41,6 +41,7 @@ mod quickstart_pane;
 mod theme;
 mod transcript;
 mod turn_status;
+mod ui_render_spec;
 mod widgets;
 mod wire;
 mod zerocode_pane;
