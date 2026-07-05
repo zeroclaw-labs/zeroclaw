@@ -1367,9 +1367,7 @@ pub fn skills_to_prompt_with_mode(
     // `Full` was removed because inlining every skill body blows up the context
     // window and diverges from the progressive-disclosure model used by Claude
     // Code and OpenClaw. This parameter is retained only so existing call sites
-    // keep compiling during the deprecation window; removal (this param, the
-    // `prompt_injection_mode` config key, and `SkillsPromptInjectionMode`) is
-    // tracked in #8310.
+    // keep compiling during the deprecation window.
     _mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
 ) -> String {
     use std::fmt::Write;

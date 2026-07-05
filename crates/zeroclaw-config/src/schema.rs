@@ -5423,9 +5423,7 @@ pub enum SkillsPromptInjectionMode {
     /// prompt; this blew up the context window and diverged from the
     /// progressive-disclosure model used by Claude Code and OpenClaw. Setting
     /// `full` now behaves exactly like `compact` and emits a startup warning.
-    /// Retained only for back-compat parsing during the deprecation window;
-    /// removal of this variant and the `prompt_injection_mode` key is tracked
-    /// in #8310.
+    /// Retained only for back-compat parsing during the deprecation window.
     Full,
     /// The only live behavior: inline compact skill metadata
     /// (name/description/location + callable tool specs) and load instructions
@@ -5554,7 +5552,7 @@ pub struct SkillsConfig {
     /// DEPRECATED and ignored. Skills always render as compact summaries that
     /// load instructions on demand via `read_skill`. The key is still parsed
     /// for back-compat (setting `full` only logs a deprecation warning) and is
-    /// slated for removal — see #8310.
+    /// slated for removal.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
     /// Autonomous skill creation from successful multi-step task executions.
@@ -17060,7 +17058,7 @@ impl Config {
         // Deprecation: skills.prompt_injection_mode is ignored — skills always
         // render compactly and load on demand via `read_skill`. Warn (once, at
         // startup) when `full` is set so users who relied on eager inlining
-        // learn why behavior changed. Key removal is tracked in #8310.
+        // learn why behavior changed.
         if matches!(
             self.skills.prompt_injection_mode,
             SkillsPromptInjectionMode::Full
