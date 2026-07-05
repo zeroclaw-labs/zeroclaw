@@ -33,7 +33,7 @@ cargo test --test integration               # integration only
 cargo test --test system                    # system only
 cargo test --test live -- --ignored         # live (requires API credentials)
 cargo test --test integration agent         # filter within a level
-cargo nextest run --locked --workspace  # what CI runs
+cargo nextest run --locked --workspace --exclude zeroclaw-desktop  # what CI runs
 ./dev/ci.sh all                             # full CI battery (Docker)
 ./dev/ci.sh test-component                  # level-specific CI commands (Docker)
 ```

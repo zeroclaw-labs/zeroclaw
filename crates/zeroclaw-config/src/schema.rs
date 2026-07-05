@@ -10536,6 +10536,31 @@ impl LogLlmRequestPayload {
     }
 }
 
+/// OTel content capture policy. Mirrors [`LogToolIo`] but gates OTel span
+/// attribute emission, not log persistence. Defaults to `Off` for privacy.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OtelContentPolicy {
+    #[default]
+    Off,
+    Redacted,
+    Full,
+}
+
+impl OtelContentPolicy {
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Redacted => "redacted",
+            Self::Full => "full",
+        }
+    }
+}
+
 /// Observability backend configuration (`[observability]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -10653,6 +10678,36 @@ pub struct ObservabilityConfig {
         deserialize_with = "deserialize_enum_lenient"
     )]
     pub log_llm_request_payload: LogLlmRequestPayload,
+
+    /// OTel GenAI content capture: "off" | "redacted" | "full".
+    /// Controls whether `gen_ai.system_instructions`, `gen_ai.input.messages`,
+    /// and `gen_ai.output.messages` are emitted on OTel spans.
+    /// - `off` (default): no content attributes, only metadata.
+    /// - `redacted`: content is leak-scanned and truncated at `otel_genai_content_max_chars`.
+    /// - `full`: content is leak-scanned but not truncated.
+    #[serde(default, deserialize_with = "deserialize_enum_lenient")]
+    pub otel_genai_content: OtelContentPolicy,
+
+    /// Per-field character truncation limit for OTel GenAI content when
+    /// `otel_genai_content = "redacted"`. Each string field is truncated
+    /// independently. `0` is treated as `off`.
+    #[serde(default = "default_otel_genai_content_max_chars")]
+    pub otel_genai_content_max_chars: usize,
+
+    /// OTel tool I/O capture: "off" | "redacted" | "full".
+    /// Controls whether `gen_ai.tool.arguments`, `input.value`,
+    /// `gen_ai.tool.result`, and `output.value` are emitted on OTel spans.
+    /// - `off` (default): no content attributes, only tool name + outcome.
+    /// - `redacted`: content is leak-scanned and truncated at `otel_tool_io_max_chars`.
+    /// - `full`: content is leak-scanned but not truncated.
+    #[serde(default, deserialize_with = "deserialize_enum_lenient")]
+    pub otel_tool_io: OtelContentPolicy,
+
+    /// Per-field character truncation limit for OTel tool I/O when
+    /// `otel_tool_io = "redacted"`. Each string field is truncated
+    /// independently. `0` is treated as `off`.
+    #[serde(default = "default_otel_tool_io_max_chars")]
+    pub otel_tool_io_max_chars: usize,
 }
 
 impl Default for ObservabilityConfig {
@@ -10674,6 +10729,10 @@ impl Default for ObservabilityConfig {
             log_tool_io_truncate_bytes: default_log_tool_io_truncate_bytes(),
             log_tool_io_denylist: Vec::new(),
             log_llm_request_payload: default_log_llm_request_payload(),
+            otel_genai_content: OtelContentPolicy::Off,
+            otel_genai_content_max_chars: default_otel_genai_content_max_chars(),
+            otel_tool_io: OtelContentPolicy::Off,
+            otel_tool_io_max_chars: default_otel_tool_io_max_chars(),
         }
     }
 }
@@ -10721,6 +10780,14 @@ fn default_log_llm_request_payload() -> LogLlmRequestPayload {
 
 fn default_log_tool_io_truncate_bytes() -> usize {
     40960
+}
+
+fn default_otel_genai_content_max_chars() -> usize {
+    1000
+}
+
+fn default_otel_tool_io_max_chars() -> usize {
+    1000
 }
 
 // ── Hooks ────────────────────────────────────────────────────────
@@ -20645,6 +20712,12 @@ pub struct SopConfig {
     /// Intended to converge with the shared B/F redaction switch once those consumers land.
     #[serde(default = "default_sop_untrusted_outbound_redact")]
     pub untrusted_outbound_redact: bool,
+
+    /// Enable SOP procedural-memory proposal tooling. Default false keeps
+    /// self-modifying SOP write-back opt-in while the SOP subsystem is
+    /// Experimental.
+    #[serde(default)]
+    pub procedural_memory_enabled: bool,
 }
 
 fn default_sop_execution_mode() -> String {
@@ -20783,6 +20856,7 @@ impl Default for SopConfig {
             untrusted_guard_sensitivity: default_sop_untrusted_guard_sensitivity(),
             untrusted_frame_warning: default_sop_untrusted_frame_warning(),
             untrusted_outbound_redact: default_sop_untrusted_outbound_redact(),
+            procedural_memory_enabled: false,
         }
     }
 }
