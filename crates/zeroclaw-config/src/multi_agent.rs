@@ -421,7 +421,6 @@ output_modality = "voice"
         assert_eq!(with_voice.output_modality, OutputModality::Voice);
         assert_eq!(with_voice.external_peers[0].as_str(), "@alice");
 
-        // Omitting the field falls back to mirror (current behavior).
         let defaulted: PeerGroupConfig = toml::from_str(r#"channel = "telegram""#).unwrap();
         assert_eq!(defaulted.output_modality, OutputModality::Mirror);
     }

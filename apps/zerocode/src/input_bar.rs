@@ -569,7 +569,6 @@ impl InputBarState {
         &self.clipboard_temps
     }
 
-    #[cfg(test)]
     pub fn has_file_explorer(&self) -> bool {
         self.file_explorer.is_some()
     }

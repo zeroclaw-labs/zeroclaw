@@ -320,6 +320,12 @@ cli-skills-install-suggestion =
     Matched capability: {$matched}
     Next: Run `{$install_command}` to install it.
 
+cli-plugin-install-suggestion =
+    It looks like this request needs the `{$name}` plugin, but it is not installed.
+
+    Matched capability: {$matched}
+    Next: Run `{$install_command}` to install it.
+
 cli-completions-long-about =
     Generate shell completion scripts for `zeroclaw`.
 
@@ -415,10 +421,16 @@ onboard-openai-codex-followup =
 cli-web-dist-dir-reason-tilde = starts with `~` which is not expanded
 cli-web-dist-dir-reason-dollar = contains `$` which is not expanded
 cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason}; gateway.web_dist_dir is read verbatim, so expand the value yourself (e.g. an absolute path)
+cli-doctor-systemd-linger-enabled = systemd user lingering enabled
+cli-doctor-systemd-linger-disabled = systemd user lingering disabled; user service may stop after logout. Enable with: loginctl enable-linger {$user}
+cli-doctor-systemd-linger-unknown = systemd user lingering could not be checked with loginctl
 cli-self-test-web-dist-dir-name = web_dist_dir
 cli-self-test-web-dist-dir-pass-unset = not set (using auto-detect)
 cli-self-test-web-dist-dir-pass-literal = {$path} (literal path)
 cli-self-test-web-dist-dir-fail-expansion = WARNING: {$path} — {$reason}; gateway.web_dist_dir is read verbatim, so expand the value yourself (e.g. an absolute path)
+
+# Service lifecycle warnings.
+cli-service-systemd-linger-disabled-warning = systemd user lingering is disabled. ZeroClaw's user service may stop after logout. Enable it with: loginctl enable-linger {$user}
 
 # ── peripherals (zeroclaw peripheral) ──
 cli-peripherals-none = No peripherals configured.
@@ -438,9 +450,20 @@ cli-skills-create-hint = {"  "}Create one: mkdir -p ~/.zeroclaw/workspace/skills
 cli-skills-install-hint = {"  "}Or install: zeroclaw skills install <source>
 cli-skills-installed-header = Installed skills ({$count}):
 cli-skills-tags = Tags:  {$tags}
+cli-skills-skipped-header = Skipped ({$count}):
+cli-skills-skipped-reason = {"    "}Reason: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}Set `skills.allow_scripts = true` in your zeroclaw config to enable it.
 
 # ── sop (zeroclaw sop) ──
 cli-sop-none = No SOPs found.
+cli-sop-pending-none = No SOP runs waiting for approval.
+cli-sop-pending-header = SOP runs waiting for approval:
+cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] step {$step}/{$total}
+# gateway WebSocket SOP approval error frames (UI-surfaced)
+cli-sop-ws-invalid-approval = sop approval_response requires run_id and a decision of approve or deny
+cli-sop-ws-resolve-failed = sop resolve failed: {$error}
+cli-sop-ws-engine-lock-poisoned = SOP engine lock poisoned
+cli-sop-ws-subsystem-disabled = SOP subsystem not enabled
 cli-sop-create-hint = {"  "}Create one: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}then add SOP.toml and SOP.md
 cli-sop-loaded-header = Loaded SOPs ({$count}):
@@ -612,6 +635,9 @@ cli-agent-not-created = Your agent was not created — and nothing on disk was c
 cli-onboard-deprecated = `zeroclaw onboard` is deprecated — use `zeroclaw quickstart`.
 cli-otp-initialized = Initialized OTP secret for ZeroClaw.
 cli-otp-enrollment-uri = Enrollment URI: {$uri}
+cli-otp-received = {"  "}✓ OTP received
+cli-secret-captured = {"  "}● Value captured — press Enter to save
+cli-secret-received = {"  "}✓ Secret received
 cli-pairing-enabled = 🔐 Gateway pairing is enabled.
 cli-pairing-use-code = {"  "}Use this one-time code to pair a new device:
 cli-pairing-post = {"    "}POST /pair with header X-Pairing-Code: {$code}
@@ -704,7 +730,17 @@ cli-config-schema-current = Config already at current schema version.
 cli-config-applied-ops = Applied {$count} operation(s):
 cli-plugins-none = No plugins installed.
 cli-plugins-installed = Installed plugins:
+cli-plugin-search-none = No plugins matching '{$query}'.
+cli-plugin-search-results = Plugins matching '{$query}' ({$count}):
+cli-plugin-search-result =   {$name} v{$version} — {$description}
+cli-plugin-no-description = (no description)
+cli-plugin-install-resolving = Resolving '{$source}' from plugin registry...
 cli-plugin-installed-from = Plugin installed from {$source}
+cli-plugin-installed-name-version = Installed plugin {$name} v{$version}
+cli-plugin-config-entry-seeded = Seeded [[plugins.entries]] for '{$name}'. Set plugin config values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-seed-skipped = warning: skipped seeding the config entry for '{$name}': the [plugins] section on disk is malformed. Repair it, add a [[plugins.entries]] block with `name = "{$name}"`, then set values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-seed-unaddressable = warning: skipped seeding the config entry for '{$name}': plugin names containing '.' cannot be addressed by dotted config paths (`config set` splits on '.'). Add a [[plugins.entries]] block with `name = "{$name}"` to the config file by hand.
+cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-plugin-removed = Plugin '{$name}' removed.
 cli-plugin-not-found = Plugin '{$name}' not found.
 cli-plugin-legacy-detected = Note: plugins in a legacy location ({$path}) are not loaded by the agent — run `zeroclaw plugin migrate` to move them into {$target}.
@@ -795,6 +831,10 @@ cli-channels-start-hint = To start channels: zeroclaw channel start
 cli-channels-doctor-hint = To check health:    zeroclaw channel doctor
 cli-channels-configure-hint = To configure:      zeroclaw config set channels.<name>.<field>=<value>
 
+cli-models-set-ok = Default model set to "{ $model }" on { $provider }.
+cli-models-status-current = Default model: { $model } (provider: { $provider })
+cli-models-status-none = No default model configured.
+
 # ── Agent turn-engine user-visible markers (#7415) ────────────────────
 # Appended to (or persisted as) assistant output when a turn is cut short;
 # shown to end users across every transport (channels, WS, RPC, ACP, CLI).
@@ -817,6 +857,12 @@ turn-tool-interrupted-before-result = [interrupted by user before this tool prod
 # Safe reply delivered when the model repeatedly emits malformed internal
 # tool-call protocol and the turn gives up retrying.
 channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
+channel-runtime-new-session = Conversation history cleared. Starting fresh.
+channel-runtime-stop-sent = Stop signal sent.
+channel-runtime-stop-no-task = No in-flight task for this sender scope.
+channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
+channel-runtime-model-switched = Model switched to `{ $model }` (model_provider: `{ $provider }`). Context preserved.
+channel-runtime-request-timeout = ⚠️ Request timed out while waiting for the model. Please try again.
 
 # ── Alias CRUD CLI — zeroclaw {agents,providers,channels} {create,list,rename,delete} (#7468 / #7175) ──
 cli-alias-list-empty = (no entries under {$section})
@@ -861,3 +907,12 @@ cli-bundle-warn-archive = warning: bundle directory archive failed: {$error}
 cli-bundle-deleted = deleted skill_bundles.{$alias} (stripped from {$count} agent(s))
 cli-bundle-warn-move = warning: bundle directory move failed: {$error}
 cli-bundle-renamed = renamed skill_bundles.{$from} → skill_bundles.{$to}
+
+# ── daemon gateway bind pre-flight — zeroclaw daemon (#7895) ──
+# Emitted by the daemon startup guard in src/main.rs when the configured gateway
+# address is already bound. The daemon supervises its own in-process gateway
+# (shared event bus / canvas / reload channel) and cannot adopt a separate
+# process, so it fails fast with an actionable message instead of degrading into
+# a supervisor retry loop. The two variants differ only by who holds the port.
+cli-daemon-gateway-already-running = A ZeroClaw gateway is already running on {$host}:{$port}. The daemon supervises its own gateway and will not start a second one on the same address. Stop that gateway (or point the daemon at a free port with `zeroclaw config set gateway.port <port>`), then run the daemon again.
+cli-daemon-gateway-port-occupied = Gateway address {$host}:{$port} is already in use by another process. Free the port or point the daemon at a free port (`zeroclaw config set gateway.port <port>`), then run the daemon again.

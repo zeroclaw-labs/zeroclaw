@@ -286,6 +286,13 @@ cli-skills-install-suggestion =
 
     匹配的能力：{$matched}
     下一步：运行 `{$install_command}` 进行安装。
+
+cli-plugin-install-suggestion =
+    看起来此请求需要 `{$name}` 插件，但它尚未安装。
+
+    匹配的能力：{$matched}
+    下一步：运行 `{$install_command}` 进行安装。
+
 cli-completions-long-about =
     为 `zeroclaw` 生成 shell 补全脚本。
 
@@ -347,6 +354,8 @@ channel-wecom-ws-dm-access-denied =
 channel-discord-interaction-unauthorized = 你没有权限在此处使用该命令。
 channel-discord-interaction-malformed = 未知或格式错误的命令。
 channel-discord-interaction-unavailable = 该命令已不可用，或其输入为空。
+channel-discord-component-expired = 此按钮或菜单已过期或已被使用。
+channel-discord-approval-recorded = 您的决定已记录。
 channel-discord-delivery-failure-note-one = （注意：我无法传送 {$count} 个文件。）
 channel-discord-delivery-failure-note-many = （注意：我无法传送 {$count} 个文件。）
 channel-whatsapp-web-delivery-failure-note-one = （注意：我无法传送 {$count} 个 WhatsApp 媒体附件。）
@@ -383,6 +392,9 @@ cli-skills-create-hint = {"  "}创建一个: mkdir -p ~/.zeroclaw/workspace/skil
 cli-skills-install-hint = {"  "}或安装: zeroclaw skills install <source>
 cli-skills-installed-header = 已安装的技能 ({$count}):
 cli-skills-tags = 标签:  {$tags}
+cli-skills-skipped-header = 已跳过 ({$count}):
+cli-skills-skipped-reason = {"    "}原因: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}在 zeroclaw 配置中设置 `skills.allow_scripts = true` 以启用它。
 cli-sop-none = 未找到 SOP。
 cli-sop-create-hint = {"  "}创建一个: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}然后添加 SOP.toml 和 SOP.md
@@ -549,6 +561,9 @@ cli-agent-not-created = 未创建您的 agent — 磁盘上没有任何更改。
 cli-onboard-deprecated = `zeroclaw onboard` 已弃用 — 请使用 `zeroclaw quickstart`。
 cli-otp-initialized = 已为 ZeroClaw 初始化 OTP 密钥。
 cli-otp-enrollment-uri = 注册 URI：{$uri}
+cli-otp-received = {"  "}✓ OTP 已接收
+cli-secret-captured = {"  "}● 已接收输入 — 按 Enter 保存
+cli-secret-received = {"  "}✓ 密钥已接收
 cli-pairing-enabled = 🔐 已启用 gateway 配对。
 cli-pairing-use-code = {"  "}使用此一次性代码配对新设备：
 cli-pairing-post = {"    "}POST /pair，附带请求头 X-Pairing-Code: {$code}
@@ -619,7 +634,6 @@ cli-status-otp = {"  "}已启用 OTP：       {$v}
 cli-status-estop = {"  "}已启用急停：    {$v}
 cli-status-peripherals-enabled = {"  "}已启用：   {$v}
 cli-status-boards = {"  "}Boards:    {$v}
-cli-status-channel-not-compiled = 🚫 已配置，未编译
 cli-status-word-enabled = 已启用
 cli-status-word-disabled = 已禁用
 cli-status-word-yes = 是
@@ -629,6 +643,7 @@ cli-status-word-off = 关闭
 cli-status-word-none = （无）
 cli-status-word-configured = 已配置
 cli-status-word-not-configured = 未配置
+cli-status-channel-not-compiled = 🚫 已配置，未编译
 cli-desktop-not-installed = 未安装 ZeroClaw 配套应用。
 cli-desktop-blurb1 = 该配套应用是一个轻量级菜单栏应用，
 cli-desktop-blurb2 = 它连接到与 CLI 相同的网关。
@@ -637,7 +652,13 @@ cli-config-schema-current = 配置已为当前架构版本。
 cli-config-applied-ops = 已应用 {$count} 个操作：
 cli-plugins-none = 未安装任何插件。
 cli-plugins-installed = 已安装的插件：
+cli-plugin-search-none = 没有匹配 '{$query}' 的插件。
+cli-plugin-search-results = 匹配 '{$query}' 的插件（{$count}）：
+cli-plugin-search-result =   {$name} v{$version} — {$description}
+cli-plugin-no-description = （无描述）
+cli-plugin-install-resolving = 正在从插件注册表解析 '{$source}'...
 cli-plugin-installed-from = 已从 {$source} 安装插件
+cli-plugin-installed-name-version = 已安装插件 {$name} v{$version}
 cli-plugin-removed = 已移除插件“{$name}”。
 cli-plugin-not-found = 未找到插件“{$name}”。
 cli-plugin-legacy-detected = 注意：位于旧位置（{$path}）的插件未被代理加载。请运行 `zeroclaw plugin migrate` 将其移动到 {$target}。
@@ -713,13 +734,24 @@ cli-channels-build-hint = {"  "}请从源码构建：`./install.sh --source --pr
 cli-channels-start-hint = 启动渠道：zeroclaw channel start
 cli-channels-doctor-hint = 检查健康状况：    zeroclaw channel doctor
 cli-channels-configure-hint = 配置方法：      zeroclaw config set channels.<name>.<field>=<value>
+
+cli-models-set-ok = 默认模型已设置为 "{ $model }" (provider: { $provider })。
+cli-models-status-current = 默认模型: { $model } (provider: { $provider })
+cli-models-status-none = 未配置默认模型。
 turn-interrupted-by-user = [被用户中断]
 turn-cancelled-client-rpc = [已通过客户端取消回合]
 turn-stream-interrupted = [流已中断]
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
+turn-ingress-dropped = 此请求未被处理：{ $reason }
 turn-tool-interrupted-before-result = [在此工具产生结果前被用户中断]
 channel-runtime-malformed-tool-output = 我生成了内部工具调用格式错误，无法完成此请求。请重试。
+channel-runtime-new-session = 对话历史已清除。重新开始。
+channel-runtime-stop-sent = 已发送停止信号。
+channel-runtime-stop-no-task = 此发送者范围内没有正在执行的任务。
+channel-runtime-model-empty = 模型 ID 不能为空。请使用 `/model <model-id>`。
+channel-runtime-model-switched = 已切换到模型 `{ $model }`（model_provider：`{ $provider }`）。上下文已保留。
+channel-runtime-request-timeout = ⚠️ 等待模型响应超时，请重试。
 cli-alias-list-empty = （{$section} 下无条目）
 cli-alias-created = 已创建 {$section}.{$alias}
 cli-alias-exists = {$section}.{$alias} 已存在（未更改）

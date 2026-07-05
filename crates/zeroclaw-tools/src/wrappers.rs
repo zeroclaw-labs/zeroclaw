@@ -50,9 +50,9 @@ type PathExtractor = dyn Fn(&serde_json::Value) -> Option<String> + Send + Sync;
 ///
 /// ## Read-tool exception (anti-probing)
 ///
-/// `FileReadTool` (`zeroclaw-runtime::tools::file_read`) and `PdfReadTool` in
-/// this crate intentionally call `record_action()` *themselves* on the
-/// post-`PathGuardedTool` `resolve_candidate` / `canonicalize` failure paths.
+/// `FileReadTool` (`zeroclaw-runtime::tools::file_read`) in this crate
+/// intentionally calls `record_action()` *itself* on the post-`PathGuardedTool`
+/// `resolve_candidate` / `canonicalize` failure paths.
 /// This prevents an attacker from probing path existence for free: each
 /// attempt — successful or failed — consumes exactly one slot.  The outer
 /// `RateLimitedTool` only records on `success: true`, so the totals stay at
@@ -126,7 +126,7 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
 ///
 /// Replaces the `forbidden_path_argument()` guard blocks previously inlined in
 /// tools that accept a path-like argument (`shell`, `file_read`, `file_write`,
-/// `file_edit`, `pdf_read`, `content_search`, `glob_search`, `image_info`).
+/// `file_edit`, `content_search`, `glob_search`, `image_info`).
 ///
 /// Path extraction is argument-name-driven: the wrapper inspects the `"path"`,
 /// `"command"`, `"pattern"`, and `"query"` fields of the JSON argument object.

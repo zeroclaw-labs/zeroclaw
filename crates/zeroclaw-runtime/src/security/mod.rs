@@ -28,6 +28,7 @@ pub mod docker;
 // Prompt injection defense (contributed from RustyClaw, MIT licensed)
 pub mod domain_matcher;
 pub mod estop;
+pub mod external_content;
 #[cfg(target_os = "linux")]
 pub mod firejail;
 pub mod iam_policy;
@@ -58,6 +59,12 @@ pub use detect::{SandboxPosture, sandbox_posture};
 pub use domain_matcher::DomainMatcher;
 #[allow(unused_imports)]
 pub use estop::{EstopLevel, EstopManager, EstopState, ResumeSelector};
+#[allow(unused_imports)]
+pub use external_content::{
+    ContentSafety, FramingPolicy, OutboundPolicy, ScanOutcome, ScanPolicy, ScreenVerdict,
+    cap_untrusted, frame_untrusted, new_marker_id, sanitize_untrusted, scan_untrusted,
+    scrub_outbound,
+};
 // Universal ingress policy front door (RFC #6971)
 #[allow(unused_imports)]
 pub use ingress::{IngressPolicy, ingress_policy};

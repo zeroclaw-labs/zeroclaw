@@ -63,9 +63,63 @@ into it and seal the inputs. With that resolution and sealing in place:
 The end state is that the divergence is uncompilable rather than merely tested
 against. Current/future boundary: `ResolvedAgentExecution`, its `resolve()`
 constructor, and the `ResolvedIo` / `ResolvedRuntimeKnobs` input layers all exist on
-`master` and every production path constructs through them; absorbing each surface's
-per-field resolution into `resolve()`, and sealing the bundle's fields behind it, are
-the work later surface PRs do.
+`master` and every production path constructs through them; the TOOL surface now has
+its gated constructor too (`ScopedToolRegistry::assemble`, below, with the gateway as
+its first consumer); absorbing the remaining surfaces' per-field resolution into
+`resolve()`, and sealing the bundle's fields behind it, are the work later surface
+PRs do.
+
+## The tool-assembly seam (Epic A, the first surface)
+
+The per-agent tool registry is the first surface with a single gated constructor:
+`ScopedToolRegistry::assemble` (`crates/zeroclaw-runtime/src/tools/scoped.rs`). The
+registry has historically been assembled by hand at six construction sites - the
+reason the built-in filter and MCP scoping had to be patched per-site (#7064,
+#6960, #8120). `assemble` applies, in order: the agent's `config.peripherals`
+(when connected - see the knob below), the built-in `allowed_tools`/
+`excluded_tools` filter, the ACP memory strip, MCP server scoping per `mcp_bundles`
+plus per-tool gating (eager or deferred; omission is not a grant) with the MCP
+capability tools and pinned-resources prompt section, and skill registration under
+the same `SecurityPolicy` (a site with no skills passes an empty slice - the
+gateway does, until the Epic F loader unification).
+
+Per-site variation is expressed as data, never as a skipped security step. The
+`ScopedAssembly` knobs only narrow or withhold - none can widen what the policy
+grants:
+
+- `caller_allowed` - a per-run allowlist (the `run()` path); intersects with, never
+  overrides, the policy filter and the MCP tool-access policy.
+- `connect_mcp` - `false` on the ACP fast-boot path: MCP servers are neither
+  resolved nor connected, so nothing is granted.
+- `connect_peripherals` - `false` on listing-only surfaces: loading peripherals
+  physically connects hardware (exclusive serial holds), which a registry no turn
+  runs against must never do.
+- `exclude_memory` - the ACP memory-tool strip.
+
+Cut-over status (the strangle, one site per PR): the **gateway** constructs through
+`assemble` today - both its registry builders, the dashboard-agent seed and the
+per-agent `/api/tools` listings. That closed the gateway's filter gap by
+construction: its listings previously showed unfiltered built-ins the agent's
+policy denies (live gateway chat resolves through `process_message`, which already
+filtered), plus a `tool_search` stub even when policy denied every deferred MCP
+tool. Two scoping notes keep the listings claim honest: peripherals are excluded
+from listings by design (`connect_peripherals: false` - enumerating them without
+connecting hardware is a future refinement), and `process_message` filters
+built-ins through a variant that admits the canonical read-only defaults at
+non-Full autonomy - a cross-path filter divergence that predates the seam, tracked
+as its own parity row and unified when that surface strangles in.
+
+The remaining hand-rolled sites - the channels orchestrator (`start_channels`),
+`loop_` `run` / `process_message`, `Agent::from_config`, and the delegate
+independent-target builder (`independent_agentic_tools_for_target`, added by #8239
+while this program was in flight - the recurrence the seal exists to end) - migrate
+in follow-up PRs. Once all sites mint through `assemble`, the engine's tools field
+seals to `ScopedToolRegistry` (a private-field newtype only `assemble` constructs),
+and handing the engine an unscoped registry - or quietly re-inlining a construction
+site, as a cross-merge did to the channel path once already - becomes a compile
+error instead of a review catch. Until that seal, cross-site parity for the
+not-yet-migrated sites remains by convention; what the seam guarantees today is
+that every path routed through it shares one implementation.
 
 ## The harness
 

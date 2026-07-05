@@ -287,6 +287,13 @@ cli-skills-install-suggestion =
 
     Capacidad coincidente: {$matched}
     Siguiente: Ejecuta `{$install_command}` para instalarla.
+
+cli-plugin-install-suggestion =
+    Parece que esta solicitud necesita el plugin `{$name}`, pero no está instalado.
+
+    Capacidad coincidente: {$matched}
+    Siguiente: Ejecuta `{$install_command}` para instalarlo.
+
 cli-completions-long-about =
     Genera scripts de autocompletado de shell para `zeroclaw`.
 
@@ -348,6 +355,8 @@ channel-wecom-ws-dm-access-denied =
 channel-discord-interaction-unauthorized = No tienes permiso para usar este comando aquí.
 channel-discord-interaction-malformed = Comando desconocido o mal formado.
 channel-discord-interaction-unavailable = Ese comando ya no está disponible o su entrada estaba vacía.
+channel-discord-component-expired = Este botón o menú ha expirado o ya fue utilizado.
+channel-discord-approval-recorded = Tu decisión ha sido registrada.
 channel-discord-delivery-failure-note-one = (nota: no pude entregar {$count} archivo.)
 channel-discord-delivery-failure-note-many = (nota: no pude entregar {$count} archivos.)
 channel-whatsapp-web-delivery-failure-note-one = (nota: no pude entregar {$count} archivo multimedia de WhatsApp.)
@@ -384,6 +393,9 @@ cli-skills-create-hint = {"  "}Cree uno: mkdir -p ~/.zeroclaw/workspace/skills/m
 cli-skills-install-hint = {"  "}O instale: zeroclaw skills install <source>
 cli-skills-installed-header = Skills instaladas ({$count}):
 cli-skills-tags = Etiquetas:  {$tags}
+cli-skills-skipped-header = Omitidas ({$count}):
+cli-skills-skipped-reason = {"    "}Motivo: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}Establece `skills.allow_scripts = true` en tu configuración de zeroclaw para habilitarla.
 cli-sop-none = No se encontraron SOP.
 cli-sop-create-hint = {"  "}Cree uno: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}luego agregue SOP.toml y SOP.md
@@ -550,6 +562,9 @@ cli-agent-not-created = Tu agente no fue creado — y no se cambió nada en el d
 cli-onboard-deprecated = `zeroclaw onboard` está obsoleto — usa `zeroclaw quickstart`.
 cli-otp-initialized = Secreto OTP inicializado para ZeroClaw.
 cli-otp-enrollment-uri = URI de inscripción: {$uri}
+cli-otp-received = {"  "}✓ OTP recibido
+cli-secret-captured = {"  "}● Valor capturado — pulse Enter para guardar
+cli-secret-received = {"  "}✓ Secreto recibido
 cli-pairing-enabled = 🔐 El emparejamiento del gateway está habilitado.
 cli-pairing-use-code = {"  "}Usa este código de un solo uso para emparejar un nuevo dispositivo:
 cli-pairing-post = {"    "}POST /pair con encabezado X-Pairing-Code: {$code}
@@ -620,7 +635,6 @@ cli-status-otp = {"  "}OTP habilitado:       {$v}
 cli-status-estop = {"  "}Parada de emergencia activada:    {$v}
 cli-status-peripherals-enabled = {"  "}Habilitado:   {$v}
 cli-status-boards = {"  "}Tableros:    {$v}
-cli-status-channel-not-compiled = 🚫 configurado, no compilado
 cli-status-word-enabled = habilitado
 cli-status-word-disabled = deshabilitado
 cli-status-word-yes = sí
@@ -630,6 +644,7 @@ cli-status-word-off = desactivado
 cli-status-word-none = (ninguno)
 cli-status-word-configured = configurado
 cli-status-word-not-configured = no configurado
+cli-status-channel-not-compiled = 🚫 configurado, no compilado
 cli-desktop-not-installed = La aplicación complementaria de ZeroClaw no está instalada.
 cli-desktop-blurb1 = La aplicación complementaria es una ligera app de la barra de menú que
 cli-desktop-blurb2 = se conecta a la misma puerta de enlace que la CLI.
@@ -638,7 +653,13 @@ cli-config-schema-current = La configuración ya está en la versión actual del
 cli-config-applied-ops = Se aplicaron {$count} operación(es):
 cli-plugins-none = No hay complementos instalados.
 cli-plugins-installed = Complementos instalados:
+cli-plugin-search-none = No hay complementos que coincidan con '{$query}'.
+cli-plugin-search-results = Complementos que coinciden con '{$query}' ({$count}):
+cli-plugin-search-result =   {$name} v{$version} — {$description}
+cli-plugin-no-description = (sin descripción)
+cli-plugin-install-resolving = Resolviendo '{$source}' desde el registro de complementos...
 cli-plugin-installed-from = Complemento instalado desde {$source}
+cli-plugin-installed-name-version = Complemento instalado {$name} v{$version}
 cli-plugin-removed = Complemento '{$name}' eliminado.
 cli-plugin-not-found = No se encontró el complemento '{$name}'.
 cli-plugin-legacy-detected = Nota: los complementos en una ubicación heredada ({$path}) no se cargan en el agente. Ejecuta `zeroclaw plugin migrate` para moverlos a {$target}.
@@ -714,11 +735,15 @@ cli-channels-build-hint = {"  "}Compila desde el código fuente con `./install.s
 cli-channels-start-hint = Para iniciar canales: zeroclaw channel start
 cli-channels-doctor-hint = Para comprobar el estado:    zeroclaw channel doctor
 cli-channels-configure-hint = Para configurar:      zeroclaw config set channels.<name>.<field>=<value>
+cli-models-set-ok = Modelo predeterminado establecido en "{ $model }" en { $provider }.
+cli-models-status-current = Modelo predeterminado: { $model } (proveedor: { $provider })
+cli-models-status-none = No hay ningún modelo predeterminado configurado.
 turn-interrupted-by-user = [interrumpido por el usuario]
 turn-cancelled-client-rpc = [turno cancelado mediante el cliente]
 turn-stream-interrupted = [transmisión interrumpida]
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
+turn-ingress-dropped = Esta solicitud no se procesó: { $reason }
 turn-tool-interrupted-before-result = [interrumpido por el usuario antes de que esta herramienta produjera un resultado]
 channel-runtime-malformed-tool-output = Generé un error de formato interno en la llamada de herramienta y no pude completar esta solicitud. Inténtalo de nuevo.
 cli-alias-list-empty = (sin entradas en {$section})
