@@ -303,7 +303,7 @@ fn required_str<'a>(args: &'a serde_json::Value, field: &str) -> anyhow::Result<
 
 fn parse_status(status: &str) -> anyhow::Result<ProposalStatus> {
     serde_json::from_value(serde_json::Value::String(status.to_string()))
-        .map_err(|_| anyhow::Error::msg(format!("invalid proposal status: {status}")))
+        .map_err(|e| anyhow::Error::msg(format!("invalid proposal status '{status}': {e}")))
 }
 
 #[cfg(test)]
