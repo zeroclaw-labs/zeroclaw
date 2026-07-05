@@ -904,6 +904,7 @@ pub async fn run_gateway(
                 // hardware (exclusive serial holds) that the live turn paths
                 // need. Never connect them for a registry no turn runs against.
                 connect_peripherals: false,
+                emit_assembly_logs: false,
                 exclude_memory: false,
             })
             .await;
@@ -1050,6 +1051,7 @@ pub async fn run_gateway(
             // `config.peripherals` is global - N per-agent opens of the same
             // boards would fail against the first holder anyway).
             connect_peripherals: false,
+            emit_assembly_logs: false,
             exclude_memory: false,
         })
         .await;

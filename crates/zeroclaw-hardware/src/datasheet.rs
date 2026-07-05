@@ -10,11 +10,8 @@
 //! 4. **read** — return the local path of a cached datasheet so the LLM can
 //!    reference it with the `read_file` tool or a future RAG pipeline.
 //!
-//! # Note on PDF extraction
-//!
-//! Full in-process PDF parsing is available when the `rag-pdf` feature is
-//! enabled (adds `pdf-extract`).  Without that feature, the tool returns the
-//! PDF file path and instructs the LLM to use a future RAG step.
+//! Datasheets must be `.md` or `.txt`. PDF datasheet parsing is no longer
+//! supported as of #8519; convert PDFs to `.md` or `.txt` before indexing.
 
 use async_trait::async_trait;
 use std::path::PathBuf;

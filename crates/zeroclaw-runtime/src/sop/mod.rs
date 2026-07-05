@@ -8,6 +8,7 @@ pub mod engine;
 pub mod executor;
 pub mod graph;
 pub mod metrics;
+pub mod procedural_memory;
 pub mod route;
 pub mod rundata;
 pub mod schema;
@@ -35,8 +36,8 @@ pub use metrics::SopMetricsCollector;
 pub use scope::StepToolScope;
 pub use step_contract::{StepFailure, StepRouting, SwitchRule};
 pub use store::{
-    ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, SopEventRecord, SopRunStore,
-    SqliteRunStore, StoreError, build_run_store,
+    ClaimToken, PersistedRun, ProposalKind, ProposalRecord, ProposalStatus, SopEventRecord,
+    SopRunStore, SqliteRunStore, StoreError, build_run_store,
 };
 pub use trigger_registry::{
     BoundTriggerSource, ChannelAlias, ChannelTriggerKind, ConfiguredChannel, TriggerField,
