@@ -96,14 +96,26 @@ impl TextBrowserTool {
             .host_str()
             .ok_or_else(|| anyhow::Error::msg("URL must include a host"))?;
 
-        // Re-add IPv6 brackets so the host string matches the shape used
-        // elsewhere in this crate (`[::1]`, `[fe80::1]`). `Url::host_str`
-        // strips the brackets for IPv6 literals.
-        let is_ipv6 = host_str.parse::<std::net::Ipv6Addr>().is_ok();
-        let host = if is_ipv6 {
-            format!("[{host_str}]")
+        // Derive two host strings:
+        // - `display_host`: preserves the original shape (with IPv6 brackets) for
+        //   user-facing error messages.
+        // - `host`: unbracketed, lowercased, and for IPv6 normalized through
+        //   Ipv6Addr::to_string() so it matches the form stored by
+        //   domain_guard::normalize_allowed_domains (which strips brackets and
+        //   compresses via IpAddr::to_string()).
+        //
+        // `Url::host_str()` keeps the original URL text including IPv6 brackets
+        // (e.g. `"[::1]"`), so strip brackets before attempting to parse as an
+        // IPv6 address. Normalize through Ipv6Addr::to_string() so the compressed
+        // form matches what domain_guard::normalize_allowed_domains stores.
+        let bare_host = host_str.trim_start_matches('[').trim_end_matches(']');
+        let is_ipv6 = bare_host.parse::<std::net::Ipv6Addr>().is_ok();
+        let (host, display_host) = if is_ipv6 {
+            let bare = bare_host.parse::<std::net::Ipv6Addr>().unwrap().to_string();
+            (bare.clone(), format!("[{bare}]"))
         } else {
-            host_str.to_lowercase()
+            let h = host_str.to_lowercase();
+            (h.clone(), h)
         };
 
         // SSRF gate: deny by default for private/local hosts unless the operator
@@ -112,7 +124,7 @@ impl TextBrowserTool {
         let host_allowed = domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts);
 
         if private_host && !host_allowed {
-            anyhow::bail!("Blocked local/private host: {host}");
+            anyhow::bail!("Blocked local/private host: {display_host}");
         }
 
         // Resolved-IP SSRF gate. The literal-host check above only inspects
@@ -774,6 +786,36 @@ mod tests {
     fn specific_private_host_entry_permits_listed_host() {
         let tool = private_tool(vec!["10.0.0.1"]);
         assert!(tool.validate_url("http://10.0.0.1").is_ok());
+    }
+
+    #[test]
+    fn specific_ipv6_loopback_allowlist_permits_bracketed_url() {
+        // Regression for Audacity88's 2026-07-04 review of #8635: an explicit
+        // IPv6 allowlist entry like "::1" must match the URL http://[::1]/ even
+        // though the URL host is parsed with brackets while the normalized
+        // allowlist entry stores the bare IP.
+        let tool = private_tool(vec!["::1"]);
+        assert!(tool.validate_url("http://[::1]/").is_ok());
+        assert!(tool.validate_url("https://[::1]:8443/").is_ok());
+    }
+
+    #[test]
+    fn specific_ipv6_link_local_allowlist_permits_bracketed_url() {
+        let tool = private_tool(vec!["fe80::1"]);
+        assert!(tool.validate_url("http://[fe80::1]/").is_ok());
+    }
+
+    #[test]
+    fn specific_ipv6_allowlist_does_not_match_unlisted() {
+        let tool = private_tool(vec!["::1"]);
+        let err = tool
+            .validate_url("http://[fe80::1]/")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("local/private") || err.contains("Blocked"),
+            "got: {err}"
+        );
     }
 
     #[test]
