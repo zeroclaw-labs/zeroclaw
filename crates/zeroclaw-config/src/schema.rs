@@ -17063,6 +17063,7 @@ impl Config {
             self.skills.prompt_injection_mode,
             SkillsPromptInjectionMode::Full
         ) {
+            let _skills_scope = ::zeroclaw_log::scope_span!(skill_bundle: "skills").entered();
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)

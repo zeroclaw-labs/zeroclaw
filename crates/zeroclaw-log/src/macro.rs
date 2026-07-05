@@ -88,6 +88,23 @@ macro_rules! scope {
     }};
 }
 
+/// Sync counterpart to [`crate::scope!`]. Returns a bare scope span
+/// carrying the same recognized ad-hoc fields; enter it with
+/// `let _g = scope_span!(...).entered()` around synchronous work that
+/// emits `record!`. Prefer `attribution_span!(thing)` when the work is
+/// bound to an `Attributable`; use this for sync entry points (config
+/// validation, bootstrap) where no `Attributable` is in scope.
+#[macro_export]
+macro_rules! scope_span {
+    ($($key:ident : $value:expr),+ $(,)?) => {{
+        $crate::__private::tracing::info_span!(
+            target: "zeroclaw_log_internal_scope",
+            "zeroclaw_scope",
+            $($key = %($value)),+
+        )
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{Action, Event, EventOutcome};
