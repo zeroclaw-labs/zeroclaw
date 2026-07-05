@@ -1,9 +1,8 @@
 # Built-In Tool Inventory
 
-Use this page with [First-party extensions](./first-party-extensions.md) when
-deciding whether an agent-callable tool should stay in the core binary, become
-feature-gated, move to a WASM plugin, ship as a skill package, or use an MCP or
-CLI-backed integration.
+Use this page when deciding whether an agent-callable tool should stay in the
+core binary, become feature-gated, move to a WASM plugin, ship as a skill
+package, or use an MCP or CLI-backed integration.
 
 This is a classification map, not a removal plan. Do not remove or externalize a
 tool until the replacement preserves the operator contract: config, security

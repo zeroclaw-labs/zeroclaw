@@ -393,6 +393,9 @@ cli-skills-create-hint = {"  "}作成: mkdir -p ~/.zeroclaw/workspace/skills/my-
 cli-skills-install-hint = {"  "}またはインストール: zeroclaw skills install <source>
 cli-skills-installed-header = インストール済みのスキル ({$count}):
 cli-skills-tags = タグ:  {$tags}
+cli-skills-skipped-header = スキップ済み ({$count}):
+cli-skills-skipped-reason = {"    "}理由: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}有効にするには、zeroclaw の設定で `skills.allow_scripts = true` を設定してください。
 cli-sop-none = SOP が見つかりません。
 cli-sop-create-hint = {"  "}作成: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}その後 SOP.toml と SOP.md を追加します

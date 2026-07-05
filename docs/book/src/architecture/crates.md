@@ -105,7 +105,7 @@ Model-side tool-call syntax parsing. Handles variations between providers:
 
 ### `zeroclaw-plugins`
 
-Dynamic plugin loader for out-of-process tool implementations. See [Developing → Plugin protocol](../developing/plugin-protocol.md).
+Sandboxed WASM plugin host: loads component-model plugins (tool, channel, memory, skill bundles) in-process under WASI with per-call fuel and memory limits. See [Developing → Plugin protocol](../developing/plugin-protocol.md).
 
 ### `zeroclaw-hardware`
 
