@@ -141,8 +141,7 @@ Negative consequences:
 
 ## References
 
-- [First-party extension architecture](../../developing/first-party-extensions.md)
-- [Extension examples: shared state](../../developing/extension-examples.md)
+- [Built-in tool inventory](../../developing/tool-inventory.md)
 - [Issue #4057](https://github.com/zeroclaw-labs/zeroclaw/issues/4057)
 - `AGENTS.md`
 - `crates/zeroclaw-runtime/src/tools/mod.rs`

@@ -11,7 +11,8 @@ relates-to:
   - crates/zeroclaw-api/src/observability_traits.rs
   - crates/zeroclaw-api/src/runtime_traits.rs
   - crates/zeroclaw-api/src/peripherals_traits.rs
-  - docs/book/src/developing/first-party-extensions.md
+  - docs/book/src/architecture/crates.md
+  - docs/book/src/developing/tool-inventory.md
 ---
 
 # ADR-002: First-Party Extension Surfaces Use Trait Contracts
@@ -23,8 +24,8 @@ architecture docs.
 
 This record was drafted from
 [FND-002 §6.3](../../foundations/fnd-002-documentation-standards.md#63-retroactive-adrs),
-the current `zeroclaw-api` trait surfaces, and the first-party extension
-docs. It was not recovered from an older ADR file.
+the current `zeroclaw-api` trait surfaces, and the crate and
+tool-boundary docs. It was not recovered from an older ADR file.
 
 ## Context
 
@@ -107,8 +108,7 @@ Follow-up decisions:
 ## References
 
 - [Architecture: Crates](../crates.md)
-- [First-party extension architecture](../../developing/first-party-extensions.md)
-- [Extension examples](../../developing/extension-examples.md)
+- [Built-in tool inventory](../../developing/tool-inventory.md)
 - [Plugin protocol](../../developing/plugin-protocol.md)
 - `crates/zeroclaw-api/src/model_provider.rs`
 - `crates/zeroclaw-api/src/channel.rs`
