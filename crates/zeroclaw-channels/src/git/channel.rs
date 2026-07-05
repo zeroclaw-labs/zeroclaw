@@ -653,9 +653,9 @@ mod tests {
     fn user_allowlist_is_case_insensitive_like_forge_logins() {
         let ch = channel(vec!["*".into()]);
         assert!(ch.is_user_allowed("anyone"));
-        let ch = channel(vec!["Marc".into()]);
-        assert!(ch.is_user_allowed("marc"));
-        assert!(ch.is_user_allowed("MARC"));
+        let ch = channel(vec!["Test_User".into()]);
+        assert!(ch.is_user_allowed("test_user"));
+        assert!(ch.is_user_allowed("TEST_USER"));
         assert!(!ch.is_user_allowed("mallory"));
         let ch = channel(vec![]);
         assert!(!ch.is_user_allowed("anyone"));
@@ -789,7 +789,7 @@ mod tests {
                         "number": 12,
                         "title": "Flaky test",
                         "body": "@myapp please investigate",
-                        "user": {"login": "marc", "type": "User"},
+                        "user": {"login": "test_user", "type": "User"},
                         "created_at": (now - chrono::Duration::seconds(60)).to_rfc3339(),
                     }])),
                 )
@@ -801,7 +801,7 @@ mod tests {
                     ResponseTemplate::new(200).set_body_json(serde_json::json!([{
                         "id": 9001,
                         "body": "@myapp ping",
-                        "user": {"login": "marc", "type": "User"},
+                        "user": {"login": "test_user", "type": "User"},
                         "created_at": (now - chrono::Duration::seconds(30)).to_rfc3339(),
                         "issue_url": "https://api.github.com/repos/octo/repo/issues/12",
                     }])),
@@ -863,7 +863,7 @@ mod tests {
                         "number": 31,
                         "title": "Add events",
                         "body": "Implements the event enum.",
-                        "user": {"login": "marc", "type": "User"},
+                        "user": {"login": "test_user", "type": "User"},
                         "created_at": (now - chrono::Duration::seconds(60)).to_rfc3339(),
                         "html_url": "https://github.com/octo/repo/pull/31",
                         "pull_request": {"merged_at": null},
@@ -923,7 +923,7 @@ mod tests {
             let comment = serde_json::json!({
                 "id": 9001,
                 "body": "@myapp ping",
-                "user": {"login": "marc", "type": "User"},
+                "user": {"login": "test_user", "type": "User"},
                 "created_at": (now - chrono::Duration::seconds(30)).to_rfc3339(),
                 "issue_url": "https://api.github.com/repos/octo/repo/issues/12",
             });
@@ -1014,7 +1014,7 @@ mod tests {
                     "head_branch": "feat/x",
                     "run_number": 88,
                     "run_attempt": 1,
-                    "actor": {"login": "marc", "type": "User"},
+                    "actor": {"login": "test_user", "type": "User"},
                     "pull_requests": [],
                 })
             };
@@ -1206,7 +1206,7 @@ mod tests {
                 "number": 12,
                 "title": "Flaky test",
                 "body": "@myapp please investigate",
-                "user": {"login": "marc", "type": "User"},
+                "user": {"login": "test_user", "type": "User"},
                 "created_at": (now - chrono::Duration::seconds(60)).to_rfc3339(),
             }]);
             mount_token_mock(&server).await;
@@ -1290,7 +1290,7 @@ mod tests {
                             "number": 1,
                             "title": "First",
                             "body": "@myapp one",
-                            "user": {"login": "marc", "type": "User"},
+                            "user": {"login": "test_user", "type": "User"},
                             "created_at": (now - chrono::Duration::seconds(90)).to_rfc3339(),
                         }])),
                 )
@@ -1304,7 +1304,7 @@ mod tests {
                         "number": 2,
                         "title": "Second",
                         "body": "@myapp two",
-                        "user": {"login": "marc", "type": "User"},
+                        "user": {"login": "test_user", "type": "User"},
                         "created_at": (now - chrono::Duration::seconds(30)).to_rfc3339(),
                     }])),
                 )

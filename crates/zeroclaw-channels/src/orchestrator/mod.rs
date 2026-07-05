@@ -24753,11 +24753,11 @@ Done."#;
         let msg = ChannelMessage {
             channel: "git".to_string(),
             channel_alias: Some("main".to_string()),
-            sender: "marc".to_string(),
+            sender: "test_user".to_string(),
             subject: Some("zeroclaw:sop-event:git.main:pull_request.opened".to_string()),
             content: r#"{"sop":"triage"}"#.to_string(),
             internal_sop_event: Some("git.main:pull_request.opened".to_string()),
-            ..ChannelMessage::new("1", "marc", "octo/repo#12", "", "git", 0)
+            ..ChannelMessage::new("1", "test_user", "octo/repo#12", "", "git", 0)
         };
         let router = router_without_sop_engine();
         assert!(

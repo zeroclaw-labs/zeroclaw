@@ -252,7 +252,7 @@ mod tests {
             "number": 12,
             "title": "Flaky test",
             "body": "@myapp please investigate",
-            "user": {"login": "marc", "type": "User"},
+            "user": {"login": "test_user", "type": "User"},
             "created_at": "2026-06-13T01:00:00Z",
             "html_url": "https://github.com/octo/repo/issues/12",
         });
@@ -277,7 +277,7 @@ mod tests {
         serde_json::json!({
             "id": 4242,
             "body": "@myapp is this cast safe?",
-            "user": {"login": "marc", "type": "User"},
+            "user": {"login": "test_user", "type": "User"},
             "created_at": "2026-06-13T01:05:00Z",
             "pull_request_url": "https://api.github.com/repos/octo/repo/pulls/31",
         })
@@ -296,7 +296,7 @@ mod tests {
             "head_branch": "feat/x",
             "run_number": 88,
             "run_attempt": 1,
-            "actor": {"login": "marc", "type": "User"},
+            "actor": {"login": "test_user", "type": "User"},
             "pull_requests": [{"number": 31}],
         })
     }
@@ -308,7 +308,7 @@ mod tests {
             "tag_name": "v0.9.0",
             "name": "v0.9.0 — events",
             "body": body,
-            "author": {"login": "marc", "type": "User"},
+            "author": {"login": "test_user", "type": "User"},
             "draft": draft,
             "published_at": if draft { serde_json::Value::Null } else { serde_json::json!("2026-06-13T01:20:00Z") },
             "html_url": "https://github.com/octo/repo/releases/tag/v0.9.0",
@@ -319,12 +319,15 @@ mod tests {
 
     #[test]
     fn issue_comment_normalizes_to_generic_event() {
-        let event =
-            from_comment(&comment("marc", "User", "@myapp run the tests"), &repo()).unwrap();
+        let event = from_comment(
+            &comment("test_user", "User", "@myapp run the tests"),
+            &repo(),
+        )
+        .unwrap();
         assert_eq!(event.event_type(), "issue_comment.created");
         assert_eq!(event.dedup_id(), "ghc_9001");
         assert!(event.is_conversational());
-        assert_eq!(event.author().unwrap().login, "marc");
+        assert_eq!(event.author().unwrap().login, "test_user");
     }
 
     #[test]
@@ -404,7 +407,7 @@ mod tests {
 
     #[test]
     fn malformed_comment_issue_url_is_dropped() {
-        let mut c = comment("marc", "User", "@myapp hello");
+        let mut c = comment("test_user", "User", "@myapp hello");
         c.issue_url = "garbage".to_string();
         assert!(from_comment(&c, &repo()).is_none());
     }
@@ -423,7 +426,7 @@ mod tests {
 
     #[test]
     fn feed_comment_shares_identity_with_targeted_poll() {
-        let json = comment_json("marc", "User", "@myapp ping");
+        let json = comment_json("test_user", "User", "@myapp ping");
         let targeted =
             from_comment(&serde_json::from_value(json.clone()).unwrap(), &repo()).unwrap();
         let feed = from_repo_event(
@@ -447,7 +450,7 @@ mod tests {
             "number": 12,
             "title": "Flaky test",
             "body": "@myapp please investigate",
-            "user": {"login": "marc", "type": "User"},
+            "user": {"login": "test_user", "type": "User"},
             "created_at": "2026-06-13T01:00:00Z",
             "closed_at": null,
             "merged_at": null,
@@ -508,7 +511,7 @@ mod tests {
         assert!(from_repo_event(
             &feed_event(
                 "IssueCommentEvent",
-                serde_json::json!({"action": "edited", "comment": comment_json("marc", "User", "hi")})
+                serde_json::json!({"action": "edited", "comment": comment_json("test_user", "User", "hi")})
             ),
             &repo()
         )
