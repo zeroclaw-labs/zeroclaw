@@ -46,5 +46,4 @@ ignore = [
     # (Tauri) was removed in PR #8544.
     "RUSTSEC-2026-0173",  # proc-macro-error2 unmaintained; transitive macro helper; tracking #8519
     "RUSTSEC-2024-0388",  # derivative unmaintained; transitive derive helper; tracking #8519
-    "RUSTSEC-2026-0192",  # ttf-parser unmaintained; via pdf-extract -> lopdf; tracking #8519
 ]
