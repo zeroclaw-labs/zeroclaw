@@ -948,6 +948,12 @@ mod turn_order_tests {
         assert_eq!(msgs[1].role, "user");
     }
 
+    /// The sanitizer is a pure leading-turn repair: with no `user` anywhere it
+    /// drains every non-system turn, leaving system-only. That system-only
+    /// shape is NOT a valid provider payload; the prep boundary
+    /// (`prepare_messages_for_iteration`) fails closed on a no-user history
+    /// before dispatch. See the runtime `prepare_fails_closed_when_no_user_turn_survives`
+    /// regression.
     #[test]
     fn no_user_turn_drops_all_non_system() {
         let mut msgs = vec![
