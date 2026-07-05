@@ -100,6 +100,7 @@ zc-queue-full = La cola está llena ({ $cap } máx.). Espera a que se envíen lo
 zc-queue-title = Cola ({ $count })
 zc-queue-empty-list = No hay mensajes en cola.
 zc-queue-paused-ghost = Cola en pausa — presiona { $key } o envía un mensaje para reanudar
+zc-queue-paused-ghost-no-key = Cola en pausa — envía un mensaje para reanudar
 zc-queue-item-injected = (inyectado)
 zc-queue-resumed = Cola reanudada.
 zc-queue-clear-empty = La cola ya está vacía.
@@ -109,7 +110,7 @@ zc-queue-clear-invalid = No hay mensaje en cola en la posición { $index } (la c
 zc-queue-help-resume = Pausar/reanudar cola
 zc-queue-help-nav = Seleccionar mensaje en cola
 zc-queue-help-delete = Eliminar de la cola
-zc-queue-help-clear = Limpiar cola ([N] = posición)
+zc-queue-help-clear-command = { $command } [N] — limpiar cola
 zc-queue-help-edit = Editar mensaje en cola
 zc-queue-help-resize = Cambiar tamaño de la cola
 zc-queue-help-enqueue = Poner mensaje en cola
@@ -324,7 +325,7 @@ zc-code-help-return-to-input = Volver a la entrada
 zc-code-help-browse-mode = Modo de navegación
 zc-code-help-scroll-conversation = Desplazar conversación
 zc-code-help-toggle-thoughts = Alternar pensamientos
-zc-code-help-toggle-thinking-cmd = Alternar visibilidad del pensamiento
+zc-code-help-toggle-thinking-cmd = { $command } — alternar visibilidad del pensamiento
 zc-code-help-new-session = Nueva sesión
 zc-code-session-list-resume-title = Sesiones guardadas (Intro=reanudar, Esc=nueva)
 zc-code-session-list-switch-title = Sesiones (Intro=cambiar, Esc=cerrar)

@@ -100,6 +100,7 @@ zc-queue-full = La file d'attente est pleine ({ $cap } max). Attendez que les me
 zc-queue-title = File d'attente ({ $count })
 zc-queue-empty-list = Aucun message en file d'attente.
 zc-queue-paused-ghost = File d'attente suspendue — appuyez sur { $key } ou envoyez un message pour reprendre
+zc-queue-paused-ghost-no-key = File d'attente suspendue — envoyez un message pour reprendre
 zc-queue-item-injected = (injection)
 zc-queue-resumed = File d'attente reprise.
 zc-queue-clear-empty = La file d'attente est déjà vide.
@@ -109,7 +110,7 @@ zc-queue-clear-invalid = Aucun message en file d'attente à l'index { $index } (
 zc-queue-help-resume = Suspendre/reprendre la file
 zc-queue-help-nav = Sélectionner dans la file
 zc-queue-help-delete = Supprimer le message en file
-zc-queue-help-clear = Vider la file ([N] = position)
+zc-queue-help-clear-command = { $command } [N] — vider la file
 zc-queue-help-edit = Modifier le message en file
 zc-queue-help-resize = Redimensionner la file
 zc-queue-help-enqueue = Mettre le message en file
@@ -324,7 +325,7 @@ zc-code-help-return-to-input = Revenir à la saisie
 zc-code-help-browse-mode = Mode navigation
 zc-code-help-scroll-conversation = Faire défiler la conversation
 zc-code-help-toggle-thoughts = Basculer les réflexions
-zc-code-help-toggle-thinking-cmd = Basculer la visibilité de la réflexion
+zc-code-help-toggle-thinking-cmd = { $command } — basculer la visibilité de la réflexion
 zc-code-help-new-session = Nouvelle session
 zc-code-session-list-resume-title = Sessions enregistrées (Entrée=reprendre, Échap=nouveau)
 zc-code-session-list-switch-title = Sessions (Entrée=changer, Échap=fermer)

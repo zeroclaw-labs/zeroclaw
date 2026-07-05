@@ -2608,7 +2608,7 @@ impl Transcript {
 
 impl crate::widgets::HelpContext for Transcript {
     fn help_context(&self) -> crate::widgets::HelpNode {
-        use crate::keymap::{CodeTabAction, RebindableActions};
+        use crate::keymap::{CodeTabAction, action_key_labels};
         use crate::widgets::{HelpEntry as E, HelpNode};
         match &self.phase {
             TranscriptPhase::PickAgent { loading, .. } => {
@@ -2793,37 +2793,36 @@ impl crate::widgets::HelpContext for Transcript {
                 }
                 // Idle: compose pane-level bindings + input bar as child.
                 let mut pane_entries = vec![
-                    // Browse-mode bindings rendered from the registry so
-                    // rebinds always stay in sync — see also the browse-mode
-                    // dispatch code in `handle_key`.
                     E::new(
-                        CodeTabAction::BrowseEnter
-                            .resolved()
-                            .iter()
-                            .map(|c| c.display().to_string()),
+                        action_key_labels(CodeTabAction::BrowseEnter),
                         crate::i18n::t("zc-code-help-browse-mode"),
                     ),
-                    E::key(
-                        "Shift+↑/↓",
+                    E::new(
+                        action_key_labels(CodeTabAction::BrowseSelectExtend)
+                            .into_iter()
+                            .chain(action_key_labels(CodeTabAction::BrowseSelectExtendDown)),
                         crate::i18n::t("zc-code-help-scroll-conversation"),
                     ),
-                    E::key("t", crate::i18n::t("zc-code-help-toggle-thoughts")),
-                    E::key(
-                        "/toggle-thinking",
-                        crate::i18n::t("zc-code-help-toggle-thinking-cmd"),
+                    E::new(
+                        action_key_labels(CodeTabAction::ToggleThoughts),
+                        crate::i18n::t("zc-code-help-toggle-thoughts"),
                     ),
+                    E::desc(crate::i18n::t_args(
+                        "zc-code-help-toggle-thinking-cmd",
+                        &[("command", crate::input_bar::SLASH_COMMAND_TOGGLE_THINKING)],
+                    )),
                     E::spacer(),
-                    E::key(
-                        chord_label(CodeTabAction::NewSession),
+                    E::new(
+                        action_key_labels(CodeTabAction::NewSession),
                         crate::i18n::t("zc-code-help-new-session"),
                     ),
-                    E::key(
-                        chord_label(CodeTabAction::SwitchSession),
+                    E::new(
+                        action_key_labels(CodeTabAction::SwitchSession),
                         crate::i18n::t("zc-code-help-session-list"),
                     ),
                     E::spacer(),
-                    E::key(
-                        chord_label(CodeTabAction::PauseResumeQueue),
+                    E::new(
+                        action_key_labels(CodeTabAction::PauseResumeQueue),
                         crate::i18n::t("zc-queue-help-resume"),
                     ),
                 ];
@@ -2988,10 +2987,7 @@ fn render(f: &mut Frame, state: &mut TranscriptState, area: Rect) {
     let input_area = area;
 
     let queue_paused_hint = if state.queue_paused() && state.queue_len() > 0 {
-        Some(crate::i18n::t_args(
-            "zc-queue-paused-ghost",
-            &[("key", &resume_queue_chord_label())],
-        ))
+        Some(queue_paused_ghost_text())
     } else {
         None
     };
@@ -3106,12 +3102,14 @@ fn model_picker_overlay_area(model_picker: &ModelPickerOverlay, area: Rect) -> O
     }
 }
 
-fn resume_queue_chord_label() -> String {
-    crate::keymap::CodeTabAction::PauseResumeQueue
-        .default_chords()
-        .first()
-        .map(|c| c.display())
-        .unwrap_or_else(|| "Alt+P".to_string())
+fn queue_paused_ghost_text() -> String {
+    match crate::keymap::action_key_labels(crate::keymap::CodeTabAction::PauseResumeQueue)
+        .into_iter()
+        .next()
+    {
+        Some(key) => crate::i18n::t_args("zc-queue-paused-ghost", &[("key", &key)]),
+        None => crate::i18n::t("zc-queue-paused-ghost-no-key"),
+    }
 }
 
 /// Queue-management help entries shown whenever the queue sidebar is open —
@@ -3119,55 +3117,34 @@ fn resume_queue_chord_label() -> String {
 /// from drifting apart. Every key label is derived from the keymap registry,
 /// never hardcoded, so rebinds stay reflected in help.
 fn queue_sidebar_help_entries() -> Vec<crate::widgets::HelpEntry> {
-    use crate::keymap::CodeTabAction as A;
+    use crate::keymap::{CodeTabAction as A, action_key_labels};
     use crate::widgets::HelpEntry as E;
     vec![
-        E::key(
-            chord_label_pair(A::QueueNavUp, A::QueueNavDown),
+        E::new(
+            action_key_labels(A::QueueNavUp)
+                .into_iter()
+                .chain(action_key_labels(A::QueueNavDown)),
             crate::i18n::t("zc-queue-help-nav"),
         ),
-        E::key(
-            chord_label(A::QueueDelete),
+        E::new(
+            action_key_labels(A::QueueDelete),
             crate::i18n::t("zc-queue-help-delete"),
         ),
-        E::key("/clear-queue", crate::i18n::t("zc-queue-help-clear")),
-        E::key(
-            chord_label(A::QueueEdit),
+        E::desc(crate::i18n::t_args(
+            "zc-queue-help-clear-command",
+            &[("command", crate::input_bar::SLASH_COMMAND_CLEAR_QUEUE)],
+        )),
+        E::new(
+            action_key_labels(A::QueueEdit),
             crate::i18n::t("zc-queue-help-edit"),
         ),
-        E::key(
-            chord_label_pair(A::QueueWiden, A::QueueNarrow),
+        E::new(
+            action_key_labels(A::QueueWiden)
+                .into_iter()
+                .chain(action_key_labels(A::QueueNarrow)),
             crate::i18n::t("zc-queue-help-resize"),
         ),
     ]
-}
-
-/// Render an action's primary bound chord as a `&'static str` for help entries.
-/// `HelpEntry::key` requires `'static`, and chord display is computed at
-/// runtime, so the label is leaked — help is built once per popup open.
-fn chord_label(action: crate::keymap::CodeTabAction) -> &'static str {
-    let label = action
-        .default_chords()
-        .first()
-        .map(|c| c.display())
-        .unwrap_or_default();
-    Box::leak(label.into_boxed_str())
-}
-
-/// Like `chord_label` but joins two actions' chords as `A/B` (e.g. the up/down
-/// or widen/narrow pairs that share one help row).
-fn chord_label_pair(
-    a: crate::keymap::CodeTabAction,
-    b: crate::keymap::CodeTabAction,
-) -> &'static str {
-    let render = |action: crate::keymap::CodeTabAction| {
-        action
-            .default_chords()
-            .first()
-            .map(|c| c.display())
-            .unwrap_or_default()
-    };
-    Box::leak(format!("{}/{}", render(a), render(b)).into_boxed_str())
 }
 
 fn render_session_status_row(f: &mut Frame, state: &TranscriptState, area: Rect) {
@@ -3454,10 +3431,13 @@ enum ToolRenderer {
 
 impl ToolRenderer {
     fn select(presentation: ToolPresentation, input: Option<&serde_json::Value>) -> Self {
-        if string_field(input, "patch").is_some() || string_field(input, "diff").is_some() {
-            return Self::Patch;
-        }
         match presentation {
+            ToolPresentation::Diff
+                if string_field(input, "patch").is_some()
+                    || string_field(input, "diff").is_some() =>
+            {
+                Self::Patch
+            }
             ToolPresentation::Diff => Self::Diff,
             ToolPresentation::File => Self::File,
             _ => Self::Generic,
@@ -7315,7 +7295,7 @@ mod tests {
     }
 
     #[test]
-    fn ui_profile_change_marks_dirty_without_mutating_entries() {
+    fn transcript_entries_do_not_depend_on_ui_profile() {
         let mut state = state();
         state
             .entries
@@ -7366,17 +7346,33 @@ mod tests {
     }
 
     #[test]
-    fn patch_shaped_tools_use_patch_renderer() {
+    fn diff_presentation_with_patch_input_uses_patch_renderer() {
         let entry = TranscriptEntry::Tool {
             tool_call_id: Arc::<str>::from("tool-1"),
             name: Arc::<str>::from("apply_patch"),
             input_json: Arc::<str>::from(r#"{"patch":"@@ -1 +1\n-old\n+new"}"#),
-            presentation: ToolPresentation::Generic,
+            presentation: ToolPresentation::Diff,
             result: None,
         };
         let text = rendered_entry(&entry, 80);
         assert!(text.contains("@@ -1 +1"), "{text}");
         assert!(text.contains("+new"), "{text}");
+    }
+
+    #[test]
+    fn generic_patch_input_stays_generic() {
+        let entry = TranscriptEntry::Tool {
+            tool_call_id: Arc::<str>::from("tool-1"),
+            name: Arc::<str>::from("metadata_tool"),
+            input_json: Arc::<str>::from(r#"{"patch":"@@ -1 +1\n-old\n+new"}"#),
+            presentation: ToolPresentation::Generic,
+            result: None,
+        };
+        let text = rendered_entry(&entry, 80);
+        assert!(
+            text.contains(r#"{"patch":"@@ -1 +1\n-old\n+new"}"#),
+            "{text}"
+        );
     }
 
     #[test]
@@ -7701,6 +7697,31 @@ mod tests {
                 &UiRenderSpec::rich()
             ),
             "⚙ sop_execute"
+        );
+    }
+
+    #[test]
+    fn tool_title_uses_presentation_not_tool_name() {
+        let shell = serde_json::json!({ "command": "cargo test" });
+        let read = serde_json::json!({ "path": "Cargo.toml" });
+
+        assert_eq!(
+            tool_title(
+                "file_read",
+                ToolPresentation::Shell,
+                Some(&shell),
+                &UiRenderSpec::rich()
+            ),
+            "$ cargo test"
+        );
+        assert_eq!(
+            tool_title(
+                "shell",
+                ToolPresentation::File,
+                Some(&read),
+                &UiRenderSpec::rich()
+            ),
+            "shell Cargo.toml"
         );
     }
 

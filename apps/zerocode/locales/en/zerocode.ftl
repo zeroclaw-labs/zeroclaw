@@ -112,6 +112,7 @@ zc-queue-full = Queue is full ({ $cap } max). Wait for messages to send.
 zc-queue-title = Queue ({ $count })
 zc-queue-empty-list = No queued messages.
 zc-queue-paused-ghost = Queue paused — press { $key } or send a message to resume
+zc-queue-paused-ghost-no-key = Queue paused — send a message to resume
 zc-queue-item-injected = (inject)
 zc-queue-resumed = Queue resumed.
 zc-queue-clear-empty = Queue is already empty.
@@ -121,7 +122,7 @@ zc-queue-clear-invalid = No queued message at index { $index } (queue has { $cou
 zc-queue-help-resume = Pause/resume queue
 zc-queue-help-nav = Select queued
 zc-queue-help-delete = Delete queued
-zc-queue-help-clear = Clear queue ([N] = position)
+zc-queue-help-clear-command = { $command } [N] — clear queue
 zc-queue-help-edit = Edit queued
 zc-queue-help-resize = Resize queue
 zc-queue-help-enqueue = Queue message
@@ -385,6 +386,7 @@ zc-code-help-return-to-input = Return to input
 zc-code-help-browse-mode = Browse mode
 zc-code-help-scroll-conversation = Scroll conversation
 zc-code-help-toggle-thoughts = Toggle thoughts
+zc-code-help-toggle-thinking-cmd = { $command } — toggle thinking visibility
 zc-code-help-new-session = New session
 zc-code-session-list-resume-title = Saved sessions (Enter=resume, Esc=new)
 zc-code-session-list-switch-title = Sessions (Enter=switch, Esc=close)

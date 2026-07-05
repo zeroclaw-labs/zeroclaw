@@ -100,7 +100,21 @@ fn deserialize_ui_profile_or_default<'de, D>(deserializer: D) -> Result<UiProfil
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(UiProfile::deserialize(deserializer).unwrap_or_default())
+    let raw = match String::deserialize(deserializer) {
+        Ok(raw) => raw,
+        Err(e) => {
+            eprintln!("zerocode: invalid [ui].profile ({e}); using minimal");
+            return Ok(UiProfile::default());
+        }
+    };
+    if raw == "minimal" {
+        return Ok(UiProfile::Minimal);
+    }
+    if raw == "rich" {
+        return Ok(UiProfile::Rich);
+    }
+    eprintln!("zerocode: unknown [ui].profile '{raw}'; using minimal");
+    Ok(UiProfile::default())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

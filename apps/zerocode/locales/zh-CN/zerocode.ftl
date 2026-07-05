@@ -100,6 +100,7 @@ zc-queue-full = 队列已满（最多 { $cap } 条）。请等待消息发送。
 zc-queue-title = 队列（{ $count }）
 zc-queue-empty-list = 没有排队消息。
 zc-queue-paused-ghost = 队列已暂停 — 按 { $key } 或发送消息以恢复
+zc-queue-paused-ghost-no-key = 队列已暂停 — 发送消息以恢复
 zc-queue-item-injected = （插入）
 zc-queue-resumed = 队列已恢复。
 zc-queue-clear-empty = 队列已经为空。
@@ -109,7 +110,7 @@ zc-queue-clear-invalid = 索引 { $index } 处没有排队消息（队列中共�
 zc-queue-help-resume = 暂停/恢复队列
 zc-queue-help-nav = 选择排队消息
 zc-queue-help-delete = 删除排队消息
-zc-queue-help-clear = 清除队列（[N] = 位置）
+zc-queue-help-clear-command = { $command } [N] — 清除队列
 zc-queue-help-edit = 编辑排队消息
 zc-queue-help-resize = 调整队列大小
 zc-queue-help-enqueue = 将消息加入队列
@@ -324,7 +325,7 @@ zc-code-help-return-to-input = 返回输入
 zc-code-help-browse-mode = 浏览模式
 zc-code-help-scroll-conversation = 滚动对话
 zc-code-help-toggle-thoughts = 切换思考
-zc-code-help-toggle-thinking-cmd = 切换思考可见性
+zc-code-help-toggle-thinking-cmd = { $command } — 切换思考可见性
 zc-code-help-new-session = 新建会话
 zc-code-session-list-resume-title = 已保存会话（Enter=恢复，Esc=新建）
 zc-code-session-list-switch-title = 会话（Enter=切换，Esc=关闭）

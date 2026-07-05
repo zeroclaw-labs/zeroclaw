@@ -561,6 +561,36 @@ mod tests {
     }
 
     #[test]
+    fn patch_schema_defaults_to_diff_presentation() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "patch": { "type": "string" }
+            }
+        });
+
+        assert_eq!(
+            default_tool_presentation(Role::Tool(ToolKind::Plugin), &schema),
+            ToolPresentation::Diff
+        );
+    }
+
+    #[test]
+    fn diff_schema_defaults_to_diff_presentation() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "diff": { "type": "string" }
+            }
+        });
+
+        assert_eq!(
+            default_tool_presentation(Role::Tool(ToolKind::Plugin), &schema),
+            ToolPresentation::Diff
+        );
+    }
+
+    #[test]
     fn ephemeral_warning_names_cause_and_fix() {
         assert!(EPHEMERAL_WORKSPACE_WARNING.contains("EPHEMERAL WORKSPACE"));
         assert!(EPHEMERAL_WORKSPACE_WARNING.contains("tmpfs"));

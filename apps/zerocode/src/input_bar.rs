@@ -32,18 +32,21 @@ use crate::turn_status::TurnStatus;
 const MAX_INPUT_ROWS: u16 = 5;
 const MAX_PROMPT_HISTORY: usize = 100;
 
+pub(crate) const SLASH_COMMAND_CLEAR_QUEUE: &str = "/clear-queue";
+pub(crate) const SLASH_COMMAND_TOGGLE_THINKING: &str = "/toggle-thinking";
+
 /// Slash commands available for auto-complete.
 const SLASH_COMMANDS: &[&str] = &[
     "/attach",
     "/attachments",
-    "/clear-queue",
+    SLASH_COMMAND_CLEAR_QUEUE,
     "/detach",
     "/model",
     "/model-provider",
     "/new",
     "/new-session",
     "/restart-session",
-    "/toggle-thinking",
+    SLASH_COMMAND_TOGGLE_THINKING,
 ];
 
 // ── Action type ──────────────────────────────────────────────────
@@ -132,17 +135,20 @@ fn parse_slash_command(input: &str) -> SlashCommand<'_> {
         SlashCommand::Detach(idx.trim().parse().ok())
     } else if trimmed == "/detach" {
         SlashCommand::Detach(None)
-    } else if let Some(arg) = trimmed.strip_prefix("/clear-queue ") {
+    } else if let Some(arg) = trimmed
+        .strip_prefix(SLASH_COMMAND_CLEAR_QUEUE)
+        .and_then(|arg| arg.strip_prefix(' '))
+    {
         // Malformed index -> Some(0): an invalid index, never a clear-all, so a
         // typo cannot wipe the whole queue. Only the bare form clears all.
         SlashCommand::ClearQueue(Some(arg.trim().parse().unwrap_or(0)))
-    } else if trimmed == "/clear-queue" {
+    } else if trimmed == SLASH_COMMAND_CLEAR_QUEUE {
         SlashCommand::ClearQueue(None)
     } else if trimmed == "/attachments" {
         SlashCommand::ListAttachments
     } else if trimmed == "/restart-session" || trimmed == "/new-session" || trimmed == "/new" {
         SlashCommand::RestartSession
-    } else if trimmed == "/toggle-thinking" {
+    } else if trimmed == SLASH_COMMAND_TOGGLE_THINKING {
         SlashCommand::ToggleThinking
     } else if let Some(name) = trimmed.strip_prefix("/model-provider ") {
         let name = name.trim();
