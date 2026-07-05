@@ -7,7 +7,7 @@ Tools are not to be confused with `zeroclaw` CLI subcommands. CLI commands are f
 An agent gets its tools through the skill, knowledge, and MCP bundles it references; see [Agents](../agents/overview.md) for how bundles attach to an agent.
 
 Before adding a built-in tool or replacing one with an external integration,
-use the [first-party extension boundary](../developing/first-party-extensions.md#choose-built-in-or-external)
+use the [Built-In Tool Inventory](../developing/tool-inventory.md)
 to choose the smallest durable home.
 
 ## Built-in tools
@@ -44,6 +44,7 @@ Conditionally registered:
 
 | Tool | Enabled by |
 |---|---|
+| `knowledge` | `[knowledge].enabled = true`. Stores structured relationship memory; see [Relationship memory](./relationship-memory.md) |
 | Hardware probes | `--features hardware`: GPIO, I2C, SPI reads/writes |
 | `pdf_read` | `--features rag-pdf` |
 | `sop_*` tools | Registered when `sop.sops_dir` is configured: run and inspect SOPs |

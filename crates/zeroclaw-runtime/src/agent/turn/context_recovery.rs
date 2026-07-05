@@ -1,5 +1,6 @@
 //! LLM-failure recording and in-loop context-overflow recovery.
 
+use super::context::TurnCtx;
 use super::outcome::is_tool_loop_cancelled;
 use crate::agent::history::estimate_history_tokens;
 use crate::agent::history_trim::trim_to_recent_turns;
@@ -10,12 +11,9 @@ use zeroclaw_providers::ChatMessage;
 /// Record a failed provider call: observer `LlmResponse` (failure) and the
 /// `llm_response` failure log line.
 pub(crate) fn record_llm_failure(
-    observer: &dyn Observer,
-    provider_name: &str,
-    model: &str,
+    ctx: &TurnCtx<'_>,
     llm_started_at: Instant,
     iteration: usize,
-    turn_id: &str,
     e: &anyhow::Error,
 ) {
     // User cancellation gets the fixed message the streaming consumers have
@@ -25,17 +23,19 @@ pub(crate) fn record_llm_failure(
     } else {
         zeroclaw_providers::sanitize_api_error(&e.to_string())
     };
-    observer.record_event(&ObserverEvent::LlmResponse {
-        model_provider: provider_name.to_string(),
-        model: model.to_string(),
+    ctx.observer.record_event(&ObserverEvent::LlmResponse {
+        model_provider: ctx.provider_name.to_string(),
+        model: ctx.model.to_string(),
         duration: llm_started_at.elapsed(),
         success: false,
         error_message: Some(safe_error.clone()),
         input_tokens: None,
         output_tokens: None,
-        channel: None,
-        agent_alias: None,
-        turn_id: None,
+        channel: Some(ctx.channel_name.to_string()),
+        agent_alias: ctx.agent_alias.map(|s| s.to_string()),
+        turn_id: Some(ctx.turn_id.to_string()),
+        // Error path: no prompt/completion content captured.
+        messages: None,
     });
     ::zeroclaw_log::record!(
         WARN,
@@ -44,10 +44,10 @@ pub(crate) fn record_llm_failure(
             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
             .with_duration(u64::try_from(llm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX))
             .with_attrs(::serde_json::json!({
-                "model": model,
+                "model": ctx.model,
                 "iteration": iteration + 1,
                 "error": safe_error,
-                "trace_id": turn_id,
+                "trace_id": ctx.turn_id,
             })),
         "llm_response"
     );

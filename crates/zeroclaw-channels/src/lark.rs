@@ -1595,7 +1595,8 @@ impl LarkChannel {
                         interruption_scope_id: None,
                     attachments: vec![],
                         subject: None,
-                    };
+
+                        ..Default::default()};
 
                     ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WS: message in {}", lark_msg.chat_id));
                     if tx.send(channel_msg).await.is_err() { break; }
@@ -2270,6 +2271,8 @@ impl LarkChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         }]
     }
 
@@ -2688,6 +2691,8 @@ impl LarkChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         });
 
         messages
@@ -2753,6 +2758,15 @@ impl Channel for LarkChannel {
 
     async fn health_check(&self) -> bool {
         self.get_tenant_access_token().await.is_ok()
+    }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator API on the Lark/Feishu Open Platform.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 
     async fn add_reaction(
@@ -3176,6 +3190,7 @@ impl Channel for LarkChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        _suppress_voice: bool,
     ) -> anyhow::Result<()> {
         if message_id.is_empty() {
             return self.send(&SendMessage::new(text, recipient)).await;
@@ -6342,6 +6357,7 @@ mod tests {
             "oc_test_chat_id",
             "om_draft_media",
             "final caption [IMAGE:draft.png]",
+            false,
         )
         .await
         .expect("finalize_draft should clean text and send image");

@@ -333,10 +333,8 @@ impl CopilotModelProvider {
                         })
                         .collect::<Vec<_>>();
 
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|s| ApiContent::Text(s.to_string()));
+                    let content = crate::request_payload::non_empty_string_field(&value, "content")
+                        .map(ApiContent::Text);
 
                     return ApiMessage {
                         role: "assistant".to_string(),
@@ -392,7 +390,11 @@ impl CopilotModelProvider {
             model: model.to_string(),
             messages,
             temperature,
-            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
+            // Omit tool_choice when the tool list is empty — spec-compliant
+            // validators reject tool_choice without a non-empty tools field.
+            tool_choice: native_tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools: native_tools,
         };
 

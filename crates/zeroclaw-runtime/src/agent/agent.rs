@@ -93,6 +93,7 @@ struct TurnGuard {
     turn_id: Option<String>,
     turn_started_at: Instant,
     agent_alias: Option<String>,
+    channel_name: String,
     total_input_tokens: u64,
     total_output_tokens: u64,
     saw_usage: bool,
@@ -116,7 +117,7 @@ impl TurnGuard {
                 },
             ),
             cost_usd: None,
-            channel: None,
+            channel: Some(self.channel_name.clone()),
             agent_alias: self.agent_alias.clone(),
             turn_id: self.turn_id.clone(),
         });
@@ -141,6 +142,176 @@ pub fn tool_dispatcher_for_provider(
         "xml" => Box::new(XmlToolDispatcher),
         _ if model_provider.supports_native_tools() => Box::new(NativeToolDispatcher),
         _ => Box::new(XmlToolDispatcher),
+    }
+}
+
+/// Outcome of consulting a cross-channel [`ApprovalRoute`](zeroclaw_config::autonomy::ApprovalRoute).
+///
+/// Either the decision is settled here (the named approver answered, or the gate
+/// fails closed), or the caller should fall through to the originating fan-out
+/// (explicit `InheritOriginator`).
+enum RoutedApproval {
+    /// Use this response. `decider` names the channel that answered, for audit
+    /// attribution; `None` for a bridge-synthesized fail-closed deny.
+    Decided {
+        response: zeroclaw_api::channel::ChannelApprovalResponse,
+        decider: Option<String>,
+    },
+    /// Explicit `InheritOriginator` — defer to the originating-channel fan-out.
+    Fallthrough,
+}
+
+/// Resolve a cross-channel approval route: ask the named approver channel alone,
+/// bounded by `timeout_secs`, and apply `on_no_approver` (fail-closed by default)
+/// when the approver does not answer decisively, is unreachable, is unregistered,
+/// or times out.
+///
+/// Extracted from `AskUserApprovalBridge::request_approval` so the routing
+/// decision is unit-testable against stub channels without a full Agent.
+async fn resolve_routed_approval(
+    handles: &tools::PerToolChannelHandle,
+    route: &zeroclaw_config::autonomy::ApprovalRoute,
+    recipient: &str,
+    request: &zeroclaw_api::channel::ChannelApprovalRequest,
+) -> RoutedApproval {
+    let approver: Option<(String, Arc<dyn zeroclaw_api::channel::Channel>)> = handles
+        .read()
+        .iter()
+        .find(|(name, _)| name.as_str() == route.approver_channel)
+        .map(|(name, channel)| (name.clone(), Arc::clone(channel)));
+
+    let reason: &str = if let Some((channel_name, channel)) = approver {
+        let dur = std::time::Duration::from_secs(route.timeout_secs.max(1));
+        match tokio::time::timeout(dur, channel.request_approval(recipient, request)).await {
+            Ok(Ok(Some(response))) => {
+                return RoutedApproval::Decided {
+                    response,
+                    decider: Some(channel_name),
+                };
+            }
+            Ok(Ok(None)) => "approver returned no decision",
+            Ok(Err(_)) => "approver channel unreachable",
+            Err(_) => "approver timed out",
+        }
+    } else {
+        "approver channel not registered"
+    };
+
+    match route.on_no_approver {
+        zeroclaw_config::autonomy::OnNoApprover::Deny => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "tool": request.tool_name,
+                        "approver_channel": route.approver_channel,
+                        "reason": reason,
+                        "policy": "deny",
+                    })),
+                "approval route fail-closed: denying gated tool"
+            );
+            RoutedApproval::Decided {
+                response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+                decider: None,
+            }
+        }
+        zeroclaw_config::autonomy::OnNoApprover::InheritOriginator => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "tool": request.tool_name,
+                        "approver_channel": route.approver_channel,
+                        "reason": reason,
+                        "policy": "inherit-originator",
+                    })),
+                "approval route falling back to originating channel"
+            );
+            RoutedApproval::Fallthrough
+        }
+    }
+}
+
+/// A route-only approval bridge for the channel-less turn path
+/// (`process_message`): gateway chat/webhook dispatch and agent-to-agent peer
+/// messages run an agent turn with no originating channel handle, so a gated
+/// tool there can only reach a human through a configured
+/// [`ApprovalRoute`](zeroclaw_config::autonomy::ApprovalRoute).
+///
+/// Unlike the per-turn `AskUserApprovalBridge`, this carries NO originating
+/// fan-out — there is nothing to fall through to on this path. `request_approval`
+/// asks the named approver via [`resolve_routed_approval`]; a `Decided` outcome
+/// (including the fail-closed `Deny` synthesized when the approver is
+/// unreachable/unregistered/silent/timed-out under the default policy) is
+/// returned to the gate, and `InheritOriginator` returns `None` so the gate
+/// applies the non-interactive default (auto-deny) — "inherit the originator"
+/// degrades to today's channel-less behavior when there is no originator.
+pub(crate) struct RoutedApprovalChannel {
+    handles: tools::PerToolChannelHandle,
+    route: zeroclaw_config::autonomy::ApprovalRoute,
+    last_decision: parking_lot::Mutex<Option<String>>,
+}
+
+impl RoutedApprovalChannel {
+    pub(crate) fn new(
+        handles: tools::PerToolChannelHandle,
+        route: zeroclaw_config::autonomy::ApprovalRoute,
+    ) -> Self {
+        Self {
+            handles,
+            route,
+            last_decision: parking_lot::Mutex::new(None),
+        }
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for RoutedApprovalChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Cli)
+    }
+    fn alias(&self) -> &str {
+        "approval-route"
+    }
+}
+
+#[async_trait::async_trait]
+impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
+    fn name(&self) -> &str {
+        "approval-route"
+    }
+
+    fn last_decision_channel(&self) -> Option<String> {
+        self.last_decision.lock().clone()
+    }
+
+    async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn listen(
+        &self,
+        _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        *self.last_decision.lock() = None;
+        match resolve_routed_approval(&self.handles, &self.route, recipient, request).await {
+            RoutedApproval::Decided { response, decider } => {
+                *self.last_decision.lock() = decider;
+                Ok(Some(response))
+            }
+            // No originating channel to inherit on this path; let the gate apply
+            // the non-interactive default (auto-deny).
+            RoutedApproval::Fallthrough => Ok(None),
+        }
     }
 }
 
@@ -178,10 +349,28 @@ pub struct Agent {
     security_summary: Option<String>,
     /// Autonomy level from config; controls safety prompt instructions.
     autonomy_level: crate::security::AutonomyLevel,
+    /// Cross-channel HITL: resolved from the active risk profile's
+    /// `approval_route`. When set, the per-turn approval bridge asks the named
+    /// approver channel (bounded + fail-closed) instead of the originating
+    /// fan-out. `None` ⇒ today's behavior. See EPIC B.
+    approval_route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
     /// Activated MCP tools for deferred loading mode.
     /// When MCP deferred loading is enabled, tools are activated via `tool_search`
     /// and stored here for lookup during tool execution.
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    /// Pre-rendered MCP pinned-resource system-prompt section, read once at
+    /// construction from each server's `pinned_resources` and provenance-wrapped
+    /// (`trust="untrusted-external"`). Empty when no pins are configured or all
+    /// were skipped. Appended to the system prompt in `build_system_prompt`.
+    mcp_pinned_section: String,
+    /// Pre-rendered deferred-MCP-tools system-prompt section, built once at
+    /// construction when `mcp.deferred_loading` is enabled. It enumerates the
+    /// policy-admitted `<server>__<tool>` stubs and instructs the model to call
+    /// `tool_search` to activate them. Empty when deferred loading is off or no
+    /// stubs are admitted. Appended to the system prompt in
+    /// `build_system_prompt` so TUI Chat sessions surface the same deferred MCP
+    /// affordance the gateway and channel/webhook paths already expose (#8193).
+    mcp_deferred_section: String,
     /// Hook runner for tool-call auditing and lifecycle side effects.
     /// See issue #5462.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
@@ -202,6 +391,13 @@ pub struct Agent {
     /// at most once per session even though the multimodal pipeline re-walks
     /// the full conversation history on every turn and tool iteration.
     image_cache: zeroclaw_providers::multimodal::LocalImageCache,
+    /// Channel name stamped onto observer events to identify the calling surface
+    /// (e.g. "agent", "wss", "gateway"). Defaults to "agent" for direct Agent callers.
+    channel_name: String,
+    /// Test-only clock seam for deterministic cache-key tests. Production
+    /// always uses the live local clock.
+    #[cfg(test)]
+    turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
 }
 
 impl Drop for Agent {
@@ -314,11 +510,17 @@ pub struct AgentBuilder {
     response_cache: Option<Arc<zeroclaw_memory::response_cache::ResponseCache>>,
     security_summary: Option<String>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
+    approval_route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    mcp_pinned_section: Option<String>,
+    mcp_deferred_section: Option<String>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     approval_manager: Option<Arc<ApprovalManager>>,
     agent_alias: Option<String>,
+    channel_name: Option<String>,
     exclude_memory: bool,
+    #[cfg(test)]
+    turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
 }
 
 impl Default for AgentBuilder {
@@ -356,11 +558,17 @@ impl AgentBuilder {
             response_cache: None,
             security_summary: None,
             autonomy_level: None,
+            approval_route: None,
             activated_tools: None,
+            mcp_pinned_section: None,
+            mcp_deferred_section: None,
             hook_runner: None,
             approval_manager: None,
             agent_alias: None,
+            channel_name: None,
             exclude_memory: false,
+            #[cfg(test)]
+            turn_datetime: None,
         }
     }
 
@@ -512,11 +720,29 @@ impl AgentBuilder {
         self
     }
 
+    pub fn approval_route(
+        mut self,
+        route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
+    ) -> Self {
+        self.approval_route = route;
+        self
+    }
+
     pub fn activated_tools(
         mut self,
         activated: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>>,
     ) -> Self {
         self.activated_tools = activated;
+        self
+    }
+
+    pub fn mcp_pinned_section(mut self, section: Option<String>) -> Self {
+        self.mcp_pinned_section = section;
+        self
+    }
+
+    pub fn mcp_deferred_section(mut self, section: Option<String>) -> Self {
+        self.mcp_deferred_section = section;
         self
     }
 
@@ -533,6 +759,20 @@ impl AgentBuilder {
     /// Set the agent alias used for turn-span attribution.
     pub fn agent_alias(mut self, alias: String) -> Self {
         self.agent_alias = Some(alias);
+        self
+    }
+
+    pub fn channel_name(mut self, name: String) -> Self {
+        self.channel_name = Some(name);
+        self
+    }
+
+    #[cfg(test)]
+    fn turn_datetime<F>(mut self, provider: F) -> Self
+    where
+        F: Fn() -> chrono::DateTime<chrono::Local> + Send + Sync + 'static,
+    {
+        self.turn_datetime = Some(Arc::new(provider));
         self
     }
 
@@ -678,15 +918,21 @@ impl AgentBuilder {
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
             response_cache: self.response_cache,
             security_summary: self.security_summary,
+            approval_route: self.approval_route,
             autonomy_level: self
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
+            mcp_pinned_section: self.mcp_pinned_section.unwrap_or_default(),
+            mcp_deferred_section: self.mcp_deferred_section.unwrap_or_default(),
             hook_runner: self.hook_runner,
             approval_manager: self.approval_manager,
             agent_alias: self.agent_alias.unwrap_or_default(),
             channel_handles: AgentChannelHandles::default(),
             image_cache: zeroclaw_providers::multimodal::LocalImageCache::new(),
+            channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
+            #[cfg(test)]
+            turn_datetime: self.turn_datetime,
         })
     }
 }
@@ -704,6 +950,19 @@ impl Agent {
         }
 
         crate::agent::loop_::ToolLoopCostTrackingContext::usage_only()
+    }
+
+    fn current_turn_datetime(&self) -> chrono::DateTime<chrono::Local> {
+        #[cfg(test)]
+        if let Some(provider) = &self.turn_datetime {
+            return provider();
+        }
+
+        chrono::Local::now()
+    }
+
+    pub fn set_channel_name(&mut self, name: String) {
+        self.channel_name = name;
     }
 
     fn new_turn_id() -> String {
@@ -851,7 +1110,7 @@ impl Agent {
             });
         }
 
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        let now = self.current_turn_datetime().format("%Y-%m-%d %H:%M:%S %Z");
         let enriched = if context.is_empty() {
             format!("[{now}] {user_message}")
         } else {
@@ -869,6 +1128,23 @@ impl Agent {
 
     pub fn set_temperature(&mut self, temperature: Option<f64>) {
         self.temperature = temperature;
+    }
+
+    /// Refresh this agent's memory embedder after a provider-profile
+    /// `config/set`/`config/delete`, so a live session's per-agent memory stops
+    /// embedding against a stale endpoint/key without a daemon restart (#8359).
+    /// Forwards through any memory wrappers (e.g. `AgentScopedMemory`) to the
+    /// embedding backend; a no-op for backends that do not embed. `&self` —
+    /// the swap is interior to the memory handle.
+    pub fn refresh_memory_embedder(
+        &self,
+        model_provider: &str,
+        api_key: Option<&str>,
+        model: &str,
+        dimensions: usize,
+    ) {
+        self.memory
+            .refresh_embedder(model_provider, api_key, model, dimensions);
     }
 
     #[cfg(test)]
@@ -910,6 +1186,14 @@ impl Agent {
     #[cfg(test)]
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.iter().map(|t| t.name()).collect()
+    }
+
+    /// Render the current system prompt. Test-only — lets regression tests
+    /// assert on prompt-injected sections (e.g. the deferred-MCP-tools section
+    /// that advertises `tool_search`) without driving a full turn (#8193).
+    #[cfg(test)]
+    pub fn system_prompt_for_test(&self) -> Result<String> {
+        self.build_system_prompt()
     }
 
     /// Hydrate the agent with prior chat messages (e.g. from a session backend).
@@ -1106,12 +1390,20 @@ impl Agent {
         if let Err(e) = tokio::fs::create_dir_all(&agent_workspace).await {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "workspace": agent_workspace.display().to_string(), "e": e.to_string()})), "Failed to create per-agent workspace dir (continuing): ");
         }
-        // Seed the agent's bootstrap files (AGENTS.md / SOUL.md /
-        // IDENTITY.md / USER.md / TOOLS.md / BOOTSTRAP.md) on first
-        // run. Idempotent — never overwrites existing files; only
-        // fills in the gaps so a freshly-created agent has a basic
-        // identity to load.
-        if let Err(e) = zeroclaw_config::schema::ensure_bootstrap_files(&agent_workspace).await {
+        // Seed the agent's personality files (SOUL.md / IDENTITY.md /
+        // USER.md / AGENTS.md / TOOLS.md / HEARTBEAT.md / MEMORY.md) from
+        // the default preset on first run. Idempotent — only missing or
+        // blank files are written, so existing user edits are preserved.
+        // Without this a freshly-created agent loads with empty operating
+        // files, which silently breaks tool use for prompt-guided models
+        // that rely on AGENTS.md/TOOLS.md instead of native tool schemas.
+        if let Err(e) = crate::agent::personality::seed_default_personality(
+            config,
+            agent_alias,
+            &agent_workspace,
+        )
+        .await
+        {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "workspace": agent_workspace.display().to_string(), "e": e.to_string()})), "Failed to ensure per-agent bootstrap files (continuing with whatever exists): ");
         }
         let security = Arc::new({
@@ -1208,6 +1500,7 @@ impl Agent {
             tui_env,
             sop_engine,
             sop_audit,
+            None,
         );
         let mut tools = all_tools_result.tools;
         let delegate_handle = all_tools_result.delegate_handle;
@@ -1251,10 +1544,23 @@ impl Agent {
         // and webhook paths (loop_.rs) so that the WebSocket/daemon UI
         // path also has access to MCP tools.
         let mut activated_tools: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>> = None;
+        // Provenance-wrapped MCP pinned-resource system-prompt section, read
+        // once at construction (capability- and policy-gated).
+        let mut mcp_pinned_section = String::new();
+        // Deferred-MCP-tools system-prompt section (deferred_loading only). Built
+        // from the policy-admitted stubs so the model is told the deferred MCP
+        // tools exist and to call `tool_search` to activate them. Without this,
+        // TUI Chat sessions register `tool_search` but never advertise it, so the
+        // agent reports it has no MCP tools / no `tool_search` (#8193).
+        let mut mcp_deferred_section = String::new();
         // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
         let mut mcp_elevation_arcs: Vec<Arc<dyn tools::Tool>> = Vec::new();
         // Secure by default: only the MCP servers granted by this agent's
-        // `mcp_bundles` (omission is not a grant).
+        // `mcp_bundles` (omission is not a grant). Regression-covered by
+        // `crates/zeroclaw-runtime/src/rpc/dispatch.rs::tests::`
+        // `chat_session_new_omits_mcp_tools_when_agent_has_no_bundles_{deferred,eager}`
+        // - those tests reach this code path via `session/new` -> `Agent::from_config_with_tui_env`.
+        // If you change the call below, update those tests.
         let agent_mcp_servers = if initialize_mcp && config.mcp.enabled {
             config.mcp_servers_for_agent(agent_alias)
         } else {
@@ -1275,6 +1581,20 @@ impl Agent {
                     mcp_elevation_arcs = tools::collect_mcp_elevation_arcs(&registry).await;
                     let mcp_policy =
                         crate::agent::loop_::mcp_tool_access_policy(security.as_ref(), None);
+                    for tool in tools::build_mcp_capability_tools(&registry, mcp_policy.as_ref()) {
+                        crate::agent::loop_::register_eager_mcp_tool_if_allowed(
+                            tool,
+                            &mut tools,
+                            delegate_handle.as_ref(),
+                            mcp_policy.as_ref(),
+                        );
+                    }
+                    mcp_pinned_section = tools::mcp_context::build_pinned_resources_section(
+                        &registry,
+                        &agent_mcp_servers,
+                        mcp_policy.as_ref(),
+                    )
+                    .await;
                     if config.mcp.deferred_loading {
                         let deferred_set = tools::DeferredMcpToolSet::from_registry(
                             std::sync::Arc::clone(&registry),
@@ -1297,6 +1617,16 @@ impl Agent {
                                 .stubs
                                 .iter()
                                 .map(|stub| stub.prefixed_name.as_str()),
+                            mcp_policy.as_ref(),
+                        );
+                        // Build the system-prompt section describing the
+                        // policy-admitted deferred stubs BEFORE `mcp_policy` is
+                        // moved into `tool_search.with_access_policy`. Mirrors the
+                        // channel/webhook (`loop_.rs`) and gateway paths so TUI
+                        // Chat sessions advertise the same deferred MCP tools and
+                        // the `tool_search` affordance (#8193).
+                        mcp_deferred_section = tools::build_deferred_tools_section_filtered(
+                            &deferred_set,
                             mcp_policy.as_ref(),
                         );
                         if allowed_stub_count > 0 {
@@ -1494,18 +1824,14 @@ impl Agent {
             .exclude_memory(exclude_memory)
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(risk_profile.level)
+            .approval_route(risk_profile.approval_route.clone())
             .activated_tools(activated_tools)
+            .mcp_pinned_section(Some(mcp_pinned_section))
+            .mcp_deferred_section(Some(mcp_deferred_section))
             .hook_runner(if config.hooks.enabled {
-                let mut runner = crate::hooks::HookRunner::new();
-                if config.hooks.builtin.command_logger {
-                    runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
-                }
-                if config.hooks.builtin.webhook_audit.enabled {
-                    runner.register(Box::new(crate::hooks::builtin::WebhookAuditHook::new(
-                        config.hooks.builtin.webhook_audit.clone(),
-                    )));
-                }
-                Some(Arc::new(runner))
+                Some(Arc::new(crate::hooks::HookRunner::from_config(
+                    &config.hooks,
+                )))
             } else {
                 None
             })
@@ -1702,15 +2028,22 @@ impl Agent {
     }
 
     fn build_system_prompt(&self) -> Result<String> {
-        let expose_text_tool_protocol = !self.config.resolved.strict_tool_parsing
-            || self.tool_dispatcher.should_send_tool_specs();
+        self.build_system_prompt_with_dispatcher(self.tool_dispatcher.as_ref())
+    }
+
+    fn build_system_prompt_with_dispatcher(
+        &self,
+        dispatcher: &dyn ToolDispatcher,
+    ) -> Result<String> {
+        let expose_text_tool_protocol =
+            !self.config.resolved.strict_tool_parsing || dispatcher.should_send_tool_specs();
         let no_tools: Vec<Box<dyn Tool>> = Vec::new();
         let prompt_tools = if expose_text_tool_protocol {
             &self.tools
         } else {
             &no_tools
         };
-        let instructions = self.tool_dispatcher.prompt_instructions(prompt_tools);
+        let instructions = dispatcher.prompt_instructions(prompt_tools);
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
             agent_workspace_dir: &self.agent_workspace_dir,
@@ -1720,7 +2053,7 @@ impl Agent {
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
-            sends_native_tool_specs: self.tool_dispatcher.should_send_tool_specs()
+            sends_native_tool_specs: dispatcher.should_send_tool_specs()
                 && !prompt_tools.is_empty(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
@@ -1730,10 +2063,39 @@ impl Agent {
         if receipts.enabled && receipts.inject_system_prompt {
             prompt.push_str(crate::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
         }
+        if !self.mcp_deferred_section.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&self.mcp_deferred_section);
+        }
+        if !self.mcp_pinned_section.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&self.mcp_pinned_section);
+        }
         Ok(prompt)
     }
 
-    // Superseded by the loop's prepare/approve/execute pipeline (#7415).
+    /// Rebuild the stored system prompt using the dispatcher that matches the
+    /// active provider for this turn.
+    ///
+    /// `Agent::from_config` freezes the tool dispatcher and builds the prompt
+    /// once against the base provider. A multimodal/vision turn can route to a
+    /// different active provider, so we rebuild `history[0]` here before the
+    /// turn proceeds. This is the Agent-level complement to the per-iteration
+    /// anchor refresh in `turn/mod.rs` (#8054 Surface 3).
+    fn rebuild_system_prompt_for_dispatcher(
+        &mut self,
+        dispatcher: &dyn ToolDispatcher,
+    ) -> Result<()> {
+        let new_prompt = self.build_system_prompt_with_dispatcher(dispatcher)?;
+        let Some(ConversationMessage::Chat(first)) = self.history.first_mut() else {
+            return Ok(());
+        };
+        if first.role != "system" {
+            return Ok(());
+        }
+        first.content = new_prompt;
+        Ok(())
+    }
 
     fn classify_model(&self, user_message: &str) -> String {
         if let Some(decision) =
@@ -1943,7 +2305,7 @@ impl Agent {
             });
         }
 
-        let now = chrono::Local::now();
+        let now = self.current_turn_datetime();
         let (year, month, day) = (now.year(), now.month(), now.day());
         let (hour, minute, second) = (now.hour(), now.minute(), now.second());
         let tz = now.format("%Z");
@@ -1967,7 +2329,7 @@ impl Agent {
         self.observer.record_event(&ObserverEvent::AgentStart {
             model_provider: self.model_provider_name.clone(),
             model: effective_model.clone(),
-            channel: None,
+            channel: Some(self.channel_name.clone()),
             agent_alias: self.observer_agent_alias(),
             turn_id: Some(turn_id.clone()),
         });
@@ -1979,6 +2341,7 @@ impl Agent {
             turn_id: Some(turn_id.clone()),
             turn_started_at,
             agent_alias: self.observer_agent_alias(),
+            channel_name: self.channel_name.clone(),
             total_input_tokens: 0,
             total_output_tokens: 0,
             saw_usage: false,
@@ -1991,7 +2354,31 @@ impl Agent {
         // otherwise distinct conversations can collide when their final
         // prompt matches. Keyed on the raw provider transcript — multimodal
         // preparation is a per-iteration loop concern now.
-        let provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+        //
+        // ── Per-turn active-provider resolution and prompt refresh (#8054 Surface 2) ──
+        // The agent was built against the base provider, but a multimodal turn
+        // may route to a vision provider with different native-tool support.
+        // Rebuild the stored system prompt with the active provider's
+        // dispatcher and use that dispatcher when preparing the provider-visible
+        // transcript.
+        let active_dispatcher = {
+            let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let (vision_provider_box, _degrade_strip_images) =
+                crate::agent::turn::resolve_vision_provider(
+                    self.model_provider.as_ref(),
+                    &base_provider_messages,
+                    &self.multimodal_config,
+                    &self.model_provider_name,
+                )?;
+            let active_provider: &dyn ModelProvider = vision_provider_box
+                .as_deref()
+                .unwrap_or(self.model_provider.as_ref());
+            tool_dispatcher_for_provider(&self.config, active_provider)
+        };
+
+        self.rebuild_system_prompt_for_dispatcher(active_dispatcher.as_ref())?;
+
+        let provider_messages = active_dispatcher.to_provider_messages(&self.history);
         let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
 
         if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
@@ -2035,6 +2422,7 @@ impl Agent {
         let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
             &self.config.resolved.tool_receipts,
         );
+        let agent_alias_for_loop = self.observer_agent_alias();
         let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
                 Some(cost_context.clone()),
@@ -2077,7 +2465,7 @@ impl Agent {
                             },
                         ),
                         history: &mut loop_history,
-                        channel_name: "cli",
+                        channel_name: &self.channel_name,
                         channel_reply_target: None,
                         cancellation_token: None,
                         on_delta: None,
@@ -2093,6 +2481,8 @@ impl Agent {
                         // Phase 1: stamp Internal/Trusted. Real per-transport
                         // stamping is PR C (RFC #6971 §4).
                         ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                        agent_alias: agent_alias_for_loop.as_deref(),
+                        turn_id: &turn_id,
                     }),
                 ),
             )
@@ -2200,6 +2590,11 @@ impl Agent {
             // than the loop's static "cli" channel name. See
             // `last_decision_channel` below and `gate_tool_approval`.
             last_decision: parking_lot::Mutex<Option<String>>,
+            // Cross-channel HITL: when the active risk profile names a DISTINCT
+            // approver channel, this gate asks only that channel (bounded by a
+            // timeout, fail-closed) instead of fanning out to the originating
+            // back-channels. `None` ⇒ today's fan-out behavior. See EPIC B.
+            route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
         }
 
         impl ::zeroclaw_api::attribution::Attributable for AskUserApprovalBridge {
@@ -2243,16 +2638,39 @@ impl Agent {
                 request: &zeroclaw_api::channel::ChannelApprovalRequest,
             ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>>
             {
+                // Clear the previous decision's attribution; only a decisive
+                // answer below sets it, so an all-`None` fan-out leaves it unset
+                // and the gate falls back to the loop's channel name.
+                *self.last_decision.lock() = None;
+
+                // ── Cross-channel HITL route (EPIC B) ──────────────────────
+                // A configured `ApprovalRoute` redirects this gate to a DISTINCT
+                // approver channel rather than the originating fan-out. The
+                // approver is asked alone, bounded by `timeout_secs`; any
+                // non-decisive outcome (declined-without-answer, unreachable,
+                // unregistered, or timed out) is resolved by `on_no_approver` —
+                // fail-closed `Deny` by default, or fall through to the
+                // originating fan-out on explicit `InheritOriginator`. The
+                // decision logic lives in `resolve_routed_approval` so it is
+                // unit-testable without standing up a full Agent.
+                if let Some(route) = &self.route {
+                    match resolve_routed_approval(&self.handles, route, recipient, request).await {
+                        RoutedApproval::Decided { response, decider } => {
+                            *self.last_decision.lock() = decider;
+                            return Ok(Some(response));
+                        }
+                        RoutedApproval::Fallthrough => {
+                            // explicit InheritOriginator → originating fan-out below
+                        }
+                    }
+                }
+
                 let channels: Vec<(String, Arc<dyn zeroclaw_api::channel::Channel>)> = self
                     .handles
                     .read()
                     .iter()
                     .map(|(name, channel)| (name.clone(), Arc::clone(channel)))
                     .collect();
-                // Clear the previous decision's attribution; only a decisive
-                // answer below sets it, so an all-`None` fan-out leaves it unset
-                // and the gate falls back to the loop's channel name.
-                *self.last_decision.lock() = None;
                 for (channel_name, channel) in &channels {
                     match channel.request_approval(recipient, request).await {
                         Ok(Some(response)) => {
@@ -2332,7 +2750,7 @@ impl Agent {
         self.observer.record_event(&ObserverEvent::AgentStart {
             model_provider: self.model_provider_name.clone(),
             model: effective_model.clone(),
-            channel: None,
+            channel: Some(self.channel_name.clone()),
             agent_alias: self.observer_agent_alias(),
             turn_id: Some(turn_id.clone()),
         });
@@ -2344,6 +2762,7 @@ impl Agent {
             turn_id: Some(turn_id.clone()),
             turn_started_at,
             agent_alias: self.observer_agent_alias(),
+            channel_name: self.channel_name.clone(),
             total_input_tokens: 0,
             total_output_tokens: 0,
             saw_usage: false,
@@ -2354,7 +2773,41 @@ impl Agent {
         // provider-visible transcript (matches `Agent::turn`; the old code
         // re-checked every iteration, but only a transcript identical to a
         // previously cached single-exchange turn can ever hit).
-        let provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+        //
+        // ── Per-turn active-provider resolution and prompt refresh (#8054 Surface 2) ──
+        // The agent was built against the base provider, but a multimodal turn
+        // may route to a vision provider with different native-tool support.
+        // Rebuild the stored system prompt if the active provider's tool mode
+        // differs from the prompt's current claim, and use the active provider's
+        // dispatcher when preparing the provider-visible transcript.
+        let active_dispatcher = {
+            let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let (vision_provider_box, _degrade_strip_images) =
+                crate::agent::turn::resolve_vision_provider(
+                    self.model_provider.as_ref(),
+                    &base_provider_messages,
+                    &self.multimodal_config,
+                    &self.model_provider_name,
+                )
+                .map_err(|error| StreamedTurnError {
+                    error,
+                    committed_response: String::new(),
+                    new_messages: new_msgs.clone(),
+                })?;
+            let active_provider: &dyn ModelProvider = vision_provider_box
+                .as_deref()
+                .unwrap_or(self.model_provider.as_ref());
+            tool_dispatcher_for_provider(&self.config, active_provider)
+        };
+
+        self.rebuild_system_prompt_for_dispatcher(active_dispatcher.as_ref())
+            .map_err(|error| StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: new_msgs.clone(),
+            })?;
+
+        let provider_messages = active_dispatcher.to_provider_messages(&self.history);
         let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
 
         if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
@@ -2386,6 +2839,7 @@ impl Agent {
                 Box::new(AskUserApprovalBridge {
                     handles: Arc::clone(handles),
                     last_decision: parking_lot::Mutex::new(None),
+                    route: self.approval_route.clone(),
                 }) as Box<dyn zeroclaw_api::channel::Channel>
             });
 
@@ -2403,6 +2857,7 @@ impl Agent {
         };
 
         let cost_context = self.tool_loop_cost_tracking_context();
+        let agent_alias_for_loop = self.observer_agent_alias();
 
         // Built once per turn so the HMAC key is stable across steering rounds
         // and the same collector accumulates every round's receipts. `None`
@@ -2494,7 +2949,7 @@ impl Agent {
                                 },
                             ),
                             history: &mut loop_history,
-                            channel_name: "cli",
+                            channel_name: &self.channel_name,
                             channel_reply_target: None,
                             cancellation_token: cancel_token.clone(),
                             on_delta: None,
@@ -2510,6 +2965,8 @@ impl Agent {
                             // Phase 1: stamp Internal/Trusted. Real per-transport
                             // stamping is PR C (RFC #6971 §4).
                             ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                            agent_alias: agent_alias_for_loop.as_deref(),
+                            turn_id: &turn_id,
                         }),
                     ),
                 )
@@ -2688,8 +3145,6 @@ pub async fn run(
     model_override: Option<String>,
     temperature: Option<f64>,
 ) -> Result<()> {
-    let start = Instant::now();
-
     let mut effective_config = config;
     if let Some(ref p) = provider_override {
         // When a model_provider override is specified, ensure that model_provider type exists
@@ -2716,48 +3171,6 @@ pub async fn run(
 
     let mut agent = Agent::from_config(&effective_config, agent_alias).await?;
 
-    let (provider_name, model_name) =
-        match effective_config.resolved_model_provider_for_agent(agent_alias) {
-            Some((ty, _alias, entry)) => {
-                let model = entry
-                    .model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|m| !m.is_empty())
-                    .map(ToString::to_string)
-                    .or_else(|| effective_config.resolve_default_model())
-                    .unwrap_or_else(|| "<unresolved>".to_string());
-                (ty.to_string(), model)
-            }
-            None => (
-                provider_override.unwrap_or_else(|| "unknown".to_string()),
-                effective_config
-                    .resolve_default_model()
-                    .unwrap_or_else(|| "<unresolved>".to_string()),
-            ),
-        };
-
-    agent.observer.record_event(&ObserverEvent::AgentStart {
-        model_provider: provider_name.clone(),
-        model: model_name.clone(),
-        channel: None,
-        agent_alias: None,
-        turn_id: None,
-    });
-
-    let _run_guard = TurnGuard {
-        observer: Arc::clone(&agent.observer),
-        model_provider: provider_name,
-        model: model_name,
-        turn_id: None,
-        turn_started_at: start,
-        agent_alias: None,
-        total_input_tokens: 0,
-        total_output_tokens: 0,
-        saw_usage: false,
-        done: false,
-    };
-
     if let Some(msg) = message {
         let response = agent.run_single(&msg).await?;
         println!("{response}");
@@ -2778,6 +3191,7 @@ mod safety_net;
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use chrono::TimeZone;
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3154,6 +3568,13 @@ mod tests {
     #[derive(Default)]
     struct CapturingObserver {
         events: parking_lot::Mutex<Vec<ObserverEvent>>,
+    }
+
+    fn fixed_response_cache_turn_datetime() -> chrono::DateTime<chrono::Local> {
+        chrono::Local
+            .with_ymd_and_hms(2026, 6, 25, 12, 0, 0)
+            .single()
+            .expect("fixed local test timestamp")
     }
 
     impl Observer for CapturingObserver {
@@ -3596,6 +4017,370 @@ mod tests {
         assert!(xml_prompt.contains("## Tools"));
         assert!(xml_prompt.contains("echo"));
         assert!(xml_prompt.contains("## Tool Use Protocol"));
+    }
+
+    mod surface2_tests {
+        use super::*;
+        use crate::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher};
+
+        /// Marker text produced by the section-based prompt builder when tools
+        /// are advertised as XML/text instructions rather than native tool specs.
+        const XML_TOOLS_MARKER: &str = "## Tools";
+        type CapturedTranscripts = Arc<Mutex<Vec<Vec<ChatMessage>>>>;
+
+        /// Test provider that captures the provider-visible transcript and
+        /// reports a configurable native-tool capability.
+        struct CapturingModelProvider {
+            responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
+            supports_native: bool,
+            captured_messages: CapturedTranscripts,
+        }
+
+        #[async_trait]
+        impl ModelProvider for CapturingModelProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<String> {
+                Ok("ok".into())
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                self.captured_messages
+                    .lock()
+                    .push(request.messages.to_vec());
+                let mut guard = self.responses.lock();
+                if guard.is_empty() {
+                    return Ok(zeroclaw_providers::ChatResponse {
+                        text: Some("done".into()),
+                        tool_calls: vec![],
+                        usage: None,
+                        reasoning_content: None,
+                    });
+                }
+                Ok(guard.remove(0))
+            }
+
+            fn supports_native_tools(&self) -> bool {
+                self.supports_native
+            }
+        }
+
+        impl ::zeroclaw_api::attribution::Attributable for CapturingModelProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "CapturingModelProvider"
+            }
+        }
+
+        fn capturing_provider(
+            supports_native: bool,
+        ) -> (Box<dyn ModelProvider>, CapturedTranscripts) {
+            let captured: CapturedTranscripts = Arc::new(Mutex::new(Vec::new()));
+            (
+                Box::new(CapturingModelProvider {
+                    responses: Mutex::new(vec![]),
+                    supports_native,
+                    captured_messages: Arc::clone(&captured),
+                }),
+                captured,
+            )
+        }
+
+        fn test_agent_with_provider(
+            provider: Box<dyn ModelProvider>,
+            tools: Vec<Box<dyn Tool>>,
+        ) -> Agent {
+            test_agent_with_provider_and_multimodal(provider, tools, None, None)
+        }
+
+        fn test_agent_with_provider_and_multimodal(
+            provider: Box<dyn ModelProvider>,
+            tools: Vec<Box<dyn Tool>>,
+            tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
+            multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
+        ) -> Agent {
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let workspace = tempfile::TempDir::new().expect("temp dir");
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                    .expect("memory creation should succeed"),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            let mut builder = Agent::builder()
+                .model_provider(provider)
+                .tools(tools)
+                .memory(mem)
+                .observer(observer)
+                .workspace_dir(workspace.path().to_path_buf());
+            if let Some(dispatcher) = tool_dispatcher {
+                builder = builder.tool_dispatcher(dispatcher);
+            } else {
+                builder = builder.tool_dispatcher(Box::new(NativeToolDispatcher));
+            }
+            if let Some(mm) = multimodal_config {
+                builder = builder.multimodal_config(mm);
+            }
+            builder.build().expect("agent builder should succeed")
+        }
+
+        #[test]
+        fn build_system_prompt_with_dispatcher_reflects_dispatcher_mode() {
+            let workspace = tempfile::TempDir::new().expect("temp dir");
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                    .expect("memory creation should succeed"),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            let agent = Agent::builder()
+                .model_provider(Box::new(MockModelProvider {
+                    responses: Mutex::new(vec![]),
+                }))
+                .tools(vec![Box::new(MockTool)])
+                .memory(mem)
+                .observer(observer)
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(workspace.path().to_path_buf())
+                .build()
+                .expect("agent builder should succeed");
+
+            let native_prompt = agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher as &dyn ToolDispatcher)
+                .unwrap();
+            assert!(
+                !native_prompt.contains(XML_TOOLS_MARKER),
+                "native dispatcher must not emit XML tool listing"
+            );
+
+            let xml_prompt = agent
+                .build_system_prompt_with_dispatcher(&XmlToolDispatcher as &dyn ToolDispatcher)
+                .unwrap();
+            assert!(
+                xml_prompt.contains(XML_TOOLS_MARKER),
+                "xml dispatcher must emit XML tool listing"
+            );
+        }
+
+        #[test]
+        fn rebuild_system_prompt_switches_to_xml_when_active_provider_non_native() {
+            let (provider, _) = capturing_provider(true);
+            let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+
+            // Seed a native-style system prompt as if the agent was built
+            // against a native-capable base provider.
+            let native_prompt = agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher as &dyn ToolDispatcher)
+                .unwrap();
+            agent.history = vec![ConversationMessage::Chat(ChatMessage::system(
+                native_prompt,
+            ))];
+
+            // Active provider for this turn does not support native tools.
+            agent
+                .rebuild_system_prompt_for_dispatcher(&XmlToolDispatcher)
+                .expect("rebuild should succeed");
+
+            let prompt = match &agent.history[0] {
+                ConversationMessage::Chat(msg) => msg.content.clone(),
+                _ => panic!("history[0] should be a chat message"),
+            };
+            assert!(
+                prompt.contains(XML_TOOLS_MARKER),
+                "prompt must be rebuilt with XML tool listing"
+            );
+        }
+
+        #[test]
+        fn rebuild_system_prompt_switches_to_native_when_active_provider_native() {
+            let (provider, _) = capturing_provider(false);
+            let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+
+            let xml_prompt = agent
+                .build_system_prompt_with_dispatcher(&XmlToolDispatcher as &dyn ToolDispatcher)
+                .unwrap();
+            agent.history = vec![ConversationMessage::Chat(ChatMessage::system(xml_prompt))];
+
+            // Active provider for this turn supports native tools.
+            agent
+                .rebuild_system_prompt_for_dispatcher(&NativeToolDispatcher)
+                .expect("rebuild should succeed");
+
+            let prompt = match &agent.history[0] {
+                ConversationMessage::Chat(msg) => msg.content.clone(),
+                _ => panic!("history[0] should be a chat message"),
+            };
+            assert!(
+                !prompt.contains(XML_TOOLS_MARKER),
+                "prompt must be rebuilt without XML tool listing"
+            );
+        }
+
+        #[tokio::test]
+        async fn turn_uses_active_provider_tool_mode_for_transcript() {
+            let (provider, captured) = capturing_provider(false);
+            let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+
+            // The base provider does not support native tools, so the active
+            // provider resolved by the turn path must be non-native. The
+            // provider-visible transcript should reflect that.
+            agent.turn("hello").await.expect("turn should succeed");
+
+            let messages = captured.lock();
+            let first_call = messages
+                .first()
+                .expect("provider should have received a request");
+            let system = first_call
+                .iter()
+                .find(|m| m.role == "system")
+                .expect("transcript must contain a system message");
+            assert!(
+                system.content.contains(XML_TOOLS_MARKER),
+                "system prompt must advertise XML tools when active provider is non-native"
+            );
+        }
+
+        #[tokio::test]
+        async fn turn_streamed_uses_active_provider_tool_mode_for_transcript() {
+            let (provider, captured) = capturing_provider(false);
+            let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
+
+            agent
+                .turn_streamed("hello", event_tx, None)
+                .await
+                .expect("streamed turn should succeed");
+
+            let messages = captured.lock();
+            let first_call = messages
+                .first()
+                .expect("provider should have received a request");
+            let system = first_call
+                .iter()
+                .find(|m| m.role == "system")
+                .expect("transcript must contain a system message");
+            assert!(
+                system.content.contains(XML_TOOLS_MARKER),
+                "streamed system prompt must advertise XML tools when active provider is non-native"
+            );
+        }
+
+        /// Regression: an image turn that routes to a vision provider with
+        /// different native-tool support rebuilds the stored system prompt and
+        /// provider-visible transcript for that provider (#8054 Surface 2).
+        #[tokio::test]
+        async fn turn_rebuilds_prompt_for_vision_routed_xml_provider() {
+            // Base provider supports native tools but not vision. The configured
+            // vision provider is a custom OpenAI-compatible endpoint: it supports
+            // vision but not native tools.
+            let (base_provider, _captured) = capturing_provider(true);
+            let mm_config = zeroclaw_config::schema::MultimodalConfig {
+                vision_model_provider: Some("custom:http://127.0.0.1:9".into()),
+                ..Default::default()
+            };
+            let mut agent = test_agent_with_provider_and_multimodal(
+                base_provider,
+                vec![Box::new(MockTool)],
+                Some(Box::new(NativeToolDispatcher)),
+                Some(mm_config),
+            );
+
+            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
+
+            // The vision provider will fail to connect to localhost:9, but the
+            // prompt rebuild and provider-visible transcript happen before the
+            // network call.
+            let result = agent.turn(msg).await;
+            assert!(
+                result.is_err(),
+                "vision provider chat should fail to connect"
+            );
+
+            let system_content = match &agent.history[0] {
+                ConversationMessage::Chat(m) => m.content.clone(),
+                _ => panic!("history[0] should be a chat message"),
+            };
+            assert!(
+                system_content.contains(XML_TOOLS_MARKER),
+                "stored system prompt must be rebuilt for XML vision provider"
+            );
+
+            let provider_messages = XmlToolDispatcher.to_provider_messages(&agent.history);
+            let system = provider_messages
+                .iter()
+                .find(|m| m.role == "system")
+                .expect("transcript must contain a system message");
+            assert!(
+                system.content.contains(XML_TOOLS_MARKER),
+                "provider-visible transcript must advertise XML tools for vision provider"
+            );
+        }
+
+        #[tokio::test]
+        async fn turn_streamed_rebuilds_prompt_for_vision_routed_native_provider() {
+            // Base provider does not support native tools or vision. The
+            // configured vision provider is an Anthropic-compatible endpoint:
+            // it supports both vision and native tools.
+            let (base_provider, _captured) = capturing_provider(false);
+            let mm_config = zeroclaw_config::schema::MultimodalConfig {
+                vision_model_provider: Some("anthropic-custom:http://127.0.0.1:9".into()),
+                ..Default::default()
+            };
+            let mut agent = test_agent_with_provider_and_multimodal(
+                base_provider,
+                vec![Box::new(MockTool)],
+                Some(Box::new(XmlToolDispatcher)),
+                Some(mm_config),
+            );
+
+            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
+
+            let result = agent.turn_streamed(msg, event_tx, None).await;
+            assert!(
+                result.is_err(),
+                "vision provider chat should fail to connect"
+            );
+
+            let system_content = match &agent.history[0] {
+                ConversationMessage::Chat(m) => m.content.clone(),
+                _ => panic!("history[0] should be a chat message"),
+            };
+            assert!(
+                !system_content.contains(XML_TOOLS_MARKER),
+                "stored system prompt must be rebuilt for native vision provider"
+            );
+
+            let provider_messages = NativeToolDispatcher.to_provider_messages(&agent.history);
+            let system = provider_messages
+                .iter()
+                .find(|m| m.role == "system")
+                .expect("transcript must contain a system message");
+            assert!(
+                !system.content.contains(XML_TOOLS_MARKER),
+                "provider-visible transcript must advertise native tools for vision provider"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6820,8 +7605,124 @@ mod tests {
             | ObserverEvent::LlmRequest { turn_id, .. }
             | ObserverEvent::LlmResponse { turn_id, .. }
             | ObserverEvent::AgentEnd { turn_id, .. }
-            | ObserverEvent::ToolCall { turn_id, .. } => turn_id.as_deref(),
+            | ObserverEvent::ToolCall { turn_id, .. }
+            | ObserverEvent::ToolCallStart { turn_id, .. } => turn_id.as_deref(),
             _ => None,
+        }
+    }
+
+    fn assert_all_events_share_turn_id(
+        events: &[ObserverEvent],
+        expected_alias: Option<&str>,
+        expected_channel: Option<&str>,
+    ) {
+        // Regression guard for PR #7771: every lifecycle observer event that
+        // carries the `(channel, agent_alias, turn_id)` correlation triple
+        // MUST populate all three. These six variants back OTel parent-child
+        // span linkage and per-agent attribution; a `None` in any field
+        // silently breaks trace correlation. The original `run()` entry point
+        // emitted `AgentStart`/`AgentEnd` with `agent_alias: None` /
+        // `turn_id: None` because it recorded events outside the turn engine.
+        //
+        // This checks each event individually (no skipping
+        // `AgentStart`/`AgentEnd` aliases) and forbids `None` outright rather
+        // than only checking consistency among the non-`None` subset — a
+        // single `None` field is a failure, not something to be filtered out.
+        let mut turn_ids: Vec<String> = Vec::new();
+        for event in events {
+            let (variant, channel, agent_alias, turn_id) = match event {
+                ObserverEvent::AgentStart {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("AgentStart", channel, agent_alias, turn_id),
+                ObserverEvent::AgentEnd {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("AgentEnd", channel, agent_alias, turn_id),
+                ObserverEvent::LlmRequest {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("LlmRequest", channel, agent_alias, turn_id),
+                ObserverEvent::LlmResponse {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("LlmResponse", channel, agent_alias, turn_id),
+                ObserverEvent::ToolCallStart {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("ToolCallStart", channel, agent_alias, turn_id),
+                ObserverEvent::ToolCall {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => ("ToolCall", channel, agent_alias, turn_id),
+                _ => continue,
+            };
+            assert!(
+                channel.is_some(),
+                "{variant} observer event must carry channel, got None: {event:?}"
+            );
+            assert!(
+                agent_alias.is_some(),
+                "{variant} observer event must carry agent_alias, got None: {event:?}"
+            );
+            assert!(
+                turn_id.is_some(),
+                "{variant} observer event must carry turn_id, got None: {event:?}"
+            );
+            turn_ids.push(turn_id.clone().expect("checked Some above"));
+        }
+
+        assert!(!turn_ids.is_empty(), "expected turn events with turn_id");
+        let first = &turn_ids[0];
+        assert!(
+            turn_ids.iter().all(|id| id == first),
+            "all turn_ids should be consistent"
+        );
+
+        if let Some(alias) = expected_alias {
+            for e in events {
+                let agent_alias = match e {
+                    ObserverEvent::AgentStart { agent_alias, .. }
+                    | ObserverEvent::AgentEnd { agent_alias, .. }
+                    | ObserverEvent::LlmRequest { agent_alias, .. }
+                    | ObserverEvent::LlmResponse { agent_alias, .. }
+                    | ObserverEvent::ToolCallStart { agent_alias, .. }
+                    | ObserverEvent::ToolCall { agent_alias, .. } => agent_alias,
+                    _ => continue,
+                };
+                assert_eq!(
+                    agent_alias.as_deref(),
+                    Some(alias),
+                    "agent_alias should be consistent"
+                );
+            }
+        }
+
+        if let Some(channel) = expected_channel {
+            for e in events {
+                let ch = match e {
+                    ObserverEvent::AgentStart { channel: ch, .. }
+                    | ObserverEvent::LlmRequest { channel: ch, .. }
+                    | ObserverEvent::LlmResponse { channel: ch, .. }
+                    | ObserverEvent::ToolCallStart { channel: ch, .. }
+                    | ObserverEvent::ToolCall { channel: ch, .. }
+                    | ObserverEvent::AgentEnd { channel: ch, .. } => ch,
+                    _ => continue,
+                };
+                assert_eq!(ch.as_deref(), Some(channel), "channel should be consistent");
+            }
         }
     }
 
@@ -6901,6 +7802,7 @@ mod tests {
             .model_name("test-model".into())
             .temperature(Some(0.0))
             .prompt_builder(SystemPromptBuilder::default())
+            .turn_datetime(fixed_response_cache_turn_datetime)
             .build()
             .expect("agent builder should succeed with valid config");
 
@@ -6926,6 +7828,7 @@ mod tests {
             .model_name("test-model".into())
             .temperature(Some(0.0))
             .prompt_builder(SystemPromptBuilder::default())
+            .turn_datetime(fixed_response_cache_turn_datetime)
             .build()
             .expect("agent builder should succeed with valid config");
 
@@ -7290,18 +8193,230 @@ mod tests {
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .agent_alias("test-agent".into())
             .build()
             .expect("agent builder should succeed with valid config");
 
         let _ = agent.turn("test").await.expect("turn should succeed");
 
         let events = capturing.events.lock();
-        let turn_ids: Vec<&str> = events.iter().filter_map(observer_event_turn_id).collect();
-        assert!(!turn_ids.is_empty(), "turn events should carry turn_id");
-        let first = turn_ids[0];
+        assert_all_events_share_turn_id(&events, Some("test-agent"), Some("agent"));
+    }
+}
+
+/// Cross-channel HITL approval routing (EPIC B): `resolve_routed_approval`
+/// asks the named approver channel alone and applies `on_no_approver`
+/// (fail-closed by default) on any non-decisive outcome.
+#[cfg(test)]
+mod approval_route_tests {
+    use super::*;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use zeroclaw_api::channel::{ChannelApprovalRequest, ChannelApprovalResponse};
+    use zeroclaw_config::autonomy::{ApprovalRoute, OnNoApprover};
+
+    enum StubBehavior {
+        Answer(ChannelApprovalResponse),
+        NoDecision,
+        Slow,
+    }
+
+    struct StubChannel {
+        name: String,
+        behavior: StubBehavior,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for StubChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Channel(zeroclaw_api::attribution::ChannelKind::Cli)
+        }
+        fn alias(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_api::channel::Channel for StubChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn send(&self, _m: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn request_approval(
+            &self,
+            _recipient: &str,
+            _request: &ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+            match &self.behavior {
+                StubBehavior::Answer(resp) => Ok(Some(resp.clone())),
+                StubBehavior::NoDecision => Ok(None),
+                StubBehavior::Slow => {
+                    // Far exceeds the route timeout; with a paused clock the
+                    // timeout fires at +timeout_secs virtual time, instantly.
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    Ok(Some(ChannelApprovalResponse::Approve))
+                }
+            }
+        }
+    }
+
+    fn registry(channels: Vec<StubChannel>) -> tools::PerToolChannelHandle {
+        let mut map: HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> = HashMap::new();
+        for c in channels {
+            map.insert(c.name.clone(), Arc::new(c));
+        }
+        Arc::new(RwLock::new(map))
+    }
+
+    fn req() -> ChannelApprovalRequest {
+        ChannelApprovalRequest {
+            tool_name: "shell".into(),
+            arguments_summary: "rm -rf /".into(),
+            raw_arguments: None,
+        }
+    }
+
+    fn route(approver: &str, policy: OnNoApprover) -> ApprovalRoute {
+        ApprovalRoute {
+            approver_channel: approver.into(),
+            on_no_approver: policy,
+            timeout_secs: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn approver_answer_is_used_and_attributed() {
+        let h = registry(vec![StubChannel {
+            name: "ops".into(),
+            behavior: StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        }]);
+        match resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await {
+            RoutedApproval::Decided { response, decider } => {
+                assert_eq!(response, ChannelApprovalResponse::Approve);
+                assert_eq!(
+                    decider.as_deref(),
+                    Some("ops"),
+                    "decider names the approver"
+                );
+            }
+            RoutedApproval::Fallthrough => panic!("expected a routed decision"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unregistered_approver_fails_closed_by_default() {
+        let h = registry(vec![]);
+        match resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await {
+            RoutedApproval::Decided { response, decider } => {
+                assert_eq!(response, ChannelApprovalResponse::Deny, "fail-closed deny");
+                assert!(decider.is_none(), "synthetic deny has no decider");
+            }
+            RoutedApproval::Fallthrough => panic!("default policy must NOT fall through"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unregistered_approver_inherits_when_opted_in() {
+        let h = registry(vec![]);
+        let out = resolve_routed_approval(
+            &h,
+            &route("ops", OnNoApprover::InheritOriginator),
+            "r",
+            &req(),
+        )
+        .await;
         assert!(
-            turn_ids.iter().all(|turn_id| *turn_id == first),
-            "all turn_ids should be consistent"
+            matches!(out, RoutedApproval::Fallthrough),
+            "InheritOriginator must fall through to the originating fan-out"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_decision_fails_closed() {
+        let h = registry(vec![StubChannel {
+            name: "ops".into(),
+            behavior: StubBehavior::NoDecision,
+        }]);
+        let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await;
+        assert!(matches!(
+            out,
+            RoutedApproval::Decided {
+                response: ChannelApprovalResponse::Deny,
+                ..
+            }
+        ));
+    }
+
+    // The route timeout (1s) fires and cancels the stub's long sleep, so this
+    // resolves in ~1s of real time without needing tokio's `test-util` clock.
+    #[tokio::test]
+    async fn slow_approver_times_out_and_fails_closed() {
+        let h = registry(vec![StubChannel {
+            name: "ops".into(),
+            behavior: StubBehavior::Slow,
+        }]);
+        let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await;
+        assert!(matches!(
+            out,
+            RoutedApproval::Decided {
+                response: ChannelApprovalResponse::Deny,
+                ..
+            }
+        ));
+    }
+
+    // ── RoutedApprovalChannel (the channel-less / process_message bridge) ──
+    // Proves the route is CONSULTED on the non-interactive path: the bridge the
+    // gate sees as `ctx.channel` returns the approver's decision, fails closed
+    // by default, and yields `None` (gate auto-denies) when opted into
+    // inherit-originator on a path that has no originator.
+    use zeroclaw_api::channel::Channel as _;
+
+    #[tokio::test]
+    async fn routed_channel_returns_and_attributes_approver_decision() {
+        let h = registry(vec![StubChannel {
+            name: "ops".into(),
+            behavior: StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        }]);
+        let bridge = RoutedApprovalChannel::new(h, route("ops", OnNoApprover::Deny));
+        let out = bridge.request_approval("r", &req()).await.unwrap();
+        assert_eq!(out, Some(ChannelApprovalResponse::Approve));
+        assert_eq!(
+            bridge.last_decision_channel().as_deref(),
+            Some("ops"),
+            "the gate attributes the approval to the deciding channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_channel_fails_closed_when_approver_unregistered() {
+        let bridge = RoutedApprovalChannel::new(registry(vec![]), route("ops", OnNoApprover::Deny));
+        let out = bridge.request_approval("r", &req()).await.unwrap();
+        assert_eq!(
+            out,
+            Some(ChannelApprovalResponse::Deny),
+            "unreachable approver denies, not auto-approves"
+        );
+        assert!(bridge.last_decision_channel().is_none());
+    }
+
+    #[tokio::test]
+    async fn routed_channel_inherit_returns_none_on_channelless_path() {
+        let bridge = RoutedApprovalChannel::new(
+            registry(vec![]),
+            route("ops", OnNoApprover::InheritOriginator),
+        );
+        let out = bridge.request_approval("r", &req()).await.unwrap();
+        assert_eq!(
+            out, None,
+            "no originator to inherit; gate applies the non-interactive auto-deny"
         );
     }
 }

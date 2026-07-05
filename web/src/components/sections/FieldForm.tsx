@@ -8,7 +8,8 @@
 //  * enum       → <select> with enum_variants
 //  * string-array → <textarea>, one value per line
 //  * integer/float → <input type="number">
-//  * secret     → <input type="password"> with populated indicator
+//  * secret     → "set" indicator + Change when populated; masked input with
+//    a reveal/hide toggle when unset or changing
 //  * provider model field (path matches `model_providers.<name>.model`) →
 //    fetches /api/config/catalog/models?provider=<name>, populates a
 //    <datalist>; on fetch failure falls back to free-text with help text.
@@ -28,6 +29,8 @@ import {
 import { Link } from "react-router-dom";
 import {
   ExternalLink,
+  Eye,
+  EyeOff,
   FolderOpen,
   List as ListIcon,
   MessageSquarePlus,
@@ -48,6 +51,7 @@ import {
   fetchConfigSchema,
   getAgentOptions,
   getCatalogModels,
+  getChannels,
   listProps,
   objectArrayElementProps,
   patchConfig,
@@ -718,6 +722,96 @@ function agentAliasJumpPath(
   return `${base}/${encodeURIComponent(alias)}`;
 }
 
+// Secret field renderer. A populated secret shows a static "set" indicator and
+// a Change button so the stored value (and its length) is never represented in
+// the DOM until the operator opts in. Entering change mode reveals a masked
+// input with a reveal/hide eye toggle and a cancel control that reverts to the
+// set state. An unset secret renders the input directly with no cancel.
+//
+// The draft contract is unchanged: an empty value means "keep the stored
+// secret" (handled by handleSave's `e.is_secret && raw.length === 0` guard), so
+// cancelling clears the draft back to empty.
+function SecretField({
+  inputId,
+  populated,
+  value,
+  onChange,
+}: {
+  inputId: string;
+  populated: boolean;
+  value: string;
+  onChange: (next: string) => void;
+}) {
+  // Start in change mode when a populated field already carries a staged draft
+  // value (operator typed a replacement, navigated away, came back). Otherwise
+  // the pending edit would hide behind the "set" indicator and the operator
+  // could not see or read back their own unsaved change.
+  const [changing, setChanging] = useState(populated && value.length > 0);
+  const [revealed, setRevealed] = useState(false);
+
+  const editing = !populated || changing;
+
+  if (!editing) {
+    return (
+      <button
+        type="button"
+        onClick={() => {
+          setChanging(true);
+          setRevealed(false);
+        }}
+        className="btn-secondary text-sm px-3 py-1.5 inline-flex items-center gap-1"
+      >
+        {t("fieldform.secret_change")}
+      </button>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-2">
+      <div className="relative flex-1">
+        <input
+          id={inputId}
+          type={revealed ? "text" : "password"}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="input-electric w-full px-3 py-2 pr-10 text-sm"
+          placeholder={t("fieldform.secret_enter_placeholder")}
+          autoComplete="off"
+        />
+        <button
+          type="button"
+          onClick={() => setRevealed((r) => !r)}
+          title={revealed ? t("fieldform.secret_hide") : t("fieldform.secret_reveal")}
+          aria-label={revealed ? t("fieldform.secret_hide") : t("fieldform.secret_reveal")}
+          aria-pressed={revealed}
+          className="btn-icon absolute right-1.5 top-1/2 -translate-y-1/2"
+        >
+          {revealed ? (
+            <EyeOff className="h-4 w-4" />
+          ) : (
+            <Eye className="h-4 w-4" />
+          )}
+        </button>
+      </div>
+      {populated && (
+        <button
+          type="button"
+          onClick={() => {
+            onChange("");
+            setChanging(false);
+            setRevealed(false);
+          }}
+          title={t("fieldform.secret_cancel_change")}
+          aria-label={t("fieldform.secret_cancel_change")}
+          className="btn-icon flex-shrink-0"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      )}
+    </div>
+  );
+}
+
 const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
   function FieldForm(
     {
@@ -747,6 +841,36 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
       undefined,
     );
     const [filter, setFilter] = useState("");
+
+    // When this form edits a channel block (`channels.<type>.<alias>`), its
+    // `excluded_tools` ToolPicker should list the OWNING agent's scoped tools
+    // (built-ins + its `mcp_bundles` MCP), not the default agent's. The owner
+    // is the agent whose `channels` list contains `<type>.<alias>` (a reverse
+    // lookup the gateway already does and returns as `owning_agent`), so it
+    // is NOT the alias in the path. `undefined` for non-channel sections
+    // (risk profiles are shared across agents; pipeline/claude_code are
+    // global) leaves the picker on the default-agent catalog.
+    const [toolAgent, setToolAgent] = useState<string | undefined>(undefined);
+    useEffect(() => {
+      if (!prefix.startsWith("channels.")) {
+        setToolAgent(undefined);
+        return;
+      }
+      const channelName = prefix.slice("channels.".length);
+      let cancelled = false;
+      void getChannels()
+        .then((channels) => {
+          if (cancelled) return;
+          const owner = channels.find((c) => c.name === channelName)?.owning_agent;
+          setToolAgent(owner ?? undefined);
+        })
+        .catch(() => {
+          if (!cancelled) setToolAgent(undefined);
+        });
+      return () => {
+        cancelled = true;
+      };
+    }, [prefix]);
 
     // Schema is whole-Config and ETag-cached server-side; fetch once per
     // session so every form row can resolve its `///` doc-comment helper
@@ -1122,6 +1246,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
               <FieldRow
                 key={f.path}
                 entry={f}
+                toolAgent={toolAgent}
                 value={draft[f.path] ?? ""}
                 onChange={(v) => {
                   setDraft((d) => ({ ...d, [f.path]: v }));
@@ -1252,6 +1377,10 @@ interface FieldRowProps {
   tombstoned?: boolean;
   /** Pulls the row out of tombstoned state. */
   onUndoTombstone?: () => void;
+  /** Owning agent for an `allowed_tools`/`excluded_tools` ToolPicker in this
+   *  section (e.g. a channel's `owning_agent`), so the picker lists that
+   *  agent's scoped tools. `undefined` keeps the default-agent catalog. */
+  toolAgent?: string;
 }
 
 function FieldRow({
@@ -1267,6 +1396,7 @@ function FieldRow({
   drift,
   tombstoned,
   onUndoTombstone,
+  toolAgent,
 }: FieldRowProps) {
   const renderer = rendererFor(entry);
   const requirement = setupRequirement(entry);
@@ -1717,6 +1847,7 @@ function FieldRow({
           // (parseInput → parseStringArrayValue) never sees a difference.
           <ToolPicker
             id={entry.path}
+            agent={toolAgent}
             value={parseArrayRows(value)}
             onChange={(next) => onChange(JSON.stringify(next))}
           />
@@ -1792,20 +1923,20 @@ function FieldRow({
               </div>
             )}
           </div>
+        ) : renderer === "secret" ? (
+          <SecretField
+            inputId={entry.path}
+            populated={entry.populated}
+            value={value}
+            onChange={onChange}
+          />
         ) : (
           <input
             id={entry.path}
-            type={renderer === "secret" ? "password" : "text"}
+            type="text"
             value={value}
             onChange={(e) => onChange(e.target.value)}
             className="input-electric w-full px-3 py-2 text-sm"
-            placeholder={
-              renderer === "secret"
-                ? entry.populated
-                  ? t("fieldform.secret_keep_placeholder")
-                  : t("fieldform.secret_enter_placeholder")
-                : ""
-            }
           />
         )}
 

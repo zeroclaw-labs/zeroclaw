@@ -105,7 +105,7 @@ Model-side tool-call syntax parsing. Handles variations between providers:
 
 ### `zeroclaw-plugins`
 
-Dynamic plugin loader for out-of-process tool implementations. See [Developing → Plugin protocol](../developing/plugin-protocol.md).
+Sandboxed WASM plugin host: loads component-model plugins (tool, channel, memory, skill bundles) in-process under WASI with per-call fuel and memory limits. See [Developing → Plugin protocol](../developing/plugin-protocol.md).
 
 ### `zeroclaw-hardware`
 
@@ -133,7 +133,10 @@ Call sites use `spawn!` instead of `tokio::spawn` directly.
 ### `zeroclaw-infra`
 
 Process-level support: debouncers, watchdogs, the SQLite session
-backend. Not a tracing/metrics layer, that's `zeroclaw-log`.
+backend. Not a tracing/metrics layer, that's `zeroclaw-log`. See
+[Runtime state and persistence](./runtime-state-and-persistence.md) for the
+state ownership and durability boundaries across config, sessions, memory,
+logs, costs, cron, and gateway metadata.
 
 ### `zeroclaw-macros`
 
