@@ -19,6 +19,12 @@
 /docs/book/src/_snippets/hardware-release-targets.md
 /docs/book/src/_snippets/hardware-pi-targets.md
 /docs/book/src/_snippets/hardware-lowmem-lto.md
+/docs/book/src/_snippets/plugin-channel-flag-count.md
+/docs/book/src/_snippets/plugin-channel-func-count.md
+/docs/book/src/_snippets/plugin-channel-required-count.md
+/docs/book/src/_snippets/plugin-channel-multi-delay-default-ms.md
+/docs/book/src/_snippets/plugin-memory-flag-count.md
+/docs/book/src/_snippets/plugin-archive-max-mib.md
 /docs/book/theme/lang-switcher.js
 /docs/book/theme/pc-themes.css
 /docs/superpowers/plans

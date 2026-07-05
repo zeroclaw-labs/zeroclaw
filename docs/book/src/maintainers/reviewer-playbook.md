@@ -54,7 +54,7 @@ If any intake check fails, leave one actionable checklist comment and stop. Don'
 - Rollback path is concrete; "revert" is not concrete.
 - Compatibility and migration impact is clear.
 - No personal or sensitive data leaked into diff artifacts; tests use neutral, project-scoped placeholders.
-- Naming and architecture boundaries follow project contracts (`AGENTS.md`, [Extension examples](../developing/extension-examples.md)).
+- Naming and architecture boundaries follow project contracts (`AGENTS.md`, [Architecture overview](../architecture/overview.md#core-traits)).
 
 ### Deep-review checklist (high-risk only)
 

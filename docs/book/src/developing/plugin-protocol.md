@@ -118,7 +118,11 @@ jail, and host-fed `inbound` queue) is complete and unit-covered, and
 to register. Wiring those into the live orchestrator (the discovery-to-channel
 loop in the runtime, plus a per-vendor host listener that drains its transport
 into each channel's `inbound` queue) is the remaining seam and lands with the
-runtime channel-registration change, not this host slice.
+runtime channel-registration change, not this host slice. The memory bridge
+(`WasmMemory`) is in the same position one step earlier: the adapter implements
+the full `Memory` trait against the `memory-plugin` world, but the host does not
+yet expose a memory counterpart to `channel_plugin_details()` and the runtime
+does not yet construct a `WasmMemory` as a configurable backend.
 
 ## Plugin structure
 
@@ -394,10 +398,14 @@ reserved `__config` key, but only when the manifest grants `config_read`:
 `runtime.rs` strips any caller-supplied `__config` before injecting the resolved
 section, so the section cannot be spoofed, and withholds it entirely when the
 permission is absent. Operators populate this section through the configuration
-surfaces above (zerocode, the CLI, the gateway), never by hand-editing a file;
-the section's keys are whatever the plugin's schema declares. The field is
-marked secret, so values encrypt at rest under the adjacent `.secret_key`. A
-plugin only ever sees its own section.
+surfaces above (zerocode, the CLI, the gateway) rather than hand-editing a
+file, with one current exception: a freshly installed plugin has no
+`plugins.entries` entry yet, and `config set` cannot materialize a missing
+natural-key entry, so the first entry must be added to the file by hand
+(tracked in issue #8636). The section's keys are whatever the plugin's schema
+declares. The field is marked secret, so CLI-written values encrypt at rest
+under the adjacent `.secret_key`; hand-written plaintext values are also
+accepted at load. A plugin only ever sees its own section.
 
 ## WASI Component Host
 
@@ -486,7 +494,10 @@ fails its policy rather than aborting the whole host; install returns the error.
 
 A plugin is a `cdylib` crate that targets the component model. Generate the
 guest bindings from the same `wit/v0` package the host uses, implement the
-exported world, and compile to `wasm32-wasip2`.
+exported world, and compile to `wasm32-wasip2`. For the full worked
+walkthroughs from empty crate to installed plugin, see the
+[plugin guides](../plugins/index.md); the notes below cover the
+build and install mechanics.
 
 ### Building
 
@@ -534,9 +545,11 @@ cp -r my-plugin/ ~/.zeroclaw/plugins/my-plugin/
 
 ## Configuration
 
-You never hand-edit TOML to configure a plugin. ZeroClaw exposes the plugin
+You rarely hand-edit TOML to configure a plugin. ZeroClaw exposes the plugin
 config schema through every surface, and each surface writes the same underlying
-state through the schema mirror. Pick whichever fits the moment:
+state through the schema mirror (the one current exception: seeding a fresh
+plugin's `plugins.entries` entry, per the note under Per-plugin config). Pick
+whichever fits the moment:
 
 - **zerocode** the interactive config editor. Walk to the plugins section and
   set fields with validation and inline help.
@@ -567,7 +580,11 @@ workspace `Cargo.toml` select whether plugins are built in at all and which
 execution backend ships:
 
 - `plugins-wasm` is the umbrella that pulls the plugin host and its runtime
-  integration into the binary.
+  integration into the binary. It is **required**: the backend features below
+  select an execution engine but do not imply the umbrella, so building with
+  only a backend feature succeeds and silently yields a binary with no
+  `plugin` subcommand. Always pass `plugins-wasm` plus your chosen backend,
+  e.g. `--features plugins-wasm,plugins-wasm-cranelift`.
 - `plugins-wasm-runtime-only` is the smallest and fastest to start: no JIT, so
   components are deserialized from a precompiled `.cwasm`.
 - `plugins-wasm-cranelift` adds the Cranelift JIT, so a `.wasm` component is

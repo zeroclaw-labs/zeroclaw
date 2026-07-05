@@ -539,7 +539,7 @@ fn elide_image_data(content: &str) -> String {
 /// xoxb-/…) and `scrub_credentials` (key=value / bearer=) are disjoint; neither
 /// alone covers free-form content. Residual secrets/PII may remain — this is
 /// disclosed in the PR/docs, not eliminated.
-fn scrub_for_export(content: &str) -> String {
+pub(crate) fn scrub_for_export(content: &str) -> String {
     scrub_credentials(&zeroclaw_providers::scrub_secret_patterns(
         &elide_image_data(content),
     ))
@@ -552,6 +552,14 @@ fn scrub_for_export(content: &str) -> String {
 /// builds pay no cloning/scrubbing cost. The system message is split into
 /// `system_instructions`; the rest become `input`. Every string passes through
 /// [`scrub_for_export`] (image elision + dual credential scrub).
+///
+/// This function does NOT consult any OTel content policy — it only constructs
+/// a credential-scrubbed snapshot when the `observability-otel` feature is
+/// enabled. Whether that snapshot is actually exported (and at what privacy
+/// level: `off` / `redacted` / `full`) is decided by the owning
+/// `OtelObserver`'s instance content config at the OTel export boundary, not
+/// here. Keeping the policy out of the capture path avoids process-global
+/// mutable state and the cross-observer drift it caused.
 pub(crate) fn capture_llm_messages(
     messages: &[ChatMessage],
     output_text: Option<&str>,

@@ -50,7 +50,7 @@ flowchart TB
 | `zeroclaw-tools` | Callable tool implementations the agent invokes (browser, HTTP, PDF, hardware probes) |
 | `zeroclaw-tool-call-parser` | Model-side tool-call syntax parsing and normalisation |
 | `zeroclaw-memory` | Conversation memory, embeddings, vector retrieval |
-| `zeroclaw-plugins` | Dynamic plugin loading |
+| `zeroclaw-plugins` | Sandboxed WASM plugin host (WIT component model) |
 | `zeroclaw-hardware` | Hardware abstraction layer (GPIO, I2C, SPI, USB) |
 | `zeroclaw-infra` | Process-level support: SQLite session backend, debouncers, stall watchdog |
 | `zeroclaw-log` | The single log-emission surface: JSONL schema, attribution, `record!`/`scope!` macros, `/api/logs` reader, `Observer` bridge |
@@ -88,9 +88,9 @@ sequenceDiagram
 
 Full detail: [Request lifecycle](./request-lifecycle.md).
 
-## Extension points
+## Core traits
 
-Trait-based extension contracts live in `zeroclaw-api`. For built-in providers, channels, tools, memory backends, and peripherals, start with [First-party extensions](../developing/first-party-extensions.md); the bullets below point to the closest adjacent docs.
+Trait contracts live in `zeroclaw-api`; the trait definitions in `crates/zeroclaw-api/src/` are the source of truth for built-in providers, channels, tools, memory backends, and peripherals. For capabilities that should live outside the core binary, start with the [plugin guides](../plugins/index.md). The bullets below point to the closest adjacent docs.
 
 - **`ModelProvider`**: use `custom` or an existing provider family for OpenAI-compatible endpoints; implement this trait when adding a new provider family, auth model, capability declaration, or wire protocol. See [Custom providers](../providers/custom.md).
 - **`Channel`**: implement for a new messaging platform. Inbound and outbound are separate hooks. See [Channels overview](../channels/overview.md).
