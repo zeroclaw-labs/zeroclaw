@@ -28,7 +28,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::autonomy::AutonomyLevel;
-use crate::autonomy::DelegationPolicy;
+use crate::autonomy::{DelegationMode, DelegationPolicy};
 use crate::policy::{default_allowed_commands, default_forbidden_paths};
 use crate::schema::{RiskProfileConfig, RuntimeProfileConfig};
 
@@ -107,6 +107,7 @@ fn locked_down_risk() -> RiskProfileConfig {
         always_ask: vec![],
         allowed_roots: vec![],
         delegation_policy: DelegationPolicy::default(),
+        approval_route: None,
         allowed_tools: vec![],
         excluded_tools: vec![],
         sandbox_enabled: Some(true),
@@ -135,7 +136,10 @@ fn balanced_risk() -> RiskProfileConfig {
         auto_approve: vec![],
         always_ask: vec![],
         allowed_roots: vec![],
-        delegation_policy: DelegationPolicy::default(),
+        delegation_policy: DelegationPolicy {
+            mode: DelegationMode::Allow,
+        },
+        approval_route: None,
         allowed_tools: vec![],
         excluded_tools: vec![],
         sandbox_enabled: Some(true),
@@ -159,10 +163,13 @@ fn yolo_risk() -> RiskProfileConfig {
         require_approval_for_medium_risk: false,
         block_high_risk_commands: false,
         shell_env_passthrough: vec![],
-        auto_approve: vec![],
+        auto_approve: vec!["*".to_string()],
         always_ask: vec![],
         allowed_roots: vec![],
-        delegation_policy: DelegationPolicy::default(),
+        delegation_policy: DelegationPolicy {
+            mode: DelegationMode::Allow,
+        },
+        approval_route: None,
         allowed_tools: vec![],
         excluded_tools: vec![],
         sandbox_enabled: Some(false),
@@ -202,6 +209,14 @@ pub const RUNTIME_PRESETS: &[RuntimePreset] = &[
                metered API keys, or tight feedback loops where you want \
                the agent to stop and ask early rather than burn budget.",
         values: tight_runtime,
+    },
+    RuntimePreset {
+        preset_name: "local_small",
+        label: "Local Small",
+        help: "Compact no-text-fallback profile for smaller local models. \
+               Keeps context and tool results small, disables parallel tool \
+               fan-out, and requires native or structured tool calls.",
+        values: local_small_runtime,
     },
     RuntimePreset {
         preset_name: "balanced",
@@ -249,6 +264,31 @@ fn tight_runtime() -> RuntimeProfileConfig {
         max_tool_result_chars: Some(8_000),
         keep_tool_context_turns: Some(2),
         memory_recall_limit: Some(3),
+        ..RuntimeProfileConfig::default()
+    }
+}
+
+fn local_small_runtime() -> RuntimeProfileConfig {
+    RuntimeProfileConfig {
+        agentic: true,
+        max_tool_iterations: 4,
+        max_actions_per_hour: 10,
+        max_cost_per_day_cents: 100,
+        shell_timeout_secs: 30,
+        max_delegation_depth: 1,
+        delegation_timeout_secs: Some(60),
+        agentic_timeout_secs: Some(120),
+        max_history_messages: Some(20),
+        max_context_tokens: Some(8_000),
+        compact_context: Some(true),
+        parallel_tools: Some(false),
+        tool_dispatcher: None,
+        tool_call_dedup_exempt: vec![],
+        max_system_prompt_chars: Some(4_000),
+        max_tool_result_chars: Some(4_000),
+        keep_tool_context_turns: Some(1),
+        memory_recall_limit: Some(3),
+        strict_tool_parsing: true,
         ..RuntimeProfileConfig::default()
     }
 }
@@ -620,6 +660,61 @@ mod tests {
         assert_eq!(format!("{preset_values:?}"), format!("{schema_default:?}"),);
     }
 
+    #[test]
+    fn local_small_runtime_matches_documented_small_model_shape() {
+        let preset = runtime_preset("local_small").expect("local_small preset");
+        let values = (preset.values)();
+
+        assert!(values.agentic);
+        assert_eq!(values.max_tool_iterations, 4);
+        assert_eq!(values.max_actions_per_hour, 10);
+        assert_eq!(values.max_cost_per_day_cents, 100);
+        assert_eq!(values.shell_timeout_secs, 30);
+        assert_eq!(values.max_delegation_depth, 1);
+        assert_eq!(values.delegation_timeout_secs, Some(60));
+        assert_eq!(values.agentic_timeout_secs, Some(120));
+        assert_eq!(values.max_history_messages, Some(20));
+        assert_eq!(values.max_context_tokens, Some(8_000));
+        assert_eq!(values.compact_context, Some(true));
+        assert_eq!(values.parallel_tools, Some(false));
+        assert_eq!(values.max_system_prompt_chars, Some(4_000));
+        assert_eq!(values.max_tool_result_chars, Some(4_000));
+        assert_eq!(values.keep_tool_context_turns, Some(1));
+        assert_eq!(values.memory_recall_limit, Some(3));
+        assert!(values.strict_tool_parsing);
+    }
+
+    #[test]
+    fn local_small_runtime_resolves_to_strict_compact_agent_policy() {
+        let preset = runtime_preset("local_small").expect("local_small preset");
+        let mut config = crate::schema::Config::default();
+        config
+            .runtime_profiles
+            .insert("local_small".into(), (preset.values)());
+        config.agents.insert(
+            "local_agent".into(),
+            crate::schema::AliasedAgentConfig {
+                runtime_profile: crate::providers::RuntimeProfileRef::new("local_small"),
+                ..crate::schema::AliasedAgentConfig::default()
+            },
+        );
+
+        let resolved = config
+            .resolved_agent_config("local_agent")
+            .expect("agent should resolve");
+
+        assert!(resolved.resolved.strict_tool_parsing);
+        assert_eq!(resolved.resolved.max_tool_iterations, 4);
+        assert_eq!(resolved.resolved.max_history_messages, 20);
+        assert_eq!(resolved.resolved.max_context_tokens, 8_000);
+        assert!(resolved.resolved.compact_context);
+        assert!(!resolved.resolved.parallel_tools);
+        assert_eq!(resolved.resolved.max_system_prompt_chars, 4_000);
+        assert_eq!(resolved.resolved.max_tool_result_chars, 4_000);
+        assert_eq!(resolved.resolved.keep_tool_context_turns, 1);
+        assert_eq!(config.effective_memory_recall_limit("local_agent"), 3);
+    }
+
     /// Regression: the `unbounded` preset must NOT zero out the action
     /// budget. A `max_actions_per_hour` of 0 is a hard zero budget (the
     /// per-sender tracker treats 0 as always exhausted), so an agent on
@@ -665,6 +760,43 @@ mod tests {
             assert!(
                 policy.is_command_allowed(cmd),
                 "yolo profile must allow `{cmd}` — it grants full autonomy with no denylist",
+            );
+        }
+    }
+
+    /// Regression: the `yolo` preset must declare unrestricted intent.
+    #[test]
+    fn yolo_risk_auto_approves_everything_with_no_forbidden_paths() {
+        let preset = risk_preset("yolo").unwrap();
+        let values = (preset.values)();
+        assert_eq!(
+            values.auto_approve,
+            vec!["*".to_string()],
+            "yolo must auto-approve every tool via the `*` wildcard",
+        );
+        assert!(
+            values.forbidden_paths.is_empty(),
+            "yolo must have no forbidden paths",
+        );
+        assert!(
+            values.always_ask.is_empty(),
+            "yolo must never force an approval prompt",
+        );
+        assert!(
+            values.delegation_policy.permits(),
+            "yolo must permit delegation",
+        );
+    }
+
+    /// Regression: `yolo` and `balanced` both permit delegation.
+    #[test]
+    fn yolo_and_balanced_permit_delegation() {
+        for name in ["yolo", "balanced"] {
+            let preset = risk_preset(name).unwrap();
+            let values = (preset.values)();
+            assert!(
+                values.delegation_policy.permits(),
+                "{name} must permit delegation",
             );
         }
     }

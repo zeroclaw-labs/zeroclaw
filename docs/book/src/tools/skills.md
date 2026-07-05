@@ -10,6 +10,8 @@ Skills live in the workspace under `skills/<name>/`. With the default workspace 
 
 For hand-authored local skills, use `SKILL.md` or `SKILL.toml`. Use `SKILL.md` for instructions plus simple metadata. Use `SKILL.toml` when the skill needs structured prompts or tool definitions. ZeroClaw also understands `manifest.toml` for registry-style skill packages, but `SKILL.md` and `SKILL.toml` are the recommended local authoring formats.
 
+To distribute a set of skills as a signed, versioned, installable package, see [Skill bundles](./skill-bundles.md).
+
 ## Create a Markdown skill
 
 A minimal instruction-only skill can be just a Markdown file:
@@ -145,6 +147,8 @@ zeroclaw skills test --verbose
 
 `zeroclaw skills test` runs the skill's `TEST.sh` file when one exists. Inspect `TEST.sh` before running tests from a skill source you do not already trust.
 
+For a worked example that turns a built-in tool into a reusable operator workflow, see [using relationship memory from skills](./relationship-memory-skill-template.md).
+
 ## Prompt-triggered capability suggestions
 
 ZeroClaw can optionally suggest an installable skill capability when a submitted prompt clearly names something that exists in cached registry metadata but is not installed. The server-side path runs after submission and before the normal LLM turn. It only returns a suggestion; it does not install the skill, enable it, write memory, or treat the skill body as global instructions.
@@ -202,5 +206,6 @@ Because reflection forwards turn content to the model provider, the task, the to
 ## See also
 
 - [Tools overview](./overview.md)
+- [Using relationship memory from skills](./relationship-memory-skill-template.md)
 - [Security overview](../security/overview.md)
 - [Tool receipts](../security/tool-receipts.md)
