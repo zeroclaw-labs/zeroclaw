@@ -239,7 +239,10 @@ fn normalise_mods(code: KeyCode, mut m: KeyModifiers) -> KeyModifiers {
 
 #[cfg(target_os = "macos")]
 fn is_host_reserved_chord(code: &KeyCode) -> bool {
-    matches!(code, KeyCode::Char('c' | 'C' | 'n' | 'N' | 's' | 'S'))
+    matches!(
+        code,
+        KeyCode::Char('c' | 'C' | 'n' | 'N' | 's' | 'S') | KeyCode::F(1)
+    )
 }
 
 #[cfg(target_os = "macos")]

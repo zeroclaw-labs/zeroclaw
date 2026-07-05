@@ -17,6 +17,19 @@ pub use chord::Chord;
 
 use crossterm::event::KeyEvent;
 
+/// Does this key event match a Help chord that is allowed to open help even
+/// while a pane's text editor owns input? Bare `?` and `F1` must stay typeable
+/// in the message field, so only a modified Help chord (the reserved
+/// `Ctrl+F1`, kept literal on darwin where bare `F1` is host-reserved for
+/// brightness) bypasses text-input ownership. Resolved from the registry so an
+/// override to the Help binding carries through with no handler-side literal.
+pub fn help_bypasses_text_input(event: &KeyEvent) -> bool {
+    GlobalAction::Help
+        .resolved()
+        .iter()
+        .any(|chord| !chord.modifiers.is_empty() && chord.matches(event))
+}
+
 /// Uniform interface over every `keyactions!`-generated enum so generic
 /// code (the keybind surface) can walk variants, names, labels, and
 /// resolved chords without knowing the concrete enum.
@@ -84,6 +97,11 @@ mod tests {
         assert_eq!(GlobalAction::from_chord(&q), Some(GlobalAction::Help));
         let f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE);
         assert_eq!(GlobalAction::from_chord(&f1), Some(GlobalAction::Help));
+        // Ctrl+F1 is the reserved help chord that stays reachable while the
+        // editor owns input; F1 is host-reserved so the Ctrl modifier is not
+        // translated to Cmd on darwin and the chord matches literally.
+        let ctrl_f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::CONTROL);
+        assert_eq!(GlobalAction::from_chord(&ctrl_f1), Some(GlobalAction::Help));
     }
 
     #[test]
