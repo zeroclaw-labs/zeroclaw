@@ -518,7 +518,11 @@ fn write_section(out: &mut String, path: &[&str], schema: &Value, defs: &Map<Str
             && add.is_object()
         {
             let value_schema = resolve(add, defs);
-            if value_schema.get("properties").and_then(Value::as_object).is_some() {
+            if value_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .is_some()
+            {
                 // Insert `<alias>` into the displayed path so the table header
                 // reads `[cron.<alias>]`, `[risk_profiles.<alias>]`, etc.
                 let mut map_path: Vec<String> = path.iter().map(|s| (*s).to_owned()).collect();
@@ -911,7 +915,9 @@ mod tests {
         );
 
         // Other CronJobDecl fields should also be present.
-        for field in ["name", "job_type", "schedule", "enabled", "prompt", "command"] {
+        for field in [
+            "name", "job_type", "schedule", "enabled", "prompt", "command",
+        ] {
             assert!(
                 md.contains(field),
                 "cron section should expose the `{field}` field"
