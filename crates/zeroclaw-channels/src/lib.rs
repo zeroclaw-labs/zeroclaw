@@ -9,6 +9,7 @@
 
 pub mod allowlist;
 pub mod listing;
+pub mod login_probe;
 pub mod orchestrator;
 pub mod paced_channel;
 pub mod util;

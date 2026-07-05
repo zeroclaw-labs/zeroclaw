@@ -541,6 +541,27 @@ impl WhatsAppWebChannel {
         retry_count.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Expand `~` in a configured `session_path`. Single source of truth
+    /// for the on-disk location — the run loop and the readiness probe
+    /// must agree on the file they are looking at.
+    fn expand_session_path(session_path: &str) -> String {
+        shellexpand::tilde(session_path).to_string()
+    }
+
+    /// Channel-owned persisted-login probe: reports whether the session
+    /// database at the configured `session_path` holds a device linked to a
+    /// WhatsApp account (`device.pn` written by a completed QR pairing).
+    /// Stricter than the run loop's resume check on purpose — a channel
+    /// waiting for its QR scan persists an unregistered device row, which
+    /// must not read as an authenticated login. Read-only; never creates
+    /// the database or its sidecar files.
+    pub fn has_persisted_session(session_path: &str) -> bool {
+        if session_path.is_empty() {
+            return false;
+        }
+        super::whatsapp_storage::persisted_device_exists(Self::expand_session_path(session_path))
+    }
+
     /// Return the session file paths to remove (primary + WAL + SHM sidecars).
     fn session_file_paths(expanded_session_path: &str) -> [String; 3] {
         [
@@ -1914,7 +1935,7 @@ impl Channel for WhatsAppWebChannel {
         let retry_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         loop {
-            let expanded_session_path = shellexpand::tilde(&self.session_path).to_string();
+            let expanded_session_path = Self::expand_session_path(&self.session_path);
 
             ::zeroclaw_log::record!(
                 INFO,

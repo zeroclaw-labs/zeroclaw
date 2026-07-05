@@ -7493,7 +7493,7 @@ fn build_channel_by_id(
                     peer_resolver,
                     wc.api_base_url.clone(),
                     wc.cdn_base_url.clone(),
-                    wc.state_dir.as_ref().map(|s| expand_tilde_in_path(s)),
+                    Some(WeChatChannel::resolve_state_dir(wc.state_dir.as_deref())),
                 )?
                 .with_persistence(config_arc.clone())
                 .with_workspace_dir(workspace_dir),
@@ -9487,7 +9487,9 @@ fn collect_configured_channels(
             peer_resolver,
             wechat.api_base_url.clone(),
             wechat.cdn_base_url.clone(),
-            wechat.state_dir.as_ref().map(|s| expand_tilde_in_path(s)),
+            Some(WeChatChannel::resolve_state_dir(
+                wechat.state_dir.as_deref(),
+            )),
         ) {
             Ok(channel) => {
                 channels.push(ConfiguredChannel {
@@ -11144,7 +11146,7 @@ pub async fn deliver_announcement(
                 peer_resolver,
                 wc.api_base_url.clone(),
                 wc.cdn_base_url.clone(),
-                wc.state_dir.as_ref().map(std::path::PathBuf::from),
+                Some(WeChatChannel::resolve_state_dir(wc.state_dir.as_deref())),
             )?
             .with_workspace_dir(config.channel_workspace_dir(channel));
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
@@ -11293,11 +11295,6 @@ pub async fn deliver_announcement(
     }
     #[allow(unreachable_code)]
     Ok(())
-}
-
-#[cfg(feature = "channel-wechat")]
-fn expand_tilde_in_path(path: &str) -> PathBuf {
-    PathBuf::from(shellexpand::tilde(path).as_ref())
 }
 
 // ── Concurrent persist lock test (#7753) ─────────────────────────
@@ -12181,15 +12178,17 @@ temperature = 0.3
 
     #[cfg(feature = "channel-wechat")]
     #[test]
-    fn expand_tilde_in_path_expands_home_prefix() {
-        let expanded = expand_tilde_in_path("~/wechat-state");
+    fn wechat_resolve_state_dir_expands_home_prefix() {
+        use crate::wechat::WeChatChannel;
+
+        let expanded = WeChatChannel::resolve_state_dir(Some("~/wechat-state"));
         assert!(!expanded.starts_with("~"));
         assert!(expanded.ends_with("wechat-state"));
 
-        let absolute = expand_tilde_in_path("/absolute/path");
+        let absolute = WeChatChannel::resolve_state_dir(Some("/absolute/path"));
         assert_eq!(absolute, PathBuf::from("/absolute/path"));
 
-        let relative = expand_tilde_in_path("relative/path");
+        let relative = WeChatChannel::resolve_state_dir(Some("relative/path"));
         assert_eq!(relative, PathBuf::from("relative/path"));
     }
 

@@ -359,7 +359,7 @@ channel-linq = ["zeroclaw-channels/channel-linq", "zeroclaw-gateway?/channel-lin
 channel-wati = ["zeroclaw-channels/channel-wati", "zeroclaw-gateway?/channel-wati"]
 channel-nextcloud = ["zeroclaw-channels/channel-nextcloud", "zeroclaw-gateway?/channel-nextcloud"]
 channel-mochat = ["zeroclaw-channels/channel-mochat"]
-channel-wechat = ["zeroclaw-channels/channel-wechat"]
+channel-wechat = ["zeroclaw-channels/channel-wechat", "zeroclaw-gateway?/channel-wechat"]
 channel-wecom = ["zeroclaw-channels/channel-wecom"]
 channel-wecom-ws = ["zeroclaw-channels/channel-wecom-ws"]
 channel-clawdtalk = ["zeroclaw-channels/channel-clawdtalk"]
@@ -371,7 +371,7 @@ channel-line = ["zeroclaw-channels/channel-line"]
 # Feishu uses the same channel implementation as Lark; `use_feishu = true`
 # selects Feishu endpoints at runtime.
 channel-feishu = ["channel-lark"]
-whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
+whatsapp-web = ["zeroclaw-channels/whatsapp-web", "zeroclaw-gateway?/whatsapp-web"]
 voice-wake = ["zeroclaw-channels/voice-wake"]
 memory-postgres = ["zeroclaw-memory/memory-postgres"]
 
