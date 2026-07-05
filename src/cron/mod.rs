@@ -426,9 +426,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 && allowed_tools.is_empty()
                 && uses_memory.is_none()
             {
-                bail!(
-                    "At least one of --expression, --tz, --command, --name, --allowed-tool, or --uses-memory must be provided"
-                );
+                bail!("{}", get_required_cli_string("cli-cron-update-no-field"));
             }
 
             let existing = if expression.is_some() || tz.is_some() || !allowed_tools.is_empty() {
