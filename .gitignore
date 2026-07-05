@@ -1,5 +1,8 @@
 /target
 /target-*/
+
+# Desktop installer build artifacts
+*.dmg
 /docs/book/book/
 /docs/book/po/messages.pot
 /docs/book/po/*.failures.log
@@ -96,6 +99,9 @@ playground/
 
 # Temporary rustc output
 rust_out
+
+# Auto-generated Tauri schemas
+apps/tauri/gen/schemas/
 
 # Generated TypeScript client (rebuild via cargo web gen-api)
 web/src/lib/api-generated.ts

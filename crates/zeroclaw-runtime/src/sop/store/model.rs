@@ -98,19 +98,49 @@ pub enum ProposalStatus {
     Stale,
 }
 
+/// Whether a proposal creates a new SOP or updates an existing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalKind {
+    Create,
+    Update,
+}
+
 /// A captured-and-distilled SOP refinement awaiting approval + write-back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposalRecord {
     pub id: String,
+    #[serde(default = "default_proposal_kind")]
+    pub kind: ProposalKind,
     pub status: ProposalStatus,
     pub source_run_id: Option<String>,
     pub sop_name: String,
     /// For stale detection against the on-disk SOP.
     pub target_content_hash: Option<String>,
+    /// Proposed `SOP.toml` bytes. Kept in the shared store so inspect/apply do
+    /// not depend on transient files.
+    #[serde(default)]
+    pub manifest_toml: String,
+    /// Proposed `SOP.md` bytes. Scanned before write-back and written atomically
+    /// only after an explicit apply action.
+    #[serde(default)]
+    pub procedure_markdown: String,
     /// Distiller model, session, timestamp, …
     pub provenance: serde_json::Value,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub status_reason: Option<String>,
+    #[serde(default)]
+    pub applied_at: Option<String>,
+    #[serde(default)]
+    pub applied_by: Option<String>,
+    #[serde(default)]
+    pub rollback_path: Option<String>,
+}
+
+fn default_proposal_kind() -> ProposalKind {
+    ProposalKind::Update
 }
 
 /// Retention bound for terminal runs + their events.
