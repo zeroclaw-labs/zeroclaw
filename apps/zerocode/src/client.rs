@@ -17,6 +17,8 @@ use tokio::sync::{broadcast, mpsc};
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
 use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
 
+const CRON_TRIGGER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 // ── Platform local-stream shim ──────────────────────────────────
 
 #[cfg(unix)]
@@ -1352,8 +1354,12 @@ impl RpcClient {
     }
 
     pub async fn cron_trigger(&self, id: &str) -> Result<CronTriggerResult> {
-        self.call(method::CRON_TRIGGER, serde_json::json!({ "id": id }))
-            .await
+        self.call_with_timeout(
+            method::CRON_TRIGGER,
+            serde_json::json!({ "id": id }),
+            CRON_TRIGGER_TIMEOUT,
+        )
+        .await
     }
 
     pub async fn memory_list(&self, category: Option<&str>) -> Result<MemoryListResult> {
