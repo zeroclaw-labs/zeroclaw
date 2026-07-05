@@ -82,6 +82,57 @@ const SAFE_ENV_VARS: &[&str] = &[
     "USERNAME",
 ];
 
+/// Environment variables that are **never** forwarded from the TUI client to a
+/// shell subprocess, even though they appear in the TUI's captured env.
+///
+/// These are variables that, when attacker-controlled, can subvert the
+/// subprocess (library injection, code execution, PATH hijacking, etc.).
+/// The TUI is assumed trusted, but this is a defense-in-depth filter against
+/// a compromised or relayed TUI connection.
+#[cfg(not(target_os = "windows"))]
+const TUI_BLOCKED_ENV_VARS: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "LD_DEBUG",
+    "LD_ORIGIN_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "PYTHONPATH",
+    "PERL5LIB",
+    "RUBYLIB",
+    "RUBYOPT",
+    "IFS",
+    "SHELLOPTS",
+    "BASH_ENV",
+    "ENV",
+    "GCONV_PATH",
+    "LOCPATH",
+    "COR_PROFILER_PATH",
+];
+
+#[cfg(target_os = "windows")]
+const TUI_BLOCKED_ENV_VARS: &[&str] = &["PATH", "PSModulePath"];
+
+/// Returns `true` when `name` matches a blocked TUI env var.
+///
+/// On Unix the match is exact (env names are case-sensitive).
+/// On Windows the match is case-insensitive (env names are
+/// case-insensitive on the platform).
+fn is_tui_env_blocked(name: &str) -> bool {
+    #[cfg(not(target_os = "windows"))]
+    {
+        TUI_BLOCKED_ENV_VARS.contains(&name)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        TUI_BLOCKED_ENV_VARS
+            .iter()
+            .any(|b| b.eq_ignore_ascii_case(name))
+    }
+}
+
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
@@ -366,6 +417,17 @@ impl Tool for ShellTool {
         // whatever the daemon process inherited.
         if let Some(ref tui_env) = self.tui_env {
             for (k, v) in tui_env {
+                // Skip known-dangerous vars (defense-in-depth: they would
+                // subvert the subprocess if the TUI connection is relayed).
+                if is_tui_env_blocked(k.as_str()) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!("shell tool: blocked dangerous env var from TUI: {k}"),
+                    );
+                    continue;
+                }
+
                 cmd.env(k, v);
             }
         }
@@ -1675,6 +1737,57 @@ mod tests {
         assert!(
             env_output_contains_assignment(&result.output, "SSH_AUTH_SOCK", "/tmp/fake.sock"),
             "SSH_AUTH_SOCK from tui_env must reach subprocess"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_tui_env_blocks_dangerous_vars() {
+        // TUI_BLOCKED_ENV_VARS must not reach the subprocess even when
+        // the TUI client sends them.
+        let tool =
+            ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
+                let mut m = std::collections::HashMap::new();
+                m.insert("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string());
+                m.insert("SSH_AUTH_SOCK".to_string(), "/tmp/fake.sock".to_string());
+                m
+            }));
+
+        let result = tool
+            .execute(json!({"command": env_print_command()}))
+            .await
+            .expect("environment print command should succeed");
+
+        assert!(result.success);
+        // SSH_AUTH_SOCK (not dangerous) must still reach subprocess
+        assert!(
+            env_output_contains_assignment(&result.output, "SSH_AUTH_SOCK", "/tmp/fake.sock"),
+            "non-blocked SSH_AUTH_SOCK from tui_env must still reach subprocess",
+        );
+        // LD_PRELOAD (dangerous) must be blocked
+        assert!(
+            !env_output_contains_assignment(&result.output, "LD_PRELOAD", "/tmp/evil.so"),
+            "dangerous LD_PRELOAD from tui_env must be blocked",
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn tui_env_blocked_vars_match_case_insensitively_on_windows() {
+        // Windows env names are case-insensitive; every case variant
+        // of a blocked entry must be rejected.
+        assert!(is_tui_env_blocked("PATH"), "exact PATH must be blocked");
+        assert!(
+            is_tui_env_blocked("Path"),
+            "mixed-case Path must be blocked"
+        );
+        assert!(
+            is_tui_env_blocked("PSModulePath"),
+            "exact PSModulePath must be blocked",
+        );
+        assert!(
+            is_tui_env_blocked("psmodulepath"),
+            "lowercase psmodulepath must be blocked",
         );
     }
 }
