@@ -249,7 +249,12 @@ impl ScopedToolRegistry {
                             &deferred_set,
                             mcp_policy.as_ref(),
                         );
-                        if allowed_stub_count > 0 {
+                        // Listing registries expose the real deferred MCP tools as
+                        // eager wrappers above and never consume the deferred prompt
+                        // section, the activation handle, or invoke tools. Skip
+                        // `tool_search` there so `/api/tools` matches eager-mode
+                        // listing (real MCP tools, no deferral-internal helper).
+                        if allowed_stub_count > 0 && !list_deferred_mcp_specs {
                             let activated =
                                 Arc::new(std::sync::Mutex::new(ActivatedToolSet::new()));
                             activated_handle = Some(Arc::clone(&activated));
@@ -580,23 +585,31 @@ mod tests {
         server
     }
 
-    fn config_with_bundled_mcp(server_uri: String) -> Config {
+    fn config_with_bundled_mcp(server_uri: String, server2_uri: String) -> Config {
         use zeroclaw_config::schema::{
             AliasedAgentConfig, McpBundleConfig, McpServerConfig, McpTransport, RiskProfileConfig,
         };
 
         let mut config = Config::default();
         config.mcp.enabled = true;
-        config.mcp.servers = vec![McpServerConfig {
-            name: "remote".into(),
-            transport: McpTransport::Http,
-            url: Some(server_uri),
-            ..Default::default()
-        }];
+        config.mcp.servers = vec![
+            McpServerConfig {
+                name: "remote".into(),
+                transport: McpTransport::Http,
+                url: Some(server_uri),
+                ..Default::default()
+            },
+            McpServerConfig {
+                name: "remote2".into(),
+                transport: McpTransport::Http,
+                url: Some(server2_uri),
+                ..Default::default()
+            },
+        ];
         config.mcp_bundles.insert(
             "mockbundle".into(),
             McpBundleConfig {
-                servers: vec!["remote".into()],
+                servers: vec!["remote".into(), "remote2".into()],
                 exclude: Vec::new(),
             },
         );
@@ -647,28 +660,57 @@ mod tests {
     /// BOTH eager and deferred loading modes. In v0.8.1 the listing was eager and
     /// surfaced each `<server>__<tool>` spec; deferred loading collapsed the whole
     /// server into a single `tool_search` stub, so the dashboard Tools screen
-    /// stopped showing MCP tools even for a correctly-bundled agent.
+    /// stopped showing MCP tools even for a correctly-bundled agent. The listing
+    /// must also match eager mode exactly: the deferral-internal `tool_search`
+    /// helper is never invoked from a listing registry and must not leak onto the
+    /// dashboard. Two bundled servers guard the multi-server case from #8302.
     #[tokio::test]
     async fn assemble_lists_bundled_mcp_tools_in_both_loading_modes() {
         let server = mock_mcp_http_server().await;
+        let server2 = mock_mcp_http_server().await;
 
-        let mut eager = config_with_bundled_mcp(server.uri());
+        let mut eager = config_with_bundled_mcp(server.uri(), server2.uri());
         eager.mcp.deferred_loading = false;
-        let eager_names = assemble_listing_for(&eager).await;
+        let mut eager_names = assemble_listing_for(&eager).await;
+
+        let mut deferred = config_with_bundled_mcp(server.uri(), server2.uri());
+        deferred.mcp.deferred_loading = true;
+        let mut deferred_names = assemble_listing_for(&deferred).await;
+
+        for expected in [
+            "remote__echo",
+            "remote__add_numbers",
+            "remote2__echo",
+            "remote2__add_numbers",
+        ] {
+            assert!(
+                eager_names.iter().any(|n| n == expected),
+                "eager mode must list bundled MCP tool {expected}: {eager_names:?}"
+            );
+            assert!(
+                deferred_names.iter().any(|n| n == expected),
+                "deferred mode must still list bundled MCP tool {expected} in the \
+                 enumeration registry (#8302); got {deferred_names:?}"
+            );
+        }
+
+        // The deferral-internal turn helper is not a real listed tool. It must
+        // not appear on the dashboard listing in deferred mode.
         assert!(
-            eager_names.iter().any(|n| n == "remote__echo")
-                && eager_names.iter().any(|n| n == "remote__add_numbers"),
-            "eager mode must list each bundled MCP tool: {eager_names:?}"
+            !deferred_names.iter().any(|n| n == "tool_search"),
+            "deferred listing registry must not expose tool_search (#8302); \
+             got {deferred_names:?}"
         );
 
-        let mut deferred = config_with_bundled_mcp(server.uri());
-        deferred.mcp.deferred_loading = true;
-        let deferred_names = assemble_listing_for(&deferred).await;
-        assert!(
-            deferred_names.iter().any(|n| n == "remote__echo")
-                && deferred_names.iter().any(|n| n == "remote__add_numbers"),
-            "deferred mode must still list each bundled MCP tool in the \
-             enumeration registry (#8302); got {deferred_names:?}"
+        // Eager and deferred listing registries must present the same tool set,
+        // which is the parity contract this fix restores.
+        eager_names.sort();
+        eager_names.dedup();
+        deferred_names.sort();
+        deferred_names.dedup();
+        assert_eq!(
+            eager_names, deferred_names,
+            "eager and deferred /api/tools listings must match (#8302)"
         );
     }
 
