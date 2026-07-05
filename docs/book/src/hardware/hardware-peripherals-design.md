@@ -114,7 +114,7 @@ ZeroClaw on Pi; GPIO via rppal or sysfs. No separate firmware.
 
 ### RAG Pipeline (Datasheet Retrieval)
 
-- **Index:** Datasheets, reference manuals, register maps (PDF → chunks, embeddings).
+- **Index:** Datasheets, reference manuals, register maps (pre-converted `.md` / `.txt` → chunks, embeddings).
 - **Retrieve:** On user query ("turn on LED"), fetch relevant snippets (e.g. GPIO section for target board).
 - **Inject:** Add to LLM system prompt or context.
 - **Result:** LLM generates accurate, board-specific code.

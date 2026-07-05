@@ -1,13 +1,13 @@
 # Tools: Overview
 
-**Tools** are the agent's hands. A tool is a capability the model can invoke mid-conversation, run a shell command, fetch an HTTP URL, extract a PDF, open a browser, write a file, read a sensor. Every tool call is subject to [security policy](../security/overview.md) and produces a [tool receipt](../security/tool-receipts.md).
+**Tools** are the agent's hands. A tool is a capability the model can invoke mid-conversation, run a shell command, fetch an HTTP URL, open a browser, write a file, read a sensor. Every tool call is subject to [security policy](../security/overview.md) and produces a [tool receipt](../security/tool-receipts.md).
 
 Tools are not to be confused with `zeroclaw` CLI subcommands. CLI commands are for operators; tools are for the agent.
 
 An agent gets its tools through the skill, knowledge, and MCP bundles it references; see [Agents](../agents/overview.md) for how bundles attach to an agent.
 
 Before adding a built-in tool or replacing one with an external integration,
-use the [first-party extension boundary](../developing/first-party-extensions.md#choose-built-in-or-external)
+use the [Built-In Tool Inventory](../developing/tool-inventory.md)
 to choose the smallest durable home.
 
 ## Built-in tools
@@ -17,7 +17,7 @@ A minimal build ships with:
 | Tool | What it does |
 |---|---|
 | `shell` | Execute a shell command in the workspace directory. Subject to command allow/deny lists |
-| `file_read` | Read a file with line numbers; supports partial reads and PDF text extraction (path must be inside the workspace unless autonomy permits otherwise) |
+| `file_read` | Read a file with line numbers; supports partial reads and base64 encoding for binary files (path must be inside the workspace unless autonomy permits otherwise) |
 | `file_write` | Write a file (same path constraint) |
 | `file_edit` | Replace an exact string match in a file with new content |
 | `glob_search` | List files matching a glob pattern within the workspace |
@@ -46,7 +46,6 @@ Conditionally registered:
 |---|---|
 | `knowledge` | `[knowledge].enabled = true`. Stores structured relationship memory; see [Relationship memory](./relationship-memory.md) |
 | Hardware probes | `--features hardware`: GPIO, I2C, SPI reads/writes |
-| `pdf_read` | `--features rag-pdf` |
 | `sop_*` tools | Registered when `sop.sops_dir` is configured: run and inspect SOPs |
 | `discord_search` | Registered when a Discord alias has `archive` enabled |
 

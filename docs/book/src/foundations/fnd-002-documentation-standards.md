@@ -77,7 +77,7 @@ All three live in `docs/` with no structural distinction between them. The resul
 
 ### 2.3 The ADR Gap
 
-The project has exactly one Architecture Decision Record: `ADR-004-tool-shared-state-ownership.md`. It is excellent: well-structured, code-referenced, specific. But the project has made at least five or six architectural decisions of equal or greater consequence that have never been recorded:
+When this RFC was written, the project had two Architecture Decision Records in the old docs tree: ADR-003 for WASM plugins and ADR-004 for tool shared-state ownership. ADR-004 was an especially strong model: well-structured, code-referenced, specific. But the project had made at least five or six architectural decisions of equal or greater consequence that had never been recorded:
 
 - The choice of Rust over TypeScript
 - The trait-driven extensibility model
@@ -89,7 +89,7 @@ Without these records, every new contributor must rediscover the reasoning throu
 
 ### 2.4 What Is Already Good
 
-The `docs-contract.md` concept, treating documentation as a governed product surface, is the right instinct. It just needs the right rules. The `AGENTS.md` at the root is excellent and sets the right precedent for AI-assisted development. ADR-004 proves the team can write high-quality architectural records.
+The `docs-contract.md` concept, treating documentation as a governed product surface, is the right instinct. It just needs the right rules. The `AGENTS.md` at the root is excellent and sets the right precedent for AI-assisted development. ADR-004 proved the team could write high-quality architectural records.
 
 ---
 
@@ -249,7 +249,7 @@ Home
 
 ### 6.1 The Format
 
-All Architecture Decision Records use the **Nygard format**, extended with YAML frontmatter for machine readability. ADR-004 is the existing model. This section formalizes it.
+All Architecture Decision Records use the **Nygard format**, extended with YAML frontmatter for machine readability. ADR-004 was the model identified by this RFC. This section formalizes that shape.
 
 Every ADR has three sections and five frontmatter fields:
 
@@ -291,7 +291,7 @@ Links to the relevant code files, issues, and external resources.
 
 - **ADRs are immutable once accepted.** If a decision changes, the old ADR is marked `superseded-by-ADR-NNN` and a new ADR is written describing the new decision and why it superseded the old one.
 - **ADRs are numbered sequentially and never renumbered.** Gaps in the sequence are acceptable (a proposed ADR that was rejected can be withdrawn, leaving a gap).
-- **ADRs live in `docs/architecture/decisions/`.** They are named `ADR-NNN-short-slug.md`.
+- **ADRs live in `docs/book/src/architecture/decisions/`.** They are named `ADR-NNN-short-slug.md`.
 - **Significant architectural changes require an ADR.** "Significant" means: a decision that would be surprising to a new contributor, a decision that constrains future choices, or a decision that involves a non-obvious tradeoff.
 
 ### 6.3 Retroactive ADRs
@@ -302,8 +302,8 @@ The following key decisions should be documented retroactively. They represent t
 |---|---|
 | ADR-001 | Rust as the implementation language (replacing TypeScript/OpenClaw) |
 | ADR-002 | Trait-driven extensibility as the primary architectural pattern |
-| ADR-003 | WASM plugin model and the Extism-to-WIT transition |
-| ADR-004 | Tool shared state ownership contract *(already exists)* |
+| ADR-003 | Extism as the initial WASM plugin execution bridge |
+| ADR-004 | Tool shared state ownership contract |
 | ADR-005 | SQLite + Markdown as the two memory backends |
 | ADR-006 | CLI as the only built-in channel; all others as plugins |
 | ADR-007 | Gateway extraction as a separate optional binary |
@@ -311,6 +311,11 @@ The following key decisions should be documented retroactively. They represent t
 Retroactive ADRs should be marked with a note:
 
 > *This is a retroactive record of a decision made prior to the formal ADR process. The date reflects when the decision was made, not when this record was written.*
+
+If the original decision date is unknown, use the date the ADR record
+was added and say that in the note. If a retroactive ADR is already
+superseded by a later decision, keep the historical ADR and write the
+superseding ADR separately.
 
 ### 6.4 Why This Matters for AI-Assisted Development
 
@@ -432,72 +437,62 @@ The root `AGENTS.md` sets project-wide policy. Crate-level `AGENTS.md` files nar
 
 ## 8. The Target Structure
 
-After the changes proposed in this RFC, the repository's documentation layout becomes:
+After the mdBook migration, the repository's code-adjacent
+documentation source layout is:
 
 ```
-docs/
+docs/book/src/
 │
-├── README.md                    ← Hub: links to wiki for user guides,
-│                                  to proposals/ for roadmap, to
-│                                  architecture/ for decisions
-├── SUMMARY.md                   ← Canonical TOC (English only, repo docs only)
+├── README.md                    ← mdBook introduction
+├── SUMMARY.md                   ← Canonical mdBook TOC
 │
 ├── architecture/
-│   ├── README.md                ← Overview: what decisions have been made,
-│   │                              current system landscape
+│   ├── overview.md              ← Current system landscape
 │   ├── decisions/               ← ADRs (immutable once accepted)
 │   │   ├── ADR-001-rust-first.md
 │   │   ├── ADR-002-trait-driven-extensibility.md
 │   │   ├── ADR-003-wasm-plugin-model.md
-│   │   ├── ADR-004-tool-shared-state-ownership.md  (already exists)
+│   │   ├── ADR-004-tool-shared-state-ownership.md
 │   │   ├── ADR-005-memory-backends.md
 │   │   ├── ADR-006-cli-only-built-in-channel.md
-│   │   └── ADR-007-gateway-extraction.md
+│   │   ├── ADR-007-gateway-extraction.md
+│   │   └── ADR-009-wit-wasmtime-plugin-execution.md
 │   └── diagrams/
 │       ├── component-map.md     ← Mermaid: crate topology
 │       └── data-flow.md         ← Mermaid: message lifecycle
 │
-├── proposals/                   ← RFCs (living until accepted/rejected)
-│   ├── microkernel-architecture.md    (already exists)
-│   └── documentation-standards.md    (this document)
-│
 ├── contributing/
-│   ├── README.md
-│   ├── docs-contract.md         ← Replaced (see Section 9)
-│   ├── pr-workflow.md
-│   ├── reviewer-playbook.md
-│   ├── ci-map.md
-│   ├── actions-source-policy.md
+│   ├── index.md
+│   ├── architecture-map.md
+│   ├── rfcs.md
 │   ├── testing.md
-│   ├── extension-examples.md
-│   ├── change-playbooks.md
-│   └── pr-discipline.md
+│   └── pr-review-protocol.md
 │
 ├── reference/
-│   ├── README.md
-│   ├── api/
-│   │   ├── config-reference.md
-│   │   ├── providers-reference.md
-│   │   └── channels-reference.md
-│   └── cli/
-│       └── commands-reference.md
+│   ├── index.md
+│   ├── cli.md
+│   ├── config.md
+│   └── providers.md
 │
 ├── security/
-│   ├── README.md
-│   ├── agnostic-security.md
-│   ├── frictionless-security.md
+│   ├── overview.md
+│   ├── model.md
 │   ├── sandboxing.md
-│   ├── audit-logging.md
-│   └── security-roadmap.md
+│   └── tool-receipts.md
 │
-└── hardware/
-    ├── README.md
-    ├── hardware-peripherals-design.md
-    ├── adding-boards-and-tools.md
-    └── datasheets/
-        ├── nucleo-f401re.md
-        ├── arduino-uno.md
-        └── esp32.md
+├── hardware/
+│   ├── index.md
+│   ├── subsystem.md
+│   ├── adding-boards-and-tools.md
+│   └── hardware-peripherals-design.md
+│
+└── foundations/
+    ├── fnd-001-intentional-architecture.md
+    ├── fnd-002-documentation-standards.md
+    ├── fnd-003-governance.md
+    ├── fnd-004-engineering-infrastructure.md
+    ├── fnd-005-contribution-culture.md
+    └── fnd-006-zero-compromise-in-practice.md
 ```
 
 **Deleted from current structure:**
@@ -570,7 +565,7 @@ because they update on their own timeline.
 
 ## ADR Governance
 
-See docs/architecture/decisions/ for the ADR format and lifecycle rules.
+See `docs/book/src/architecture/decisions/` for the ADR format and lifecycle rules.
 
 Major architectural changes require an ADR before implementation begins,
 not after.
@@ -587,8 +582,8 @@ Documents should be updated in the same PR as the code change that makes
 them stale. A PR that changes a configuration format must update the
 config reference. A PR that adds a new command must update the CLI reference.
 
-Proposals in docs/proposals/ are exempt — they describe intent and may
-precede implementation by multiple releases.
+RFC issues and roadmap trackers are exempt - they describe intent and
+may precede implementation by multiple releases.
 ```
 
 ---
@@ -656,7 +651,7 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 - [ ] Create the GitHub Wiki with the structural skeleton (Home + top-level pages, content stubs)
 - [ ] Remove the i18n parity requirement from `docs-contract.md`
 - [ ] Add YAML frontmatter to all existing `docs/` files
-- [ ] Create `docs/architecture/decisions/` directory and move ADR-004 into it as `ADR-004-tool-shared-state-ownership.md`
+- [x] Create `docs/book/src/architecture/decisions/`, add ADR-001 and ADR-002, restore ADR-003 and ADR-004, and add ADR-009 as ADR-003's superseding WIT/wasmtime record
 
 **Success metrics:**
 - Repo root contains exactly one README file
@@ -670,7 +665,7 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 
 **Deliverables:**
 
-- [ ] Write ADR-001 through ADR-003 and ADR-005 through ADR-007 (retroactive, see Section 6.3)
+- [ ] Write ADR-005 through ADR-007 (retroactive, see Section 6.3)
 - [ ] Add a Vale configuration (`.vale.ini` + style rules) and CI check
 - [ ] Replace `docs-contract.md` in full with the version specified in Section 9
 - [ ] Migrate `docs/setup-guides/` content to the GitHub Wiki
@@ -679,7 +674,8 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 - [ ] Write root-level `AGENTS.md` for `crates/zeroclaw-api` (in anticipation of extraction)
 
 **Success metrics:**
-- ADR-001 through ADR-007 exist and are accepted
+- ADR-001 through ADR-007 exist with accepted or superseded status as appropriate
+- ADR-009 records the WIT/wasmtime decision that supersedes ADR-003
 - Vale CI check passes on all docs
 - Wiki has complete content for all migrated sections
 - No dead links in `docs/`
@@ -691,8 +687,8 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 **Deliverables:**
 
 - [ ] Write `AGENTS.md` for each new crate as the workspace decomposes (per architecture RFC phases)
-- [ ] Write `docs/architecture/diagrams/component-map.md` (Mermaid, reflects target crate topology)
-- [ ] Write `docs/architecture/diagrams/data-flow.md` (Mermaid, message lifecycle)
+- [ ] Write `docs/book/src/architecture/diagrams/component-map.md` (Mermaid, reflects target crate topology)
+- [ ] Write `docs/book/src/architecture/diagrams/data-flow.md` (Mermaid, message lifecycle)
 - [ ] Write the plugin SDK documentation in `docs/book/src/developing/plugin-sdk.md`
 - [ ] Write the WIT interface documentation alongside the `wit/` files (generated from WIT + hand-written explanation)
 - [ ] Update the OpenAPI spec documentation as the kernel IPC API stabilizes
@@ -708,7 +704,7 @@ The documentation migration follows the same Strangler Fig pattern as the archit
 
 **Deliverables:**
 
-- [ ] Mark ADR-001 through ADR-007 as `accepted` (not `proposed`) once the corresponding code is shipped
+- [ ] Mark ADR-005 through ADR-007 as `accepted` (not `proposed`) once the corresponding code is shipped
 - [ ] Version the kernel IPC API documentation at `v1` with a stability guarantee
 - [ ] Write the Plugin Registry governance document (who controls the registry, how plugins are reviewed, how compromised plugins are revoked)
 - [ ] Publish the plugin SDK as a standalone document site (from `docs/book/src/developing/plugin-sdk.md`)

@@ -111,6 +111,7 @@ jobs:
           SECONDS=0
           cargo clippy \
             --workspace \
+            --exclude zeroclaw-desktop \
             --all-targets \
             --features ci-all \
             -- -D warnings 2>&1 | tee "$cargo_log"
@@ -476,7 +477,7 @@ jobs:
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
       - name: Run tests
-        run: cargo nextest run --locked --workspace
+        run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"

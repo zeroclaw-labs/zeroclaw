@@ -57,7 +57,7 @@ Bump `workspace.package.version` in the workspace `Cargo.toml`, then run the two
 
 </div>
 
-This updates README badges and workflow description
+This updates README badges, the Tauri config, and workflow description
 examples, then regenerates every spec-driven install surface via
 `cargo generate installers`: setup.bat, `dist/aur/PKGBUILD`,
 `dist/scoop/zeroclaw.json`, `flake.nix`, the Dockerfile/Containerfile feature
@@ -239,7 +239,7 @@ webhook) could perform the real-world side effect on first try.
 `--all` therefore enforces a hardcoded allowlist of jobs proven safe
 to run locally; currently the artifact-only build steps in
 `release-stable-manual.yml` and `cross-platform-build-manual.yml`
-(`validate`, `web`, `release-notes`, `build`).
+(`validate`, `web`, `release-notes`, `build`, `build-desktop`).
 Everything else is skipped with a logged reason:
 
 ```
