@@ -56,6 +56,7 @@ impl RenderLayer {
 
 struct SopEditorState {
     create: bool,
+    original_name: Option<String>,
     draft: SopDraft,
     focus: EditorFocus,
     step_cursor: usize,
@@ -107,6 +108,7 @@ impl SopEditorState {
     fn new_create() -> Self {
         Self {
             create: true,
+            original_name: None,
             draft: SopDraft::default(),
             focus: EditorFocus::Name,
             step_cursor: 0,
@@ -116,6 +118,11 @@ impl SopEditorState {
     }
 
     fn from_draft(create: bool, draft: SopDraft) -> Self {
+        let original_name = if create {
+            None
+        } else {
+            Some(draft.name.trim().to_string())
+        };
         let draft = if draft.steps.is_empty() {
             SopDraft {
                 steps: vec![SopStep {
@@ -129,6 +136,7 @@ impl SopEditorState {
         };
         Self {
             create,
+            original_name,
             draft,
             focus: EditorFocus::Steps,
             step_cursor: 0,
@@ -371,6 +379,20 @@ fn cycle_pick<T: Clone + PartialEq>(items: &[T], cur: &T, forward: bool) -> Opti
         (idx + items.len() - 1) % items.len()
     };
     items.get(next).cloned()
+}
+
+/// Ordered trigger source list rendered by the picker. Prefers the
+/// backend-walked `sources` so ordering and membership match the runtime
+/// `SopTriggerSource` enum exactly; falls back to reconstructing from `bound` +
+/// `channel` only when an old or failed registry response omits `sources`, so
+/// the picker still works against a stale daemon.
+fn trigger_source_walk(registry: &crate::client::TriggerSourceRegistryView) -> Vec<String> {
+    if !registry.sources.is_empty() {
+        return registry.sources.clone();
+    }
+    let mut sources: Vec<String> = registry.bound.iter().map(|b| b.source.clone()).collect();
+    sources.push("channel".to_string());
+    sources
 }
 
 fn failure_label(f: &StepFailure) -> String {
@@ -951,13 +973,7 @@ impl SopPane {
     }
 
     fn editor_cycle_trigger_source(&mut self, forward: bool) {
-        let mut sources: Vec<String> = self
-            .trigger_registry
-            .bound
-            .iter()
-            .map(|b| b.source.clone())
-            .collect();
-        sources.push("channel".to_string());
+        let sources = self.trigger_source_walk();
         let Some(ed) = self.editor.as_mut() else {
             return;
         };
@@ -983,6 +999,15 @@ impl SopPane {
         } else {
             trigger.kind = picked;
         }
+    }
+
+    /// Ordered trigger source list rendered by the picker. Prefers the
+    /// backend-walked `sources` so ordering and membership match the runtime
+    /// `SopTriggerSource` enum exactly; falls back to reconstructing from
+    /// `bound` + `channel` only when an old or failed registry response omits
+    /// `sources`, so the picker still works against a stale daemon.
+    fn trigger_source_walk(&self) -> Vec<String> {
+        trigger_source_walk(&self.trigger_registry)
     }
 
     fn editor_cycle_trigger_channel(&mut self, forward: bool) {
@@ -1140,6 +1165,19 @@ impl SopPane {
         }
         let create = ed.create;
         let name = ed.draft.name.trim().to_string();
+        // Identity in edit mode is the name the edit started from. sops/save
+        // persists under the draft's name and overwrites that directory, so a
+        // rename would silently fork (new dir, old left behind) or clobber a
+        // different SOP. Reject renames until an explicit rename flow exists.
+        if let Some(original) = ed.original_name.as_deref()
+            && name != original
+        {
+            self.error = Some(format!(
+                "Renaming an SOP is not supported yet. Set the name back to \
+                 '{original}', or create a new SOP and delete the old one."
+            ));
+            return;
+        }
         let sop = ed.to_sop_json();
         let result = if create {
             self.rpc.sops_create(sop).await
@@ -1989,4 +2027,56 @@ fn render_node_card(
         .block(block)
         .wrap(Wrap { trim: false });
     f.render_widget(para, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trigger_source_walk;
+    use crate::client::{BoundTriggerSourceView, TriggerSourceRegistryView};
+
+    #[test]
+    fn walk_uses_backend_sources_verbatim() {
+        let registry = TriggerSourceRegistryView {
+            sources: vec![
+                "webhook".to_string(),
+                "future_source".to_string(),
+                "channel".to_string(),
+            ],
+            bound: vec![BoundTriggerSourceView {
+                source: "webhook".to_string(),
+                fields: vec![],
+            }],
+            channels: vec![],
+        };
+        assert_eq!(
+            trigger_source_walk(&registry),
+            vec!["webhook", "future_source", "channel"],
+            "picker must render the backend walk verbatim, including a source \
+             present only in `sources`, so zerocode cannot drift"
+        );
+    }
+
+    #[test]
+    fn walk_falls_back_only_when_sources_absent() {
+        let registry = TriggerSourceRegistryView {
+            sources: vec![],
+            bound: vec![
+                BoundTriggerSourceView {
+                    source: "webhook".to_string(),
+                    fields: vec![],
+                },
+                BoundTriggerSourceView {
+                    source: "manual".to_string(),
+                    fields: vec![],
+                },
+            ],
+            channels: vec![],
+        };
+        assert_eq!(
+            trigger_source_walk(&registry),
+            vec!["webhook", "manual", "channel"],
+            "with no backend `sources` (old/failed response) the picker \
+             reconstructs from bound + channel so it still works"
+        );
+    }
 }

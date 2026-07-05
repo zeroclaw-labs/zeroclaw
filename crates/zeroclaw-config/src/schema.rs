@@ -14327,9 +14327,11 @@ fn default_filesystem_max_content_bytes() -> Option<usize> {
 /// fields is config-driven (`content_template`, `thread_id_field`) so a new
 /// source — Anitya, an internal bus, anything publishing JSON — is onboarded by
 /// configuration rather than code.
-/// Where a fan-in delivery is routed once consumed. Shared by every channel
-/// that can feed the SOP engine (AMQP, and agent-loop channels via their
-/// `dispatch` field); the mode is source-agnostic.
+/// Where a fan-in delivery is routed once consumed. Used by AMQP, which carries
+/// this field to choose between the agent loop, the SOP engine, or both.
+/// Agent-loop channels (Telegram, Discord, Slack, ...) do not carry a `dispatch`
+/// field: their fan-in is trigger-driven, opting in via a SOP `channel` trigger
+/// while the normal agent turn always runs. The mode is source-agnostic.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]

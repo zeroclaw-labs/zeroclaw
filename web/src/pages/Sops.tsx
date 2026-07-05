@@ -1046,6 +1046,7 @@ export default function Sops() {
   const [overlay, setOverlay] = useState<RunOverlay | null>(null);
   const [overlayError, setOverlayError] = useState<string | null>(null);
   const [draft, setDraft] = useState<Sop | null>(loadStoredDraft);
+  const [editingName, setEditingName] = useState<string | null>(null);
   const [draftGraph, setDraftGraph] = useState<SopGraph | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -1154,6 +1155,7 @@ export default function Sops() {
 
   const startNew = useCallback(() => {
     setSaveError(null);
+    setEditingName(null);
     setDraft(blankSop(''));
   }, []);
 
@@ -1161,27 +1163,44 @@ export default function Sops() {
     if (!selected) return;
     setSaveError(null);
     getSop(selected)
-      .then((full) => setDraft(full))
+      .then((full) => {
+        setEditingName(full.name);
+        setDraft(full);
+      })
       .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
   }, [selected]);
 
   const onSaveDraft = useCallback(() => {
     if (!draft) return;
+    // Identity is the name the edit started from, not whatever the name field
+    // currently holds. Deciding create-vs-save by "does this name exist" lets a
+    // rename silently fork (edit foo -> bar creates bar, leaves foo) or clobber
+    // (edit foo -> existing bar overwrites bar). We only create when there was
+    // no original, only save when the name is unchanged, and reject renames
+    // until an explicit rename flow exists.
+    const isNew = editingName === null;
+    if (!isNew && draft.name !== editingName) {
+      setSaveError(
+        `Renaming an SOP is not supported here yet. Change the name back to "${editingName}", ` +
+          `or create a new SOP with the new name and delete the old one.`,
+      );
+      return;
+    }
     setSaving(true);
     setSaveError(null);
-    const isNew = !sops.some((s) => s.name === draft.name);
     // Renumbering and routing-ref remapping are owned by the daemon's
     // normalize_step_numbers on save; the draft is sent as-is.
     const op = isNew ? createSop(draft) : saveSop(draft);
     op.then(() => {
       setSaving(false);
       setDraft(null);
+      setEditingName(null);
       return refreshList(draft.name);
     }).catch((e: unknown) => {
       setSaving(false);
       setSaveError(e instanceof Error ? e.message : String(e));
     });
-  }, [draft, sops, refreshList]);
+  }, [draft, editingName, refreshList]);
 
   const onDeleteSelected = useCallback(() => {
     if (!selected) return;
@@ -1361,7 +1380,10 @@ export default function Sops() {
             onRemoveStep={editorHandlers.onRemoveStep}
             onMoveStep={editorHandlers.onMoveStep}
             onSave={onSaveDraft}
-            onCancel={() => setDraft(null)}
+            onCancel={() => {
+              setDraft(null);
+              setEditingName(null);
+            }}
           />
           {draftGraph ? (
             <SopCanvas

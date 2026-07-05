@@ -4824,6 +4824,34 @@ mod tests {
         assert!(d.handle_cost_org().is_err());
     }
 
+    // #8590: the `sops/trigger-sources` RPC response must carry the full
+    // ordered `SopTriggerSource` walk so authoring surfaces (web + zerocode)
+    // render the picker from the backend list instead of reconstructing it.
+    // Any new trigger source variant appears here automatically; a surface that
+    // reconstructs its own list would drift while this guard would not, so the
+    // contract is pinned at the transport boundary every surface reads from.
+    #[test]
+    fn sops_trigger_sources_rpc_carries_full_trigger_source_walk() {
+        use crate::sop::types::SopTriggerSource;
+        use strum::IntoEnumIterator;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        let value = d
+            .handle_sops_trigger_sources()
+            .expect("sops/trigger-sources must succeed on a default config");
+        let sources: Vec<String> = value
+            .get("sources")
+            .and_then(|s| serde_json::from_value(s.clone()).ok())
+            .expect("response must carry a `sources` array");
+        let expected: Vec<String> = SopTriggerSource::iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            sources, expected,
+            "RPC `sources` must equal the complete SopTriggerSource walk so \
+             surfaces cannot drift by reconstructing their own list"
+        );
+    }
+
     #[test]
     fn cost_org_unreadable_non_notfound_errors() {
         // A directory at the snapshot path produces a non-NotFound read error; it must

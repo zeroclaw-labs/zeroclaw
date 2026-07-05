@@ -2162,6 +2162,8 @@ pub struct BoundTriggerSourceView {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TriggerSourceRegistryView {
     #[serde(default)]
+    pub sources: Vec<String>,
+    #[serde(default)]
     pub bound: Vec<BoundTriggerSourceView>,
     #[serde(default)]
     pub channels: Vec<ChannelTriggerKindView>,
@@ -2887,6 +2889,7 @@ mod sop_method_tests {
     #[test]
     fn trigger_registry_view_parses_runtime_wire_shape() {
         let view: TriggerSourceRegistryView = serde_json::from_value(json!({
+            "sources": ["webhook", "filesystem", "channel", "manual"],
             "bound": [
                 {"source": "webhook", "fields": [{"name": "path", "kind": "text"}]},
                 {"source": "filesystem", "fields": [
@@ -2907,6 +2910,11 @@ mod sop_method_tests {
         }))
         .unwrap();
 
+        assert!(
+            !view.sources.is_empty(),
+            "backend sources walk must survive deserialization so zerocode \
+             renders the picker from it without reconstructing"
+        );
         assert_eq!(view.bound.len(), 3);
         let fs = &view.bound[1];
         assert_eq!(fs.fields[1].kind, TriggerFieldKindView::List);
