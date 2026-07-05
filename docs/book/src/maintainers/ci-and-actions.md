@@ -10,12 +10,12 @@ Fires on every PR targeting `master` and on trusted pushes to `master`.
 Composite job with multiple matrix legs:
 
 - **fmt**: `cargo fmt --all -- --check`
-- **lint**: `cargo clippy --workspace --all-targets --features ci-all -- -D warnings`, plus two architecture guards (`cargo test --test architecture`): config-write isolation and Fluent coverage (no bare user-facing strings)
+- **lint**: `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`, plus two architecture guards (`cargo test --test architecture`): config-write isolation and Fluent coverage (no bare user-facing strings)
 - **build**: matrix: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`
 - **check**: all features + no-default-features
 - **check-32bit**: `i686-unknown-linux-gnu` with no default features
 - **bench**: benchmarks compile check
-- **test**: `cargo nextest run --locked --workspace` on Linux
+- **test**: `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
 - **security**: `cargo deny check`
 - **nix-eval**: evaluates the NixOS module assertions (`nixos-module-eval` flake check)
 - **docs-style**: markdown lint, em-dash prose check, and changed-line link gate via `scripts/ci/docs_quality_gate.sh` and `scripts/ci/docs_links_gate.sh`

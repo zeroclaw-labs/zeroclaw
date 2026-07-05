@@ -175,16 +175,20 @@ fn agent_skill_entry(s: EffectiveSkill) -> AgentSkillEntry {
 /// [`SkillDropReason`] enum into a `(reason_kind, reason)` string pair the
 /// dashboard can group on without knowing the Rust enum. (#7963)
 fn dropped_skill_entry(d: DroppedSkill) -> DroppedSkillEntry {
-    let (reason_kind, reason) = match d.reason {
-        SkillDropReason::AuditFindings(s) => ("audit_findings", s),
-        SkillDropReason::AuditError(s) => ("audit_error", s),
-        SkillDropReason::ManifestParseError(s) => ("manifest_parse_error", s),
+    let (reason_kind, reason, scripts_blocked) = match d.reason {
+        SkillDropReason::AuditFindings {
+            summary,
+            scripts_blocked,
+        } => ("audit_findings", summary, scripts_blocked),
+        SkillDropReason::AuditError(s) => ("audit_error", s, false),
+        SkillDropReason::ManifestParseError(s) => ("manifest_parse_error", s, false),
     };
     DroppedSkillEntry {
         name: d.name,
         origin: d.origin_hint,
         reason_kind: reason_kind.to_string(),
         reason,
+        scripts_blocked,
         directory: d.location.map(|p| p.display().to_string()),
     }
 }
@@ -383,8 +387,20 @@ mod tests {
             location: Some(PathBuf::from("/x/n")),
         };
         assert_eq!(
-            dropped_skill_entry(mk(SkillDropReason::AuditFindings("a".into()))).reason_kind,
+            dropped_skill_entry(mk(SkillDropReason::AuditFindings {
+                summary: "a".into(),
+                scripts_blocked: true,
+            }))
+            .reason_kind,
             "audit_findings"
+        );
+        assert!(
+            dropped_skill_entry(mk(SkillDropReason::AuditFindings {
+                summary: "a".into(),
+                scripts_blocked: true,
+            }))
+            .scripts_blocked,
+            "scripts_blocked flag must pass through to the wire entry"
         );
         assert_eq!(
             dropped_skill_entry(mk(SkillDropReason::AuditError("b".into()))).reason_kind,
