@@ -46,6 +46,16 @@ pub(super) fn require_auth(
     }
 
     let token = extract_bearer_token(headers).unwrap_or("");
+    // Defense-in-depth: reject empty tokens explicitly so a future
+    // refactor of is_authenticated cannot accidentally treat "" as valid.
+    if token.is_empty() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            })),
+        ));
+    }
     if state.pairing.is_authenticated(token) {
         Ok(())
     } else {
@@ -2625,6 +2635,24 @@ mod tests {
                 .iter()
                 .any(|item| item.contains("Bind this channel"))
         );
+    }
+
+    #[test]
+    fn require_auth_rejects_empty_bearer_token() {
+        let config = zeroclaw_config::schema::Config::default();
+        let mut state = test_state(config);
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer ".parse().unwrap(), // empty token after prefix
+        );
+
+        let result = require_auth(&state, &headers);
+        assert!(result.is_err(), "empty bearer token must be rejected");
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
