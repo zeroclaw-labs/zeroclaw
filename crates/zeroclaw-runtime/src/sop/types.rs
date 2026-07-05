@@ -192,6 +192,8 @@ pub enum SopStepKind {
     Execute,
     /// Checkpoint step — pauses execution and waits for human approval.
     Checkpoint,
+    /// Deterministic capability step - executed by the SOP capability registry.
+    Capability,
 }
 
 impl fmt::Display for SopStepKind {
@@ -199,6 +201,7 @@ impl fmt::Display for SopStepKind {
         match self {
             Self::Execute => write!(f, "execute"),
             Self::Checkpoint => write!(f, "checkpoint"),
+            Self::Capability => write!(f, "capability"),
         }
     }
 }
@@ -224,8 +227,11 @@ pub struct StepSchema {
 /// A single step in an SOP procedure, parsed from SOP.md.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SopStep {
+    #[serde(default)]
     pub number: u32,
+    #[serde(default)]
     pub title: String,
+    #[serde(default)]
     pub body: String,
     #[serde(default)]
     pub suggested_tools: Vec<String>,
@@ -249,6 +255,12 @@ pub struct SopStep {
     /// Optional per-step execution mode override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<SopExecutionMode>,
+    /// Capability identifier used when `kind = "capability"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    /// Capability arguments, serialized as `with` in TOML/JSON definitions.
+    #[serde(default, rename = "with", skip_serializing_if = "Option::is_none")]
+    pub capability_input: Option<serde_json::Value>,
 }
 
 impl Default for SopStep {
@@ -265,11 +277,27 @@ impl Default for SopStep {
             routing: StepRouting::default(),
             on_failure: StepFailure::default(),
             mode: None,
+            capability: None,
+            capability_input: None,
         }
     }
 }
 
 impl SopStep {
+    pub fn capability_id(&self) -> Option<&str> {
+        self.capability.as_deref()
+    }
+
+    pub fn capability_call_input(&self, piped_input: serde_json::Value) -> serde_json::Value {
+        let Some(mut configured) = self.capability_input.clone() else {
+            return piped_input;
+        };
+        if let Some(object) = configured.as_object_mut() {
+            object.entry("input").or_insert(piped_input);
+        }
+        configured
+    }
+
     pub fn effective_tool_scope(&self) -> Option<StepToolScope> {
         let mut scope = self.scope.clone();
         if !self.suggested_tools.is_empty() {
@@ -322,6 +350,8 @@ pub struct SopManifest {
     pub sop: SopMeta,
     #[serde(default)]
     pub triggers: Vec<SopTrigger>,
+    #[serde(default)]
+    pub steps: Vec<SopStep>,
 }
 
 /// The `[sop]` table in SOP.toml.
@@ -747,6 +777,7 @@ path = "/var/inbox"
     fn step_kind_display() {
         assert_eq!(SopStepKind::Execute.to_string(), "execute");
         assert_eq!(SopStepKind::Checkpoint.to_string(), "checkpoint");
+        assert_eq!(SopStepKind::Capability.to_string(), "capability");
     }
 
     #[test]
@@ -806,6 +837,8 @@ path = "/var/inbox"
                 .unwrap();
         assert!(step.suggested_tools.is_empty());
         assert!(!step.requires_confirmation);
+        assert!(step.capability.is_none());
+        assert!(step.capability_input.is_none());
     }
 
     #[test]
@@ -822,6 +855,8 @@ path = "/var/inbox"
         assert!(value.get("routing").is_none());
         assert!(value.get("on_failure").is_none());
         assert!(value.get("mode").is_none());
+        assert!(value.get("capability").is_none());
+        assert!(value.get("with").is_none());
     }
 
     #[test]
