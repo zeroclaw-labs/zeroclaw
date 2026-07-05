@@ -98,8 +98,14 @@ pub struct Skill {
 /// dashboard can show the same reason without re-running the audit. (#7963)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillDropReason {
-    /// `audit_*` returned Ok(report) with findings; String = report.summary().
-    AuditFindings(String),
+    /// `audit_*` returned Ok(report) with findings. `summary` = report.summary();
+    /// `scripts_blocked` is true when the secure-default script policy is the
+    /// blocker, so consumers can offer the `skills.allow_scripts = true` hint
+    /// without re-parsing the human-readable summary.
+    AuditFindings {
+        summary: String,
+        scripts_blocked: bool,
+    },
     /// `audit_*` returned Err (unauditable); String = error message.
     AuditError(String),
     /// Audit passed but SKILL.toml/manifest.toml failed to parse.
@@ -409,11 +415,10 @@ pub fn print_install_tier_banner(name: &str, version: Option<&str>, tier: SkillT
 }
 
 /// Emit a user-visible warning when a skill directory is skipped due to audit
-/// findings. When the findings mention blocked scripts and `allow_scripts` is
-/// `false`, the message includes actionable remediation guidance so users know
-/// how to enable their skill.
-fn warn_skipped_skill(path: &Path, summary: &str, allow_scripts: bool) {
-    let scripts_blocked = summary.contains("script-like files are blocked");
+/// findings. When `scripts_blocked` is set and `allow_scripts` is `false`, the
+/// message includes actionable remediation guidance so users know how to enable
+/// their skill.
+fn warn_skipped_skill(path: &Path, summary: &str, scripts_blocked: bool, allow_scripts: bool) {
     if scripts_blocked && !allow_scripts {
         ::zeroclaw_log::record!(
             WARN,
@@ -755,11 +760,15 @@ fn load_skills_from_directory_uncached(
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
                 let summary = report.summary();
-                warn_skipped_skill(&path, &summary, allow_scripts);
+                let scripts_blocked = report.scripts_blocked;
+                warn_skipped_skill(&path, &summary, scripts_blocked, allow_scripts);
                 dropped.push(DroppedSkill {
                     name: dir_stem(&path),
                     origin_hint: "workspace".into(),
-                    reason: SkillDropReason::AuditFindings(summary),
+                    reason: SkillDropReason::AuditFindings {
+                        summary,
+                        scripts_blocked,
+                    },
                     location: Some(path.clone()),
                 });
                 continue;
@@ -880,11 +889,15 @@ fn load_open_skills_from_directory_uncached(
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
                 let summary = report.summary();
-                warn_skipped_skill(&path, &summary, allow_scripts);
+                let scripts_blocked = report.scripts_blocked;
+                warn_skipped_skill(&path, &summary, scripts_blocked, allow_scripts);
                 dropped.push(DroppedSkill {
                     name: dir_stem(&path),
                     origin_hint: "open-skills".into(),
-                    reason: SkillDropReason::AuditFindings(summary),
+                    reason: SkillDropReason::AuditFindings {
+                        summary,
+                        scripts_blocked,
+                    },
                     location: Some(path.clone()),
                 });
                 continue;
@@ -998,6 +1011,7 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> (Vec<Skill>, Vec<Dr
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
                 let summary = report.summary();
+                let scripts_blocked = report.scripts_blocked;
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1011,7 +1025,10 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> (Vec<Skill>, Vec<Dr
                 dropped.push(DroppedSkill {
                     name: dir_stem(&path),
                     origin_hint: "open-skills".into(),
-                    reason: SkillDropReason::AuditFindings(summary),
+                    reason: SkillDropReason::AuditFindings {
+                        summary,
+                        scripts_blocked,
+                    },
                     location: Some(path.clone()),
                 });
                 continue;
@@ -3933,10 +3950,19 @@ description = "fine"
         assert_eq!(dropped.len(), 1, "the script skill must be reported");
         assert_eq!(dropped[0].origin_hint, "workspace");
         match &dropped[0].reason {
-            SkillDropReason::AuditFindings(summary) => assert!(
-                summary.contains("script-like files are blocked"),
-                "reason must mark scripts as the blocker; got: {summary}"
-            ),
+            SkillDropReason::AuditFindings {
+                summary,
+                scripts_blocked,
+            } => {
+                assert!(
+                    *scripts_blocked,
+                    "reason must flag scripts as the blocker; got: {summary}"
+                );
+                assert!(
+                    summary.contains("script-like files are blocked"),
+                    "summary must describe the script block; got: {summary}"
+                );
+            }
             other => panic!("expected AuditFindings, got: {other:?}"),
         }
 

@@ -120,9 +120,10 @@ pub async fn handle_command(
                 println!();
                 for entry in &skipped {
                     let (reason, scripts_blocked) = match &entry.reason {
-                        SkillDropReason::AuditFindings(s) => {
-                            (s.clone(), s.contains("script-like files are blocked"))
-                        }
+                        SkillDropReason::AuditFindings {
+                            summary,
+                            scripts_blocked,
+                        } => (summary.clone(), *scripts_blocked),
                         SkillDropReason::AuditError(s) | SkillDropReason::ManifestParseError(s) => {
                             (s.clone(), false)
                         }
