@@ -125,6 +125,7 @@ pub(crate) fn live_channel_registry() -> Option<tools::PerToolChannelHandle> {
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
+use crate::tools::scoped;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -371,62 +372,6 @@ pub fn register_eager_mcp_tool_if_allowed(
     true
 }
 
-/// Apply the SecurityPolicy built-in tool filter on the channel/daemon
-/// (`process_message`) path.
-///
-/// Extracted as a named seam so the production filtering of the eager
-/// built-in registry is regression-testable without driving the full agent
-/// loop (see `process_message_policy_filters_eager_builtins`). The channel
-/// path has no caller-supplied allowlist, so only the agent's own
-/// `SecurityPolicy` (`allowed_tools` + `excluded_tools`) gates here; the
-/// `run()` path additionally composes a caller-supplied `allowed_tools` gate.
-pub(crate) fn filter_channel_builtin_tools(
-    tools_registry: &mut Vec<Box<dyn Tool>>,
-    security: &zeroclaw_config::policy::SecurityPolicy,
-) {
-    let before_filter = tools_registry.len();
-
-    // At non-Full autonomy, the known default read-only auto-approve
-    // tools (web_search_tool, web_fetch, calculator, etc.) are always
-    // accessible on channels so the bot can fetch real-time information.
-    // Only the canonical builtin default set bypasses allowed_tools;
-    // operator-added auto_approve entries (e.g. shell) still require
-    // explicit allowlisting via allowed_tools.
-    if security.autonomy != AutonomyLevel::Full {
-        let defaults = zeroclaw_config::schema::default_auto_approve();
-        let safe_defaults: HashSet<&str> = defaults.iter().map(String::as_str).collect();
-        tools_registry.retain(|t| {
-            let name = t.name();
-            if safe_defaults.contains(name) {
-                // Builtin read-only tool: admit past allowed_tools but
-                // still respect the excluded_tools denylist.
-                return security
-                    .excluded_tools
-                    .as_ref()
-                    .is_none_or(|list| !list.iter().any(|ex| ex == name));
-            }
-            security.is_tool_allowed(name)
-        });
-    } else {
-        apply_policy_tool_filter(tools_registry, Some(security), None);
-    }
-
-    if tools_registry.len() != before_filter {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
-                .with_category(::zeroclaw_log::EventCategory::Agent)
-                .with_attrs(::serde_json::json!({
-                    "before": before_filter,
-                    "retained": tools_registry.len(),
-                    "policy_allowed": security.allowed_tools.as_ref().map(|v| v.len()),
-                    "policy_excluded": security.excluded_tools.as_ref().map(|v| v.len()),
-                })),
-            "Applied capability-based tool access filter (process_message)"
-        );
-    }
-}
-
 /// Returns the subset of `tool_specs` that should be sent to the LLM for this turn.
 ///
 /// Rules (mirrors NullClaw `filterToolSpecsForTurn`):
@@ -594,7 +539,7 @@ fn elide_image_data(content: &str) -> String {
 /// xoxb-/…) and `scrub_credentials` (key=value / bearer=) are disjoint; neither
 /// alone covers free-form content. Residual secrets/PII may remain — this is
 /// disclosed in the PR/docs, not eliminated.
-fn scrub_for_export(content: &str) -> String {
+pub(crate) fn scrub_for_export(content: &str) -> String {
     scrub_credentials(&zeroclaw_providers::scrub_secret_patterns(
         &elide_image_data(content),
     ))
@@ -607,6 +552,14 @@ fn scrub_for_export(content: &str) -> String {
 /// builds pay no cloning/scrubbing cost. The system message is split into
 /// `system_instructions`; the rest become `input`. Every string passes through
 /// [`scrub_for_export`] (image elision + dual credential scrub).
+///
+/// This function does NOT consult any OTel content policy — it only constructs
+/// a credential-scrubbed snapshot when the `observability-otel` feature is
+/// enabled. Whether that snapshot is actually exported (and at what privacy
+/// level: `off` / `redacted` / `full`) is decided by the owning
+/// `OtelObserver`'s instance content config at the OTel export boundary, not
+/// here. Keeping the policy out of the capture path avoids process-global
+/// mutable state and the cross-observer drift it caused.
 pub(crate) fn capture_llm_messages(
     messages: &[ChatMessage],
     output_text: Option<&str>,
@@ -1393,14 +1346,36 @@ pub async fn run(
             sop_audit,
             None,
         );
-        let mut tools_registry = all_tools_result.tools;
-        let delegate_handle = all_tools_result.delegate_handle;
-        let unfiltered_tool_arcs = all_tools_result.unfiltered_tool_arcs;
-        let ask_user_handle = all_tools_result.ask_user_handle;
-        let channel_room_handle = all_tools_result.channel_room_handle;
-        let reaction_handle = all_tools_result.reaction_handle;
-        let poll_handle = all_tools_result.poll_handle;
-        let escalate_handle = all_tools_result.escalate_handle;
+        let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
+        // Route the per-agent tool registry through the one gated seam
+        // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
+        // to the behavior this path hand-rolled. `caller_allowed` carries the
+        // run() per-run allowlist; connect_peripherals is true (execution path).
+        let scoped::ScopedAssembled {
+            registry,
+            delegate_handle: _,
+            ask_user_handle,
+            reaction_handle,
+            poll_handle,
+            escalate_handle,
+            channel_room_handle,
+            deferred_section,
+            activated_handle,
+        } = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+            config: &config,
+            agent_alias,
+            security: &security,
+            built: all_tools_result,
+            skills: &skills,
+            runtime: runtime.clone(),
+            caller_allowed: allowed_tools.as_deref(),
+            connect_mcp: true,
+            connect_peripherals: true,
+            exclude_memory: false,
+            emit_assembly_logs: true,
+        })
+        .await;
+        let tools_registry = registry.into_inner();
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
@@ -1418,223 +1393,6 @@ pub async fn run(
                     .with_attrs(::serde_json::json!({"count": count})),
                 &format!("Registered {} channel(s) for CLI agent", count),
             );
-        }
-
-        let peripheral_tools: Vec<Box<dyn Tool>> = if let Some(f) = PERIPHERAL_TOOLS_FN.get() {
-            f(config.peripherals.clone()).await.unwrap_or_default()
-        } else {
-            vec![]
-        };
-        if !peripheral_tools.is_empty() {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
-                    .with_category(::zeroclaw_log::EventCategory::Tool)
-                    .with_attrs(::serde_json::json!({"count": peripheral_tools.len()})),
-                "Peripheral tools added"
-            );
-            tools_registry.extend(peripheral_tools);
-        }
-
-        // ── Capability-based tool access control ─────────────────────
-        // Two-gate filter: parent agent's SecurityPolicy
-        // (`allowed_tools` + `excluded_tools`) AND the caller-supplied
-        // `allowed_tools` parameter. Both must admit a tool name for
-        // the tool to survive. `None` on either gate is unrestricted
-        // for that gate alone.
-        let before_filter = tools_registry.len();
-        apply_policy_tool_filter(
-            &mut tools_registry,
-            Some(security.as_ref()),
-            allowed_tools.as_deref(),
-        );
-        if tools_registry.len() != before_filter {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
-                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_attrs(::serde_json::json!({
-                        "before": before_filter,
-                        "retained": tools_registry.len(),
-                        "policy_allowed": security.allowed_tools.as_ref().map(|v| v.len()),
-                        "policy_excluded": security.excluded_tools.as_ref().map(|v| v.len()),
-                        "caller_allowed": allowed_tools.as_ref().map(|v| v.len()),
-                    })),
-                "Applied capability-based tool access filter"
-            );
-        }
-
-        // ── Wire MCP tools (non-fatal) — CLI path ────────────────────
-        // NOTE: MCP tools are injected after built-in tool filtering
-        // (filter_primary_agent_tools_or_fail / agent.allowed_tools / agent.denied_tools).
-        // MCP registration and deferred discovery then apply the same policy
-        // explicitly so denied MCP tools never surface in context or delegate handles.
-        //
-        // When `deferred_loading` is enabled, MCP tools are NOT added to the registry
-        // eagerly. Instead, a `tool_search` built-in is registered so the LLM can
-        // fetch schemas on demand. This reduces context window waste.
-        let mut deferred_section = String::new();
-        let mut activated_handle: Option<
-            std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
-        > = None;
-        // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
-        let mut mcp_elevation_arcs: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
-        // Secure by default: only the MCP servers granted by this agent's
-        // `mcp_bundles` (omission is not a grant).
-        let agent_mcp_servers = if config.mcp.enabled {
-            config.mcp_servers_for_agent(agent_alias)
-        } else {
-            Vec::new()
-        };
-        if !agent_mcp_servers.is_empty() {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
-                    .with_category(::zeroclaw_log::EventCategory::Tool),
-                &format!(
-                    "Initializing MCP client - {} server(s) granted via mcp_bundles",
-                    agent_mcp_servers.len()
-                )
-            );
-            match crate::tools::McpRegistry::connect_all(&agent_mcp_servers).await {
-                Ok(registry) => {
-                    let registry = std::sync::Arc::new(registry);
-                    mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
-                    let mcp_policy =
-                        mcp_tool_access_policy(security.as_ref(), allowed_tools.as_deref());
-                    // Register the generic MCP resource/prompt capability tools
-                    // (policy-gated, both deferred and eager modes).
-                    for tool in
-                        crate::tools::build_mcp_capability_tools(&registry, mcp_policy.as_ref())
-                    {
-                        register_eager_mcp_tool_if_allowed(
-                            tool,
-                            &mut tools_registry,
-                            delegate_handle.as_ref(),
-                            mcp_policy.as_ref(),
-                        );
-                    }
-                    let pinned_section = crate::tools::mcp_context::build_pinned_resources_section(
-                        &registry,
-                        &agent_mcp_servers,
-                        mcp_policy.as_ref(),
-                    )
-                    .await;
-                    if config.mcp.deferred_loading {
-                        // Deferred path: build stubs and register tool_search
-                        let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
-                            std::sync::Arc::clone(&registry),
-                        )
-                        .await;
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Load
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Tool),
-                            &format!(
-                                "MCP deferred: {} tool stub(s) from {} server(s)",
-                                deferred_set.len(),
-                                registry.server_count()
-                            )
-                        );
-                        let allowed_stub_count = mcp_allowed_tool_count(
-                            deferred_set
-                                .stubs
-                                .iter()
-                                .map(|stub| stub.prefixed_name.as_str()),
-                            mcp_policy.as_ref(),
-                        );
-                        deferred_section = crate::tools::build_deferred_tools_section_filtered(
-                            &deferred_set,
-                            mcp_policy.as_ref(),
-                        );
-                        if allowed_stub_count > 0 {
-                            let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                                crate::tools::ActivatedToolSet::new(),
-                            ));
-                            activated_handle = Some(std::sync::Arc::clone(&activated));
-                            let mut tool_search =
-                                crate::tools::ToolSearchTool::new(deferred_set, activated);
-                            if let Some(policy) = mcp_policy {
-                                tool_search = tool_search.with_access_policy(policy);
-                            }
-                            if let Some(ref handle) = delegate_handle {
-                                let delegate_tools = std::sync::Arc::clone(handle);
-                                tool_search = tool_search.with_activation_hook(
-                                    std::sync::Arc::new(move |tool| {
-                                        let mut tools = delegate_tools.write();
-                                        let already_registered = tools
-                                            .iter()
-                                            .any(|existing| existing.name() == tool.name());
-                                        if !already_registered {
-                                            tools.push(tool);
-                                        }
-                                    }),
-                                );
-                            }
-                            tools_registry.push(Box::new(tool_search));
-                        }
-                    } else {
-                        // Eager path: register only MCP tools admitted by the
-                        // same policy used by deferred MCP discovery.
-                        let names = registry.tool_names();
-                        let mut registered = 0usize;
-                        let mut skipped = 0usize;
-                        for name in names {
-                            if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
-                                skipped += 1;
-                                continue;
-                            }
-                            if let Some(def) = registry.get_tool_def(&name).await {
-                                let wrapper: std::sync::Arc<dyn Tool> =
-                                    std::sync::Arc::new(crate::tools::McpToolWrapper::new(
-                                        name,
-                                        def,
-                                        std::sync::Arc::clone(&registry),
-                                    ));
-                                if register_eager_mcp_tool_if_allowed(
-                                    wrapper,
-                                    &mut tools_registry,
-                                    delegate_handle.as_ref(),
-                                    mcp_policy.as_ref(),
-                                ) {
-                                    registered += 1;
-                                }
-                            }
-                        }
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Register
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Tool),
-                            &format!(
-                                "MCP: {} tool(s) registered from {} server(s), {} skipped by policy",
-                                registered,
-                                registry.server_count(),
-                                skipped
-                            )
-                        );
-                    }
-                    // Append pinned MCP resources unconditionally, after both the
-                    // deferred and eager branches, so the deferred-path reassignment
-                    // of `deferred_section` does not clobber them.
-                    append_pinned_mcp_section(&mut deferred_section, &pinned_section);
-                }
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "MCP registry failed to initialize"
-                    );
-                }
-            }
         }
 
         // ── Resolve model_provider ─────────────────────────────────────────
@@ -1749,26 +1507,6 @@ pub async fn run(
             .map(ToString::to_string)
             .unwrap_or_else(crate::i18n::detect_locale);
         crate::i18n::init(&i18n_locale);
-
-        // ── Build system prompt from workspace MD files (OpenClaw framework) ──
-        let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
-
-        // Register skill-defined tools as callable tool specs in the tool registry
-        // so the LLM can invoke them via native function calling, not just XML prompts.
-        // Resolution registry = built-in arcs + resolution-only MCP wrappers, so
-        // skill elevation (kind = "builtin" / "mcp") can resolve either target.
-        let skill_resolution_registry: Vec<std::sync::Arc<dyn Tool>> = unfiltered_tool_arcs
-            .iter()
-            .cloned()
-            .chain(mcp_elevation_arcs.iter().cloned())
-            .collect();
-        tools::register_skill_tools_with_context_and_runtime(
-            &mut tools_registry,
-            &skills,
-            security.clone(),
-            &skill_resolution_registry,
-            runtime,
-        );
 
         let mut tool_descs: Vec<(&str, &str)> = vec![
             (
@@ -3079,22 +2817,48 @@ pub async fn process_message(
             sop_audit,
             None,
         );
-        let mut tools_registry = all_tools_result_pm.tools;
-        let delegate_handle_pm = all_tools_result_pm.delegate_handle;
-        let unfiltered_tool_arcs_pm = all_tools_result_pm.unfiltered_tool_arcs;
-        let ask_user_handle_pm = all_tools_result_pm.ask_user_handle;
-        let channel_room_handle_pm = all_tools_result_pm.channel_room_handle;
-        let reaction_handle_pm = all_tools_result_pm.reaction_handle;
-        let poll_handle_pm = all_tools_result_pm.poll_handle;
-        let escalate_handle_pm = all_tools_result_pm.escalate_handle;
+        let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
+        // Route the per-agent tool registry through the one gated seam - the same
+        // seam run() uses. This UNIFIES process_message's built-in filter with every
+        // other construction path: `assemble` applies the plain policy filter
+        // (allowed_tools + excluded_tools), replacing filter_channel_builtin_tools,
+        // which admitted the canonical read-only defaults past allowed_tools at
+        // non-Full autonomy. Only process_message (i.e. gateway live chat and peer
+        // delegation) had that admit; the real channels already use the plain filter.
+        // See the PR body for the hardening rationale.
+        let scoped::ScopedAssembled {
+            registry,
+            delegate_handle: _,
+            ask_user_handle,
+            reaction_handle,
+            poll_handle,
+            escalate_handle,
+            channel_room_handle,
+            mut deferred_section,
+            activated_handle: activated_handle_pm,
+        } = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+            config: &config,
+            agent_alias,
+            security: &security,
+            built: all_tools_result_pm,
+            skills: &skills,
+            runtime: runtime.clone(),
+            caller_allowed: None,
+            connect_mcp: true,
+            connect_peripherals: true,
+            exclude_memory: false,
+            emit_assembly_logs: true,
+        })
+        .await;
+        let tools_registry = registry.into_inner();
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
-            &ask_user_handle_pm,
-            &channel_room_handle_pm,
-            &reaction_handle_pm,
-            &poll_handle_pm,
-            &escalate_handle_pm,
+            &ask_user_handle,
+            &channel_room_handle,
+            &reaction_handle,
+            &poll_handle,
+            &escalate_handle,
         );
         if count > 0 {
             ::zeroclaw_log::record!(
@@ -3104,182 +2868,6 @@ pub async fn process_message(
                     .with_attrs(::serde_json::json!({"count": count})),
                 &format!("Registered {} channel(s) for process_message agent", count),
             );
-        }
-        let peripheral_tools: Vec<Box<dyn Tool>> = if let Some(f) = PERIPHERAL_TOOLS_FN.get() {
-            f(config.peripherals.clone()).await.unwrap_or_default()
-        } else {
-            vec![]
-        };
-        tools_registry.extend(peripheral_tools);
-
-        // ── Capability-based tool access control ─────────────────────
-        // Mirror the `run()` path: apply the SecurityPolicy filter
-        // (allowed_tools + excluded_tools) so daemon-provisioned agents get
-        // the same restriction as CLI-invoked agents. Extracted into
-        // `filter_channel_builtin_tools` so the production path is
-        // regression-tested (see process_message_policy_filters_eager_builtins).
-        filter_channel_builtin_tools(&mut tools_registry, security.as_ref());
-
-        // ── Wire MCP tools (non-fatal) — process_message path ────────
-        // NOTE: Same ordering contract as the CLI path above. MCP tools are
-        // initialized after built-in filtering, then registration/discovery is
-        // gated explicitly by the agent's security policy.
-        let mut deferred_section = String::new();
-        let mut activated_handle_pm: Option<
-            std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
-        > = None;
-        // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
-        let mut mcp_elevation_arcs: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
-        // Secure by default: only the MCP servers granted by this agent's
-        // `mcp_bundles` (omission is not a grant).
-        let agent_mcp_servers = if config.mcp.enabled {
-            config.mcp_servers_for_agent(agent_alias)
-        } else {
-            Vec::new()
-        };
-        if !agent_mcp_servers.is_empty() {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
-                    .with_category(::zeroclaw_log::EventCategory::Tool),
-                &format!(
-                    "Initializing MCP client - {} server(s) granted via mcp_bundles",
-                    agent_mcp_servers.len()
-                )
-            );
-            match crate::tools::McpRegistry::connect_all(&agent_mcp_servers).await {
-                Ok(registry) => {
-                    let registry = std::sync::Arc::new(registry);
-                    mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
-                    let mcp_policy_pm = mcp_tool_access_policy(security.as_ref(), None);
-                    for tool in
-                        crate::tools::build_mcp_capability_tools(&registry, mcp_policy_pm.as_ref())
-                    {
-                        register_eager_mcp_tool_if_allowed(
-                            tool,
-                            &mut tools_registry,
-                            delegate_handle_pm.as_ref(),
-                            mcp_policy_pm.as_ref(),
-                        );
-                    }
-                    let pinned_section = crate::tools::mcp_context::build_pinned_resources_section(
-                        &registry,
-                        &agent_mcp_servers,
-                        mcp_policy_pm.as_ref(),
-                    )
-                    .await;
-                    if config.mcp.deferred_loading {
-                        let deferred_set = crate::tools::DeferredMcpToolSet::from_registry(
-                            std::sync::Arc::clone(&registry),
-                        )
-                        .await;
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Load
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Tool),
-                            &format!(
-                                "MCP deferred: {} tool stub(s) from {} server(s)",
-                                deferred_set.len(),
-                                registry.server_count()
-                            )
-                        );
-                        let allowed_stub_count_pm = mcp_allowed_tool_count(
-                            deferred_set
-                                .stubs
-                                .iter()
-                                .map(|stub| stub.prefixed_name.as_str()),
-                            mcp_policy_pm.as_ref(),
-                        );
-                        deferred_section = crate::tools::build_deferred_tools_section_filtered(
-                            &deferred_set,
-                            mcp_policy_pm.as_ref(),
-                        );
-                        if allowed_stub_count_pm > 0 {
-                            let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                                crate::tools::ActivatedToolSet::new(),
-                            ));
-                            activated_handle_pm = Some(std::sync::Arc::clone(&activated));
-                            let mut tool_search_pm =
-                                crate::tools::ToolSearchTool::new(deferred_set, activated);
-                            if let Some(policy) = mcp_policy_pm {
-                                tool_search_pm = tool_search_pm.with_access_policy(policy);
-                            }
-                            if let Some(ref handle) = delegate_handle_pm {
-                                let delegate_tools = std::sync::Arc::clone(handle);
-                                tool_search_pm = tool_search_pm.with_activation_hook(
-                                    std::sync::Arc::new(move |tool| {
-                                        let mut tools = delegate_tools.write();
-                                        let already_registered = tools
-                                            .iter()
-                                            .any(|existing| existing.name() == tool.name());
-                                        if !already_registered {
-                                            tools.push(tool);
-                                        }
-                                    }),
-                                );
-                            }
-                            tools_registry.push(Box::new(tool_search_pm));
-                        }
-                    } else {
-                        let names = registry.tool_names();
-                        let mut registered = 0usize;
-                        let mut skipped = 0usize;
-                        for name in names {
-                            if !eager_mcp_tool_allowed(&name, mcp_policy_pm.as_ref()) {
-                                skipped += 1;
-                                continue;
-                            }
-                            if let Some(def) = registry.get_tool_def(&name).await {
-                                let wrapper: std::sync::Arc<dyn Tool> =
-                                    std::sync::Arc::new(crate::tools::McpToolWrapper::new(
-                                        name,
-                                        def,
-                                        std::sync::Arc::clone(&registry),
-                                    ));
-                                if register_eager_mcp_tool_if_allowed(
-                                    wrapper,
-                                    &mut tools_registry,
-                                    delegate_handle_pm.as_ref(),
-                                    mcp_policy_pm.as_ref(),
-                                ) {
-                                    registered += 1;
-                                }
-                            }
-                        }
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Register
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Tool),
-                            &format!(
-                                "MCP: {} tool(s) registered from {} server(s), {} skipped by policy",
-                                registered,
-                                registry.server_count(),
-                                skipped
-                            )
-                        );
-                    }
-                    // Append pinned MCP resources unconditionally, after both the
-                    // deferred and eager branches, so the deferred-path reassignment
-                    // of `deferred_section` does not clobber them.
-                    append_pinned_mcp_section(&mut deferred_section, &pinned_section);
-                }
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "MCP registry failed to initialize"
-                    );
-                }
-            }
         }
 
         let model_name = match agent_model_provider
@@ -3336,23 +2924,6 @@ pub async fn process_message(
             .map(ToString::to_string)
             .unwrap_or_else(crate::i18n::detect_locale);
         crate::i18n::init(&i18n_locale);
-
-        let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
-
-        // Register skill-defined tools as callable tool specs (process_message path).
-        // Resolution registry = built-in arcs + resolution-only MCP wrappers.
-        let skill_resolution_registry: Vec<std::sync::Arc<dyn Tool>> = unfiltered_tool_arcs_pm
-            .iter()
-            .cloned()
-            .chain(mcp_elevation_arcs.iter().cloned())
-            .collect();
-        tools::register_skill_tools_with_context_and_runtime(
-            &mut tools_registry,
-            &skills,
-            security.clone(),
-            &skill_resolution_registry,
-            runtime,
-        );
 
         let mut tool_descs: Vec<(&str, &str)> = vec![
             ("shell", "Execute terminal commands."),
@@ -14833,19 +14404,17 @@ Let me check the result."#;
         );
     }
 
-    // ── process_message() path regression (#6959) ─────────────────
-    //
-    // The bug was not that `apply_policy_tool_filter` filtered wrong; it
-    // was that the daemon/channel `process_message` path never called it,
-    // so a restrictive SecurityPolicy did not apply when the same agent was
-    // reached through a channel. This drives the exact seam that path now
-    // calls (`filter_channel_builtin_tools`) against the *real* eager
-    // built-in registry produced by `all_tools`, and proves an agent
-    // allowlisted to `file_read` does not get raw `shell` / `file_write`.
-    #[test]
-    fn process_message_policy_filters_eager_builtins() {
-        use std::sync::Arc;
-
+    /// Characterization of the unified `process_message` built-in filter
+    /// (replaces the deleted `filter_channel_builtin_tools` safe-defaults tests,
+    /// #6959). `process_message` now routes its real eager registry through
+    /// `ScopedToolRegistry::assemble` with `caller_allowed: None` - the plain
+    /// `allowed_tools`/`excluded_tools` policy filter. At non-Full autonomy a
+    /// canonical read-only default (`web_search_tool`) that is NOT in a
+    /// restrictive `allowed_tools` is now DROPPED, where the removed admit
+    /// retained it. This positively pins the narrowing this path lands: on the
+    /// gateway-chat and peer paths `allowed_tools` is honored strictly.
+    #[tokio::test]
+    async fn process_message_seam_narrows_safe_defaults_outside_allowed_tools() {
         let config = zeroclaw_config::schema::Config::default();
         let security = Arc::new(TestPolicy {
             workspace_dir: std::env::temp_dir(),
@@ -14855,7 +14424,8 @@ Let me check the result."#;
         let mem: Arc<dyn zeroclaw_memory::Memory> =
             Arc::new(zeroclaw_memory::NoneMemory::new("test"));
 
-        let mut registry = crate::tools::all_tools(
+        // Build the real eager built-in registry, as process_message does.
+        let built = crate::tools::all_tools(
             Arc::new(config.clone()),
             &security,
             &risk,
@@ -14873,81 +14443,53 @@ Let me check the result."#;
             None,
             false,
             None,
-        )
-        .tools;
-
-        // Sanity: the unrestricted channel registry exposes the dangerous
-        // eager built-ins a restrictive policy is expected to remove.
-        let unrestricted = tool_names(&registry);
-        assert!(
-            unrestricted.contains(&"file_read"),
-            "expected file_read in unrestricted registry, got {unrestricted:?}"
-        );
-        assert!(
-            unrestricted.contains(&"shell"),
-            "expected shell in unrestricted registry, got {unrestricted:?}"
-        );
-        assert!(
-            unrestricted.contains(&"file_write"),
-            "expected file_write in unrestricted registry, got {unrestricted:?}"
         );
 
-        // Allowlist the agent to `file_read` only, then run the exact filter
-        // `process_message` applies.
-        let policy = TestPolicy {
-            allowed_tools: Some(vec!["file_read".into()]),
+        let before = tool_names(&built.tools);
+        assert!(
+            before.contains(&"web_search_tool"),
+            "precondition: web_search_tool in the eager registry, got {before:?}"
+        );
+        assert!(
+            before.contains(&"shell"),
+            "precondition: shell in the eager registry, got {before:?}"
+        );
+
+        // Restrict allowed_tools to shell only, at non-Full autonomy - the exact
+        // scenario where the removed admit diverged from the plain filter.
+        let policy = Arc::new(TestPolicy {
+            workspace_dir: std::env::temp_dir(),
+            allowed_tools: Some(vec!["shell".into()]),
+            autonomy: crate::security::AutonomyLevel::Supervised,
             ..TestPolicy::default()
-        };
-        super::filter_channel_builtin_tools(&mut registry, &policy);
+        });
 
-        let filtered = tool_names(&registry);
-        assert!(
-            filtered.contains(&"file_read"),
-            "allowlisted tool must survive on process_message path, got {filtered:?}"
-        );
-        assert!(
-            !filtered.contains(&"shell"),
-            "shell must be filtered out on process_message path, got {filtered:?}"
-        );
-        assert!(
-            !filtered.contains(&"file_write"),
-            "file_write must be filtered out on process_message path, got {filtered:?}"
-        );
-
-        // Denylist variant: an exclusion drops only the named tool.
-        let mut registry2 = crate::tools::all_tools(
-            Arc::new(config.clone()),
-            &security,
-            &risk,
-            "test",
-            Arc::new(zeroclaw_memory::NoneMemory::new("test")),
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
+        let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
+            crate::tools::scoped::ScopedAssembly {
+                config: &config,
+                agent_alias: "test",
+                security: &policy,
+                built,
+                skills: &[],
+                runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                caller_allowed: None, // process_message has no caller allowlist
+                connect_mcp: false,   // exercise the filter without MCP fixtures
+                connect_peripherals: false,
+                exclude_memory: false,
+                emit_assembly_logs: false,
+            },
         )
-        .tools;
-        let deny = TestPolicy {
-            excluded_tools: Some(vec!["shell".into()]),
-            ..TestPolicy::default()
-        };
-        super::filter_channel_builtin_tools(&mut registry2, &deny);
-        let after_deny = tool_names(&registry2);
+        .await;
+
+        let filtered: Vec<&str> = assembled.registry.iter().map(|t| t.name()).collect();
         assert!(
-            !after_deny.contains(&"shell"),
-            "excluded shell must be removed on process_message path, got {after_deny:?}"
+            !filtered.contains(&"web_search_tool"),
+            "unified filter must DROP a read-only default outside allowed_tools \
+             (the removed safe-defaults admit retained it), got {filtered:?}"
         );
         assert!(
-            after_deny.contains(&"file_read"),
-            "non-excluded file_read must remain, got {after_deny:?}"
+            filtered.contains(&"shell"),
+            "shell in allowed_tools must survive, got {filtered:?}"
         );
     }
 
@@ -15159,143 +14701,6 @@ Let me check the result."#;
 
         let events = capturing.events.lock();
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("cli"));
-    }
-
-    // ── filter_channel_builtin_tools safe-default bypass ─────────
-    //
-    // At non-Full autonomy the known read-only defaults
-    // (web_search_tool, web_fetch, calculator, etc.) bypass
-    // allowed_tools so the bot can always fetch real-time info.
-    // Operator-added auto_approve entries (e.g. shell) do NOT get
-    // the same bypass — they must be explicitly allowlisted.
-
-    #[test]
-    fn channel_safe_defaults_survive_restrictive_allowed_tools() {
-        let config = zeroclaw_config::schema::Config::default();
-        let security = Arc::new(TestPolicy {
-            workspace_dir: std::env::temp_dir(),
-            ..TestPolicy::default()
-        });
-        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
-        let mem: Arc<dyn zeroclaw_memory::Memory> =
-            Arc::new(zeroclaw_memory::NoneMemory::new("test"));
-
-        // Restrict allowed_tools to shell only — nothing else is
-        // admitted by the policy itself.
-        let policy = TestPolicy {
-            allowed_tools: Some(vec!["shell".into()]),
-            autonomy: AutonomyLevel::Supervised,
-            ..TestPolicy::default()
-        };
-
-        let mut registry = crate::tools::all_tools(
-            Arc::new(config.clone()),
-            &security,
-            &risk,
-            "test",
-            mem,
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
-        )
-        .tools;
-
-        let before = tool_names(&registry);
-        assert!(
-            before.contains(&"web_search_tool"),
-            "precondition: web_search_tool in registry, got {before:?}"
-        );
-        assert!(
-            before.contains(&"shell"),
-            "precondition: shell in registry, got {before:?}"
-        );
-
-        super::filter_channel_builtin_tools(&mut registry, &policy);
-
-        let filtered = tool_names(&registry);
-        assert!(
-            filtered.contains(&"web_search_tool"),
-            "safe default web_search_tool must survive restrictive allowed_tools, got {filtered:?}"
-        );
-        assert!(
-            filtered.contains(&"shell"),
-            "shell in allowed_tools must survive, got {filtered:?}"
-        );
-    }
-
-    #[test]
-    fn channel_operator_auto_approve_gated_by_allowed_tools() {
-        let config = zeroclaw_config::schema::Config::default();
-        let security = Arc::new(TestPolicy {
-            workspace_dir: std::env::temp_dir(),
-            ..TestPolicy::default()
-        });
-        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
-        let mem: Arc<dyn zeroclaw_memory::Memory> =
-            Arc::new(zeroclaw_memory::NoneMemory::new("test"));
-
-        // Operator added shell to auto_approve but allowed_tools
-        // only lists file_read. Under the safe-defaults gate,
-        // shell (NOT a canonical safe default) must still pass
-        // is_tool_allowed — which means it's dropped.
-        let policy = TestPolicy {
-            allowed_tools: Some(vec!["file_read".into()]),
-            auto_approve: vec!["shell".into()],
-            autonomy: AutonomyLevel::Supervised,
-            ..TestPolicy::default()
-        };
-
-        let mut registry = crate::tools::all_tools(
-            Arc::new(config.clone()),
-            &security,
-            &risk,
-            "test",
-            mem,
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
-        )
-        .tools;
-
-        let before = tool_names(&registry);
-        assert!(
-            before.contains(&"shell"),
-            "precondition: shell in registry, got {before:?}"
-        );
-        assert!(
-            before.contains(&"file_read"),
-            "precondition: file_read in registry, got {before:?}"
-        );
-
-        super::filter_channel_builtin_tools(&mut registry, &policy);
-
-        let filtered = tool_names(&registry);
-        assert!(
-            !filtered.contains(&"shell"),
-            "operator-added auto_approve shell must be dropped when not in allowed_tools, got {filtered:?}"
-        );
-        assert!(
-            filtered.contains(&"file_read"),
-            "file_read in allowed_tools must survive, got {filtered:?}"
-        );
     }
 
     /// `read_capped_line` returns a full line and [`CappedLine::Line`]
