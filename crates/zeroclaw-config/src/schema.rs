@@ -18615,6 +18615,21 @@ impl Config {
             config.env_overridden_paths = applied.paths;
             config.pre_override_snapshots = applied.snapshots;
 
+            // Apply legacy provider-native env-var fallbacks
+            // (TRANSCRIPTION_API_KEY, OPENAI_API_KEY). These run after
+            // apply_env_overrides so ZEROCLAW_* values take priority.
+            // Fallbacks are only applied when the config field is not yet set.
+            {
+                let legacy = crate::env_overrides::apply_legacy_env_fallbacks(&mut config);
+                for (path, snapshot) in legacy {
+                    config.env_overridden_paths.insert(path.clone());
+                    config
+                        .pre_override_snapshots
+                        .entry(path)
+                        .or_insert(snapshot);
+                }
+            }
+
             // Validation must NOT prevent the daemon from booting. If
             // it did, a single broken agent reference would lock the
             // operator out of `/config` — the only place they can fix
@@ -18654,6 +18669,20 @@ impl Config {
             let applied = crate::env_overrides::apply_env_overrides(&mut config)?;
             config.env_overridden_paths = applied.paths;
             config.pre_override_snapshots = applied.snapshots;
+
+            // Apply legacy provider-native env-var fallbacks
+            // (TRANSCRIPTION_API_KEY, OPENAI_API_KEY). Same priority as
+            // the load-existing branch above.
+            {
+                let legacy = crate::env_overrides::apply_legacy_env_fallbacks(&mut config);
+                for (path, snapshot) in legacy {
+                    config.env_overridden_paths.insert(path.clone());
+                    config
+                        .pre_override_snapshots
+                        .entry(path)
+                        .or_insert(snapshot);
+                }
+            }
 
             // Same boot-resilience as the load-existing branch above:
             // a fresh-init config can't realistically fail validation,
