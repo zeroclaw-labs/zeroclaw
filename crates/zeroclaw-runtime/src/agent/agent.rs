@@ -7360,6 +7360,52 @@ mod tests {
     }
 
     #[test]
+    fn register_skill_tools_honors_excluded_tools() {
+        // excluded_tools always subtracts — including skill-defined tools (previously
+        // skill tools bypassed the policy entirely; the #6959 class, missed for skills).
+        let security = Arc::new(crate::security::SecurityPolicy {
+            excluded_tools: Some(vec!["deploy__status".to_string()]),
+            ..crate::security::SecurityPolicy::default()
+        });
+        let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedMockTool::new("builtin_a"))];
+
+        let skills = vec![make_skill("deploy", &["run", "status"])];
+        tools::register_skill_tools(&mut tools, &skills, security);
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            names.contains(&"deploy__run"),
+            "non-excluded skill tool must register, got {names:?}"
+        );
+        assert!(
+            !names.contains(&"deploy__status"),
+            "excluded_tools must subtract the skill tool deploy__status, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn register_skill_tools_allowlist_does_not_hide_skills() {
+        // The allowlist gates built-ins, NOT skill tools: skills are granted explicitly via
+        // skill config, and builtin-kind skill tools are scoped-elevation wrappers meant to
+        // stay callable when the raw tool is off the allowlist. A restrictive allowed_tools
+        // that omits the skill tool must NOT remove it (only excluded_tools does).
+        let security = Arc::new(crate::security::SecurityPolicy {
+            allowed_tools: Some(vec!["shell".to_string()]),
+            ..crate::security::SecurityPolicy::default()
+        });
+        let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+
+        let skills = vec![make_skill("deploy", &["run"])];
+        tools::register_skill_tools(&mut tools, &skills, security);
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            names.contains(&"deploy__run"),
+            "allowlist must not hide an explicitly-granted skill tool, got {names:?}"
+        );
+    }
+
+    #[test]
     fn from_config_policy_filter_blocks_raw_target_but_keeps_scoped_wrapper() {
         // Path-level boundary for the from_config (ws.rs / daemon) path. The
         // SecurityPolicy allow/deny gate now runs over the built-in registry

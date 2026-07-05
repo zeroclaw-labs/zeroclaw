@@ -285,9 +285,15 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 ///    `agent::run`-level `allowed_tools` parameter).
 ///
 /// A tool survives only when BOTH gates admit its name. `None` on
-/// either gate is unrestricted for that gate alone. Built-in tools,
-/// MCP tools, and skill tools all flow through the same filter; the
-/// helper does not know or care about category.
+/// either gate is unrestricted for that gate alone. The helper itself is
+/// category-agnostic - it filters whatever names are in `tools`. In
+/// production, however, the categories are gated at different layers:
+/// built-in tools flow through this filter, MCP tools through their
+/// `ToolAccessPolicy`, and skill tools through the `is_tool_excluded`
+/// denylist gate applied at skill registration (`register_skill_tools*`) -
+/// skill tools are deliberately NOT subject to the `allowed_tools`
+/// allowlist (they are granted via skill config; see
+/// `SecurityPolicy::is_tool_excluded`).
 pub fn apply_policy_tool_filter(
     tools: &mut Vec<Box<dyn Tool>>,
     policy: Option<&zeroclaw_config::policy::SecurityPolicy>,

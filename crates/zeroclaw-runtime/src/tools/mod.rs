@@ -347,6 +347,21 @@ pub fn register_skill_tools_with_context_and_runtime(
     }
 
     let before = tools_registry.len();
+    // Keep the policy after `security` is moved into skill-tool construction: skill tools
+    // must honor the `excluded_tools` denylist, like every other tool. The built-in filter
+    // (`apply_policy_tool_filter`) runs before skill registration, so without this check a
+    // skill-defined tool bypasses the policy entirely - the same class of gap #6959 fixed
+    // for eager built-ins, never applied to skill tools, so `excluded_tools` silently
+    // failed to subtract a skill tool. This is the single skill-registration chokepoint
+    // (assemble, from_config, the channel orchestrator, and direct callers all funnel
+    // here), so gating once here closes it on every construction path.
+    //
+    // Denylist only, NOT the `allowed_tools` allowlist: skill tools are granted explicitly
+    // via skill config, and `builtin`-kind skill tools are scoped-elevation wrappers meant
+    // to stay callable when the raw tool is off the allowlist (see
+    // `SecurityPolicy::is_tool_excluded`). Applying the allowlist would defeat that; the
+    // denylist still removes any skill tool named in `excluded_tools`.
+    let policy = Arc::clone(&security);
     let skill_tools = crate::skills::skills_to_tools_with_context_and_runtime(
         skills,
         security,
@@ -365,6 +380,15 @@ pub fn register_skill_tools_with_context_and_runtime(
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                 &format!(
                     "Skill tool '{}' shadows built-in tool, skipping",
+                    tool.name()
+                )
+            );
+        } else if policy.is_tool_excluded(tool.name()) {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "Skill tool '{}' denied by excluded_tools, skipping",
                     tool.name()
                 )
             );
