@@ -7311,6 +7311,7 @@ fn build_channel_by_id(
                 let workspace_dir = one_shot_channel_workspace_dir(&config, "whatsapp", &alias);
                 Ok(Arc::new(
                     WhatsAppWebChannel::new(wa, alias, peer_resolver, allowed_groups_resolver)
+                        .with_persistence(config_arc.clone())
                         .with_workspace_dir(workspace_dir),
                 ))
             }
@@ -8718,6 +8719,7 @@ fn collect_configured_channels(
                                     peer_resolver,
                                     allowed_groups_resolver,
                                 )
+                                .with_persistence(config_arc.clone())
                                 .with_transcription(config.transcription.clone())
                                 .with_tts(&config)
                                 .with_workspace_dir(workspace_dir)

@@ -125,6 +125,12 @@ pub struct WhatsAppWebChannel {
     /// Resolves allowed group chats from canonical config at message-time.
     /// Empty = all groups permitted. Direct messages bypass.
     allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    /// Optional pairing-persist handle to the canonical shared `Config`.
+    /// `None` in tests; `Some` in the long-running daemon, wired via
+    /// `.with_persistence(config)`. Same contract as WeChat's handle: on
+    /// connect, the linked account is persisted into `peer_groups` through
+    /// `crate::identity_persist` (no channel-local allowlist cache).
+    persist: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
 }
 
 impl WhatsAppWebChannel {
@@ -196,6 +202,7 @@ impl WhatsAppWebChannel {
             dm_mention_patterns: Arc::new(Vec::new()),
             group_mention_patterns: Arc::new(Vec::new()),
             workspace_dir: None,
+            persist: None,
         }
     }
 
@@ -203,6 +210,20 @@ impl WhatsAppWebChannel {
     /// channel handle is bound to.
     pub fn alias(&self) -> &str {
         &self.alias
+    }
+
+    /// Wire the shared Config handle so a completed pairing can persist the
+    /// linked account into `peer_groups` and save — the same contract as
+    /// `WeChatChannel::with_persistence`. The long-running daemon sets this
+    /// from the orchestrator; tests and one-shot callers leave it unset
+    /// (pairing works at runtime, doesn't persist).
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_persistence(
+        mut self,
+        config: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+    ) -> Self {
+        self.persist = Some(config);
+        self
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -2001,6 +2022,7 @@ impl Channel for WhatsAppWebChannel {
             let wa_dm_mention_patterns = self.dm_mention_patterns.clone();
             let wa_group_mention_patterns = self.group_mention_patterns.clone();
             let allowed_groups_resolver = Arc::clone(&self.allowed_groups_resolver);
+            let persist_clone = self.persist.clone();
 
             // whatsapp-rust 0.6: BotBuilder gained a 4th typestate slot for the
             // async runtime (oxidezap/whatsapp-rust#621). `with_runtime` is
@@ -2039,6 +2061,7 @@ impl Channel for WhatsAppWebChannel {
                     let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
                     let wa_group_mention_patterns = wa_group_mention_patterns.clone();
                     let allowed_groups_resolver = Arc::clone(&allowed_groups_resolver);
+                    let persist_inner = persist_clone.clone();
                     async move {
                         // whatsapp-rust 0.6: event handlers receive `Arc<Event>`
                         // per PR #613, so we match against `&*event` to get a
@@ -2352,12 +2375,12 @@ impl Channel for WhatsAppWebChannel {
                             Event::Connected(_) => {
                                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "connected successfully");
                                 WhatsAppWebChannel::reset_retry(&retry_count);
+                                let device = client
+                                    .persistence_manager()
+                                    .get_device_snapshot()
+                                    .await;
                                 // Resolve bot identity from the device store
                                 if mention_only {
-                                    let device = client
-                                        .persistence_manager()
-                                        .get_device_snapshot()
-                                    .await;
                                     if let Some(ref pn) = device.pn
                                         && let Some(digits) =
                                             Self::store_jid_digits(&bot_phone_inner, pn.user())
@@ -2369,6 +2392,25 @@ impl Channel for WhatsAppWebChannel {
                                             Self::store_jid_digits(&bot_lid_inner, lid.user())
                                     {
                                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("resolved bot LID from device: {}", digits));
+                                    }
+                                }
+                                // Persist the linked account as an authorized
+                                // peer in canonical peer_groups (same shape
+                                // WeChat pairing writes). Idempotent, so the
+                                // reconnect-after-resume case is a no-op.
+                                if let Some(ref pn) = device.pn {
+                                    let digits = Self::jid_digits(pn.user());
+                                    if !digits.is_empty()
+                                        && let Err(e) =
+                                            crate::identity_persist::persist_external_peer(
+                                                persist_inner.as_ref(),
+                                                "whatsapp",
+                                                alias.as_ref(),
+                                                &format!("+{digits}"),
+                                            )
+                                            .await
+                                    {
+                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("failed to persist linked WhatsApp identity: {e}"));
                                     }
                                 }
                             }

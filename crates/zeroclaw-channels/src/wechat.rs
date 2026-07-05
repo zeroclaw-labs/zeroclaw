@@ -908,55 +908,13 @@ impl WeChatChannel {
     }
 
     async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
-        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
-        use zeroclaw_config::providers::ChannelRef;
-
-        let Some(config) = &self.persist else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"identity": identity})),
-                "paired identity not persisted (no persistence handle wired)"
-            );
-            return Ok(());
-        };
-        let normalized = identity.trim().to_string();
-        if normalized.is_empty() {
-            anyhow::bail!("Cannot persist empty WeChat identity");
-        }
-        let group_name = format!("wechat_{}", self.alias);
-        let channel_ref = ChannelRef::new(format!("wechat.{}", self.alias));
-        let snapshot = {
-            let mut cfg = config.write();
-            if !cfg.channels.wechat.contains_key(&self.alias) {
-                anyhow::bail!(
-                    "Missing [channels.wechat.{}] section. Run `zeroclaw config set channels.wechat.<alias>.app-id=<id>` to configure.",
-                    self.alias
-                );
-            }
-            let group = cfg
-                .peer_groups
-                .entry(group_name)
-                .or_insert_with(|| PeerGroupConfig {
-                    channel: channel_ref,
-                    ..PeerGroupConfig::default()
-                });
-            if group
-                .external_peers
-                .iter()
-                .any(|p| p.as_str() == normalized)
-            {
-                return Ok(());
-            }
-            group.external_peers.push(PeerUsername::new(normalized));
-            cfg.clone()
-        };
-        snapshot
-            .save()
-            .await
-            .context("Failed to persist WeChat peer to config.toml")?;
-        Ok(())
+        crate::identity_persist::persist_external_peer(
+            self.persist.as_ref(),
+            "wechat",
+            &self.alias,
+            identity,
+        )
+        .await
     }
 
     fn extract_bind_code(text: &str) -> Option<&str> {
