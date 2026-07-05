@@ -504,6 +504,34 @@ impl WhatsAppWebChannel {
         ]
     }
 
+    /// Channel-owned relink hook: delete the persisted session so the next
+    /// channel start finds no device and begins a fresh QR pairing.
+    ///
+    /// Removes the same triple the logged-out purge path removes —
+    /// [`Self::session_file_paths`] is the single source of truth for both.
+    /// Returns the paths actually removed; already absent files are not an
+    /// error, so relinking an unpaired channel is a safe no-op that returns
+    /// an empty list. Never creates the database.
+    ///
+    /// This only clears disk state. A currently running channel keeps its
+    /// live connection until it is restarted; callers own scheduling that
+    /// restart (e.g. a daemon reload).
+    pub fn clear_persisted_session(session_path: &str) -> std::io::Result<Vec<String>> {
+        let mut removed = Vec::new();
+        if session_path.is_empty() {
+            return Ok(removed);
+        }
+        let expanded = Self::expand_session_path(session_path);
+        for path in Self::session_file_paths(&expanded) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed.push(path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(removed)
+    }
+
     /// Attempt to download and transcribe a WhatsApp voice note.
     /// Returns `None` if transcription is disabled, download fails, or
     /// transcription fails (all logged as warnings).
@@ -2616,6 +2644,39 @@ mod tests {
     use super::*;
     #[cfg(feature = "whatsapp-web")]
     use wacore_binary::jid::Jid;
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn clear_persisted_session_removes_db_triple_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("session.db");
+        let db_str = db.to_string_lossy().into_owned();
+        std::fs::write(&db, b"db").unwrap();
+        std::fs::write(format!("{db_str}-wal"), b"wal").unwrap();
+        std::fs::write(format!("{db_str}-shm"), b"shm").unwrap();
+
+        let removed = WhatsAppWebChannel::clear_persisted_session(&db_str).unwrap();
+        assert_eq!(removed.len(), 3);
+        for path in WhatsAppWebChannel::session_file_paths(&db_str) {
+            assert!(
+                !std::path::Path::new(&path).exists(),
+                "{path} must be removed"
+            );
+        }
+
+        // Relinking an already unpaired channel is a safe no-op that
+        // must not create the database.
+        let removed = WhatsAppWebChannel::clear_persisted_session(&db_str).unwrap();
+        assert!(removed.is_empty());
+        assert!(!db.exists());
+
+        // Empty session_path (channel saved without one) clears nothing.
+        assert!(
+            WhatsAppWebChannel::clear_persisted_session("")
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
