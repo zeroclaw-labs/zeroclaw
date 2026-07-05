@@ -120,7 +120,7 @@ function MenuItem({
       type="button"
       onClick={onClick}
       className={`block w-full px-3 py-1.5 text-left hover:bg-pc-elevated ${
-        tone === 'danger' ? 'text-rose-500' : 'text-pc-text'
+        tone === 'danger' ? 'text-status-error' : 'text-pc-text'
       }`}
     >
       {label}
@@ -150,6 +150,9 @@ export default function SopCanvas({
   const [hoverWire, setHoverWire] = useState<number | null>(null);
   const [menu, setMenu] = useState<ContextMenu | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const panRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
+  const [panning, setPanning] = useState(false);
 
   // Reseed from the backend layout when the projection changes, preserving any
   // positions the user has dragged for nodes that still exist.
@@ -185,6 +188,11 @@ export default function SopCanvas({
 
   const onPointerMove = useCallback(
     (e: React.PointerEvent) => {
+      if (panRef.current && scrollRef.current) {
+        scrollRef.current.scrollLeft = panRef.current.left - (e.clientX - panRef.current.x);
+        scrollRef.current.scrollTop = panRef.current.top - (e.clientY - panRef.current.y);
+        return;
+      }
       const p = toLocal(e.clientX, e.clientY);
       if (drag) {
         setPos((prev) => {
@@ -198,7 +206,29 @@ export default function SopCanvas({
     [drag, linkFrom, toLocal],
   );
 
-  const endDrag = useCallback(() => setDrag(null), []);
+  const endDrag = useCallback(() => {
+    setDrag(null);
+    panRef.current = null;
+    setPanning(false);
+  }, []);
+
+  // Left-click on empty canvas background starts a drag-scroll pan. Nodes,
+  // handles, and wires stop propagation on their own pointerdown, so this only
+  // fires on the bare SVG.
+  const startPan = useCallback(
+    (e: React.PointerEvent) => {
+      setMenu(null);
+      if (e.button !== 0 || linkFrom !== null || !scrollRef.current) return;
+      panRef.current = {
+        x: e.clientX,
+        y: e.clientY,
+        left: scrollRef.current.scrollLeft,
+        top: scrollRef.current.scrollTop,
+      };
+      setPanning(true);
+    },
+    [linkFrom],
+  );
 
   const openMenu = useCallback(
     (e: React.MouseEvent, step: number | null) => {
@@ -237,13 +267,13 @@ export default function SopCanvas({
   }, [pos]);
 
   return (
-    <div className="relative overflow-auto rounded-[var(--radius-lg)] border border-pc-border bg-pc-bg-base">
+    <div ref={scrollRef} className="relative overflow-auto rounded-[var(--radius-lg)] border border-pc-border bg-pc-bg-base">
       {readOnly ? null : (
         <div className="absolute right-2 top-2 z-10 flex gap-1">
           <button
             type="button"
             onClick={onAddStep}
-            className="inline-flex items-center gap-1 rounded bg-pc-accent px-2 py-1 text-xs text-white"
+            className="inline-flex items-center gap-1 rounded bg-pc-accent px-2 py-1 text-xs text-[#0b1220] hover:bg-pc-accent-light"
           >
             <Plus className="h-3.5 w-3.5" aria-hidden /> {t('sops.add_step')}
           </button>
@@ -329,9 +359,9 @@ export default function SopCanvas({
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
         onPointerLeave={endDrag}
-        onPointerDown={() => setMenu(null)}
+        onPointerDown={startPan}
         onContextMenu={(e) => openMenu(e, null)}
-        className="block touch-none select-none"
+        className={`block touch-none select-none ${panning ? 'cursor-grabbing' : linkFrom !== null ? '' : 'cursor-grab'}`}
       >
         <defs>
           <marker
@@ -543,6 +573,7 @@ export default function SopCanvas({
         onContextMenu={(e) => openMenu(e, node.step)}
         onPointerDown={(e) => {
           if (e.button !== 0) return;
+          e.stopPropagation();
           if (linkFrom !== null) {
             completeLink(node.step);
             return;

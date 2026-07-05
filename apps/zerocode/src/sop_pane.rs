@@ -36,6 +36,8 @@ pub(crate) struct SopPane {
     editor_graph: SopGraphView,
     pan_x: u16,
     pan_y: u16,
+    canvas_rect: Rect,
+    pan_drag: Option<(u16, u16, u16, u16)>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -472,6 +474,8 @@ impl SopPane {
             editor_graph: SopGraphView::default(),
             pan_x: 0,
             pan_y: 0,
+            canvas_rect: Rect::new(0, 0, 0, 0),
+            pan_drag: None,
         }
     }
 
@@ -664,8 +668,24 @@ impl SopPane {
                     } else {
                         self.open_editor_for_step(step).await;
                     }
+                    return;
+                }
+                // Empty canvas background: anchor a left-drag pan. Records the
+                // press point and the pan offsets at press time; the Drag arm
+                // walks pan_x/pan_y relative to this anchor.
+                if in_rect(col, row, self.canvas_rect) {
+                    self.pan_drag = Some((col, row, self.pan_x, self.pan_y));
                 }
             }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some((start_col, start_row, base_x, base_y)) = self.pan_drag {
+                    let dx = col as i32 - start_col as i32;
+                    let dy = row as i32 - start_row as i32;
+                    self.pan_x = (base_x as i32 - dx).clamp(0, u16::MAX as i32) as u16;
+                    self.pan_y = (base_y as i32 - dy).clamp(0, u16::MAX as i32) as u16;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.pan_drag = None,
             MouseEventKind::ScrollUp => self.select_prev(),
             MouseEventKind::ScrollDown => self.select_next(),
             _ => {}
@@ -1316,6 +1336,7 @@ impl SopPane {
             .borders(Borders::ALL)
             .title(title.to_string());
         let inner = block.inner(area);
+        self.canvas_rect = inner;
         f.render_widget(block, area);
         self.node_rects.clear();
         self.handle_rects.clear();

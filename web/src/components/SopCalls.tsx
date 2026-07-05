@@ -62,7 +62,7 @@ function JsonField({
         }}
         className={`${INPUT_CLS} font-mono text-xs`}
       />
-      {parseError ? <p className="mt-1 text-xs text-rose-500">{parseError}</p> : null}
+      {parseError ? <p className="mt-1 text-xs text-status-error">{parseError}</p> : null}
     </label>
   );
 }
@@ -170,7 +170,7 @@ export function PlannedCallsEditor({
                       onChange(calls.filter((_, j) => j !== i));
                       setOpenIdx(null);
                     }}
-                    className="rounded px-1.5 py-1 text-rose-500 hover:bg-pc-elevated"
+                    className="rounded px-1.5 py-1 text-status-error hover:bg-pc-elevated"
                     aria-label={t('sops.remove_call')}
                   >
                     <Trash2 className="h-3.5 w-3.5" aria-hidden />
@@ -242,7 +242,7 @@ export function CapturedCallList({ calls }: { calls: StepToolCall[] }) {
               </span>
               <span className="min-w-0 flex-1 truncate font-mono">{call.tool}</span>
               <span
-                className={`shrink-0 text-[10px] ${call.success ? 'text-emerald-500' : 'text-rose-500'}`}
+                className={`shrink-0 text-[10px] ${call.success ? 'text-status-success' : 'text-status-error'}`}
               >
                 {call.success ? t('sops.call_ok') : t('sops.call_failed')}
               </span>
@@ -257,7 +257,7 @@ export function CapturedCallList({ calls }: { calls: StepToolCall[] }) {
             </pre>
           </div>
           {call.error ? (
-            <div className="text-xs text-rose-500">{call.error}</div>
+            <div className="text-xs text-status-error">{call.error}</div>
           ) : null}
           <div className="text-xs">
             <span className="mb-1 block text-pc-text-muted">{t('sops.call_output')}</span>

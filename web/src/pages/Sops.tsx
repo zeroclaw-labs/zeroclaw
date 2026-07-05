@@ -162,9 +162,9 @@ function DiagnosticsPanel({ graph }: { graph: SopGraph }) {
         {graph.diagnostics.map((d, i) => (
           <li key={i} className="flex items-start gap-2">
             {d.severity === 'error' ? (
-              <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-500" aria-hidden />
+              <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-status-error" aria-hidden />
             ) : (
-              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" aria-hidden />
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-status-warning" aria-hidden />
             )}
             <span className="text-pc-text">
               <span className="text-pc-text-muted">
@@ -328,7 +328,7 @@ function StepEditor({
         <button
           type="button"
           onClick={onRemove}
-          className="rounded px-1.5 py-1 text-rose-500 hover:bg-pc-elevated"
+          className="rounded px-1.5 py-1 text-status-error hover:bg-pc-elevated"
           aria-label={t('sops.remove_step')}
         >
           <Trash2 className="h-4 w-4" aria-hidden />
@@ -474,7 +474,7 @@ function StepEditor({
                 <button
                   type="button"
                   onClick={() => setRouting({ switch: (routing.switch ?? []).filter((_, j) => j !== ri) })}
-                  className="text-rose-500"
+                  className="text-status-error"
                   aria-label={t('sops.remove_port')}
                 >
                   <Trash2 className="h-3.5 w-3.5" aria-hidden />
@@ -680,7 +680,7 @@ function ChannelTriggerFields({
         </SelectField>
       </div>
       {selected && !selected.configured ? (
-        <div className="flex items-center gap-2 text-xs text-amber-500">
+        <div className="flex items-center gap-2 text-xs text-status-warning">
           <AlertTriangle className="h-3.5 w-3.5" aria-hidden />
           <span>{t('sops.trigger_unconfigured')}</span>
           <Link
@@ -835,7 +835,7 @@ function StepListRow({
       <button
         type="button"
         onClick={onRemove}
-        className="rounded px-1 text-rose-500 hover:bg-pc-elevated"
+        className="rounded px-1 text-status-error hover:bg-pc-elevated"
         aria-label={t('sops.remove_step')}
       >
         <Trash2 className="h-3.5 w-3.5" aria-hidden />
@@ -895,7 +895,7 @@ function DraftSidebar({
             type="button"
             onClick={onSave}
             disabled={saving}
-            className="inline-flex items-center gap-1 rounded bg-pc-accent px-2 py-1 text-sm text-white disabled:opacity-50"
+            className="inline-flex items-center gap-1 rounded bg-pc-accent px-2 py-1 text-sm text-[#0b1220] hover:bg-pc-accent-light disabled:opacity-50"
           >
             {saving ? (
               <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
@@ -906,7 +906,7 @@ function DraftSidebar({
           </button>
         </div>
       </div>
-      {saveError ? <div className="text-sm text-rose-500">{saveError}</div> : null}
+      {saveError ? <div className="text-sm text-status-error">{saveError}</div> : null}
       <TextField
         label={t('sops.field_name')}
         value={draft.name}
@@ -1350,7 +1350,7 @@ export default function Sops() {
             <button
               type="button"
               onClick={startNew}
-              className="inline-flex items-center gap-1 rounded bg-pc-accent px-3 py-1.5 text-sm text-white"
+              className="inline-flex items-center gap-1 rounded bg-pc-accent px-3 py-1.5 text-sm text-[#0b1220] hover:bg-pc-accent-light"
             >
               <Plus className="h-4 w-4" aria-hidden /> {t('sops.new')}
             </button>
@@ -1359,32 +1359,42 @@ export default function Sops() {
       />
       {error ? (
         <Card>
-          <div className="text-rose-500">{error}</div>
+          <div className="text-status-error">{error}</div>
         </Card>
       ) : null}
       {draft && editorHandlers ? (
-        <div className="grid grid-cols-[20rem_minmax(0,1fr)_24rem] items-start gap-4">
-          <DraftSidebar
-            draft={draft}
-            saving={saving}
-            saveError={saveError}
-            selectedStep={selectedStep}
-            selectedTrigger={selectedTrigger}
-            triggerRegistry={triggerRegistry}
-            onSelectStep={setSelectedStep}
-            onField={editorHandlers.onField}
-            onTrigger={editorHandlers.onTrigger}
-            onAddTrigger={editorHandlers.onAddTrigger}
-            onRemoveTrigger={editorHandlers.onRemoveTrigger}
-            onAddStep={editorHandlers.onAddStep}
-            onRemoveStep={editorHandlers.onRemoveStep}
-            onMoveStep={editorHandlers.onMoveStep}
-            onSave={onSaveDraft}
-            onCancel={() => {
-              setDraft(null);
-              setEditingName(null);
-            }}
-          />
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-[20rem_minmax(0,1fr)]">
+            <DraftSidebar
+              draft={draft}
+              saving={saving}
+              saveError={saveError}
+              selectedStep={selectedStep}
+              selectedTrigger={selectedTrigger}
+              triggerRegistry={triggerRegistry}
+              onSelectStep={setSelectedStep}
+              onField={editorHandlers.onField}
+              onTrigger={editorHandlers.onTrigger}
+              onAddTrigger={editorHandlers.onAddTrigger}
+              onRemoveTrigger={editorHandlers.onRemoveTrigger}
+              onAddStep={editorHandlers.onAddStep}
+              onRemoveStep={editorHandlers.onRemoveStep}
+              onMoveStep={editorHandlers.onMoveStep}
+              onSave={onSaveDraft}
+              onCancel={() => {
+                setDraft(null);
+                setEditingName(null);
+              }}
+            />
+            <StepInspector
+              draft={draft}
+              selectedStep={selectedStep}
+              runCallsByStep={runCallsByStep}
+              onStep={editorHandlers.onStep}
+              onRemoveStep={editorHandlers.onRemoveStep}
+              onMoveStep={editorHandlers.onMoveStep}
+            />
+          </div>
           {draftGraph ? (
             <SopCanvas
               draft={draft}
@@ -1401,17 +1411,7 @@ export default function Sops() {
               onConnect={onConnect}
               onDisconnect={onDisconnect}
             />
-          ) : (
-            <div />
-          )}
-          <StepInspector
-            draft={draft}
-            selectedStep={selectedStep}
-            runCallsByStep={runCallsByStep}
-            onStep={editorHandlers.onStep}
-            onRemoveStep={editorHandlers.onRemoveStep}
-            onMoveStep={editorHandlers.onMoveStep}
-          />
+          ) : null}
         </div>
       ) : loading ? (
         <Card>
@@ -1473,7 +1473,7 @@ export default function Sops() {
                 <button
                   type="button"
                   onClick={onDeleteSelected}
-                  className="inline-flex items-center gap-1 rounded border border-pc-border px-2 py-1 text-sm text-rose-500 hover:bg-pc-elevated"
+                  className="inline-flex items-center gap-1 rounded border border-pc-border px-2 py-1 text-sm text-status-error hover:bg-pc-elevated"
                 >
                   <Trash2 className="h-4 w-4" aria-hidden /> {t('sops.delete')}
                 </button>
@@ -1493,7 +1493,7 @@ export default function Sops() {
                   {overlay.total_steps}
                 </Badge>
               ) : null}
-              {overlayError ? <span className="text-xs text-rose-500">{overlayError}</span> : null}
+              {overlayError ? <span className="text-xs text-status-error">{overlayError}</span> : null}
             </div>
             {graphLoading ? (
               <Loader2 className="h-5 w-5 animate-spin text-pc-text-muted" aria-hidden />
