@@ -2044,9 +2044,10 @@ fn is_agent_scope_authorized(
 ) -> bool {
     let channel_type = msg.channel.as_str();
     let channel_alias = msg.channel_alias.as_deref().unwrap_or(msg.channel.as_str());
+    let agent_alias = ctx.agent_alias.as_str();
     let admins: Vec<String> = ctx
         .prompt_config
-        .channel_agent_scope_admins(channel_type, channel_alias)
+        .channel_agent_scope_admins(channel_type, channel_alias, agent_alias)
         .into_iter()
         .map(|p| normalize_peer_username(&p))
         .collect();
@@ -18861,7 +18862,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "discord_users".into(),
             peer_group("discord.clamps", &["bob", "carol"], false),
         );
-        let admins = config.channel_agent_scope_admins("discord", "clamps");
+        let admins = config.channel_agent_scope_admins("discord", "clamps", "agentX");
         assert_eq!(admins, vec!["alice".to_string(), "ops".to_string()]);
     }
 

@@ -17081,16 +17081,22 @@ impl Config {
     }
 
     /// Sender usernames authorized to issue `/model --agent <model>` on
-    /// `<channel_type>.<alias>`. A `[peer_groups.<name>]` contributes
-    /// when its `channel` matches (type-wide or dotted) **and** its
-    /// `admin_for_agent_scope = true`. Returns deduped and sorted.
-    /// Live-resolve against the `Config` this method is called on —
-    /// no internal cache. Edits to `peer_groups` take effect at the
-    /// next `Config::channel_agent_scope_admins` call; the orchestrator
-    /// gate reads through a snapshot of this `Config`, so operator
-    /// edits become visible after the runtime context is rebuilt
+    /// `<channel_type>.<alias>` for agent `agent_alias`. A
+    /// `[peer_groups.<name>]` contributes when its `channel` matches
+    /// (type-wide or dotted), its `admin_for_agent_scope = true`, and its
+    /// `agents` list (if non-empty) contains `agent_alias`. Returns
+    /// deduped and sorted. Live-resolve against the `Config` this method
+    /// is called on — no internal cache. Edits to `peer_groups` take
+    /// effect at the next `Config::channel_agent_scope_admins` call; the
+    /// orchestrator gate reads through a snapshot of this `Config`, so
+    /// operator edits become visible after the runtime context is rebuilt
     /// (daemon restart). See issue #8044.
-    pub fn channel_agent_scope_admins(&self, channel_type: &str, alias: &str) -> Vec<String> {
+    pub fn channel_agent_scope_admins(
+        &self,
+        channel_type: &str,
+        alias: &str,
+        agent_alias: &str,
+    ) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for group in self.peer_groups.values() {
@@ -17102,6 +17108,13 @@ impl Config {
                 None => group.channel == channel_type,
             };
             if !group_matches {
+                continue;
+            }
+            // Agent-bound: when the group's `agents` list is non-empty,
+            // only grant the privilege if `agent_alias` appears in it.
+            // An empty `agents` list is interpreted as "all agents"
+            // (backward-compatible channel-wide default).
+            if !group.agents.is_empty() && !group.agents.iter().any(|a| a.as_str() == agent_alias) {
                 continue;
             }
             for peer in &group.external_peers {
