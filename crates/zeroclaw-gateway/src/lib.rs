@@ -8282,8 +8282,19 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let state = admin_paircode_state(&tmp, true, false);
         // No registry → registry branch is skipped, so persistence is the
-        // only failing step. Point config_path at an unwritable target.
-        state.config.write().config_path = std::path::PathBuf::from("/no/such/dir/config.toml");
+        // only failing step.
+        //
+        // Force `save_dirty` → `write_config_atomically` → `create_dir_all`
+        // to fail deterministically by planting an ordinary file at the
+        // parent segment of `config_path`. `create_dir_all` then hits
+        // ENOTDIR at the kernel level, which root cannot bypass — unlike
+        // the previous `/no/such/dir/config.toml` path, where a uid-0 CI
+        // runner is allowed to create `/no/…` from `/` and the save
+        // silently succeeds, letting the whole rollback path go untested
+        // (and leaking a 200 + token if it ever regresses).
+        let blocker = tmp.path().join("legacy-pair-blocker");
+        std::fs::write(&blocker, b"").expect("seed blocker file");
+        state.config.write().config_path = blocker.join("config.toml");
 
         let code = state
             .pairing
