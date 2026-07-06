@@ -1164,7 +1164,6 @@ enum DeprecatedPropsCommands {
 fn runtime_dir_env_is_explicit(name: &str, value: &str) -> bool {
     match name {
         "ZEROCLAW_CONFIG_DIR" | "ZEROCLAW_DATA_DIR" => !value.trim().is_empty(),
-        "ZEROCLAW_WORKSPACE" => !value.is_empty(),
         _ => false,
     }
 }
@@ -1174,13 +1173,11 @@ fn resolve_homebrew_onboard_config_dir(
     exe: &Path,
     env_lookup: impl Fn(&str) -> Option<String>,
 ) -> Option<PathBuf> {
-    let explicit_runtime_dir = [
-        "ZEROCLAW_CONFIG_DIR",
-        "ZEROCLAW_DATA_DIR",
-        "ZEROCLAW_WORKSPACE",
-    ]
-    .iter()
-    .any(|name| env_lookup(name).is_some_and(|value| runtime_dir_env_is_explicit(name, &value)));
+    let explicit_runtime_dir = ["ZEROCLAW_CONFIG_DIR", "ZEROCLAW_DATA_DIR"]
+        .iter()
+        .any(|name| {
+            env_lookup(name).is_some_and(|value| runtime_dir_env_is_explicit(name, &value))
+        });
 
     if explicit_runtime_dir {
         return None;
@@ -8383,11 +8380,7 @@ mod tests {
     fn homebrew_onboard_config_dir_preserves_explicit_runtime_paths() {
         let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
 
-        for var in [
-            "ZEROCLAW_CONFIG_DIR",
-            "ZEROCLAW_DATA_DIR",
-            "ZEROCLAW_WORKSPACE",
-        ] {
+        for var in ["ZEROCLAW_CONFIG_DIR", "ZEROCLAW_DATA_DIR"] {
             assert_eq!(
                 resolve_homebrew_onboard_config_dir(exe, |name| {
                     (name == var).then(|| "/tmp/zeroclaw-explicit".to_string())
@@ -8396,19 +8389,6 @@ mod tests {
                 "{var} should take precedence over Homebrew detection",
             );
         }
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn homebrew_onboard_config_dir_treats_workspace_whitespace_as_explicit() {
-        let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
-
-        assert_eq!(
-            resolve_homebrew_onboard_config_dir(exe, |name| {
-                (name == "ZEROCLAW_WORKSPACE").then(|| "   ".to_string())
-            }),
-            None,
-        );
     }
 
     #[test]

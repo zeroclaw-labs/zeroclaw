@@ -640,7 +640,7 @@ fn json_to_toml(v: serde_json::Value) -> Option<toml::Value> {
 /// The env-var grammar uses `__` as path separator, which lets aliases keep
 /// single `_` literally (`prod_v2`, `staging_api`). Hyphens are forbidden
 /// because they are illegal in POSIX env-var identifiers; uppercase is
-/// forbidden so the bootstrap env-vars (`ZEROCLAW_WORKSPACE`,
+/// forbidden so the bootstrap env-vars (`ZEROCLAW_DATA_DIR`,
 /// `ZEROCLAW_CONFIG_DIR`) stay disambiguated by case.
 pub fn validate_alias_key(key: &str) -> Result<(), String> {
     if key.is_empty() {

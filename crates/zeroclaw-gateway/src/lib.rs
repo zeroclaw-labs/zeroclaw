@@ -819,15 +819,6 @@ pub async fn run_gateway(
     let canvas_store = canvas_store.unwrap_or_default();
     let agent_alias_opt = default_agent_alias(&config);
 
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
-
     // The seeded `risk_profile` + `SecurityPolicy` here drive the legacy
     // single-agent `/api/tools` listing and the `run_gateway_chat_with_tools`
     // test mock — they are not load-bearing for per-request agent dispatch.
@@ -864,8 +855,6 @@ pub async fn run_gateway(
                 agent_alias,
                 Arc::clone(&runtime),
                 Arc::clone(&mem),
-                composio_key,
-                composio_entity_id,
                 &config.browser,
                 &config.http_request,
                 &config.web_fetch,
@@ -1013,8 +1002,6 @@ pub async fn run_gateway(
             &alias,
             Arc::clone(&runtime),
             Arc::clone(&mem),
-            composio_key,
-            composio_entity_id,
             &config.browser,
             &config.http_request,
             &config.web_fetch,
@@ -1675,7 +1662,6 @@ pub async fn run_gateway(
         .route("/webhook", post(handle_webhook))
         .merge(optional_channel_routes())
         // ── Claude Code runner hooks ──
-        .route("/hooks/claude-code", post(api::handle_claude_code_hook))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
         .route("/api/logs", get(api_logs::handle_api_logs))

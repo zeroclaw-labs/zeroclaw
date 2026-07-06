@@ -1002,14 +1002,13 @@ mod tests {
 
         // Roots with no curated group yet: they render in the `Other`
         // bucket. Pre-existing — ungrouped before grouping moved into
-        // the schema. Annotating one with `#[group]` (e.g. `microsoft365`
-        // and the `file_*` tool sections are obvious candidates) means
-        // removing it from this list. The assertions below keep the list
-        // honest: every entry must still be a real, still-ungrouped root.
+        // the schema. Annotating one with `#[group]` (e.g. the `file_*`
+        // tool sections are obvious candidates) means removing it from
+        // this list. The assertions below keep the list honest: every
+        // entry must still be a real, still-ungrouped root.
         const UNGROUPED: &[&str] = &[
             "escalation",
             "locale",
-            "microsoft365",
             "file_upload",
             "file_upload_bundle",
             "file_download",
@@ -1050,10 +1049,6 @@ mod tests {
     #[test]
     fn migrated_hand_list_roots_keep_their_groups() {
         let expected = [
-            ("claude_code", SectionGroup::Integrations),
-            ("codex_cli", SectionGroup::Integrations),
-            ("gemini_cli", SectionGroup::Integrations),
-            ("opencode_cli", SectionGroup::Integrations),
             ("sop", SectionGroup::Agent),
             ("verifiable_intent", SectionGroup::Agent),
             ("shell_tool", SectionGroup::Tools),

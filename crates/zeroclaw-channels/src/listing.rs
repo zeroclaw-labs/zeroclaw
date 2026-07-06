@@ -144,19 +144,9 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-clawdtalk"),
     },
     ChannelCompileSpec {
-        schema_name: Some("Reddit"),
-        type_keys: &["reddit"],
-        compiled: cfg!(feature = "channel-reddit"),
-    },
-    ChannelCompileSpec {
         schema_name: Some("Bluesky"),
         type_keys: &["bluesky"],
         compiled: cfg!(feature = "channel-bluesky"),
-    },
-    ChannelCompileSpec {
-        schema_name: Some("X/Twitter"),
-        type_keys: &["twitter"],
-        compiled: cfg!(feature = "channel-twitter"),
     },
     ChannelCompileSpec {
         schema_name: Some("Mochat"),

@@ -5,10 +5,10 @@
 //!   channel field surfaces as one `ChannelInfo` entry; name and desc
 //!   strings live in `channels()` itself, not in this file).
 //! - Toggle integrations: `Config::integration_descriptors()` (per-struct
-//!   `#[integration(...)]` attribute on `BrowserConfig` /
-//!   `GoogleWorkspaceConfig`, plus an inline descriptor for `cron` whose
-//!   `active` reflects whether any job is configured — cron is now a
-//!   `HashMap<String, CronJobDecl>` with no enable toggle struct).
+//!   `#[integration(...)]` attribute on `BrowserConfig`, plus an inline
+//!   descriptor for `cron` whose `active` reflects whether any job is
+//!   configured — cron is now a `HashMap<String, CronJobDecl>` with no
+//!   enable toggle struct).
 //! - AI providers: `zeroclaw_providers::list_providers()` (each
 //!   `ProviderInfo` row carries `display_name`, `description`, and a
 //!   `ProviderActivation` strategy).
@@ -357,26 +357,6 @@ mod tests {
         assert!(matches!(
             toggle_status(&config, |n| n == "Browser"),
             IntegrationStatus::Available
-        ));
-    }
-
-    #[test]
-    fn google_workspace_available_in_default_config() {
-        // GoogleWorkspaceConfig defaults to enabled=false.
-        let config = Config::default();
-        assert!(matches!(
-            toggle_status(&config, |n| n == "Google Workspace"),
-            IntegrationStatus::Available
-        ));
-    }
-
-    #[test]
-    fn google_workspace_active_when_enabled() {
-        let mut config = Config::default();
-        config.google_workspace.enabled = true;
-        assert!(matches!(
-            toggle_status(&config, |n| n == "Google Workspace"),
-            IntegrationStatus::Active
         ));
     }
 

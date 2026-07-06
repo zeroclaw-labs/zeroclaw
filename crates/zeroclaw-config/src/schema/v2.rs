@@ -103,11 +103,9 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "wecom_ws",
     "wechat",
     "qq",
-    "twitter",
     "mochat",
     "nostr",
     "clawdtalk",
-    "reddit",
     "bluesky",
     "voice_call",
     "voice_wake",
@@ -1127,7 +1125,7 @@ fn synthesize_peer_group_from_allowlist(
 ///   merged discord block.
 /// - Singular→plural fold per channel type (`discord.guild_id` →
 ///   `guild_ids[]`, `mattermost.channel_id` → `channel_ids[]`,
-///   `reddit.subreddit` → `subreddits[]`, `signal.group_id` →
+///   `signal.group_id` →
 ///   `group_ids[]` or `dm_only=true` for the `"dm"` sentinel).
 ///
 /// `cli: bool` is preserved at the top-level `channels.cli`, not aliased.
@@ -1368,7 +1366,7 @@ fn fold_discord_history(channels: &mut toml::Table) {
 
 /// Apply V2→V3 singular→plural folds:
 /// `discord.guild_id` → `guild_ids[]`, `mattermost.channel_id` → `channel_ids[]`,
-/// `reddit.subreddit` → `subreddits[]`, and `signal.group_id` → `group_ids[]`
+/// and `signal.group_id` → `group_ids[]`
 /// (with the `"dm"` sentinel mapped to `dm_only=true` instead).
 fn apply_v2_to_v3_channel_folds(channel_type: &str, instance: &mut toml::Table) {
     use crate::migration::fold_string_into_array;
@@ -1385,13 +1383,6 @@ fn apply_v2_to_v3_channel_folds(channel_type: &str, instance: &mut toml::Table) 
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 "channels.mattermost.channel_id folded into channels.mattermost.channel_ids[]"
-            );
-        }
-        "reddit" if fold_string_into_array(instance, "subreddit", "subreddits") => {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                "channels.reddit.subreddit folded into channels.reddit.subreddits[]"
             );
         }
         "signal" => {
@@ -1445,9 +1436,8 @@ fn apply_v2_to_v3_channel_folds(channel_type: &str, instance: &mut toml::Table) 
 /// - Linq/Email/GmailPush: `allowed_senders`
 /// - Nostr:         `allowed_pubkeys`
 ///
-/// Channels with no inbound peer-auth concept (Webhook, Reddit,
-/// Bluesky, MQTT, voice_*, ClawdTalk, CLI) return `None` and the
-/// function is a no-op.
+/// Channels with no inbound peer-auth concept (Webhook, Bluesky, MQTT,
+/// voice_*, ClawdTalk, CLI) return `None` and the function is a no-op.
 fn fold_channel_peer_auth_into_peer_groups(
     channel_type: &str,
     instance: &mut toml::Table,
@@ -1455,8 +1445,9 @@ fn fold_channel_peer_auth_into_peer_groups(
 ) {
     let Some(field_name) = (match channel_type {
         "telegram" | "discord" | "slack" | "mattermost" | "matrix" | "nextcloud_talk" | "irc"
-        | "lark" | "line" | "feishu" | "dingtalk" | "wecom" | "wechat" | "qq" | "twitter"
-        | "mochat" => Some("allowed_users"),
+        | "lark" | "line" | "feishu" | "dingtalk" | "wecom" | "wechat" | "qq" | "mochat" => {
+            Some("allowed_users")
+        }
         "imessage" => Some("allowed_contacts"),
         "signal" => Some("allowed_from"),
         "whatsapp" | "wati" => Some("allowed_numbers"),

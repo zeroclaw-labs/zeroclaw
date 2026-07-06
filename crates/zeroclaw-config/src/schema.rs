@@ -46,7 +46,6 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.wechat",
     "channel.whatsapp",
     "tool.browser",
-    "tool.composio",
     "tool.http_request",
     "tool.pushover",
     "tool.web_search",
@@ -72,15 +71,14 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 
 /// Top-level ZeroClaw configuration, loaded from `config.toml`.
 ///
-/// Resolution order: `ZEROCLAW_CONFIG_DIR` env → `ZEROCLAW_WORKSPACE` env → `~/.zeroclaw/config.toml`.
+/// Resolution order: `ZEROCLAW_CONFIG_DIR` env → `~/.zeroclaw/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct Config {
     /// Shared instance data directory (databases, hygiene state, cost
     /// records, daemon state files). Computed from `ZEROCLAW_CONFIG_DIR`
-    /// / `ZEROCLAW_DATA_DIR` / `ZEROCLAW_WORKSPACE` (deprecated) at
-    /// load time, not serialized. Per-agent identity + markdown lives
-    /// at `agent_workspace_dir(&alias)`, not here.
+    /// / `ZEROCLAW_DATA_DIR` at load time, not serialized. Per-agent
+    /// identity + markdown lives at `agent_workspace_dir(&alias)`, not here.
     #[serde(skip)]
     pub data_dir: PathBuf,
     /// Path to config.toml - computed from home, not serialized
@@ -313,17 +311,6 @@ pub struct Config {
     #[nested]
     pub wss: WssConfig,
 
-    /// Composio managed OAuth tools integration (`[composio]`).
-    #[serde(default)]
-    #[nested]
-    #[group = "Integrations"]
-    pub composio: ComposioConfig,
-
-    /// Microsoft 365 Graph API integration (`[microsoft365]`).
-    #[serde(default)]
-    #[nested]
-    pub microsoft365: Microsoft365Config,
-
     /// Secrets encryption configuration (`[secrets]`).
     #[serde(default)]
     #[nested]
@@ -403,18 +390,6 @@ pub struct Config {
     #[nested]
     #[group = "Tools"]
     pub web_search: WebSearchConfig,
-
-    /// Project delivery intelligence configuration (`[project_intel]`).
-    #[serde(default)]
-    #[nested]
-    #[group = "Tools"]
-    pub project_intel: ProjectIntelConfig,
-
-    /// Google Workspace CLI (`gws`) tool configuration (`[google_workspace]`).
-    #[serde(default)]
-    #[nested]
-    #[group = "Integrations"]
-    pub google_workspace: GoogleWorkspaceConfig,
 
     /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]`).
     #[serde(default)]
@@ -526,18 +501,6 @@ pub struct Config {
     #[nested]
     pub onboard_state: OnboardStateConfig,
 
-    /// Notion integration configuration (`[notion]`).
-    #[serde(default)]
-    #[nested]
-    #[group = "Integrations"]
-    pub notion: NotionConfig,
-
-    /// Jira integration configuration (`[jira]`).
-    #[serde(default)]
-    #[nested]
-    #[group = "Integrations"]
-    pub jira: JiraConfig,
-
     /// Secure inter-node transport configuration (`[node_transport]`).
     #[serde(default)]
     #[nested]
@@ -549,12 +512,6 @@ pub struct Config {
     #[nested]
     #[group = "Tools"]
     pub knowledge: KnowledgeConfig,
-
-    /// LinkedIn integration configuration (`[linkedin]`).
-    #[serde(default)]
-    #[nested]
-    #[group = "Integrations"]
-    pub linkedin: LinkedInConfig,
 
     /// Standalone image generation tool configuration (`[image_gen]`).
     #[serde(default)]
@@ -600,36 +557,6 @@ pub struct Config {
     #[nested]
     #[group = "Agent"]
     pub verifiable_intent: VerifiableIntentConfig,
-
-    /// Claude Code tool configuration (`[claude_code]`).
-    #[serde(default)]
-    #[nested]
-    #[group = "Integrations"]
-    pub claude_code: ClaudeCodeConfig,
-
-    /// Claude Code task runner with Slack progress and SSH session handoff (`[claude_code_runner]`).
-    #[serde(default)]
-    #[nested]
-    #[group = "Integrations"]
-    pub claude_code_runner: ClaudeCodeRunnerConfig,
-
-    /// Codex CLI tool configuration (`[codex_cli]`).
-    #[serde(default)]
-    #[nested]
-    #[group = "Integrations"]
-    pub codex_cli: CodexCliConfig,
-
-    /// Gemini CLI tool configuration (`[gemini_cli]`).
-    #[serde(default)]
-    #[nested]
-    #[group = "Integrations"]
-    pub gemini_cli: GeminiCliConfig,
-
-    /// OpenCode CLI tool configuration (`[opencode_cli]`).
-    #[serde(default)]
-    #[nested]
-    #[group = "Integrations"]
-    pub opencode_cli: OpenCodeCliConfig,
 
     /// Standard Operating Procedures engine configuration (`[sop]`).
     #[serde(default)]
@@ -4485,23 +4412,6 @@ where
     Ok(T::deserialize(raw).unwrap_or_default())
 }
 
-/// Deserialize an `Option<String>` that maps an empty literal `""` to
-/// `None`. Used by `JiraConfig::email` so a config that round-tripped
-/// `email = ""` to disk (the legacy `email: String` had no
-/// `skip_serializing_if`) doesn't deserialize as `Some("")` and silently
-/// break Basic auth — the email-required validation was removed when
-/// Server/DC Bearer-token support landed, so this is the last line of
-/// defense.
-fn deserialize_optional_email_skip_empty<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value: Option<String> = Option::deserialize(deserializer)?;
-    Ok(value.filter(|s| !s.trim().is_empty()))
-}
-
 // ── Hardware Config (wizard-driven) ─────────────────────────────
 
 /// Hardware transport mode.
@@ -6823,117 +6733,7 @@ impl Default for NodeTransportConfig {
 
 // ── Composio (managed tool surface) ─────────────────────────────
 
-/// Composio managed OAuth tools integration (`[composio]` section).
-///
-/// Provides access to 1000+ OAuth-connected tools via the Composio platform.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "composio"]
-pub struct ComposioConfig {
-    /// Enable Composio integration for 1000+ OAuth tools
-    #[serde(default, alias = "enable")]
-    pub enabled: bool,
-    /// Composio API key (stored encrypted when secrets.encrypt = true)
-    #[serde(default)]
-    #[secret]
-    #[credential_class = "encrypted_secret"]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub api_key: Option<String>,
-    /// Default entity ID for multi-user setups
-    #[serde(default = "default_entity_id")]
-    pub entity_id: String,
-}
-
-fn default_entity_id() -> String {
-    "default".into()
-}
-
-impl Default for ComposioConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            api_key: None,
-            entity_id: default_entity_id(),
-        }
-    }
-}
-
 // ── Microsoft 365 (Graph API integration) ───────────────────────
-
-/// Microsoft 365 integration via Microsoft Graph API (`[microsoft365]` section).
-///
-/// Provides access to Outlook mail, Teams messages, Calendar events,
-/// OneDrive files, and SharePoint search.
-#[derive(Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "ms365"]
-pub struct Microsoft365Config {
-    /// Enable Microsoft 365 integration
-    #[serde(default, alias = "enable")]
-    pub enabled: bool,
-    /// Azure AD tenant ID
-    #[serde(default)]
-    pub tenant_id: Option<String>,
-    /// Azure AD application (client) ID
-    #[serde(default)]
-    pub client_id: Option<String>,
-    /// Azure AD client secret (stored encrypted when secrets.encrypt = true)
-    #[serde(default)]
-    #[secret]
-    #[credential_class = "encrypted_secret"]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub client_secret: Option<String>,
-    /// Authentication flow: "client_credentials" or "device_code"
-    #[serde(default = "default_ms365_auth_flow")]
-    pub auth_flow: String,
-    /// OAuth scopes to request
-    #[serde(default = "default_ms365_scopes")]
-    pub scopes: Vec<String>,
-    /// Encrypt the token cache file on disk
-    #[serde(default = "default_true")]
-    pub token_cache_encrypted: bool,
-    /// User principal name or "me" (for delegated flows)
-    #[serde(default)]
-    pub user_id: Option<String>,
-}
-
-fn default_ms365_auth_flow() -> String {
-    "client_credentials".to_string()
-}
-
-fn default_ms365_scopes() -> Vec<String> {
-    vec!["https://graph.microsoft.com/.default".to_string()]
-}
-
-impl std::fmt::Debug for Microsoft365Config {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Microsoft365Config")
-            .field("enabled", &self.enabled)
-            .field("tenant_id", &self.tenant_id)
-            .field("client_id", &self.client_id)
-            .field("client_secret", &self.client_secret.as_ref().map(|_| "***"))
-            .field("auth_flow", &self.auth_flow)
-            .field("scopes", &self.scopes)
-            .field("token_cache_encrypted", &self.token_cache_encrypted)
-            .field("user_id", &self.user_id)
-            .finish()
-    }
-}
-
-impl Default for Microsoft365Config {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            tenant_id: None,
-            client_id: None,
-            client_secret: None,
-            auth_flow: default_ms365_auth_flow(),
-            scopes: default_ms365_scopes(),
-            token_cache_encrypted: true,
-            user_id: None,
-        }
-    }
-}
 
 // ── Secrets (encrypted credential store) ────────────────────────
 
@@ -7480,64 +7280,6 @@ impl Default for WebSearchConfig {
 
 // ── Project Intelligence ────────────────────────────────────────
 
-/// Project delivery intelligence configuration (`[project_intel]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "project_intel"]
-pub struct ProjectIntelConfig {
-    /// Enable the project_intel tool. Default: false.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Default report language (en, de, fr, it). Default: "en".
-    #[serde(default = "default_project_intel_language")]
-    pub default_language: String,
-    /// Output directory for generated reports.
-    #[serde(default = "default_project_intel_report_dir")]
-    pub report_output_dir: String,
-    /// Optional custom templates directory.
-    #[serde(default)]
-    pub templates_dir: Option<String>,
-    /// Risk detection sensitivity: low, medium, high. Default: "medium".
-    #[serde(default = "default_project_intel_risk_sensitivity")]
-    pub risk_sensitivity: String,
-    /// Include git log data in reports. Default: true.
-    #[serde(default = "default_true")]
-    pub include_git_data: bool,
-    /// Include Jira data in reports. Default: false.
-    #[serde(default)]
-    pub include_jira_data: bool,
-    /// Jira instance base URL (required if include_jira_data is true).
-    #[serde(default)]
-    pub jira_base_url: Option<String>,
-}
-
-fn default_project_intel_language() -> String {
-    "en".into()
-}
-
-fn default_project_intel_report_dir() -> String {
-    default_path_under_config_dir("project-reports")
-}
-
-fn default_project_intel_risk_sensitivity() -> String {
-    "medium".into()
-}
-
-impl Default for ProjectIntelConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            default_language: default_project_intel_language(),
-            report_output_dir: default_project_intel_report_dir(),
-            templates_dir: None,
-            risk_sensitivity: default_project_intel_risk_sensitivity(),
-            include_git_data: true,
-            include_jira_data: false,
-            jira_base_url: None,
-        }
-    }
-}
-
 // ── Backup ──────────────────────────────────────────────────────
 
 /// Backup tool configuration (`[backup]` section).
@@ -7639,182 +7381,6 @@ impl Default for DataRetentionConfig {
     }
 }
 
-// ── Google Workspace ─────────────────────────────────────────────
-
-/// Built-in default service allowlist for the `google_workspace` tool.
-///
-/// Applied when `allowed_services` is empty. Defined here (not in the tool layer)
-/// so that config validation can cross-check `allowed_operations` entries against
-/// the effective service set in all cases, including when the operator relies on
-/// the default.
-pub const DEFAULT_GWS_SERVICES: &[&str] = &[
-    "drive",
-    "sheets",
-    "gmail",
-    "calendar",
-    "docs",
-    "slides",
-    "tasks",
-    "people",
-    "chat",
-    "classroom",
-    "forms",
-    "keep",
-    "meet",
-    "events",
-];
-
-/// Google Workspace CLI (`gws`) tool configuration (`[google_workspace]` section).
-///
-/// ## Defaults
-/// - `enabled`: `false` (tool is not registered unless explicitly opted-in).
-/// - `allowed_services`: empty vector, which grants access to the full default
-///   service set: `drive`, `sheets`, `gmail`, `calendar`, `docs`, `slides`,
-///   `tasks`, `people`, `chat`, `classroom`, `forms`, `keep`, `meet`, `events`.
-/// - `credentials_path`: `None` (uses default `gws` credential discovery).
-/// - `default_account`: `None` (uses the `gws` active account).
-/// - `rate_limit_per_minute`: `60`.
-/// - `timeout_secs`: `30`.
-/// - `audit_log`: `false`.
-/// - `credentials_path`: `None` (uses default `gws` credential discovery).
-/// - `default_account`: `None` (uses the `gws` active account).
-/// - `rate_limit_per_minute`: `60`.
-/// - `timeout_secs`: `30`.
-/// - `audit_log`: `false`.
-///
-/// ## Compatibility
-/// Configs that omit the `[google_workspace]` section entirely are treated as
-/// `GoogleWorkspaceConfig::default()` (disabled, all defaults allowed). Adding
-/// the section is purely opt-in and does not affect other config sections.
-///
-/// ## Rollback / Migration
-/// To revert, remove the `[google_workspace]` section from the config file (or
-/// set `enabled = false`). No data migration is required; the tool simply stops
-/// being registered.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct GoogleWorkspaceAllowedOperation {
-    /// Google Workspace service ID (for example `gmail` or `drive`).
-    pub service: String,
-    /// Top-level resource name for the service (for example `users` for Gmail or `files` for Drive).
-    pub resource: String,
-    /// Optional sub-resource for 4-segment gws commands
-    /// (for example `messages` or `drafts` under `gmail users`).
-    /// When present, the entry only matches calls that include this exact sub_resource.
-    /// When absent, the entry only matches calls with no sub_resource.
-    #[serde(default)]
-    pub sub_resource: Option<String>,
-    /// Allowed methods for the service/resource/sub_resource combination.
-    #[serde(default)]
-    pub methods: Vec<String>,
-}
-
-/// Google Workspace CLI (`gws`) tool configuration (`[google_workspace]` section).
-///
-/// ## Defaults
-/// - `enabled`: `false` (tool is not registered unless explicitly opted-in).
-/// - `allowed_services`: empty vector, which grants access to the full default
-///   service set: `drive`, `sheets`, `gmail`, `calendar`, `docs`, `slides`,
-///   `tasks`, `people`, `chat`, `classroom`, `forms`, `keep`, `meet`, `events`.
-/// - `allowed_operations`: empty vector, which preserves the legacy behavior of
-///   allowing any resource/method under the allowed service set.
-/// - `credentials_path`: `None` (uses default `gws` credential discovery).
-/// - `default_account`: `None` (uses the `gws` active account).
-/// - `rate_limit_per_minute`: `60`.
-/// - `timeout_secs`: `30`.
-/// - `audit_log`: `false`.
-///
-/// ## Compatibility
-/// Configs that omit the `[google_workspace]` section entirely are treated as
-/// `GoogleWorkspaceConfig::default()` (disabled, all defaults allowed). Adding
-/// the section is purely opt-in and does not affect other config sections.
-///
-/// ## Rollback / Migration
-/// To revert, remove the `[google_workspace]` section from the config file (or
-/// set `enabled = false`). No data migration is required; the tool simply stops
-/// being registered.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "google_workspace"]
-#[integration(
-    category = "ToolsAutomation",
-    display_name = "Google Workspace",
-    description = "Drive, Gmail, Calendar, Sheets, Docs via gws CLI",
-    status_field = "enabled"
-)]
-pub struct GoogleWorkspaceConfig {
-    /// Enable the `google_workspace` tool. Default: `false`.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Restrict which Google Workspace services the agent can access.
-    ///
-    /// When empty (the default), the full default service set is allowed (see
-    /// struct-level docs). When non-empty, only the listed service IDs are
-    /// permitted. Each entry must be non-empty, lowercase alphanumeric with
-    /// optional underscores/hyphens, and unique.
-    #[serde(default)]
-    pub allowed_services: Vec<String>,
-    /// Restrict which resource/method combinations the agent can access.
-    ///
-    /// When empty (the default), all methods under `allowed_services` remain
-    /// available for backward compatibility. When non-empty, the runtime denies
-    /// any `(service, resource, sub_resource, method)` combination that is not
-    /// explicitly listed. `sub_resource` is optional per entry: an entry without
-    /// it matches only 3-segment `gws` calls; an entry with it matches only calls
-    /// that supply that exact sub_resource value.
-    ///
-    /// Each entry's `service` must appear in `allowed_services` when that list is
-    /// non-empty; config validation rejects entries that would never match at
-    /// runtime.
-    #[serde(default)]
-    pub allowed_operations: Vec<GoogleWorkspaceAllowedOperation>,
-    /// Path to service account JSON or OAuth client credentials file.
-    ///
-    /// When `None`, the tool relies on the default `gws` credential discovery
-    /// (`gws auth login`). Set this to point at a service-account key or an
-    /// OAuth client-secrets JSON for headless / CI environments.
-    #[serde(default)]
-    pub credentials_path: Option<String>,
-    /// Default Google account email to pass to `gws --account`.
-    ///
-    /// When `None`, the currently active `gws` account is used.
-    #[serde(default)]
-    pub default_account: Option<String>,
-    /// Maximum number of `gws` API calls allowed per minute. Default: `60`.
-    #[serde(default = "default_gws_rate_limit")]
-    pub rate_limit_per_minute: u32,
-    /// Command execution timeout in seconds. Default: `30`.
-    #[serde(default = "default_gws_timeout_secs")]
-    pub timeout_secs: u64,
-    /// Enable audit logging of every `gws` invocation (service, resource,
-    /// method, timestamp). Default: `false`.
-    #[serde(default)]
-    pub audit_log: bool,
-}
-
-fn default_gws_rate_limit() -> u32 {
-    60
-}
-
-fn default_gws_timeout_secs() -> u64 {
-    30
-}
-
-impl Default for GoogleWorkspaceConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            allowed_services: Vec::new(),
-            allowed_operations: Vec::new(),
-            credentials_path: None,
-            default_account: None,
-            rate_limit_per_minute: default_gws_rate_limit(),
-            timeout_secs: default_gws_timeout_secs(),
-            audit_log: false,
-        }
-    }
-}
-
 // ── Knowledge ───────────────────────────────────────────────────
 
 /// Knowledge graph configuration for capturing and reusing expertise.
@@ -7861,48 +7427,6 @@ impl Default for KnowledgeConfig {
 }
 
 // ── LinkedIn ────────────────────────────────────────────────────
-
-/// LinkedIn integration configuration (`[linkedin]` section).
-///
-/// When enabled, the `linkedin` tool is registered in the agent tool surface.
-/// Requires `LINKEDIN_*` credentials in the workspace `.env` file.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "linkedin"]
-pub struct LinkedInConfig {
-    /// Enable the LinkedIn tool.
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// LinkedIn REST API version header (YYYYMM format).
-    #[serde(default = "default_linkedin_api_version")]
-    pub api_version: String,
-
-    /// Content strategy for automated posting.
-    #[serde(default)]
-    #[nested]
-    pub content: LinkedInContentConfig,
-
-    /// Image generation for posts (`[linkedin.image]`).
-    #[serde(default)]
-    #[nested]
-    pub image: LinkedInImageConfig,
-}
-
-impl Default for LinkedInConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            api_version: default_linkedin_api_version(),
-            content: LinkedInContentConfig::default(),
-            image: LinkedInImageConfig::default(),
-        }
-    }
-}
-
-fn default_linkedin_api_version() -> String {
-    "202602".to_string()
-}
 
 /// Per-plugin config section keyed by plugin alias; values are secret so they
 /// encrypt at rest under the same adjacent `.secret_key` as every other secret.
@@ -8072,118 +7596,6 @@ impl Default for PluginsConfig {
             security: PluginSecurityConfig::default(),
             limits: PluginLimitsConfig::default(),
             entries: Vec::new(),
-        }
-    }
-}
-
-/// Content strategy configuration for LinkedIn auto-posting (`[linkedin.content]`).
-///
-/// The agent reads this via the `linkedin get_content_strategy` action to know
-/// what feeds to check, which repos to highlight, and how to write posts.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "linkedin.content"]
-pub struct LinkedInContentConfig {
-    /// RSS feed URLs to monitor for topic inspiration (titles only).
-    #[serde(default)]
-    pub rss_feeds: Vec<String>,
-
-    /// GitHub usernames whose public activity to reference.
-    #[serde(default)]
-    pub github_users: Vec<String>,
-
-    /// GitHub repositories to highlight (format: `owner/repo`).
-    #[serde(default)]
-    pub github_repos: Vec<String>,
-
-    /// Topics of expertise and interest for post themes.
-    #[serde(default)]
-    pub topics: Vec<String>,
-
-    /// Professional persona description (name, role, expertise).
-    #[serde(default)]
-    pub persona: String,
-
-    /// Freeform posting instructions for the AI agent.
-    #[serde(default)]
-    pub instructions: String,
-}
-
-/// Image generation configuration for LinkedIn posts (`[linkedin.image]`).
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "linkedin.image"]
-pub struct LinkedInImageConfig {
-    /// Enable image generation for posts.
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// ModelProvider priority order. Tried in sequence; first success wins.
-    #[serde(default = "default_image_providers")]
-    pub providers: Vec<String>,
-
-    /// Generate a branded SVG text card when all AI model_providers fail.
-    #[serde(default = "default_true")]
-    pub fallback_card: bool,
-
-    /// Accent color for the fallback card (CSS hex).
-    #[serde(default = "default_card_accent_color")]
-    pub card_accent_color: String,
-
-    /// Temp directory for generated images, relative to workspace.
-    #[serde(default = "default_image_temp_dir")]
-    pub temp_dir: String,
-
-    /// Stability AI model_provider settings.
-    #[serde(default)]
-    #[nested]
-    pub stability: ImageProviderStabilityConfig,
-
-    /// Google Imagen (Vertex AI) model_provider settings.
-    #[serde(default)]
-    #[nested]
-    pub imagen: ImageProviderImagenConfig,
-
-    /// OpenAI DALL-E model_provider settings.
-    #[serde(default)]
-    #[nested]
-    pub dalle: ImageProviderDalleConfig,
-
-    /// Flux (fal.ai) model_provider settings.
-    #[serde(default)]
-    #[nested]
-    pub flux: ImageProviderFluxConfig,
-}
-
-fn default_image_providers() -> Vec<String> {
-    vec![
-        "stability".into(),
-        "imagen".into(),
-        "dalle".into(),
-        "flux".into(),
-    ]
-}
-
-fn default_card_accent_color() -> String {
-    "#0A66C2".into()
-}
-
-fn default_image_temp_dir() -> String {
-    "linkedin/images".into()
-}
-
-impl Default for LinkedInImageConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            providers: default_image_providers(),
-            fallback_card: true,
-            card_accent_color: default_card_accent_color(),
-            temp_dir: default_image_temp_dir(),
-            stability: ImageProviderStabilityConfig::default(),
-            imagen: ImageProviderImagenConfig::default(),
-            dalle: ImageProviderDalleConfig::default(),
-            flux: ImageProviderFluxConfig::default(),
         }
     }
 }
@@ -8601,253 +8013,13 @@ impl Default for FileDownloadConfig {
 
 // ── Claude Code ─────────────────────────────────────────────────
 
-/// Claude Code CLI tool configuration (`[claude_code]` section).
-///
-/// Delegates coding tasks to the `claude -p` CLI. Authentication uses the
-/// binary's own OAuth session (Max subscription) by default — no API key
-/// needed unless `env_passthrough` includes `ANTHROPIC_API_KEY`.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "claude_code"]
-pub struct ClaudeCodeConfig {
-    /// Enable the `claude_code` tool
-    #[serde(default)]
-    pub enabled: bool,
-    /// Maximum execution time in seconds (coding tasks can be long)
-    #[serde(default = "default_claude_code_timeout_secs")]
-    pub timeout_secs: u64,
-    /// Claude Code tools the subprocess is allowed to use
-    #[serde(default = "default_claude_code_allowed_tools")]
-    pub allowed_tools: Vec<String>,
-    /// Optional system prompt appended to Claude Code invocations
-    #[serde(default)]
-    pub system_prompt: Option<String>,
-    /// Maximum output size in bytes (2MB default)
-    #[serde(default = "default_claude_code_max_output_bytes")]
-    pub max_output_bytes: usize,
-    /// Extra env vars passed to the claude subprocess (e.g. ANTHROPIC_API_KEY for API-key billing)
-    #[serde(default)]
-    #[credential_class = "legacy_env_path"]
-    pub env_passthrough: Vec<String>,
-}
-
-fn default_claude_code_timeout_secs() -> u64 {
-    600
-}
-
-fn default_claude_code_allowed_tools() -> Vec<String> {
-    vec!["Read".into(), "Edit".into(), "Bash".into(), "Write".into()]
-}
-
-fn default_claude_code_max_output_bytes() -> usize {
-    2_097_152
-}
-
-impl Default for ClaudeCodeConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            timeout_secs: default_claude_code_timeout_secs(),
-            allowed_tools: default_claude_code_allowed_tools(),
-            system_prompt: None,
-            max_output_bytes: default_claude_code_max_output_bytes(),
-            env_passthrough: Vec::new(),
-        }
-    }
-}
-
 // ── Claude Code Runner ──────────────────────────────────────────
-
-/// Claude Code task runner configuration (`[claude_code_runner]` section).
-///
-/// Spawns Claude Code in a tmux session with HTTP hooks that POST tool
-/// execution events back to ZeroClaw's gateway, updating a Slack message
-/// in-place with progress plus an SSH handoff link.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "claude_code_runner"]
-pub struct ClaudeCodeRunnerConfig {
-    /// Enable the `claude_code_runner` tool
-    #[serde(default)]
-    pub enabled: bool,
-    /// SSH host for session handoff links (e.g. "myhost.example.com")
-    #[serde(default)]
-    pub ssh_host: Option<String>,
-    /// Prefix for tmux session names (default: "zc-claude-")
-    #[serde(default = "default_claude_code_runner_tmux_prefix")]
-    pub tmux_prefix: String,
-    /// Session time-to-live in seconds before auto-cleanup (default: 3600)
-    #[serde(default = "default_claude_code_runner_session_ttl")]
-    pub session_ttl: u64,
-}
-
-fn default_claude_code_runner_tmux_prefix() -> String {
-    "zc-claude-".into()
-}
-
-fn default_claude_code_runner_session_ttl() -> u64 {
-    3600
-}
-
-impl Default for ClaudeCodeRunnerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            ssh_host: None,
-            tmux_prefix: default_claude_code_runner_tmux_prefix(),
-            session_ttl: default_claude_code_runner_session_ttl(),
-        }
-    }
-}
 
 // ── Codex CLI ───────────────────────────────────────────────────
 
-/// Codex CLI tool configuration (`[codex_cli]` section).
-///
-/// Delegates coding tasks to the `codex exec` CLI. Authentication uses the
-/// binary's own session by default — no API key needed unless
-/// `env_passthrough` includes `OPENAI_API_KEY`.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "codex_cli"]
-pub struct CodexCliConfig {
-    /// Enable the `codex_cli` tool
-    #[serde(default)]
-    pub enabled: bool,
-    /// Maximum execution time in seconds (coding tasks can be long)
-    #[serde(default = "default_codex_cli_timeout_secs")]
-    pub timeout_secs: u64,
-    /// Maximum output size in bytes (2MB default)
-    #[serde(default = "default_codex_cli_max_output_bytes")]
-    pub max_output_bytes: usize,
-    /// Extra env vars passed to the codex subprocess (e.g. OPENAI_API_KEY)
-    #[serde(default)]
-    #[credential_class = "legacy_env_path"]
-    pub env_passthrough: Vec<String>,
-    /// Extra CLI arguments appended to `codex exec` before the prompt.
-    ///
-    /// Values come from operator-controlled config (same trust level as
-    /// `env_passthrough`) and are not validated — the operator is responsible
-    /// for understanding the implications of flags passed here.
-    ///
-    /// **Warning:** `--sandbox=danger-full-access` disables Codex's bubblewrap
-    /// isolation; only use in environments where the container itself provides
-    /// isolation (e.g. Kubernetes pods with restricted PSS).
-    ///
-    /// Example: `["--sandbox=danger-full-access", "--skip-git-repo-check"]`
-    #[serde(default)]
-    pub extra_args: Vec<String>,
-}
-
-fn default_codex_cli_timeout_secs() -> u64 {
-    600
-}
-
-fn default_codex_cli_max_output_bytes() -> usize {
-    2_097_152
-}
-
-impl Default for CodexCliConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            timeout_secs: default_codex_cli_timeout_secs(),
-            max_output_bytes: default_codex_cli_max_output_bytes(),
-            env_passthrough: Vec::new(),
-            extra_args: Vec::new(),
-        }
-    }
-}
-
 // ── Gemini CLI ──────────────────────────────────────────────────
 
-/// Gemini CLI tool configuration (`[gemini_cli]` section).
-///
-/// Delegates coding tasks to the `gemini -p` CLI. Authentication uses the
-/// binary's own session by default — no API key needed unless
-/// `env_passthrough` includes `GOOGLE_API_KEY`.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "gemini_cli"]
-pub struct GeminiCliConfig {
-    /// Enable the `gemini_cli` tool
-    #[serde(default)]
-    pub enabled: bool,
-    /// Maximum execution time in seconds (coding tasks can be long)
-    #[serde(default = "default_gemini_cli_timeout_secs")]
-    pub timeout_secs: u64,
-    /// Maximum output size in bytes (2MB default)
-    #[serde(default = "default_gemini_cli_max_output_bytes")]
-    pub max_output_bytes: usize,
-    /// Extra env vars passed to the gemini subprocess (e.g. GOOGLE_API_KEY)
-    #[serde(default)]
-    #[credential_class = "legacy_env_path"]
-    pub env_passthrough: Vec<String>,
-}
-
-fn default_gemini_cli_timeout_secs() -> u64 {
-    600
-}
-
-fn default_gemini_cli_max_output_bytes() -> usize {
-    2_097_152
-}
-
-impl Default for GeminiCliConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            timeout_secs: default_gemini_cli_timeout_secs(),
-            max_output_bytes: default_gemini_cli_max_output_bytes(),
-            env_passthrough: Vec::new(),
-        }
-    }
-}
-
 // ── OpenCode CLI ───────────────────────────────────────────────
-
-/// OpenCode CLI tool configuration (`[opencode_cli]` section).
-///
-/// Delegates coding tasks to the `opencode run` CLI. Authentication uses the
-/// binary's own session by default — no API key needed unless
-/// `env_passthrough` includes provider-specific keys.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "opencode_cli"]
-pub struct OpenCodeCliConfig {
-    /// Enable the `opencode_cli` tool
-    #[serde(default)]
-    pub enabled: bool,
-    /// Maximum execution time in seconds (coding tasks can be long)
-    #[serde(default = "default_opencode_cli_timeout_secs")]
-    pub timeout_secs: u64,
-    /// Maximum output size in bytes (2MB default)
-    #[serde(default = "default_opencode_cli_max_output_bytes")]
-    pub max_output_bytes: usize,
-    /// Extra env vars passed to the opencode subprocess
-    #[serde(default)]
-    #[credential_class = "legacy_env_path"]
-    pub env_passthrough: Vec<String>,
-}
-
-fn default_opencode_cli_timeout_secs() -> u64 {
-    600
-}
-
-fn default_opencode_cli_max_output_bytes() -> usize {
-    2_097_152
-}
-
-impl Default for OpenCodeCliConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            timeout_secs: default_opencode_cli_timeout_secs(),
-            max_output_bytes: default_opencode_cli_max_output_bytes(),
-            env_passthrough: Vec::new(),
-        }
-    }
-}
 
 // ── Proxy ───────────────────────────────────────────────────────
 
@@ -12282,10 +11454,6 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub qq: HashMap<String, QQConfig>,
-    /// X/Twitter channel instances (`[channels.twitter.<alias>]`).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[nested]
-    pub twitter: HashMap<String, TwitterConfig>,
     /// Mochat customer service channel instances (`[channels.mochat.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -12297,10 +11465,6 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub clawdtalk: HashMap<String, crate::scattered_types::ClawdTalkConfig>,
-    /// Reddit channel instances (`[channels.reddit.<alias>]`).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[nested]
-    pub reddit: HashMap<String, RedditConfig>,
     /// Bluesky channel instances (`[channels.bluesky.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -12525,22 +11689,10 @@ impl ChannelsConfig {
                 configured: !self.clawdtalk.is_empty(),
             },
             ChannelInfo {
-                kind: "reddit",
-                name: "Reddit",
-                desc: "Reddit bot (OAuth2)",
-                configured: !self.reddit.is_empty(),
-            },
-            ChannelInfo {
                 kind: "bluesky",
                 name: "Bluesky",
                 desc: "AT Protocol",
                 configured: !self.bluesky.is_empty(),
-            },
-            ChannelInfo {
-                kind: "twitter",
-                name: "X/Twitter",
-                desc: "X/Twitter Bot via API v2",
-                configured: !self.twitter.is_empty(),
             },
             ChannelInfo {
                 kind: "mochat",
@@ -12622,11 +11774,9 @@ impl ChannelsConfig {
             || self.wecom_ws.values().any(|c| c.enabled)
             || self.wechat.values().any(|c| c.enabled)
             || self.qq.values().any(|c| c.enabled)
-            || self.twitter.values().any(|c| c.enabled)
             || self.mochat.values().any(|c| c.enabled)
             || self.nostr.values().any(|c| c.enabled)
             || self.clawdtalk.values().any(|c| c.enabled)
-            || self.reddit.values().any(|c| c.enabled)
             || self.bluesky.values().any(|c| c.enabled)
             || self.voice_call.values().any(|c| c.enabled)
             || self.voice_wake.values().any(|c| c.enabled)
@@ -12643,7 +11793,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 35] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 33] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -12668,11 +11818,9 @@ impl ChannelsConfig {
             ("wecom_ws", !self.wecom_ws.is_empty(), true),
             ("wechat", !self.wechat.is_empty(), true),
             ("qq", !self.qq.is_empty(), true),
-            ("twitter", !self.twitter.is_empty(), true),
             ("mochat", !self.mochat.is_empty(), true),
             ("nostr", !self.nostr.is_empty(), true),
             ("clawdtalk", !self.clawdtalk.is_empty(), true),
-            ("reddit", !self.reddit.is_empty(), true),
             ("bluesky", !self.bluesky.is_empty(), true),
             ("voice_call", !self.voice_call.is_empty(), true),
             ("voice_wake", !self.voice_wake.is_empty(), false),
@@ -12753,11 +11901,9 @@ impl Default for ChannelsConfig {
             wecom_ws: HashMap::new(),
             wechat: HashMap::new(),
             qq: HashMap::new(),
-            twitter: HashMap::new(),
             mochat: HashMap::new(),
             nostr: HashMap::new(),
             clawdtalk: HashMap::new(),
-            reddit: HashMap::new(),
             bluesky: HashMap::new(),
             voice_call: HashMap::new(),
             voice_wake: HashMap::new(),
@@ -15665,40 +14811,6 @@ impl ChannelConfig for QQConfig {
     }
 }
 
-/// X/Twitter channel configuration (Twitter API v2)
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "channels.twitter"]
-pub struct TwitterConfig {
-    /// Whether this channel is active. The runtime only loads channels whose
-    /// `enabled = true`. Default: `false` so an operator who pastes a partial
-    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
-    /// live before the rest of its config is filled in.
-    #[tab(Behavior)]
-    #[serde(default)]
-    pub enabled: bool,
-    /// Twitter API v2 Bearer Token (OAuth 2.0)
-    #[secret]
-    #[tab(Connection)]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub bearer_token: String,
-
-    /// Tools excluded from this channel's tool spec. When set, these tools
-    /// are not exposed to the model when responding via this channel.
-    #[tab(Behavior)]
-    #[serde(default)]
-    pub excluded_tools: Vec<String>,
-}
-
-impl ChannelConfig for TwitterConfig {
-    fn name() -> &'static str {
-        "X/Twitter"
-    }
-    fn desc() -> &'static str {
-        "X/Twitter Bot via API v2"
-    }
-}
-
 /// Mochat channel configuration (Mochat customer service API)
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -15741,57 +14853,6 @@ impl ChannelConfig for MochatConfig {
     }
     fn desc() -> &'static str {
         "Mochat Customer Service"
-    }
-}
-
-/// Reddit channel configuration (OAuth2 bot).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "channels.reddit"]
-pub struct RedditConfig {
-    /// Whether this channel is active. The runtime only loads channels whose
-    /// `enabled = true`. Default: `false` so an operator who pastes a partial
-    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
-    /// live before the rest of its config is filled in.
-    #[tab(Behavior)]
-    #[serde(default)]
-    pub enabled: bool,
-    /// Reddit OAuth2 client ID.
-    #[tab(Connection)]
-    pub client_id: String,
-    /// Reddit OAuth2 client secret.
-    #[secret]
-    #[tab(Connection)]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub client_secret: String,
-    /// Reddit OAuth2 refresh token for persistent access.
-    #[secret]
-    #[tab(Connection)]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub refresh_token: String,
-    /// Reddit bot username (without `u/` prefix).
-    #[tab(Advanced)]
-    pub username: String,
-    /// Subreddits to filter messages (without `r/` prefix). Empty = accept
-    /// from any subreddit the bot has access to. Migrated from the legacy
-    /// `subreddit` singular field.
-    #[tab(Advanced)]
-    #[serde(default)]
-    pub subreddits: Vec<String>,
-
-    /// Tools excluded from this channel's tool spec. When set, these tools
-    /// are not exposed to the model when responding via this channel.
-    #[tab(Behavior)]
-    #[serde(default)]
-    pub excluded_tools: Vec<String>,
-}
-
-impl ChannelConfig for RedditConfig {
-    fn name() -> &'static str {
-        "Reddit"
-    }
-    fn desc() -> &'static str {
-        "Reddit bot (OAuth2)"
     }
 }
 
@@ -15975,152 +15036,6 @@ pub fn default_nostr_relays() -> Vec<String> {
 }
 
 // -- Notion --
-
-/// Notion integration configuration (`[notion]`).
-///
-/// When `enabled = true`, the agent polls a Notion database for pending tasks
-/// and exposes a `notion` tool for querying, reading, creating, and updating pages.
-/// Requires `api_key` (or the `NOTION_API_KEY` env var) and `database_id`.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "notion"]
-pub struct NotionConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    #[secret]
-    #[credential_class = "encrypted_secret"]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub api_key: String,
-    #[serde(default)]
-    pub database_id: String,
-    #[serde(default = "default_notion_poll_interval")]
-    pub poll_interval_secs: u64,
-    #[serde(default = "default_notion_status_prop")]
-    pub status_property: String,
-    #[serde(default = "default_notion_input_prop")]
-    pub input_property: String,
-    #[serde(default = "default_notion_result_prop")]
-    pub result_property: String,
-    #[serde(default = "default_notion_max_concurrent")]
-    pub max_concurrent: usize,
-    #[serde(default = "default_notion_recover_stale")]
-    pub recover_stale: bool,
-}
-
-fn default_notion_poll_interval() -> u64 {
-    5
-}
-fn default_notion_status_prop() -> String {
-    "Status".into()
-}
-fn default_notion_input_prop() -> String {
-    "Input".into()
-}
-fn default_notion_result_prop() -> String {
-    "Result".into()
-}
-fn default_notion_max_concurrent() -> usize {
-    4
-}
-fn default_notion_recover_stale() -> bool {
-    true
-}
-
-impl Default for NotionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            api_key: String::new(),
-            database_id: String::new(),
-            poll_interval_secs: default_notion_poll_interval(),
-            status_property: default_notion_status_prop(),
-            input_property: default_notion_input_prop(),
-            result_property: default_notion_result_prop(),
-            max_concurrent: default_notion_max_concurrent(),
-            recover_stale: default_notion_recover_stale(),
-        }
-    }
-}
-
-/// Jira integration configuration (`[jira]`).
-///
-/// When `enabled = true`, registers the `jira` tool which can get tickets,
-/// search with JQL, and add comments. Requires `base_url` and `api_token`
-/// (or the `JIRA_API_TOKEN` env var).
-///
-/// ## Defaults
-/// - `enabled`: `false`
-/// - `allowed_actions`: `["get_ticket"]` — read-only by default.
-///   Add `"search_tickets"` or `"comment_ticket"` to unlock them.
-/// - `timeout_secs`: `30`
-///
-/// ## Auth
-/// Jira Cloud uses HTTP Basic auth: `email` + `api_token`.
-/// Jira Server/Data Center uses Bearer token auth: omit `email` and set
-/// `api_token` to a personal access token.
-/// `api_token` is stored encrypted at rest; set it here or via `JIRA_API_TOKEN`.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "jira"]
-pub struct JiraConfig {
-    /// Enable the `jira` tool. Default: `false`.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Atlassian instance base URL, e.g. `https://yourco.atlassian.net`.
-    #[serde(default)]
-    pub base_url: String,
-    /// Jira account email used for Basic auth (Cloud).
-    /// Omit for Server/DC deployments using Bearer token auth.
-    /// An empty string (`email = ""`) deserializes as `None`. Configs
-    /// that round-tripped the empty default to disk would otherwise
-    /// silently regress to Basic auth with empty username, since the
-    /// email-required validation was dropped when Server/DC Bearer-token
-    /// support landed.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_optional_email_skip_empty"
-    )]
-    pub email: Option<String>,
-    /// Jira API token. Encrypted at rest. Falls back to `JIRA_API_TOKEN` env var.
-    #[serde(default)]
-    #[secret]
-    #[credential_class = "encrypted_secret"]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub api_token: String,
-    /// Actions the agent is permitted to call.
-    /// Valid values: `"get_ticket"`, `"search_tickets"`, `"comment_ticket"`,
-    /// `"list_projects"`, `"myself"`, `"list_transitions"`,
-    /// `"transition_ticket"`, `"create_ticket"`.
-    /// Defaults to `["get_ticket"]` (read-only).
-    #[serde(default = "default_jira_allowed_actions")]
-    pub allowed_actions: Vec<String>,
-    /// Request timeout in seconds. Default: `30`.
-    #[serde(default = "default_jira_timeout_secs")]
-    pub timeout_secs: u64,
-}
-
-fn default_jira_allowed_actions() -> Vec<String> {
-    vec!["get_ticket".to_string()]
-}
-
-fn default_jira_timeout_secs() -> u64 {
-    30
-}
-
-impl Default for JiraConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            base_url: String::new(),
-            email: None,
-            api_token: String::new(),
-            allowed_actions: default_jira_allowed_actions(),
-            timeout_secs: default_jira_timeout_secs(),
-        }
-    }
-}
 
 ///
 /// Controls the read-only cloud transformation analysis tools:
@@ -16418,8 +15333,6 @@ impl Default for Config {
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
-            composio: ComposioConfig::default(),
-            microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             browser_delegate: crate::scattered_types::BrowserDelegateConfig::default(),
@@ -16430,8 +15343,6 @@ impl Default for Config {
             link_enricher: LinkEnricherConfig::default(),
             text_browser: TextBrowserConfig::default(),
             web_search: WebSearchConfig::default(),
-            project_intel: ProjectIntelConfig::default(),
-            google_workspace: GoogleWorkspaceConfig::default(),
             proxy: ProxyConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
@@ -16451,11 +15362,8 @@ impl Default for Config {
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
             onboard_state: OnboardStateConfig::default(),
-            notion: NotionConfig::default(),
-            jira: JiraConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
-            linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
             file_upload: FileUploadConfig::default(),
             file_upload_bundle: FileUploadBundleConfig::default(),
@@ -16463,11 +15371,6 @@ impl Default for Config {
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
-            claude_code: ClaudeCodeConfig::default(),
-            claude_code_runner: ClaudeCodeRunnerConfig::default(),
-            codex_cli: CodexCliConfig::default(),
-            gemini_cli: GeminiCliConfig::default(),
-            opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
@@ -16586,8 +15489,7 @@ pub fn resolve_config_dir_for_data(data_dir: &Path) -> (PathBuf, PathBuf) {
 /// Resolve the current runtime config/data directories.
 ///
 /// This mirrors the same precedence used by `Config::load_or_init()`:
-/// `ZEROCLAW_CONFIG_DIR` > `ZEROCLAW_DATA_DIR` > `ZEROCLAW_WORKSPACE`
-/// (deprecated) > defaults.
+/// `ZEROCLAW_CONFIG_DIR` > `ZEROCLAW_DATA_DIR` > defaults.
 pub async fn resolve_runtime_dirs() -> Result<(PathBuf, PathBuf)> {
     let (default_zeroclaw_dir, default_data_dir) = default_config_and_data_dirs()?;
     let (config_dir, data_dir, _) =
@@ -16597,21 +15499,19 @@ pub async fn resolve_runtime_dirs() -> Result<(PathBuf, PathBuf)> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConfigResolutionSource {
-    EnvConfigDir,
-    EnvDataDir,
-    EnvWorkspaceLegacy,
-    DefaultConfigDir,
-    HomebrewConfigDir,
+    EnvConfig,
+    EnvData,
+    Default,
+    Homebrew,
 }
 
 impl ConfigResolutionSource {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::EnvConfigDir => "ZEROCLAW_CONFIG_DIR",
-            Self::EnvDataDir => "ZEROCLAW_DATA_DIR",
-            Self::EnvWorkspaceLegacy => "ZEROCLAW_WORKSPACE",
-            Self::DefaultConfigDir => "default",
-            Self::HomebrewConfigDir => "homebrew",
+            Self::EnvConfig => "ZEROCLAW_CONFIG_DIR",
+            Self::EnvData => "ZEROCLAW_DATA_DIR",
+            Self::Default => "default",
+            Self::Homebrew => "homebrew",
         }
     }
 }
@@ -16740,7 +15640,7 @@ async fn resolve_runtime_config_dirs(
         let custom_config_dir = custom_config_dir.trim();
         if !custom_config_dir.is_empty() {
             // If the operator ALSO set ZEROCLAW_DATA_DIR or
-            // ZEROCLAW_WORKSPACE, CONFIG_DIR wins; surface the
+            // ZEROCLAW_DATA_DIR, CONFIG_DIR wins; surface the
             // collision so they know which one took effect.
             if std::env::var("ZEROCLAW_DATA_DIR")
                 .ok()
@@ -16756,25 +15656,11 @@ async fn resolve_runtime_config_dirs(
                      directory under it)."
                 );
             }
-            if std::env::var("ZEROCLAW_WORKSPACE")
-                .ok()
-                .filter(|v| !v.is_empty())
-                .is_some()
-            {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    "ZEROCLAW_CONFIG_DIR is set; ZEROCLAW_WORKSPACE (deprecated) \
-                     is ignored. ZEROCLAW_WORKSPACE will be removed in a future \
-                     release; switch any remaining references to ZEROCLAW_DATA_DIR."
-                );
-            }
             let zeroclaw_dir = expand_tilde_path(custom_config_dir);
             return Ok((
                 zeroclaw_dir.clone(),
                 zeroclaw_dir.join("data"),
-                ConfigResolutionSource::EnvConfigDir,
+                ConfigResolutionSource::EnvConfig,
             ));
         }
     }
@@ -16782,42 +15668,9 @@ async fn resolve_runtime_config_dirs(
     if let Ok(custom_data) = std::env::var("ZEROCLAW_DATA_DIR")
         && !custom_data.trim().is_empty()
     {
-        if std::env::var("ZEROCLAW_WORKSPACE")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_some()
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "ZEROCLAW_DATA_DIR and ZEROCLAW_WORKSPACE are both set; \
-                 ZEROCLAW_WORKSPACE (deprecated) is ignored. \
-                 ZEROCLAW_WORKSPACE will be removed in a future release."
-            );
-        }
         let expanded = expand_tilde_path(&custom_data);
         let (zeroclaw_dir, data_dir) = resolve_config_dir_for_data(&expanded);
-        return Ok((zeroclaw_dir, data_dir, ConfigResolutionSource::EnvDataDir));
-    }
-
-    if let Ok(custom_workspace) = std::env::var("ZEROCLAW_WORKSPACE")
-        && !custom_workspace.is_empty()
-    {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-            "ZEROCLAW_WORKSPACE is deprecated; use ZEROCLAW_DATA_DIR instead. \
-             ZEROCLAW_WORKSPACE will be removed in a future release."
-        );
-        let expanded = expand_tilde_path(&custom_workspace);
-        let (zeroclaw_dir, data_dir) = resolve_config_dir_for_data(&expanded);
-        return Ok((
-            zeroclaw_dir,
-            data_dir,
-            ConfigResolutionSource::EnvWorkspaceLegacy,
-        ));
+        return Ok((zeroclaw_dir, data_dir, ConfigResolutionSource::EnvData));
     }
 
     if cfg!(target_os = "macos")
@@ -16827,14 +15680,14 @@ async fn resolve_runtime_config_dirs(
         return Ok((
             homebrew_config_dir.clone(),
             homebrew_config_dir.join("workspace"),
-            ConfigResolutionSource::HomebrewConfigDir,
+            ConfigResolutionSource::Homebrew,
         ));
     }
 
     Ok((
         default_zeroclaw_dir.to_path_buf(),
         default_data_dir.to_path_buf(),
-        ConfigResolutionSource::DefaultConfigDir,
+        ConfigResolutionSource::Default,
     ))
 }
 
@@ -17068,16 +15921,14 @@ impl Config {
     /// row in this method. The integrations registry consumes the result
     /// without per-vendor branches.
     pub fn integration_descriptors(&self) -> Vec<crate::config::IntegrationDescriptor> {
-        // BrowserConfig and GoogleWorkspaceConfig carry
-        // `#[integration(...)]` annotations on V3, so the macro emits
-        // `integration_descriptor()` on each. Cron has been flattened
+        // BrowserConfig carries an `#[integration(...)]` annotation, so the
+        // macro emits `integration_descriptor()` on it. Cron has been flattened
         // to `HashMap<String, CronJobDecl>` with no enable toggle, so
         // it gets a hand-crafted descriptor whose `active` reflects
         // whether any job is configured. Display copy lives next to
         // the field so the registry never branches on a category name.
         vec![
             self.browser.integration_descriptor(),
-            self.google_workspace.integration_descriptor(),
             crate::config::IntegrationDescriptor {
                 display_name: "Cron",
                 description: "Scheduled tasks",
@@ -17249,7 +16100,7 @@ impl Config {
         // the install root the operator actually uses. Running the
         // migration against `default_zeroclaw_dir` would silently skip
         // any install reached via `ZEROCLAW_CONFIG_DIR` or
-        // `ZEROCLAW_WORKSPACE`.
+        // `ZEROCLAW_DATA_DIR`.
         let (zeroclaw_dir, _legacy_workspace_dir, resolution_source) =
             resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
 
@@ -18509,90 +17360,6 @@ impl Config {
             }
         }
 
-        // Microsoft 365
-        if self.microsoft365.enabled {
-            let tenant = self
-                .microsoft365
-                .tenant_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            if tenant.is_none() {
-                anyhow::bail!(
-                    "microsoft365.tenant_id must not be empty when microsoft365 is enabled"
-                );
-            }
-            let client = self
-                .microsoft365
-                .client_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            if client.is_none() {
-                anyhow::bail!(
-                    "microsoft365.client_id must not be empty when microsoft365 is enabled"
-                );
-            }
-            let flow = self.microsoft365.auth_flow.trim();
-            if flow != "client_credentials" && flow != "device_code" {
-                anyhow::bail!(
-                    "microsoft365.auth_flow must be 'client_credentials' or 'device_code'"
-                );
-            }
-            if flow == "client_credentials"
-                && self
-                    .microsoft365
-                    .client_secret
-                    .as_deref()
-                    .is_none_or(|s| s.trim().is_empty())
-            {
-                anyhow::bail!(
-                    "microsoft365.client_secret must not be empty when auth_flow is 'client_credentials'"
-                );
-            }
-        }
-
-        // Microsoft 365
-        if self.microsoft365.enabled {
-            let tenant = self
-                .microsoft365
-                .tenant_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            if tenant.is_none() {
-                anyhow::bail!(
-                    "microsoft365.tenant_id must not be empty when microsoft365 is enabled"
-                );
-            }
-            let client = self
-                .microsoft365
-                .client_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            if client.is_none() {
-                anyhow::bail!(
-                    "microsoft365.client_id must not be empty when microsoft365 is enabled"
-                );
-            }
-            let flow = self.microsoft365.auth_flow.trim();
-            if flow != "client_credentials" && flow != "device_code" {
-                anyhow::bail!("microsoft365.auth_flow must be client_credentials or device_code");
-            }
-            if flow == "client_credentials"
-                && self
-                    .microsoft365
-                    .client_secret
-                    .as_deref()
-                    .is_none_or(|s| s.trim().is_empty())
-            {
-                anyhow::bail!(
-                    "microsoft365.client_secret must not be empty when auth_flow is client_credentials"
-                );
-            }
-        }
-
         // MCP
         if self.mcp.enabled {
             validate_mcp_config(&self.mcp)?;
@@ -18613,170 +17380,6 @@ impl Config {
                     "knowledge.db_path",
                     "knowledge.db_path must not be empty"
                 );
-            }
-        }
-
-        // Google Workspace allowed_services validation
-        let mut seen_gws_services = std::collections::HashSet::new();
-        for (i, service) in self.google_workspace.allowed_services.iter().enumerate() {
-            let normalized = service.trim();
-            if normalized.is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    format!("google_workspace.allowed_services[{i}]"),
-                    "google_workspace.allowed_services[{i}] must not be empty"
-                );
-            }
-            if !normalized
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-            {
-                anyhow::bail!(
-                    "google_workspace.allowed_services[{i}] contains invalid characters: {normalized}"
-                );
-            }
-            if !seen_gws_services.insert(normalized.to_string()) {
-                anyhow::bail!(
-                    "google_workspace.allowed_services contains duplicate entry: {normalized}"
-                );
-            }
-        }
-
-        // Build the effective allowed-services set for cross-validation.
-        // When the operator leaves allowed_services empty the tool falls back to
-        // DEFAULT_GWS_SERVICES; use the same constant here so validation is
-        // consistent in both cases.
-        let effective_services: std::collections::HashSet<&str> =
-            if self.google_workspace.allowed_services.is_empty() {
-                DEFAULT_GWS_SERVICES.iter().copied().collect()
-            } else {
-                self.google_workspace
-                    .allowed_services
-                    .iter()
-                    .map(|s| s.trim())
-                    .collect()
-            };
-
-        let mut seen_gws_operations = std::collections::HashSet::new();
-        for (i, operation) in self.google_workspace.allowed_operations.iter().enumerate() {
-            let service = operation.service.trim();
-            let resource = operation.resource.trim();
-
-            if service.is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    format!("google_workspace.allowed_operations[{i}].service"),
-                    "google_workspace.allowed_operations[{i}].service must not be empty"
-                );
-            }
-            if resource.is_empty() {
-                anyhow::bail!(
-                    "google_workspace.allowed_operations[{i}].resource must not be empty"
-                );
-            }
-
-            if !effective_services.contains(service) {
-                anyhow::bail!(
-                    "google_workspace.allowed_operations[{i}].service '{service}' is not in the \
-                     effective allowed_services; this entry can never match at runtime"
-                );
-            }
-            if !service
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-            {
-                anyhow::bail!(
-                    "google_workspace.allowed_operations[{i}].service contains invalid characters: {service}"
-                );
-            }
-            if !resource
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-            {
-                anyhow::bail!(
-                    "google_workspace.allowed_operations[{i}].resource contains invalid characters: {resource}"
-                );
-            }
-
-            if let Some(ref sub_resource) = operation.sub_resource {
-                let sub = sub_resource.trim();
-                if sub.is_empty() {
-                    anyhow::bail!(
-                        "google_workspace.allowed_operations[{i}].sub_resource must not be empty when present"
-                    );
-                }
-                if !sub
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-                {
-                    anyhow::bail!(
-                        "google_workspace.allowed_operations[{i}].sub_resource contains invalid characters: {sub}"
-                    );
-                }
-            }
-
-            if operation.methods.is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    format!("google_workspace.allowed_operations[{i}].methods"),
-                    "google_workspace.allowed_operations[{i}].methods must not be empty"
-                );
-            }
-
-            let mut seen_methods = std::collections::HashSet::new();
-            for (j, method) in operation.methods.iter().enumerate() {
-                let normalized = method.trim();
-                if normalized.is_empty() {
-                    anyhow::bail!(
-                        "google_workspace.allowed_operations[{i}].methods[{j}] must not be empty"
-                    );
-                }
-                if !normalized
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-                {
-                    anyhow::bail!(
-                        "google_workspace.allowed_operations[{i}].methods[{j}] contains invalid characters: {normalized}"
-                    );
-                }
-                if !seen_methods.insert(normalized.to_string()) {
-                    anyhow::bail!(
-                        "google_workspace.allowed_operations[{i}].methods contains duplicate entry: {normalized}"
-                    );
-                }
-            }
-
-            let sub_key = operation
-                .sub_resource
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or("");
-            let operation_key = format!("{service}:{resource}:{sub_key}");
-            if !seen_gws_operations.insert(operation_key.clone()) {
-                anyhow::bail!(
-                    "google_workspace.allowed_operations contains duplicate service/resource/sub_resource entry: {operation_key}"
-                );
-            }
-        }
-
-        // Project intelligence
-        if self.project_intel.enabled {
-            let lang = &self.project_intel.default_language;
-            if !["en", "de", "fr", "it"].contains(&lang.as_str()) {
-                anyhow::bail!(
-                    "project_intel.default_language must be one of: en, de, fr, it (got '{lang}')"
-                );
-            }
-            let sens = &self.project_intel.risk_sensitivity;
-            if !["low", "medium", "high"].contains(&sens.as_str()) {
-                anyhow::bail!(
-                    "project_intel.risk_sensitivity must be one of: low, medium, high (got '{sens}')"
-                );
-            }
-            if let Some(ref tpl_dir) = self.project_intel.templates_dir
-                && !std::path::Path::new(tpl_dir).exists()
-            {
-                anyhow::bail!("project_intel.templates_dir path does not exist: {tpl_dir}");
             }
         }
 
@@ -18828,48 +17431,6 @@ impl Config {
             }
         }
 
-        // Notion
-        if self.notion.enabled {
-            if self.notion.database_id.trim().is_empty() {
-                anyhow::bail!("notion.database_id must not be empty when notion.enabled = true");
-            }
-            if self.notion.poll_interval_secs == 0 {
-                validation_bail!(
-                    InvalidNumericRange,
-                    "notion.poll_interval_secs",
-                    "notion.poll_interval_secs must be greater than 0"
-                );
-            }
-            if self.notion.max_concurrent == 0 {
-                validation_bail!(
-                    InvalidNumericRange,
-                    "notion.max_concurrent",
-                    "notion.max_concurrent must be greater than 0"
-                );
-            }
-            if self.notion.status_property.trim().is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    "notion.status_property",
-                    "notion.status_property must not be empty"
-                );
-            }
-            if self.notion.input_property.trim().is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    "notion.input_property",
-                    "notion.input_property must not be empty"
-                );
-            }
-            if self.notion.result_property.trim().is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    "notion.result_property",
-                    "notion.result_property must not be empty"
-                );
-            }
-        }
-
         // Pinggy tunnel region — validate allowed values (case-insensitive, auto-lowercased at runtime).
         if let Some(ref pinggy) = self.tunnel.pinggy
             && let Some(ref region) = pinggy.region
@@ -18879,42 +17440,6 @@ impl Config {
                 anyhow::bail!(
                     "tunnel.pinggy.region must be one of: us, eu, ap, br, au (or omitted for auto)"
                 );
-            }
-        }
-
-        // Jira
-        if self.jira.enabled {
-            if self.jira.base_url.trim().is_empty() {
-                anyhow::bail!("jira.base_url must not be empty when jira.enabled = true");
-            }
-            if self.jira.api_token.trim().is_empty()
-                && std::env::var("JIRA_API_TOKEN")
-                    .unwrap_or_default()
-                    .trim()
-                    .is_empty()
-            {
-                anyhow::bail!(
-                    "jira.api_token must be set (or JIRA_API_TOKEN env var) when jira.enabled = true"
-                );
-            }
-            let valid_actions = [
-                "get_ticket",
-                "search_tickets",
-                "comment_ticket",
-                "list_projects",
-                "myself",
-                "list_transitions",
-                "transition_ticket",
-                "create_ticket",
-            ];
-            for action in &self.jira.allowed_actions {
-                if !valid_actions.contains(&action.as_str()) {
-                    anyhow::bail!(
-                        "jira.allowed_actions contains unknown action: '{}'. \
-                         Valid: get_ticket, search_tickets, comment_ticket, list_projects, myself, list_transitions, transition_ticket, create_ticket",
-                        action
-                    );
-                }
             }
         }
 
@@ -22562,11 +21087,9 @@ auto_save = true
                 wecom_ws: HashMap::new(),
                 wechat: HashMap::new(),
                 qq: HashMap::new(),
-                twitter: HashMap::new(),
                 mochat: HashMap::new(),
                 nostr: HashMap::new(),
                 clawdtalk: HashMap::new(),
-                reddit: HashMap::new(),
                 bluesky: HashMap::new(),
                 voice_call: HashMap::new(),
                 voice_duplex: HashMap::new(),
@@ -22589,8 +21112,6 @@ auto_save = true
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
-            composio: ComposioConfig::default(),
-            microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             browser_delegate: crate::scattered_types::BrowserDelegateConfig::default(),
@@ -22601,8 +21122,6 @@ auto_save = true
             link_enricher: LinkEnricherConfig::default(),
             text_browser: TextBrowserConfig::default(),
             web_search: WebSearchConfig::default(),
-            project_intel: ProjectIntelConfig::default(),
-            google_workspace: GoogleWorkspaceConfig::default(),
             proxy: ProxyConfig::default(),
             pacing: PacingConfig::default(),
             cost: CostConfig::default(),
@@ -22621,11 +21140,8 @@ auto_save = true
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
             onboard_state: OnboardStateConfig::default(),
-            notion: NotionConfig::default(),
-            jira: JiraConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
-            linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
             file_upload: FileUploadConfig::default(),
             file_upload_bundle: FileUploadBundleConfig::default(),
@@ -22633,11 +21149,6 @@ auto_save = true
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
-            claude_code: ClaudeCodeConfig::default(),
-            claude_code_runner: ClaudeCodeRunnerConfig::default(),
-            codex_cli: CodexCliConfig::default(),
-            gemini_cli: GeminiCliConfig::default(),
-            opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
@@ -23254,8 +21765,6 @@ default_temperature = 0.7
             gateway: GatewayConfig::default(),
             a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
-            composio: ComposioConfig::default(),
-            microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             browser_delegate: crate::scattered_types::BrowserDelegateConfig::default(),
@@ -23266,8 +21775,6 @@ default_temperature = 0.7
             link_enricher: LinkEnricherConfig::default(),
             text_browser: TextBrowserConfig::default(),
             web_search: WebSearchConfig::default(),
-            project_intel: ProjectIntelConfig::default(),
-            google_workspace: GoogleWorkspaceConfig::default(),
             proxy: ProxyConfig::default(),
             pacing: PacingConfig::default(),
             cost: CostConfig::default(),
@@ -23287,11 +21794,8 @@ default_temperature = 0.7
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
             onboard_state: OnboardStateConfig::default(),
-            notion: NotionConfig::default(),
-            jira: JiraConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
-            linkedin: LinkedInConfig::default(),
             image_gen: ImageGenConfig::default(),
             file_upload: FileUploadConfig::default(),
             file_upload_bundle: FileUploadBundleConfig::default(),
@@ -23299,11 +21803,6 @@ default_temperature = 0.7
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
-            claude_code: ClaudeCodeConfig::default(),
-            claude_code_runner: ClaudeCodeRunnerConfig::default(),
-            codex_cli: CodexCliConfig::default(),
-            gemini_cli: GeminiCliConfig::default(),
-            opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
@@ -23370,7 +21869,6 @@ default_temperature = 0.7
             },
         );
         // ModelProvider fields are now resolved directly — no cache needed.
-        config.composio.api_key = Some("composio-credential".into());
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
         config.web_search.tavily_api_key = Some("tavily-credential".into());
@@ -23483,7 +21981,6 @@ default_temperature = 0.7
         for plaintext in [
             "root-credential",
             "Bearer provider-header-credential",
-            "composio-credential",
             "browser-credential",
             "brave-credential",
             "tavily-credential",
@@ -23527,15 +22024,6 @@ default_temperature = 0.7
         assert_eq!(
             store.decrypt(provider_header).unwrap(),
             "Bearer provider-header-credential"
-        );
-
-        let composio_encrypted = stored.composio.api_key.as_deref().unwrap();
-        assert!(crate::secrets::SecretStore::is_encrypted(
-            composio_encrypted
-        ));
-        assert_eq!(
-            store.decrypt(composio_encrypted).unwrap(),
-            "composio-credential"
         );
 
         let browser_encrypted = stored.browser.computer_use.api_key.as_deref().unwrap();
@@ -24099,11 +22587,9 @@ allowed_users = ["@u:matrix.org"]
             wecom_ws: HashMap::new(),
             wechat: HashMap::new(),
             qq: HashMap::new(),
-            twitter: HashMap::new(),
             mochat: HashMap::new(),
             nostr: HashMap::new(),
             clawdtalk: HashMap::new(),
-            reddit: HashMap::new(),
             bluesky: HashMap::new(),
             voice_call: HashMap::new(),
             voice_duplex: HashMap::new(),
@@ -24620,11 +23106,9 @@ allowed_numbers = ["+1", "+2"]
             wecom_ws: HashMap::new(),
             wechat: HashMap::new(),
             qq: HashMap::new(),
-            twitter: HashMap::new(),
             mochat: HashMap::new(),
             nostr: HashMap::new(),
             clawdtalk: HashMap::new(),
-            reddit: HashMap::new(),
             bluesky: HashMap::new(),
             voice_call: HashMap::new(),
             voice_duplex: HashMap::new(),
@@ -24805,69 +23289,6 @@ default_temperature = 0.7
     }
 
     // ══════════════════════════════════════════════════════════
-    // COMPOSIO CONFIG TESTS
-    // ══════════════════════════════════════════════════════════
-
-    #[test]
-    async fn composio_config_default_disabled() {
-        let c = ComposioConfig::default();
-        assert!(!c.enabled, "Composio must be disabled by default");
-        assert!(c.api_key.is_none(), "No API key by default");
-        assert_eq!(c.entity_id, "default");
-    }
-
-    #[test]
-    async fn composio_config_serde_roundtrip() {
-        let c = ComposioConfig {
-            enabled: true,
-            api_key: Some("comp-key-123".into()),
-            entity_id: "user42".into(),
-        };
-        let toml_str = toml::to_string(&c).unwrap();
-        let parsed: ComposioConfig = toml::from_str(&toml_str).unwrap();
-        assert!(parsed.enabled);
-        assert_eq!(parsed.api_key.as_deref(), Some("comp-key-123"));
-        assert_eq!(parsed.entity_id, "user42");
-    }
-
-    #[test]
-    async fn composio_config_backward_compat_missing_section() {
-        let minimal = r#"
-workspace_dir = "/tmp/ws"
-config_path = "/tmp/config.toml"
-default_temperature = 0.7
-"#;
-        let parsed = parse_test_config(minimal);
-        assert!(
-            !parsed.composio.enabled,
-            "Missing [composio] must default to disabled"
-        );
-        assert!(parsed.composio.api_key.is_none());
-    }
-
-    #[test]
-    async fn composio_config_partial_toml() {
-        let toml_str = r"
-enabled = true
-";
-        let parsed: ComposioConfig = toml::from_str(toml_str).unwrap();
-        assert!(parsed.enabled);
-        assert!(parsed.api_key.is_none());
-        assert_eq!(parsed.entity_id, "default");
-    }
-
-    #[test]
-    async fn composio_config_enable_alias_supported() {
-        let toml_str = r"
-enable = true
-";
-        let parsed: ComposioConfig = toml::from_str(toml_str).unwrap();
-        assert!(parsed.enabled);
-        assert!(parsed.api_key.is_none());
-        assert_eq!(parsed.entity_id, "default");
-    }
-
-    // ══════════════════════════════════════════════════════════
     // SECRETS CONFIG TESTS
     // ══════════════════════════════════════════════════════════
 
@@ -24900,10 +23321,8 @@ default_temperature = 0.7
     }
 
     #[test]
-    async fn config_default_has_composio_and_secrets() {
+    async fn config_default_has_secrets_and_browser() {
         let c = Config::default();
-        assert!(!c.composio.enabled);
-        assert!(c.composio.api_key.is_none());
         assert!(c.secrets.encrypt);
         assert!(c.browser.enabled);
         assert_eq!(c.browser.allowed_domains, vec!["*".to_string()]);
@@ -25279,7 +23698,7 @@ model = "primary-model"
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("HOME", &temp_home) };
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+        unsafe { std::env::set_var("ZEROCLAW_DATA_DIR", &workspace_dir) };
 
         let mut config = Config {
             data_dir: workspace_dir,
@@ -25316,7 +23735,7 @@ model = "primary-model"
         );
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var("ZEROCLAW_DATA_DIR") };
         if let Some(home) = original_home {
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::set_var("HOME", home) };
@@ -25469,32 +23888,6 @@ wire_api = "ws"
     }
 
     #[test]
-    async fn resolve_runtime_config_dirs_accepts_legacy_zeroclaw_workspace() {
-        let _env_guard = env_override_lock().await;
-        let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        let default_workspace_dir = default_config_dir.join("workspace");
-        let workspace_dir = default_config_dir.join("profile-a");
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
-        let (config_dir, resolved_workspace_dir, source) =
-            resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
-                .await
-                .unwrap();
-
-        // ZEROCLAW_WORKSPACE is the deprecated alias for ZEROCLAW_DATA_DIR.
-        // Resolution treats the path as the config root and derives the data
-        // sub-dir from it; the source label reflects the deprecated entry.
-        assert_eq!(source, ConfigResolutionSource::EnvWorkspaceLegacy);
-        assert_eq!(config_dir, workspace_dir);
-        assert_eq!(resolved_workspace_dir, workspace_dir.join("data"));
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
-        let _ = fs::remove_dir_all(default_config_dir).await;
-    }
-
-    #[test]
     async fn resolve_runtime_config_dirs_uses_env_config_dir_first() {
         let _env_guard = env_override_lock().await;
         let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
@@ -25506,14 +23899,14 @@ wire_api = "ws"
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", &explicit_config_dir) };
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var("ZEROCLAW_DATA_DIR") };
 
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
                 .await
                 .unwrap();
 
-        assert_eq!(source, ConfigResolutionSource::EnvConfigDir);
+        assert_eq!(source, ConfigResolutionSource::EnvConfig);
         assert_eq!(config_dir, explicit_config_dir);
         assert_eq!(resolved_workspace_dir, explicit_config_dir.join("data"));
 
@@ -25529,13 +23922,13 @@ wire_api = "ws"
         let default_workspace_dir = default_config_dir.join("workspace");
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var("ZEROCLAW_DATA_DIR") };
         let (config_dir, resolved_workspace_dir, source) =
             resolve_runtime_config_dirs(&default_config_dir, &default_workspace_dir)
                 .await
                 .unwrap();
 
-        assert_eq!(source, ConfigResolutionSource::DefaultConfigDir);
+        assert_eq!(source, ConfigResolutionSource::Default);
         assert_eq!(config_dir, default_config_dir);
         assert_eq!(resolved_workspace_dir, default_workspace_dir);
 
@@ -25635,7 +24028,7 @@ wire_api = "ws"
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("HOME", &temp_home) };
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+        unsafe { std::env::set_var("ZEROCLAW_DATA_DIR", &workspace_dir) };
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
@@ -25653,7 +24046,7 @@ wire_api = "ws"
         );
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var("ZEROCLAW_DATA_DIR") };
         if let Some(home) = original_home {
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::set_var("HOME", home) };
@@ -25677,12 +24070,12 @@ wire_api = "ws"
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("HOME", &temp_home) };
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+        unsafe { std::env::set_var("ZEROCLAW_DATA_DIR", &workspace_dir) };
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
         // V3: `config.data_dir` lives at `<install>/data/`. The
-        // ZEROCLAW_WORKSPACE env var (deprecated alias) resolved to the
+        // ZEROCLAW_DATA_DIR env var (deprecated alias) resolved to the
         // legacy config layout where the install root is the parent of
         // the env-var path; data sits at `<install>/data/`.
         assert_eq!(config.data_dir, legacy_config_dir.join("data"));
@@ -25690,7 +24083,7 @@ wire_api = "ws"
         assert!(config.config_path.exists());
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var("ZEROCLAW_DATA_DIR") };
         if let Some(home) = original_home {
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::set_var("HOME", home) };
@@ -25724,13 +24117,13 @@ default_model = "legacy-model"
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("HOME", &temp_home) };
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+        unsafe { std::env::set_var("ZEROCLAW_DATA_DIR", &workspace_dir) };
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
         // V3: `config.data_dir` resolves to `<install>/data/` under
         // the install root (the directory holding the existing
-        // `config.toml`), regardless of the ZEROCLAW_WORKSPACE
+        // `config.toml`), regardless of the ZEROCLAW_DATA_DIR
         // (deprecated) override.
         assert_eq!(config.data_dir, legacy_config_dir.join("data"));
         assert_eq!(config.config_path, legacy_config_path);
@@ -25744,7 +24137,7 @@ default_model = "legacy-model"
         );
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var("ZEROCLAW_DATA_DIR") };
         if let Some(home) = original_home {
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::set_var("HOME", home) };
@@ -25769,7 +24162,7 @@ default_model = "legacy-model"
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("HOME", &temp_home) };
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var("ZEROCLAW_DATA_DIR") };
 
         let mut config = Config {
             config_path: config_path.clone(),
@@ -25839,7 +24232,7 @@ default_model = "persisted-profile"
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("HOME", &temp_home) };
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+        unsafe { std::env::set_var("ZEROCLAW_DATA_DIR", &workspace_dir) };
 
         let mut rx = capture_log_events();
 
@@ -25849,7 +24242,7 @@ default_model = "persisted-profile"
 
         // V3: shared databases live at `<install>/data/`, per-agent
         // identity at `<install>/agents/<alias>/workspace/`. The
-        // ZEROCLAW_WORKSPACE env var (deprecated alias for
+        // ZEROCLAW_DATA_DIR env var (deprecated alias for
         // ZEROCLAW_DATA_DIR) pinned the install root, so data_dir is
         // `<install>/data/` derived from the resolved root.
         assert_eq!(config.data_dir, workspace_dir.join("data"));
@@ -25867,7 +24260,7 @@ default_model = "persisted-profile"
         assert!(!logs.contains("\"initialized\":false"), "{logs}");
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var("ZEROCLAW_DATA_DIR") };
         if let Some(home) = original_home {
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::set_var("HOME", home) };
@@ -25906,7 +24299,7 @@ audit = "should-be-a-table-not-a-string"
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("HOME", &temp_home) };
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+        unsafe { std::env::set_var("ZEROCLAW_DATA_DIR", &workspace_dir) };
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
@@ -25917,7 +24310,7 @@ audit = "should-be-a-table-not-a-string"
         );
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var("ZEROCLAW_DATA_DIR") };
         if let Some(home) = original_home {
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::set_var("HOME", home) };
@@ -25977,7 +24370,7 @@ name = "weather-tool"
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::set_var("HOME", &temp_home) };
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+        unsafe { std::env::set_var("ZEROCLAW_DATA_DIR", &workspace_dir) };
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
@@ -25988,7 +24381,7 @@ name = "weather-tool"
         );
 
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var("ZEROCLAW_DATA_DIR") };
         if let Some(home) = original_home {
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::set_var("HOME", home) };
@@ -26049,7 +24442,7 @@ runtime_profile = "default"
         // SAFETY: test-only, guarded by env_override_lock.
         unsafe { std::env::set_var("HOME", &temp_home) };
         // SAFETY: test-only, guarded by env_override_lock.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+        unsafe { std::env::set_var("ZEROCLAW_DATA_DIR", &workspace_dir) };
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
@@ -26073,7 +24466,7 @@ runtime_profile = "default"
         );
 
         // SAFETY: test-only, guarded by env_override_lock.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var("ZEROCLAW_DATA_DIR") };
         if let Some(home) = original_home {
             // SAFETY: test-only, guarded by env_override_lock.
             unsafe { std::env::set_var("HOME", home) };
@@ -26132,7 +24525,7 @@ runtime_profile = "default"
         // SAFETY: test-only, guarded by env_override_lock.
         unsafe { std::env::set_var("HOME", &temp_home) };
         // SAFETY: test-only, guarded by env_override_lock.
-        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+        unsafe { std::env::set_var("ZEROCLAW_DATA_DIR", &workspace_dir) };
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
@@ -26151,7 +24544,7 @@ runtime_profile = "default"
         );
 
         // SAFETY: test-only, guarded by env_override_lock.
-        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        unsafe { std::env::remove_var("ZEROCLAW_DATA_DIR") };
         if let Some(home) = original_home {
             // SAFETY: test-only, guarded by env_override_lock.
             unsafe { std::env::set_var("HOME", home) };
@@ -26218,101 +24611,6 @@ runtime_profile = "default"
     }
 
     #[test]
-    async fn validate_rejects_unknown_jira_actions() {
-        for action in ["delete_ticket", "drop_database", ""] {
-            let mut config = Config::default();
-            config.jira.enabled = true;
-            config.jira.base_url = "https://jira.example.test".into();
-            config.jira.api_token = "token".into();
-            config.jira.allowed_actions = vec![action.into()];
-
-            let err = config
-                .validate()
-                .expect_err("unknown Jira action should be rejected")
-                .to_string();
-            assert!(
-                err.contains("jira.allowed_actions contains unknown action"),
-                "expected Jira allowed action error for {action:?}, got: {err}"
-            );
-        }
-    }
-
-    #[test]
-    async fn validate_accepts_all_published_jira_actions() {
-        for action in [
-            "get_ticket",
-            "search_tickets",
-            "comment_ticket",
-            "list_projects",
-            "myself",
-            "list_transitions",
-            "transition_ticket",
-            "create_ticket",
-        ] {
-            let mut config = Config::default();
-            config.jira.enabled = true;
-            config.jira.base_url = "https://jira.example.test".into();
-            config.jira.api_token = "token".into();
-            config.jira.allowed_actions = vec![action.into()];
-
-            assert!(
-                config.validate().is_ok(),
-                "published Jira action {action:?} should validate"
-            );
-        }
-    }
-
-    #[test]
-    async fn jira_email_empty_string_deserializes_as_none() {
-        // Legacy configs round-tripped `email = ""` to disk because the
-        // pre-rename `email: String` lacked `skip_serializing_if`. The
-        // current `Option<String>` would otherwise deserialize `""` as
-        // `Some("")`, and JiraTool would attempt Basic auth with empty
-        // username (the dropped email-required validation no longer
-        // catches this). Defense-in-depth: empty strings deserialize as
-        // None.
-        let toml_input = r#"
-enabled = true
-base_url = "https://jira.example.test"
-email = ""
-api_token = "tok"
-"#;
-        let cfg: JiraConfig = toml::from_str(toml_input).expect("parses with empty email");
-        assert!(
-            cfg.email.is_none(),
-            "empty `email = \"\"` must deserialize as None, got {:?}",
-            cfg.email
-        );
-        // Whitespace-only is also normalized to None.
-        let toml_input_ws = r#"
-enabled = true
-base_url = "https://jira.example.test"
-email = "   "
-api_token = "tok"
-"#;
-        let cfg_ws: JiraConfig =
-            toml::from_str(toml_input_ws).expect("parses with whitespace email");
-        assert!(
-            cfg_ws.email.is_none(),
-            "whitespace-only email must deserialize as None, got {:?}",
-            cfg_ws.email
-        );
-        // A real email still survives.
-        let toml_input_real = r#"
-enabled = true
-base_url = "https://jira.example.test"
-email = "ops@example.com"
-api_token = "tok"
-"#;
-        let cfg_real: JiraConfig = toml::from_str(toml_input_real).expect("parses with real email");
-        assert_eq!(
-            cfg_real.email.as_deref(),
-            Some("ops@example.com"),
-            "non-empty email must round-trip unchanged"
-        );
-    }
-
-    #[test]
     async fn proxy_config_scope_services_requires_entries_when_enabled() {
         let proxy = ProxyConfig {
             enabled: true,
@@ -26326,116 +24624,6 @@ api_token = "tok"
 
         let error = proxy.validate().unwrap_err().to_string();
         assert!(error.contains("proxy.scope='services'"));
-    }
-
-    #[test]
-    async fn google_workspace_allowed_operations_require_methods() {
-        let mut config = Config::default();
-        config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
-            service: "gmail".into(),
-            resource: "users".into(),
-            sub_resource: Some("drafts".into()),
-            methods: Vec::new(),
-        }];
-
-        let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("google_workspace.allowed_operations[0].methods"));
-    }
-
-    #[test]
-    async fn google_workspace_allowed_operations_reject_duplicate_service_resource_sub_resource_entries()
-     {
-        let mut config = Config::default();
-        config.google_workspace.allowed_operations = vec![
-            GoogleWorkspaceAllowedOperation {
-                service: "gmail".into(),
-                resource: "users".into(),
-                sub_resource: Some("drafts".into()),
-                methods: vec!["create".into()],
-            },
-            GoogleWorkspaceAllowedOperation {
-                service: "gmail".into(),
-                resource: "users".into(),
-                sub_resource: Some("drafts".into()),
-                methods: vec!["update".into()],
-            },
-        ];
-
-        let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("duplicate service/resource/sub_resource entry"));
-    }
-
-    #[test]
-    async fn google_workspace_allowed_operations_allow_same_resource_different_sub_resource() {
-        let mut config = Config::default();
-        config.google_workspace.allowed_operations = vec![
-            GoogleWorkspaceAllowedOperation {
-                service: "gmail".into(),
-                resource: "users".into(),
-                sub_resource: Some("messages".into()),
-                methods: vec!["list".into(), "get".into()],
-            },
-            GoogleWorkspaceAllowedOperation {
-                service: "gmail".into(),
-                resource: "users".into(),
-                sub_resource: Some("drafts".into()),
-                methods: vec!["create".into(), "update".into()],
-            },
-        ];
-
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    async fn google_workspace_allowed_operations_reject_duplicate_methods_within_entry() {
-        let mut config = Config::default();
-        config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
-            service: "gmail".into(),
-            resource: "users".into(),
-            sub_resource: Some("drafts".into()),
-            methods: vec!["create".into(), "create".into()],
-        }];
-
-        let err = config.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("duplicate entry"),
-            "expected duplicate entry error, got: {err}"
-        );
-    }
-
-    #[test]
-    async fn google_workspace_allowed_operations_accept_valid_entries() {
-        let mut config = Config::default();
-        config.google_workspace.allowed_operations = vec![
-            GoogleWorkspaceAllowedOperation {
-                service: "gmail".into(),
-                resource: "users".into(),
-                sub_resource: Some("messages".into()),
-                methods: vec!["list".into(), "get".into()],
-            },
-            GoogleWorkspaceAllowedOperation {
-                service: "drive".into(),
-                resource: "files".into(),
-                sub_resource: None,
-                methods: vec!["list".into(), "get".into()],
-            },
-        ];
-
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    async fn google_workspace_allowed_operations_reject_invalid_sub_resource_characters() {
-        let mut config = Config::default();
-        config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
-            service: "gmail".into(),
-            resource: "users".into(),
-            sub_resource: Some("bad resource!".into()),
-            methods: vec!["list".into()],
-        }];
-
-        let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("sub_resource contains invalid characters"));
     }
 
     fn runtime_proxy_cache_contains(cache_key: &str) -> bool {
@@ -28391,144 +26579,6 @@ url = "http://localhost:8080/mcp"
         );
     }
 
-    #[test]
-    async fn google_workspace_allowed_operations_deserialize_from_toml() {
-        let toml_str = r#"
-            enabled = true
-
-            [[allowed_operations]]
-            service = "gmail"
-            resource = "users"
-            sub_resource = "drafts"
-            methods = ["create", "update"]
-        "#;
-
-        let cfg: GoogleWorkspaceConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.allowed_operations.len(), 1);
-        assert_eq!(cfg.allowed_operations[0].service, "gmail");
-        assert_eq!(cfg.allowed_operations[0].resource, "users");
-        assert_eq!(
-            cfg.allowed_operations[0].sub_resource.as_deref(),
-            Some("drafts")
-        );
-        assert_eq!(
-            cfg.allowed_operations[0].methods,
-            vec!["create".to_string(), "update".to_string()]
-        );
-    }
-
-    #[test]
-    async fn google_workspace_allowed_operations_deserialize_without_sub_resource() {
-        let toml_str = r#"
-            enabled = true
-
-            [[allowed_operations]]
-            service = "drive"
-            resource = "files"
-            methods = ["list", "get"]
-        "#;
-
-        let cfg: GoogleWorkspaceConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.allowed_operations[0].sub_resource, None);
-    }
-
-    #[test]
-    async fn config_validate_accepts_google_workspace_allowed_operations() {
-        let mut cfg = Config::default();
-        cfg.google_workspace.enabled = true;
-        cfg.google_workspace.allowed_services = vec!["gmail".into()];
-        cfg.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
-            service: "gmail".into(),
-            resource: "users".into(),
-            sub_resource: Some("drafts".into()),
-            methods: vec!["create".into(), "update".into()],
-        }];
-
-        cfg.validate().unwrap();
-    }
-
-    #[test]
-    async fn config_validate_rejects_duplicate_google_workspace_allowed_operations() {
-        let mut cfg = Config::default();
-        cfg.google_workspace.enabled = true;
-        cfg.google_workspace.allowed_services = vec!["gmail".into()];
-        cfg.google_workspace.allowed_operations = vec![
-            GoogleWorkspaceAllowedOperation {
-                service: "gmail".into(),
-                resource: "users".into(),
-                sub_resource: Some("drafts".into()),
-                methods: vec!["create".into()],
-            },
-            GoogleWorkspaceAllowedOperation {
-                service: "gmail".into(),
-                resource: "users".into(),
-                sub_resource: Some("drafts".into()),
-                methods: vec!["update".into()],
-            },
-        ];
-
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("duplicate service/resource/sub_resource entry"));
-    }
-
-    #[test]
-    async fn config_validate_rejects_operation_service_not_in_allowed_services() {
-        let mut cfg = Config::default();
-        cfg.google_workspace.enabled = true;
-        cfg.google_workspace.allowed_services = vec!["gmail".into()];
-        cfg.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
-            service: "drive".into(), // drive is not in allowed_services
-            resource: "files".into(),
-            sub_resource: None,
-            methods: vec!["list".into()],
-        }];
-
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("not in the effective allowed_services"),
-            "expected not-in-allowed_services error, got: {err}"
-        );
-    }
-
-    #[test]
-    async fn config_validate_accepts_default_service_when_allowed_services_empty() {
-        // When allowed_services is empty the validator uses DEFAULT_GWS_SERVICES.
-        // A known default service must pass.
-        let mut cfg = Config::default();
-        cfg.google_workspace.enabled = true;
-        // allowed_services deliberately left empty (falls back to defaults)
-        cfg.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
-            service: "drive".into(),
-            resource: "files".into(),
-            sub_resource: None,
-            methods: vec!["list".into()],
-        }];
-
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    async fn config_validate_rejects_unknown_service_when_allowed_services_empty() {
-        // Even with allowed_services empty (using defaults), an operation whose
-        // service is not in DEFAULT_GWS_SERVICES must fail validation — not silently
-        // pass through to be rejected at runtime.
-        let mut cfg = Config::default();
-        cfg.google_workspace.enabled = true;
-        // allowed_services deliberately left empty
-        cfg.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
-            service: "not_a_real_service".into(),
-            resource: "files".into(),
-            sub_resource: None,
-            methods: vec!["list".into()],
-        }];
-
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("not in the effective allowed_services"),
-            "expected effective-allowed_services error, got: {err}"
-        );
-    }
-
     // ── Bootstrap files ─────────────────────────────────────
 
     #[tokio::test]
@@ -29589,7 +27639,7 @@ exit 65
         };
         let _path_guard = EnvValueGuard::set("PATH", path);
         let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
-        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
 
         let config_path = dir.path().join("config.toml");
         std::fs::write(
@@ -29658,7 +27708,7 @@ exit 65
         };
         let _path_guard = EnvValueGuard::set("PATH", path);
         let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
-        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
 
         let config_path = dir.path().join("config.toml");
         std::fs::write(
@@ -29715,7 +27765,7 @@ printf '%s\n' 'sk-proj-from-onepassword'
         };
         let _path_guard = EnvValueGuard::set("PATH", path);
         let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
-        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
 
         let config_path = dir.path().join("config.toml");
         std::fs::write(

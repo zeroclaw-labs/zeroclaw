@@ -313,38 +313,6 @@ channel_id = "mm-fold-test"
 }
 
 #[test]
-fn t5_reddit_subreddit_folds_into_subreddits() {
-    let v3 = migrate_v2(
-        r#"
-schema_version = 2
-
-[channels.reddit]
-enabled = true
-client_id = "rid"
-client_secret = "rsec"
-refresh_token = "rrt"
-username = "bot"
-subreddit = "fold-test"
-"#,
-    );
-    let subreddits = v3
-        .get("channels")
-        .and_then(toml::Value::as_table)
-        .and_then(|t| t.get("reddit"))
-        .and_then(toml::Value::as_table)
-        .and_then(|t| t.get("default"))
-        .and_then(toml::Value::as_table)
-        .and_then(|t| t.get("subreddits"))
-        .and_then(toml::Value::as_array)
-        .expect("channels.reddit.default.subreddits array");
-    assert!(
-        subreddits.iter().any(|v| v.as_str() == Some("fold-test")),
-        "V2 reddit.subreddit was not folded into V3 subreddits[]; got {:?}",
-        subreddits
-    );
-}
-
-#[test]
 fn t6_signal_group_id_folds_into_group_ids() {
     let raw = r#"
 default_provider = "openai"
@@ -2373,9 +2341,7 @@ fn generate_v3_channel_breadth_lower_bound() {
         + cfg.channels.wecom.len()
         + cfg.channels.wechat.len()
         + cfg.channels.qq.len()
-        + cfg.channels.twitter.len()
         + cfg.channels.mochat.len()
-        + cfg.channels.reddit.len()
         + cfg.channels.bluesky.len()
         + cfg.channels.email.len()
         + cfg.channels.gmail_push.len()

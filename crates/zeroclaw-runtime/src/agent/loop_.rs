@@ -1300,15 +1300,6 @@ pub async fn run(
         }
 
         // ── Tools (including memory tools and peripherals) ────────────
-        let (composio_key, composio_entity_id) = if config.composio.enabled {
-            (
-                config.composio.api_key.as_deref(),
-                Some(config.composio.entity_id.as_str()),
-            )
-        } else {
-            (None, None)
-        };
-
         // Build SOP engine when sops_dir is configured so SOP tools are
         // available on this path (CLI agent run).
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
@@ -1328,8 +1319,6 @@ pub async fn run(
             agent_alias,
             runtime.clone(),
             mem.clone(),
-            composio_key,
-            composio_entity_id,
             &config.browser,
             &config.http_request,
             &config.web_fetch,
@@ -1567,12 +1556,6 @@ pub async fn run(
                 "browser_open",
                 "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
             ));
-        }
-        if config.composio.enabled {
-            tool_descs.push((
-            "composio",
-            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run (optionally with connected_account_id), 'connect' to OAuth.",
-        ));
         }
         tool_descs.push((
         "schedule",
@@ -2788,15 +2771,6 @@ pub async fn process_message(
         )
         .await?;
 
-        let (composio_key, composio_entity_id) = if config.composio.enabled {
-            (
-                config.composio.api_key.as_deref(),
-                Some(config.composio.entity_id.as_str()),
-            )
-        } else {
-            (None, None)
-        };
-
         // Build SOP engine when sops_dir is configured so SOP tools are
         // available on this path (process_message CLI agent).
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
@@ -2816,8 +2790,6 @@ pub async fn process_message(
             agent_alias,
             runtime.clone(),
             mem.clone(),
-            composio_key,
-            composio_entity_id,
             &config.browser,
             &config.http_request,
             &config.web_fetch,
@@ -2962,9 +2934,6 @@ pub async fn process_message(
         ));
         if config.browser.enabled {
             tool_descs.push(("browser_open", "Open approved URLs in browser."));
-        }
-        if config.composio.enabled {
-            tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
         }
         tool_descs.push((
             "channel_room",
@@ -14515,8 +14484,6 @@ Let me check the result."#;
             &risk,
             "test",
             mem,
-            None,
-            None,
             &config.browser,
             &config.http_request,
             &config.web_fetch,

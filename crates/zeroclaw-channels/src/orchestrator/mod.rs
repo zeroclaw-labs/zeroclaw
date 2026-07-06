@@ -58,12 +58,8 @@ pub use crate::mochat::MochatChannel;
 pub use crate::nextcloud_talk::NextcloudTalkChannel;
 #[cfg(feature = "channel-nostr")]
 pub use crate::nostr::NostrChannel;
-#[cfg(feature = "channel-notion")]
-pub use crate::notion::NotionChannel;
 #[cfg(feature = "channel-qq")]
 pub use crate::qq::QQChannel;
-#[cfg(feature = "channel-reddit")]
-pub use crate::reddit::RedditChannel;
 #[cfg(feature = "channel-signal")]
 pub use crate::signal::SignalChannel;
 #[cfg(feature = "channel-slack")]
@@ -72,8 +68,6 @@ pub use crate::transcription;
 pub use crate::tts::{TtsManager, TtsProvider};
 #[cfg(feature = "channel-twitch")]
 pub use crate::twitch::TwitchChannel;
-#[cfg(feature = "channel-twitter")]
-pub use crate::twitter::TwitterChannel;
 #[cfg(feature = "channel-voice-call")]
 pub use crate::voice_call::VoiceCallChannel;
 #[cfg(feature = "voice-wake")]
@@ -7125,29 +7119,6 @@ fn build_channel_by_id(
         "twitch" => {
             anyhow::bail!("Twitch channel requires the `channel-twitch` feature");
         }
-        #[cfg(feature = "channel-twitter")]
-        "twitter" => {
-            let tw = config
-                .channels
-                .twitter
-                .get("default")
-                .context("X/Twitter channel is not configured")?;
-            let alias = "default".to_string();
-            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-                let cfg_arc = config_arc.clone();
-                let alias = alias.clone();
-                Arc::new(move || cfg_arc.read().channel_external_peers("twitter", &alias))
-            };
-            Ok(Arc::new(TwitterChannel::new(
-                tw.bearer_token.clone(),
-                alias,
-                peer_resolver,
-            )))
-        }
-        #[cfg(not(feature = "channel-twitter"))]
-        "twitter" => {
-            anyhow::bail!("X/Twitter channel requires the `channel-twitter` feature");
-        }
         #[cfg(feature = "channel-mochat")]
         "mochat" => {
             let mc = config
@@ -7233,7 +7204,7 @@ fn build_channel_by_id(
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, imessage, line, voice-call"
+            email, gmail_push, irc, mochat, imessage, line, voice-call"
         ),
     }
 }
@@ -8624,41 +8595,6 @@ fn collect_configured_channels(
         );
     }
 
-    #[cfg(feature = "channel-twitter")]
-    for (alias, tw) in &config.channels.twitter {
-        if !active_channel_aliases.contains(&format!("twitter.{alias}")) {
-            continue;
-        }
-        if !tw.enabled {
-            continue;
-        }
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-            let cfg_arc = config_arc.clone();
-            let alias = alias.clone();
-            Arc::new(move || cfg_arc.read().channel_external_peers("twitter", &alias))
-        };
-        channels.push(ConfiguredChannel {
-            display_name: "X/Twitter",
-            alias: Some(alias.clone()),
-            channel: Arc::new(TwitterChannel::new(
-                tw.bearer_token.clone(),
-                alias.clone(),
-                peer_resolver,
-            )),
-        });
-    }
-
-    #[cfg(not(feature = "channel-twitter"))]
-    if !config.channels.twitter.is_empty() {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-            "X/Twitter channel is configured but this build was compiled without \
-             `channel-twitter`; skipping X/Twitter."
-        );
-    }
-
     #[cfg(feature = "channel-mochat")]
     for (alias, mc) in &config.channels.mochat {
         if !active_channel_aliases.contains(&format!("mochat.{alias}")) {
@@ -8869,81 +8805,6 @@ fn collect_configured_channels(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "ClawdTalk channel is configured but this build was compiled without \
              `channel-clawdtalk`; skipping ClawdTalk."
-        );
-    }
-
-    // Notion database poller channel
-    #[cfg(feature = "channel-notion")]
-    if config.notion.enabled && !config.notion.database_id.trim().is_empty() {
-        let notion_api_key = config.notion.api_key.trim().to_string();
-        if notion_api_key.is_empty() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "Notion channel enabled but `notion.api_key` is unset. Set it via the schema-mirror grammar: \
-                 `ZEROCLAW_notion__api_key=...`."
-            );
-        } else {
-            channels.push(ConfiguredChannel {
-                display_name: "Notion",
-                alias: None,
-                channel: Arc::new(NotionChannel::new(
-                    "notion",
-                    notion_api_key,
-                    config.notion.database_id.clone(),
-                    config.notion.poll_interval_secs,
-                    config.notion.status_property.clone(),
-                    config.notion.input_property.clone(),
-                    config.notion.result_property.clone(),
-                    config.notion.max_concurrent,
-                    config.notion.recover_stale,
-                )),
-            });
-        }
-    }
-
-    #[cfg(not(feature = "channel-notion"))]
-    if config.notion.enabled {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-            "Notion channel is enabled but this build was compiled without \
-             `channel-notion`; skipping Notion."
-        );
-    }
-
-    #[cfg(feature = "channel-reddit")]
-    for (alias, rd) in &config.channels.reddit {
-        if !active_channel_aliases.contains(&format!("reddit.{alias}")) {
-            continue;
-        }
-        if !rd.enabled {
-            continue;
-        }
-        channels.push(ConfiguredChannel {
-            display_name: "Reddit",
-            alias: Some(alias.clone()),
-            channel: Arc::new(RedditChannel::new(
-                alias.clone(),
-                rd.client_id.clone(),
-                rd.client_secret.clone(),
-                rd.refresh_token.clone(),
-                rd.username.clone(),
-                rd.subreddits.clone(),
-            )),
-        });
-    }
-
-    #[cfg(not(feature = "channel-reddit"))]
-    if !config.channels.reddit.is_empty() {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-            "Reddit channel is configured but this build was compiled without \
-             `channel-reddit`; skipping Reddit."
         );
     }
 
@@ -9452,14 +9313,6 @@ pub async fn start_channels(
             provider_api_key.as_deref(),
         )
         .await?;
-        let (composio_key, composio_entity_id) = if config.composio.enabled {
-            (
-                config.composio.api_key.as_deref(),
-                Some(config.composio.entity_id.as_str()),
-            )
-        } else {
-            (None, None)
-        };
 
         // Per-agent workspace: `<install>/agents/<alias>/workspace/`. Holds
         // this agent's IDENTITY.md / SOUL.md / USER.md / TOOLS.md /
@@ -9480,8 +9333,6 @@ pub async fn start_channels(
             agent_alias,
             Arc::clone(&runtime),
             Arc::clone(&mem),
-            composio_key,
-            composio_entity_id,
             &config.browser,
             &config.http_request,
             &config.web_fetch,
@@ -9751,12 +9602,6 @@ pub async fn start_channels(
             tool_descs.push((
                 "browser_open",
                 "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
-            ));
-        }
-        if config.composio.enabled {
-            tool_descs.push((
-                "composio",
-                "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover actions, 'list_accounts' to retrieve connected account IDs, 'execute' to run (optionally with connected_account_id), and 'connect' for OAuth.",
             ));
         }
         tool_descs.push((

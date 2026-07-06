@@ -61,12 +61,8 @@ pub mod mochat;
 pub mod nextcloud_talk;
 #[cfg(feature = "channel-nostr")]
 pub mod nostr;
-#[cfg(feature = "channel-notion")]
-pub mod notion;
 #[cfg(feature = "channel-qq")]
 pub mod qq;
-#[cfg(feature = "channel-reddit")]
-pub mod reddit;
 #[cfg(feature = "channel-signal")]
 pub mod signal;
 #[cfg(feature = "channel-slack")]
@@ -75,8 +71,6 @@ pub mod slack;
 pub mod telegram;
 #[cfg(feature = "channel-twitch")]
 pub mod twitch;
-#[cfg(feature = "channel-twitter")]
-pub mod twitter;
 #[cfg(feature = "channel-voice-call")]
 pub mod voice_call;
 #[cfg(feature = "voice-wake")]

@@ -1440,17 +1440,6 @@ impl Agent {
         )
         .await?;
 
-        let composio_key = if config.composio.enabled {
-            config.composio.api_key.as_deref()
-        } else {
-            None
-        };
-        let composio_entity_id = if config.composio.enabled {
-            Some(config.composio.entity_id.as_str())
-        } else {
-            None
-        };
-
         // Build SOP engine when sops_dir is configured so SOP tools are
         // available on this path (WebSocket/daemon sessions).
         // If caller provided an engine (daemon path), use it; otherwise
@@ -1474,8 +1463,6 @@ impl Agent {
             agent_alias,
             runtime.clone(),
             memory.clone(),
-            composio_key,
-            composio_entity_id,
             &config.browser,
             &config.http_request,
             &config.web_fetch,

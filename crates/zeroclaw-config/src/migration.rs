@@ -1555,6 +1555,61 @@ summary_model = "anthropic/claude-3-haiku"
     }
 
     #[test]
+    fn v3_to_v4_drops_removed_saas_and_cli_sections() {
+        let raw = r#"
+schema_version = 3
+
+[composio]
+enabled = true
+
+[jira]
+enabled = true
+base_url = "https://jira.example.test"
+
+[notion]
+enabled = true
+
+[google_workspace]
+enabled = true
+
+[claude_code]
+enabled = true
+
+[channels.twitter]
+enabled = true
+
+[channels.reddit]
+enabled = true
+
+[channels.telegram.main]
+enabled = true
+bot_token = "t"
+"#;
+        let migrated = migrate_file(raw)
+            .expect("migrate_file succeeds")
+            .expect("V3 input triggers migration");
+        for dropped in [
+            "[composio]",
+            "[jira]",
+            "[notion]",
+            "[google_workspace]",
+            "[claude_code]",
+            "[channels.twitter]",
+            "[channels.reddit]",
+        ] {
+            assert!(
+                !migrated.contains(dropped),
+                "migrated V4 config must not carry removed section {dropped}; got:\n{migrated}"
+            );
+        }
+        let cfg = migrate_to_current(raw).expect("V3 → V4 migration succeeds");
+        assert!(
+            cfg.channels.telegram.contains_key("main"),
+            "surviving channels must be preserved through the drop"
+        );
+    }
+
+    #[test]
     fn v3_to_v4_is_lossless_for_untouched_config() {
         let raw = r#"
 schema_version = 3

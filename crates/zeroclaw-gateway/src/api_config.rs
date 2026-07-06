@@ -3742,7 +3742,6 @@ mod tests {
         };
         cfg.save().await.expect("initial save");
 
-        cfg.composio.api_key = Some("injected-via-env".into());
         cfg.env_overridden_paths =
             std::collections::HashSet::from(["composio.api_key".to_string()]);
 

@@ -523,8 +523,6 @@ fn config_nested_optional_sections_default_when_absent() {
     let toml_str = "default_temperature = 0.7\n";
     let parsed: Config = toml::from_str(toml_str).expect("minimal TOML should parse");
     assert!(parsed.channels.telegram.is_empty());
-    assert!(!parsed.composio.enabled);
-    assert!(parsed.composio.api_key.is_none());
     assert!(parsed.browser.enabled);
 }
 

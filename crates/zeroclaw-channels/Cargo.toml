@@ -192,13 +192,10 @@ channels-full = [
   "channel-mqtt",
   "channel-amqp",
   "channel-nextcloud",
-  "channel-notion",
   "channel-qq",
-  "channel-reddit",
   "channel-signal",
   "channel-slack",
   "channel-twitch",
-  "channel-twitter",
   "channel-voice-call",
   "channel-wati",
   "channel-wecom",
@@ -242,9 +239,6 @@ channel-imessage = []
 channel-dingtalk = []
 channel-qq = []
 channel-bluesky = []
-channel-twitter = []
-channel-reddit = []
-channel-notion = []
 channel-mqtt = ["dep:rumqttc"]
 channel-filesystem = ["dep:notify", "dep:glob"]
 channel-amqp = ["dep:lapin", "dep:tokio-executor-trait", "dep:tokio-reactor-trait", "dep:async-reactor-trait", "dep:p12-keystore", "dep:rustls-pemfile"]

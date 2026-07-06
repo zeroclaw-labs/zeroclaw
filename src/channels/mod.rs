@@ -52,19 +52,6 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
                 }
                 println!("{}", get_required_cli_string("cli-channels-build-hint"));
             }
-            // Notion is a top-level config section, not part of ChannelsConfig
-            #[cfg(feature = "channel-notion")]
-            {
-                let notion_configured =
-                    config.notion.enabled && !config.notion.database_id.trim().is_empty();
-                println!(
-                    "{}",
-                    get_required_cli_string_with_args(
-                        "cli-channels-notion",
-                        &[("status", if notion_configured { "✅" } else { "❌" })],
-                    )
-                );
-            }
             println!();
             println!("{}", get_required_cli_string("cli-channels-start-hint"));
             println!("{}", get_required_cli_string("cli-channels-doctor-hint"));

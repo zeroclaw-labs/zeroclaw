@@ -11,7 +11,7 @@
 //! other leaf path. No string-literal pattern matching, no hardcoded family
 //! names.
 //!
-//! Bootstrap exception: `ZEROCLAW_WORKSPACE` and `ZEROCLAW_CONFIG_DIR` keep
+//! Bootstrap exception: `ZEROCLAW_DATA_DIR` and `ZEROCLAW_CONFIG_DIR` keep
 //! their UPPERCASE form. The case rule (lowercase tail = config-tree,
 //! uppercase tail = bootstrap) does the disambiguation work without an
 //! exemption list.

@@ -691,16 +691,6 @@ impl DelegateTool {
                     "Failed to initialize memory for independent delegate target '{agent_name}'"
                 ))
             })?;
-        let composio_key = if config.composio.enabled {
-            config.composio.api_key.as_deref()
-        } else {
-            None
-        };
-        let composio_entity_id = if config.composio.enabled {
-            Some(config.composio.entity_id.as_str())
-        } else {
-            None
-        };
         let target_api_key = config
             .resolved_model_provider_for_agent(agent_name)
             .and_then(|(_, _, provider)| provider.api_key.as_deref());
@@ -712,8 +702,6 @@ impl DelegateTool {
             agent_name,
             runtime,
             memory,
-            composio_key,
-            composio_entity_id,
             &config.browser,
             &config.http_request,
             &config.web_fetch,

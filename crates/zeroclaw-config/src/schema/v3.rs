@@ -48,6 +48,31 @@ const V4_INERT_AGENT_KEYS: &[&str] = &[
     "strict_tool_parsing",
 ];
 
+/// Top-level SaaS-integration and CLI-wrapper sections removed in V4. Their
+/// tools, structs, and (for twitter/reddit/notion) channels were cut; the
+/// top-level `Config` already ignores these keys on load, so migration strips
+/// them so a re-serialized V4 config no longer advertises dead sections.
+const V4_DROPPED_TOP_LEVEL_KEYS: &[&str] = &[
+    "composio",
+    "microsoft365",
+    "project_intel",
+    "google_workspace",
+    "linkedin",
+    "jira",
+    "notion",
+    "twitter",
+    "reddit",
+    "claude_code",
+    "claude_code_runner",
+    "codex_cli",
+    "gemini_cli",
+    "opencode_cli",
+];
+
+/// Removed channel aliases under `[channels]` cut in V4 (twitter/reddit/notion
+/// listen paths were removed alongside their tools).
+const V4_DROPPED_CHANNEL_KEYS: &[&str] = &["twitter", "reddit", "notion"];
+
 impl V3Config {
     /// Returns a V4-shaped `toml::Value`. The caller deserializes it into
     /// `Config` — that round-trip is the gate that catches any structural
@@ -77,6 +102,10 @@ impl V3Config {
                 toml::Value::Table(new_profiles),
             );
         }
+
+        drop_removed_top_level_keys(&mut passthrough);
+        drop_removed_channel_keys(&mut passthrough);
+        drop_removed_peer_groups(&mut passthrough);
 
         passthrough.insert("schema_version".to_string(), toml::Value::Integer(4));
 
@@ -118,6 +147,7 @@ fn drop_inert_agent_keys(agents: std::collections::HashMap<String, toml::Value>)
                         )
                     );
                 }
+                prune_removed_channel_refs(&alias, &mut agent_table);
                 toml::Value::Table(agent_table)
             }
             other => other,
@@ -125,6 +155,35 @@ fn drop_inert_agent_keys(agents: std::collections::HashMap<String, toml::Value>)
         out.insert(alias, cleaned);
     }
     out
+}
+
+/// Remove `agents.<alias>.channels` entries that bind to a channel type cut in
+/// V4 (twitter/reddit/notion). Matches both the bare type (`"twitter"`) and any
+/// dotted alias (`"twitter.default"`); otherwise a migrated config would carry a
+/// dangling agent→channel reference that fails `Config::validate`.
+fn prune_removed_channel_refs(alias: &str, agent_table: &mut toml::Table) {
+    let Some(toml::Value::Array(channels)) = agent_table.get_mut("channels") else {
+        return;
+    };
+    let mut removed = Vec::new();
+    channels.retain(|entry| {
+        let Some(reference) = entry.as_str() else {
+            return true;
+        };
+        let channel_type = reference.split('.').next().unwrap_or(reference);
+        let cut = V4_DROPPED_CHANNEL_KEYS.contains(&channel_type);
+        if cut {
+            removed.push(reference.to_string());
+        }
+        !cut
+    });
+    if !removed.is_empty() {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("[agents.{alias}.channels] dropped refs to removed channels: {removed:?}")
+        );
+    }
 }
 
 fn drop_summary_model_swap(
@@ -152,4 +211,68 @@ fn drop_summary_model_swap(
         out.insert(alias, cleaned);
     }
     out
+}
+
+fn drop_removed_top_level_keys(passthrough: &mut toml::Table) {
+    let mut dropped = Vec::new();
+    for key in V4_DROPPED_TOP_LEVEL_KEYS {
+        if passthrough.remove(*key).is_some() {
+            dropped.push(*key);
+        }
+    }
+    if !dropped.is_empty() {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("top-level SaaS/CLI sections dropped: {dropped:?} (tools removed in V4)")
+        );
+    }
+}
+
+fn drop_removed_peer_groups(passthrough: &mut toml::Table) {
+    let Some(toml::Value::Table(peer_groups)) = passthrough.get_mut("peer_groups") else {
+        return;
+    };
+    let removed: Vec<String> = peer_groups
+        .iter()
+        .filter_map(|(name, group)| {
+            let channel_type = group
+                .as_table()
+                .and_then(|table| table.get("channel"))
+                .and_then(toml::Value::as_str)
+                .map(|reference| reference.split('.').next().unwrap_or(reference));
+            channel_type
+                .is_some_and(|ct| V4_DROPPED_CHANNEL_KEYS.contains(&ct))
+                .then(|| name.clone())
+        })
+        .collect();
+    for name in &removed {
+        peer_groups.remove(name);
+    }
+    if !removed.is_empty() {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("[peer_groups] dropped groups bound to removed channels: {removed:?}")
+        );
+    }
+}
+
+fn drop_removed_channel_keys(passthrough: &mut toml::Table) {
+    let Some(toml::Value::Table(channels)) = passthrough.get_mut("channels") else {
+        return;
+    };
+    let mut dropped = Vec::new();
+    for key in V4_DROPPED_CHANNEL_KEYS {
+        if channels.remove(*key).is_some() {
+            dropped.push(*key);
+        }
+    }
+    if !dropped.is_empty() {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("channel aliases dropped: {dropped:?} (channels removed in V4)")
+        );
+    }
 }

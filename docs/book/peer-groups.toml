@@ -66,11 +66,6 @@ sender_desc = "the sender's email address"
 sender_example = "sender@example.com"
 
 [[channel]]
-key = "twitter"
-sender_desc = "the Twitter/X @username"
-sender_example = "example_user"
-
-[[channel]]
 key = "nostr"
 sender_desc = "the sender's hex public key"
 sender_example = "npub1exampleexampleexampleexample"
