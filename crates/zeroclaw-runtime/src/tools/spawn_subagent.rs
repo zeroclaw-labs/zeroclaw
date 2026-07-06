@@ -217,6 +217,9 @@ impl Tool for SpawnSubagentTool {
             // Sub-turn origin already skips memory injection; explicit for
             // the same future-proofing reason as `is_subagent` above.
             suppress_memory_inject: true,
+            // Subagents keep a live memory backend and the memory tools; only
+            // the injected context preamble is suppressed above.
+            memory_free: false,
         };
         let parent_alias = subagent_ctx.parent_alias.clone();
 

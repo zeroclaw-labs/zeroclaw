@@ -879,8 +879,13 @@ async fn run_agent_job(
         memory: None,
         is_subagent: false,
         // `uses_memory = false` fully opts the job out of the engine's
-        // memory-context injection (stateless digest jobs).
+        // memory-context injection (stateless digest jobs)...
         suppress_memory_inject: !job.uses_memory,
+        // ...and makes the run memory-free end to end: the loop binds a
+        // `NoneMemory` backend and drops the persistent memory tools, so a
+        // `uses_memory = false` job can neither recall/store through a real
+        // backend nor reach one via advertised memory tools (issue #8695).
+        memory_free: !job.uses_memory,
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {

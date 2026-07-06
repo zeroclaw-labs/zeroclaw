@@ -988,6 +988,14 @@ pub struct AgentRunOverrides {
     /// Spawn-site opt-out of the engine's memory-context injection (e.g. a
     /// cron job configured with `uses_memory = false`). Default `false`.
     pub suppress_memory_inject: bool,
+    /// Spawn-site request for a fully memory-free run: the loop binds a
+    /// `NoneMemory` backend (no recall, no store, no governance) and drops the
+    /// persistent memory tools from the registry, so the model can neither read
+    /// nor write memory for this run. Set by cron jobs with
+    /// `uses_memory = false`; `suppress_memory_inject` alone only stops the
+    /// context preamble and would still hand the model a live backend and
+    /// working memory tools. Default `false`.
+    pub memory_free: bool,
 }
 
 /// Build the dotted provider ref (`"openai.qwertfoozp"`) from the agent's
@@ -1150,6 +1158,7 @@ pub async fn run(
             Arc::from(platform::create_runtime(&config.runtime)?);
         let is_subagent_caller = overrides.is_subagent;
         let suppress_memory_inject = overrides.suppress_memory_inject;
+        let memory_free = overrides.memory_free;
         let security = match overrides.security {
             Some(sec) => sec,
             None => Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?),
@@ -1168,15 +1177,24 @@ pub async fn run(
         // `read_memory_from` allowlist. When the caller supplies a
         // pre-built memory handle (SubAgent narrowing path), use that
         // instead so the validator's allowlist subset reaches the loop.
-        let mem: Arc<dyn Memory> = match overrides.memory {
-            Some(m) => m,
-            None => {
-                zeroclaw_memory::create_memory_for_agent(
-                    &config,
-                    agent_alias,
-                    agent_model_provider.and_then(|e| e.api_key.as_deref()),
-                )
-                .await?
+        let mem: Arc<dyn Memory> = if memory_free {
+            // A memory-free run (cron `uses_memory = false`) binds an explicit
+            // no-op backend so recall, store, and governance are inert even
+            // though the loop wiring is unchanged. The persistent memory tools
+            // are also dropped below (`exclude_memory`), so the model has no
+            // path back into a real store for this run.
+            Arc::new(zeroclaw_memory::NoneMemory::new("none"))
+        } else {
+            match overrides.memory {
+                Some(m) => m,
+                None => {
+                    zeroclaw_memory::create_memory_for_agent(
+                        &config,
+                        agent_alias,
+                        agent_model_provider.and_then(|e| e.api_key.as_deref()),
+                    )
+                    .await?
+                }
             }
         };
         ::zeroclaw_log::record!(
@@ -1268,7 +1286,10 @@ pub async fn run(
             caller_allowed: allowed_tools.as_deref(),
             connect_mcp: true,
             connect_peripherals: true,
-            exclude_memory: false,
+            // A memory-free run drops the persistent memory tools so the model
+            // cannot read or write memory even though the registry is otherwise
+            // built identically.
+            exclude_memory: memory_free,
             emit_assembly_logs: true,
         })
         .await;
