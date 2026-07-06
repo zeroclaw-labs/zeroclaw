@@ -41,11 +41,15 @@ pub(crate) fn merge_external_peer(
     if normalized.is_empty() {
         anyhow::bail!("Cannot persist empty {channel_type} identity");
     }
-    let configured = match channel_type {
-        "wechat" => cfg.channels.wechat.contains_key(alias),
-        "whatsapp" => cfg.channels.whatsapp.contains_key(alias),
-        other => anyhow::bail!("no paired-identity persistence for channel type {other}"),
-    };
+    // Existence comes from the canonical channel registry
+    // (`Config::channels_by_alias()` walks every configured
+    // `[channels.<type>.<alias>]` block regardless of type), so this writer
+    // holds no channel-type list of its own and a future QR-pairing channel
+    // needs no edit here.
+    let configured = cfg
+        .channels_by_alias()
+        .iter()
+        .any(|info| info.channel_type == channel_type && info.alias == alias);
     if !configured {
         anyhow::bail!(
             "Missing [channels.{channel_type}.{alias}] section in config.toml — \
@@ -88,11 +92,17 @@ pub(crate) async fn persist_external_peer(
     use anyhow::Context;
 
     let Some(config) = persist else {
+        // The raw identity is a durable personal identifier (e.g. a phone
+        // number) and must not reach the log sink; channel_type/alias give
+        // the operator enough to locate the unwired constructor path.
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"identity": identity})),
+                .with_attrs(::serde_json::json!({
+                    "channel_type": channel_type,
+                    "alias": alias,
+                })),
             "paired identity not persisted (no persistence handle wired)"
         );
         return Ok(());
@@ -197,15 +207,43 @@ mod tests {
     }
 
     #[test]
-    fn merge_rejects_empty_identity_unconfigured_channel_and_unknown_type() {
+    fn merge_rejects_empty_identity_and_unconfigured_channel() {
         let mut config = config_with_whatsapp("admin");
         assert!(merge_external_peer(&mut config, "whatsapp", "admin", "  ").is_err());
-        assert!(merge_external_peer(&mut config, "whatsapp", "ghost", "+15551234567").is_err());
-        assert!(merge_external_peer(&mut config, "telegram", "admin", "someone").is_err());
+        assert!(
+            merge_external_peer(&mut config, "whatsapp", "ghost", "+15551234567").is_err(),
+            "an alias with no [channels.whatsapp.ghost] block is rejected"
+        );
+        assert!(
+            merge_external_peer(&mut config, "telegram", "admin", "someone").is_err(),
+            "a type/alias pair with no configured block is rejected"
+        );
         assert!(
             config.peer_groups.is_empty(),
             "failed merges must not leave partial groups behind"
         );
+    }
+
+    #[test]
+    fn merge_accepts_any_configured_channel_type_via_the_registry() {
+        // The existence check reads the canonical channel registry, not a
+        // hardcoded channel-type list: a configured channel of any type can
+        // persist a paired identity without this module needing an edit.
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "admin".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(merge_external_peer(&mut config, "telegram", "admin", "someone").unwrap());
+        let group = config
+            .peer_groups
+            .get("telegram_admin")
+            .expect("group created under <type>_<alias>");
+        assert_eq!(group.channel.as_str(), "telegram.admin");
     }
 
     #[tokio::test]
