@@ -107,13 +107,6 @@ impl ChatMessage {
         self.role == "user"
     }
 
-    /// Drop leading turns that violate the universal turn-order invariant that
-    /// strict providers enforce: the first non-system turn must be a `user`
-    /// turn. Context trims, session restores, and synthetic priming can
-    /// decapitate the anchoring `user` message and leave an `assistant`
-    /// tool-call or a `tool` result as the first non-system turn, which strict
-    /// providers reject. Tolerant providers silently accept the malformed
-    /// shape, so the defect only surfaces on strict routes.
     pub fn sanitize_leading_turn_order(messages: &mut Vec<Self>) {
         let first_non_system = messages
             .iter()
@@ -948,12 +941,6 @@ mod turn_order_tests {
         assert_eq!(msgs[1].role, "user");
     }
 
-    /// The sanitizer is a pure leading-turn repair: with no `user` anywhere it
-    /// drains every non-system turn, leaving system-only. That system-only
-    /// shape is NOT a valid provider payload; the prep boundary
-    /// (`prepare_messages_for_iteration`) fails closed on a no-user history
-    /// before dispatch. See the runtime `prepare_fails_closed_when_no_user_turn_survives`
-    /// regression.
     #[test]
     fn no_user_turn_drops_all_non_system() {
         let mut msgs = vec![
