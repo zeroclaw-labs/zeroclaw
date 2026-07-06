@@ -358,14 +358,11 @@ impl DebouncedReporter {
     }
 
     fn transit_to(&mut self, target: HerdrState, session_id: Option<&str>) {
-        eprintln!("[herdr-debug] transit_to: current={:?} target={:?} session_id={:?}", self.state, target, session_id);
         if self.state == target {
-            eprintln!("[herdr-debug] state unchanged, skipping");
             return;
         }
         self.state = target;
         if target == HerdrState::Released {
-            eprintln!("[herdr-debug] transitioning to Released, sending idle + release_agent");
             self.client.report_state("idle", None);
             self.client.report_released();
         } else {
@@ -375,7 +372,6 @@ impl DebouncedReporter {
                 HerdrState::Blocked => "blocked",
                 HerdrState::Released => unreachable!(),
             };
-            eprintln!("[herdr-debug] sending pane.report_agent with state={}", label);
             self.client.report_state(label, session_id);
         }
     }
@@ -383,16 +379,11 @@ impl DebouncedReporter {
     /// Flush the reporter at shutdown: if the agent has not yet reported
     /// Released, send the release messages now, then drain the I/O channel.
     fn flush(&mut self) {
-        eprintln!("[herdr-debug] flush() called, current state={:?}", self.state);
         if self.state != HerdrState::Released {
             self.state = HerdrState::Released;
-            eprintln!("[herdr-debug] transitioning to Released, sending idle + release_agent");
             self.client.report_state("idle", None);
             self.client.report_released();
-        } else {
-            eprintln!("[herdr-debug] already Released, skipping state transitions");
         }
-        eprintln!("[herdr-debug] calling client.flush()");
         self.client.flush();
     }
 }
@@ -444,37 +435,37 @@ impl HerdrObserver {
 
 impl Observer for HerdrObserver {
     fn record_event(&self, event: &ObserverEvent) {
-        eprintln!("[herdr-debug] record_event: {:?}", std::mem::discriminant(event));
         let mut reporter = self.reporter.lock().expect("herdr observer poisoned");
         match event {
+            ObserverEvent::AgentStart { .. } => {
+                reporter.transit_to(HerdrState::Idle, current_session_id().as_deref());
+            }
             ObserverEvent::LlmRequest { .. } | ObserverEvent::ToolCallStart { .. } => {
-                eprintln!("[herdr-debug] LlmRequest/ToolCallStart -> Working");
+                reporter.transit_to(HerdrState::Working, current_session_id().as_deref());
+            }
+            ObserverEvent::LlmResponse { .. } => {
+                reporter.transit_to(HerdrState::Working, current_session_id().as_deref());
+            }
+            ObserverEvent::ToolCall { .. } => {
                 reporter.transit_to(HerdrState::Working, current_session_id().as_deref());
             }
             ObserverEvent::TurnComplete => {
-                eprintln!("[herdr-debug] TurnComplete -> Idle");
                 reporter.transit_to(HerdrState::Idle, None);
             }
             ObserverEvent::AgentEnd { .. } => {
-                eprintln!("[herdr-debug] AgentEnd -> Released");
                 reporter.transit_to(HerdrState::Released, None);
             }
             ObserverEvent::AuthorizationRequested { .. } => {
-                eprintln!("[herdr-debug] AuthorizationRequested -> Blocked");
                 reporter.transit_to(HerdrState::Blocked, None);
             }
             ObserverEvent::AuthorizationResponded { granted, .. } => {
                 if *granted {
-                    eprintln!("[herdr-debug] AuthorizationResponded(granted=true) -> Working");
                     reporter.transit_to(HerdrState::Working, None);
                 } else {
-                    eprintln!("[herdr-debug] AuthorizationResponded(granted=false) -> Idle");
                     reporter.transit_to(HerdrState::Idle, None);
                 }
             }
-            _ => {
-                eprintln!("[herdr-debug] unhandled event type");
-            }
+            _ => {}
         }
     }
 
