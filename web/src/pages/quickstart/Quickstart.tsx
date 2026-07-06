@@ -403,7 +403,9 @@ export default function Quickstart() {
           label={t("common.name")}
           value={form.agentName}
           onChange={(v) => {
-            setForm((f) => ({ ...f, agentName: v }));
+            // Agent aliases must be lowercase — normalize as the user types so
+            // a stray capital (or paste) can't fail validation at apply time.
+            setForm((f) => ({ ...f, agentName: v.toLowerCase() }));
             recordStep("agent");
           }}
           placeholder={t("quickstart.agent_name_placeholder")}
@@ -672,6 +674,9 @@ function LabeledInput({
           value={value}
           onChange={(e) => onChange(e.target.value)}
           placeholder={placeholder}
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
         />
       ) : (
         <input
@@ -680,6 +685,12 @@ function LabeledInput({
           value={value}
           onChange={(e) => onChange(e.target.value)}
           placeholder={placeholder}
+          // Aliases, model names, API keys etc. are technical identifiers —
+          // the WebView must not autocapitalize/autocorrect them (e.g. agent
+          // aliases must be lowercase).
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
         />
       )}
     </label>

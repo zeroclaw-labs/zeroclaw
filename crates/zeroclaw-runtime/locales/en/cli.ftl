@@ -27,6 +27,8 @@ cli-config-about = Manage ZeroClaw configuration
 cli-update-about = Check for and apply ZeroClaw updates
 cli-self-test-about = Run diagnostic self-tests
 cli-completions-about = Generate shell completion scripts
+cli-desktop-about = Launch the ZeroClaw companion desktop app
+
 cli-config-schema-about = Dump the full configuration JSON Schema to stdout
 cli-config-list-about = List all config properties with current values
 cli-config-get-about = Get a config property value
@@ -334,6 +336,17 @@ cli-completions-long-about =
       zeroclaw completions zsh > ~/.zfunc/_zeroclaw
       zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish
 
+cli-desktop-long-about =
+    Launch the ZeroClaw companion desktop app.
+
+    The companion app is a lightweight menu bar / system tray application that connects to the same gateway as the CLI. It provides quick access to the dashboard, status monitoring, and device pairing.
+
+    Use --install to download the pre-built companion app for your platform.
+
+    Examples:
+      zeroclaw desktop              # launch the companion app
+      zeroclaw desktop --install    # download and install it
+
 # Channel-side reply emitted when chat dispatch refuses because the
 # gateway has no model configured. Used by the gateway crate channel
 # webhook handlers (WhatsApp, Linq, WATI, Nextcloud Talk).
@@ -437,6 +450,9 @@ cli-skills-create-hint = {"  "}Create one: mkdir -p ~/.zeroclaw/workspace/skills
 cli-skills-install-hint = {"  "}Or install: zeroclaw skills install <source>
 cli-skills-installed-header = Installed skills ({$count}):
 cli-skills-tags = Tags:  {$tags}
+cli-skills-skipped-header = Skipped ({$count}):
+cli-skills-skipped-reason = {"    "}Reason: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}Set `skills.allow_scripts = true` in your zeroclaw config to enable it.
 
 # ── sop (zeroclaw sop) ──
 cli-sop-none = No SOPs found.
@@ -662,6 +678,11 @@ cli-status-service-stopped = 🔴 Service:       stopped
 cli-status-channels = Channels:
 cli-status-cli-always = {"  "}CLI:      ✅ always
 cli-status-peripherals = Peripherals:
+cli-desktop-download = Download the ZeroClaw companion app:
+cli-desktop-homebrew = Or install via Homebrew (coming soon):
+cli-desktop-linux-pkg = {"  "}Download the .deb or .AppImage for your architecture.
+cli-desktop-launching = Launching ZeroClaw companion app...
+
 # ── status fields ──
 cli-status-version = Version:     {$v}
 cli-status-workspace = Workspace:   {$v}
@@ -703,6 +724,9 @@ cli-status-word-not-configured = not configured
 cli-status-channel-not-compiled = 🚫 configured, not compiled
 
 # ── desktop / config / plugins / estop / auth ──
+cli-desktop-not-installed = ZeroClaw companion app is not installed.
+cli-desktop-blurb1 = The companion app is a lightweight menu bar app that
+cli-desktop-blurb2 = connects to the same gateway as the CLI.
 cli-config-all-configured = All sections already configured.
 cli-config-schema-current = Config already at current schema version.
 cli-config-applied-ops = Applied {$count} operation(s):
@@ -715,6 +739,10 @@ cli-plugin-no-description = (no description)
 cli-plugin-install-resolving = Resolving '{$source}' from plugin registry...
 cli-plugin-installed-from = Plugin installed from {$source}
 cli-plugin-installed-name-version = Installed plugin {$name} v{$version}
+cli-plugin-config-entry-seeded = Seeded [[plugins.entries]] for '{$name}'. Set plugin config values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-seed-skipped = warning: skipped seeding the config entry for '{$name}': the [plugins] section on disk is malformed. Repair it, add a [[plugins.entries]] block with `name = "{$name}"`, then set values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-seed-unaddressable = warning: skipped seeding the config entry for '{$name}': plugin names containing '.' cannot be addressed by dotted config paths (`config set` splits on '.'). Add a [[plugins.entries]] block with `name = "{$name}"` to the config file by hand.
+cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-plugin-removed = Plugin '{$name}' removed.
 cli-plugin-not-found = Plugin '{$name}' not found.
 cli-plugin-legacy-detected = Note: plugins in a legacy location ({$path}) are not loaded by the agent — run `zeroclaw plugin migrate` to move them into {$target}.
@@ -731,6 +759,7 @@ cli-warn-crypto-provider = Warning: Failed to install default crypto provider: {
 cli-error-label = {"   "}Error: {$err}
 cli-warn-cost-usage = {"  "}⚠ Could not load cost usage: {$err}
 cli-warn-cost-tracker = {"  "}⚠ Could not init cost tracker: {$err}
+cli-desktop-download-at = {"  "}Download it at: {$url}
 cli-config-legend = Legend: 💉 env-overridden  🔒 secret
 cli-config-secret-set = {$path} is set (encrypted secret — value not displayed)
 cli-config-secret-unset = {$path} is not set (encrypted secret)
