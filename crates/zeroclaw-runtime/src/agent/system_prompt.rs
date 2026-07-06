@@ -500,7 +500,7 @@ mod tests {
 
     fn build_with_autonomy(tools: &[(&str, &str)], level: AutonomyLevel) -> String {
         let workspace = tempfile::TempDir::new().expect("tempdir");
-        let autonomy = zeroclaw_config::schema::AutonomyConfig {
+        let autonomy = zeroclaw_config::schema::RiskProfileConfig {
             level,
             ..Default::default()
         };
@@ -516,6 +516,8 @@ mod tests {
             SkillsPromptInjectionMode::Full,
             false,
             0,
+            true,
+            false,
         )
     }
 
