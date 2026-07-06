@@ -490,6 +490,16 @@ impl SopEngine {
 
     /// Report the result of the current step and advance the run.
     /// Returns the next action to take.
+    ///
+    /// Refuses to advance a run whose status is `WaitingApproval` or
+    /// `PausedCheckpoint`: those states mean an external gate is pending
+    /// (an approval, or a deterministic checkpoint resume) and a driver
+    /// supplying a fabricated `SopStepResult` must not be allowed to skip
+    /// the gate. The legitimate path for clearing a `WaitingApproval` gate
+    /// is `resolve_gate` / `clear_waiting_gate`; the legitimate path for
+    /// resuming a `PausedCheckpoint` is `approve_step`. Mirrors the
+    /// status check `approve_step` already performs for the checkpoint
+    /// case.
     pub fn advance_step(&mut self, run_id: &str, result: SopStepResult) -> Result<SopRunAction> {
         let (sop_name, current_step_number) = {
             let run = self.active_runs.get(run_id).ok_or_else(|| {
@@ -502,6 +512,28 @@ impl SopEngine {
                 );
                 anyhow::Error::msg(format!("Active run not found: {run_id}"))
             })?;
+            if matches!(
+                run.status,
+                SopRunStatus::WaitingApproval | SopRunStatus::PausedCheckpoint
+            ) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "status": run.status.to_string(),
+                            "step": run.current_step,
+                        })),
+                    "SOP engine: advance_step rejected — run is paused at a gate"
+                );
+                bail!(
+                    "Run {run_id} is paused at a {} gate; resolve the gate through \
+                     `resolve_gate` (WaitingApproval) or `approve_step` (PausedCheckpoint) \
+                     before advancing with sop_advance",
+                    run.status
+                );
+            }
             (run.sop_name.clone(), run.current_step)
         };
 
@@ -3916,6 +3948,126 @@ mod tests {
         let action = engine.start_run("s1", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
         assert!(engine.approve_step(&run_id).is_err());
+    }
+
+    // ── Advance step gate guard (#8678) ─────────────────
+    //
+    // A driver calling `sop_advance` while a run is parked at an external
+    // gate (WaitingApproval or PausedCheckpoint) used to be allowed to
+    // fabricate a Completed step result, record it, and dispatch the next
+    // step — silently bypassing the approval flow or the deterministic
+    // checkpoint resume. `advance_step` now refuses those calls.
+
+    #[test]
+    fn advance_step_rejects_waiting_approval_run() {
+        // requires_confirmation forces the run to WaitApproval on step 1.
+        let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Critical);
+        sop.steps[0].requires_confirmation = true;
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        // Sanity: run is parked at the gate.
+        let run = engine.active_runs().get(&run_id).unwrap();
+        assert_eq!(run.status, SopRunStatus::WaitingApproval);
+        let step_results_before = run.step_results.len();
+
+        // Driver tries to fabricate success for the gated step.
+        let err = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: "fabricated".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap_err();
+
+        // Error must point at the gate, not the run id.
+        assert!(
+            err.to_string().contains("WaitingApproval"),
+            "rejection should mention the gate status, got: {err}"
+        );
+
+        // The run state must be unchanged: still WaitingApproval, no
+        // phantom step result recorded, no next step dispatched.
+        let run = engine.active_runs().get(&run_id).unwrap();
+        assert_eq!(run.status, SopRunStatus::WaitingApproval);
+        assert_eq!(run.step_results.len(), step_results_before);
+    }
+
+    #[test]
+    fn advance_step_rejects_paused_checkpoint_run() {
+        // A deterministic SOP with a Checkpoint step pauses the run in
+        // PausedCheckpoint after step 1 completes. Driving `sop_advance`
+        // directly must be rejected — the only legitimate resume path is
+        // `approve_step`.
+        let mut engine = engine_with_sops(vec![deterministic_sop("det-cp")]);
+        let action = engine.start_run("det-cp", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        // Advance through step 1 (Execute) to reach the checkpoint.
+        engine
+            .advance_deterministic_step(&run_id, serde_json::json!({"ok": true}), None)
+            .unwrap();
+        let run = engine.get_run(&run_id).unwrap();
+        assert_eq!(run.status, SopRunStatus::PausedCheckpoint);
+
+        // Driver tries to fabricate completion of the checkpoint step.
+        let err = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 2,
+                    status: SopStepStatus::Completed,
+                    output: "fabricated".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("PausedCheckpoint"),
+            "rejection should mention the gate status, got: {err}"
+        );
+
+        // The run must still be parked at the checkpoint, not advanced
+        // past it.
+        let run = engine.get_run(&run_id).unwrap();
+        assert_eq!(run.status, SopRunStatus::PausedCheckpoint);
+    }
+
+    #[test]
+    fn advance_step_still_works_for_running_run() {
+        // Control case: a non-paused run must still be drivable through
+        // sop_advance. Without this case, the new guard could be hiding
+        // a regression on the happy path.
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )]);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: "done".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
     }
 
     // ── Context formatting ──────────────────────────────
