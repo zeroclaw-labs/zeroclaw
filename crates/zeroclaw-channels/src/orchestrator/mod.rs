@@ -9744,15 +9744,10 @@ pub async fn start_channels(
             ),
         ];
 
-        if matches!(
-            config.skills.prompt_injection_mode,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-        ) {
-            tool_descs.push((
-                "read_skill",
-                "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
-            ));
-        }
+        tool_descs.push((
+            "read_skill",
+            "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
+        ));
         if config.browser.enabled {
             tool_descs.push((
                 "browser_open",

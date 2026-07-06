@@ -1534,15 +1534,10 @@ pub async fn run(
                 "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
             ),
         ];
-        if matches!(
-            config.skills.prompt_injection_mode,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-        ) {
-            tool_descs.push((
+        tool_descs.push((
             "read_skill",
             "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
         ));
-        }
         tool_descs.push((
         "cron_add",
         "Create a cron job. Supports schedule kinds: cron, at, every; and job types: shell or agent.",
@@ -2939,15 +2934,10 @@ pub async fn process_message(
             ("screenshot", "Capture a screenshot."),
             ("image_info", "Read image metadata."),
         ];
-        if matches!(
-            config.skills.prompt_injection_mode,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-        ) {
-            tool_descs.push((
-                "read_skill",
-                "Load the full source for an available skill by name.",
-            ));
-        }
+        tool_descs.push((
+            "read_skill",
+            "Load the full source for an available skill by name.",
+        ));
         if config.browser.enabled {
             tool_descs.push(("browser_open", "Open approved URLs in browser."));
         }
@@ -12491,6 +12481,91 @@ Let me check the result."#;
         .expect("tools turn prompt should build");
         assert!(tools_turn_prompt.contains(NATIVE_TOOLS_TASK_FRAMING));
         assert!(!tools_turn_prompt.contains(NO_TOOLS_TASK_FRAMING));
+    }
+
+    #[test]
+    fn deprecated_full_mode_text_prompt_is_compact_and_advertises_read_skill() {
+        use zeroclaw_config::schema::{RiskProfileConfig, SkillsPromptInjectionMode};
+
+        let workspace = tempdir().unwrap();
+        // Non-native provider forces the text tool-use protocol path, which is
+        // where the original blocker hid `read_skill` under a Compact-only gate.
+        let provider = ScriptedModelProvider::from_text_responses(vec!["ok"]);
+        assert!(!zeroclaw_providers::ModelProvider::supports_native_tools(
+            &provider
+        ));
+
+        // `read_skill` is registered unconditionally in `all_tools_with_runtime`,
+        // so model it in the registry here regardless of the deprecated mode.
+        let tools_registry: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(CountingTool::new(
+            "read_skill",
+            Arc::new(AtomicUsize::new(0)),
+        ))];
+
+        // The fixed prompt builders now push `read_skill` into `tool_descs`
+        // unconditionally; the later registry retain keeps it because the
+        // registry advertises it.
+        let tool_descs: Vec<(&str, &str)> = vec![(
+            "read_skill",
+            "Load the full source for an available skill by name.",
+        )];
+
+        let skills = vec![crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Release safely".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec!["Run smoke tests before deploy.".into()],
+            slash_options: Vec::new(),
+            location: Some(workspace.path().join("skills/deploy/SKILL.md")),
+        }];
+
+        let risk_profile = RiskProfileConfig::default();
+
+        let system_prompt = super::build_system_prompt_for_turn(
+            workspace.path(),
+            "test-model",
+            &tool_descs,
+            "",
+            &skills,
+            None,
+            None,
+            &risk_profile,
+            &provider,
+            &tools_registry,
+            &[],
+            None,
+            false,
+            // Explicitly request the deprecated `full` mode to prove it behaves
+            // like compact for both the skills section and the text tool list.
+            SkillsPromptInjectionMode::Full,
+            false,
+            usize::MAX,
+            true,
+            false,
+            None,
+        )
+        .expect("full-mode text prompt should build");
+
+        // Skills section is compact: on-demand loading, no inlined instructions.
+        assert!(
+            system_prompt.contains("read_skill(name)"),
+            "compact skills section must instruct on-demand loading via read_skill"
+        );
+        assert!(
+            !system_prompt.contains("Run smoke tests before deploy."),
+            "full mode must not inline skill instructions"
+        );
+
+        // The prompt-visible text tool list advertises read_skill: the original
+        // blocker was that a `full`-mode text prompt omitted it.
+        assert!(
+            system_prompt.contains("**read_skill**"),
+            "non-native text tool protocol must advertise read_skill under deprecated full mode"
+        );
     }
 
     #[test]
