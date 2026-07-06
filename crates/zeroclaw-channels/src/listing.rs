@@ -154,6 +154,11 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-bluesky"),
     },
     ChannelCompileSpec {
+        schema_name: Some("Git"),
+        type_keys: &["git"],
+        compiled: cfg!(feature = "channel-git"),
+    },
+    ChannelCompileSpec {
         schema_name: Some("X/Twitter"),
         type_keys: &["twitter"],
         compiled: cfg!(feature = "channel-twitter"),

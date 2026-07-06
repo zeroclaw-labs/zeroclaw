@@ -861,6 +861,20 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_assistant_reasoning: Option<bool>,
+    /// Pull live token prices for this provider's models from its own
+    /// OpenAI-compatible `/models` listing (the gateway is the source of truth
+    /// for its prices), filling cost-tracking rates for models the operator
+    /// has NOT priced under `[cost.rates]` / `pricing`. Models the gateway does
+    /// not price (or providers with no HTTP `/models` listing at all, such as
+    /// a subprocess gateway like `kilocli`) fall back to the public models.dev
+    /// catalog. Configured rates always win; live prices only fill gaps. A
+    /// background task refreshes the price snapshot hourly; the cost-recording
+    /// path reads the cached snapshot and never blocks on the network. Default
+    /// `false`: off means no fetching and behavior identical to a build
+    /// without the feature.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub live_pricing: bool,
     /// Override the provider's default for native tool calling.
     /// `None` (default) honors the provider's built-in choice. `Some(true)`
     /// forces native tool calls on, `Some(false)` forces text-fallback.
@@ -886,6 +900,12 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Context window size (max input tokens) for this model.
+    /// Auto-populated on setup from provider's /models endpoint if available.
+    /// Override manually for custom endpoints or when auto-detection fails.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
     /// Path to a PEM-encoded CA certificate for TLS connections to this provider.
     /// Must be an absolute path; shell expansion (e.g. `~`) is not performed.
     /// Leave unset to use the system's default trust store.
@@ -3282,7 +3302,11 @@ pub struct ResolvedRuntime {
     pub compact_context: bool,
     pub max_tool_iterations: usize,
     pub max_history_messages: usize,
+    /// Token budget for preemptive context/history trimming (from runtime profile).
+    /// NOT the provider `max_tokens` output limit.
     pub max_context_tokens: usize,
+    /// Model's context window (max input tokens) — from provider config.
+    pub model_context_window: usize,
     pub parallel_tools: bool,
     pub tool_dispatcher: String,
     pub strict_tool_parsing: bool,
@@ -3320,6 +3344,7 @@ impl Default for ResolvedRuntime {
             max_tool_iterations: 10,
             max_history_messages: 50,
             max_context_tokens: 32_000,
+            model_context_window: 32_000,
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             strict_tool_parsing: false,
@@ -3922,9 +3947,26 @@ impl Config {
 
     #[must_use]
     pub fn effective_max_context_tokens(&self, agent_alias: &str) -> usize {
+        // Token budget for preemptive context/history trimming (runtime profile override).
+        // This is NOT the provider max_tokens output limit and NOT the model's context window.
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_context_tokens)
             .unwrap_or(32_000)
+    }
+
+    /// Returns the model's context window size (max input tokens).
+    /// Source: provider config `context_window` → fallback 32,000.
+    /// Does NOT check runtime profile (that's for output budget).
+    #[must_use]
+    pub fn effective_model_context_window(&self, agent_alias: &str) -> usize {
+        // 1. Provider config (config.toml) — PRIMARY SOT for model's context window
+        if let Some((_, _, provider_config)) = self.resolved_model_provider_for_agent(agent_alias)
+            && let Some(ctx) = provider_config.context_window
+        {
+            return ctx;
+        }
+        // 2. Hard fallback 32,000 (stub)
+        32_000
     }
 
     #[must_use]
@@ -4005,7 +4047,10 @@ impl Config {
         let mut resolved = ResolvedRuntime {
             max_tool_iterations: self.effective_max_tool_iterations(agent_alias),
             max_history_messages: self.effective_max_history_messages(agent_alias),
+            // Token budget for context/history trimming — from runtime profile
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
+            // Model's context window (max input tokens) — from provider config
+            model_context_window: self.effective_model_context_window(agent_alias),
             compact_context: self.effective_compact_context(agent_alias),
             parallel_tools: self.effective_parallel_tools(agent_alias),
             tool_dispatcher: self.effective_tool_dispatcher(agent_alias),
@@ -4699,7 +4744,7 @@ impl Default for TranscriptionConfig {
 
 /// Transport type for MCP server connections.
 #[derive(
-    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, zeroclaw_macros::ConfigEnum,
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, zeroclaw_macros::ConfigEnum,
 )]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
@@ -4713,9 +4758,84 @@ pub enum McpTransport {
     Sse,
 }
 
+impl McpTransport {
+    /// Wire token for this transport, matching the `rename_all = "lowercase"`
+    /// serde representation (`stdio`/`http`/`sse`). The exhaustive match makes
+    /// a new variant a compile error here rather than a silent miss.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            McpTransport::Stdio => "stdio",
+            McpTransport::Http => "http",
+            McpTransport::Sse => "sse",
+        }
+    }
+
+    /// The `McpServerConfig` leaf this transport requires to be non-empty.
+    /// Single source of truth shared by `validate_mcp_config` (runtime
+    /// enforcement) and the config-form `x-required-by-transport` schema
+    /// metadata the Operator Console reads to mark the right field Required
+    /// per transport. Changing the relationship here updates both consumers.
+    pub fn required_leaf(self) -> &'static str {
+        match self {
+            McpTransport::Stdio => "command",
+            McpTransport::Http | McpTransport::Sse => "url",
+        }
+    }
+}
+
+/// Every transport, enumerated on-demand from the schema rather than a
+/// hand-maintained list, so the set is derived from the enum itself and a new
+/// variant shows up here automatically (its `required_leaf` arm then forces a
+/// decision). schemars emits a fieldless enum as a top-level `enum` array, or
+/// as `oneOf` of `const`s once the variants carry doc comments; handle both,
+/// matching the existing `enum_variants` helper. The wire tokens honor the
+/// serde rename, so they round-trip straight back to the enum.
+#[cfg(feature = "schema-export")]
+fn mcp_transports() -> Vec<McpTransport> {
+    let schema = serde_json::to_value(schemars::schema_for!(McpTransport)).unwrap_or_default();
+    let wire_values: Vec<serde_json::Value> =
+        if let Some(values) = schema.get("enum").and_then(serde_json::Value::as_array) {
+            values.clone()
+        } else if let Some(variants) = schema.get("oneOf").and_then(serde_json::Value::as_array) {
+            variants
+                .iter()
+                .filter_map(|variant| variant.get("const").cloned())
+                .collect()
+        } else {
+            Vec::new()
+        };
+    wire_values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<McpTransport>(value).ok())
+        .collect()
+}
+
+/// Per-transport required-leaf map, projected from [`McpTransport::required_leaf`]
+/// onto the schema as the `x-required-by-transport` extension on
+/// `McpServerConfig`. The Operator Console config form reads it so the Required
+/// badge tracks the selected transport (`stdio` needs `command`, `http`/`sse`
+/// need `url`) instead of hardcoding the relationship in the web surface.
+#[cfg(feature = "schema-export")]
+fn mcp_required_by_transport() -> serde_json::Value {
+    let map: serde_json::Map<String, serde_json::Value> = mcp_transports()
+        .into_iter()
+        .map(|transport| {
+            (
+                transport.wire_name().to_string(),
+                serde_json::Value::String(transport.required_leaf().to_string()),
+            )
+        })
+        .collect();
+    serde_json::Value::Object(map)
+}
+
 /// Configuration for a single external MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[cfg_attr(
+    feature = "schema-export",
+    schemars(extend("x-required-by-transport" = mcp_required_by_transport()))
+)]
 #[prefix = "mcp.servers"]
 pub struct McpServerConfig {
     /// Display name used as a tool prefix (`<server>__<tool>`). Filled in
@@ -9189,6 +9309,10 @@ fn validate_mcp_config(config: &McpConfig) -> Result<()> {
             }
         }
 
+        // The transport -> required-leaf relationship is owned by
+        // `McpTransport::required_leaf`, which feeds the `x-required-by-transport`
+        // schema metadata. The validator matches on the `McpTransport` enum so a
+        // new variant is a compile error here rather than a runtime fall-through.
         match server.transport {
             McpTransport::Stdio => {
                 if server.command.trim().is_empty() {
@@ -9204,11 +9328,7 @@ fn validate_mcp_config(config: &McpConfig) -> Result<()> {
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| {
-                        let transport_str = match server.transport {
-                            McpTransport::Http => "http",
-                            McpTransport::Sse => "sse",
-                            McpTransport::Stdio => "stdio",
-                        };
+                        let transport_str = server.transport.wire_name();
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -12330,6 +12450,11 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub bluesky: HashMap<String, BlueskyConfig>,
+    /// Git-forge channel instances (`[channels.git.<alias>]`). GitHub is
+    /// the first provider; the `provider` field selects the forge.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub git: HashMap<String, GitConfig>,
     /// Voice call channel instances (`[channels.voice_call.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -12562,6 +12687,12 @@ impl ChannelsConfig {
                 configured: !self.bluesky.is_empty(),
             },
             ChannelInfo {
+                kind: "git",
+                name: "Git",
+                desc: "Git forge (GitHub, Gitea, Forgejo): issues, PRs & events",
+                configured: !self.git.is_empty(),
+            },
+            ChannelInfo {
                 kind: "twitter",
                 name: "X/Twitter",
                 desc: "X/Twitter Bot via API v2",
@@ -12659,6 +12790,7 @@ impl ChannelsConfig {
             || self.mqtt.values().any(|c| c.enabled)
             || self.amqp.values().any(|c| c.enabled)
             || self.filesystem.values().any(|c| c.enabled)
+            || self.git.values().any(|c| c.enabled)
     }
 
     /// One `(canonical_name, configured, deliverable)` row per channel in the
@@ -12668,7 +12800,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 35] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -12699,6 +12831,7 @@ impl ChannelsConfig {
             ("clawdtalk", !self.clawdtalk.is_empty(), true),
             ("reddit", !self.reddit.is_empty(), true),
             ("bluesky", !self.bluesky.is_empty(), true),
+            ("git", !self.git.is_empty(), true),
             ("voice_call", !self.voice_call.is_empty(), true),
             ("voice_wake", !self.voice_wake.is_empty(), false),
             ("voice_duplex", !self.voice_duplex.is_empty(), false),
@@ -12784,6 +12917,7 @@ impl Default for ChannelsConfig {
             clawdtalk: HashMap::new(),
             reddit: HashMap::new(),
             bluesky: HashMap::new(),
+            git: HashMap::new(),
             voice_call: HashMap::new(),
             voice_wake: HashMap::new(),
             voice_duplex: HashMap::new(),
@@ -15857,6 +15991,178 @@ impl ChannelConfig for BlueskyConfig {
     }
 }
 
+/// Git-forge channel configuration (polling-based; no webhook required).
+///
+/// A `provider` selects the forge. GitHub authenticates as a GitHub App:
+/// a short-lived RS256 JWT signed with the app's private key is exchanged
+/// for per-installation access tokens. Gitea and Forgejo use a personal
+/// access token against the instance's `/api/v1` endpoint, named by the
+/// required `api_base_url`. Inbound issue/PR comments are polled from the
+/// forge REST API, so the daemon needs no inbound network exposure.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.git"]
+pub struct GitConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Git forge provider. Supported: `"github"`, `"gitea"`, and
+    /// `"forgejo"` (Forgejo uses the Gitea-compatible REST provider).
+    /// Default: `"github"`.
+    #[tab(Connection)]
+    #[serde(default = "default_git_provider")]
+    pub provider: String,
+    /// GitHub App ID (shown on the app's settings page). GitHub provider only.
+    #[tab(Connection)]
+    #[serde(default)]
+    pub app_id: u64,
+    /// Path to the app's RS256 private key, the `.pem` file GitHub
+    /// generates on the app's settings page. Should be readable only by
+    /// the daemon user (0600); looser permissions log a startup warning.
+    /// GitHub provider only.
+    #[tab(Connection)]
+    #[serde(default)]
+    pub private_key_path: String,
+    /// Installation ID to act as. When unset, the app's installations are
+    /// listed on first use and a sole installation is auto-selected;
+    /// startup fails if the app has zero or multiple installations.
+    #[tab(Connection)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation_id: Option<u64>,
+    /// Gitea/Forgejo API base URL, including `/api/v1`, for example
+    /// `https://git.example.org/api/v1` (for the public Gitea service:
+    /// `https://gitea.com/api/v1`). Required when `provider` is `"gitea"`
+    /// or `"forgejo"` - there is no default host, because every API
+    /// request carries `access_token`; the channel fails closed at
+    /// startup rather than send the token to an endpoint the operator
+    /// never named. Gitea/Forgejo provider only.
+    #[tab(Connection)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
+    /// Personal access token for Gitea/Forgejo API requests. The token needs
+    /// repository read access plus issue/PR comment write access for replies
+    /// and reactions. Gitea/Forgejo provider only.
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default)]
+    pub access_token: String,
+    /// Repositories to poll, as `owner/repo`. Empty = every repository
+    /// visible to the installation.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub repos: Vec<String>,
+    /// Poll interval in seconds for new issues and comments. Values below
+    /// 15 are clamped to 15. Default: `30`.
+    #[tab(Advanced)]
+    #[serde(default = "default_github_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// Only respond to comments that @-mention the app's bot login.
+    /// Default: `true`.
+    #[tab(Behavior)]
+    #[serde(default = "default_true")]
+    pub mention_only: bool,
+    /// Process comments authored by other bot accounts. The app's own
+    /// comments are always ignored. Default: `false`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub listen_to_bots: bool,
+    /// Per-channel proxy override for GitHub API requests.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    /// Per-event routing table, keyed by normalized event type
+    /// (`"issue_comment.created"`, `"pull_request.opened"`,
+    /// `"workflow_run.failed"`, …). Event types absent from the table fall
+    /// back to the conversational default: `issue_comment.created`,
+    /// `issues.opened`, and `pull_request.opened` are delivered as
+    /// messages (mention-gated); everything else is ignored. Which API
+    /// endpoints are polled is derived from this table; routing an event
+    /// type is also subscribing to it.
+    #[tab(Behavior)]
+    #[serde(default)]
+    #[nested]
+    pub events: HashMap<String, GitEventRoute>,
+    /// Also poll the repository Events API (`/repos/{owner}/{repo}/events`)
+    /// as a broad backbone transport: one conditional (ETag) request per
+    /// repository per tick, so an idle repo costs almost nothing. Caveats:
+    /// events arrive with a delay of up to ~5 minutes and the feed carries
+    /// no Actions/check events (workflow runs always use their dedicated
+    /// endpoint). Items also surfaced by a targeted endpoint are
+    /// de-duplicated. Default: `false`.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub events_backbone: bool,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+}
+
+fn default_github_poll_interval_secs() -> u64 {
+    30
+}
+
+fn default_git_provider() -> String {
+    "github".to_string()
+}
+
+impl Default for GitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_git_provider(),
+            app_id: 0,
+            private_key_path: String::new(),
+            installation_id: None,
+            api_base_url: None,
+            access_token: String::new(),
+            repos: Vec::new(),
+            poll_interval_secs: default_github_poll_interval_secs(),
+            mention_only: true,
+            listen_to_bots: false,
+            proxy_url: None,
+            events: HashMap::new(),
+            events_backbone: false,
+            excluded_tools: Vec::new(),
+        }
+    }
+}
+
+impl ChannelConfig for GitConfig {
+    fn name() -> &'static str {
+        "Git"
+    }
+    fn desc() -> &'static str {
+        "Git forge (GitHub, Gitea, Forgejo): issues, PRs & events"
+    }
+}
+
+/// Routing for one normalized git-forge event type, keyed in
+/// `[channels.git.<alias>.events]` by the event type string
+/// (`"pull_request.opened" = { sop = "pr-triage" }`).
+///
+/// An entry with neither `message = true` nor a `sop` explicitly ignores the
+/// event type (overriding the conversational default).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.git.events"]
+pub struct GitEventRoute {
+    /// Deliver the event into the agent loop as a normal channel message.
+    #[serde(default)]
+    pub message: bool,
+    /// Route the event to the named SOP through channel-sourced SOP ingress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sop: Option<String>,
+}
+
 /// Voice duplex configuration (`[channels.voice_duplex]`).
 ///
 /// Enables full-duplex voice event handling over WebSocket.
@@ -18112,6 +18418,30 @@ impl Config {
                 &format!("channels.telegram.{alias}.api_base_url"),
                 &tg.api_base_url,
             )?;
+        }
+
+        // Git forge channel: a PAT-backed provider must name its API origin
+        // explicitly. There is deliberately no default host - every request
+        // carries `access_token` as a bearer credential, so guessing an
+        // endpoint (e.g. gitea.com) would disclose the token to a host the
+        // operator never configured. Only enabled aliases are checked so a
+        // half-filled disabled block doesn't fail the whole config.
+        for (alias, git) in &self.channels.git {
+            let provider = git.provider.trim().to_ascii_lowercase();
+            if git.enabled && matches!(provider.as_str(), "gitea" | "forgejo") {
+                let path = format!("channels.git.{alias}.api_base_url");
+                match git.api_base_url.as_deref() {
+                    None => validation_bail!(
+                        RequiredFieldEmpty,
+                        path,
+                        "{path} is required when provider = \"{provider}\": set the \
+                         instance's API base URL including /api/v1 (e.g. \
+                         https://git.example.org/api/v1); no default host is assumed \
+                         because API requests carry the access token"
+                    ),
+                    Some(url) => validate_http_base_url(&path, url)?,
+                }
+            }
         }
 
         for name in self.http_request.secrets.keys() {
@@ -21033,6 +21363,82 @@ mod tests {
     }
 
     #[test]
+    async fn git_events_routing_table_parses_dotted_keys_and_defaults() {
+        let cfg: GitConfig = ::toml::from_str(
+            r#"
+            enabled = true
+            app_id = 12345
+            private_key_path = "~/.zeroclaw/github-app.pem"
+            events_backbone = true
+
+            [events]
+            "pull_request.opened" = { sop = "pr-triage" }
+            "issues.opened" = { sop = "issue-triage" }
+            "issue_comment.created" = { message = true }
+            "workflow_run.failed" = { sop = "ci-failure" }
+            "#,
+        )
+        .unwrap();
+        // Provider defaults to github when the field is omitted.
+        assert_eq!(cfg.provider, "github");
+        assert!(cfg.events_backbone);
+        assert_eq!(cfg.events.len(), 4);
+        let pr = &cfg.events["pull_request.opened"];
+        assert_eq!(pr.sop.as_deref(), Some("pr-triage"));
+        assert!(!pr.message);
+        assert!(cfg.events["issue_comment.created"].message);
+        assert!(cfg.events["issue_comment.created"].sop.is_none());
+
+        // An explicit provider round-trips.
+        let gitlab: GitConfig = ::toml::from_str("enabled = true\nprovider = \"gitlab\"").unwrap();
+        assert_eq!(gitlab.provider, "gitlab");
+
+        // Absent table: empty map, backbone off — the conversational
+        // defaults live in the channel's router, not here.
+        let bare: GitConfig = ::toml::from_str("enabled = true").unwrap();
+        assert!(bare.events.is_empty());
+        assert!(!bare.events_backbone);
+    }
+
+    #[test]
+    async fn git_gitea_provider_fields_parse() {
+        let cfg: GitConfig = ::toml::from_str(
+            r#"
+            enabled = true
+            provider = "forgejo"
+            api_base_url = "https://git.example.org/api/v1"
+            access_token = "token-value"
+            repos = ["team/project"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.provider, "forgejo");
+        assert_eq!(
+            cfg.api_base_url.as_deref(),
+            Some("https://git.example.org/api/v1")
+        );
+        assert_eq!(cfg.access_token, "token-value");
+        assert_eq!(cfg.repos, vec!["team/project"]);
+    }
+
+    #[test]
+    async fn git_gitea_access_token_is_secret() {
+        assert!(GitConfig::prop_is_secret("channels.git.access_token"));
+
+        let cfg = GitConfig {
+            access_token: "token-value".to_string(),
+            ..Default::default()
+        };
+        let fields = cfg.secret_fields();
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.name == "channels.git.access_token" && field.is_set),
+            "Gitea/Forgejo access_token must be secret-classified and set"
+        );
+    }
+
+    #[test]
     async fn amqp_validate_requires_paired_client_cert_and_key() {
         let base = AmqpConfig {
             enabled: true,
@@ -22100,6 +22506,98 @@ api_base_url = "http://127.0.0.1:8081"
         assert!(msg.contains("channels.telegram.default.api_base_url"));
     }
 
+    // Regression (fail closed, both PAT-backed forge providers): a Gitea or
+    // Forgejo alias with an access token but no api_base_url must be rejected
+    // at config-validation time. The old behavior silently defaulted to
+    // https://gitea.com/api/v1 and sent the configured token there.
+    #[test]
+    async fn validate_rejects_gitea_forgejo_without_api_base_url() {
+        for provider in ["gitea", "forgejo"] {
+            let mut config = Config::default();
+            config.channels.git.insert(
+                "default".to_string(),
+                GitConfig {
+                    enabled: true,
+                    provider: provider.to_string(),
+                    access_token: "tok".into(),
+                    ..Default::default()
+                },
+            );
+
+            let err = config
+                .validate()
+                .expect_err("a PAT-backed forge provider without api_base_url must be rejected");
+            let msg = err.to_string();
+            assert!(msg.contains("channels.git.default.api_base_url"), "{msg}");
+            assert!(msg.contains(provider), "{msg}");
+        }
+    }
+
+    #[test]
+    async fn validate_rejects_blank_or_malformed_gitea_api_base_url() {
+        for bad in ["   ", "not a url", "ftp://git.example.org/api/v1"] {
+            let mut config = Config::default();
+            config.channels.git.insert(
+                "default".to_string(),
+                GitConfig {
+                    enabled: true,
+                    provider: "gitea".to_string(),
+                    access_token: "tok".into(),
+                    api_base_url: Some(bad.to_string()),
+                    ..Default::default()
+                },
+            );
+
+            let err = config
+                .validate()
+                .expect_err("blank or malformed Gitea API base URL must be rejected");
+            let msg = err.to_string();
+            assert!(msg.contains("channels.git.default.api_base_url"), "{msg}");
+        }
+    }
+
+    // The requirement is scoped to enabled PAT-backed providers: the GitHub
+    // provider has no api_base_url, and a disabled half-filled Gitea block
+    // must not fail the whole config.
+    #[test]
+    async fn validate_git_api_base_url_scope() {
+        let mut config = Config::default();
+        config.channels.git.insert(
+            "default".to_string(),
+            GitConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.channels.git.insert(
+            "disabled_gitea".to_string(),
+            GitConfig {
+                enabled: false,
+                provider: "gitea".to_string(),
+                access_token: "tok".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .validate()
+            .expect("github provider and disabled gitea alias must validate");
+
+        let mut config = Config::default();
+        config.channels.git.insert(
+            "default".to_string(),
+            GitConfig {
+                enabled: true,
+                provider: "forgejo".to_string(),
+                access_token: "tok".into(),
+                api_base_url: Some("https://git.example.org/api/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        config
+            .validate()
+            .expect("forgejo with an explicit api_base_url must validate");
+    }
+
     #[test]
     async fn observability_enums_deserialize_legacy_string_values() {
         // Backward compat: TOML configs written before the enum conversion
@@ -22696,6 +23194,7 @@ auto_save = true
                 clawdtalk: HashMap::new(),
                 reddit: HashMap::new(),
                 bluesky: HashMap::new(),
+                git: HashMap::new(),
                 voice_call: HashMap::new(),
                 voice_duplex: HashMap::new(),
                 voice_wake: HashMap::new(),
@@ -24233,6 +24732,7 @@ allowed_users = ["@u:matrix.org"]
             clawdtalk: HashMap::new(),
             reddit: HashMap::new(),
             bluesky: HashMap::new(),
+            git: HashMap::new(),
             voice_call: HashMap::new(),
             voice_duplex: HashMap::new(),
             voice_wake: HashMap::new(),
@@ -24754,6 +25254,7 @@ allowed_numbers = ["+1", "+2"]
             clawdtalk: HashMap::new(),
             reddit: HashMap::new(),
             bluesky: HashMap::new(),
+            git: HashMap::new(),
             voice_call: HashMap::new(),
             voice_duplex: HashMap::new(),
             voice_wake: HashMap::new(),
@@ -28216,6 +28717,130 @@ require_otp_to_resume = true
         };
         let err = validate_mcp_config(&cfg).expect_err("invalid url should fail");
         assert!(err.to_string().contains("valid URL"), "got: {err}");
+    }
+
+    #[test]
+    async fn mcp_transport_required_leaf_is_the_single_source() {
+        // The relationship every consumer reads. Wire names must match the
+        // `rename_all = "lowercase"` serde representation.
+        assert_eq!(McpTransport::Stdio.required_leaf(), "command");
+        assert_eq!(McpTransport::Http.required_leaf(), "url");
+        assert_eq!(McpTransport::Sse.required_leaf(), "url");
+        assert_eq!(McpTransport::Stdio.wire_name(), "stdio");
+        assert_eq!(McpTransport::Http.wire_name(), "http");
+        assert_eq!(McpTransport::Sse.wire_name(), "sse");
+        // The schema-derived enumerator must surface every variant, and
+        // `wire_name` must agree with serde for each, or the emitted metadata
+        // desyncs from the wire representation the form reads.
+        let transports = mcp_transports();
+        assert_eq!(
+            transports,
+            vec![McpTransport::Stdio, McpTransport::Http, McpTransport::Sse]
+        );
+        for transport in transports {
+            let wire = serde_json::to_value(transport).expect("transport serializes");
+            assert_eq!(
+                wire,
+                serde_json::Value::String(transport.wire_name().into())
+            );
+        }
+    }
+
+    #[test]
+    async fn validate_mcp_config_enforces_required_leaf_for_every_transport() {
+        // Drift guard: whatever `required_leaf` declares, the validator must
+        // actually enforce, so the schema metadata and the runtime check can
+        // never disagree about which field a transport needs.
+        for transport in mcp_transports() {
+            let mut server = McpServerConfig {
+                name: "svc".to_string(),
+                transport,
+                ..Default::default()
+            };
+            // Populate every required leaf except the one under test, leaving
+            // the declared `required_leaf` empty, and confirm rejection.
+            match transport.required_leaf() {
+                "command" => server.command = String::new(),
+                "url" => {
+                    server.command = "echo".to_string();
+                    server.url = None;
+                }
+                other => panic!("unhandled required leaf {other} for {transport:?}"),
+            }
+            let cfg = McpConfig {
+                enabled: true,
+                servers: vec![server],
+                ..Default::default()
+            };
+            validate_mcp_config(&cfg).expect_err(&format!(
+                "{transport:?} must reject an empty {}",
+                transport.required_leaf()
+            ));
+        }
+    }
+
+    #[test]
+    async fn mcp_server_schema_emits_required_by_transport_metadata() {
+        // The config form reads `x-required-by-transport` off the
+        // `McpServerConfig` element schema; assert it is present and projects
+        // exactly `McpTransport::required_leaf` for every variant.
+        #[cfg(feature = "schema-export")]
+        let schema = schemars::schema_for!(McpServerConfig);
+        let schema_json = serde_json::to_value(&schema).expect("schema serializes to json");
+        let map = schema_json
+            .get("x-required-by-transport")
+            .and_then(serde_json::Value::as_object)
+            .expect("schema should carry the x-required-by-transport extension");
+        let transports = mcp_transports();
+        assert_eq!(map.len(), transports.len());
+        for transport in transports {
+            assert_eq!(
+                map.get(transport.wire_name())
+                    .and_then(serde_json::Value::as_str),
+                Some(transport.required_leaf()),
+                "metadata for {transport:?} must match required_leaf",
+            );
+        }
+    }
+
+    #[test]
+    async fn full_config_schema_nests_required_by_transport_on_mcp_server_def() {
+        // The gateway serves `schema_for!(Config)` to the Operator Console; the
+        // extension must survive into that full document (under `$defs`) where
+        // the form resolves the `mcp.servers` element type, not just on the
+        // standalone struct schema.
+        #[cfg(feature = "schema-export")]
+        let schema = schemars::schema_for!(Config);
+        let schema_json = serde_json::to_value(&schema).expect("schema serializes to json");
+
+        fn find_extension(
+            value: &serde_json::Value,
+        ) -> Option<&serde_json::Map<String, serde_json::Value>> {
+            match value {
+                serde_json::Value::Object(obj) => {
+                    if let Some(found) = obj
+                        .get("x-required-by-transport")
+                        .and_then(serde_json::Value::as_object)
+                    {
+                        return Some(found);
+                    }
+                    obj.values().find_map(find_extension)
+                }
+                serde_json::Value::Array(items) => items.iter().find_map(find_extension),
+                _ => None,
+            }
+        }
+
+        let map = find_extension(&schema_json).expect(
+            "full Config schema should carry x-required-by-transport on the mcp server def",
+        );
+        for transport in mcp_transports() {
+            assert_eq!(
+                map.get(transport.wire_name())
+                    .and_then(serde_json::Value::as_str),
+                Some(transport.required_leaf()),
+            );
+        }
     }
 
     #[test]

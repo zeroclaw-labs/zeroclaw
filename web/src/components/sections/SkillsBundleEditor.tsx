@@ -17,10 +17,14 @@ import {
   createSkill,
   deleteSkill,
   listSkillsInBundle,
+  listSlashOptionKinds,
   readSkill,
   writeSkill,
   type SkillEntry,
   type SkillFrontmatter,
+  type SkillSlashChoice,
+  type SkillSlashOption,
+  type SlashOptionKindDescriptor,
 } from '../../lib/api';
 
 interface Props {
@@ -168,13 +172,25 @@ export default function SkillsBundleEditor({ bundle }: Props) {
   };
 
   const setTags = (tags: string[]) => {
+    setBuffer((prev) => {
+      if (!prev) return prev;
+      const frontmatter = { ...prev.draft.frontmatter, tags };
+      // Dropping the `slash` tag retires the command, so clear its now-orphaned
+      // typed options: the options editor is gated on the tag, so otherwise they
+      // would persist invisibly and silently reappear if the tag is re-added.
+      if (!tags.includes('slash')) frontmatter.slash_options = [];
+      return { ...prev, draft: { ...prev.draft, frontmatter } };
+    });
+  };
+
+  const setSlashOptions = (slash_options: SkillSlashOption[]) => {
     setBuffer((prev) =>
       prev
         ? {
             ...prev,
             draft: {
               ...prev.draft,
-              frontmatter: { ...prev.draft.frontmatter, tags },
+              frontmatter: { ...prev.draft.frontmatter, slash_options },
             },
           }
         : prev,
@@ -307,6 +323,12 @@ export default function SkillsBundleEditor({ bundle }: Props) {
             onChange={setFrontmatterField}
             onTagsChange={setTags}
           />
+          {(buffer.draft.frontmatter.tags ?? []).includes('slash') && (
+            <SlashOptionsEditor
+              options={buffer.draft.frontmatter.slash_options ?? []}
+              onChange={setSlashOptions}
+            />
+          )}
           <div
             className="rounded-xl border overflow-hidden"
             style={{ borderColor: 'var(--pc-border)' }}
@@ -561,6 +583,410 @@ function Field({ label, value, onChange, placeholder }: FieldProps) {
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
         className="rounded-md border bg-transparent px-3 py-1.5 text-sm"
+        style={{ borderColor: 'var(--pc-border)' }}
+      />
+    </div>
+  );
+}
+
+// The typed slash-option model (zeroclaw-labs/zeroclaw#8021), shaped after
+// Discord's application command option types. The kind list and which
+// constraints each kind carries (choices / numeric bounds / length bounds) are
+// NOT restated here: the editor fetches the backend registry
+// (`listSlashOptionKinds`, built by walking the backend `SlashOptionKind` enum)
+// and walks it. The Discord layer drops bounds/choices that don't match the
+// type and sorts required options first, so the editor only gates which inputs
+// are *offered* per kind; it does not enforce order.
+
+interface SlashOptionsEditorProps {
+  options: SkillSlashOption[];
+  onChange: (options: SkillSlashOption[]) => void;
+}
+
+/**
+ * Bespoke editor for a `slash`-tagged skill's typed slash-command options.
+ * The flat frontmatter form can't express this nested list, so it lives here
+ * (the data model is round-tripped by the runtime; see
+ * SkillFrontmatter::slash_options). Only rendered when the `slash` tag is on.
+ */
+function SlashOptionsEditor({ options, onChange }: SlashOptionsEditorProps) {
+  const [kinds, setKinds] = useState<SlashOptionKindDescriptor[]>([]);
+  useEffect(() => {
+    let live = true;
+    listSlashOptionKinds()
+      .then((r) => {
+        if (live) setKinds(r.kinds);
+      })
+      .catch(() => {
+        if (live) setKinds([]);
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  const update = (i: number, patch: Partial<SkillSlashOption>) =>
+    onChange(options.map((o, idx) => (idx === i ? { ...o, ...patch } : o)));
+  const remove = (i: number) => onChange(options.filter((_, idx) => idx !== i));
+  const move = (i: number, dir: -1 | 1) => {
+    const j = i + dir;
+    if (j < 0 || j >= options.length) return;
+    const next = options.slice();
+    const a = next[i];
+    const b = next[j];
+    if (a === undefined || b === undefined) return;
+    next[i] = b;
+    next[j] = a;
+    onChange(next);
+  };
+  const add = () => {
+    const first = kinds[0]?.manifest_name;
+    if (first === undefined) return;
+    onChange([
+      ...options,
+      { name: '', description: '', type: first, required: false },
+    ]);
+  };
+
+  return (
+    <div
+      className="rounded-xl border p-4 flex flex-col gap-3"
+      style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}
+    >
+      <div className="flex items-center justify-between">
+        <div className="flex flex-col">
+          <span className="text-sm" style={{ color: 'var(--pc-text-secondary)' }}>
+            Slash command options
+          </span>
+          <span className="text-xs" style={{ color: 'var(--pc-text-faint)' }}>
+            Typed parameters this <code>/command</code> accepts. With none, the
+            skill runs with a single free-text argument.
+          </span>
+        </div>
+        <button
+          type="button"
+          onClick={add}
+          disabled={kinds.length === 0}
+          className="btn-secondary text-xs whitespace-nowrap disabled:opacity-40"
+        >
+          + Add option
+        </button>
+      </div>
+
+      {options.length === 0 ? (
+        <p className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+          No options yet.
+        </p>
+      ) : (
+        <div className="flex flex-col gap-3">
+          {options.map((opt, i) => (
+            <SlashOptionCard
+              key={i}
+              option={opt}
+              index={i}
+              count={options.length}
+              kinds={kinds}
+              onChange={(patch) => update(i, patch)}
+              onRemove={() => remove(i)}
+              onMove={(dir) => move(i, dir)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface SlashOptionCardProps {
+  option: SkillSlashOption;
+  index: number;
+  count: number;
+  kinds: SlashOptionKindDescriptor[];
+  onChange: (patch: Partial<SkillSlashOption>) => void;
+  onRemove: () => void;
+  onMove: (dir: -1 | 1) => void;
+}
+
+function SlashOptionCard({
+  option,
+  index,
+  count,
+  kinds,
+  onChange,
+  onRemove,
+  onMove,
+}: SlashOptionCardProps) {
+  const kind = kinds.find((k) => k.manifest_name === option.type);
+  const isNumeric = kind?.supports_numeric_bounds ?? false;
+  const isString = kind?.supports_length_bounds ?? false;
+  const hasChoices = kind?.supports_choices ?? false;
+
+  // Switching to a kind that no longer supports a constraint clears it, so the
+  // saved frontmatter never carries a bound the channel would silently drop.
+  // The capability flags come from the registry, not a hardcoded per-type map.
+  const onType = (type: string) => {
+    const next = kinds.find((k) => k.manifest_name === type);
+    const patch: Partial<SkillSlashOption> = { type };
+    if (!(next?.supports_numeric_bounds ?? false)) {
+      patch.min = null;
+      patch.max = null;
+    }
+    if (!(next?.supports_length_bounds ?? false)) {
+      patch.min_length = null;
+      patch.max_length = null;
+    }
+    if (!(next?.supports_choices ?? false)) patch.choices = [];
+    onChange(patch);
+  };
+
+  return (
+    <div
+      className="rounded-lg border p-3 flex flex-col gap-2"
+      style={{ borderColor: 'var(--pc-border)' }}
+    >
+      <div className="flex flex-wrap items-end gap-2">
+        <div className="flex flex-col gap-1 flex-1 min-w-[8rem]">
+          <label className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+            Name
+          </label>
+          <input
+            type="text"
+            value={option.name}
+            onChange={(e) => onChange({ name: e.target.value })}
+            placeholder="lowercase_name"
+            aria-label={`Option ${index + 1} name`}
+            className="rounded-md border bg-transparent px-2 py-1 text-sm"
+            style={{ borderColor: 'var(--pc-border)' }}
+          />
+        </div>
+        <div className="flex flex-col gap-1">
+          <label className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+            Type
+          </label>
+          <select
+            value={option.type}
+            onChange={(e) => onType(e.target.value)}
+            aria-label={`Option ${index + 1} type`}
+            className="rounded-md border bg-transparent px-2 py-1 text-sm"
+            style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text)' }}
+          >
+            {kinds.map((k) => (
+              <option
+                key={k.manifest_name}
+                value={k.manifest_name}
+                style={{ color: '#000', background: '#fff' }}
+              >
+                {k.manifest_name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <label className="flex items-center gap-1.5 cursor-pointer select-none pb-1.5">
+          <input
+            type="checkbox"
+            checked={option.required ?? false}
+            onChange={(e) => onChange({ required: e.target.checked })}
+          />
+          <span className="text-xs" style={{ color: 'var(--pc-text-secondary)' }}>
+            Required
+          </span>
+        </label>
+        <div className="flex-1" />
+        <div className="flex items-center gap-1 pb-1">
+          <button
+            type="button"
+            onClick={() => onMove(-1)}
+            disabled={index === 0}
+            aria-label={`Move option ${index + 1} up`}
+            className="text-xs px-1.5 py-0.5 rounded border disabled:opacity-30"
+            style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-muted)' }}
+          >
+            ↑
+          </button>
+          <button
+            type="button"
+            onClick={() => onMove(1)}
+            disabled={index === count - 1}
+            aria-label={`Move option ${index + 1} down`}
+            className="text-xs px-1.5 py-0.5 rounded border disabled:opacity-30"
+            style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-muted)' }}
+          >
+            ↓
+          </button>
+          <button
+            type="button"
+            onClick={onRemove}
+            aria-label="Remove option"
+            className="text-xs px-1.5 py-0.5 rounded border"
+            style={{ borderColor: 'var(--pc-border)', color: '#f87171' }}
+          >
+            ×
+          </button>
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-1">
+        <label className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+          Description
+        </label>
+        <input
+          type="text"
+          value={option.description}
+          onChange={(e) => onChange({ description: e.target.value })}
+          placeholder="Shown to the user when picking this option"
+          aria-label={`Option ${index + 1} description`}
+          className="rounded-md border bg-transparent px-2 py-1 text-sm"
+          style={{ borderColor: 'var(--pc-border)' }}
+        />
+      </div>
+
+      {isNumeric && (
+        <div className="flex flex-wrap gap-2">
+          <NumField
+            label="Min"
+            value={option.min}
+            onChange={(v) => onChange({ min: v })}
+          />
+          <NumField
+            label="Max"
+            value={option.max}
+            onChange={(v) => onChange({ max: v })}
+          />
+        </div>
+      )}
+
+      {isString && (
+        <div className="flex flex-wrap gap-2">
+          <NumField
+            label="Min length"
+            value={option.min_length}
+            onChange={(v) => onChange({ min_length: clampLen(v) })}
+            integer
+          />
+          <NumField
+            label="Max length"
+            value={option.max_length}
+            onChange={(v) => onChange({ max_length: clampLen(v) })}
+            integer
+          />
+        </div>
+      )}
+
+      {hasChoices && (
+        <ChoicesEditor
+          choices={option.choices ?? []}
+          onChange={(choices) => onChange({ choices })}
+        />
+      )}
+    </div>
+  );
+}
+
+// Length bounds are u32 on the backend; keep them non-negative integers.
+function clampLen(v: number | null): number | null {
+  if (v === null) return null;
+  return Math.max(0, Math.round(v));
+}
+
+interface ChoicesEditorProps {
+  choices: SkillSlashChoice[];
+  onChange: (choices: SkillSlashChoice[]) => void;
+}
+
+/** Predefined choices (a dropdown in Discord). `value` is the text handed to
+ *  the skill; `name` is what the user sees. */
+function ChoicesEditor({ choices, onChange }: ChoicesEditorProps) {
+  const update = (i: number, patch: Partial<SkillSlashChoice>) =>
+    onChange(choices.map((c, idx) => (idx === i ? { ...c, ...patch } : c)));
+  const remove = (i: number) => onChange(choices.filter((_, idx) => idx !== i));
+  const add = () => onChange([...choices, { name: '', value: '' }]);
+
+  return (
+    <div
+      className="flex flex-col gap-1.5 border-t pt-2"
+      style={{ borderColor: 'var(--pc-border)' }}
+    >
+      <div className="flex items-center justify-between">
+        <label className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+          Choices <span style={{ color: 'var(--pc-text-faint)' }}>(optional, a fixed dropdown)</span>
+        </label>
+        <button
+          type="button"
+          onClick={add}
+          className="text-xs px-2 py-0.5 rounded border"
+          style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-muted)' }}
+        >
+          + Choice
+        </button>
+      </div>
+      {choices.map((c, i) => (
+        <div key={i} className="flex items-center gap-2">
+          <input
+            type="text"
+            value={c.name}
+            onChange={(e) => update(i, { name: e.target.value })}
+            placeholder="label"
+            aria-label={`Choice ${i + 1} label`}
+            className="rounded-md border bg-transparent px-2 py-1 text-xs flex-1"
+            style={{ borderColor: 'var(--pc-border)' }}
+          />
+          <span className="text-xs" style={{ color: 'var(--pc-text-faint)' }}>
+            →
+          </span>
+          <input
+            type="text"
+            value={c.value}
+            onChange={(e) => update(i, { value: e.target.value })}
+            placeholder="value"
+            aria-label={`Choice ${i + 1} value`}
+            className="rounded-md border bg-transparent px-2 py-1 text-xs flex-1 font-mono"
+            style={{ borderColor: 'var(--pc-border)' }}
+          />
+          <button
+            type="button"
+            onClick={() => remove(i)}
+            aria-label={`Remove choice ${i + 1}`}
+            className="text-xs leading-none"
+            style={{ color: 'var(--pc-text-muted)' }}
+          >
+            ×
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+interface NumFieldProps {
+  label: string;
+  value: number | null | undefined;
+  onChange: (value: number | null) => void;
+  integer?: boolean;
+}
+
+// A clearable numeric input: empty string maps to null (the option carries no
+// bound), any parseable number maps through. `integer` switches the step hint.
+function NumField({ label, value, onChange, integer }: NumFieldProps) {
+  return (
+    <div className="flex flex-col gap-1">
+      <label className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+        {label}
+      </label>
+      <input
+        type="number"
+        step={integer ? 1 : 'any'}
+        value={value ?? ''}
+        onChange={(e) => {
+          const raw = e.target.value;
+          if (raw === '') {
+            onChange(null);
+            return;
+          }
+          const n = Number(raw);
+          // Reject NaN and +/-Infinity (the backend bound is a finite f64).
+          onChange(Number.isFinite(n) ? n : null);
+        }}
+        className="rounded-md border bg-transparent px-2 py-1 text-sm w-24"
         style={{ borderColor: 'var(--pc-border)' }}
       />
     </div>
