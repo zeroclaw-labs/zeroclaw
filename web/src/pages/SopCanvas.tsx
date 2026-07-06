@@ -713,13 +713,13 @@ export default function SopCanvas({
           height={nodeHeight(node)}
           rx={10}
           fill="var(--pc-bg-surface)"
-          stroke={nodeStateStroke(state)}
+          stroke={selected ? 'var(--pc-accent)' : nodeStateStroke(state)}
           strokeWidth={selected ? 2.5 : 1.5}
         />
         <rect width={NODE_W} height={26} rx={10} fill="var(--pc-bg-elevated)" />
         <rect y={16} width={NODE_W} height={10} fill="var(--pc-bg-elevated)" />
-        <circle cx={16} cy={13} r={9} fill="var(--pc-accent-dim)" />
-        <text x={16} y={17} fontSize="11" textAnchor="middle" fill="var(--pc-accent)">
+        <circle cx={16} cy={13} r={9} fill="var(--pc-accent)" />
+        <text x={16} y={17} fontSize="11" textAnchor="middle" fill="#0b1220" fontWeight="600">
           {node.step}
         </text>
         <text x={32} y={17} fontSize="12" fill="var(--pc-text-primary)">
