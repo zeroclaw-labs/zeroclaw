@@ -1477,7 +1477,7 @@ export default function Sops() {
     : null;
 
   return (
-    <div className="space-y-4">
+    <div className="p-6 space-y-6 animate-fade-in">
       <PageHeader
         title={t('sops.title')}
         description={t('sops.subtitle')}
