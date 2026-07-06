@@ -329,12 +329,18 @@ enum OverrideScope {
     Agent,
 }
 
-impl OverrideScope {
-    fn label(self) -> &'static str {
-        match self {
-            OverrideScope::User => "user",
-            OverrideScope::Agent => "agent",
-        }
+fn channel_runtime_cli_string(key: &str) -> String {
+    zeroclaw_runtime::i18n::get_required_cli_string(key)
+}
+
+fn channel_runtime_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
+    zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
+}
+
+fn channel_runtime_scope_label(scope: OverrideScope) -> String {
+    match scope {
+        OverrideScope::User => channel_runtime_cli_string("channel-runtime-scope-user"),
+        OverrideScope::Agent => channel_runtime_cli_string("channel-runtime-scope-agent"),
     }
 }
 
@@ -1981,8 +1987,14 @@ fn shadow_note(
         String::new()
     } else {
         format!(
-            "\n⚠️ A higher-precedence override is active, so messages will use `{}` (`{}`) instead — see `/model`.",
-            effective.model, effective.model_provider
+            "\n{}",
+            channel_runtime_cli_string_with_args(
+                "channel-runtime-shadow-note",
+                &[
+                    ("model", effective.model.as_str()),
+                    ("provider", effective.model_provider.as_str()),
+                ],
+            )
         )
     }
 }
@@ -2441,15 +2453,25 @@ fn build_models_help_response(
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
 ) -> String {
     let mut response = String::new();
-    let _ = writeln!(
-        response,
-        "Current model_provider: `{}`\nCurrent model: `{}`",
-        current.model_provider, current.model
-    );
-    response.push_str("\nSwitch model with `/model <model-id>` or `/model <hint>`.\n");
+    response.push_str(&channel_runtime_cli_string_with_args(
+        "channel-runtime-current-model-status",
+        &[
+            ("provider", current.model_provider.as_str()),
+            ("model", current.model.as_str()),
+        ],
+    ));
+    response.push('\n');
+    response.push_str(&channel_runtime_cli_string(
+        "channel-runtime-model-switch-hint",
+    ));
+    response.push('\n');
 
     if !model_routes.is_empty() {
-        response.push_str("\nConfigured model routes:\n");
+        response.push('\n');
+        response.push_str(&channel_runtime_cli_string(
+            "channel-runtime-configured-routes-header",
+        ));
+        response.push('\n');
         for route in model_routes {
             let _ = writeln!(
                 response,
@@ -2461,17 +2483,19 @@ fn build_models_help_response(
 
     let cached_models = load_cached_model_preview(workspace_dir, &current.model_provider);
     if cached_models.is_empty() {
-        let _ = writeln!(
-            response,
-            "\nNo cached model list found for `{}`. Ask the operator to run `zeroclaw models refresh --model-provider {}`.",
-            current.model_provider, current.model_provider
-        );
+        response.push('\n');
+        response.push_str(&channel_runtime_cli_string_with_args(
+            "channel-runtime-no-cached-models",
+            &[("provider", current.model_provider.as_str())],
+        ));
+        response.push('\n');
     } else {
-        let _ = writeln!(
-            response,
-            "\nCached model IDs (top {}):",
-            cached_models.len()
-        );
+        response.push('\n');
+        response.push_str(&channel_runtime_cli_string_with_args(
+            "channel-runtime-cached-model-ids-header",
+            &[("count", &cached_models.len().to_string())],
+        ));
+        response.push('\n');
         for model in cached_models {
             let _ = writeln!(response, "- `{model}`");
         }
@@ -2482,14 +2506,26 @@ fn build_models_help_response(
 
 fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     let mut response = String::new();
-    let _ = writeln!(
-        response,
-        "Current model_provider: `{}`\nCurrent model: `{}`",
-        current.model_provider, current.model
-    );
-    response.push_str("\nSwitch model_provider with `/models <model_provider>`.\n");
-    response.push_str("Switch model with `/model <model-id>`.\n\n");
-    response.push_str("Available model model_providers:\n");
+    response.push_str(&channel_runtime_cli_string_with_args(
+        "channel-runtime-current-model-status",
+        &[
+            ("provider", current.model_provider.as_str()),
+            ("model", current.model.as_str()),
+        ],
+    ));
+    response.push('\n');
+    response.push_str(&channel_runtime_cli_string(
+        "channel-runtime-provider-switch-hint",
+    ));
+    response.push('\n');
+    response.push_str(&channel_runtime_cli_string(
+        "channel-runtime-model-switch-hint",
+    ));
+    response.push_str("\n\n");
+    response.push_str(&channel_runtime_cli_string(
+        "channel-runtime-available-providers-header",
+    ));
+    response.push('\n');
     for model_provider in zeroclaw_providers::list_model_providers() {
         let _ = writeln!(response, "- {}", model_provider.name);
     }
@@ -2503,17 +2539,28 @@ fn build_config_text_response(
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
 ) -> String {
     let mut resp = String::new();
-    let _ = writeln!(
-        resp,
-        "Current model_provider: `{}`\nCurrent model: `{}`",
-        current.model_provider, current.model
-    );
-    resp.push_str("\nAvailable model_providers:\n");
+    resp.push_str(&channel_runtime_cli_string_with_args(
+        "channel-runtime-current-model-status",
+        &[
+            ("provider", current.model_provider.as_str()),
+            ("model", current.model.as_str()),
+        ],
+    ));
+    resp.push('\n');
+    resp.push('\n');
+    resp.push_str(&channel_runtime_cli_string(
+        "channel-runtime-available-providers-header",
+    ));
+    resp.push('\n');
     for p in zeroclaw_providers::list_model_providers() {
         let _ = writeln!(resp, "- `{}`", p.name);
     }
     if !model_routes.is_empty() {
-        resp.push_str("\nConfigured model routes:\n");
+        resp.push('\n');
+        resp.push_str(&channel_runtime_cli_string(
+            "channel-runtime-configured-routes-header",
+        ));
+        resp.push('\n');
         for route in model_routes {
             let _ = writeln!(
                 resp,
@@ -2522,9 +2569,10 @@ fn build_config_text_response(
             );
         }
     }
-    resp.push_str(
-        "\nUse `/models <model_provider>` to switch model_provider.\nUse `/model <model-id>` to switch model.",
-    );
+    resp.push('\n');
+    resp.push_str(&channel_runtime_cli_string(
+        "channel-runtime-config-switch-hints",
+    ));
     resp
 }
 
@@ -2611,7 +2659,10 @@ fn build_config_block_kit(
     let mut provider_select = serde_json::json!({
         "type": "static_select",
         "action_id": "zeroclaw_config_provider",
-        "placeholder": { "type": "plain_text", "text": "Select model_provider" },
+        "placeholder": {
+            "type": "plain_text",
+            "text": channel_runtime_cli_string("channel-runtime-config-select-provider-placeholder")
+        },
         "options": provider_options
     });
     if let Some(init) = initial_provider {
@@ -2621,7 +2672,10 @@ fn build_config_block_kit(
     let mut model_select = serde_json::json!({
         "type": "static_select",
         "action_id": "zeroclaw_config_model",
-        "placeholder": { "type": "plain_text", "text": "Select model" },
+        "placeholder": {
+            "type": "plain_text",
+            "text": channel_runtime_cli_string("channel-runtime-config-select-model-placeholder")
+        },
         "options": model_options
     });
     if let Some(init) = initial_model {
@@ -2633,22 +2687,31 @@ fn build_config_block_kit(
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": format!(
-                    "*Model Configuration*\nCurrent: `{}` / `{}`",
-                    current.model_provider, current.model
+                "text": channel_runtime_cli_string_with_args(
+                    "channel-runtime-config-block-title",
+                    &[
+                        ("provider", current.model_provider.as_str()),
+                        ("model", current.model.as_str()),
+                    ],
                 )
             }
         },
         {
             "type": "section",
             "block_id": "config_provider_block",
-            "text": { "type": "mrkdwn", "text": "*ModelProvider*" },
+            "text": {
+                "type": "mrkdwn",
+                "text": channel_runtime_cli_string("channel-runtime-config-provider-label")
+            },
             "accessory": provider_select
         },
         {
             "type": "section",
             "block_id": "config_model_block",
-            "text": { "type": "mrkdwn", "text": "*Model*" },
+            "text": {
+                "type": "mrkdwn",
+                "text": channel_runtime_cli_string("channel-runtime-config-model-label")
+            },
             "accessory": model_select
         }
     ]);
@@ -2690,11 +2753,18 @@ fn build_scope_override_summary(
         .map(fmt_sel)
         .unwrap_or_else(|| "—".to_string());
     let default = default_route_selection_from_snapshot(defaults_snapshot);
+    let default = fmt_sel(&default);
     format!(
-        "\n\n**Model overrides** (session-only; precedence user > agent > session > default):\n\
-         • user: {user}\n• agent: {agent}\n• session (this chat): {session}\n• default (config): {}\n\
-         Set a scope with `/model --user|--agent <model-id>`; clear by setting it back to the default.",
-        fmt_sel(&default),
+        "\n\n{}",
+        channel_runtime_cli_string_with_args(
+            "channel-runtime-scope-overrides-summary",
+            &[
+                ("user", user.as_str()),
+                ("agent", agent.as_str()),
+                ("session", session.as_str()),
+                ("default", default.as_str()),
+            ],
+        )
     )
 }
 
@@ -2733,15 +2803,22 @@ async fn handle_runtime_command_if_needed(
                                 );
                             }
 
-                            format!(
-                                "ModelProvider switched to `{provider_ref}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
-                                current.model
+                            channel_runtime_cli_string_with_args(
+                                "channel-runtime-set-provider-switched",
+                                &[
+                                    ("provider", provider_ref.as_str()),
+                                    ("model", current.model.as_str()),
+                                ],
                             )
                         }
                         Err(err) => {
                             let safe_err = zeroclaw_providers::sanitize_api_error(&err.to_string());
-                            format!(
-                                "Failed to initialize model_provider `{provider_ref}`. Route unchanged.\nDetails: {safe_err}"
+                            channel_runtime_cli_string_with_args(
+                                "channel-runtime-set-provider-init-failed",
+                                &[
+                                    ("provider", provider_ref.as_str()),
+                                    ("error", safe_err.as_str()),
+                                ],
                             )
                         }
                     }
@@ -2752,15 +2829,20 @@ async fn handle_runtime_command_if_needed(
                         .map(|a| format!("`{family}.{a}`"))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    format!(
-                        "ModelProvider `{family}` has multiple configured aliases. Qualify which one with `/models {family}.<alias>`: {list}"
+                    channel_runtime_cli_string_with_args(
+                        "channel-runtime-provider-ambiguous",
+                        &[("family", family.as_str()), ("list", list.as_str())],
                     )
                 }
-                ModelsCommandResolution::NoAlias(ref_or_family) => format!(
-                    "No configured provider entry for `{ref_or_family}`. Add `[providers.models.{ref_or_family}]` (with its api_key/uri) or select a configured provider — `/models` lists valid ones."
-                ),
-                ModelsCommandResolution::Unknown => format!(
-                    "Unknown model_provider `{raw_model_provider}`. Use `/models` to list valid model_providers."
+                ModelsCommandResolution::NoAlias(ref_or_family) => {
+                    channel_runtime_cli_string_with_args(
+                        "channel-runtime-provider-no-alias",
+                        &[("provider", ref_or_family.as_str())],
+                    )
+                }
+                ModelsCommandResolution::Unknown => channel_runtime_cli_string_with_args(
+                    "channel-runtime-provider-unknown",
+                    &[("provider", raw_model_provider.as_str())],
                 ),
             }
         }
@@ -2776,18 +2858,21 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::SetModelScoped(scope, raw_model) => {
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
-                "Model ID cannot be empty. Use `/model --user|--agent <model-id>`.".to_string()
+                channel_runtime_cli_string("channel-runtime-scoped-model-empty")
             } else {
                 // Resolve provider+model the same way bare `/model` does, then
                 // write it at the requested scope instead of the per-sender route.
                 let mut next = current.clone();
                 apply_model_ref(&mut next, &ctx.model_routes, &model);
                 set_scope_override(ctx, scope, msg, next.clone(), &defaults_snapshot);
-                let mut resp = format!(
-                    "Model set to `{}` (model_provider: `{}`) for the **{}** scope. Session-only — resets on restart.",
-                    next.model,
-                    next.model_provider,
-                    scope.label(),
+                let scope_label = channel_runtime_scope_label(scope);
+                let mut resp = channel_runtime_cli_string_with_args(
+                    "channel-runtime-scoped-model-switched",
+                    &[
+                        ("model", next.model.as_str()),
+                        ("provider", next.model_provider.as_str()),
+                        ("scope", scope_label.as_str()),
+                    ],
                 );
                 resp.push_str(&shadow_note(
                     ctx,
@@ -2802,12 +2887,12 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::SetModel(raw_model) => {
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
-                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-model-empty")
+                channel_runtime_cli_string("channel-runtime-model-empty")
             } else {
                 apply_model_ref(&mut current, &ctx.model_routes, &model);
                 set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
 
-                let mut resp = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                let mut resp = channel_runtime_cli_string_with_args(
                     "channel-runtime-model-switched",
                     &[
                         ("model", current.model.as_str()),
@@ -2860,7 +2945,7 @@ async fn handle_runtime_command_if_needed(
                 );
             }
             mark_sender_for_new_session(ctx, &sender_key);
-            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-new-session")
+            channel_runtime_cli_string("channel-runtime-new-session")
         }
         ChannelRuntimeCommand::SetThinking(level) => match level {
             Some(level) => {
@@ -2868,9 +2953,9 @@ async fn handle_runtime_command_if_needed(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(sender_key.clone(), level);
-                format!(
-                    "Thinking set to `{}` for this sender session.\nUse `/thinking reset` to return to the agent default.",
-                    level.as_str()
+                channel_runtime_cli_string_with_args(
+                    "channel-runtime-thinking-set",
+                    &[("level", level.as_str())],
                 )
             }
             None => {
@@ -2882,18 +2967,21 @@ async fn handle_runtime_command_if_needed(
                     .is_some();
                 let default = ctx.agent_cfg.resolved.thinking.default_level.as_str();
                 if removed {
-                    format!(
-                        "Thinking override cleared. Using agent default `{default}` for this sender session."
+                    channel_runtime_cli_string_with_args(
+                        "channel-runtime-thinking-cleared",
+                        &[("default", default)],
                     )
                 } else {
-                    format!(
-                        "Thinking is already using agent default `{default}` for this sender session.\nUse `/thinking high`, `/thinking max`, or `/thinking off` to override it."
+                    channel_runtime_cli_string_with_args(
+                        "channel-runtime-thinking-default",
+                        &[("default", default)],
                     )
                 }
             }
         },
-        ChannelRuntimeCommand::InvalidThinking(raw) => format!(
-            "Unknown thinking level `{raw}`. Use `/thinking off|minimal|low|medium|high|max`, `/thinking on`, or `/thinking reset`."
+        ChannelRuntimeCommand::InvalidThinking(raw) => channel_runtime_cli_string_with_args(
+            "channel-runtime-thinking-invalid",
+            &[("raw", raw.as_str())],
         ),
     };
 
@@ -4719,9 +4807,12 @@ async fn process_channel_message_body(
         Ok(model_provider) => model_provider,
         Err(err) => {
             let safe_err = zeroclaw_providers::sanitize_api_error(&err.to_string());
-            let message = format!(
-                "⚠️ Failed to initialize model_provider `{}`. Please run `/models` to choose another model_provider.\nDetails: {safe_err}",
-                route.model_provider
+            let message = channel_runtime_cli_string_with_args(
+                "channel-runtime-provider-turn-init-failed",
+                &[
+                    ("provider", route.model_provider.as_str()),
+                    ("error", safe_err.as_str()),
+                ],
             );
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
@@ -5728,13 +5819,12 @@ async fn process_channel_message_body(
                 &ctx.prompt_config.security.leak_detection,
                 outbound_content_format_for_channel(&msg.channel),
             );
-            let mut delivered_response = if sanitized_response.is_empty()
-                && !outbound_response.trim().is_empty()
-            {
-                "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
-            } else {
-                sanitized_response
-            };
+            let mut delivered_response =
+                if sanitized_response.is_empty() && !outbound_response.trim().is_empty() {
+                    channel_runtime_cli_string("channel-runtime-malformed-tool-output")
+                } else {
+                    sanitized_response
+                };
             delivered_response = ensure_nonempty_channel_reply(
                 delivered_response,
                 &outbound_response,
@@ -5751,13 +5841,15 @@ async fn process_channel_message_body(
                     || req_base.starts_with(act_base)
                     || act_base.starts_with(req_base);
                 if !same_family {
-                    use std::fmt::Write as _;
-                    write!(
-                        delivered_response,
-                        "\n\n---\n\u{26A1} `{}` unavailable \u{2014} response from **{}** (`{}`)\nSwitch model: /models",
-                        fb.requested_provider, fb.actual_provider, fb.actual_model,
-                    )
-                    .ok();
+                    delivered_response.push_str("\n\n---\n");
+                    delivered_response.push_str(&channel_runtime_cli_string_with_args(
+                        "channel-runtime-fallback-footer",
+                        &[
+                            ("requested", fb.requested_provider.as_str()),
+                            ("actual", fb.actual_provider.as_str()),
+                            ("model", fb.actual_model.as_str()),
+                        ],
+                    ));
                 }
             }
 
@@ -15724,7 +15816,14 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains("ModelProvider switched to `openrouter.default`"));
+        let expected_reply = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "channel-runtime-set-provider-switched",
+            &[
+                ("provider", "openrouter.default"),
+                ("model", "default-model"),
+            ],
+        );
+        assert!(sent[0].contains(&expected_reply));
 
         let route_key = "telegram_chat-1_alice";
         let route = runtime_ctx
