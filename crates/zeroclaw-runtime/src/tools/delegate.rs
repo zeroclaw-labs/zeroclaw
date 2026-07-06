@@ -729,18 +729,17 @@ impl DelegateTool {
             None,
         );
 
-        // Route the independent-target registry through the one gated seam - the same
-        // `assemble` seam run(), process_message, and the gateway use (from_config's
-        // migration is #8711, in review). Tool-set-neutral on this
-        // path: assemble step 2 filters with the TARGET's SecurityPolicy (the #8239
-        // invariant - target tools, not the caller's), caller_allowed is None (no per-run
-        // allowlist here), and MCP / peripherals / skill-tools / memory-strip are all off,
-        // exactly what this builder did by hand. `emit_assembly_logs: true` because this
-        // is an execution surface (the target then runs a turn), so operators get the same
-        // "which tools were admitted / did policy drop tools" audit breadcrumbs the other
-        // execution paths emit. The `delegate` tool is stripped afterward because
-        // `all_tools_with_runtime` unconditionally injects it and an independent delegate
-        // must not be able to recurse into further delegation.
+        // Route the independent-target registry through the one gated `assemble`
+        // seam. Tool-set-neutral on this path: assemble's built-in filter runs
+        // against the TARGET's SecurityPolicy (target tools, not the caller's),
+        // caller_allowed is None (no per-run allowlist here), and MCP / peripherals
+        // / skill-tools / memory-strip are all off, exactly what this builder did by
+        // hand. `emit_assembly_logs: true` because this is an execution surface (the
+        // target then runs a turn), so operators get the same "which tools were
+        // admitted / did policy drop tools" audit breadcrumbs the other execution
+        // paths emit. The `delegate` tool is stripped afterward because
+        // `all_tools_with_runtime` unconditionally injects it and an independent
+        // delegate must not be able to recurse into further delegation.
         let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
                 config,
