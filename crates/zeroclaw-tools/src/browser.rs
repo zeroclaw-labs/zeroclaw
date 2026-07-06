@@ -975,9 +975,39 @@ impl BrowserTool {
             );
         }
 
-        // Replace the raw user path with the resolved, validated path so
-        // the write always uses the same string we checked.
-        *path = Some(full.to_string_lossy().to_string());
+        // Build the final *target* path (parent + file name) so we can apply
+        // the same target-level guards the file_write / file_edit tools use:
+        // runtime-config protection and existing-symlink rejection. This
+        // closes the gap where a screenshot path inside an allowed workspace
+        // could still overwrite a protected config/state file or write
+        // through a symlink to a location outside the workspace.
+        let Some(file_name) = full.file_name() else {
+            anyhow::bail!("Screenshot path '{path_str}' is missing a file name");
+        };
+        let resolved_target = canonical.join(file_name);
+
+        if self.security.is_runtime_config_path(&resolved_target) {
+            anyhow::bail!(
+                "Screenshot path '{path_str}' targets a runtime config file: {}",
+                resolved_target.display(),
+            );
+        }
+
+        // If the target already exists and is a symlink, refuse to follow it
+        // — the backends' write call would land wherever the symlink points,
+        // which is not the same as `resolved_target`.
+        if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await
+            && meta.file_type().is_symlink()
+        {
+            anyhow::bail!(
+                "Refusing to write screenshot through symlink: {}",
+                resolved_target.display(),
+            );
+        }
+
+        // Replace the raw user path with the canonical target so the write
+        // always uses the same string we checked.
+        *path = Some(resolved_target.to_string_lossy().to_string());
 
         Ok(())
     }
@@ -2962,5 +2992,108 @@ mod tests {
         // Non-screenshot actions pass through without validation
         rt.block_on(tool.validate_screenshot_path(&mut action))
             .expect("non-screenshot action should pass through");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_screenshot_path_rejects_existing_symlink_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Layout: <tmp>/outside/real.txt  <- symlink target outside the workspace
+        //         <tmp>/ws/           (workspace_dir)
+        //         <tmp>/ws/page.png -> ../outside/real.txt  (workspace-resident symlink)
+        let outside_dir = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("real.txt"), "data").unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::os::unix::fs::symlink("../outside/real.txt", ws.join("page.png")).unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: ws.clone(),
+            workspace_only: true,
+            ..Default::default()
+        });
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut action = BrowserAction::Screenshot {
+            path: Some("page.png".into()),
+            full_page: false,
+        };
+        let err = rt
+            .block_on(tool.validate_screenshot_path(&mut action))
+            .unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("symlink"),
+            "expected symlink rejection, got: {err}",
+        );
+    }
+
+    #[test]
+    fn validate_screenshot_path_rejects_runtime_config_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Layout: <tmp>/               (runtime config dir = workspace_dir.parent())
+        //         <tmp>/ws/            (workspace_dir)
+        //
+        // runtime_config_dir is `workspace_dir.parent().canonicalize()` = `<tmp>`.
+        // To land a screenshot target *inside* `<tmp>` while still passing
+        // `is_resolved_path_allowed`, we add `<tmp>` to `allowed_roots` and
+        // ask for the relative path `../config.toml`. That resolves to
+        // `<tmp>/config.toml`, whose parent is `<tmp>` — matching the
+        // runtime_config_dir — and whose file name is the protected
+        // `config.toml`. The runtime_config guard must reject it.
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: ws.clone(),
+            workspace_only: true,
+            allowed_roots: vec![tmp.path().to_path_buf()],
+            ..Default::default()
+        });
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut action = BrowserAction::Screenshot {
+            path: Some("../config.toml".into()),
+            full_page: false,
+        };
+        let err = rt
+            .block_on(tool.validate_screenshot_path(&mut action))
+            .unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("runtime config") || msg.contains("config"),
+            "expected runtime config rejection, got: {err}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_screenshot_path_allows_existing_regular_file_target() {
+        // Existing non-symlink file inside the workspace must still be a
+        // valid screenshot target — the symlink guard only triggers on
+        // symlink metadata. Without this test, a future refactor that
+        // uses `metadata()` instead of `symlink_metadata()` could
+        // accidentally reject legitimate writes.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
+        std::fs::write(ws.join("existing.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: ws.clone(),
+            workspace_only: true,
+            ..Default::default()
+        });
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut action = BrowserAction::Screenshot {
+            path: Some("existing.png".into()),
+            full_page: false,
+        };
+        rt.block_on(tool.validate_screenshot_path(&mut action))
+            .expect("existing regular file inside workspace should be accepted");
     }
 }
