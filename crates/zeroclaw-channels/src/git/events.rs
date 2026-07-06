@@ -26,7 +26,7 @@ use super::types::{
 /// account is a bot. Providers map their native user payloads onto this.
 #[derive(Debug, Clone)]
 pub struct EventActor {
-    /// Account login (`marc`, `dependabot[bot]`, …). Compared
+    /// Account login (`test_user`, `dependabot[bot]`, …). Compared
     /// case-insensitively against the bot login and the allowlist.
     pub login: String,
     /// Whether the account is a bot/service identity.
@@ -699,14 +699,14 @@ mod tests {
 
     #[test]
     fn issue_comment_maps_with_issue_threading() {
-        let event = comment_event("marc", false, "@myapp run the tests", 7);
+        let event = comment_event("test_user", false, "@myapp run the tests", 7);
         assert_eq!(event.event_type(), "issue_comment.created");
         assert_eq!(event.dedup_id(), "ghc_9001");
         assert!(event.is_conversational());
 
         let msg = to_message(&event, &filter(true, false), true).unwrap();
         assert_eq!(msg.id, "ghc_9001");
-        assert_eq!(msg.sender, "marc");
+        assert_eq!(msg.sender, "test_user");
         assert_eq!(msg.reply_target, "octo/repo#7");
         assert_eq!(msg.thread_ts.as_deref(), Some("octo/repo#7"));
         assert_eq!(msg.content, "run the tests");
@@ -720,7 +720,7 @@ mod tests {
             repo: repo(),
             number: 12,
             issue_id: "555".to_string(),
-            author: actor("marc", false),
+            author: actor("test_user", false),
             title: "Flaky test".to_string(),
             body: "@myapp please investigate".to_string(),
             created_at: at("2026-06-13T01:00:00Z"),
@@ -736,7 +736,7 @@ mod tests {
         let pr = GitEvent::PullRequestOpened(PullPost {
             repo: repo(),
             number: 12,
-            author: actor("marc", false),
+            author: actor("test_user", false),
             title: "Flaky test".to_string(),
             body: "x".to_string(),
             created_at: at("2026-06-13T01:00:00Z"),
@@ -751,7 +751,7 @@ mod tests {
         let event = GitEvent::PullRequestOpened(PullPost {
             repo: repo(),
             number: 12,
-            author: actor("marc", false),
+            author: actor("test_user", false),
             title: "Route through SOP".to_string(),
             body: "Please review".to_string(),
             created_at: at("2026-06-13T01:00:00Z"),
@@ -782,7 +782,7 @@ mod tests {
         assert_eq!(payload["event_type"], "pull_request.opened");
         assert_eq!(payload["repo"], "octo/repo");
         assert_eq!(payload["number"], 12);
-        assert_eq!(payload["author"]["login"], "marc");
+        assert_eq!(payload["author"]["login"], "test_user");
         assert_eq!(payload["title"], "Route through SOP");
     }
 
@@ -792,7 +792,7 @@ mod tests {
             repo: repo(),
             number: 12,
             title: "Flaky test".to_string(),
-            author: actor("marc", false),
+            author: actor("test_user", false),
             html_url: "https://github.com/octo/repo/issues/12".to_string(),
             at: at("2026-06-13T02:00:00Z"),
         });
@@ -817,7 +817,7 @@ mod tests {
             branch: Some("feat/x".to_string()),
             run_number: 88,
             pr_number: Some(31),
-            actor: Some(actor("marc", false)),
+            actor: Some(actor("test_user", false)),
             html_url: "https://github.com/octo/repo/actions/runs/77001".to_string(),
             finished_at: at("2026-06-13T01:14:00Z"),
         });
@@ -825,7 +825,7 @@ mod tests {
         assert!(!with_pr.is_conversational());
         // Non-conversational events bypass the mention gate.
         let msg = to_message(&with_pr, &filter(true, false), true).unwrap();
-        assert_eq!(msg.sender, "marc");
+        assert_eq!(msg.sender, "test_user");
         assert_eq!(msg.reply_target, "octo/repo#31");
         assert_eq!(msg.subject.as_deref(), Some("CI"));
         assert!(
@@ -849,7 +849,7 @@ mod tests {
             release_id: "6100".to_string(),
             tag: "v0.9.0".to_string(),
             name: Some("v0.9.0 — events".to_string()),
-            author: actor("marc", false),
+            author: actor("test_user", false),
             body: "Changelog body".to_string(),
             html_url: "https://github.com/octo/repo/releases/tag/v0.9.0".to_string(),
             published_at: at("2026-06-13T01:20:00Z"),
@@ -867,7 +867,7 @@ mod tests {
 
     #[test]
     fn unmentioned_comment_dropped_only_on_the_gated_path() {
-        let event = comment_event("marc", false, "just chatting", 7);
+        let event = comment_event("test_user", false, "just chatting", 7);
         // Message path under mention_only: dropped.
         assert!(to_message(&event, &filter(true, false), true).is_none());
         // mention_only off: accepted.
@@ -904,9 +904,9 @@ mod tests {
 
     #[test]
     fn empty_body_dropped_on_conversational_path() {
-        let event = comment_event("marc", false, "@myapp", 7);
+        let event = comment_event("test_user", false, "@myapp", 7);
         assert!(to_message(&event, &filter(true, false), true).is_none());
-        let event = comment_event("marc", false, "", 7);
+        let event = comment_event("test_user", false, "", 7);
         assert!(to_message(&event, &filter(false, false), true).is_none());
     }
 
@@ -915,7 +915,7 @@ mod tests {
         let event = GitEvent::PullRequestOpened(PullPost {
             repo: repo(),
             number: 12,
-            author: actor("marc", false),
+            author: actor("test_user", false),
             title: "Flaky test".to_string(),
             body: String::new(),
             created_at: at("2026-06-13T01:00:00Z"),

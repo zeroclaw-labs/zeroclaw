@@ -110,7 +110,7 @@ mod tests {
             "index": 7,
             "title": "Bug",
             "body": "Please look",
-            "user": {"login": "marc"},
+            "user": {"login": "test_user"},
             "created_at": "2026-06-13T01:00:00Z",
             "html_url": "https://forgejo.example/forge/project/issues/7"
         }))
@@ -125,7 +125,7 @@ mod tests {
             "index": 8,
             "title": "Patch",
             "body": "Please review",
-            "user": {"login": "marc"},
+            "user": {"login": "test_user"},
             "created_at": "2026-06-13T01:00:00Z",
             "pull_request": {"merged": false},
             "html_url": "https://forgejo.example/forge/project/pulls/8"
