@@ -3389,6 +3389,116 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    #[derive(Clone, Copy)]
+    enum RuntimeStreamPlan {
+        Unsupported,
+        Text(&'static str),
+        Error,
+    }
+
+    struct RuntimeStreamingProbeProvider {
+        stream: RuntimeStreamPlan,
+        chat_text: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for RuntimeStreamingProbeProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok(self.chat_text.unwrap_or("ok").to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            let Some(text) = self.chat_text else {
+                anyhow::bail!("chat path must not be used for this probe");
+            };
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(text.to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            !matches!(self.stream, RuntimeStreamPlan::Unsupported)
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::StreamExt as _;
+
+            match self.stream {
+                RuntimeStreamPlan::Unsupported => futures_util::stream::empty().boxed(),
+                RuntimeStreamPlan::Text(text) => futures_util::stream::iter(vec![
+                    Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
+                        zeroclaw_providers::traits::StreamChunk::delta(text),
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed(),
+                RuntimeStreamPlan::Error => futures_util::stream::iter(vec![Err(
+                    zeroclaw_providers::traits::StreamError::ModelProvider(
+                        "stream failed before output".into(),
+                    ),
+                )])
+                .boxed(),
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for RuntimeStreamingProbeProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "RuntimeStreamingProbeProvider"
+        }
+    }
+
+    fn streaming_probe_reliable_provider(
+        primary: RuntimeStreamingProbeProvider,
+        fallback: RuntimeStreamingProbeProvider,
+    ) -> zeroclaw_providers::reliable::ReliableModelProvider {
+        zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "provider-requested".to_string(),
+                    Box::new(primary) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "provider-served".to_string(),
+                    Box::new(fallback) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        )
+    }
+
     /// End-to-end: a resilient wrapper that fails over to a second entry
     /// mid-turn must surface the downgrade in BOTH the returned response and
     /// the event stream.
@@ -3471,6 +3581,71 @@ mod tests {
         assert!(
             chunk_carried_notice,
             "the notice must also be streamed for delta-only consumers (ZeroCode)"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_turn_surfaces_streaming_provider_fallback_notice() {
+        let reliable = streaming_probe_reliable_provider(
+            RuntimeStreamingProbeProvider {
+                stream: RuntimeStreamPlan::Unsupported,
+                chat_text: None,
+            },
+            RuntimeStreamingProbeProvider {
+                stream: RuntimeStreamPlan::Text("streamed fallback"),
+                chat_text: None,
+            },
+        );
+
+        let mut agent = blank_input_agent(Box::new(reliable));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let outcome = agent
+            .turn_streamed_with_steering_state("hello", tx, None, None)
+            .await
+            .expect("turn must succeed via the streaming fallback entry");
+
+        assert!(
+            outcome.response.contains("streamed fallback")
+                && outcome.response.contains("provider-served"),
+            "final response must include streamed text and fallback notice: {}",
+            outcome.response
+        );
+
+        let mut streamed = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let TurnEvent::Chunk { delta } = event {
+                streamed.push_str(&delta);
+            }
+        }
+        assert!(
+            streamed.contains("streamed fallback") && streamed.contains("provider-served"),
+            "streamed chunks must include the live fallback output and notice: {streamed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_turn_does_not_surface_stale_record_after_stream_error() {
+        let reliable = streaming_probe_reliable_provider(
+            RuntimeStreamingProbeProvider {
+                stream: RuntimeStreamPlan::Unsupported,
+                chat_text: Some("primary final"),
+            },
+            RuntimeStreamingProbeProvider {
+                stream: RuntimeStreamPlan::Error,
+                chat_text: None,
+            },
+        );
+
+        let mut agent = blank_input_agent(Box::new(reliable));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let outcome = agent
+            .turn_streamed_with_steering_state("hello", tx, None, None)
+            .await
+            .expect("pre-output stream error must fall back to primary chat");
+
+        assert_eq!(
+            outcome.response, "primary final",
+            "failed fallback streams must not leave stale fallback notice state"
         );
     }
 
