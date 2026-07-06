@@ -5569,7 +5569,7 @@ pub struct GoogleSttConfig {
 /// Local/self-hosted Whisper-compatible STT endpoint (`[transcription.local_whisper]`).
 ///
 /// Configures a self-hosted STT endpoint. Can be on localhost, a private network host, or any reachable URL.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.local_whisper"]
 pub struct LocalWhisperConfig {
@@ -5600,6 +5600,28 @@ fn default_local_whisper_max_audio_bytes() -> usize {
 
 fn default_local_whisper_timeout_secs() -> u64 {
     300
+}
+
+// `#[derive(Default)]` would leave `max_audio_bytes = 0` and `timeout_secs = 0`
+// (Rust's `usize`/`u64` defaults), even though those fields have serde defaults
+// pointing at the helpers above. `#[serde(default = ...)]` only fires for
+// *deserialization* — Rust's `Default::default()` bypasses it. Without this
+// manual impl, `Config::init_defaults` materializes
+// `transcription.local_whisper = Some(LocalWhisperConfig { max_audio_bytes: 0,
+// timeout_secs: 0, .. })`; `LocalWhisperProvider::from_config` then rejects it
+// at load (`max_audio_bytes must be greater than zero`), the failure poisons
+// the parent `[transcription]` block's deserialization, and the daemon logs
+// `dropped_config: transcription` while running with `transcription.enabled =
+// false` regardless of operator intent. See #8718.
+impl Default for LocalWhisperConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            bearer_token: None,
+            max_audio_bytes: default_local_whisper_max_audio_bytes(),
+            timeout_secs: default_local_whisper_timeout_secs(),
+        }
+    }
 }
 
 /// HMAC tool execution receipt configuration, per agent

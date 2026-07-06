@@ -1824,6 +1824,58 @@ mod tests {
         );
     }
 
+    // ── #8718 regression: `LocalWhisperConfig::default()` must use the
+    //    serde-default values, not the Rust `usize`/`u64` zeros. `#[serde(default
+    //    = "...")]` only fires for deserialization; without a manual `Default`
+    //    impl that delegates to the helpers, `Config::init_defaults`
+    //    materializes `Some(LocalWhisperConfig { max_audio_bytes: 0,
+    //    timeout_secs: 0, .. })`, the parent `[transcription]` block is
+    //    poisoned at load, and `transcription.enabled` silently flips to
+    //    `false` regardless of operator intent.
+
+    #[test]
+    fn local_whisper_default_uses_serde_defaults_not_rust_zero() {
+        let cfg = zeroclaw_config::schema::LocalWhisperConfig::default();
+        assert_eq!(
+            cfg.max_audio_bytes,
+            25 * 1024 * 1024,
+            "Rust default must reuse the serde-default value (25 MB); got {}",
+            cfg.max_audio_bytes
+        );
+        assert_eq!(
+            cfg.timeout_secs, 300,
+            "Rust default must reuse the serde-default value (300 s); got {}",
+            cfg.timeout_secs
+        );
+        assert_eq!(
+            cfg.bearer_token, None,
+            "bearer_token stays None by default (unauthenticated local endpoint)"
+        );
+        assert!(
+            cfg.url.is_empty(),
+            "url stays empty (no working endpoint at config-init time)"
+        );
+    }
+
+    #[test]
+    fn local_whisper_provider_accepts_config_init_default_after_url_and_token_filled() {
+        // Mirrors the post-init state from a `zeroclaw config init
+        // transcription.local_whisper` followed by the operator setting
+        // `url` and `bearer_token`: the scaffolded `max_audio_bytes` /
+        // `timeout_secs` defaults must already be valid, so from_config
+        // succeeds without manual adjustment.
+        let cfg = zeroclaw_config::schema::LocalWhisperConfig {
+            url: "http://127.0.0.1:9999/v1/transcribe".to_string(),
+            bearer_token: Some("test-token".to_string()),
+            ..zeroclaw_config::schema::LocalWhisperConfig::default()
+        };
+
+        let provider = LocalWhisperProvider::from_config("local_whisper", &cfg)
+            .expect("config-init default must be loadable once url + bearer_token are set");
+        assert_eq!(provider.max_audio_bytes, 25 * 1024 * 1024);
+        assert_eq!(provider.timeout_secs, 300);
+    }
+
     #[test]
     fn local_whisper_registered_when_config_present() {
         let config = TranscriptionConfig {
