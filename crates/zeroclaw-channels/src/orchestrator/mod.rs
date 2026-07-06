@@ -38,6 +38,8 @@ pub use crate::discord::DiscordChannel;
 pub use crate::email_channel::EmailChannel;
 #[cfg(feature = "channel-filesystem")]
 pub use crate::filesystem::FilesystemChannel;
+#[cfg(feature = "channel-git")]
+pub use crate::git::GitChannel;
 #[cfg(feature = "channel-email")]
 pub use crate::gmail_push::GmailPushChannel;
 #[cfg(feature = "channel-imessage")]
@@ -6113,6 +6115,8 @@ struct AgentRouter {
     by_agent: Arc<HashMap<String, Arc<ChannelRuntimeContext>>>,
     owner_by_channel_key: Arc<HashMap<String, String>>,
     single_ctx: Option<Arc<ChannelRuntimeContext>>,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
 
 impl AgentRouter {
@@ -6122,17 +6126,23 @@ impl AgentRouter {
             by_agent: Arc::new(HashMap::new()),
             owner_by_channel_key: Arc::new(HashMap::new()),
             single_ctx: Some(ctx),
+            sop_engine: None,
+            sop_audit: None,
         }
     }
 
     fn multi(
         by_agent: HashMap<String, Arc<ChannelRuntimeContext>>,
         owner_by_channel_key: HashMap<String, String>,
+        sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+        sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     ) -> Self {
         Self {
             by_agent: Arc::new(by_agent),
             owner_by_channel_key: Arc::new(owner_by_channel_key),
             single_ctx: None,
+            sop_engine,
+            sop_audit,
         }
     }
 
@@ -6160,6 +6170,82 @@ impl AgentRouter {
     }
 }
 
+async fn dispatch_channel_sop_event(
+    router: &AgentRouter,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    // Route on the internal marker the git/forge producer sets, NOT on the
+    // user-facing `subject`. The email channel is the one inbound channel that
+    // fills `subject` from user-controlled data, so keying on `subject` would
+    // let an allowlisted (or From-spoofed) sender hijack SOP ingress. This
+    // marker is set only by the git producer and never round-trips through any
+    // wire format, so it cannot be forged by an inbound message.
+    let Some(topic) = msg
+        .internal_sop_event
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return false;
+    };
+
+    let Some(engine) = router.sop_engine.as_ref() else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "channel": msg.channel.as_str(),
+                    "channel_alias": msg.channel_alias.as_deref(),
+                    "topic": topic,
+                })
+            ),
+            "dropping channel SOP event: SOP engine is not available"
+        );
+        return true;
+    };
+    let Some(audit) = router.sop_audit.as_ref() else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "channel": msg.channel.as_str(),
+                    "channel_alias": msg.channel_alias.as_deref(),
+                    "topic": topic,
+                })
+            ),
+            "dropping channel SOP event: SOP audit logger is not available"
+        );
+        return true;
+    };
+
+    let event = zeroclaw_runtime::sop::types::SopEvent {
+        source: zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
+        topic: Some(topic.to_string()),
+        payload: Some(msg.content.clone()),
+        timestamp: zeroclaw_runtime::sop::engine::now_iso8601(),
+    };
+    let target_sop = channel_sop_target(msg);
+    let results = if let Some(sop_name) = target_sop.as_deref() {
+        zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to(engine, audit, event, sop_name).await
+    } else {
+        zeroclaw_runtime::sop::dispatch::dispatch_sop_event(engine, audit, event).await
+    };
+    zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
+    true
+}
+
+fn channel_sop_target(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&msg.content)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("sop")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+        })
+}
+
 async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
     router: AgentRouter,
@@ -6178,6 +6264,9 @@ async fn run_message_dispatch_loop(
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"channel_alias": msg.channel_alias, "sender": msg.sender})), "dropping inbound message: no agent owns this channel");
             continue;
         };
+        if dispatch_channel_sop_event(&router, &msg).await {
+            continue;
+        }
         // Fast path: /stop cancels the in-flight task for this sender scope without
         // spawning a worker or registering a new task. Handled here — before semaphore
         // acquisition — so the target task is still in the store and is never replaced.
@@ -7149,6 +7238,25 @@ fn build_channel_by_id(
         "twitter" => {
             anyhow::bail!("X/Twitter channel requires the `channel-twitter` feature");
         }
+        #[cfg(feature = "channel-git")]
+        "git" => {
+            let g = config
+                .channels
+                .git
+                .get("default")
+                .context("Git channel is not configured")?;
+            let alias = "default".to_string();
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("git", &alias))
+            };
+            Ok(Arc::new(GitChannel::new(g.clone(), alias, peer_resolver)?))
+        }
+        #[cfg(not(feature = "channel-git"))]
+        "git" => {
+            anyhow::bail!("Git channel requires the `channel-git` feature");
+        }
         #[cfg(feature = "channel-mochat")]
         "mochat" => {
             let mc = config
@@ -7234,7 +7342,7 @@ fn build_channel_by_id(
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, imessage, line, voice-call"
+            email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
         ),
     }
 }
@@ -8660,6 +8768,51 @@ fn collect_configured_channels(
         );
     }
 
+    #[cfg(feature = "channel-git")]
+    for (alias, g) in &config.channels.git {
+        if !active_channel_aliases.contains(&format!("git.{alias}")) {
+            continue;
+        }
+        if !g.enabled {
+            continue;
+        }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || cfg_arc.read().channel_external_peers("git", &alias))
+        };
+        match GitChannel::new(g.clone(), alias.clone(), peer_resolver) {
+            Ok(channel) => channels.push(ConfiguredChannel {
+                display_name: "Git",
+                alias: Some(alias.clone()),
+                channel: Arc::new(channel),
+            }),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "alias": alias,
+                            "error": e.to_string(),
+                        })),
+                    "Git channel alias misconfigured; skipping"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(feature = "channel-git"))]
+    if !config.channels.git.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Git channel is configured but this build was compiled without \
+             `channel-git`; skipping Git."
+        );
+    }
+
     #[cfg(feature = "channel-mochat")]
     for (alias, mc) in &config.channels.mochat {
         if !active_channel_aliases.contains(&format!("mochat.{alias}")) {
@@ -9311,6 +9464,14 @@ pub async fn start_channels(
         cancel.cancelled().await;
         return Ok(());
     }
+
+    // Start the live model-pricing refresher (once per process; idempotent and
+    // a no-op unless some provider sets `live_pricing = true`). Each call
+    // re-binds the refresher's config handle, so reload iterations that
+    // re-instantiate the config Arc (or toggle `live_pricing`) are honored
+    // without a restart. Fills cost rates for models the operator hasn't
+    // priced in `[cost.rates]`.
+    zeroclaw_providers::pricing::spawn_refresher(config_arc.clone());
 
     // Every `[channels.<type>.<alias>]` block is owned by exactly one agent
     // (declared via `agents.<alias>.channels = [...]`). One
@@ -10273,7 +10434,7 @@ pub async fn start_channels(
         }
     }
 
-    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key);
+    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
 
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
@@ -11329,7 +11490,7 @@ temperature = 0.3
         let mut owners: HashMap<String, String> = HashMap::new();
         owners.insert("discord.clamps".to_string(), "clamps".to_string());
         owners.insert("discord.glados".to_string(), "glados".to_string());
-        let router = AgentRouter::multi(by_agent, owners);
+        let router = AgentRouter::multi(by_agent, owners, None, None);
 
         let msg_clamps = channel_message("discord", Some("clamps"));
         let msg_glados = channel_message("discord", Some("glados"));
@@ -11352,7 +11513,7 @@ temperature = 0.3
         by_agent.insert("agent_a".to_string(), Arc::clone(&agent_a_ctx));
         let mut owners: HashMap<String, String> = HashMap::new();
         owners.insert("discord.bot_a".to_string(), "agent_a".to_string());
-        let router = AgentRouter::multi(by_agent, owners);
+        let router = AgentRouter::multi(by_agent, owners, None, None);
 
         let cli_msg = channel_message("cli", None);
         assert!(router.resolve(&cli_msg).is_none(), "cli has no owner");
@@ -11365,7 +11526,7 @@ temperature = 0.3
         by_agent.insert("ops".to_string(), Arc::clone(&notion_agent_ctx));
         let mut owners: HashMap<String, String> = HashMap::new();
         owners.insert("notion".to_string(), "ops".to_string());
-        let router = AgentRouter::multi(by_agent, owners);
+        let router = AgentRouter::multi(by_agent, owners, None, None);
 
         let msg = channel_message("notion", None);
         let resolved = router.resolve(&msg).expect("notion resolves");
@@ -11391,7 +11552,7 @@ temperature = 0.3
         let legacy_ctx = router_test_ctx();
         let mut by_agent: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
         by_agent.insert("legacy".to_string(), Arc::clone(&legacy_ctx));
-        let router = AgentRouter::multi(by_agent, owners);
+        let router = AgentRouter::multi(by_agent, owners, None, None);
 
         let msg = channel_message("mattermost", Some("default"));
         let resolved = router.resolve(&msg).expect("fallback owner resolves");
@@ -20351,6 +20512,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     mime_type: Some("image/png".to_string()),
                 }],
                 subject: None,
+                internal_sop_event: None,
             },
             CancellationToken::new(),
         )
@@ -21985,6 +22147,7 @@ This is an example JSON object for profile settings."#;
                     mime_type: Some("image/png".to_string()),
                 }],
                 subject: None,
+                internal_sop_event: None,
             },
             CancellationToken::new(),
         )
@@ -24555,6 +24718,60 @@ Done."#;
         let sm = SendMessage::reply_to(&msg, "Here is the answer");
         assert_eq!(sm.in_reply_to.as_deref(), Some("<abc123@mail.example>"));
         assert!(sm.subject.is_none());
+    }
+
+    /// Router with no SOP engine wired. `dispatch_channel_sop_event` decides
+    /// whether a message is a channel SOP event before it ever touches the
+    /// engine, so this is enough to exercise the source/dispatch boundary.
+    fn router_without_sop_engine() -> AgentRouter {
+        AgentRouter {
+            by_agent: Arc::new(HashMap::new()),
+            owner_by_channel_key: Arc::new(HashMap::new()),
+            single_ctx: None,
+            sop_engine: None,
+            sop_audit: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_channel_sop_event_ignores_user_controlled_subject() {
+        // An email-shaped message: the reserved prefix sits in the
+        // user-controlled `subject`, but the internal git-only marker is
+        // absent. It MUST NOT route to SOP.
+        let msg = ChannelMessage {
+            channel: "email".to_string(),
+            sender: "attacker@example.com".to_string(),
+            subject: Some("zeroclaw:sop-event:git.main:pull_request.opened".to_string()),
+            content: r#"{"sop":"triage"}"#.to_string(),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "attacker@example.com", "", "", "email", 0)
+        };
+        let router = router_without_sop_engine();
+        assert!(
+            !dispatch_channel_sop_event(&router, &msg).await,
+            "a forged subject must not select SOP ingress"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_channel_sop_event_routes_git_produced_marker() {
+        // A genuine git-produced message: the internal marker carries the
+        // topic. It IS recognized as a SOP event (returns true; the missing
+        // engine is handled inside, but the routing decision fired).
+        let msg = ChannelMessage {
+            channel: "git".to_string(),
+            channel_alias: Some("main".to_string()),
+            sender: "test_user".to_string(),
+            subject: Some("zeroclaw:sop-event:git.main:pull_request.opened".to_string()),
+            content: r#"{"sop":"triage"}"#.to_string(),
+            internal_sop_event: Some("git.main:pull_request.opened".to_string()),
+            ..ChannelMessage::new("1", "test_user", "octo/repo#12", "", "git", 0)
+        };
+        let router = router_without_sop_engine();
+        assert!(
+            dispatch_channel_sop_event(&router, &msg).await,
+            "a git-produced internal marker must select SOP ingress"
+        );
     }
 }
 
