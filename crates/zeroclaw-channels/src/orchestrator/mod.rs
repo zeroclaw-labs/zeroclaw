@@ -18866,6 +18866,81 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(admins, vec!["alice".to_string(), "ops".to_string()]);
     }
 
+    /// Round-3 contract: when a peer group's `agents` list is non-empty,
+    /// the admin privilege is granted only for `agent_alias` values that
+    /// appear in that list. This pins the agent-bound semantics added in
+    /// round 3; without it, dropping or inverting the `agent_alias` filter
+    /// would not regress any existing test (because every prior fixture
+    /// constructs `agents: Vec::new()`, which falls through the legacy
+    /// channel-wide path).
+    fn peer_group_with_agents(
+        channel: &str,
+        members: &[&str],
+        admin_for_agent_scope: bool,
+        agents: &[&str],
+    ) -> zeroclaw_config::multi_agent::PeerGroupConfig {
+        use zeroclaw_config::multi_agent::{
+            AgentAlias, OutputModality, PeerGroupConfig, PeerUsername,
+        };
+        PeerGroupConfig {
+            channel: zeroclaw_config::providers::ChannelRef(channel.into()),
+            agents: agents.iter().map(|a| AgentAlias::new(*a)).collect(),
+            external_peers: members
+                .iter()
+                .map(|s| PeerUsername(s.to_string()))
+                .collect(),
+            ignore: Vec::new(),
+            output_modality: OutputModality::default(),
+            admin_for_agent_scope,
+        }
+    }
+
+    #[test]
+    fn channel_agent_scope_admins_filters_by_agents_list_when_non_empty() {
+        // The same admin peer is granted the privilege for `agentX`
+        // (because `agents = ["agentX"]` includes it) and denied for
+        // `agentY` (because `agentY` is not in the list). The peer is
+        // also denied for `agentX` if the group is constructed with an
+        // empty `agents` list (the legacy channel-wide path), which is
+        // pinned separately below.
+        use zeroclaw_config::schema::Config;
+        let mut config = Config::default();
+        config.peer_groups.insert(
+            "discord_admins".into(),
+            peer_group_with_agents("discord.clamps", &["alice"], true, &["agentX"]),
+        );
+
+        let for_x = config.channel_agent_scope_admins("discord", "clamps", "agentX");
+        assert_eq!(
+            for_x,
+            vec!["alice".to_string()],
+            "agentX is in agents=[agentX], so alice must surface"
+        );
+
+        let for_y = config.channel_agent_scope_admins("discord", "clamps", "agentY");
+        assert!(
+            for_y.is_empty(),
+            "agentY is NOT in agents=[agentX], so the group must be filtered out"
+        );
+    }
+
+    #[test]
+    fn channel_agent_scope_admins_empty_agents_list_means_channel_wide() {
+        // Backward-compatible legacy: an empty `agents` list means the
+        // admin privilege is granted for any agent_alias on the channel.
+        // This is the path every pre-round-3 config falls into.
+        use zeroclaw_config::schema::Config;
+        let mut config = Config::default();
+        config.peer_groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice"], true),
+        );
+        let for_x = config.channel_agent_scope_admins("discord", "clamps", "agentX");
+        let for_y = config.channel_agent_scope_admins("discord", "clamps", "agentY");
+        assert_eq!(for_x, vec!["alice".to_string()]);
+        assert_eq!(for_y, vec!["alice".to_string()]);
+    }
+
     // --- SSOT normalization + wildcard + leading-`@` + case-insensitive.
     // The gate routes through `allowlist::is_user_allowed`, so the
     // helpers below must mirror the inbound-channel normalization shape
