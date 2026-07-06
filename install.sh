@@ -29,8 +29,8 @@ PLUGIN_HOST_BIN_NAME="zeroclaw-plugin-host"
 
 # Apps installed by default (the rest are discovered and listed but off
 # until selected via --apps or the interactive picker). Intentionally a
-# fixed list: Tauri-based apps need the Tauri toolchain + webview deps,
-# so they ship off-by-default.
+# fixed list: zeroclaw-desktop and other Tauri-based apps need the Tauri
+# toolchain + webview deps, so they ship off-by-default.
 DEFAULT_APPS="zerocode zeroclaw-plugin-host"
 
 # ── Parse Cargo.toml (source of truth) ────────────────────────────
@@ -93,9 +93,9 @@ expand_default_features() {
 # `cargo install --path apps/<dir>` — they are NOT cargo features of the
 # main binary. The installable set is discovered from `apps/*/Cargo.toml`
 # so adding an app surfaces here without editing this script. `zerocode`
-# (the TUI) is the default app. Tauri-based apps need the Tauri toolchain
-# + system webview deps and are excluded from the simple `cargo install`
-# path.
+# (the TUI) is the default app. Tauri-based apps (e.g. zeroclaw-desktop)
+# need the Tauri toolchain + system webview deps and are excluded from the
+# simple `cargo install` path.
 discover_apps() {
   APPS=""
   for dir in apps/*/; do
@@ -147,6 +147,13 @@ validate_feature() {
   die "Unknown feature '$1'. Run: $0 --list-features"
 }
 
+selected_feature_enabled() {
+  case ",$USER_FEATURES," in
+  *",$1,"*) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
 # ── List features ─────────────────────────────────────────────────
 
 list_features() {
@@ -165,7 +172,7 @@ list_features() {
     default | ci-all | fantoccini | landlock | metrics) continue ;;
     channel-*) channels="${channels:+$channels, }$feat" ;;
     observability-*) observability="${observability:+$observability, }$feat" ;;
-    hardware | peripheral-* | sandbox-* | browser-* | probe | rag-pdf | webauthn)
+    hardware | peripheral-* | sandbox-* | browser-* | probe | webauthn)
       platform="${platform:+$platform, }$feat"
       ;;
     *) other="${other:+$other, }$feat" ;;
@@ -679,11 +686,18 @@ install_web_dist() {
 # present — never to run cargo by hand.
 build_web_dashboard() {
   src_dir="$1"
+  required="${2:-false}"
   if [ ! -d "$src_dir/web" ]; then
+    if [ "$required" = true ]; then
+      die "feature embedded-web requires a web/ directory in the source checkout."
+    fi
     warn "Source has no web/ directory; skipping dashboard build."
     return 0
   fi
   if ! command -v npm >/dev/null 2>&1; then
+    if [ "$required" = true ]; then
+      die "feature embedded-web requires Node.js/npm to build web/dist before cargo install. Install the Node version from .nvmrc and re-run, or remove embedded-web."
+    fi
     warn "npm not found — skipping dashboard build. The gateway will run"
     warn "  in API-only mode. Install Node.js (npm) and re-run ./install.sh"
     warn "  --source to build and install the dashboard."
@@ -694,6 +708,9 @@ build_web_dashboard() {
   # re-runs cheap.
   info "Building web dashboard (cargo web build)..."
   (cd "$src_dir" && cargo web build) || {
+    if [ "$required" = true ]; then
+      die "feature embedded-web requires a successful dashboard build before cargo install."
+    fi
     warn "Dashboard build failed — gateway will run in API-only mode."
     return 0
   }
@@ -1108,6 +1125,11 @@ See all available features:
 
   # ── Build and install ─────────────────────────────────────────────
 
+  WANT_EMBEDDED_WEB=false
+  if selected_feature_enabled embedded-web; then
+    WANT_EMBEDDED_WEB=true
+  fi
+
   echo
   printf "%s\n" "$(bold "Building ZeroClaw v$VERSION")"
   if [ -n "$CARGO_FLAGS" ]; then
@@ -1116,6 +1138,16 @@ See all available features:
     info "Feature flags: (defaults)"
   fi
   echo
+
+  # embedded-web includes web/dist at Rust compile time, so the dashboard must
+  # exist before cargo install reaches zeroclaw-gateway's build script.
+  if [ "$WANT_EMBEDDED_WEB" = true ]; then
+    if [ "$DRY_RUN" = true ]; then
+      info "[dry-run] Would build web dashboard before cargo install for embedded-web"
+    else
+      build_web_dashboard "$INSTALL_DIR" true
+    fi
+  fi
 
   # >>> generated:source-cargo-install by `cargo generate installers` - do not edit <<<
   if [ "$DRY_RUN" = true ]; then
@@ -1143,7 +1175,13 @@ See all available features:
   esac
   if [ "$WANT_GATEWAY" = true ]; then
     if [ "$DRY_RUN" = true ]; then
-      info "[dry-run] Would build web dashboard"
+      if [ "$WANT_EMBEDDED_WEB" = true ]; then
+        info "[dry-run] Web dashboard would already be built for embedded-web"
+      else
+        info "[dry-run] Would build web dashboard"
+      fi
+    elif [ "$WANT_EMBEDDED_WEB" = true ]; then
+      info "Web dashboard already built for embedded-web"
     else
       build_web_dashboard "$INSTALL_DIR"
     fi

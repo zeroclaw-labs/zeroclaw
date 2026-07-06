@@ -2446,6 +2446,7 @@ fn parse_iso8601_secs(input: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::store::ProposalKind;
     use super::*;
     use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, ResolveOutcome};
     use crate::sop::step_contract::StepFailure;
@@ -3568,13 +3569,20 @@ mod tests {
         let now = now_iso8601();
         let proposal = ProposalRecord {
             id: "prop-1".to_string(),
+            kind: ProposalKind::Update,
             status: ProposalStatus::Pending,
             source_run_id: Some("run-1".to_string()),
             sop_name: "s1".to_string(),
             target_content_hash: Some("sha256:abc".to_string()),
+            manifest_toml: "[sop]\nname = \"s1\"\ndescription = \"S1\"\n".to_string(),
+            procedure_markdown: "## Steps\n\n1. **Do** - It.\n".to_string(),
             provenance: serde_json::json!({"producer": "test"}),
             created_at: now.clone(),
             updated_at: now,
+            status_reason: None,
+            applied_at: None,
+            applied_by: None,
+            rollback_path: None,
         };
 
         engine.save_proposal(&proposal).unwrap();

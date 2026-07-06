@@ -76,6 +76,9 @@ pub struct ChannelMessage {
     /// When true, the orchestrator records this as context only and must not
     /// start an agent turn or emit visible channel side effects.
     pub passive_context: bool,
+    /// Channel adapter observed that this inbound message explicitly addressed
+    /// the bot through a platform-level signal such as an @mention.
+    pub explicitly_addressed: bool,
     /// Controls whether conversation history is sender-scoped or room-scoped.
     pub conversation_scope: ChannelConversationScope,
 }
@@ -642,6 +645,7 @@ mod tests {
         assert!(msg.attachments.is_empty());
         assert!(msg.subject.is_none());
         assert!(!msg.passive_context);
+        assert!(!msg.explicitly_addressed);
         assert_eq!(msg.conversation_scope, ChannelConversationScope::Sender);
     }
 

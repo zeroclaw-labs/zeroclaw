@@ -26,6 +26,7 @@ cli-config-about = Gestiona la configuración de ZeroClaw
 cli-update-about = Comprueba y aplica las actualizaciones de ZeroClaw
 cli-self-test-about = Ejecuta autopruebas de diagnóstico
 cli-completions-about = Genera scripts de autocompletado del shell
+cli-desktop-about = Inicia la aplicación de escritorio complementaria de ZeroClaw
 cli-config-schema-about = Vuelca el esquema JSON de configuración completo en stdout
 cli-config-list-about = Lista todas las propiedades de configuración con los valores actuales
 cli-config-get-about = Obtiene el valor de una propiedad de configuración
@@ -302,6 +303,16 @@ cli-completions-long-about =
     source <(zeroclaw completions bash)
     zeroclaw completions zsh > ~/.zfunc/_zeroclaw
     zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish
+cli-desktop-long-about =
+    Lanza la aplicación de escritorio complementaria de ZeroClaw.
+
+    La aplicación complementaria es una aplicación ligera de barra de menú / bandeja del sistema que se conecta al mismo gateway que la CLI. Proporciona acceso rápido al panel, monitoreo de estado y emparejamiento de dispositivos.
+
+    Usa --install para descargar la aplicación complementaria precompilada para tu plataforma.
+
+    Ejemplos:
+    zeroclaw desktop              # lanzar la aplicación complementaria
+    zeroclaw desktop --install    # descargarla e instalarla
 channel-needs-quickstart-reply = Este agente aún no está completamente configurado. El operador debe ejecutar Quickstart antes de que pueda responder.
 channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web está configurado pero la característica 'whatsapp-web' no está compilada.
 channel-whatsapp-web-feature-missing-build = Compila/ejecuta con: cargo build --features whatsapp-web
@@ -382,6 +393,9 @@ cli-skills-create-hint = {"  "}Cree uno: mkdir -p ~/.zeroclaw/workspace/skills/m
 cli-skills-install-hint = {"  "}O instale: zeroclaw skills install <source>
 cli-skills-installed-header = Skills instaladas ({$count}):
 cli-skills-tags = Etiquetas:  {$tags}
+cli-skills-skipped-header = Omitidas ({$count}):
+cli-skills-skipped-reason = {"    "}Motivo: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}Establece `skills.allow_scripts = true` en tu configuración de zeroclaw para habilitarla.
 cli-sop-none = No se encontraron SOP.
 cli-sop-create-hint = {"  "}Cree uno: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}luego agregue SOP.toml y SOP.md
@@ -589,6 +603,10 @@ cli-status-service-stopped = 🔴 Servicio:       detenido
 cli-status-channels = Canales:
 cli-status-cli-always = {"  "}CLI:      ✅ siempre
 cli-status-peripherals = Periféricos:
+cli-desktop-download = Descarga la aplicación complementaria de ZeroClaw:
+cli-desktop-homebrew = O instálala con Homebrew (próximamente):
+cli-desktop-linux-pkg = {"  "}Descarga el .deb o .AppImage para tu arquitectura.
+cli-desktop-launching = Iniciando la aplicación complementaria de ZeroClaw...
 cli-status-version = Versión:     {$v}
 cli-status-workspace = Espacio de trabajo:   {$v}
 cli-status-config = Configuración:      {$v}
@@ -627,6 +645,9 @@ cli-status-word-none = (ninguno)
 cli-status-word-configured = configurado
 cli-status-word-not-configured = no configurado
 cli-status-channel-not-compiled = 🚫 configurado, no compilado
+cli-desktop-not-installed = La aplicación complementaria de ZeroClaw no está instalada.
+cli-desktop-blurb1 = La aplicación complementaria es una ligera app de la barra de menú que
+cli-desktop-blurb2 = se conecta a la misma puerta de enlace que la CLI.
 cli-config-all-configured = Todas las secciones ya están configuradas.
 cli-config-schema-current = La configuración ya está en la versión actual del esquema.
 cli-config-applied-ops = Se aplicaron {$count} operación(es):
@@ -653,6 +674,7 @@ cli-warn-crypto-provider = Advertencia: No se pudo instalar el proveedor de cifr
 cli-error-label = {"   "}Error: {$err}
 cli-warn-cost-usage = {"  "}⚠ No se pudo cargar el uso de costos: {$err}
 cli-warn-cost-tracker = {"  "}⚠ No se pudo inicializar el rastreador de costos: {$err}
+cli-desktop-download-at = {"  "}Descárgala en: {$url}
 cli-config-legend = Leyenda: 💉 anulado por entorno  🔒 secreto
 cli-config-secret-set = {$path} está establecido (secreto cifrado — valor no mostrado)
 cli-config-secret-unset = {$path} no está establecido (secreto cifrado)

@@ -208,6 +208,30 @@ impl RpcContext {
     }
 
     #[cfg(test)]
+    pub fn minimal_with_memory(
+        config: Config,
+        sessions: Arc<SessionStore>,
+        memory: Arc<dyn zeroclaw_api::memory_traits::Memory>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            config: Arc::new(RwLock::new(config)),
+            sessions,
+            session_backend: None,
+            memory: Some(memory),
+            cost_tracker: None,
+            event_tx: None,
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(ApprovalPendingMap::default()),
+            tui_registry: Arc::new(TuiRegistry::new_unsigned()),
+            acp_session_store: None,
+            sop_engine: None,
+            sop_audit: None,
+            hooks: None,
+        })
+    }
+
+    #[cfg(test)]
     pub fn minimal_with_cost_tracker(
         config: Config,
         sessions: Arc<SessionStore>,
