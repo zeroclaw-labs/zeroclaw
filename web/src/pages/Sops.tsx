@@ -13,7 +13,6 @@ import {
   getSopGraph,
   getRunOverlay,
   getSop,
-  createSop,
   saveSop,
   deleteSop,
   wireDraft,
@@ -52,6 +51,7 @@ function blankStep(number: number): SopStep {
 }
 
 const DRAFT_STORAGE_KEY = 'zeroclaw_sop_draft';
+const DRAFT_EDITING_NAME_KEY = 'zeroclaw_sop_editing_name';
 
 function setArgAtPath(
   root: Record<string, unknown>,
@@ -109,6 +109,23 @@ function storeDraft(draft: Sop | null): void {
     else sessionStorage.removeItem(DRAFT_STORAGE_KEY);
   } catch {
     // Storage is best-effort; a failure only loses cross-navigation recovery.
+  }
+}
+
+function loadStoredEditingName(): string | null {
+  try {
+    return sessionStorage.getItem(DRAFT_EDITING_NAME_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function storeEditingName(name: string | null): void {
+  try {
+    if (name !== null) sessionStorage.setItem(DRAFT_EDITING_NAME_KEY, name);
+    else sessionStorage.removeItem(DRAFT_EDITING_NAME_KEY);
+  } catch {
+    // Best-effort; a failure only degrades a post-reload rename into a fork.
   }
 }
 
@@ -1186,7 +1203,7 @@ export default function Sops() {
   const [overlay, setOverlay] = useState<RunOverlay | null>(null);
   const [overlayError, setOverlayError] = useState<string | null>(null);
   const [draft, setDraft] = useState<Sop | null>(loadStoredDraft);
-  const [editingName, setEditingName] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState<string | null>(loadStoredEditingName);
   const [draftGraph, setDraftGraph] = useState<SopGraph | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -1209,6 +1226,10 @@ export default function Sops() {
     window.addEventListener('beforeunload', warn);
     return () => window.removeEventListener('beforeunload', warn);
   }, [draft]);
+
+  useEffect(() => {
+    storeEditingName(draft ? editingName : null);
+  }, [draft, editingName]);
 
   useEffect(() => {
     let active = true;
@@ -1363,34 +1384,28 @@ export default function Sops() {
 
   const onSaveDraft = useCallback(() => {
     if (!draft) return;
-    // Identity is the name the edit started from, not whatever the name field
-    // currently holds. Deciding create-vs-save by "does this name exist" lets a
-    // rename silently fork (edit foo -> bar creates bar, leaves foo) or clobber
-    // (edit foo -> existing bar overwrites bar). We only create when there was
-    // no original, only save when the name is unchanged, and reject renames
-    // until an explicit rename flow exists.
-    const isNew = editingName === null;
-    if (!isNew && draft.name !== editingName) {
-      setSaveError(
-        `Renaming an SOP is not supported here yet. Change the name back to "${editingName}", ` +
-          `or create a new SOP with the new name and delete the old one.`,
-      );
-      return;
-    }
     setSaving(true);
     setSaveError(null);
-    // Renumbering and routing-ref remapping are owned by the daemon's
-    // normalize_step_numbers on save; the draft is sent as-is.
-    const op = isNew ? createSop(draft) : saveSop(draft);
-    op.then(() => {
-      setSaving(false);
-      setDraft(null);
-      setEditingName(null);
-      return refreshList(draft.name);
-    }).catch((e: unknown) => {
-      setSaving(false);
-      setSaveError(e instanceof Error ? e.message : String(e));
-    });
+    // Save is an upsert: PUT /api/sops/{name} creates the SOP when absent and
+    // overwrites it when present, so a save never 409s on its own name. When an
+    // existing SOP was renamed in the editor (draft.name diverged from the name
+    // the edit started at), the upsert writes the new name; we then delete the
+    // old directory so the rename moves rather than forks. Renumbering and
+    // routing-ref remapping are owned by the daemon's normalize_step_numbers.
+    const renamedFrom =
+      editingName !== null && draft.name !== editingName ? editingName : null;
+    saveSop(draft)
+      .then(() => (renamedFrom ? deleteSop(renamedFrom).catch(() => undefined) : undefined))
+      .then(() => {
+        setSaving(false);
+        setDraft(null);
+        setEditingName(null);
+        return refreshList(draft.name);
+      })
+      .catch((e: unknown) => {
+        setSaving(false);
+        setSaveError(e instanceof Error ? e.message : String(e));
+      });
   }, [draft, editingName, refreshList]);
 
   const onDeleteSelected = useCallback(() => {
