@@ -3206,10 +3206,10 @@ fn header_fence_lang(line: &Line<'static>) -> Option<String> {
     }
 }
 
-/// Wrap recovered fence body text in its Markdown fence so a copied fence round-
-/// trips to the same source the model emitted, language tag included.
-fn fenced_text(lang: Option<&str>, body: &str) -> String {
-    format!("```{}\n{body}\n```", lang.unwrap_or(""))
+/// Return the code body for clipboard copy without markdown fences.
+/// Users pasting into a terminal expect raw commands, not fenced blocks.
+fn fenced_text(_lang: Option<&str>, body: &str) -> String {
+    body.to_string()
 }
 
 /// Wrapped screen-row count for a single cached line at the given width.
@@ -7035,8 +7035,8 @@ mod tests {
             "a highlighted fence must still register copy regions"
         );
         assert_eq!(
-            state.copy_hit_regions[0].text, "```rust\nfn main() {}\nlet y = 2;\n```",
-            "copy text re-wraps the body in its fence with the language tag"
+            state.copy_hit_regions[0].text, "fn main() {}\nlet y = 2;",
+            "copy text contains only the code body without markdown fences"
         );
     }
 
@@ -7047,8 +7047,8 @@ mod tests {
         let body = Rect::new(0, 0, 60, 20);
         state.rebuild_copy_regions(60, 0, body);
         assert_eq!(
-            state.copy_hit_regions[0].text, "```\nplain text\n```",
-            "an unlabeled fence round-trips with bare backticks, no ` code ` label"
+            state.copy_hit_regions[0].text, "plain text",
+            "copy text contains only the code body without fences"
         );
     }
 
@@ -7073,8 +7073,8 @@ mod tests {
 
         state.rebuild_copy_regions(60, fence_entry.1, body);
         assert_eq!(
-            state.copy_hit_regions[0].text, "```rust\nfn main() {}\n```",
-            "scrolled-to fence registers a copy region through the bounded scan"
+            state.copy_hit_regions[0].text, "fn main() {}",
+            "scrolled-to fence registers a copy region with body only"
         );
 
         state.rebuild_copy_regions(60, 0, body);
@@ -7085,12 +7085,9 @@ mod tests {
     }
 
     #[test]
-    fn fenced_text_round_trips_language_and_backticks() {
-        assert_eq!(
-            fenced_text(Some("python"), "x = 1"),
-            "```python\nx = 1\n```"
-        );
-        assert_eq!(fenced_text(None, "x = 1"), "```\nx = 1\n```");
+    fn fenced_text_returns_body_without_markdown_fences() {
+        assert_eq!(fenced_text(Some("python"), "x = 1"), "x = 1");
+        assert_eq!(fenced_text(None, "x = 1"), "x = 1");
     }
 
     #[test]
