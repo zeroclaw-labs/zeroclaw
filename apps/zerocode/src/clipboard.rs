@@ -8,48 +8,56 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-/// Number of read attempts when the clipboard advertises an image target but
-/// the byte read comes back empty. A freshly captured screenshot populates the
-/// clipboard asynchronously: the selection owner may advertise the image target
-/// a beat before the pixel data is actually servable, so a single read races
-/// the export and intermittently returns nothing. Re-reading across a short
-/// window absorbs that race so a genuinely-present image always resolves.
-const IMAGE_READ_ATTEMPTS: u32 = 8;
+/// Number of full probe+read attempts. Each attempt re-enumerates the
+/// clipboard's advertised targets and reads a live image target in one shot.
+///
+/// Two independent failure modes make a single read unreliable:
+///   1. A freshly captured screenshot populates the clipboard asynchronously;
+///      the image target can be advertised a beat before the bytes are
+///      servable.
+///   2. A hostile clipboard owner (observed: a long-running GLFW app that
+///      re-grabs the selection every few ms, shadowing the screenshot with
+///      text-only targets) can win the selection back between a probe and a
+///      read.
+///
+/// Both are races. Re-probing and re-reading as an ATOMIC unit each attempt is
+/// what beats mode 2: re-reading a stale target (the previous behaviour) can
+/// never recover once the owner has changed. Bounded so a genuinely image-less
+/// clipboard still returns promptly.
+const IMAGE_READ_ATTEMPTS: u32 = 10;
 
-/// Delay between image-read attempts.
-const IMAGE_READ_RETRY_DELAY: Duration = Duration::from_millis(120);
+/// Delay between probe+read attempts.
+const IMAGE_READ_RETRY_DELAY: Duration = Duration::from_millis(80);
 
 /// Try to read image data from the system clipboard.
 ///
 /// Returns `Some((bytes, mime_type))` on success, `None` when the clipboard
 /// genuinely holds no image or no clipboard tool is available.
 ///
-/// The read is target-aware and retrying: it first asks the clipboard which
-/// image target it can serve, then reads that exact target with a bounded
-/// retry. Hardcoding `image/png` and reading once (the previous behaviour)
-/// silently lost screenshots whenever the source offered the image under a
-/// different target or had not finished exporting `image/png` yet, which is
-/// why paste "sometimes worked and sometimes didn't."
+/// Each attempt re-enumerates the clipboard's advertised targets and reads the
+/// first servable image target, retrying the whole probe+read to survive both
+/// the async-export race and a hostile clipboard owner that re-grabs the
+/// selection. Hardcoding `image/png` and reading once (the previous behaviour)
+/// silently lost screenshots whenever the image was offered under a different
+/// target, had not finished exporting, or was shadowed by another owner — which
+/// is why paste "sometimes worked and sometimes didn't."
 pub(crate) fn read_clipboard_image() -> Option<(Vec<u8>, String)> {
     let tool = which_clipboard_tool()?;
 
-    // Resolve the concrete image target the clipboard can actually serve.
-    // Falls back to `image/png` for tools that don't enumerate targets
-    // (pngpaste, PowerShell) — those always emit PNG bytes directly.
-    let target = image_target_for_tool(&tool);
-
     for attempt in 0..IMAGE_READ_ATTEMPTS {
-        match run_clipboard_tool(&tool, &target) {
-            Some(bytes) if !bytes.is_empty() => {
+        // Re-probe every attempt: the servable target set can change between
+        // attempts when another client re-grabs the selection. For tools that
+        // cannot enumerate (pngpaste, PowerShell) this resolves to image/png,
+        // which those tools always emit.
+        for target in image_targets_for_tool(&tool) {
+            if let Some(bytes) = run_clipboard_tool(&tool, &target)
+                && !bytes.is_empty()
+            {
                 return Some((bytes, mime_for_target(&target)));
             }
-            // Empty read while a target is advertised: the export is still
-            // racing the offer. Back off briefly and retry.
-            _ => {
-                if attempt + 1 < IMAGE_READ_ATTEMPTS {
-                    std::thread::sleep(IMAGE_READ_RETRY_DELAY);
-                }
-            }
+        }
+        if attempt + 1 < IMAGE_READ_ATTEMPTS {
+            std::thread::sleep(IMAGE_READ_RETRY_DELAY);
         }
     }
     None
@@ -141,26 +149,37 @@ const ACCEPTED_IMAGE_TARGETS: &[&str] = &[
     "image/tiff",
 ];
 
-/// Resolve the concrete image target the clipboard can serve for this tool.
+/// Resolve the servable image targets for this tool, in preference order.
 ///
 /// For target-enumerating tools (xclip, wl-paste) this intersects the
 /// clipboard's advertised targets with [`ACCEPTED_IMAGE_TARGETS`] and returns
-/// the highest-preference match. For direct-PNG tools (pngpaste, PowerShell)
-/// enumeration is not available, so it returns `image/png` unconditionally —
-/// those tools re-encode to PNG regardless of the source format.
-fn image_target_for_tool(tool: &ClipboardTool) -> String {
+/// every match, highest preference first, so the reader can try each in turn.
+/// For direct-PNG tools (pngpaste, PowerShell) enumeration is not available, so
+/// it returns just `image/png` — those tools re-encode to PNG regardless of the
+/// source format.
+fn image_targets_for_tool(tool: &ClipboardTool) -> Vec<String> {
     let advertised = match tool {
         ClipboardTool::Xclip => list_targets_xclip(),
         ClipboardTool::WlPaste => list_targets_wl_paste(),
         ClipboardTool::PngPaste | ClipboardTool::PowerShellImage => None,
     };
     match advertised {
-        Some(targets) => ACCEPTED_IMAGE_TARGETS
-            .iter()
-            .find(|wanted| targets.iter().any(|t| t.eq_ignore_ascii_case(wanted)))
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "image/png".to_string()),
-        None => "image/png".to_string(),
+        Some(targets) => {
+            let matched: Vec<String> = ACCEPTED_IMAGE_TARGETS
+                .iter()
+                .filter(|wanted| targets.iter().any(|t| t.eq_ignore_ascii_case(wanted)))
+                .map(|t| t.to_string())
+                .collect();
+            if matched.is_empty() {
+                // No advertised image target this attempt (owner shadowed it, or
+                // the offer is not up yet). Return empty so the caller retries
+                // the whole probe rather than reading a target that is not there.
+                Vec::new()
+            } else {
+                matched
+            }
+        }
+        None => vec!["image/png".to_string()],
     }
 }
 
@@ -425,24 +444,39 @@ mod tests {
 
     #[test]
     fn image_target_selection_prefers_png() {
-        // The intersection logic lives in image_target_for_tool via the
-        // advertised list; exercise the preference ordering directly.
+        // image_targets_for_tool intersects advertised with ACCEPTED in
+        // preference order; exercise the ordering directly.
         let advertised = ["image/jpeg".to_string(), "image/png".to_string()];
-        let chosen = ACCEPTED_IMAGE_TARGETS
+        let matched: Vec<&str> = ACCEPTED_IMAGE_TARGETS
             .iter()
-            .find(|w| advertised.iter().any(|t| t.eq_ignore_ascii_case(w)))
-            .map(|t| t.to_string());
-        assert_eq!(chosen.as_deref(), Some("image/png"));
+            .copied()
+            .filter(|w| advertised.iter().any(|t| t.eq_ignore_ascii_case(w)))
+            .collect();
+        assert_eq!(matched.first().copied(), Some("image/png"));
+        assert_eq!(matched, vec!["image/png", "image/jpeg"]);
     }
 
     #[test]
     fn image_target_selection_falls_back_to_next_preference() {
         let advertised = ["image/gif".to_string(), "image/jpeg".to_string()];
-        let chosen = ACCEPTED_IMAGE_TARGETS
+        let matched: Vec<&str> = ACCEPTED_IMAGE_TARGETS
             .iter()
-            .find(|w| advertised.iter().any(|t| t.eq_ignore_ascii_case(w)))
-            .map(|t| t.to_string());
-        assert_eq!(chosen.as_deref(), Some("image/jpeg"));
+            .copied()
+            .filter(|w| advertised.iter().any(|t| t.eq_ignore_ascii_case(w)))
+            .collect();
+        assert_eq!(matched.first().copied(), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn image_targets_direct_png_tools_return_png() {
+        assert_eq!(
+            image_targets_for_tool(&ClipboardTool::PngPaste),
+            vec!["image/png".to_string()]
+        );
+        assert_eq!(
+            image_targets_for_tool(&ClipboardTool::PowerShellImage),
+            vec!["image/png".to_string()]
+        );
     }
 
     #[test]
