@@ -117,8 +117,8 @@ impl IngressContext {
     /// The shared phase-1 envelope shape: `source_class = Internal`,
     /// `trust = Trusted`, `transport = Internal`, `sender = None`,
     /// `message_id = None`, with only the origin varying. Real
-    /// source/transport/trust stamping at the entry edge is phase 2
-    /// (tracker #8583); every constructor below keeps the phase-1
+    /// source/transport/trust stamping at the entry edge is not wired
+    /// here yet; every constructor below keeps the phase-1
     /// placeholders so trust-facing behavior is unchanged. Passing the
     /// layer with any of these envelopes dispositions to
     /// [`IngressDecision::Loop`] under the default policy.
@@ -140,8 +140,8 @@ impl IngressContext {
     }
 
     /// Envelope for a turn the channel orchestrator dispatches for a channel
-    /// peer. Phase 1 keeps the placeholder source/transport/trust; the real
-    /// channel transport identity is stamped at the edge in phase 2.
+    /// peer. Keeps the placeholder source/transport/trust; the real
+    /// channel transport identity is not stamped at the edge yet.
     #[must_use]
     pub fn channel() -> Self {
         Self::phase1(TurnOrigin::Channel)

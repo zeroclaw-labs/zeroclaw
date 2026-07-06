@@ -2480,7 +2480,7 @@ impl Agent {
                         new_messages_out: Some(&mut loop_new_messages),
                         image_cache: Some(&mut self.image_cache),
                         // Direct embedded Agent::turn call; source/transport/
-                        // trust stay phase-1 placeholders (RFC #6971 §4).
+                        // trust stay placeholders, not yet stamped at the edge.
                         memory: Some(crate::agent::memory_inject::TurnMemory {
                             handle: self.memory.as_ref(),
                             query: user_message.to_string(),
@@ -2971,7 +2971,7 @@ impl Agent {
                             new_messages_out: Some(&mut round_added),
                             image_cache: Some(&mut self.image_cache),
                             // Direct embedded Agent::turn call; source/transport/
-                            // trust stay phase-1 placeholders (RFC #6971 §4).
+                            // trust stay placeholders, not yet stamped at the edge.
                             memory: Some(crate::agent::memory_inject::TurnMemory {
                                 handle: self.memory.as_ref(),
                                 query: user_message.to_string(),

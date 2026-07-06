@@ -5084,8 +5084,7 @@ async fn process_channel_message_body(
                 new_messages_out: None,
                 image_cache: None,
                 // Channel-orchestrator dispatch; source/transport/trust stay
-                // phase-1 placeholders. Real channel transport identity is
-                // stamped at the edge in phase 2 (RFC #6971 §4, tracker #8583).
+                // placeholders, not yet stamped at the edge.
                 memory: Some(zeroclaw_runtime::agent::memory_inject::TurnMemory {
                     handle: ctx.memory.as_ref(),
                     query: msg.content.clone(),
