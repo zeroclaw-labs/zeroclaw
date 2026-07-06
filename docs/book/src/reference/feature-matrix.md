@@ -60,6 +60,27 @@ inventory and gating rules live in the [Tools overview](../tools/overview.md).
 
 {{#include ../_snippets/feature-matrix-tools.md}}
 
+## SOP support
+
+[Standard Operating Procedures](../sop/index.md) are deterministic, trigger-matched
+procedures run by the `SopEngine` with approval gates and auditable run state
+([how they run](../sop/how-it-works.md), [syntax](../sop/syntax.md)). This row is
+hand-recorded rather than code-walked: SOP is not part of the channel, provider,
+or tool registries the tables above are generated from.
+
+| Capability | ZeroClaw | OpenClaw | Hermes |
+|---|---|---|---|
+| Deterministic SOP engine (trigger match, approval gates, audited runs) | 🧪 | ❌ | 🟡 |
+
+ZeroClaw's `SopEngine` is present but still maturing: MQTT, filesystem, and AMQP
+are wired live fan-in sources, while webhook, cron, peripheral, and calendar
+triggers are defined and matched but not yet routed to a live source, so the
+capability is **experimental**. OpenClaw has no deterministic-procedure engine
+(its exec-approval flow is a per-tool permission prompt, not a step runner), so
+it is **none**. Hermes ships cron and webhook "routines" that pair a trigger with
+a free-form agent prompt but no deterministic multi-step engine, approval gates,
+or audited run state, so it is **partial** on the trigger side only.
+
 ## ZeroClaw, OpenClaw, and Hermes
 
 ZeroClaw is a from-scratch runtime, not a fork. The comparison columns state
