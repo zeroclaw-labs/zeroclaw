@@ -426,6 +426,7 @@ zc-code-sidebar-queue = Queue
 zc-code-sidebar-session = Session
 zc-code-sidebar-active-tools = Active tools
 zc-code-sidebar-recent-files = Recent files
+zc-code-sidebar-toggle-button = [sidebar]
 zc-code-copied-clipboard = Copied raw text to clipboard
 zc-code-copied-markdown = Copied markdown to clipboard
 zc-code-retry-queued = Queued message retry

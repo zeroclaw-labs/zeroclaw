@@ -1212,6 +1212,10 @@ impl ZerocodePane {
         self.ui.clone()
     }
 
+    pub(crate) fn set_ui_config(&mut self, ui: config::UiSection) {
+        self.ui = ui;
+    }
+
     fn activate_connection(&mut self) {
         let Some(field) = ConnField::variants().get(self.conn_cursor).copied() else {
             return;

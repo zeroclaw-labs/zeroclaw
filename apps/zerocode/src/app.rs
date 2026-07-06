@@ -708,6 +708,22 @@ pub async fn run(
                 if quit {
                     break;
                 }
+                let ui_command = match mode {
+                    Mode::Code => code_pane.take_ui_command(),
+                    Mode::Chat => chat_pane.take_ui_command(),
+                    _ => None,
+                };
+                if let Some(command) = ui_command {
+                    apply_transcript_ui_command(
+                        config_dir,
+                        &mut ui_config,
+                        command,
+                        &mut code_pane,
+                        &mut chat_pane,
+                        &mut config_app,
+                        mode,
+                    );
+                }
                 if mode == Mode::Quickstart && quickstart.take_leave_request() {
                     switch_mode(
                         &mut mode,
@@ -812,6 +828,22 @@ pub async fn run(
                             quickstart.handle_mouse(mouse, content_area).await;
                         }
                     }
+                    let ui_command = match mode {
+                        Mode::Code => code_pane.take_ui_command(),
+                        Mode::Chat => chat_pane.take_ui_command(),
+                        _ => None,
+                    };
+                    if let Some(command) = ui_command {
+                        apply_transcript_ui_command(
+                            config_dir,
+                            &mut ui_config,
+                            command,
+                            &mut code_pane,
+                            &mut chat_pane,
+                            &mut config_app,
+                            mode,
+                        );
+                    }
                     consume_immediate_start_code(&reconnect_state, &mut mode, &mut code_pane).await;
                 }
             }
@@ -831,6 +863,60 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn apply_transcript_ui_command(
+    config_dir: &std::path::Path,
+    ui_config: &mut config::UiSection,
+    command: transcript::TranscriptUiCommand,
+    code_pane: &mut code::Code,
+    chat_pane: &mut transcript::Transcript,
+    config_app: &mut config_manager::App,
+    mode: Mode,
+) {
+    let mut next = ui_config.clone();
+    let persist_result = match command {
+        transcript::TranscriptUiCommand::ToggleSidebar => {
+            next.show_adaptive_sidebar = !next.show_adaptive_sidebar;
+            config::persist_show_adaptive_sidebar(config_dir, next.show_adaptive_sidebar)
+        }
+        transcript::TranscriptUiCommand::CycleProfile => {
+            let profiles = config::UiProfile::variants();
+            let current = profiles
+                .iter()
+                .position(|profile| *profile == next.profile)
+                .unwrap_or(0);
+            let Some(profile) = profiles.get((current + 1) % profiles.len()).copied() else {
+                return;
+            };
+            next.profile = profile;
+            config::persist_ui_profile(config_dir, profile)
+        }
+    };
+    if let Err(error) = persist_result {
+        set_active_transcript_notice(
+            mode,
+            code_pane,
+            chat_pane,
+            crate::i18n::t_args("zc-zerocode-save-failed", &[("error", &error.to_string())]),
+        );
+        return;
+    }
+    config_app.set_zerocode_ui_config(next.clone());
+    apply_zerocode_ui_config(ui_config, next, code_pane, chat_pane);
+}
+
+fn set_active_transcript_notice(
+    mode: Mode,
+    code_pane: &mut code::Code,
+    chat_pane: &mut transcript::Transcript,
+    message: String,
+) {
+    match mode {
+        Mode::Code => code_pane.set_info_notice(message),
+        Mode::Chat => chat_pane.set_info_notice(message),
+        _ => {}
+    }
 }
 
 fn apply_zerocode_ui_config(

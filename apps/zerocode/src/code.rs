@@ -30,6 +30,10 @@ impl Code {
         self.inner.set_adaptive_sidebar_visible(visible);
     }
 
+    pub(crate) fn take_ui_command(&mut self) -> Option<transcript::TranscriptUiCommand> {
+        self.inner.take_ui_command()
+    }
+
     pub(crate) fn set_resume_session_id(&mut self, sid: Option<String>) {
         self.inner.set_resume_session_id(sid);
     }
@@ -104,6 +108,10 @@ impl Code {
 
     pub(crate) fn info_message(&mut self) -> Option<&crate::widgets::InfoMessage> {
         self.inner.info_message()
+    }
+
+    pub(crate) fn set_info_notice(&mut self, msg: String) {
+        self.inner.set_info_notice(msg);
     }
 }
 

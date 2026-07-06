@@ -363,6 +363,7 @@ zc-code-sidebar-queue = Cola
 zc-code-sidebar-session = Sesión
 zc-code-sidebar-active-tools = Herramientas activas
 zc-code-sidebar-recent-files = Archivos recientes
+zc-code-sidebar-toggle-button = [barra]
 zc-code-copied-clipboard = Copiado al portapapeles
 zc-code-copied-markdown = Markdown copiado al portapapeles
 zc-code-retry-queued = Reintento añadido a la cola

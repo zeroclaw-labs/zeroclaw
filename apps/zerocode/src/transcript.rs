@@ -72,6 +72,12 @@ enum TranscriptPhase {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TranscriptUiCommand {
+    ToggleSidebar,
+    CycleProfile,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PaneKind {
     Code,
     Chat,
@@ -121,6 +127,7 @@ pub(crate) struct Transcript {
     pane_kind: PaneKind,
     ui_profile: UiProfile,
     show_adaptive_sidebar: bool,
+    pending_ui_command: Option<TranscriptUiCommand>,
     /// One-shot session id to reattach to on the next session start, set by
     /// the app layer across a reconnect so the rebuilt pane resumes the
     /// pre-disconnect session (the daemon retains it, #7182) instead of
@@ -236,6 +243,7 @@ impl Transcript {
             pane_kind,
             ui_profile,
             show_adaptive_sidebar: true,
+            pending_ui_command: None,
             resume_session_id: None,
             resume_agent_alias: None,
             pick_agent_list_area: Rect::default(),
@@ -264,6 +272,16 @@ impl Transcript {
         self.show_adaptive_sidebar = visible;
         if let TranscriptPhase::Active(state) = &mut self.phase {
             state.set_adaptive_sidebar_visible(visible);
+        }
+    }
+
+    pub(crate) fn take_ui_command(&mut self) -> Option<TranscriptUiCommand> {
+        self.pending_ui_command.take()
+    }
+
+    pub(crate) fn set_info_notice(&mut self, msg: String) {
+        if let TranscriptPhase::Active(state) = &mut self.phase {
+            state.set_info_notice(msg);
         }
     }
 
@@ -1497,6 +1515,14 @@ impl Transcript {
                     state.mark_dirty_append();
                     return false;
                 }
+                InputBarAction::ToggleSidebar => {
+                    self.pending_ui_command = Some(TranscriptUiCommand::ToggleSidebar);
+                    return false;
+                }
+                InputBarAction::CycleProfile => {
+                    self.pending_ui_command = Some(TranscriptUiCommand::CycleProfile);
+                    return false;
+                }
                 InputBarAction::ClearQueue(idx) => {
                     let notice = state.clear_queue_cmd(idx);
                     state.set_info_notice(notice);
@@ -2340,6 +2366,13 @@ impl Transcript {
                 return;
             }
 
+            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+                && state.point_in_adaptive_sidebar_button(col, row)
+            {
+                self.pending_ui_command = Some(TranscriptUiCommand::ToggleSidebar);
+                return;
+            }
+
             if state.point_in_adaptive_sidebar(col, row) {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => state.adaptive_sidebar_scroll_by(-3),
@@ -2985,6 +3018,7 @@ fn render(f: &mut Frame, state: &mut TranscriptState, area: Rect) {
     } else {
         state.queue_item_rects.clear();
         state.adaptive_sidebar_rect = None;
+        state.adaptive_sidebar_button_rect = None;
         area
     };
 
@@ -3243,14 +3277,33 @@ fn render_adaptive_sidebar(f: &mut Frame, state: &mut TranscriptState, area: Rec
     f.render_widget(block, area);
     state.queue_item_rects.clear();
     state.adaptive_sidebar_rect = None;
+    state.adaptive_sidebar_button_rect = None;
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    state.adaptive_sidebar_rect = Some(inner);
+    let rows_area = if state.queue_sidebar_open() {
+        inner
+    } else {
+        let button = crate::i18n::t("zc-code-sidebar-toggle-button");
+        let button_width =
+            unicode_width::UnicodeWidthStr::width(button.as_str()).min(inner.width as usize) as u16;
+        let button_area = Rect::new(inner.x, inner.y, button_width, 1);
+        state.adaptive_sidebar_button_rect = Some(button_area);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(button, theme::accent_style()))),
+            button_area,
+        );
 
-    let (rows, row_owner) = adaptive_sidebar_rows_with_owners(state, inner.width);
+        if inner.height <= 1 {
+            return;
+        }
+        Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1)
+    };
+    state.adaptive_sidebar_rect = Some(rows_area);
+
+    let (rows, row_owner) = adaptive_sidebar_rows_with_owners(state, rows_area.width);
     let total = rows.len() as u16;
-    let max_scroll = total.saturating_sub(inner.height);
+    let max_scroll = total.saturating_sub(rows_area.height);
     if state.adaptive_sidebar_scroll > max_scroll {
         state.adaptive_sidebar_scroll = max_scroll;
     }
@@ -3260,19 +3313,19 @@ fn render_adaptive_sidebar(f: &mut Frame, state: &mut TranscriptState, area: Rec
         if row_index < scroll {
             continue;
         }
-        let screen_y = inner.y + (row_index - scroll);
-        if screen_y >= inner.y + inner.height {
+        let screen_y = rows_area.y + (row_index - scroll);
+        if screen_y >= rows_area.y + rows_area.height {
             break;
         }
         if let Some(id) = owner {
             state
                 .queue_item_rects
-                .push((*id, Rect::new(inner.x, screen_y, inner.width, 1)));
+                .push((*id, Rect::new(rows_area.x, screen_y, rows_area.width, 1)));
         }
     }
 
     let para = Paragraph::new(rows).scroll((scroll, 0));
-    f.render_widget(para, inner);
+    f.render_widget(para, rows_area);
 }
 
 fn adaptive_sidebar_rows(state: &TranscriptState) -> Vec<Line<'static>> {
@@ -5344,6 +5397,7 @@ pub struct TranscriptState {
     queue_item_rects: Vec<(u64, ratatui::layout::Rect)>,
     /// Inner sidebar rect from the last draw, for scroll-wheel hit-testing.
     adaptive_sidebar_rect: Option<ratatui::layout::Rect>,
+    adaptive_sidebar_button_rect: Option<ratatui::layout::Rect>,
     /// Scroll offset (in rendered rows) into the adaptive sidebar.
     adaptive_sidebar_scroll: u16,
     /// Latest info-bar message (queue/attach notices, model-switch op notes,
@@ -5433,6 +5487,7 @@ impl TranscriptState {
             queue_sel: None,
             queue_item_rects: Vec::new(),
             adaptive_sidebar_rect: None,
+            adaptive_sidebar_button_rect: None,
             adaptive_sidebar_scroll: 0,
             info_message: None,
             model_picker: ModelPickerOverlay::None,
@@ -6451,6 +6506,11 @@ impl TranscriptState {
             .is_some_and(|rect| mouse::in_rect(col, row, rect))
     }
 
+    pub fn point_in_adaptive_sidebar_button(&self, col: u16, row: u16) -> bool {
+        self.adaptive_sidebar_button_rect
+            .is_some_and(|rect| mouse::in_rect(col, row, rect))
+    }
+
     /// Scroll the adaptive sidebar by `delta` rows (negative = up). Clamped to
     /// the content overflow recorded on the last draw.
     pub fn adaptive_sidebar_scroll_by(&mut self, delta: i16) {
@@ -6941,6 +7001,40 @@ mod tests {
             .unwrap();
 
         assert!(state.adaptive_sidebar_open(80));
+    }
+
+    #[test]
+    fn adaptive_sidebar_button_hidden_for_queue_sidebar() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = state();
+        state
+            .enqueue_message("queued".to_string(), Vec::new())
+            .unwrap();
+        let area = Rect::new(0, 0, 40, 8);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_adaptive_sidebar(frame, &mut state, area))
+            .expect("draw sidebar");
+
+        assert!(state.adaptive_sidebar_button_rect.is_none());
+    }
+
+    #[test]
+    fn adaptive_sidebar_button_shown_for_context_sidebar() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = state();
+        state.cwd = Some("/repo".to_string());
+        let area = Rect::new(0, 0, 40, 8);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_adaptive_sidebar(frame, &mut state, area))
+            .expect("draw sidebar");
+
+        assert!(state.adaptive_sidebar_button_rect.is_some());
     }
 
     #[test]

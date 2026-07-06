@@ -363,6 +363,7 @@ zc-code-sidebar-queue = キュー
 zc-code-sidebar-session = セッション
 zc-code-sidebar-active-tools = 実行中ツール
 zc-code-sidebar-recent-files = 最近のファイル
+zc-code-sidebar-toggle-button = [サイドバー]
 zc-code-copied-clipboard = クリップボードにコピーしました
 zc-code-copied-markdown = Markdown をクリップボードにコピーしました
 zc-code-retry-queued = メッセージの再試行をキューに追加しました

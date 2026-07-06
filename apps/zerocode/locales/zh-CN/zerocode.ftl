@@ -363,6 +363,7 @@ zc-code-sidebar-queue = 队列
 zc-code-sidebar-session = 会话
 zc-code-sidebar-active-tools = 活跃工具
 zc-code-sidebar-recent-files = 最近文件
+zc-code-sidebar-toggle-button = [侧栏]
 zc-code-copied-clipboard = 已复制到剪贴板
 zc-code-copied-markdown = 已复制 Markdown 到剪贴板
 zc-code-retry-queued = 已将消息重试加入队列

@@ -363,6 +363,7 @@ zc-code-sidebar-queue = File
 zc-code-sidebar-session = Session
 zc-code-sidebar-active-tools = Outils actifs
 zc-code-sidebar-recent-files = Fichiers récents
+zc-code-sidebar-toggle-button = [barre]
 zc-code-copied-clipboard = Copié dans le presse-papiers
 zc-code-copied-markdown = Markdown copié dans le presse-papiers
 zc-code-retry-queued = Message remis en file

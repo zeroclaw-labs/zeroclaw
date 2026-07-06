@@ -33,10 +33,17 @@ const MAX_INPUT_ROWS: u16 = 5;
 const MAX_PROMPT_HISTORY: usize = 100;
 
 pub(crate) const SLASH_COMMAND_CLEAR_QUEUE: &str = "/clear-queue";
+pub(crate) const SLASH_COMMAND_PROFILE: &str = "/profile";
+pub(crate) const SLASH_COMMAND_SIDEBAR: &str = "/sidebar";
 pub(crate) const SLASH_COMMAND_TOGGLE_THINKING: &str = "/toggle-thinking";
 
-/// Slash commands available for auto-complete.
-const SLASH_COMMANDS: &[&str] = &[
+macro_rules! slash_commands {
+    ($($command:expr),+ $(,)?) => {
+        const SLASH_COMMANDS: &[&str] = &[$($command),+];
+    };
+}
+
+slash_commands! {
     "/attach",
     "/attachments",
     SLASH_COMMAND_CLEAR_QUEUE,
@@ -45,9 +52,11 @@ const SLASH_COMMANDS: &[&str] = &[
     "/model-provider",
     "/new",
     "/new-session",
+    SLASH_COMMAND_PROFILE,
     "/restart-session",
+    SLASH_COMMAND_SIDEBAR,
     SLASH_COMMAND_TOGGLE_THINKING,
-];
+}
 
 // ── Action type ──────────────────────────────────────────────────
 
@@ -80,6 +89,8 @@ pub(crate) enum InputBarAction {
     StatusMessage(String),
     /// User typed `/toggle-thinking` — parent should toggle thought visibility.
     ToggleThinking,
+    ToggleSidebar,
+    CycleProfile,
     /// User chose a model directly (`/model <name>`) — parent applies it via
     /// `session/configure`.
     SetModel(String),
@@ -113,6 +124,8 @@ enum SlashCommand<'a> {
     /// rather than silently clearing the whole queue.
     ClearQueue(Option<usize>),
     ToggleThinking,
+    ToggleSidebar,
+    CycleProfile,
     /// `/model <name>` — switch model directly.
     Model(&'a str),
     /// `/model` (no arg) — open the model picker modal.
@@ -148,6 +161,10 @@ fn parse_slash_command(input: &str) -> SlashCommand<'_> {
         SlashCommand::ListAttachments
     } else if trimmed == "/restart-session" || trimmed == "/new-session" || trimmed == "/new" {
         SlashCommand::RestartSession
+    } else if trimmed == SLASH_COMMAND_PROFILE {
+        SlashCommand::CycleProfile
+    } else if trimmed == SLASH_COMMAND_SIDEBAR {
+        SlashCommand::ToggleSidebar
     } else if trimmed == SLASH_COMMAND_TOGGLE_THINKING {
         SlashCommand::ToggleThinking
     } else if let Some(name) = trimmed.strip_prefix("/model-provider ") {
@@ -1526,6 +1543,8 @@ impl InputBarState {
                 SlashCommand::ClearQueue(idx) => InputBarAction::ClearQueue(idx),
                 SlashCommand::RestartSession => InputBarAction::RestartSession,
                 SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
+                SlashCommand::ToggleSidebar => InputBarAction::ToggleSidebar,
+                SlashCommand::CycleProfile => InputBarAction::CycleProfile,
                 SlashCommand::Model(name) => InputBarAction::SetModel(name.to_string()),
                 SlashCommand::ModelPicker => InputBarAction::OpenModelPicker,
                 SlashCommand::ModelProvider(name) => {
@@ -2344,6 +2363,14 @@ mod tests {
             SlashCommand::ToggleThinking
         ));
         assert!(matches!(
+            parse_slash_command("/sidebar"),
+            SlashCommand::ToggleSidebar
+        ));
+        assert!(matches!(
+            parse_slash_command("/profile"),
+            SlashCommand::CycleProfile
+        ));
+        assert!(matches!(
             parse_slash_command("hello"),
             SlashCommand::NotACommand
         ));
@@ -3019,6 +3046,22 @@ mod tests {
         assert!(matches!(action, InputBarAction::ToggleThinking));
         // Input should be cleared after submission.
         assert_eq!(bar.input(), "");
+    }
+
+    #[test]
+    fn slash_sidebar_returns_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/sidebar");
+        let action = bar.handle_enter();
+        assert!(matches!(action, InputBarAction::ToggleSidebar));
+    }
+
+    #[test]
+    fn slash_profile_returns_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/profile");
+        let action = bar.handle_enter();
+        assert!(matches!(action, InputBarAction::CycleProfile));
     }
 
     #[test]
