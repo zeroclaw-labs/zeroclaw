@@ -3,6 +3,8 @@
 
 # Desktop installer build artifacts
 *.dmg
+# Kernel sidecar staging for the self-contained desktop build
+/apps/tauri/binaries/
 /docs/book/book/
 /docs/book/po/messages.pot
 /docs/book/po/*.failures.log

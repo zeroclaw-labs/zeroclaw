@@ -171,6 +171,38 @@ Community open-skills loading is opt-in via the `skills` config. When enabled, Z
 
 The default prompt injection mode is `full`, which includes full skill instructions in the system prompt. Use `compact` to keep only compact metadata in context and load skill details on demand:
 
+## Autonomous skill creation
+
+After a successful multi-step task (at least two tool calls), ZeroClaw can persist the execution as a reusable skill. This is **off by default** and opt-in:
+
+```toml
+[skills.skill_creation]
+enabled = true              # off by default
+max_skills = 500            # LRU cap: oldest auto-generated skill is evicted past this
+similarity_threshold = 0.85 # embedding-dedup cutoff; near-duplicate tasks are skipped
+```
+
+By default each created skill is a deterministic `SKILL.toml` generated directly from the tool-call trace; no model call is involved.
+
+### Reflection (`SKILL.md` synthesis)
+
+With reflection enabled, ZeroClaw instead asks the agent's configured model provider to synthesize a canonical [`SKILL.md`](#create-a-markdown-skill) from a **bounded** slice of the execution (the task, the tool-call trace, and the final answer). Every input is independently truncated to a configured character budget so a large execution can never produce an unbounded reflection request:
+
+```toml
+[skills.skill_creation]
+enabled = true
+reflection_enabled = true   # opt-in; requires enabled = true
+max_task_chars = 1000           # task description budget
+max_tool_trace_chars = 4000     # tool-call trace budget
+max_final_answer_chars = 2000   # final assistant answer budget
+```
+
+If the reflection call fails (provider error, malformed output, or an empty body), ZeroClaw falls back to the deterministic `SKILL.toml` path, so enabling reflection never leaves a skill un-created. Reflected skills are stamped with the `zeroclaw-auto` author and participate in the same dedup and LRU eviction as `SKILL.toml` skills.
+
+Because reflection forwards turn content to the model provider, the task, the tool-call trace, and the final answer are each scanned for credential-shaped values (API keys, tokens, AWS credentials, PEM private keys, JWTs, database connection URLs, and high-entropy secrets) and redacted **before** the prompt is composed and sent, using the same outbound-content guardrail ZeroClaw applies to channel responses. Redaction runs in-process ahead of the request, so a secret that appears in a tool argument or the final answer is replaced with a `[REDACTED_…]` marker rather than reaching the provider.
+
+> **Reflection vs. skill improvement.** Reflection (`[skills.skill_creation] reflection_enabled`) *creates a new skill* from a completed execution trace. The `[skills.skill_improvement]` background review fork is a separate feature that *patches existing skills* after they are used. They can be enabled independently.
+
 ## See also
 
 - [Tools overview](./overview.md)

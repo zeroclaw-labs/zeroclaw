@@ -208,9 +208,10 @@ The test suite is not absent. The existing test investment is real. The work thi
 describes is about the quality and distribution of that investment: what gets tested,
 how, and whether the tests prove what they appear to prove.
 
-`ADR-004-tool-shared-state-ownership.md` is an excellent piece of architectural record.
-It proves the team can produce high-quality design documentation when the expectation
-is clear. This RFC is proposing an equivalent expectation for the code itself.
+[ADR-004](../architecture/decisions/ADR-004-tool-shared-state-ownership.md)
+is an excellent piece of architectural record. It proves the team can produce
+high-quality design documentation when the expectation is clear. This RFC is
+proposing an equivalent expectation for the code itself.
 
 --------
 

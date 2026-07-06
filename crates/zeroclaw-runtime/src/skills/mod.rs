@@ -138,6 +138,120 @@ pub struct ShadowedSkill {
     pub origin_hint: String,
 }
 
+/// The canonical set of typed slash-option kinds a skill may declare. This enum
+/// is the single source of truth for both the kind list and which constraints
+/// each kind carries: any surface that offers a kind picker or gates constraint
+/// inputs walks these variants and reads their capability methods rather than
+/// restating them. Discord's `OptKind` is the wire projection of this set,
+/// built by mapping each variant, so a new variant here forces a decision in
+/// every exhaustive `match` on both sides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SlashOptionKind {
+    String,
+    Integer,
+    Number,
+    Boolean,
+    User,
+    Channel,
+    Role,
+    Mentionable,
+}
+
+impl SlashOptionKind {
+    /// Every kind, in the order surfaces should offer them. Walked (not
+    /// restated) by every registry consumer.
+    pub const ALL: [Self; 8] = [
+        Self::String,
+        Self::Integer,
+        Self::Number,
+        Self::Boolean,
+        Self::User,
+        Self::Channel,
+        Self::Role,
+        Self::Mentionable,
+    ];
+
+    /// The canonical `type` token written in frontmatter.
+    pub fn manifest_name(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Integer => "integer",
+            Self::Number => "number",
+            Self::Boolean => "boolean",
+            Self::User => "user",
+            Self::Channel => "channel",
+            Self::Role => "role",
+            Self::Mentionable => "mentionable",
+        }
+    }
+
+    /// Predefined `choices` apply only to string/integer/number options.
+    pub fn supports_choices(self) -> bool {
+        match self {
+            Self::String | Self::Integer | Self::Number => true,
+            Self::Boolean | Self::User | Self::Channel | Self::Role | Self::Mentionable => false,
+        }
+    }
+
+    /// `min`/`max` numeric bounds apply only to integer/number options.
+    pub fn supports_numeric_bounds(self) -> bool {
+        match self {
+            Self::Integer | Self::Number => true,
+            Self::String
+            | Self::Boolean
+            | Self::User
+            | Self::Channel
+            | Self::Role
+            | Self::Mentionable => false,
+        }
+    }
+
+    /// `min_length`/`max_length` bounds apply only to string options.
+    pub fn supports_length_bounds(self) -> bool {
+        match self {
+            Self::String => true,
+            Self::Integer
+            | Self::Number
+            | Self::Boolean
+            | Self::User
+            | Self::Channel
+            | Self::Role
+            | Self::Mentionable => false,
+        }
+    }
+
+    /// The wire-facing capability row for this kind, consumed by API surfaces.
+    pub fn descriptor(self) -> SlashOptionKindDescriptor {
+        SlashOptionKindDescriptor {
+            manifest_name: self.manifest_name().to_string(),
+            supports_choices: self.supports_choices(),
+            supports_numeric_bounds: self.supports_numeric_bounds(),
+            supports_length_bounds: self.supports_length_bounds(),
+        }
+    }
+}
+
+/// Serialized capability row for one [`SlashOptionKind`], as published to
+/// surfaces (the web dashboard mirrors this shape). Built by walking
+/// [`SlashOptionKind::ALL`]; never hand-authored.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct SlashOptionKindDescriptor {
+    pub manifest_name: String,
+    pub supports_choices: bool,
+    pub supports_numeric_bounds: bool,
+    pub supports_length_bounds: bool,
+}
+
+/// The full registry, produced by exhaustively walking [`SlashOptionKind::ALL`].
+pub fn slash_option_kinds() -> Vec<SlashOptionKindDescriptor> {
+    SlashOptionKind::ALL
+        .into_iter()
+        .map(SlashOptionKind::descriptor)
+        .collect()
+}
+
 /// A typed option a `slash`-tagged skill exposes on its slash command. Shaped
 /// after the Discord Application Command Option model but channel-agnostic; a
 /// slash-capable channel maps `kind` to its wire option type. Declared in
@@ -2860,6 +2974,46 @@ fn namespace_plugin_skill(plugin_name: &str, mut skill: Skill) -> Skill {
 mod registry_tests {
     use super::*;
     use std::io::{self, Write};
+
+    #[test]
+    fn slash_option_kinds_registry_is_walked_from_the_enum() {
+        // The published registry is exactly `SlashOptionKind::ALL` walked into
+        // descriptors, in order. No hand-authored rows: adding a variant to the
+        // enum extends this without touching the builder.
+        let registry = slash_option_kinds();
+        assert_eq!(registry.len(), SlashOptionKind::ALL.len());
+        for (descriptor, kind) in registry.iter().zip(SlashOptionKind::ALL) {
+            assert_eq!(descriptor.manifest_name, kind.manifest_name());
+            assert_eq!(descriptor.supports_choices, kind.supports_choices());
+            assert_eq!(
+                descriptor.supports_numeric_bounds,
+                kind.supports_numeric_bounds()
+            );
+            assert_eq!(
+                descriptor.supports_length_bounds,
+                kind.supports_length_bounds()
+            );
+        }
+    }
+
+    #[test]
+    fn only_scalar_kinds_carry_bounds_and_choices() {
+        // Capability invariants the surfaces depend on: numeric bounds imply a
+        // scalar with choices; length bounds are string-only.
+        for kind in SlashOptionKind::ALL {
+            if kind.supports_numeric_bounds() || kind.supports_length_bounds() {
+                assert!(
+                    kind.supports_choices(),
+                    "{:?} carries bounds but is not choiceable",
+                    kind.manifest_name()
+                );
+            }
+        }
+        assert!(SlashOptionKind::String.supports_length_bounds());
+        assert!(!SlashOptionKind::String.supports_numeric_bounds());
+        assert!(SlashOptionKind::Integer.supports_numeric_bounds());
+        assert!(!SlashOptionKind::Integer.supports_length_bounds());
+    }
 
     struct CountingWriter {
         written: usize,
