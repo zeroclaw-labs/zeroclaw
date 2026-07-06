@@ -51,6 +51,7 @@ pub fn run(locale: Option<&str>, tag: Option<&str>) -> anyhow::Result<()> {
     crate::cmd::mdbook::keymap::run(&root)?;
     crate::cmd::mdbook::hardware::run(&root)?;
     crate::cmd::mdbook::feature_matrix::run(&root)?;
+    crate::cmd::mdbook::plugins::run(&root)?;
 
     // Watched locale: the one passed in, or the first entry in locales.toml.
     let watch_locale = locale
