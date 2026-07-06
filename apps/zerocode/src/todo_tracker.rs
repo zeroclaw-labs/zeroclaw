@@ -5,7 +5,7 @@
 //! session, after which the user's toggle is authoritative; a master
 //! `enabled` flag hard-gates all rendering.
 
-use crate::wire::{PlanEntry, PlanStatus};
+use crate::wire::{ConfigFieldEntry, PlanEntry, PlanStatus};
 
 /// Where the tracker renders relative to the Code pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,32 +16,144 @@ pub(crate) enum TodoLocation {
     Right,
 }
 
+impl TodoLocation {
+    /// Parse the `[todotracker] location` config value. Unknown values
+    /// fall back to `Right` (the schema default).
+    fn from_config_str(s: &str) -> Self {
+        match s {
+            "bottom" => Self::Bottom,
+            "left" => Self::Left,
+            _ => Self::Right,
+        }
+    }
+}
+
+/// Parsed `[todotracker]` config, sourced from the daemon over
+/// `config/list` at pane init. Defaults mirror the schema defaults so a
+/// fetch failure or absent section still yields correct behavior.
+#[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
+pub(crate) struct TodoTrackerSettings {
+    pub enabled: bool,
+    pub enabled_at_start: bool,
+    pub location: TodoLocation,
+    pub width: u16,
+    pub max_height: u16,
+}
+
+impl Default for TodoTrackerSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            enabled_at_start: false,
+            location: TodoLocation::Right,
+            width: 32,
+            max_height: 5,
+        }
+    }
+}
+
+impl TodoTrackerSettings {
+    /// Build settings from `config/list` field entries (prefix
+    /// `todotracker`). Each field is keyed by its dotted `path`
+    /// (`todotracker.enabled`, …); absent or unparseable fields keep the
+    /// schema default. The daemon is the source of truth for defaults,
+    /// but we re-apply them here so a partial/failed fetch degrades
+    /// gracefully.
+    #[allow(dead_code)]
+    pub(crate) fn from_config_fields(fields: &[ConfigFieldEntry]) -> Self {
+        let mut s = Self::default();
+        for f in fields {
+            let key = f.path.rsplit('.').next().unwrap_or(f.path.as_str());
+            let Some(value) = f.value.as_ref() else {
+                continue;
+            };
+            match key {
+                "enabled" => {
+                    if let Some(b) = value.as_bool() {
+                        s.enabled = b;
+                    }
+                }
+                "enabled_at_start" => {
+                    if let Some(b) = value.as_bool() {
+                        s.enabled_at_start = b;
+                    }
+                }
+                "location" => {
+                    if let Some(loc) = value.as_str() {
+                        s.location = TodoLocation::from_config_str(loc);
+                    }
+                }
+                "width" => {
+                    if let Some(n) = value.as_u64() {
+                        s.width = n.clamp(1, u16::MAX as u64) as u16;
+                    }
+                }
+                "max_height" => {
+                    if let Some(n) = value.as_u64() {
+                        s.max_height = n.clamp(1, u16::MAX as u64) as u16;
+                    }
+                }
+                _ => {}
+            }
+        }
+        s
+    }
+}
+
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct TodoTracker {
     entries: Vec<PlanEntry>,
     visible: bool,
     has_ever_popped: bool,
     location: TodoLocation,
     enabled: bool,
+    /// Side-panel target column width (left/right); runtime-clamped.
+    width: u16,
+    /// Bottom-strip max height in rows (grows up to this).
+    max_height: u16,
 }
 
 #[allow(dead_code)]
 impl TodoTracker {
-    /// `enabled` is the master switch; `enabled_at_start` is the initial
-    /// visibility when enabled.
-    pub(crate) fn new(location: TodoLocation, enabled: bool, enabled_at_start: bool) -> Self {
+    /// Construct from parsed `[todotracker]` settings.
+    pub(crate) fn from_settings(settings: TodoTrackerSettings) -> Self {
         Self {
             entries: Vec::new(),
-            visible: enabled && enabled_at_start,
+            visible: settings.enabled && settings.enabled_at_start,
             has_ever_popped: false,
-            location,
-            enabled,
+            location: settings.location,
+            enabled: settings.enabled,
+            width: settings.width,
+            max_height: settings.max_height,
         }
+    }
+
+    /// Test-only convenience constructor: builds settings from the three
+    /// behavioral flags with default width/max_height.
+    #[cfg(test)]
+    pub(crate) fn new(location: TodoLocation, enabled: bool, enabled_at_start: bool) -> Self {
+        Self::from_settings(TodoTrackerSettings {
+            enabled,
+            enabled_at_start,
+            location,
+            ..TodoTrackerSettings::default()
+        })
     }
 
     pub(crate) fn location(&self) -> TodoLocation {
         self.location
+    }
+
+    /// Side-panel target column width from config (left/right).
+    pub(crate) fn width(&self) -> u16 {
+        self.width
+    }
+
+    /// Bottom-strip max height from config.
+    pub(crate) fn max_height(&self) -> u16 {
+        self.max_height
     }
 
     /// Replace the plan wholesale. On the first non-empty plan of the
@@ -151,6 +263,100 @@ mod tests {
             priority: PlanPriority::Medium,
             active_form: None,
         }
+    }
+
+    fn field(path: &str, value: serde_json::Value) -> crate::wire::ConfigFieldEntry {
+        crate::wire::ConfigFieldEntry {
+            path: path.to_string(),
+            category: "todotracker".to_string(),
+            kind: crate::wire::PropKind::String,
+            type_hint: String::new(),
+            value: Some(value),
+            populated: true,
+            is_secret: false,
+            is_env_overridden: false,
+            enum_variants: Vec::new(),
+            description: String::new(),
+            section: None,
+            tab: crate::wire::ConfigTab::None,
+            alias_source: None,
+        }
+    }
+
+    #[test]
+    fn settings_default_matches_schema_defaults() {
+        let s = TodoTrackerSettings::default();
+        assert!(s.enabled);
+        assert!(!s.enabled_at_start);
+        assert_eq!(s.location, TodoLocation::Right);
+        assert_eq!(s.width, 32);
+        assert_eq!(s.max_height, 5);
+    }
+
+    #[test]
+    fn settings_parse_all_fields_from_config() {
+        let fields = vec![
+            field("todotracker.enabled", serde_json::json!(true)),
+            field("todotracker.enabled_at_start", serde_json::json!(true)),
+            field("todotracker.location", serde_json::json!("bottom")),
+            field("todotracker.width", serde_json::json!(40)),
+            field("todotracker.max_height", serde_json::json!(8)),
+        ];
+        let s = TodoTrackerSettings::from_config_fields(&fields);
+        assert!(s.enabled);
+        assert!(s.enabled_at_start);
+        assert_eq!(s.location, TodoLocation::Bottom);
+        assert_eq!(s.width, 40);
+        assert_eq!(s.max_height, 8);
+    }
+
+    #[test]
+    fn settings_keep_defaults_for_absent_or_bad_fields() {
+        // Unknown location string falls back to Right; missing fields keep defaults.
+        let fields = vec![field("todotracker.location", serde_json::json!("diagonal"))];
+        let s = TodoTrackerSettings::from_config_fields(&fields);
+        assert_eq!(s.location, TodoLocation::Right);
+        assert_eq!(s.width, 32);
+        assert!(s.enabled);
+    }
+
+    #[test]
+    fn config_enabled_false_disables_tracker() {
+        // The reviewer's core case: [todotracker] enabled = false must
+        // actually disable the running tracker.
+        let fields = vec![field("todotracker.enabled", serde_json::json!(false))];
+        let s = TodoTrackerSettings::from_config_fields(&fields);
+        let mut t = TodoTracker::from_settings(s);
+        t.set_plan(vec![entry("A", PlanStatus::Pending)]);
+        assert!(
+            !t.is_visible(),
+            "enabled=false must keep the tracker hidden"
+        );
+        assert!(!t.wants_space());
+    }
+
+    #[test]
+    fn config_enabled_at_start_shows_tracker_at_launch() {
+        let fields = vec![
+            field("todotracker.enabled", serde_json::json!(true)),
+            field("todotracker.enabled_at_start", serde_json::json!(true)),
+        ];
+        let t = TodoTracker::from_settings(TodoTrackerSettings::from_config_fields(&fields));
+        assert!(
+            t.is_visible(),
+            "enabled_at_start=true must be visible at launch"
+        );
+    }
+
+    #[test]
+    fn config_width_and_max_height_flow_to_tracker() {
+        let fields = vec![
+            field("todotracker.width", serde_json::json!(50)),
+            field("todotracker.max_height", serde_json::json!(9)),
+        ];
+        let t = TodoTracker::from_settings(TodoTrackerSettings::from_config_fields(&fields));
+        assert_eq!(t.width(), 50);
+        assert_eq!(t.max_height(), 9);
     }
 
     #[test]
