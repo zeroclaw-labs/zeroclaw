@@ -128,6 +128,7 @@ cli-models-set-about = Establece el modelo predeterminado en la configuración
 cli-models-status-about = Muestra la configuración actual del modelo y el estado de la caché
 cli-doctor-models-about = Sondea catálogos de modelos en todos los proveedores e informa sobre la disponibilidad
 cli-doctor-traces-about = Consulta eventos de traza en tiempo de ejecución (diagnósticos de herramientas y respuestas de modelos)
+cli-doctor-update-context-windows-about = Actualiza context_window en config.toml desde los endpoints /models del proveedor
 cli-hardware-discover-about = Enumera dispositivos USB y muestra placas conocidas
 cli-hardware-introspect-about = Inspecciona un dispositivo por su número de serie o ruta de dispositivo
 cli-hardware-info-about = Obtiene información del chip vía USB usando probe-rs sobre ST-Link
@@ -287,6 +288,13 @@ cli-skills-install-suggestion =
 
     Capacidad coincidente: {$matched}
     Siguiente: Ejecuta `{$install_command}` para instalarla.
+
+cli-plugin-install-suggestion =
+    Parece que esta solicitud necesita el plugin `{$name}`, pero no está instalado.
+
+    Capacidad coincidente: {$matched}
+    Siguiente: Ejecuta `{$install_command}` para instalarlo.
+
 cli-completions-long-about =
     Genera scripts de autocompletado de shell para `zeroclaw`.
 
@@ -386,6 +394,9 @@ cli-skills-create-hint = {"  "}Cree uno: mkdir -p ~/.zeroclaw/workspace/skills/m
 cli-skills-install-hint = {"  "}O instale: zeroclaw skills install <source>
 cli-skills-installed-header = Skills instaladas ({$count}):
 cli-skills-tags = Etiquetas:  {$tags}
+cli-skills-skipped-header = Omitidas ({$count}):
+cli-skills-skipped-reason = {"    "}Motivo: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}Establece `skills.allow_scripts = true` en tu configuración de zeroclaw para habilitarla.
 cli-sop-none = No se encontraron SOP.
 cli-sop-create-hint = {"  "}Cree uno: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}luego agregue SOP.toml y SOP.md
@@ -552,6 +563,9 @@ cli-agent-not-created = Tu agente no fue creado — y no se cambió nada en el d
 cli-onboard-deprecated = `zeroclaw onboard` está obsoleto — usa `zeroclaw quickstart`.
 cli-otp-initialized = Secreto OTP inicializado para ZeroClaw.
 cli-otp-enrollment-uri = URI de inscripción: {$uri}
+cli-otp-received = {"  "}✓ OTP recibido
+cli-secret-captured = {"  "}● Valor capturado — pulse Enter para guardar
+cli-secret-received = {"  "}✓ Secreto recibido
 cli-pairing-enabled = 🔐 El emparejamiento del gateway está habilitado.
 cli-pairing-use-code = {"  "}Usa este código de un solo uso para emparejar un nuevo dispositivo:
 cli-pairing-post = {"    "}POST /pair con encabezado X-Pairing-Code: {$code}
@@ -774,3 +788,17 @@ cli-bundle-warn-archive = advertencia: falló el archivado del directorio del bu
 cli-bundle-deleted = eliminado skill_bundles.{$alias} (eliminado de {$count} agente(s))
 cli-bundle-warn-move = advertencia: falló el movimiento del directorio del bundle: {$error}
 cli-bundle-renamed = renombrado skill_bundles.{$from} → skill_bundles.{$to}
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
+cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
+cli-agent-context-bar-unknown = ctx: desconocido / {$max}
+cli-doctor-ctxwin-already-set = {$provider_ref}: ya tiene context_window = {$ctx}
+cli-doctor-ctxwin-no-model = {$provider_ref}: no hay modelo configurado, omitiendo
+cli-doctor-ctxwin-would-set = {$provider_ref}: establecería context_window = {$ctx} (simulación)
+cli-doctor-ctxwin-set = {$provider_ref}: context_window establecido = {$ctx}
+cli-doctor-ctxwin-not-found = {$provider_ref}: no se encontró la entrada para actualizar
+cli-doctor-ctxwin-fetch-failed = {$provider_ref}: el proveedor no expone ventana de contexto o falló la obtención
+cli-doctor-ctxwin-saved = Guardados {$updated} cambios en config.toml
+cli-doctor-ctxwin-dry-run = Simulación completa — sin cambios. Ejecute sin --dry-run para aplicar.
+cli-doctor-ctxwin-none = No se necesitan actualizaciones.
+cli-doctor-ctxwin-write-failed = {$provider_ref}: error al escribir context_window: {$error}

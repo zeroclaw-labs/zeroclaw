@@ -897,7 +897,7 @@ fn draw_status_bar(
     // The ctx bar is held back until the context-accounting feature is
     // ready to show; there is no user-facing switch — the gate flips
     // when the work lands.
-    const SHOW_CTX_BAR: bool = false;
+    const SHOW_CTX_BAR: bool = true;
     // If browse mode is active, split off a fixed-width badge first.
     let left_area = if browse_mode {
         let badge_w = "  BROWSE  ".len() as u16 + 1;

@@ -58,7 +58,6 @@ use crate::microsoft365::Microsoft365Tool;
 use crate::model_routing_config::ModelRoutingConfigTool;
 use crate::notion_tool::NotionTool;
 use crate::opencode_cli::OpenCodeCliTool;
-use crate::pdf_read::PdfReadTool;
 use crate::pipeline::PipelineTool;
 use crate::poll::PollTool;
 use crate::project_intel::ProjectIntelTool;
@@ -67,6 +66,7 @@ use crate::pushover::PushoverTool;
 use crate::reaction::ReactionTool;
 use crate::report_template_tool::ReportTemplateTool;
 use crate::screenshot::ScreenshotTool;
+use crate::send_via::SendViaTool;
 use crate::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
@@ -124,7 +124,6 @@ tool_attribution!(Microsoft365Tool, ToolKind::Plugin);
 tool_attribution!(ModelRoutingConfigTool, ToolKind::Plugin);
 tool_attribution!(NotionTool, ToolKind::Plugin);
 tool_attribution!(OpenCodeCliTool, ToolKind::Plugin);
-tool_attribution!(PdfReadTool, ToolKind::Plugin);
 tool_attribution!(PipelineTool, ToolKind::Plugin);
 tool_attribution!(PollTool, ToolKind::Wait);
 tool_attribution!(ProjectIntelTool, ToolKind::Plugin);
@@ -133,6 +132,7 @@ tool_attribution!(PushoverTool, ToolKind::Plugin);
 tool_attribution!(ReactionTool, ToolKind::Plugin);
 tool_attribution!(ReportTemplateTool, ToolKind::Plugin);
 tool_attribution!(ScreenshotTool, ToolKind::Plugin);
+tool_attribution!(SendViaTool, ToolKind::Plugin);
 tool_attribution!(SessionDeleteTool, ToolKind::Plugin);
 tool_attribution!(SessionResetTool, ToolKind::Plugin);
 tool_attribution!(SessionsCurrentTool, ToolKind::Plugin);
@@ -144,3 +144,56 @@ tool_attribution!(ToolSearchTool, ToolKind::Search);
 tool_attribution!(WeatherTool, ToolKind::Plugin);
 tool_attribution!(WebFetchTool, ToolKind::FetchUrl);
 tool_attribution!(WebSearchTool, ToolKind::Search);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use crate::calculator::CalculatorTool;
+    use zeroclaw_api::attribution::{Attributable, Role};
+
+    /// `tool_attribution!` must produce an `Attributable` impl that maps
+    /// `role()` to `Role::Tool(kind)` and `alias()` to `Tool::name()`.
+    /// CalculatorTool is the only unit-struct Tool in this crate so it
+    /// stands in as a smoke test for the macro expansion itself.
+    #[test]
+    fn macro_sets_role_to_tool_kind() {
+        let tool = CalculatorTool;
+        assert_eq!(tool.role(), Role::Tool(ToolKind::Plugin));
+        assert_eq!(tool.alias(), "calculator");
+    }
+
+    /// `Attributable` is implemented for `Arc<T>` / `Box<T>` / `&T` in
+    /// `zeroclaw-api`. Dispatch sites commonly hand the runtime an
+    /// `Arc<dyn Tool>`, so the alias via `Arc` must agree with the inner.
+    #[test]
+    fn attributable_via_arc_matches_inner() {
+        let inner = CalculatorTool;
+        let arc: Arc<CalculatorTool> = Arc::new(inner);
+        assert_eq!(arc.alias(), "calculator");
+        assert_eq!(arc.role(), Role::Tool(ToolKind::Plugin));
+    }
+
+    /// The log pipeline joins `ToolKind` and `Tool::name()` with a `.`
+    /// to form the `<kind>.<alias>` composite. A `.` inside `name()`
+    /// would silently split the composite and break attribution lookup.
+    /// Pin the invariant: no Tool name contains a `.`.
+    #[test]
+    fn tool_name_has_no_dot_separator() {
+        let tool = CalculatorTool;
+        assert!(
+            !tool.alias().contains('.'),
+            "alias `{}` must not contain `.` — would break `<kind>.<alias>` composite parsing",
+            tool.alias()
+        );
+    }
+
+    /// An empty `name()` would yield `tool.<empty>` in logs, which is
+    /// useless for triage. Pin non-empty.
+    #[test]
+    fn tool_name_is_nonempty() {
+        let tool = CalculatorTool;
+        assert!(!tool.alias().is_empty());
+    }
+}

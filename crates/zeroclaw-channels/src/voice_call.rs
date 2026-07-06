@@ -327,6 +327,8 @@ impl VoiceCallChannel {
             interruption_scope_id: Some(call_id.to_string()),
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
         tx.send(msg).await.map_err(|e| {
             ::zeroclaw_log::record!(
@@ -546,7 +548,13 @@ impl Channel for VoiceCallChannel {
         Ok(())
     }
 
-    async fn finalize_draft(&self, _recipient: &str, _message_id: &str, _text: &str) -> Result<()> {
+    async fn finalize_draft(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+        _suppress_voice: bool,
+    ) -> Result<()> {
         Ok(())
     }
 

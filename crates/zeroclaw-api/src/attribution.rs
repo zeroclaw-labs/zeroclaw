@@ -81,6 +81,8 @@ pub enum ChannelKind {
     DingTalk,
     Discord,
     Email,
+    Filesystem,
+    Git,
     GmailPush,
     #[strum(serialize = "imessage")]
     IMessage,
@@ -113,6 +115,7 @@ pub enum ChannelKind {
     Wechat,
     WhatsappBusiness,
     WhatsappWeb,
+    Plugin,
 }
 
 /// Built-in tool implementations. Closed set — plugins that need their

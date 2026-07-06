@@ -1,7 +1,7 @@
 import { SkillCard } from '@/components/SkillCard';
 import { getAgentOptions, listAgentSkills, readSkill } from '@/lib/api';
 import { t } from '@/lib/i18n';
-import type { AgentSkillEntry, SkillDocument } from '@/lib/api';
+import type { AgentSkillEntry, DroppedSkillEntry, SkillDocument } from '@/lib/api';
 import {
   BookOpen,
   RefreshCw,
@@ -13,6 +13,7 @@ export default function Skills() {
   const [agents, setAgents] = useState<string[]>([]);
   const [selectedAlias, setSelectedAlias] = useState<string>('');
   const [skills, setSkills] = useState<AgentSkillEntry[]>([]);
+  const [dropped, setDropped] = useState<DroppedSkillEntry[]>([]);
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
   const [reloading, setReloading] = useState(false);
@@ -41,8 +42,9 @@ export default function Skills() {
   }, []);
 
   const loadSkills = useCallback((alias: string) => {
-    return listAgentSkills(alias).then(({ skills: ss }) => {
+    return listAgentSkills(alias).then(({ skills: ss, dropped: dd }) => {
       setSkills(ss);
+      setDropped(dd ?? []);
     });
   }, []);
 
@@ -182,8 +184,35 @@ export default function Skills() {
         </span>
       </div>
 
-      {/* Empty state */}
-      {filtered.length === 0 && (
+      {/* Dropped-skill warning — surfaces skills the resolver skipped during
+          the security audit, so an empty list isn't mistaken for "none configured". */}
+      {dropped.length > 0 && (
+        <div
+          className="rounded-lg p-3 text-sm"
+          style={{
+            background: 'rgba(251, 191, 36, 0.1)',
+            borderLeft: '4px solid #fbbf24',
+            color: '#fbbf24',
+          }}
+        >
+          {dropped.length} {t('skills.skipped_count')}
+          <ul className="mt-2 space-y-1">
+            {dropped.map((d) => (
+              <li
+                key={`${d.origin}/${d.name}`}
+                className="text-xs"
+                style={{ color: 'var(--pc-text-muted)' }}
+              >
+                <span className="font-mono">{d.name}</span> ({d.origin}) — {d.reason}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Empty state — only when there are no skills AND nothing was dropped;
+          the dropped banner above already explains the "all skipped" case. */}
+      {filtered.length === 0 && dropped.length === 0 && (
         <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
           {t('skills.empty')}
         </p>

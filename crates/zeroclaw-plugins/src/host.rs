@@ -200,8 +200,10 @@ impl PluginHost {
         self.loaded.get(name).map(plugin_info_from_loaded)
     }
 
-    /// Install a plugin from a directory path.
-    pub fn install(&mut self, source: &str) -> Result<(), PluginError> {
+    /// Install a plugin from a directory path. Returns the installed
+    /// plugin's manifest name so callers can key follow-up work (config
+    /// seeding, messaging) off the canonical name rather than the source path.
+    pub fn install(&mut self, source: &str) -> Result<String, PluginError> {
         let source_path = PathBuf::from(source);
         let manifest_path = if source_path.is_dir() {
             source_path.join("manifest.toml")
@@ -271,6 +273,7 @@ impl PluginHost {
             }
         }
 
+        let installed_name = manifest.name.clone();
         self.loaded.insert(
             manifest.name.clone(),
             LoadedPlugin {
@@ -281,7 +284,7 @@ impl PluginHost {
             },
         );
 
-        Ok(())
+        Ok(installed_name)
     }
 
     /// Remove a plugin by name.
@@ -324,6 +327,19 @@ impl PluginHost {
             .values()
             .filter(|p| p.manifest.capabilities.contains(&PluginCapability::Channel))
             .map(|p| &p.manifest)
+            .collect()
+    }
+
+    /// Get channel-capable plugins with their resolved WASM file paths.
+    /// Returns `(manifest, resolved_wasm_path)` tuples for building
+    /// `WasmChannel`s, mirroring [`Self::tool_plugin_details`]. Channel plugins
+    /// without a `wasm_path` are skipped, so a manifest that declares the
+    /// capability but ships no component is never registered as a live channel.
+    pub fn channel_plugin_details(&self) -> Vec<(&PluginManifest, &Path)> {
+        self.loaded
+            .values()
+            .filter(|p| p.manifest.capabilities.contains(&PluginCapability::Channel))
+            .filter_map(|p| p.wasm_path.as_deref().map(|wp| (&p.manifest, wp)))
             .collect()
     }
 
@@ -965,6 +981,44 @@ capabilities = ["tool"]
         std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
     }
 
+    fn write_channel_plugin(plugins_dir: &Path, name: &str, with_wasm: bool) {
+        let plugin_dir = plugins_dir.join(name);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let wasm_line = if with_wasm {
+            "wasm_path = \"plugin.wasm\"\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            format!(
+                "name = \"{name}\"\nversion = \"0.1.0\"\ncapabilities = [\"channel\"]\n{wasm_line}"
+            ),
+        )
+        .unwrap();
+        if with_wasm {
+            std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
+        }
+    }
+
+    #[test]
+    fn channel_plugin_details_yields_only_wasm_backed_channels() {
+        let dir = tempdir().unwrap();
+        let plugins_base = dir.path().join("plugins");
+        write_channel_plugin(&plugins_base, "with-wasm", true);
+        write_channel_plugin(&plugins_base, "no-wasm", false);
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        let details = host.channel_plugin_details();
+        assert_eq!(
+            details.len(),
+            1,
+            "a channel manifest with no wasm_path is not registrable as a live channel"
+        );
+        assert_eq!(details[0].0.name, "with-wasm");
+        assert!(details[0].1.ends_with("plugin.wasm"));
+    }
+
     #[test]
     fn from_plugins_dir_with_security_strict_drops_unsigned_plugin() {
         let dir = tempdir().unwrap();
@@ -1017,7 +1071,7 @@ capabilities = ["tool"]
         assert_eq!(
             host.list_plugins().len(),
             1,
-            "permissive mode must load an unsigned plugin (signed-but-invalid is rejected by enforce_signature_policy, covered in signature.rs)"
+            "permissive mode must load an unsigned plugin (untrusted and invalid signatures also load with a warning in permissive mode, covered in signature.rs)"
         );
     }
 
