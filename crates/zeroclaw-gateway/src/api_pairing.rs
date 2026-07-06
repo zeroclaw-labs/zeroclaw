@@ -23,7 +23,7 @@ pub struct DeviceInfo {
     pub last_seen: DateTime<Utc>,
     pub ip_address: Option<String>,
     /// macOS TCC permissions (and equivalent on other OSes) the device reports as granted.
-    /// Pushed by the calling device via POST /api/devices/me/capabilities.
+    /// Pushed by the desktop app via POST /api/devices/me/capabilities.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<String>>,
 }

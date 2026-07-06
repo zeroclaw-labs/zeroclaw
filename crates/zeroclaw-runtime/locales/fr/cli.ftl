@@ -26,6 +26,7 @@ cli-config-about = Gérer la configuration de ZeroClaw
 cli-update-about = Vérifier et appliquer les mises à jour de ZeroClaw
 cli-self-test-about = Exécuter les tests d'autodiagnostic
 cli-completions-about = Générer des scripts d'achèvement de shell
+cli-desktop-about = Lancer l'application de bureau companion ZeroClaw
 cli-config-schema-about = Afficher le schéma JSON complet de la configuration sur stdout
 cli-config-list-about = Lister toutes les propriétés de configuration avec leurs valeurs actuelles
 cli-config-get-about = Obtenir la valeur d'une propriété de configuration
@@ -127,6 +128,7 @@ cli-models-set-about = Définir le modèle par défaut dans la configuration
 cli-models-status-about = Afficher la configuration actuelle du modèle et l'état du cache
 cli-doctor-models-about = Sonder les catalogues de modèles à travers les fournisseurs et signaler la disponibilité
 cli-doctor-traces-about = Interroger les événements de trace d'exécution (diagnostics d'outils et réponses de modèle)
+cli-doctor-update-context-windows-about = Mettre à jour context_window dans config.toml depuis les endpoints /models du fournisseur
 cli-hardware-discover-about = Énumérer les dispositifs USB et afficher les cartes connues
 cli-hardware-introspect-about = Inspecter un appareil par son numéro de série ou son chemin de dispositif
 cli-hardware-info-about = Obtenir les informations de puce via USB en utilisant probe-rs via ST-Link
@@ -305,6 +307,16 @@ cli-completions-long-about =
     source <(zeroclaw completions bash)
     zeroclaw completions zsh > ~/.zfunc/_zeroclaw
     zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish
+cli-desktop-long-about =
+    Lance l'application de bureau compagnon ZeroClaw.
+
+    L'application compagnon est une application légère pour la barre de menu / zone de dénombrement du système qui se connecte au même pont que la CLI. Elle fournit un accès rapide au tableau de bord, à la supervision de l'état et à l'appairage des appareils.
+
+    Utilisez --install pour télécharger l'application compagnon pré-construite pour votre plateforme.
+
+    Exemples :
+    zeroclaw desktop              # lancer l'application compagnon
+    zeroclaw desktop --install    # télécharger et l'installer
 channel-needs-quickstart-reply = Cet agent n'est pas encore entièrement configuré. L'opérateur doit exécuter Quickstart avant que je puisse répondre.
 channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web est configuré mais la fonctionnalité 'whatsapp-web' n'est pas compilée.
 channel-whatsapp-web-feature-missing-build = Compilez/exécutez avec : cargo build --features whatsapp-web
@@ -385,6 +397,9 @@ cli-skills-create-hint = {"  "}Créez-en une : mkdir -p ~/.zeroclaw/workspace/sk
 cli-skills-install-hint = {"  "}Ou installez : zeroclaw skills install <source>
 cli-skills-installed-header = Compétences installées ({$count}) :
 cli-skills-tags = Étiquettes :  {$tags}
+cli-skills-skipped-header = Ignorées ({$count}) :
+cli-skills-skipped-reason = {"    "}Raison : {$reason}
+cli-skills-skipped-scripts-hint = {"    "}Définissez `skills.allow_scripts = true` dans votre configuration zeroclaw pour l'activer.
 cli-sop-none = Aucun SOP trouvé.
 cli-sop-create-hint = {"  "}Créez-en un : mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}puis ajoutez SOP.toml et SOP.md
@@ -592,6 +607,10 @@ cli-status-service-stopped = 🔴 Service :       arrêté
 cli-status-channels = Canaux :
 cli-status-cli-always = {"  "}CLI :      ✅ toujours
 cli-status-peripherals = Périphériques :
+cli-desktop-download = Téléchargez l'application compagnon ZeroClaw :
+cli-desktop-homebrew = Ou installez via Homebrew (bientôt disponible) :
+cli-desktop-linux-pkg = {"  "}Téléchargez le fichier .deb ou .AppImage pour votre architecture.
+cli-desktop-launching = Lancement de l'application compagnon ZeroClaw...
 cli-status-version = Version :     {$v}
 cli-status-workspace = Espace de travail :   {$v}
 cli-status-config = Config :      {$v}
@@ -630,6 +649,9 @@ cli-status-word-none = (aucun)
 cli-status-word-configured = configuré
 cli-status-word-not-configured = non configuré
 cli-status-channel-not-compiled = 🚫 configuré, non compilé
+cli-desktop-not-installed = L'application compagnon ZeroClaw n'est pas installée.
+cli-desktop-blurb1 = L'application compagnon est une application légère de barre de menus qui
+cli-desktop-blurb2 = se connecte à la même passerelle que la CLI.
 cli-config-all-configured = Toutes les sections sont déjà configurées.
 cli-config-schema-current = La configuration est déjà à la version actuelle du schéma.
 cli-config-applied-ops = {$count} opération(s) appliquée(s) :
@@ -656,6 +678,7 @@ cli-warn-crypto-provider = Avertissement : Échec de l'installation du fournisse
 cli-error-label = {"   "}Erreur : {$err}
 cli-warn-cost-usage = {"  "}⚠ Impossible de charger l'utilisation des coûts : {$err}
 cli-warn-cost-tracker = {"  "}⚠ Impossible d'initialiser le suivi des coûts : {$err}
+cli-desktop-download-at = {"  "}Téléchargez-la sur : {$url}
 cli-config-legend = Légende : 💉 remplacé par env  🔒 secret
 cli-config-secret-set = {$path} est défini (secret chiffré — valeur non affichée)
 cli-config-secret-unset = {$path} n'est pas défini (secret chiffré)
@@ -768,3 +791,17 @@ cli-bundle-warn-archive = avertissement : échec de l'archivage du répertoire d
 cli-bundle-deleted = skill_bundles.{$alias} supprimé (retiré de {$count} agent(s))
 cli-bundle-warn-move = avertissement : échec du déplacement du répertoire de bundle : {$error}
 cli-bundle-renamed = skill_bundles.{$from} → skill_bundles.{$to} renommé
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
+cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
+cli-agent-context-bar-unknown = ctx: inconnu / {$max}
+cli-doctor-ctxwin-already-set = {$provider_ref}: a déjà context_window = {$ctx}
+cli-doctor-ctxwin-no-model = {$provider_ref}: aucun modèle configuré, ignoré
+cli-doctor-ctxwin-would-set = {$provider_ref}: définirait context_window = {$ctx} (simulation)
+cli-doctor-ctxwin-set = {$provider_ref}: context_window défini = {$ctx}
+cli-doctor-ctxwin-not-found = {$provider_ref}: entrée introuvable pour mise à jour
+cli-doctor-ctxwin-fetch-failed = {$provider_ref}: n'expose pas la fenêtre de contexte ou l'obtention a échoué
+cli-doctor-ctxwin-saved = {$updated} mise(s) à jour enregistrée(s) dans config.toml
+cli-doctor-ctxwin-dry-run = Simulation terminée — aucun changement. Relancez sans --dry-run pour appliquer.
+cli-doctor-ctxwin-none = Aucune mise à jour nécessaire.
+cli-doctor-ctxwin-write-failed = {$provider_ref}: échec de l'écriture de context_window: {$error}
