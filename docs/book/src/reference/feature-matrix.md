@@ -1,7 +1,8 @@
 # Feature and support matrix
 
 A single-page inventory of what ZeroClaw supports today, compared against
-OpenClaw and Hermes. It exists so a reader can answer "does ZeroClaw do X?"
+[OpenClaw](https://github.com/openclaw/openclaw) and
+[Hermes](https://github.com/NousResearch/hermes-agent). It exists so a reader can answer "does ZeroClaw do X?"
 without walking the whole book.
 
 The **ZeroClaw** column is not hand-maintained: it is regenerated on every docs
