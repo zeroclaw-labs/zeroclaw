@@ -16,6 +16,8 @@ type HmacSha256 = Hmac<Sha256>;
 const LINE_BIND_COMMAND: &str = "/bind";
 /// Maximum audio file size accepted for transcription (25 MB).
 const MAX_LINE_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
+/// LINE Messaging API caps `sender.name` at 20 characters.
+const LINE_SENDER_NAME_MAX_CHARS: usize = 20;
 
 /// LINE Messaging API channel.
 ///
@@ -117,6 +119,10 @@ struct LineState {
     channel_access_token: String,
     api_base_url: String,
     content_api_base_url: String,
+    /// Resolves the configured `sender.name` at send-time (canonical config).
+    sender_name_resolver: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    /// Fetched icon URL from `/v2/bot/info`, shared with the channel handle.
+    sender_icon: Arc<parking_lot::RwLock<Option<String>>>,
     /// Optional transcription manager — `None` when transcription is disabled.
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
 }
@@ -162,10 +168,15 @@ async fn send_bind_reply(
     api_base_url: &str,
     reply_token: &str,
     text: &str,
+    sender: Option<serde_json::Value>,
 ) {
+    let mut message = serde_json::json!({"type": "text", "text": text});
+    if let Some(sender) = sender {
+        message["sender"] = sender;
+    }
     let body = serde_json::json!({
         "replyToken": reply_token,
-        "messages": [{"type": "text", "text": text}],
+        "messages": [message],
     });
     match client
         .post(format!("{api_base_url}/v2/bot/message/reply"))
@@ -530,6 +541,13 @@ async fn handle_webhook(
                                 .and_then(|t| t.as_str())
                                 .filter(|t| !t.is_empty())
                                 .map(|t| t.to_string());
+                            let bind_sender = {
+                                let name = (state.sender_name_resolver)()
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or_else(|| "AI".to_string());
+                                let icon = state.sender_icon.read().clone();
+                                LineChannel::build_sender_obj(&name, &icon)
+                            };
                             if let Some(ref guard) = state.pairing {
                                 match guard.try_pair(code, user_id).await {
                                     Ok(Some(_)) => {
@@ -559,6 +577,7 @@ async fn handle_webhook(
                                                 &i18n::get_required_cli_string(
                                                     "channel-line-bind-success",
                                                 ),
+                                                bind_sender.clone(),
                                             )
                                             .await;
                                         }
@@ -583,6 +602,7 @@ async fn handle_webhook(
                                                 &i18n::get_required_cli_string(
                                                     "channel-line-bind-invalid-code",
                                                 ),
+                                                bind_sender.clone(),
                                             )
                                             .await;
                                         }
@@ -600,6 +620,7 @@ async fn handle_webhook(
                                                     "channel-line-bind-rate-limited",
                                                     &[("secs", &secs)],
                                                 ),
+                                                bind_sender.clone(),
                                             )
                                             .await;
                                         }
@@ -1006,11 +1027,23 @@ impl LineChannel {
         chunks
     }
 
+    /// Normalize a configured display name to LINE's `sender.name` contract.
+    ///
+    /// The Messaging API caps `sender.name` at 20 characters; an overlong value
+    /// makes the whole Reply/Push message object invalid and the send bails on
+    /// the non-2xx response. Truncate on character boundaries so multibyte
+    /// display names cannot split a codepoint.
+    fn normalize_sender_name(name: &str) -> String {
+        name.chars().take(LINE_SENDER_NAME_MAX_CHARS).collect()
+    }
+
     /// Build the LINE `sender` object for icon/nickname switch.
     ///
     /// Returns `None` when `sender_name` is empty (LINE rejects empty names).
-    /// Name is already pre-truncated to 20 chars at `listen()` time.
+    /// The name is normalized to LINE's 20-character `sender.name` limit here so
+    /// every send path is protected at a single choke point.
     fn build_sender_obj(name: &str, icon: &Option<String>) -> Option<serde_json::Value> {
+        let name = Self::normalize_sender_name(name);
         if name.is_empty() {
             return None;
         }
@@ -1128,6 +1161,8 @@ impl LineChannel {
             channel_access_token: self.channel_access_token.clone(),
             api_base_url: self.api_base_url.clone(),
             content_api_base_url: self.content_api_base_url.clone(),
+            sender_name_resolver: Arc::clone(&self.sender_name_resolver),
+            sender_icon: Arc::clone(&self.sender_icon),
             transcription_manager: self.transcription_manager.clone(),
         });
 
@@ -2283,6 +2318,23 @@ mod tests {
         let obj = LineChannel::build_sender_obj("AI", &Some(url.clone())).unwrap();
         assert_eq!(obj["name"], "AI");
         assert_eq!(obj["iconUrl"], url);
+    }
+
+    #[test]
+    fn build_sender_obj_truncates_overlong_name_to_line_limit() {
+        let overlong = "A".repeat(40);
+        let obj = LineChannel::build_sender_obj(&overlong, &None).unwrap();
+        let name = obj["name"].as_str().unwrap();
+        assert_eq!(name.chars().count(), LINE_SENDER_NAME_MAX_CHARS);
+        assert_eq!(name, "A".repeat(LINE_SENDER_NAME_MAX_CHARS));
+    }
+
+    #[test]
+    fn build_sender_obj_truncates_multibyte_name_on_char_boundary() {
+        let overlong = "あ".repeat(30);
+        let obj = LineChannel::build_sender_obj(&overlong, &None).unwrap();
+        let name = obj["name"].as_str().unwrap();
+        assert_eq!(name.chars().count(), LINE_SENDER_NAME_MAX_CHARS);
     }
 
     // ---- Icon / Nickname Switch (sender object in outgoing messages) --------
