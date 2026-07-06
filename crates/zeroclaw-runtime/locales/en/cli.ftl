@@ -143,6 +143,7 @@ cli-models-status-about = Show current model configuration and cache status
 
 cli-doctor-models-about = Probe model catalogs across providers and report availability
 cli-doctor-traces-about = Query runtime trace events (tool diagnostics and model replies)
+cli-doctor-update-context-windows-about = Update context_window in config.toml from provider /models endpoints
 
 cli-hardware-discover-about = Enumerate USB devices and show known boards
 cli-hardware-introspect-about = Introspect a device by its serial or device path
@@ -916,3 +917,18 @@ cli-bundle-renamed = renamed skill_bundles.{$from} → skill_bundles.{$to}
 # a supervisor retry loop. The two variants differ only by who holds the port.
 cli-daemon-gateway-already-running = A ZeroClaw gateway is already running on {$host}:{$port}. The daemon supervises its own gateway and will not start a second one on the same address. Stop that gateway (or point the daemon at a free port with `zeroclaw config set gateway.port <port>`), then run the daemon again.
 cli-daemon-gateway-port-occupied = Gateway address {$host}:{$port} is already in use by another process. Free the port or point the daemon at a free port (`zeroclaw config set gateway.port <port>`), then run the daemon again.
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
+cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
+cli-agent-context-bar-unknown = ctx: unknown / {$max}
+cli-doctor-ctxwin-already-set = {$provider_ref}: already has context_window = {$ctx}
+cli-doctor-ctxwin-no-model = {$provider_ref}: no model configured, skipping
+cli-doctor-ctxwin-would-set = {$provider_ref}: would set context_window = {$ctx} (dry run)
+cli-doctor-ctxwin-set = {$provider_ref}: set context_window = {$ctx}
+cli-doctor-ctxwin-not-found = {$provider_ref}: could not find entry to update
+cli-doctor-ctxwin-fetch-failed = {$provider_ref}: provider does not expose context window or fetch failed
+cli-doctor-ctxwin-saved = Saved {$updated} updates to config.toml
+cli-doctor-ctxwin-dry-run = Dry run complete — no changes written. Run without --dry-run to apply.
+cli-doctor-ctxwin-none = No updates needed.
+cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window: {$error}
+
