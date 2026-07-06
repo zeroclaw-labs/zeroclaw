@@ -171,7 +171,7 @@ list_features() {
     default | ci-all | fantoccini | landlock | metrics) continue ;;
     channel-*) channels="${channels:+$channels, }$feat" ;;
     observability-*) observability="${observability:+$observability, }$feat" ;;
-    hardware | peripheral-* | sandbox-* | browser-* | probe | rag-pdf | webauthn)
+    hardware | peripheral-* | sandbox-* | browser-* | probe | webauthn)
       platform="${platform:+$platform, }$feat"
       ;;
     *) other="${other:+$other, }$feat" ;;

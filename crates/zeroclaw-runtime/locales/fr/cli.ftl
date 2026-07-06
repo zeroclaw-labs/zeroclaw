@@ -396,6 +396,9 @@ cli-skills-create-hint = {"  "}Créez-en une : mkdir -p ~/.zeroclaw/workspace/sk
 cli-skills-install-hint = {"  "}Ou installez : zeroclaw skills install <source>
 cli-skills-installed-header = Compétences installées ({$count}) :
 cli-skills-tags = Étiquettes :  {$tags}
+cli-skills-skipped-header = Ignorées ({$count}) :
+cli-skills-skipped-reason = {"    "}Raison : {$reason}
+cli-skills-skipped-scripts-hint = {"    "}Définissez `skills.allow_scripts = true` dans votre configuration zeroclaw pour l'activer.
 cli-sop-none = Aucun SOP trouvé.
 cli-sop-create-hint = {"  "}Créez-en un : mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}puis ajoutez SOP.toml et SOP.md
