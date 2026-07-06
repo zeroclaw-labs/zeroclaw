@@ -1311,16 +1311,13 @@ pub async fn run(
             (None, None)
         };
 
-        // Build SOP engine when sops_dir is configured so SOP tools are
-        // available on this path (CLI agent run).
-        let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+        // SOPs default-on: the engine loads the workspace sops dir when present.
+        let (sop_engine, sop_audit) = {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) =
                 crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem);
             (Some(engine), Some(audit))
-        } else {
-            (None, None)
         };
 
         let all_tools_result = tools::all_tools_with_runtime(
@@ -2780,16 +2777,13 @@ pub async fn process_message(
             (None, None)
         };
 
-        // Build SOP engine when sops_dir is configured so SOP tools are
-        // available on this path (process_message CLI agent).
-        let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+        // SOPs default-on: the engine loads the workspace sops dir when present.
+        let (sop_engine, sop_audit) = {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) =
                 crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem);
             (Some(engine), Some(audit))
-        } else {
-            (None, None)
         };
 
         let all_tools_result_pm = tools::all_tools_with_runtime(

@@ -1469,7 +1469,7 @@ impl Agent {
         // build our own (CLI/standalone path).
         let (sop_engine, sop_audit) = match (sop_engine, sop_audit) {
             (Some(engine), Some(audit)) => (Some(engine), Some(audit)),
-            (None, None) if config.sop.sops_dir.is_some() => {
+            (None, None) => {
                 let mem: Arc<dyn zeroclaw_memory::Memory> =
                     zeroclaw_memory::create_memory_for_agent(config, agent_alias, None).await?;
                 let (engine, audit) =
