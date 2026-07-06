@@ -7,6 +7,7 @@ import MarkdownEditor from '@/components/MarkdownEditor';
 import ToolPicker from '@/components/ToolPicker';
 import { PlannedCallsEditor, CapturedCallList } from '@/components/SopCalls';
 import { t } from '@/lib/i18n';
+import { loadAgentPickerSummaries } from '@/lib/agents';
 import {
   listSops,
   getSopGraph,
@@ -348,6 +349,8 @@ function StepEditor({
   onChange,
   onRemove,
   onMove,
+  agentAliases,
+  parentAgent,
 }: {
   step: SopStep;
   index: number;
@@ -356,6 +359,8 @@ function StepEditor({
   onChange: (patch: Partial<SopStep>) => void;
   onRemove: () => void;
   onMove: (dir: -1 | 1) => void;
+  agentAliases: string[];
+  parentAgent?: string | null;
 }) {
   const rowRef = useRef<HTMLDivElement | null>(null);
   const routing = step.routing ?? {};
@@ -424,6 +429,26 @@ function StepEditor({
           value={step.body}
           onChange={(next) => onChange({ body: next })}
         />
+      </div>
+      <div className="mb-2">
+        <span className="mb-1 block text-pc-text-muted text-sm">
+          <HelpTip text={sopFieldHelp('SopStep', 'agent')}>{t('sops.step_agent_label')}</HelpTip>
+        </span>
+        <select
+          value={step.agent ?? ''}
+          onChange={(e) => onChange({ agent: e.target.value === '' ? null : e.target.value })}
+          className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-sm text-pc-text"
+        >
+          <option value="">
+            {t('sops.step_agent_inherit')}
+            {parentAgent ? ` (${parentAgent})` : ''}
+          </option>
+          {agentAliases.map((alias) => (
+            <option key={alias} value={alias}>
+              {alias}
+            </option>
+          ))}
+        </select>
       </div>
       <div className="mb-2 space-y-2 text-xs">
         <div>
@@ -942,6 +967,7 @@ function DraftSidebar({
   selectedStep,
   selectedTrigger,
   triggerRegistry,
+  agentAliases,
   onSelectStep,
   onField,
   onTrigger,
@@ -959,6 +985,7 @@ function DraftSidebar({
   selectedStep: number | null;
   selectedTrigger: number | null;
   triggerRegistry: TriggerSourceRegistry | null;
+  agentAliases: string[];
   onSelectStep: (n: number) => void;
   onField: (patch: Partial<Sop>) => void;
   onTrigger: (i: number, next: SopTrigger) => void;
@@ -1032,6 +1059,19 @@ function DraftSidebar({
         options={['auto', 'supervised', 'step_by_step', 'priority_based', 'deterministic']}
         help={sopFieldHelp('Sop', 'execution_mode')}
       />
+      <SelectField
+        label={t('sops.field_agent')}
+        value={draft.agent ?? ''}
+        onChange={(v) => onField({ agent: v === '' ? null : v })}
+        help={sopFieldHelp('Sop', 'agent')}
+      >
+        <option value="">{t('sops.agent_none')}</option>
+        {agentAliases.map((alias) => (
+          <option key={alias} value={alias}>
+            {alias}
+          </option>
+        ))}
+      </SelectField>
       <div className="space-y-2">
         <div className="flex items-center justify-between">
           <span className="text-sm font-medium text-pc-text">{t('sops.triggers')}</span>
@@ -1095,6 +1135,7 @@ function StepInspector({
   draft,
   selectedStep,
   runCallsByStep,
+  agentAliases,
   onStep,
   onRemoveStep,
   onMoveStep,
@@ -1102,6 +1143,7 @@ function StepInspector({
   draft: Sop;
   selectedStep: number | null;
   runCallsByStep: Map<number, StepToolCall[]>;
+  agentAliases: string[];
   onStep: (i: number, patch: Partial<SopStep>) => void;
   onRemoveStep: (i: number) => void;
   onMoveStep: (i: number, dir: -1 | 1) => void;
@@ -1124,6 +1166,8 @@ function StepInspector({
       onChange={(patch) => onStep(index, patch)}
       onRemove={() => onRemoveStep(index)}
       onMove={(dir) => onMoveStep(index, dir)}
+      agentAliases={agentAliases}
+      parentAgent={draft.agent}
     />
   );
 }
@@ -1150,6 +1194,7 @@ export default function Sops() {
   const [selectedStep, setSelectedStep] = useState<number | null>(null);
   const [selectedTrigger, setSelectedTrigger] = useState<number | null>(null);
   const [triggerRegistry, setTriggerRegistry] = useState<TriggerSourceRegistry | null>(null);
+  const [agentAliases, setAgentAliases] = useState<string[]>([]);
 
   // Mirror the in-progress draft to session storage so navigating away (e.g. to
   // channel setup for an unconfigured trigger) and back does not lose it, and
@@ -1174,6 +1219,21 @@ export default function Sops() {
       .catch(() => {
         // Registry is best-effort: the editor still renders bound sources it
         // knows about and simply omits channel aliases if the fetch failed.
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    loadAgentPickerSummaries()
+      .then((list) => {
+        if (active) setAgentAliases(list.map((a) => a.alias));
+      })
+      .catch(() => {
+        // Agent list is best-effort: the selector falls back to free-typed
+        // aliases if the fetch failed.
       });
     return () => {
       active = false;
@@ -1508,6 +1568,7 @@ export default function Sops() {
               selectedStep={selectedStep}
               selectedTrigger={selectedTrigger}
               triggerRegistry={triggerRegistry}
+              agentAliases={agentAliases}
               onSelectStep={setSelectedStep}
               onField={editorHandlers.onField}
               onTrigger={editorHandlers.onTrigger}
@@ -1526,6 +1587,7 @@ export default function Sops() {
               draft={draft}
               selectedStep={selectedStep}
               runCallsByStep={runCallsByStep}
+              agentAliases={agentAliases}
               onStep={editorHandlers.onStep}
               onRemoveStep={editorHandlers.onRemoveStep}
               onMoveStep={editorHandlers.onMoveStep}

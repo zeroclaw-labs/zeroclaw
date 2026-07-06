@@ -1054,6 +1054,10 @@ const translations: Record<Locale, Record<string, string>> = {
     'sops.step_title_placeholder': 'Step title',
     'sops.step_body_placeholder': 'Step body / instructions',
     'sops.step_body_label': 'Instructions',
+    'sops.field_agent': 'Agent',
+    'sops.agent_none': '(none)',
+    'sops.step_agent_label': 'Agent override',
+    'sops.step_agent_inherit': 'Inherit SOP agent',
     'sops.step_tools_placeholder': 'suggested tools (comma-separated)',
     'sops.step_tools_label': 'Suggested tools',
     'sops.trigger_condition_hint':
