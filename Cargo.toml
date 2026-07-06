@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-spawn", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "tools/fill-translations", "xtask"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-spawn", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -263,7 +263,6 @@ non_row_features = [
 heavyweight_features = [
     "hardware",
     "browser-native",
-    "rag-pdf",
     "voice-wake",
 ]
 
@@ -388,7 +387,6 @@ sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
 browser-native = ["zeroclaw-tools/browser-native"]
 plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-runtime/plugins-wasm"]
 probe = ["dep:zeroclaw-hardware", "zeroclaw-hardware/probe"]
-rag-pdf = ["zeroclaw-tools/rag-pdf", "zeroclaw-runtime/rag-pdf"]
 webauthn = ["zeroclaw-runtime/webauthn", "zeroclaw-gateway?/webauthn"]
 embedded-web = ["zeroclaw-gateway/embedded-web"]
 
@@ -404,7 +402,10 @@ metrics = ["observability-prometheus"]
 # surface will be unavailable in the agent runtime.
 #
 # Each feature adds a WASM execution strategy; enable the smallest set your targets
-# need. `plugins-wasm-runtime-only` is implied by the other two.
+# need. `plugins-wasm-runtime-only` is implied by the other two. Every backend
+# feature also implies `plugins-wasm` itself, so enabling any execution strategy
+# always carries the plugin host and its CLI surface; a backend-only build
+# cannot silently produce a binary without the `plugin` subcommand.
 #
 # - `plugins-wasm-runtime-only`: Fastest startup for plugins and smallest binary size,
 #   but requires plugin authors to compile a specific version for each target
@@ -417,9 +418,9 @@ metrics = ["observability-prometheus"]
 # - `plugins-wasm-pulley`: Most flexible, supports JIT compilation on targets
 #   where Cranelift isn't available (e.g., ARM32), but has the slowest runtime
 #   performance.
-plugins-wasm-runtime-only = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
-plugins-wasm-cranelift    = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasm-cranelift"]
-plugins-wasm-pulley       = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasm-pulley"]
+plugins-wasm-runtime-only = ["plugins-wasm", "zeroclaw-plugins/plugins-wasmtime"]
+plugins-wasm-cranelift    = ["plugins-wasm", "zeroclaw-plugins/plugins-wasm-cranelift"]
+plugins-wasm-pulley       = ["plugins-wasm", "zeroclaw-plugins/plugins-wasm-pulley"]
 
 # CI meta-feature
 ci-all = [
@@ -429,7 +430,7 @@ ci-all = [
     "observability-prometheus", "observability-otel",
     "hardware", "peripheral-rpi",
     "sandbox-landlock", "sandbox-bubblewrap",
-    "browser-native", "probe", "rag-pdf",
+    "browser-native", "probe",
     "plugins-wasm", "plugins-wasm-cranelift",
     "webauthn", "memory-postgres",
 ]

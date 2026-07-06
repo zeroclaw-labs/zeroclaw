@@ -65,7 +65,9 @@ Every live cleanup batch needs exact maintainer approval for the labels and issu
 
 Type labels capture the high-level work class. They are separate from path labels such as `docs`, `ci`, or `dependencies`.
 
-New or manual applications should use the canonical no-space labels below. Existing legacy open refs may keep spaced labels until the open-reference migration packet handles them; see [Canonical spelling](#canonical-spelling).
+New or manual applications should use the canonical no-space labels below when the live label exists. Existing legacy open refs may keep spaced labels until the open-reference migration packet handles them; see [Canonical spelling](#canonical-spelling).
+
+`type:tracker` is the canonical tracker-marker spelling for active parent coordination issues. Do not create or apply `roadmap`, `type:roadmap`, or another tracker marker as an alias. If the live `type:tracker` label does not exist yet, label creation and any tracker-marker migration must happen only through a separate exact maintainer-approved packet.
 
 | Label | Purpose |
 |---|---|
@@ -74,6 +76,7 @@ New or manual applications should use the canonical no-space labels below. Exist
 | `type:docs` | Documentation-only or docs-primary work |
 | `type:rfc` | RFC issue or proposal; protected from stale closure while active |
 | `type:test` | Test-only or test-primary work |
+| `type:tracker` | Active parent coordination issue for a release, roadmap, RFC/design thread, implementation batch, cleanup, or audit. Issue-only marker; does not by itself create stale protection, assignment, acceptance, or contributor-ready scope. |
 
 ## Path labels
 
@@ -128,9 +131,11 @@ Scoped path labels do not guarantee a same-prefix base label. Because `pr-path-l
 | `runtime:wasm` | runtime WASM platform and first-party WASM plugin host files |
 | `security:bubblewrap` | `bubblewrap.rs` |
 | `security:docker` | `docker.rs` |
-| `security:pairing` | pairing security, gateway pairing API, and web pairing page |
+| `security:leak-detector` | LeakDetector redaction and sensitive-output scanning |
+| `security:pairing` | pairing security, gateway pairing API, Tauri pairing command, and web pairing page |
 | `security:policy` | runtime security policy, IAM policy, and config policy files |
 | `security:secrets` | runtime and config secrets handling |
+| `security:traits` | shared security trait and interface definitions |
 | `memory:backend` | memory backend selection and storage implementation files |
 
 ### Manual component labels
@@ -142,6 +147,8 @@ Some scoped component labels are manual routing labels rather than synchronized 
 `agent:loop` is retired. For agent-loop routing, use base `agent` plus any matching `runtime`, provider, channel, tool, or risk labels.
 
 Do not apply legacy `observability: runtime_trace` to new issues or PRs. Use `observability:otel` when the work is about OpenTelemetry tracing, add base `observability` only when the issue or PR also matches that base surface, and decide any future runtime-trace-specific canonical label in a separate create/migrate packet.
+
+Do not apply legacy `security: leak_detector` to new issues or PRs. Use `security:leak-detector` for LeakDetector redaction and sensitive-output scanning work.
 
 Gateway subarea labels such as `gateway: api`, `gateway: sse`, `gateway:local_bridge`, and `gateway:webhook_ingress` remain live migration holdbacks. New routing should use base `gateway` until a separate packet either creates canonical no-space/hyphenated sublabels and migrates refs, or collapses those labels into base `gateway`.
 
@@ -186,7 +193,9 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 
 ### Per-provider labels
 
-Provider-specific labels match dedicated provider source files. Shared registry
+Provider-specific labels match dedicated provider source files. The provider
+router has its own scoped label because routing and model-dispatch work is a
+shared provider subarea, not one concrete provider integration. Shared registry
 or factory files should receive the base `provider` label only; maintainers can
 add a provider-specific label manually when a shared-file change is truly scoped
 to one provider.
@@ -206,6 +215,7 @@ to one provider.
 | `provider:openai` | `openai.rs`, `openai_codex.rs` |
 | `provider:openrouter` | `openrouter.rs` |
 | `provider:reliable` | `reliable.rs` |
+| `provider:router` | `router.rs` |
 | `provider:telnyx` | `telnyx.rs` |
 
 Some provider labels describe provider families that currently share the OpenAI-compatible provider implementation instead of a dedicated source file. Maintainers may apply these manually when an issue or PR is truly about that family: `provider:groq`, `provider:kimi`, `provider:minimax`, `provider:moonshot`, and `provider:qwen`. Do not add shared factory or compatible-provider files to these labeler rules; that would over-label unrelated shared changes.
