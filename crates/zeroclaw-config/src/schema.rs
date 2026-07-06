@@ -12834,7 +12834,7 @@ pub struct WebhookConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub auth_header: Option<String>,
     /// Shared secret for webhook signature verification (HMAC-SHA256).
-    /// The channel will refuse to start without one — set
+    /// The channel will refuse to start without one. Set
     /// `[channels.webhook.<alias>].secret` in config.
     #[secret]
     #[tab(Connection)]
