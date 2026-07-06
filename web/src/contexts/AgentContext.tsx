@@ -263,7 +263,11 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
           if (typeof msg.max_context_tokens === 'number') {
             setContextMaxTokens(msg.max_context_tokens);
           }
-          if (typeof msg.input_tokens === 'number') {
+          // Prefer last_input_tokens (accurate per-turn prompt size) over
+          // accumulated input_tokens for context-bar rendering.
+          if (typeof msg.last_input_tokens === 'number') {
+            setContextInputTokens(msg.last_input_tokens);
+          } else if (typeof msg.input_tokens === 'number') {
             setContextInputTokens(msg.input_tokens);
           }
         }

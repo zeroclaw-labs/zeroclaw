@@ -1100,6 +1100,11 @@ async fn process_chat_message(
     let mut total_input_tokens: Option<u64> = None;
     let mut total_output_tokens: Option<u64> = None;
 
+    // Track the most recent absolute provider-reported prompt size
+    // (replaces on each TurnEvent::Usage; not accumulated).
+    // Used for accurate context-bar rendering on the client.
+    let mut last_input_tokens: Option<u64> = None;
+
     // Routes the three concurrent streams that the running turn cares about:
     //   1. inbound `approval_response` frames from the WebSocket client,
     //   2. `TurnEvent::ApprovalRequest` events from `WsApprovalChannel`,
@@ -1249,6 +1254,7 @@ async fn process_chat_message(
                             // cache reads.
                             if let Some(it) = input_tokens {
                                 total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
+                                last_input_tokens = Some(it);
                             }
                             if let Some(ot) = output_tokens {
                                 total_output_tokens = Some(total_output_tokens.unwrap_or(0) + ot);
@@ -1485,6 +1491,7 @@ async fn process_chat_message(
                 "model": turn_model,
                 "provider": provider_label,
                 "max_context_tokens": max_context_tokens,
+                "last_input_tokens": last_input_tokens,
             });
             let _ = sender.send(Message::Text(done.to_string().into())).await;
 
@@ -1515,6 +1522,7 @@ async fn process_chat_message(
                         "output_tokens": total_output_tokens,
                         "tokens_used": total_tokens,
                         "cost_usd": cost_usd,
+                        "last_input_tokens": last_input_tokens,
                         "trace_id": turn_id,
                     })),
                 "gateway_ws_turn"

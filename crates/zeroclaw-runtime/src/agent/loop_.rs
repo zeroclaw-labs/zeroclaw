@@ -2687,10 +2687,17 @@ pub async fn run(
                 // Display context usage for this turn.
                 if let Some(ref ctx) = cost_tracking_context {
                     let usage = ctx.snapshot_turn_usage();
-                    if usage.input_tokens > 0 || usage.output_tokens > 0 {
+                    // Use last_input_tokens (absolute provider-reported prompt size)
+                    // instead of accumulated input_tokens. last_input_tokens is the
+                    // accurate "context window fill" measure because the LLM's
+                    // usage.input_tokens already includes the full prompt
+                    // (history + tools + system). Accumulating across rounds
+                    // double-counts the shared history.
+                    let effective_input_tokens = usage.last_input_tokens;
+                    if effective_input_tokens > 0 || usage.output_tokens > 0 {
                         let max_ctx = eff_model_context_window as u64;
                         let pct = if max_ctx > 0 {
-                            (usage.input_tokens as f64 / max_ctx as f64 * 100.0).min(100.0)
+                            (effective_input_tokens as f64 / max_ctx as f64 * 100.0).min(100.0)
                         } else {
                             0.0
                         };
@@ -2702,11 +2709,11 @@ pub async fn run(
                             "\u{2588}".repeat(filled),
                             "\u{2591}".repeat(empty)
                         );
-                        let msg = if usage.input_tokens > 0 {
+                        let msg = if effective_input_tokens > 0 {
                             crate::i18n::get_required_cli_string_with_args(
                                 "cli-agent-context-bar",
                                 &[
-                                    ("used", format_tokens(usage.input_tokens).as_str()),
+                                    ("used", format_tokens(effective_input_tokens).as_str()),
                                     ("max", format_tokens(max_ctx).as_str()),
                                     ("bar", &bar),
                                     ("pct", format!("{:.0}", pct).as_str()),

@@ -263,6 +263,7 @@ export interface WsMessage {
   max_context_tokens?: number;
   input_tokens?: number;
   output_tokens?: number;
+  last_input_tokens?: number;
 }
 
 export type ApprovalDecision = "approve" | "deny" | "always";
