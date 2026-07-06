@@ -279,6 +279,7 @@ zc-chat-pane-acp = ACP
 zc-chat-no-agents = 有効なエージェントがありません。Configタブでエージェントを設定してください。
 zc-chat-error-fetch-agents = エージェントの取得に失敗しました: { $error }
 zc-chat-error-create-session = セッションの作成に失敗しました: { $error }
+zc-chat-elicitation-dropped = エージェントからの質問が表示される前に破棄されました（クライアントの処理が追いつきませんでした）。エージェントの質問がまだ待機している可能性があります。もう一度お試しください。
 zc-chat-session-restarted = 新しいセッションを開始しました。
 zc-chat-session-restart-error = 新しいセッションを開始できませんでした: { $error }
 zc-chat-thinking-visible = 思考出力: 表示

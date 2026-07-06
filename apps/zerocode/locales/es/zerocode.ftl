@@ -279,6 +279,7 @@ zc-chat-pane-acp = ACP
 zc-chat-no-agents = No hay agentes habilitados. Configura un agente en la pestaña Config.
 zc-chat-error-fetch-agents = No se pudieron obtener los agentes: { $error }
 zc-chat-error-create-session = No se pudo crear la sesión: { $error }
+zc-chat-elicitation-dropped = Se descartó una pregunta del agente antes de poder mostrarla (el cliente se retrasó). Es posible que la pregunta del agente siga esperando; inténtalo de nuevo.
 zc-chat-session-restarted = Nueva sesión iniciada.
 zc-chat-session-restart-error = No se pudo iniciar una nueva sesión: { $error }
 zc-chat-thinking-visible = Salida de razonamiento: visible

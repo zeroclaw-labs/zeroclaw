@@ -279,6 +279,7 @@ zc-chat-pane-acp = ACP
 zc-chat-no-agents = 没有已启用的代理。请在配置选项卡中配置代理。
 zc-chat-error-fetch-agents = 获取代理失败：{ $error }
 zc-chat-error-create-session = 创建会话失败：{ $error }
+zc-chat-elicitation-dropped = 代理的一个提问在显示前被丢弃（客户端处理不及时）。代理的问题可能仍在等待；请重试。
 zc-chat-session-restarted = 已启动新会话。
 zc-chat-session-restart-error = 无法启动新会话：{ $error }
 zc-chat-thinking-visible = 思考输出：可见
