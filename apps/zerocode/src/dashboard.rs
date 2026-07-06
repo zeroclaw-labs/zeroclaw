@@ -1693,7 +1693,7 @@ impl Dashboard {
                     Span::styled(format!("{} ", truncate(&j.id, 24)), theme::dim_style()),
                     Span::styled(
                         format!("{:<10}", crate::i18n::t("zc-dashboard-run-pending-status")),
-                        theme::accent_style(),
+                        theme::warn_style(),
                     ),
                     Span::styled(
                         format!(
