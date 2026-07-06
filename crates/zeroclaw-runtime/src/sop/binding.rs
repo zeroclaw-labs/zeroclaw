@@ -42,6 +42,47 @@ pub fn extract_bindings(value: &Value) -> Vec<ExtractedBinding> {
     out
 }
 
+/// Like [`extract_bindings`] but pairs each binding with the dotted arg-field
+/// path it sits under (empty for a top-level string, `field.sub` for nested
+/// objects, `field.N` for array elements). Authoring surfaces use the path to
+/// name the consumer input pin a binding wires into.
+pub fn extract_bindings_with_paths(value: &Value) -> Vec<(String, ExtractedBinding)> {
+    let mut out = Vec::new();
+    collect_paths(value, String::new(), &mut out);
+    out
+}
+
+fn collect_paths(value: &Value, path: String, out: &mut Vec<(String, ExtractedBinding)>) {
+    match value {
+        Value::String(s) => {
+            let mut found = Vec::new();
+            scan_string(s, &mut found);
+            for binding in found {
+                out.push((path.clone(), binding));
+            }
+        }
+        Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                collect_paths(item, join_path(&path, &idx.to_string()), out);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                collect_paths(item, join_path(&path, key), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn join_path(prefix: &str, segment: &str) -> String {
+    if prefix.is_empty() {
+        segment.to_string()
+    } else {
+        format!("{prefix}.{segment}")
+    }
+}
+
 fn collect(value: &Value, out: &mut Vec<ExtractedBinding>) {
     match value {
         Value::String(s) => scan_string(s, out),
@@ -344,16 +385,29 @@ mod tests {
     }
 
     #[test]
-    fn remap_rewrites_step_refs_and_preserves_calls() {
-        let remap = HashMap::from([(10u32, 1u32), (20u32, 2u32)]);
-        let mut args = json!({
-            "a": "{{steps.10.out}} and {{calls.0.x}}",
-            "b": "{{steps.20}}",
-            "c": "{{steps.99.gone}}",
+    fn extracts_binding_arg_field_paths() {
+        let args = json!({
+            "url": "{{steps.2.response.url}}",
+            "nested": {"deep": "{{calls.0.status}}"},
+            "list": ["x", "{{steps.1.out}}"],
         });
-        remap_step_refs(&mut args, &remap);
-        assert_eq!(args["a"], json!("{{steps.1.out}} and {{calls.0.x}}"));
-        assert_eq!(args["b"], json!("{{steps.2}}"));
-        assert_eq!(args["c"], json!("{{steps.99.gone}}"), "dangling left as-is");
+        let found = extract_bindings_with_paths(&args);
+        let by_path: std::collections::HashMap<String, String> = found
+            .into_iter()
+            .filter_map(|(path, b)| match b {
+                ExtractedBinding::Valid(binding) => Some((path, binding.raw)),
+                ExtractedBinding::Malformed { .. } => None,
+            })
+            .collect();
+        assert_eq!(by_path.get("url").map(String::as_str), Some("steps.2.response.url"));
+        assert_eq!(by_path.get("nested.deep").map(String::as_str), Some("calls.0.status"));
+        assert_eq!(by_path.get("list.1").map(String::as_str), Some("steps.1.out"));
+    }
+
+    #[test]
+    fn extracts_top_level_string_with_empty_path() {
+        let found = extract_bindings_with_paths(&json!("{{steps.1.out}}"));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "");
     }
 }

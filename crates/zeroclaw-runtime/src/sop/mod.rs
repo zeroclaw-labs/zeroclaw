@@ -29,7 +29,7 @@ pub use binding::{
 pub use engine::{MaintenanceSummary, SopEngine};
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphNode, GraphPin, GraphSeverity, GraphWire,
-    NodeKind, NodePosition, NodeRunOverlay, NodeRunState, PinClass, RunOverlay, SopGraph,
+    NodeKind, NodePosition, NodeRunOverlay, NodeRunState, PinClass, RunOverlay, SopGraph, ToolSpecs,
     TRIGGER_NODE_BASE, TextGraphFormat, render_graph_text,
 };
 pub use metrics::SopMetricsCollector;
@@ -58,6 +58,28 @@ use std::sync::{Arc, Mutex};
 use types::{SopManifest, SopMeta};
 use zeroclaw_config::schema::SopConfig;
 use zeroclaw_memory::traits::Memory;
+
+/// Build the tool-spec map an SOP graph projection uses to type step pins.
+/// Keys are tool names; values are the tool's declared `parameters` (input
+/// pins) and `output` (output pin) schema. Derived once from the agent's
+/// resolved security policy so the pins mirror the exact tools the step can
+/// call, not a hand-authored list.
+#[must_use]
+pub fn tool_specs_from_config(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> ToolSpecs {
+    let security = Arc::new(
+        zeroclaw_config::policy::SecurityPolicy::for_agent(config, agent_alias).unwrap_or_default(),
+    );
+    crate::tools::default_tools(security)
+        .iter()
+        .map(|tool| {
+            let spec = tool.spec();
+            (spec.name.clone(), spec)
+        })
+        .collect()
+}
 
 /// Build a single shared SopEngine + SopAuditLogger pair.
 /// This is the sole construction site for SOP state within a daemon.

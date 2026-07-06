@@ -4,25 +4,33 @@
 //! graph for visual editors (web node canvas, zerocode SOP pane) and text
 //! renderers. Pure projection: building a graph never mutates the SOP.
 
-use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+use zeroclaw_api::tool::ToolSpec;
+
+use super::binding::{BindingRef, BindingScope, ExtractedBinding, extract_bindings_with_paths};
 use super::types::{Sop, SopStep};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub type ToolSpecs = HashMap<String, ToolSpec>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum_macros::IntoStaticStr)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum PinClass {
     /// Execution-order edge: which step runs after which.
     Flow,
-    /// Typed data edge inferred from step input/output schemas.
+    /// Typed data edge derived from a `{{steps.N}}` binding.
     Data,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum_macros::IntoStaticStr)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 /// Why a flow wire exists. Mirrors the `StepRouting`/`StepFailure` field it
 /// was derived from, so an editor can write edits back to the right place.
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum FlowRole {
     /// Implicit fallthrough or explicit `routing.next`.
     Sequence,
@@ -99,9 +107,10 @@ pub struct GraphWire {
     pub to_pin: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum_macros::IntoStaticStr)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum GraphSeverity {
     Warning,
     Error,
@@ -168,14 +177,19 @@ pub fn render_graph_text(graph: &SopGraph, format: &TextGraphFormat) -> String {
         TextGraphFormat::Adjacency => {
             let mut out = String::new();
             for wire in &graph.wires {
-                let label = match (wire.class, wire.flow_role) {
-                    (PinClass::Flow, Some(FlowRole::Switch)) => match &wire.from_pin {
-                        Some(port) => format!("switch:{port}"),
-                        None => "switch".to_string(),
-                    },
-                    (PinClass::Flow, Some(role)) => format!("{role:?}").to_lowercase(),
-                    (PinClass::Data, _) => "data".to_string(),
-                    (PinClass::Flow, None) => "flow".to_string(),
+                let label = match (wire.class, wire.flow_role, &wire.from_pin) {
+                    (PinClass::Flow, Some(FlowRole::Switch), Some(port)) => {
+                        let role: &'static str = FlowRole::Switch.into();
+                        format!("{role}:{port}")
+                    }
+                    (PinClass::Flow, Some(role), _) => {
+                        let role: &'static str = role.into();
+                        role.to_string()
+                    }
+                    (class, _, _) => {
+                        let class: &'static str = class.into();
+                        class.to_string()
+                    }
                 };
                 out.push_str(&format!(
                     "{} -> {} [{}]\n",
@@ -217,10 +231,7 @@ fn append_diagnostics(graph: &SopGraph, out: &mut String) {
     }
     out.push_str("\ndiagnostics:\n");
     for diag in &graph.diagnostics {
-        let sev = match diag.severity {
-            GraphSeverity::Error => "error",
-            GraphSeverity::Warning => "warning",
-        };
+        let sev: &'static str = diag.severity.into();
         out.push_str(&format!(
             "  [{}] step {}: {}\n",
             sev, diag.step, diag.message
@@ -248,19 +259,60 @@ fn schema_required(fragment: &serde_json::Value) -> bool {
     }
 }
 
-fn data_pins(schema_fragment: Option<&serde_json::Value>, name: &str) -> Vec<GraphPin> {
-    match schema_fragment {
-        Some(fragment) => vec![GraphPin {
-            class: PinClass::Data,
-            name: name.to_string(),
-            data_type: schema_type(fragment),
-            required: schema_required(fragment),
-        }],
-        None => Vec::new(),
-    }
+fn schema_data_pin(fragment: Option<&serde_json::Value>, name: &str) -> Option<GraphPin> {
+    fragment.map(|fragment| GraphPin {
+        class: PinClass::Data,
+        name: name.to_string(),
+        data_type: schema_type(fragment),
+        required: schema_required(fragment),
+    })
 }
 
-fn node_for(step: &SopStep) -> GraphNode {
+fn object_field_pins(schema: &serde_json::Value, prefix: &str) -> Vec<GraphPin> {
+    let serde_json::Value::Object(map) = schema else {
+        return Vec::new();
+    };
+    let Some(serde_json::Value::Object(props)) = map.get("properties") else {
+        return schema_data_pin(Some(schema), prefix).into_iter().collect();
+    };
+    let required: std::collections::HashSet<&str> = map
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+    props
+        .iter()
+        .map(|(field, frag)| GraphPin {
+            class: PinClass::Data,
+            name: format!("{prefix}.{field}"),
+            data_type: schema_type(frag),
+            required: required.contains(field.as_str()),
+        })
+        .collect()
+}
+
+fn call_data_pins(step: &SopStep, specs: &ToolSpecs) -> (Vec<GraphPin>, Vec<GraphPin>) {
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    for (idx, call) in step.calls.iter().enumerate() {
+        let prefix = format!("calls.{idx}");
+        let Some(spec) = specs.get(&call.tool) else {
+            continue;
+        };
+        inputs.extend(object_field_pins(&spec.parameters, &prefix));
+        if let Some(output) = &spec.output {
+            outputs.push(GraphPin {
+                class: PinClass::Data,
+                name: prefix,
+                data_type: schema_type(output),
+                required: false,
+            });
+        }
+    }
+    (inputs, outputs)
+}
+
+fn node_for(step: &SopStep, specs: &ToolSpecs) -> GraphNode {
     let mut inputs = vec![GraphPin {
         class: PinClass::Flow,
         name: "in".to_string(),
@@ -287,9 +339,13 @@ fn node_for(step: &SopStep) -> GraphNode {
             .collect()
     };
 
+    let (call_inputs, call_outputs) = call_data_pins(step, specs);
+    inputs.extend(call_inputs);
+    outputs.extend(call_outputs);
+
     if let Some(schema) = &step.schema {
-        inputs.extend(data_pins(schema.input.as_ref(), "input"));
-        outputs.extend(data_pins(schema.output.as_ref(), "output"));
+        inputs.extend(schema_data_pin(schema.input.as_ref(), "input"));
+        outputs.extend(schema_data_pin(schema.output.as_ref(), "output"));
     }
 
     GraphNode {
@@ -336,13 +392,24 @@ fn types_compatible(from: Option<&str>, to: Option<&str>) -> bool {
     }
 }
 
+fn binding_matches_output(path: &str, pin_name: &str) -> bool {
+    path == pin_name
+        || path
+            .strip_prefix(pin_name)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
 impl SopGraph {
     /// Project a SOP into a graph. Never fails: unresolvable references
     /// (missing steps, dangling switch ports, unsatisfied required inputs)
     /// become diagnostics instead of errors, so editors can render and fix
     /// broken drafts.
     pub fn from_sop(sop: &Sop) -> Self {
-        let mut nodes: Vec<GraphNode> = sop.steps.iter().map(node_for).collect();
+        Self::from_sop_with_specs(sop, &ToolSpecs::new())
+    }
+
+    pub fn from_sop_with_specs(sop: &Sop, specs: &ToolSpecs) -> Self {
+        let mut nodes: Vec<GraphNode> = sop.steps.iter().map(|s| node_for(s, specs)).collect();
         let valid_steps: std::collections::HashSet<u32> =
             sop.steps.iter().map(|s| s.number).collect();
 
@@ -488,7 +555,7 @@ impl SopGraph {
             }
         }
 
-        Self::infer_data_wires(&nodes, &mut wires, &mut diagnostics);
+        Self::binding_data_wires(sop, &nodes, &mut wires, &mut diagnostics);
 
         let layout = Self::layout(&nodes, &wires);
 
@@ -566,59 +633,112 @@ impl SopGraph {
         }
     }
 
-    fn infer_data_wires(
+    fn binding_data_wires(
+        sop: &Sop,
         nodes: &[GraphNode],
         wires: &mut Vec<GraphWire>,
         diagnostics: &mut Vec<GraphDiagnostic>,
     ) {
-        for (consumer_idx, consumer) in nodes.iter().enumerate() {
-            for input in consumer.inputs.iter().filter(|p| p.class == PinClass::Data) {
-                let mut satisfied = false;
-                for producer in nodes[..consumer_idx].iter() {
-                    for output in producer
-                        .outputs
-                        .iter()
-                        .filter(|p| p.class == PinClass::Data)
-                    {
-                        if types_compatible(output.data_type.as_deref(), input.data_type.as_deref())
-                        {
-                            wires.push(GraphWire {
-                                class: PinClass::Data,
-                                from_step: producer.step,
-                                to_step: consumer.step,
-                                flow_role: None,
-                                from_pin: Some(output.name.clone()),
-                                to_pin: Some(input.name.clone()),
-                            });
-                            satisfied = true;
-                        } else {
+        let node_by_step: HashMap<u32, &GraphNode> = nodes.iter().map(|n| (n.step, n)).collect();
+
+        for step in &sop.steps {
+            let consumer = node_by_step.get(&step.number);
+            for (call_idx, call) in step.calls.iter().enumerate() {
+                for (arg_path, extracted) in extract_bindings_with_paths(&call.args) {
+                    let binding = match extracted {
+                        ExtractedBinding::Valid(binding) => binding,
+                        ExtractedBinding::Malformed { raw, reason } => {
                             diagnostics.push(GraphDiagnostic {
-                                severity: GraphSeverity::Warning,
-                                step: consumer.step,
-                                message: format!(
-                                    "data type mismatch: step {} output `{}` ({}) does not satisfy input `{}` ({})",
-                                    producer.step,
-                                    output.name,
-                                    output.data_type.as_deref().unwrap_or("any"),
-                                    input.name,
-                                    input.data_type.as_deref().unwrap_or("any"),
-                                ),
+                                severity: GraphSeverity::Error,
+                                step: step.number,
+                                message: format!("malformed binding `{raw}`: {reason}"),
                             });
+                            continue;
                         }
-                    }
-                }
-                if input.required && !satisfied {
-                    diagnostics.push(GraphDiagnostic {
-                        severity: GraphSeverity::Error,
-                        step: consumer.step,
-                        message: format!(
-                            "required input `{}` has no upstream producer of a compatible type",
-                            input.name
-                        ),
-                    });
+                    };
+                    let BindingScope::Step(producer_step) = binding.scope else {
+                        continue;
+                    };
+                    let to_pin = if arg_path.is_empty() {
+                        format!("calls.{call_idx}")
+                    } else {
+                        format!("calls.{call_idx}.{arg_path}")
+                    };
+                    Self::wire_binding(
+                        &node_by_step,
+                        consumer.copied(),
+                        step.number,
+                        producer_step,
+                        &binding,
+                        &to_pin,
+                        wires,
+                        diagnostics,
+                    );
                 }
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn wire_binding(
+        node_by_step: &HashMap<u32, &GraphNode>,
+        consumer: Option<&GraphNode>,
+        consumer_step: u32,
+        producer_step: u32,
+        binding: &BindingRef,
+        to_pin: &str,
+        wires: &mut Vec<GraphWire>,
+        diagnostics: &mut Vec<GraphDiagnostic>,
+    ) {
+        let Some(producer) = node_by_step.get(&producer_step) else {
+            diagnostics.push(GraphDiagnostic {
+                severity: GraphSeverity::Error,
+                step: consumer_step,
+                message: format!("binding references step {producer_step} which does not exist"),
+            });
+            return;
+        };
+        let from_pin = producer
+            .outputs
+            .iter()
+            .filter(|p| p.class == PinClass::Data)
+            .find(|p| binding_matches_output(&binding.path, &p.name))
+            .or_else(|| {
+                producer
+                    .outputs
+                    .iter()
+                    .find(|p| p.class == PinClass::Data)
+            });
+        let (from_pin_name, from_type) = match from_pin {
+            Some(pin) => (pin.name.clone(), pin.data_type.as_deref()),
+            None => (format!("steps.{producer_step}"), None),
+        };
+        let to_type = consumer
+            .and_then(|c| c.inputs.iter().find(|p| p.name == to_pin))
+            .and_then(|p| p.data_type.as_deref());
+        if !types_compatible(from_type, to_type) {
+            diagnostics.push(GraphDiagnostic {
+                severity: GraphSeverity::Error,
+                step: consumer_step,
+                message: format!(
+                    "data type mismatch: step {} output `{}` ({}) does not satisfy input `{}` ({})",
+                    producer_step,
+                    from_pin_name,
+                    from_type.unwrap_or("any"),
+                    to_pin,
+                    to_type.unwrap_or("any"),
+                ),
+            });
+            return;
+        }
+        wires.push(GraphWire {
+            class: PinClass::Data,
+            from_step: producer_step,
+            to_step: consumer_step,
+            flow_role: None,
+            from_pin: Some(from_pin_name),
+            to_pin: Some(to_pin.to_string()),
+        });
     }
 
     /// True when any diagnostic is `Error` severity; such a graph fails
@@ -883,24 +1003,53 @@ mod tests {
         );
     }
 
+    fn spec(name: &str, params: serde_json::Value, output: Option<serde_json::Value>) -> ToolSpec {
+        ToolSpec {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: params,
+            output,
+            param_domains: Default::default(),
+        }
+    }
+
+    fn call(tool: &str, args: serde_json::Value) -> super::super::types::PlannedToolCall {
+        super::super::types::PlannedToolCall {
+            tool: tool.to_string(),
+            args,
+            pinned: None,
+        }
+    }
+
     #[test]
-    fn data_pins_wire_by_type_and_unsatisfied_required_input_is_error() {
-        let mut producer = step(1, "a");
-        producer.schema = Some(StepSchema {
-            input: None,
-            output: Some(serde_json::json!({"type": "object"})),
-        });
-        let mut ok_consumer = step(2, "b");
-        ok_consumer.schema = Some(StepSchema {
-            input: Some(serde_json::json!({"type": "object"})),
-            output: None,
-        });
-        let mut orphan = step(3, "c");
-        orphan.schema = Some(StepSchema {
-            input: Some(serde_json::json!({"type": "string", "required": true})),
-            output: None,
-        });
-        let graph = SopGraph::from_sop(&sop(vec![producer, ok_consumer, orphan]));
+    fn binding_produces_typed_data_wire() {
+        let producer = step(1, "a");
+        let mut consumer = step(2, "b");
+        consumer.calls = vec![call(
+            "sink",
+            serde_json::json!({"value": "{{steps.1.calls.0}}"}),
+        )];
+        let mut producer = producer;
+        producer.calls = vec![call("src", serde_json::json!({}))];
+
+        let specs = ToolSpecs::from([
+            (
+                "src".to_string(),
+                spec("src", serde_json::json!({"type": "object"}), Some(serde_json::json!({"type": "object"}))),
+            ),
+            (
+                "sink".to_string(),
+                spec(
+                    "sink",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {"value": {"type": "object"}}
+                    }),
+                    None,
+                ),
+            ),
+        ]);
+        let graph = SopGraph::from_sop_with_specs(&sop(vec![producer, consumer]), &specs);
 
         let data: Vec<_> = graph
             .wires
@@ -909,11 +1058,55 @@ mod tests {
             .collect();
         assert_eq!(data.len(), 1);
         assert_eq!((data[0].from_step, data[0].to_step), (1, 2));
+        assert_eq!(data[0].from_pin.as_deref(), Some("calls.0"));
+        assert_eq!(data[0].to_pin.as_deref(), Some("calls.0.value"));
+        assert!(!graph.has_errors());
+    }
 
+    #[test]
+    fn binding_type_mismatch_is_blocking_error() {
+        let mut producer = step(1, "a");
+        producer.calls = vec![call("src", serde_json::json!({}))];
+        let mut consumer = step(2, "b");
+        consumer.calls = vec![call("sink", serde_json::json!({"value": "{{steps.1.calls.0}}"}))];
+
+        let specs = ToolSpecs::from([
+            (
+                "src".to_string(),
+                spec("src", serde_json::json!({"type": "object"}), Some(serde_json::json!({"type": "string"}))),
+            ),
+            (
+                "sink".to_string(),
+                spec(
+                    "sink",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {"value": {"type": "object"}}
+                    }),
+                    None,
+                ),
+            ),
+        ]);
+        let graph = SopGraph::from_sop_with_specs(&sop(vec![producer, consumer]), &specs);
+
+        assert!(graph.wires.iter().all(|w| w.class != PinClass::Data));
+        assert!(graph.has_errors());
         assert!(graph.diagnostics.iter().any(|d| {
-            d.severity == GraphSeverity::Error
-                && d.step == 3
-                && d.message.contains("no upstream producer")
+            d.severity == GraphSeverity::Error && d.message.contains("data type mismatch")
+        }));
+    }
+
+    #[test]
+    fn binding_to_missing_step_is_error() {
+        let mut consumer = step(1, "a");
+        consumer.calls = vec![call("sink", serde_json::json!({"value": "{{steps.9.calls.0}}"}))];
+        let specs = ToolSpecs::from([(
+            "sink".to_string(),
+            spec("sink", serde_json::json!({"type": "object"}), None),
+        )]);
+        let graph = SopGraph::from_sop_with_specs(&sop(vec![consumer]), &specs);
+        assert!(graph.diagnostics.iter().any(|d| {
+            d.severity == GraphSeverity::Error && d.message.contains("does not exist")
         }));
     }
 
@@ -1084,8 +1277,7 @@ mod tests {
                     {"class": "flow", "from_step": TRIGGER_NODE_BASE, "to_step": 1, "flow_role": "trigger", "from_pin": "event"}
                 ],
                 "diagnostics": [
-                    {"severity": "warning", "step": 1, "message": "switch port 'pr' has no target"},
-                    {"severity": "error", "step": 1, "message": "required input `input` has no upstream producer of a compatible type"}
+                    {"severity": "warning", "step": 1, "message": "switch port 'pr' has no target"}
                 ],
                 "layout": {
                     "positions": [

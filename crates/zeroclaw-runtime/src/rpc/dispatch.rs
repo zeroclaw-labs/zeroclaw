@@ -3981,7 +3981,10 @@ impl RpcDispatcher {
         let (dir, mode) = self.sops_dir_and_mode();
         let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
-        to_result(crate::sop::SopGraph::from_sop(&sop))
+        to_result(crate::sop::SopGraph::from_sop_with_specs(
+            &sop,
+            &self.sop_tool_specs(),
+        ))
     }
 
     fn handle_sops_run_overlay(&self, params: &Value) -> RpcResult {
@@ -4062,7 +4065,7 @@ impl RpcDispatcher {
             .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
         to_result(serde_json::json!({
             "sop": sop,
-            "graph": crate::sop::SopGraph::from_sop(&sop),
+            "graph": crate::sop::SopGraph::from_sop_with_specs(&sop, &self.sop_tool_specs()),
         }))
     }
 
@@ -4071,7 +4074,16 @@ impl RpcDispatcher {
             .get("sop")
             .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing 'sop'"))?;
         let sop = Self::parse_sop(sop_val)?;
-        to_result(crate::sop::SopGraph::from_sop(&sop))
+        to_result(crate::sop::SopGraph::from_sop_with_specs(
+            &sop,
+            &self.sop_tool_specs(),
+        ))
+    }
+
+    fn sop_tool_specs(&self) -> crate::sop::ToolSpecs {
+        let config = self.ctx.config.read();
+        let agent = config.agents.keys().min().cloned().unwrap_or_default();
+        crate::sop::tool_specs_from_config(&config, &agent)
     }
 
     fn handle_sops_trigger_sources(&self) -> RpcResult {

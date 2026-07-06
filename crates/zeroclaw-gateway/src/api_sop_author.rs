@@ -24,6 +24,12 @@ fn sops_dir_and_mode(
     (dir, mode)
 }
 
+fn sop_tool_specs(state: &AppState) -> zeroclaw_runtime::sop::ToolSpecs {
+    let config = state.config.read();
+    let agent = config.agents.keys().min().cloned().unwrap_or_default();
+    zeroclaw_runtime::sop::tool_specs_from_config(&config, &agent)
+}
+
 pub async fn handle_sops_list(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
@@ -116,7 +122,8 @@ pub async fn handle_sop_graph(
     let (dir, mode) = sops_dir_and_mode(&state);
     match zeroclaw_runtime::sop::load_sop_by_name(&dir, &name, mode) {
         Ok(sop) => {
-            let graph = zeroclaw_runtime::sop::SopGraph::from_sop(&sop);
+            let graph =
+                zeroclaw_runtime::sop::SopGraph::from_sop_with_specs(&sop, &sop_tool_specs(&state));
             Json(graph).into_response()
         }
         Err(e) => (
@@ -284,7 +291,8 @@ pub async fn handle_sop_wire_draft(
         )
             .into_response();
     }
-    let graph = zeroclaw_runtime::sop::SopGraph::from_sop(&sop);
+    let graph =
+        zeroclaw_runtime::sop::SopGraph::from_sop_with_specs(&sop, &sop_tool_specs(&state));
     Json(serde_json::json!({ "sop": sop, "graph": graph })).into_response()
 }
 
@@ -302,6 +310,7 @@ pub async fn handle_sop_graph_draft(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    let graph = zeroclaw_runtime::sop::SopGraph::from_sop(&req.sop);
+    let graph =
+        zeroclaw_runtime::sop::SopGraph::from_sop_with_specs(&req.sop, &sop_tool_specs(&state));
     Json(graph).into_response()
 }
