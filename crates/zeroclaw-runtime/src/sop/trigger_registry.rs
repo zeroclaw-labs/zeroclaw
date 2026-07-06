@@ -274,18 +274,17 @@ fn condition_contract_for(source: crate::sop::types::SopTriggerSource) -> Option
                 ConditionValueType::Number,
             )],
         }),
-        SopTriggerSource::Mqtt
-        | SopTriggerSource::Amqp
-        | SopTriggerSource::Channel => Some(PayloadContract {
-            open: true,
-            direct: false,
-            fields: Vec::new(),
-        }),
+        SopTriggerSource::Mqtt | SopTriggerSource::Amqp | SopTriggerSource::Channel => {
+            Some(PayloadContract {
+                open: true,
+                direct: false,
+                fields: Vec::new(),
+            })
+        }
         // Webhook, Cron, and Manual triggers carry no condition field.
         SopTriggerSource::Webhook | SopTriggerSource::Cron | SopTriggerSource::Manual => None,
     }
 }
-
 
 /// Every `SopTriggerSource` except `Channel` becomes a bound source whose field
 /// specs come from the source's own `TriggerBehavior`; every inbound-capable

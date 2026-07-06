@@ -399,9 +399,18 @@ mod tests {
                 ExtractedBinding::Malformed { .. } => None,
             })
             .collect();
-        assert_eq!(by_path.get("url").map(String::as_str), Some("steps.2.response.url"));
-        assert_eq!(by_path.get("nested.deep").map(String::as_str), Some("calls.0.status"));
-        assert_eq!(by_path.get("list.1").map(String::as_str), Some("steps.1.out"));
+        assert_eq!(
+            by_path.get("url").map(String::as_str),
+            Some("steps.2.response.url")
+        );
+        assert_eq!(
+            by_path.get("nested.deep").map(String::as_str),
+            Some("calls.0.status")
+        );
+        assert_eq!(
+            by_path.get("list.1").map(String::as_str),
+            Some("steps.1.out")
+        );
     }
 
     #[test]

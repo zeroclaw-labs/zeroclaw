@@ -1221,7 +1221,9 @@ impl SopEngine {
         let context = format_step_context(&sop, run, &step, &self.config);
 
         let mut step = step;
-        step.agent = step.effective_agent(sop.agent.as_deref()).map(str::to_string);
+        step.agent = step
+            .effective_agent(sop.agent.as_deref())
+            .map(str::to_string);
 
         self.persist_active(run_id);
         Ok(SopRunAction::ExecuteStep {
@@ -2026,10 +2028,13 @@ fn trigger_matches(trigger: &SopTrigger, event: &SopEvent) -> bool {
     trigger.source() == event.source && trigger.behavior().matches(event)
 }
 
-/// Match a channel trigger against an event topic of the form `channel` or
-/// `channel/alias`. Channel type compares case-insensitively; an aliased
-/// trigger requires an exact alias, an alias-less trigger matches any
-/// instance. No topic fails closed.
+/// Match a channel trigger against an event topic. Two producer forms are
+/// accepted through the shared [`ChannelSopTopic`] grammar: the plain
+/// `channel` / `channel/alias` form used by agent-loop message triggers, and
+/// the forge form `channel.alias:event_type`. Channel type compares
+/// case-insensitively; an aliased trigger requires an exact alias, an
+/// alias-less trigger matches any instance. No topic fails closed. The
+/// `event_type` (forge form) is left for an authored `condition` to match.
 pub(crate) fn channel_trigger_topic_matches(
     channel: &str,
     alias: Option<&str>,
@@ -2038,10 +2043,8 @@ pub(crate) fn channel_trigger_topic_matches(
     let Some(topic) = topic else {
         return false;
     };
-    let (topic_channel, topic_alias) = match topic.split_once('/') {
-        Some((c, a)) => (c, Some(a)),
-        None => (topic, None),
-    };
+    let (topic_channel, topic_alias, _event_type) =
+        zeroclaw_api::channel::ChannelSopTopic::parse(topic);
     if !topic_channel.eq_ignore_ascii_case(channel) {
         return false;
     }
@@ -2191,7 +2194,9 @@ fn resolve_step_action(
     approval_mode: ApprovalMode,
 ) -> SopRunAction {
     let mut step = step.clone();
-    step.agent = step.effective_agent(sop.agent.as_deref()).map(str::to_string);
+    step.agent = step
+        .effective_agent(sop.agent.as_deref())
+        .map(str::to_string);
     let step = &step;
 
     // Steps with requires_confirmation always need approval
@@ -2966,6 +2971,45 @@ mod tests {
             timestamp: now_iso8601(),
         };
         assert_eq!(engine.match_trigger(&event).len(), 1);
+    }
+
+    #[test]
+    fn channel_trigger_matches_forge_topic_and_condition() {
+        let sop = Sop {
+            triggers: vec![SopTrigger::Channel {
+                channel: "git".into(),
+                alias: Some("main".into()),
+                condition: Some("$.event_type == \"pull_request.opened\"".into()),
+            }],
+            ..test_sop("git-pr-sop", SopExecutionMode::Auto, SopPriority::Normal)
+        };
+        let engine = engine_with_sops(vec![sop]);
+
+        let event = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.main:pull_request.opened".into()),
+            payload: Some(
+                r#"{"event_type":"pull_request.opened","repo":"octo/repo","number":12}"#.into(),
+            ),
+            timestamp: now_iso8601(),
+        };
+        assert_eq!(engine.match_trigger(&event).len(), 1);
+
+        let wrong_event_type = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.main:issues.opened".into()),
+            payload: Some(r#"{"event_type":"issues.opened","repo":"octo/repo"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert!(engine.match_trigger(&wrong_event_type).is_empty());
+
+        let wrong_alias = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.staging:pull_request.opened".into()),
+            payload: Some(r#"{"event_type":"pull_request.opened","repo":"octo/repo"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert!(engine.match_trigger(&wrong_alias).is_empty());
     }
 
     // ── Cron trigger matching ─────────────────────────

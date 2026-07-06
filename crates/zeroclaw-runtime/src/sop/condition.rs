@@ -198,16 +198,23 @@ impl ConditionOp {
     /// then ordering), for authoring surfaces to render verbatim.
     pub fn catalog() -> Vec<ConditionOpSpec> {
         use strum::IntoEnumIterator;
-        [Self::Eq, Self::Neq, Self::Gt, Self::Gte, Self::Lt, Self::Lte]
-            .into_iter()
-            .map(|op| {
-                debug_assert!(Self::iter().any(|variant| variant == op));
-                ConditionOpSpec {
-                    token: op.token().to_string(),
-                    label: op.label().to_string(),
-                }
-            })
-            .collect()
+        [
+            Self::Eq,
+            Self::Neq,
+            Self::Gt,
+            Self::Gte,
+            Self::Lt,
+            Self::Lte,
+        ]
+        .into_iter()
+        .map(|op| {
+            debug_assert!(Self::iter().any(|variant| variant == op));
+            ConditionOpSpec {
+                token: op.token().to_string(),
+                label: op.label().to_string(),
+            }
+        })
+        .collect()
     }
 
     /// Every operator token, for the parser's longest-first scan. Walks the
@@ -250,12 +257,15 @@ impl ConditionParts {
         let trimmed = condition.trim();
         let has_path = trimmed.starts_with('$');
         let scan_from = if has_path {
-            trimmed.trim_start_matches('$').trim_start_matches('.').trim()
+            trimmed
+                .trim_start_matches('$')
+                .trim_start_matches('.')
+                .trim()
         } else {
             trimmed
         };
         let mut tokens: Vec<&'static str> = ConditionOp::catalog_tokens();
-        tokens.sort_by(|a, b| b.len().cmp(&a.len()));
+        tokens.sort_by_key(|b| std::cmp::Reverse(b.len()));
         for token in tokens {
             if let Some(at) = scan_from.find(token) {
                 let left = scan_from[..at].trim().to_string();

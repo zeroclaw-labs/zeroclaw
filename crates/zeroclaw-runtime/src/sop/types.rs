@@ -197,9 +197,12 @@ pub enum SopTrigger {
         #[serde(default)]
         condition: Option<String>,
     },
-    /// Inbound message on a configured agent-loop channel (telegram, discord,
-    /// slack, ...). Live: delivered by the channel orchestrator when the
-    /// channel's SOP dispatch mode is enabled.
+    /// Inbound message or forge/platform event on a configured channel
+    /// (telegram, discord, slack, git, ...). Live: delivered by the channel
+    /// orchestrator when the channel's SOP dispatch is enabled. The Git forge
+    /// producer sets an event topic of the form `<channel>.<alias>:<event_type>`
+    /// and puts `event_type` in the payload, so an authored `condition` filters
+    /// forge events by type without a second trigger shape.
     #[trigger(config_derived, display = "channel", opt = "alias")]
     Channel {
         /// `ChannelKind` snake_case value naming the channel type.
@@ -1010,6 +1013,22 @@ path = "/var/inbox"
     }
 
     #[test]
+    fn trigger_channel_toml() {
+        let toml_str = r#"
+type = "channel"
+channel = "git"
+alias = "main"
+condition = "$.event_type == \"pull_request.opened\""
+"#;
+        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
+        assert!(matches!(
+            trigger,
+            SopTrigger::Channel { ref channel, ref alias, .. }
+                if channel == "git" && alias.as_deref() == Some("main")
+        ));
+    }
+
+    #[test]
     fn filesystem_event_kind_display_and_serde() {
         assert_eq!(FilesystemEventKind::Created.to_string(), "created");
         assert_eq!(FilesystemEventKind::Renamed.to_string(), "renamed");
@@ -1147,6 +1166,7 @@ path = "/sop/test"
     #[test]
     fn trigger_source_display() {
         assert_eq!(SopTriggerSource::Mqtt.to_string(), "mqtt");
+        assert_eq!(SopTriggerSource::Channel.to_string(), "channel");
         assert_eq!(SopTriggerSource::Manual.to_string(), "manual");
     }
 
