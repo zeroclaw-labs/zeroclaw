@@ -1709,6 +1709,10 @@ pub async fn run_gateway(
             post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
         )
         .route("/api/config/rename-map-key", post(api_config::handle_rename_map_key))
+        .route(
+            "/api/config/model-providers/{type}/{alias}/refresh-context-window",
+            post(api_config::handle_refresh_context_window),
+        )
         .route("/api/config/delete-plan", get(api_config::handle_delete_plan))
         .route("/api/config/catalog", get(api_sections::handle_catalog))
         .route(
@@ -1786,6 +1790,10 @@ pub async fn run_gateway(
             get(api_skills::handle_agent_skills),
         )
         .route("/api/skills/bundles", get(api_skills::handle_list_bundles))
+        .route(
+            "/api/skills/slash-option-kinds",
+            get(api_skills::handle_slash_option_kinds),
+        )
         .route(
             "/api/skills/bundles/{alias}/skills",
             get(api_skills::handle_list_skills).post(api_skills::handle_create_skill),
