@@ -22,6 +22,11 @@ use std::sync::Arc;
 const UNSET_DISPLAY: &str = "<unset>";
 const MODEL_CATALOG_MAX_ATTEMPTS: u8 = 2;
 const MODEL_PROVIDER_EXISTING_COLLAPSED_LIMIT: usize = 5;
+// Policy aliases for provider-driven runtime defaults. The daemon-owned
+// `quickstart/state.runtime_presets` table is checked before either alias is
+// auto-applied, so the preset inventory remains the source of truth.
+const DEFAULT_RUNTIME_PRESET: &str = "unbounded";
+const LOCAL_PROVIDER_RUNTIME_PRESET: &str = "local_small";
 
 /// Upper bound on rendered secret-mask bullets. A pasted API key can be
 /// 100+ chars; one bullet per character wraps the masked value across
@@ -570,6 +575,7 @@ struct FormState {
     risk_mode: SelectorMode,
     runtime: String,
     runtime_mode: SelectorMode,
+    runtime_auto_defaulted: bool,
     memory: MemoryKind,
     memory_mode: SelectorMode,
     /// `true` once the user has explicitly committed a Memory
@@ -599,6 +605,7 @@ impl FormState {
             risk_mode: SelectorMode::Fresh,
             runtime: String::new(),
             runtime_mode: SelectorMode::Fresh,
+            runtime_auto_defaulted: false,
             memory: MemoryKind::Sqlite,
             memory_mode: SelectorMode::Fresh,
             memory_chosen: false,
@@ -717,9 +724,7 @@ impl FormState {
             SelectorMode::Fresh => SelectorChoice::Fresh(self.risk.clone()),
             SelectorMode::Existing => SelectorChoice::Existing(self.risk.clone()),
         };
-        // Runtime profile picker removed from all surfaces; apply silently
-        // forces the `unbounded` preset. Submit it so the field is well-formed.
-        let runtime_profile = SelectorChoice::Fresh("unbounded".to_string());
+        let runtime_profile = self.runtime_profile_choice();
         let memory = match self.memory_mode {
             SelectorMode::Fresh => SelectorChoice::Fresh(self.memory),
             SelectorMode::Existing => SelectorChoice::Existing(self.memory_existing_alias.clone()),
@@ -750,6 +755,41 @@ impl FormState {
                 personality_file: None,
                 personality_files: self.personality_files.clone(),
             },
+        }
+    }
+
+    fn runtime_profile_choice(&self) -> SelectorChoice<String> {
+        if self.runtime.is_empty() {
+            return SelectorChoice::Fresh(DEFAULT_RUNTIME_PRESET.to_string());
+        }
+        match self.runtime_mode {
+            SelectorMode::Fresh => SelectorChoice::Fresh(self.runtime.clone()),
+            SelectorMode::Existing => SelectorChoice::Existing(self.runtime.clone()),
+        }
+    }
+
+    fn apply_provider_runtime_default(
+        &mut self,
+        provider_is_local: bool,
+        preset_available: impl Fn(&str) -> bool,
+    ) {
+        let preferred = if provider_is_local {
+            LOCAL_PROVIDER_RUNTIME_PRESET
+        } else {
+            DEFAULT_RUNTIME_PRESET
+        };
+        let next = if preset_available(preferred) {
+            preferred
+        } else {
+            DEFAULT_RUNTIME_PRESET
+        };
+        if !preset_available(next) {
+            return;
+        }
+        if self.runtime.is_empty() || self.runtime_auto_defaulted {
+            self.runtime = next.to_string();
+            self.runtime_mode = SelectorMode::Fresh;
+            self.runtime_auto_defaulted = true;
         }
     }
 }
@@ -2086,7 +2126,35 @@ impl QuickstartPane {
             // don't overwrite the existing alias's values.
             self.form.model.clear();
             self.form.provider_fields.clear();
+            let runtime_presets = self.runtime_preset_names();
+            self.form.apply_provider_runtime_default(false, |preset| {
+                runtime_presets.iter().any(|known| known == preset)
+            });
         }
+    }
+
+    fn provider_type_is_local(&self, type_key: &str) -> bool {
+        self.state_snapshot
+            .as_ref()
+            .and_then(|snap| {
+                snap.model_provider_types
+                    .iter()
+                    .find(|provider| provider.kind == type_key)
+            })
+            .map(|provider| provider.local)
+            .unwrap_or(false)
+    }
+
+    fn runtime_preset_names(&self) -> Vec<String> {
+        self.state_snapshot
+            .as_ref()
+            .map(|snap| {
+                snap.runtime_presets
+                    .iter()
+                    .map(|preset| preset.preset_name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn adopt_existing_channel(&mut self, dotted_ref: String) {
@@ -2300,6 +2368,8 @@ impl QuickstartPane {
         }
         match f.selector {
             Selector::ModelProvider => {
+                let provider_is_local = self.provider_type_is_local(&f.type_key);
+                let runtime_presets = self.runtime_preset_names();
                 let pick = |key: &str| {
                     f.fields
                         .iter()
@@ -2335,6 +2405,10 @@ impl QuickstartPane {
                 self.form.provider_mode = SelectorMode::Fresh;
                 self.form.model = pick("model");
                 self.form.provider_fields = provider_fields;
+                self.form
+                    .apply_provider_runtime_default(provider_is_local, |preset| {
+                        runtime_presets.iter().any(|known| known == preset)
+                    });
             }
             Selector::Channels => {
                 let pick = |key: &str| {
@@ -2382,6 +2456,7 @@ impl QuickstartPane {
             Selector::RuntimeProfile => {
                 self.form.runtime = value;
                 self.form.runtime_mode = mode;
+                self.form.runtime_auto_defaulted = false;
             }
             Selector::Memory => {
                 if use_existing {
@@ -3598,6 +3673,10 @@ mod tests {
         assert!(model_provider_alias_duplicate_error(Some(&snap), &form).is_none());
     }
 
+    fn preset_available(_: &str) -> bool {
+        true
+    }
+
     #[test]
     fn submit_is_excluded_from_completeness() {
         // Regression: can_create walked Selector::ALL including Submit,
@@ -3673,6 +3752,136 @@ mod tests {
         assert!(f.is_satisfied(Selector::Channels));
         assert!(f.is_satisfied(Selector::PeerGroups));
         assert!(f.all_selectors_satisfied());
+    }
+
+    #[test]
+    fn submission_preserves_selected_fresh_runtime_profile() {
+        let mut f = complete_form();
+        f.runtime = "local_small".into();
+        f.runtime_mode = SelectorMode::Fresh;
+
+        let submission = f.to_submission();
+
+        assert_eq!(
+            submission.runtime_profile,
+            SelectorChoice::Fresh("local_small".into())
+        );
+    }
+
+    #[test]
+    fn submission_preserves_selected_existing_runtime_profile() {
+        let mut f = complete_form();
+        f.runtime = "small-laptop".into();
+        f.runtime_mode = SelectorMode::Existing;
+
+        let submission = f.to_submission();
+
+        assert_eq!(
+            submission.runtime_profile,
+            SelectorChoice::Existing("small-laptop".into())
+        );
+    }
+
+    #[test]
+    fn local_provider_defaults_to_local_small_runtime_profile() {
+        let mut f = FormState::default_form();
+
+        f.apply_provider_runtime_default(true, preset_available);
+
+        assert_eq!(f.runtime, "local_small");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("local_small".into())
+        );
+    }
+
+    #[test]
+    fn cloud_provider_defaults_to_unbounded_runtime_profile() {
+        let mut f = FormState::default_form();
+
+        f.apply_provider_runtime_default(false, preset_available);
+
+        assert_eq!(f.runtime, "unbounded");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("unbounded".into())
+        );
+    }
+
+    #[test]
+    fn local_provider_default_falls_back_when_local_small_preset_is_absent() {
+        let mut f = FormState::default_form();
+
+        f.apply_provider_runtime_default(true, |preset| preset == "unbounded");
+
+        assert_eq!(f.runtime, "unbounded");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("unbounded".into())
+        );
+    }
+
+    #[test]
+    fn provider_runtime_default_preserves_explicit_runtime_choice() {
+        let mut f = FormState::default_form();
+        f.runtime = "tight".into();
+        f.runtime_mode = SelectorMode::Fresh;
+
+        f.apply_provider_runtime_default(true, preset_available);
+
+        assert_eq!(f.runtime, "tight");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("tight".into())
+        );
+    }
+
+    #[test]
+    fn provider_runtime_default_preserves_explicit_unbounded_choice() {
+        let mut f = FormState::default_form();
+        f.runtime = "unbounded".into();
+        f.runtime_mode = SelectorMode::Fresh;
+
+        f.apply_provider_runtime_default(true, preset_available);
+
+        assert_eq!(f.runtime, "unbounded");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("unbounded".into())
+        );
+    }
+
+    #[test]
+    fn provider_runtime_default_preserves_explicit_local_small_choice() {
+        let mut f = FormState::default_form();
+        f.runtime = "local_small".into();
+        f.runtime_mode = SelectorMode::Fresh;
+
+        f.apply_provider_runtime_default(false, preset_available);
+
+        assert_eq!(f.runtime, "local_small");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("local_small".into())
+        );
+    }
+
+    #[test]
+    fn explicit_runtime_choice_stops_provider_default_rewrites() {
+        let mut f = FormState::default_form();
+
+        f.apply_provider_runtime_default(true, preset_available);
+        assert_eq!(f.runtime, "local_small");
+        f.runtime = "unbounded".into();
+        f.runtime_mode = SelectorMode::Fresh;
+        f.runtime_auto_defaulted = false;
+        f.apply_provider_runtime_default(true, preset_available);
+
+        assert_eq!(f.runtime, "unbounded");
+        assert_eq!(
+            f.to_submission().runtime_profile,
+            SelectorChoice::Fresh("unbounded".into())
+        );
     }
 
     #[test]
