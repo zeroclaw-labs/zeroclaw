@@ -621,7 +621,6 @@ fn build_system_prompt_for_turn(
     excluded_tools: &[String],
     activated_tools: Option<&Arc<Mutex<crate::tools::ActivatedToolSet>>>,
     strict_tool_parsing: bool,
-    skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     compact_context: bool,
     max_system_prompt_chars: usize,
     inject_memory: bool,
@@ -659,7 +658,6 @@ fn build_system_prompt_for_turn(
         bootstrap_max_chars,
         Some(risk_profile),
         native_tool_specs_present,
-        skills_prompt_mode,
         compact_context,
         max_system_prompt_chars,
         inject_memory,
@@ -1534,15 +1532,10 @@ pub async fn run(
                 "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
             ),
         ];
-        if matches!(
-            config.skills.prompt_injection_mode,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-        ) {
-            tool_descs.push((
+        tool_descs.push((
             "read_skill",
             "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
         ));
-        }
         tool_descs.push((
         "cron_add",
         "Create a cron job. Supports schedule kinds: cron, at, every; and job types: shell or agent.",
@@ -1656,7 +1649,6 @@ pub async fn run(
             &prompt_excluded_tools,
             activated_handle.as_ref(),
             agent.resolved.strict_tool_parsing,
-            config.skills.prompt_injection_mode,
             eff_compact_context,
             eff_max_system_prompt_chars,
             true,
@@ -1751,7 +1743,6 @@ pub async fn run(
                 &excluded_tools,
                 activated_handle.as_ref(),
                 agent.resolved.strict_tool_parsing,
-                config.skills.prompt_injection_mode,
                 eff_compact_context,
                 eff_max_system_prompt_chars,
                 true,
@@ -1867,7 +1858,6 @@ pub async fn run(
                         &excluded_tools,
                         activated_handle.as_ref(),
                         agent.resolved.strict_tool_parsing,
-                        config.skills.prompt_injection_mode,
                         eff_compact_context,
                         eff_max_system_prompt_chars,
                         true,
@@ -2422,7 +2412,6 @@ pub async fn run(
                             &excluded_tools,
                             activated_handle.as_ref(),
                             agent.resolved.strict_tool_parsing,
-                            config.skills.prompt_injection_mode,
                             eff_compact_context,
                             eff_max_system_prompt_chars,
                             true,
@@ -2967,15 +2956,10 @@ pub async fn process_message(
             ("screenshot", "Capture a screenshot."),
             ("image_info", "Read image metadata."),
         ];
-        if matches!(
-            config.skills.prompt_injection_mode,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-        ) {
-            tool_descs.push((
-                "read_skill",
-                "Load the full source for an available skill by name.",
-            ));
-        }
+        tool_descs.push((
+            "read_skill",
+            "Load the full source for an available skill by name.",
+        ));
         if config.browser.enabled {
             tool_descs.push(("browser_open", "Open approved URLs in browser."));
         }
@@ -3083,7 +3067,6 @@ pub async fn process_message(
                 bootstrap_max_chars,
                 Some(&risk_profile),
                 native_tool_specs_present,
-                config.skills.prompt_injection_mode,
                 eff_compact_context,
                 eff_max_system_prompt_chars,
                 false,
@@ -12278,7 +12261,6 @@ Let me check the result."#;
             None, // no identity config
             None, // no bootstrap_max_chars
             true, // native_tool_specs_present
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             crate::security::AutonomyLevel::default(),
         );
 
@@ -12339,7 +12321,6 @@ Let me check the result."#;
             None,
             None,
             native_tool_specs_present,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             crate::security::AutonomyLevel::default(),
         );
 
@@ -12381,7 +12362,6 @@ Let me check the result."#;
             None,
             None,
             native_tool_specs_present,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             crate::security::AutonomyLevel::default(),
         );
 
@@ -12413,9 +12393,7 @@ Let me check the result."#;
     #[test]
     fn interactive_turn_system_prompt_uses_effective_dynamic_mcp_specs() {
         use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
-        use zeroclaw_config::schema::{
-            RiskProfileConfig, SkillsPromptInjectionMode, ToolFilterGroup, ToolFilterGroupMode,
-        };
+        use zeroclaw_config::schema::{RiskProfileConfig, ToolFilterGroup, ToolFilterGroupMode};
 
         let workspace = tempdir().unwrap();
         let provider =
@@ -12450,7 +12428,6 @@ Let me check the result."#;
             &[],
             None,
             false,
-            SkillsPromptInjectionMode::Full,
             false,
             usize::MAX,
             true,
@@ -12478,7 +12455,6 @@ Let me check the result."#;
             &excluded_tools,
             None,
             false,
-            SkillsPromptInjectionMode::Full,
             false,
             usize::MAX,
             true,
@@ -12509,7 +12485,6 @@ Let me check the result."#;
             &included_tools,
             None,
             false,
-            SkillsPromptInjectionMode::Full,
             false,
             usize::MAX,
             true,
@@ -12535,7 +12510,6 @@ Let me check the result."#;
             None,
             None,
             false,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             crate::security::AutonomyLevel::default(),
         );
 

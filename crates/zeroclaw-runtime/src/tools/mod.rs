@@ -761,12 +761,11 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    if matches!(
-        root_config.skills.prompt_injection_mode,
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-    ) {
-        // ReadSkillTool now holds full config to support all skill sources:
-        // workspace skills, open-skills, agent-bound bundles, and plugin skills.
+    {
+        // Skills always render as compact summaries, so `read_skill` is always
+        // registered to load instructions on demand. ReadSkillTool holds full
+        // config to support all skill sources: workspace skills, open-skills,
+        // agent-bound bundles, and plugin skills.
         tool_arcs.push(Arc::new(ReadSkillTool::new(
             config.clone(),
             agent_alias.to_string(),
@@ -2505,7 +2504,7 @@ mod tests {
     }
 
     #[test]
-    fn all_tools_includes_read_skill_in_compact_mode() {
+    fn all_tools_registers_read_skill() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -2517,9 +2516,7 @@ mod tests {
 
         let browser = BrowserConfig::default();
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
-        let mut cfg = test_config(&tmp);
-        cfg.skills.prompt_injection_mode =
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
+        let cfg = test_config(&tmp);
 
         let tools = all_tools(
             Arc::new(cfg.clone()),
@@ -2543,46 +2540,6 @@ mod tests {
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read_skill"));
-    }
-
-    #[test]
-    fn all_tools_excludes_read_skill_in_full_mode() {
-        let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy::default());
-        let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
-            ..MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-
-        let browser = BrowserConfig::default();
-        let http = zeroclaw_config::schema::HttpRequestConfig::default();
-        let mut cfg = test_config(&tmp);
-        cfg.skills.prompt_injection_mode = zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
-
-        let tools = all_tools(
-            Arc::new(cfg.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "test-agent",
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &zeroclaw_config::schema::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-            false,
-            None,
-        )
-        .tools;
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(!names.contains(&"read_skill"));
     }
 
     fn registry_names(tmp: &TempDir, is_subagent_caller: bool) -> Vec<String> {

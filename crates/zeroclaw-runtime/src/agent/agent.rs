@@ -336,7 +336,6 @@ pub struct Agent {
     agent_workspace_dir: std::path::PathBuf,
     identity_config: zeroclaw_config::schema::IdentityConfig,
     skills: Vec<crate::skills::Skill>,
-    skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     auto_save: bool,
     memory_session_id: Option<String>,
     history: Vec<ConversationMessage>,
@@ -500,7 +499,6 @@ pub struct AgentBuilder {
     agent_workspace_dir: Option<std::path::PathBuf>,
     identity_config: Option<zeroclaw_config::schema::IdentityConfig>,
     skills: Option<Vec<crate::skills::Skill>>,
-    skills_prompt_mode: Option<zeroclaw_config::schema::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
     memory_session_id: Option<String>,
     classification_config: Option<zeroclaw_config::schema::QueryClassificationConfig>,
@@ -548,7 +546,6 @@ impl AgentBuilder {
             agent_workspace_dir: None,
             identity_config: None,
             skills: None,
-            skills_prompt_mode: None,
             auto_save: None,
             memory_session_id: None,
             classification_config: None,
@@ -658,14 +655,6 @@ impl AgentBuilder {
 
     pub fn skills(mut self, skills: Vec<crate::skills::Skill>) -> Self {
         self.skills = Some(skills);
-        self
-    }
-
-    pub fn skills_prompt_mode(
-        mut self,
-        skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
-    ) -> Self {
-        self.skills_prompt_mode = Some(skills_prompt_mode);
         self
     }
 
@@ -905,7 +894,6 @@ impl AgentBuilder {
             }),
             identity_config: self.identity_config.unwrap_or_default(),
             skills: self.skills.unwrap_or_default(),
-            skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
             auto_save: if exclude_memory {
                 false
             } else {
@@ -1819,7 +1807,6 @@ impl Agent {
             .route_model_by_hint(route_model_by_hint)
             .identity_config(agent_cfg.identity.clone())
             .skills(skills)
-            .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
             .exclude_memory(exclude_memory)
             .security_summary(Some(security.prompt_summary()))
@@ -2050,7 +2037,6 @@ impl Agent {
             model_name: &self.model_name,
             tools: prompt_tools,
             skills: &self.skills,
-            skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
             sends_native_tool_specs: dispatcher.should_send_tool_specs()

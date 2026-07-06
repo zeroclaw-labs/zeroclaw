@@ -4,9 +4,10 @@ use std::path::Path;
 use crate::schema::Config;
 use crate::schema::v1::V1Config;
 use crate::schema::v2::V2Config;
+use crate::schema::v3::V3Config;
 
 /// The schema version this binary writes and expects on disk.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// Top-level TOML keys that legacy schema versions had but V3 either
 /// removed or restructured. Suppresses "unknown key" warnings on V1/V2
@@ -929,6 +930,13 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
             .context("failed to deserialize as V2 schema")?;
         v2.migrate().context("failed to migrate V2 → V3")
     },
+    // V3 → V4
+    |value| {
+        let v3: V3Config = value
+            .try_into()
+            .context("failed to deserialize as V3 schema")?;
+        v3.migrate().context("failed to migrate V3 → V4")
+    },
 ];
 
 const _: () = assert!(
@@ -1477,5 +1485,101 @@ enabled = "not-a-bool"
             "no `.backup` should be created on the no-op path; got {}",
             backup.display()
         );
+    }
+
+    #[test]
+    fn v3_to_v4_drops_skills_prompt_injection_mode() {
+        let raw = r#"
+schema_version = 3
+
+[skills]
+open_skills_enabled = true
+prompt_injection_mode = "full"
+"#;
+        let cfg = migrate_to_current(raw).expect("V3 → V4 migration succeeds");
+        assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(cfg.skills.open_skills_enabled);
+        let migrated = migrate_file(raw)
+            .expect("migrate_file succeeds")
+            .expect("V3 input triggers migration");
+        assert!(
+            !migrated.contains("prompt_injection_mode"),
+            "migrated V4 config must not carry the dropped skills key; got:\n{migrated}"
+        );
+    }
+
+    #[test]
+    fn v3_to_v4_drops_inert_agent_tunable_keys() {
+        let raw = r#"
+schema_version = 3
+
+[agents.default]
+runtime_profile = "fast"
+max_tool_iterations = 20
+compact_context = true
+tool_dispatcher = "xml"
+"#;
+        let migrated = migrate_file(raw)
+            .expect("migrate_file succeeds")
+            .expect("V3 input triggers migration");
+        for dropped in ["max_tool_iterations", "compact_context", "tool_dispatcher"] {
+            assert!(
+                !migrated.contains(dropped),
+                "migrated V4 config must not carry inert agent key {dropped}; got:\n{migrated}"
+            );
+        }
+        assert!(
+            migrated.contains("runtime_profile"),
+            "surviving agent keys must be preserved; got:\n{migrated}"
+        );
+    }
+
+    #[test]
+    fn v3_to_v4_drops_summary_model_swap() {
+        let raw = r#"
+schema_version = 3
+
+[runtime_profiles.default]
+
+[runtime_profiles.default.context_compression]
+enabled = true
+summary_model = "anthropic/claude-3-haiku"
+"#;
+        let migrated = migrate_file(raw)
+            .expect("migrate_file succeeds")
+            .expect("V3 input triggers migration");
+        assert!(
+            !migrated.contains("summary_model"),
+            "migrated V4 config must not carry the deprecated summary_model swap; got:\n{migrated}"
+        );
+    }
+
+    #[test]
+    fn v3_to_v4_is_lossless_for_untouched_config() {
+        let raw = r#"
+schema_version = 3
+
+[heartbeat]
+enabled = false
+
+[channels.telegram.main]
+enabled = true
+bot_token = "t"
+"#;
+        let cfg = migrate_to_current(raw).expect("V3 → V4 migration succeeds");
+        assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(cfg.channels.telegram.contains_key("main"));
+    }
+
+    #[test]
+    fn generate_v4_runs_the_full_chain() {
+        let out = generate(CURRENT_SCHEMA_VERSION, &GenerateOptions::default())
+            .expect("generate at CURRENT_SCHEMA_VERSION succeeds");
+        assert!(
+            out.contains(&format!("schema_version = {CURRENT_SCHEMA_VERSION}")),
+            "generated config must stamp the current schema version; got:\n{out}"
+        );
+        let cfg = migrate_to_current(&out).expect("generated V4 config round-trips");
+        assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
     }
 }

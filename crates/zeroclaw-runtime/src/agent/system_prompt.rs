@@ -74,7 +74,6 @@ pub fn build_system_prompt(
         identity_config,
         bootstrap_max_chars,
         false,
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
         AutonomyLevel::default(),
     )
 }
@@ -99,7 +98,6 @@ pub fn build_system_prompt_with_tool_calls(
         bootstrap_max_chars,
         Some(&zeroclaw_config::schema::RiskProfileConfig::default()),
         false,
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
         false,
         0,
         true,
@@ -115,7 +113,6 @@ pub fn build_system_prompt_with_mode(
     identity_config: Option<&zeroclaw_config::schema::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
     native_tool_specs_present: bool,
-    skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     autonomy_level: AutonomyLevel,
 ) -> String {
     let autonomy_cfg = zeroclaw_config::schema::RiskProfileConfig {
@@ -131,7 +128,6 @@ pub fn build_system_prompt_with_mode(
         bootstrap_max_chars,
         Some(&autonomy_cfg),
         native_tool_specs_present,
-        skills_prompt_mode,
         false,
         0,
         true,
@@ -149,7 +145,6 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     bootstrap_max_chars: Option<usize>,
     autonomy_config: Option<&zeroclaw_config::schema::RiskProfileConfig>,
     native_tool_specs_present: bool,
-    skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     compact_context: bool,
     max_system_prompt_chars: usize,
     // When `false`, `MEMORY.md` is omitted from the injected bootstrap files.
@@ -287,13 +282,9 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     });
     prompt.push('\n');
 
-    // ── 3. Skills (full or compact, based on config) ─────────────
+    // ── 3. Skills (always compact; instructions load on demand) ──
     if !skills.is_empty() {
-        prompt.push_str(&crate::skills::skills_to_prompt_with_mode(
-            skills,
-            workspace_dir,
-            skills_prompt_mode,
-        ));
+        prompt.push_str(&crate::skills::skills_to_prompt(skills, workspace_dir));
         prompt.push_str("\n\n");
     }
 

@@ -1564,72 +1564,38 @@ fn display_skill_location(path: &Path) -> String {
     }
 }
 
-/// Build the "Available Skills" system prompt section with full skill instructions.
+/// Build the "Available Skills" system prompt section.
+///
+/// Skills always render as compact summaries: name, description, location,
+/// and callable tool metadata. Full skill instructions are never inlined —
+/// the model loads them on demand via `read_skill(name)`. Inlining every
+/// skill body blew up the context window and diverged from the
+/// progressive-disclosure model used by Claude Code and OpenClaw, so the
+/// old `full` prompt-injection mode was cut in schema V4.
 pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
-    skills_to_prompt_with_mode(
-        skills,
-        workspace_dir,
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
-    )
-}
-
-/// Build the "Available Skills" system prompt section with configurable verbosity.
-pub fn skills_to_prompt_with_mode(
-    skills: &[Skill],
-    workspace_dir: &Path,
-    mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
-) -> String {
     use std::fmt::Write;
 
     if skills.is_empty() {
         return String::new();
     }
 
-    let mut prompt = match mode {
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Full => String::from(
-            "## Available Skills\n\n\
-             Skill instructions and tool metadata are preloaded below.\n\
-             Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\n\
-             <available_skills>\n",
-        ),
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact => String::from(
-            "## Available Skills\n\n\
-             Skill summaries are preloaded below to keep context compact.\n\
-             Skill instructions are loaded on demand: call `read_skill(name)` with the skill's `<name>` when you need the full skill file.\n\
-             The `location` field is included for reference.\n\n\
-             <available_skills>\n",
-        ),
-    };
+    let mut prompt = String::from(
+        "## Available Skills\n\n\
+         Skill summaries are preloaded below to keep context compact.\n\
+         Skill instructions are loaded on demand: call `read_skill(name)` with the skill's `<name>` when you need the full skill file.\n\
+         The `location` field is included for reference.\n\n\
+         <available_skills>\n",
+    );
 
     for skill in skills {
         let _ = writeln!(prompt, "  <skill>");
         write_xml_text_element(&mut prompt, 4, "name", &skill.name);
         write_xml_text_element(&mut prompt, 4, "description", &skill.description);
-        let location = render_skill_location(
-            skill,
-            workspace_dir,
-            matches!(
-                mode,
-                zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-            ),
-        );
+        let location = render_skill_location(skill, workspace_dir, true);
         write_xml_text_element(&mut prompt, 4, "location", &location);
 
-        // In Full mode, inline both instructions and tools.
-        // In Compact mode, skip instructions (loaded on demand) but keep tools
-        // so the LLM knows which skill tools are available.
-        if matches!(
-            mode,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Full
-        ) && !skill.prompts.is_empty()
-        {
-            let _ = writeln!(prompt, "    <instructions>");
-            for instruction in &skill.prompts {
-                write_xml_text_element(&mut prompt, 6, "instruction", instruction);
-            }
-            let _ = writeln!(prompt, "    </instructions>");
-        }
-
+        // Skill instructions are always loaded on demand via `read_skill`; only
+        // tool metadata is inlined so the LLM knows which skill tools exist.
         if !skill.tools.is_empty() {
             // Tools with known kinds (shell, script, http) are registered as
             // callable tool specs and can be invoked directly via function calling.
@@ -4061,11 +4027,7 @@ mod prompt_callable_name_tests {
             location: None,
         };
 
-        let prompt = skills_to_prompt_with_mode(
-            std::slice::from_ref(&skill),
-            Path::new("/tmp"),
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
-        );
+        let prompt = skills_to_prompt(std::slice::from_ref(&skill), Path::new("/tmp"));
 
         let registered =
             crate::tools::skill_tool::composed_tool_name(&skill.name, &skill.tools[0].name);

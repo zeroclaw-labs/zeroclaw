@@ -21,7 +21,6 @@ pub struct PromptContext<'a> {
     pub model_name: &'a str,
     pub tools: &'a [Box<dyn Tool>],
     pub skills: &'a [Skill],
-    pub skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     pub identity_config: Option<&'a IdentityConfig>,
     pub dispatcher_instructions: &'a str,
     /// True when the provider request carries native tool specs. In that mode
@@ -233,10 +232,9 @@ impl PromptSection for SkillsSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        Ok(crate::skills::skills_to_prompt_with_mode(
+        Ok(crate::skills::skills_to_prompt(
             ctx.skills,
             ctx.workspace_dir,
-            ctx.skills_prompt_mode,
         ))
     }
 }
@@ -366,7 +364,6 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &[],
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: Some(&identity_config),
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
@@ -399,7 +396,6 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &[],
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
             sends_native_tool_specs: false,
@@ -422,7 +418,6 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &[],
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: true,
@@ -445,7 +440,6 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &[],
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
@@ -466,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn skills_section_includes_instructions_and_tools() {
+    fn skills_section_renders_compact_metadata_and_tools() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
@@ -496,7 +490,6 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
@@ -508,7 +501,9 @@ mod tests {
         let output = SkillsSection.build(&ctx).unwrap();
         assert!(output.contains("<available_skills>"));
         assert!(output.contains("<name>deploy</name>"));
-        assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
+        // Skills render compact-only: instructions load on demand, never inline.
+        assert!(output.contains("read_skill(name)"));
+        assert!(!output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names
         assert!(output.contains("<callable_tools"));
         assert!(output.contains("<name>deploy__release_checklist</name>"));
@@ -545,7 +540,6 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
             identity_config: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
@@ -575,7 +569,6 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &[],
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
             sends_native_tool_specs: false,
@@ -597,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_builder_inlines_and_escapes_skills() {
+    fn prompt_builder_escapes_skills() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let skills = vec![crate::skills::Skill {
             name: "code<review>&".into(),
@@ -626,7 +619,6 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
@@ -645,9 +637,6 @@ mod tests {
         assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
         assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
         assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
-        assert!(prompt.contains(
-            "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
-        ));
     }
 
     #[test]
@@ -662,7 +651,6 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &[],
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
@@ -699,7 +687,6 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &[],
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
@@ -728,7 +715,6 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &[],
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
@@ -765,7 +751,6 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &[],
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,

@@ -2075,14 +2075,13 @@ fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -
 }
 
 fn refreshed_new_session_system_prompt(ctx: &ChannelRuntimeContext) -> String {
-    let refreshed_skills = zeroclaw_runtime::skills::skills_to_prompt_with_mode(
+    let refreshed_skills = zeroclaw_runtime::skills::skills_to_prompt(
         &zeroclaw_runtime::skills::load_skills_for_agent(
             ctx.workspace_dir.as_ref(),
             ctx.prompt_config.as_ref(),
             ctx.agent_alias.as_ref(),
         ),
         ctx.workspace_dir.as_ref(),
-        ctx.prompt_config.skills.prompt_injection_mode,
     );
     replace_available_skills_section(ctx.system_prompt.as_str(), &refreshed_skills)
 }
@@ -9744,15 +9743,10 @@ pub async fn start_channels(
             ),
         ];
 
-        if matches!(
-            config.skills.prompt_injection_mode,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-        ) {
-            tool_descs.push((
-                "read_skill",
-                "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
-            ));
-        }
+        tool_descs.push((
+            "read_skill",
+            "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
+        ));
         if config.browser.enabled {
             tool_descs.push((
                 "browser_open",
@@ -9828,7 +9822,6 @@ pub async fn start_channels(
             bootstrap_max_chars,
             Some(&risk_profile),
             native_tools,
-            config.skills.prompt_injection_mode,
             agent.resolved.compact_context,
             agent.resolved.max_system_prompt_chars,
             true,
@@ -17583,7 +17576,6 @@ BTC is currently around $65,000 based on latest tool output."#
             None,
             None,
             false,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             false,
             0,
             false,
@@ -17743,16 +17735,18 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("<name>code-review</name>"));
         assert!(prompt.contains("<description>Review code for bugs</description>"));
         assert!(prompt.contains("SKILL.md</location>"));
-        assert!(prompt.contains("<instructions>"));
+        // Skills render compact-only: instructions are loaded on demand, never
+        // inlined into the system prompt.
+        assert!(prompt.contains("loaded on demand"));
+        assert!(!prompt.contains("<instructions>"));
         assert!(
-            prompt.contains(
+            !prompt.contains(
                 "<instruction>Always run cargo test before final response.</instruction>"
             )
         );
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names
         assert!(prompt.contains("<callable_tools"));
         assert!(prompt.contains("<name>code-review__lint</name>"));
-        assert!(!prompt.contains("loaded on demand"));
     }
 
     #[test]
@@ -17788,7 +17782,6 @@ BTC is currently around $65,000 based on latest tool output."#
             None,
             None,
             false,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
             AutonomyLevel::default(),
         );
 
@@ -17842,9 +17835,6 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("<name>run&quot;linter&quot;</name>"));
         assert!(prompt.contains("<description>Run &lt;lint&gt; &amp; report</description>"));
         assert!(prompt.contains("<kind>shell&amp;exec</kind>"));
-        assert!(prompt.contains(
-            "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
-        ));
     }
 
     #[test]
@@ -17932,7 +17922,6 @@ BTC is currently around $65,000 based on latest tool output."#
             None,
             Some(&config),
             false,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             false,
             0,
             false,
@@ -17965,7 +17954,6 @@ BTC is currently around $65,000 based on latest tool output."#
             None,
             Some(&config),
             false,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             false,
             0,
             false,
@@ -18001,7 +17989,6 @@ BTC is currently around $65,000 based on latest tool output."#
             None,
             None,
             false,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             AutonomyLevel::Full,
         );
 
@@ -18035,7 +18022,6 @@ BTC is currently around $65,000 based on latest tool output."#
             None,
             None,
             false,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             AutonomyLevel::Supervised,
         );
 
@@ -19338,7 +19324,6 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(&default_identity),
             None,
             false,
-            config.skills.prompt_injection_mode,
             AutonomyLevel::default(),
         );
         assert!(
