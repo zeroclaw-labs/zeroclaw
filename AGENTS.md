@@ -82,6 +82,13 @@ Full pre-PR validation (recommended):
 
 Docs-only changes: run markdown lint and link-integrity checks. If touching bootstrap scripts: `bash -n install.sh`.
 
+## Subagents
+
+Subagents (via `spawn_subagent` or cron `JobType::Agent`) inherit the parent's identity and permissions but run in isolated sessions. **Before running any shell commands or filesystem operations, subagents must explicitly set their working directory to the repository root** (the directory containing the top-level `Cargo.toml` and `AGENTS.md`). Do not assume the shell starts at repo root; always `cd` to it first (or use the equivalent in the tool's context).
+
+This guarantees consistent command behavior across parent and child runs.
+
+
 ## Project Snapshot
 
 ZeroClaw is a Rust-first autonomous agent runtime optimized for performance, efficiency, stability, extensibility, sustainability, and security.
@@ -90,7 +97,7 @@ Core architecture is trait-driven and modular. Extend by implementing traits and
 
 Key extension points:
 
-- `crates/zeroclaw-api/src/provider.rs` (`Provider`)
+- `crates/zeroclaw-api/src/model_provider.rs` (`ModelProvider`)
 - `crates/zeroclaw-api/src/channel.rs` (`Channel`)
 - `crates/zeroclaw-api/src/tool.rs` (`Tool`)
 - `crates/zeroclaw-api/src/memory_traits.rs` (`Memory`)
@@ -115,10 +122,14 @@ Every workspace crate carries a stability tier per the Microkernel Architecture 
 | `zeroclaw-tools` | Experimental | Plugin migration at v1.0.0 |
 | `zeroclaw-runtime` | Experimental | Agent runtime (agent loop, security, cron, SOP, skills, observability) |
 | `zeroclaw-gateway` | Experimental | Separate binary at v0.9.0 |
-| `zeroclaw-tui` | Experimental | TUI onboarding wizard |
+| `zerocode` | Experimental | TUI onboarding wizard |
 | `zeroclaw-plugins` | Experimental | WASM plugin system — foundation for v1.0.0 plugin ecosystem |
 | `zeroclaw-hardware` | Experimental | USB discovery, peripherals, serial |
 | `zeroclaw-macros` | Beta | Tightly coupled to config schema |
+| `zeroclaw-eval` | Experimental | Agent evaluation harness — Phase 0 deterministic replay of LLM trace fixtures |
+| `zeroclaw-spawn` | Beta | Attribution-propagating `tokio::spawn` wrapper layered on `zeroclaw-log` |
+| `robot-kit` | Experimental | Robot control toolkit — drive, vision, speech, sensors, safety |
+| `aardvark-sys` | Experimental | Low-level FFI bindings for Total Phase Aardvark I2C/SPI/GPIO USB adapter; only crate where `unsafe` is permitted |
 
 **Tiers**: Stable = covered by breaking-change policy. Beta = breaking changes permitted in MINOR with changelog notes. Experimental = no stability guarantee.
 
@@ -128,7 +139,7 @@ Tiers are promoted, never demoted, through deliberate team decision.
 
 - `src/main.rs` — CLI entrypoint and command routing
 - `src/lib.rs` — module re-exports and CLI command enum definitions
-- `crates/zeroclaw-api/` — public trait definitions (Provider, Channel, Tool, Memory, Observer, Peripheral)
+- `crates/zeroclaw-api/` — public trait definitions (ModelProvider, Channel, Tool, Memory, Observer, Peripheral)
 - `crates/zeroclaw-config/` — schema, config loading/merging
 - `crates/zeroclaw-log/` — unified log surface (record! macro, LogEvent schema, JSONL persistence, broadcast hook, Observer bridge)
 - `crates/zeroclaw-macros/` — Configurable derive macro
@@ -137,13 +148,18 @@ Tiers are promoted, never demoted, through deliberate team decision.
 - `crates/zeroclaw-channels/src/orchestrator/` — channel lifecycle, routing, media pipeline
 - `crates/zeroclaw-tools/` — tool execution surface (shell, file, memory, browser)
 - `crates/zeroclaw-runtime/` — agent loop, security, cron, SOP, skills, onboarding wizard, observability
+- `crates/zeroclaw-eval/` — agent evaluation harness (Phase 0 deterministic replay)
 - `crates/zeroclaw-memory/` — memory backends (markdown, sqlite, embeddings, vector merge)
 - `crates/zeroclaw-infra/` — shared infrastructure (debounce, session, stall watchdog)
+- `crates/zeroclaw-spawn/` — attribution-propagating `tokio::spawn` wrapper layered on `zeroclaw-log`
 - `crates/zeroclaw-gateway/` — webhook/gateway server (separate binary)
 - `crates/zeroclaw-hardware/` — USB discovery, peripherals, serial, GPIO
-- `crates/zeroclaw-tui/` — TUI onboarding wizard
+- `crates/robot-kit/` — robot control toolkit (drive, vision, speech, sensors, safety)
+- `crates/aardvark-sys/` — Total Phase Aardvark I2C/SPI/GPIO FFI bindings
+- `apps/zerocode/` — TUI onboarding wizard
 - `crates/zeroclaw-plugins/` — WASM plugin system
 - `crates/zeroclaw-tool-call-parser/` — tool call parsing
+- `apps/tauri/` — Tauri-based desktop GUI
 - `docs/` — topic-based documentation (setup-guides, reference, ops, security, hardware, contributing, maintainers)
 - `.github/` — CI, templates, automation workflows
 
@@ -167,7 +183,7 @@ When uncertain, classify as higher risk.
 
 Branch/commit/PR rules:
 - Work from a non-`master` branch. Open a PR to `master`; do not push directly.
-- Use conventional commit titles. Prefer small PRs (`size: XS/S/M`).
+- Use conventional commit titles. Prefer small PRs (`size:XS`, `size:S`, or `size:M`).
 - Follow `.github/pull_request_template.md` fully.
 - Never commit secrets, personal data, or real identity information (see `@docs/book/src/contributing/privacy.md`).
 
@@ -190,6 +206,7 @@ AI coding assistant skills live in `.claude/skills/`. Use the right one for the 
 
 - `.claude/skills/github-pr-review-session/SKILL.md` — PR review co-pilot; assists **you** as the human reviewer. Resolves the active reviewer from session state or `gh`, uses the RFC feedback taxonomy (🔴/🟡/✅/🔵/🟢), and formats formal review findings as H3 headings that start with the taxonomy emoji. Trigger: `review 1234`, `re-review 1234`, `go through the queue`.
 - `.claude/skills/changelog-generation/SKILL.md` — generates `CHANGELOG-next.md` between stable tags, resolves contributors via GraphQL, feeds the release workflow. Trigger: `generate changelog`, `release notes for v0.7.x`.
+- `.claude/skills/pr-architecture-check/SKILL.md` — Advisory architecture review of a PR diff; validates dependency direction, trait boundaries, extension patterns, crate placement, and core constraints against AGENTS.md and FND-001. Posts a non-blocking comment. Trigger: `arch-check #N`, `architecture check #N`.
 - `.claude/skills/github-issue-triage/SKILL.md` — Issue triage and lifecycle management; manages the backlog, labels, and stale policies. Trigger: `triage issues`, `sweep issues`, `handle issue #N`.
 - `.claude/skills/github-issue/SKILL.md` — Interactively files structured GitHub issues (bug reports or feature requests) using repo templates. Trigger: `file issue`, `report bug`, `feature request`.
 - `.claude/skills/github-pr/SKILL.md` — Opens or updates GitHub PRs, handles validation evidence, and manages PR descriptions. Trigger: `open PR`, `update PR`, `submit for review`.
@@ -221,3 +238,4 @@ Dev-operational contracts — files consumed by AI coding skills and development
 - `@docs/book/src/developing/extension-examples.md` — adding providers, channels, tools, peripherals; tool shared-state contract; architecture boundary rules
 - `@docs/book/src/contributing/privacy.md` — privacy rules and neutral-placeholder palette
 - `@docs/book/src/maintainers/superseding.md` — superseded-PR attribution, PR/commit templates, handoff template
+- `@docs/maintainers/audit-policy.md` — `.cargo/audit.toml` / `deny.toml` ignore rationale and add/remove workflow (tracks #8519, #8059)

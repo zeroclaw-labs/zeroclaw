@@ -133,33 +133,59 @@ const KNOWN_CLIS: &[KnownCli] = &[
 /// Discover available CLI tools on the system.
 /// Scans PATH for known tools and returns metadata for each found.
 pub fn discover_cli_tools(additional: &[String], excluded: &[String]) -> Vec<DiscoveredCli> {
-    let mut results = Vec::new();
+    // Build the probe list first — cheap, no spawns — preserving the
+    // KNOWN_CLIS-then-`additional` ordering that callers and tests rely on.
+    let mut probes: Vec<(&str, &[&str], CliCategory)> = Vec::new();
 
     for known in KNOWN_CLIS {
         if excluded.iter().any(|e| e == known.name) {
             continue;
         }
-        if let Some(cli) = probe_cli(known.name, known.version_args, known.category.clone()) {
-            results.push(cli);
-        }
+        probes.push((known.name, known.version_args, known.category.clone()));
     }
 
-    // Probe additional user-specified tools
+    // Append additional user-specified tools, skipping duplicates.
     for tool_name in additional {
         if excluded.iter().any(|e| e == tool_name) {
             continue;
         }
-        // Skip if already discovered
-        if results.iter().any(|r| r.name == *tool_name) {
+        if probes.iter().any(|(n, _, _)| *n == tool_name.as_str()) {
             continue;
         }
-        if let Some(cli) = probe_cli(tool_name, &["--version"], CliCategory::Build) {
-            results.push(cli);
-        }
+        probes.push((tool_name.as_str(), &["--version"], CliCategory::Build));
     }
 
-    results
+    // Probe concurrently. Each tool needs up to two short-lived child
+    // processes (`where`/`which` + `--version`); running them serially made
+    // `/api/cli-tools` visibly slow (wall time ~= sum of every probe). Scoped
+    // threads bound the scan by the slowest single tool instead. Output order
+    // is preserved because handles are joined in spawn order.
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = probes
+            .into_iter()
+            .map(|(name, args, category)| scope.spawn(move || probe_cli(name, args, category)))
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().ok().flatten())
+            .collect()
+    })
 }
+
+/// Suppress the console window that Windows otherwise spawns for each
+/// short-lived child process. Without this, hitting `/api/cli-tools` from the
+/// web UI flashes a `cmd`/console window for every probe — distracting in GUI
+/// and service contexts. No-op on non-Windows platforms. Mirrors the runtime
+/// shell-command fix from issue #5562.
+#[cfg(target_os = "windows")]
+fn hide_console(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_console(_cmd: &mut std::process::Command) {}
 
 /// Probe a single CLI tool: check if it exists and get its version.
 fn probe_cli(name: &str, version_args: &[&str], category: CliCategory) -> Option<DiscoveredCli> {
@@ -184,12 +210,12 @@ fn find_executable(name: &str) -> Option<PathBuf> {
     #[cfg(not(target_os = "windows"))]
     let which_cmd = "which";
 
-    let output = std::process::Command::new(which_cmd)
-        .arg(name)
+    let mut cmd = std::process::Command::new(which_cmd);
+    cmd.arg(name)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(std::process::Stdio::null());
+    hide_console(&mut cmd);
+    let output = cmd.output().ok()?;
 
     if !output.status.success() {
         return None;
@@ -205,12 +231,12 @@ fn find_executable(name: &str) -> Option<PathBuf> {
 
 /// Get the version string of a CLI tool.
 fn get_version(name: &str, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(name)
-        .args(args)
+    let mut cmd = std::process::Command::new(name);
+    cmd.args(args)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .ok()?;
+        .stderr(std::process::Stdio::piped());
+    hide_console(&mut cmd);
+    let output = cmd.output().ok()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

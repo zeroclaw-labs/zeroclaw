@@ -398,16 +398,12 @@ impl GmailPushChannel {
     }
 
     /// Pure, testable predicate that applies the email-allowlist match
-    /// semantics against an already-resolved peer list.
+    /// semantics against an already-resolved peer list. Shares the in-tree
+    /// `crate::allowlist::is_user_allowed_by` matcher with `email_channel`;
+    /// domain-class matching is the per-entry comparison.
     fn is_email_sender_allowed(peers: &[String], email: &str) -> bool {
-        if peers.is_empty() {
-            return false;
-        }
-        if peers.iter().any(|a| a == "*") {
-            return true;
-        }
-        let email_lower = email.to_lowercase();
-        peers.iter().any(|allowed| {
+        crate::allowlist::is_user_allowed_by(peers, email, |allowed, email| {
+            let email_lower = email.to_lowercase();
             if allowed.starts_with('@') {
                 email_lower.ends_with(&allowed.to_lowercase())
             } else if allowed.contains('@') {
@@ -535,6 +531,8 @@ impl GmailPushChannel {
                         interruption_scope_id: None,
                         attachments: Vec::new(),
                         subject: None,
+
+                        ..Default::default()
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -577,6 +575,16 @@ impl ::zeroclaw_api::attribution::Attributable for GmailPushChannel {
 
 #[async_trait]
 impl Channel for GmailPushChannel {
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Gmail push delivery has no typing-indicator concept.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Gmail push delivery has no typing-indicator concept.
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "gmail_push"
     }

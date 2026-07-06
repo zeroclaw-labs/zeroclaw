@@ -809,13 +809,13 @@ memory_monitoring = true
 #[test]
 fn t14a_max_iterations_renamed_to_max_tool_iterations() {
     let cfg = v3_config();
-    let agent = cfg
-        .agents
-        .get("complex_agent")
-        .expect("agents.complex_agent present");
+    let runtime = cfg
+        .runtime_profiles
+        .get("agent_complex_agent")
+        .expect("synthesized runtime_profiles.agent_complex_agent");
     assert_eq!(
-        agent.max_tool_iterations, 25,
-        "V2 max_iterations=25 must land at V3 max_tool_iterations on the agent"
+        runtime.max_tool_iterations, 25,
+        "V2 max_iterations=25 must land on the synthesized runtime profile's max_tool_iterations"
     );
 }
 
@@ -1890,7 +1890,7 @@ allowed_rooms = ["!ops:matrix.org"]
 
 #[test]
 fn v2_channels_voice_duplex_block_alias_wraps() {
-    // Reproduces the user-reported migration error in v0.8.0:
+    // Reproduces a user-reported migration error:
     //   invalid type: boolean `false`, expected struct VoiceDuplexConfig
     //   in `channels.voice_duplex.enabled`
     // Cause: voice_duplex was missing from V3_CHANNEL_TYPES and went
@@ -2615,6 +2615,28 @@ X-Tenant = "tenant-42"
         server.get("name").and_then(toml::Value::as_str),
         Some("primary"),
     );
+}
+
+#[test]
+fn encryption_preserves_onepassword_secret_references() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = SecretStore::new(tmp.path(), true);
+
+    let raw_toml = r#"
+schema_version = 3
+
+[providers.models.openai.default]
+model = "gpt-5"
+api_key = "op://zeroclaw/provider/openai-api-key"
+"#;
+
+    let mut value: toml::Value = toml::from_str(raw_toml).expect("toml parses");
+    encrypt_secret_strings(&mut value, &store).expect("encrypt walker succeeds");
+
+    let api_key = lookup_dotted(&value, "providers.models.openai.default.api_key")
+        .and_then(toml::Value::as_str);
+
+    assert_eq!(api_key, Some("op://zeroclaw/provider/openai-api-key"));
 }
 
 #[test]

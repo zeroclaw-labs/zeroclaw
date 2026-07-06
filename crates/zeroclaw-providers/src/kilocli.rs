@@ -55,7 +55,7 @@ const TEMP_EPSILON: f64 = 1e-9;
 /// Each inference request spawns a fresh `kilo` process. This is the
 /// non-interactive approach: the process handles the prompt and exits.
 pub struct KiloCliModelProvider {
-    /// `[model_providers.<family>.<alias>]` config-key alias.
+    /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
     /// Path to the `kilo` binary.
     binary_path: PathBuf,
@@ -252,8 +252,9 @@ impl ModelProvider for KiloCliModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
-        Self::validate_temperature(temperature)?;
+        if let Some(t) = temperature {
+            Self::validate_temperature(t)?;
+        }
 
         let full_message = match system_prompt {
             Some(system) if !system.is_empty() => {

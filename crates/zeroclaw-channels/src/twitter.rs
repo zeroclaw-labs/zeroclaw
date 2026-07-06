@@ -350,6 +350,8 @@ impl Channel for TwitterChannel {
                                 interruption_scope_id: None,
                                 attachments: vec![],
                                 subject: None,
+
+                                ..Default::default()
                             };
 
                             if tx.send(channel_msg).await.is_err() {
@@ -418,9 +420,18 @@ impl Channel for TwitterChannel {
     async fn health_check(&self) -> bool {
         self.get_authenticated_user_id().await.is_ok()
     }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator endpoint in the Twitter/X v2 API.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
-/// Split text into tweet-sized chunks, breaking at word boundaries.
+/// Split tweet text into tweet-sized chunks, breaking at word boundaries.
 fn split_tweet_text(text: &str, max_len: usize) -> Vec<String> {
     if text.len() <= max_len {
         return vec![text.to_string()];
@@ -435,8 +446,9 @@ fn split_tweet_text(text: &str, max_len: usize) -> Vec<String> {
             break;
         }
 
-        // Find last space within limit
-        let split_at = remaining[..max_len].rfind(' ').unwrap_or(max_len);
+        // Find last space within limit.
+        let limit = crate::util::floor_char_boundary(remaining, max_len);
+        let split_at = remaining[..limit].rfind(' ').unwrap_or(limit);
 
         chunks.push(remaining[..split_at].to_string());
         remaining = remaining[split_at..].trim_start();
@@ -519,6 +531,19 @@ mod tests {
         let chunks = split_tweet_text(&text, 280);
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].len(), 280);
+    }
+
+    #[test]
+    fn test_split_tweet_text_safe_on_multibyte_boundary() {
+        let text = format!("{}{}tail", "a".repeat(279), "😀");
+        let chunks = split_tweet_text(&text, 280);
+
+        assert_eq!(chunks.concat(), text);
+        assert_eq!(chunks[0], "a".repeat(279));
+        assert_eq!(chunks[1], "😀tail");
+        for chunk in &chunks {
+            assert!(chunk.is_char_boundary(chunk.len()));
+        }
     }
 
     #[test]

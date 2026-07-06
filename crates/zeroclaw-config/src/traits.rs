@@ -1,3 +1,8 @@
+/// Sentinel rendered for unset / `None` / empty config values during display.
+/// Never a valid stored value: the write path rejects it so it cannot round-trip
+/// into persisted config.
+pub const UNSET_DISPLAY: &str = "<unset>";
+
 /// Describes a single secret field discovered via `#[derive(Configurable)]`.
 #[derive(Debug, Clone)]
 pub struct SecretFieldInfo {
@@ -9,8 +14,54 @@ pub struct SecretFieldInfo {
     pub is_set: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AliasSource {
+    ModelProviders,
+    TtsProviders,
+    TranscriptionProviders,
+    Channels,
+    RiskProfiles,
+    RuntimeProfiles,
+    Agents,
+    SkillBundles,
+    KnowledgeBundles,
+    McpBundles,
+}
+
+impl AliasSource {
+    #[must_use]
+    pub const fn section_path(self) -> &'static str {
+        match self {
+            Self::ModelProviders => "providers.models",
+            Self::TtsProviders => "providers.tts",
+            Self::TranscriptionProviders => "providers.transcription",
+            Self::Channels => "channels",
+            Self::RiskProfiles => "risk_profiles",
+            Self::RuntimeProfiles => "runtime_profiles",
+            Self::Agents => "agents",
+            Self::SkillBundles => "skill_bundles",
+            Self::KnowledgeBundles => "knowledge_bundles",
+            Self::McpBundles => "mcp_bundles",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_two_tier(self) -> bool {
+        matches!(
+            self,
+            Self::ModelProviders
+                | Self::TtsProviders
+                | Self::TranscriptionProviders
+                | Self::Channels
+        )
+    }
+}
+
 /// Runtime type classification for config property values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PropKind {
     String,
     Bool,
@@ -18,6 +69,8 @@ pub enum PropKind {
     Float,
     /// An enum or other serde-serializable type (parsed as TOML string).
     Enum,
+    /// A reference to a configured alias; `alias_source` names the namespace.
+    AliasRef,
     /// A `Vec<String>` field; set via comma-separated input.
     StringArray,
     /// A `Vec<T>` field where `T` is a serializable struct (e.g. `Vec<McpServerConfig>`,
@@ -40,6 +93,16 @@ pub enum PropKind {
 /// else as `PropKind::Enum`.
 pub trait HasPropKind {
     const PROP_KIND: PropKind;
+
+    const ALIAS_SOURCE: Option<AliasSource> = None;
+
+    /// Terminal field names whose values must be redacted when this type is
+    /// displayed as an object/object-array prop. Most prop kinds have no
+    /// nested secret surface; Configurable object-array element types can
+    /// override this by delegating to their generated `secret_field_terminals`.
+    fn display_secret_terminals() -> Vec<&'static str> {
+        Vec::new()
+    }
 }
 
 macro_rules! impl_prop_kind {
@@ -72,16 +135,31 @@ impl HasPropKind for Vec<String> {
 // serialize as plain strings; the schema-tooling layer treats them as
 // strings too.
 impl HasPropKind for crate::providers::ModelProviderRef {
-    const PROP_KIND: PropKind = PropKind::String;
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::ModelProviders);
+}
+impl HasPropKind for Vec<crate::providers::ModelProviderRef> {
+    const PROP_KIND: PropKind = PropKind::StringArray;
 }
 impl HasPropKind for crate::providers::TtsProviderRef {
-    const PROP_KIND: PropKind = PropKind::String;
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::TtsProviders);
 }
 impl HasPropKind for crate::providers::TranscriptionProviderRef {
-    const PROP_KIND: PropKind = PropKind::String;
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::TranscriptionProviders);
 }
 impl HasPropKind for crate::providers::ChannelRef {
-    const PROP_KIND: PropKind = PropKind::String;
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::Channels);
+}
+impl HasPropKind for crate::providers::RiskProfileRef {
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::RiskProfiles);
+}
+impl HasPropKind for crate::providers::RuntimeProfileRef {
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::RuntimeProfiles);
 }
 impl HasPropKind for Vec<crate::providers::ChannelRef> {
     const PROP_KIND: PropKind = PropKind::StringArray;
@@ -91,7 +169,8 @@ impl HasPropKind for Vec<crate::providers::ChannelRef> {
 // PeerUsername round-trip as plain strings; AccessMode and
 // MemoryBackendKind are enums.
 impl HasPropKind for crate::multi_agent::AgentAlias {
-    const PROP_KIND: PropKind = PropKind::String;
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::Agents);
 }
 impl HasPropKind for crate::multi_agent::PeerGroupName {
     const PROP_KIND: PropKind = PropKind::String;
@@ -103,6 +182,9 @@ impl HasPropKind for crate::multi_agent::AccessMode {
     const PROP_KIND: PropKind = PropKind::Enum;
 }
 impl HasPropKind for crate::multi_agent::MemoryBackendKind {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
+impl HasPropKind for crate::multi_agent::OutputModality {
     const PROP_KIND: PropKind = PropKind::Enum;
 }
 impl HasPropKind for Vec<crate::multi_agent::AgentAlias> {
@@ -118,6 +200,10 @@ impl HasPropKind
     const PROP_KIND: PropKind = PropKind::Object;
 }
 
+impl HasPropKind for crate::scattered_types::EmailOAuth2Config {
+    const PROP_KIND: PropKind = PropKind::Object;
+}
+
 // Vec<struct> fields are surfaced as PropKind::ObjectArray — each
 // element renders as a per-row sub-form on the dashboard rather than a
 // chip. The Configurable derive routes `<Vec<T> as HasPropKind>::PROP_KIND`
@@ -130,14 +216,35 @@ impl HasPropKind for Vec<crate::schema::ClassificationRule> {
 }
 impl HasPropKind for Vec<crate::schema::EmbeddingRouteConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
+
+    fn display_secret_terminals() -> Vec<&'static str> {
+        crate::schema::EmbeddingRouteConfig::secret_field_terminals()
+    }
 }
 impl HasPropKind for Vec<crate::schema::GoogleWorkspaceAllowedOperation> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
 }
 impl HasPropKind for Vec<crate::schema::McpServerConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
+
+    fn display_secret_terminals() -> Vec<&'static str> {
+        crate::schema::McpServerConfig::secret_field_terminals()
+    }
 }
 impl HasPropKind for Vec<crate::schema::ModelRouteConfig> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
+
+    fn display_secret_terminals() -> Vec<&'static str> {
+        crate::schema::ModelRouteConfig::secret_field_terminals()
+    }
+}
+impl HasPropKind for Vec<crate::schema::ExternalRegistry> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
+impl HasPropKind for crate::schema::DelegateExecutionMode {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
+impl HasPropKind for Vec<crate::schema::DelegateTargetConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
 }
 impl HasPropKind for Vec<crate::schema::NevisRoleMappingConfig> {
@@ -148,6 +255,110 @@ impl HasPropKind for Vec<crate::schema::PeripheralBoardConfig> {
 }
 impl HasPropKind for Vec<crate::schema::ToolFilterGroup> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
+
+/// Security classification for credential-shaped config surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialSurfaceClass {
+    EncryptedSecret,
+    PathOnlyReference,
+    PublicValue,
+    ExternalAuthStore,
+    LegacyEnvPath,
+    RequiresFollowUp,
+}
+
+/// Tab grouping for config fields and UI surfaces. Each variant maps to a
+/// tab in the TUI and gateway dashboard. Serializes to its PascalCase
+/// variant name on the wire.
+///
+/// Field-partition tabs (`Connection`, `Model`, …) are used as `#[tab(...)]`
+/// annotations on schema structs. Composite tabs (`Personality`, `Skills`,
+/// `PeerGroups`, `Costs`) are rendered by dedicated UI components but share
+/// the same enum so both frontends speak one vocabulary.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub enum ConfigTab {
+    #[default]
+    /// No tab grouping — field appears in a flat list.
+    None,
+
+    // ── Shared (providers + channels) ──
+    Connection,
+    Advanced,
+
+    // ── Providers ──
+    Model,
+
+    // ── Channels ──
+    Behavior,
+
+    // ── Agents: field partitions ──
+    General,
+    Channels,
+    Providers,
+    Bundles,
+    Cron,
+    Tuning,
+    Workspace,
+    Memory,
+
+    // ── Agents: composite (custom-component) tabs ──
+    PeerGroups,
+    Personality,
+
+    // ── MCP ──
+    Settings,
+    Servers,
+
+    // ── Cost ──
+    Limits,
+    Costs,
+
+    // ── Skill bundles ──
+    Skills,
+    Aliases,
+}
+
+impl ConfigTab {
+    /// Display label for the tab bar. Returns `""` for `None`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::Connection => "Connection",
+            Self::Advanced => "Advanced",
+            Self::Model => "Model",
+            Self::Behavior => "Behavior",
+            Self::General => "General",
+            Self::Channels => "Channels",
+            Self::Providers => "Providers",
+            Self::Bundles => "Bundles",
+            Self::Cron => "Cron",
+            Self::Tuning => "Tuning",
+            Self::Workspace => "Workspace",
+            Self::Memory => "Memory",
+            Self::PeerGroups => "Peer Groups",
+            Self::Personality => "Personality",
+            Self::Settings => "Settings",
+            Self::Servers => "Servers",
+            Self::Limits => "Limits",
+            Self::Costs => "Costs",
+            Self::Skills => "Skills",
+            Self::Aliases => "Aliases",
+        }
+    }
+
+    /// `true` when this is the `None` variant (no tab grouping).
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+impl std::fmt::Display for ConfigTab {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
 }
 
 /// Describes a single property field discovered via `#[derive(Configurable)]`.
@@ -178,6 +389,32 @@ pub struct PropFieldInfo {
     /// Subject to the same write-only / no-readback rules as `#[secret]`.
     /// Reserved for future schema additions; currently no fields are derived.
     pub derived_from_secret: bool,
+    /// Explicit security classification for credential-shaped surfaces.
+    pub credential_class: Option<CredentialSurfaceClass>,
+    /// Tab grouping for this field. `ConfigTab::None` when the field has
+    /// no tab annotation (flat display, no tab bar).
+    pub tab: ConfigTab,
+    /// Alias namespace for `PropKind::AliasRef` fields; `None` otherwise.
+    pub alias_source: Option<AliasSource>,
+}
+
+impl PropKind {
+    /// Stable lowercase-kebab wire name matching the serde serialization.
+    /// Useful when consumers need the tag as a `&'static str` without
+    /// going through serde round-trip.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Bool => "bool",
+            Self::Integer => "integer",
+            Self::Float => "float",
+            Self::Enum => "enum",
+            Self::AliasRef => "alias_ref",
+            Self::StringArray => "string_array",
+            Self::ObjectArray => "object_array",
+            Self::Object => "object",
+        }
+    }
 }
 
 impl PropFieldInfo {
@@ -192,6 +429,8 @@ impl std::fmt::Debug for PropFieldInfo {
             .field("name", &self.name)
             .field("kind", &self.kind)
             .field("is_secret", &self.is_secret)
+            .field("credential_class", &self.credential_class)
+            .field("tab", &self.tab)
             .finish_non_exhaustive()
     }
 }
@@ -301,6 +540,8 @@ impl SecretField for String {
         field: &str,
     ) -> anyhow::Result<()> {
         use anyhow::Context;
+        // `is_encrypted` also includes external secret references (`op://`):
+        // encryption must preserve them, while decryption resolves them for use.
         if !self.is_empty() && !crate::security::SecretStore::is_encrypted(self) {
             *self = store
                 .encrypt(self)
@@ -365,6 +606,89 @@ impl SecretField for Option<String> {
 
     fn is_set(&self) -> bool {
         self.as_ref().is_some_and(|v| !v.is_empty())
+    }
+}
+
+impl SecretField for std::path::PathBuf {
+    fn mask(&mut self) {
+        let mut s = self.to_string_lossy().into_owned();
+        if !s.is_empty() {
+            s.mask();
+            *self = std::path::PathBuf::from(s);
+        }
+    }
+
+    fn restore_from(&mut self, current: &Self) {
+        let mut s = self.to_string_lossy().into_owned();
+        let cur = current.to_string_lossy().into_owned();
+        s.restore_from(&cur);
+        *self = std::path::PathBuf::from(s);
+    }
+
+    fn encrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        let mut s = self.to_string_lossy().into_owned();
+        s.encrypt_in_place(store, field)?;
+        *self = std::path::PathBuf::from(s);
+        Ok(())
+    }
+
+    fn decrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        let mut s = self.to_string_lossy().into_owned();
+        s.decrypt_in_place(store, field)?;
+        *self = std::path::PathBuf::from(s);
+        Ok(())
+    }
+
+    fn is_set(&self) -> bool {
+        !self.as_os_str().is_empty()
+    }
+}
+
+impl SecretField for Option<std::path::PathBuf> {
+    fn mask(&mut self) {
+        if let Some(inner) = self {
+            inner.mask();
+        }
+    }
+
+    fn restore_from(&mut self, current: &Self) {
+        if let (Some(inner), Some(cur)) = (self.as_mut(), current.as_ref()) {
+            inner.restore_from(cur);
+        }
+    }
+
+    fn encrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Some(inner) => inner.encrypt_in_place(store, field),
+            None => Ok(()),
+        }
+    }
+
+    fn decrypt_in_place(
+        &mut self,
+        store: &crate::security::SecretStore,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        match self {
+            Some(inner) => inner.decrypt_in_place(store, field),
+            None => Ok(()),
+        }
+    }
+
+    fn is_set(&self) -> bool {
+        self.as_ref().is_some_and(|v| !v.as_os_str().is_empty())
     }
 }
 
@@ -495,12 +819,9 @@ impl SecretField for Option<std::collections::HashMap<String, String>> {
 /// `Vec<T>` (List) field whose value type implements `Configurable`. The
 /// dashboard / CLI use this to surface `+ Add` affordances without
 /// hardcoding the section list. Auto-discovered by the `Configurable` derive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "schema-export",
-    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
-)]
-#[cfg_attr(feature = "schema-export", serde(rename_all = "snake_case"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
 pub enum MapKeyKind {
     /// `HashMap<String, T>` — key is user-supplied; new value is default.
     Map,
@@ -509,11 +830,8 @@ pub enum MapKeyKind {
     List,
 }
 
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(
-    feature = "schema-export",
-    derive(serde::Serialize, schemars::JsonSchema)
-)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct MapKeySection {
     /// Dotted section path, e.g. `providers.models`, `mcp.servers`.
     pub path: &'static str,
@@ -524,6 +842,84 @@ pub struct MapKeySection {
     /// Doc comment on the field (flattened to one line). What the user sees
     /// when picking which kind of thing to add.
     pub description: &'static str,
+    /// For `Kind::List` Vec sections that declared `#[natural_key = "<f>"]`
+    /// (the per-element editor opt-in shipped with the `mcp.servers`
+    /// per-field editor), this is the snake_case field name on the inner
+    /// type that holds the alias used to address each element — e.g.
+    /// `"name"` for `[[mcp.servers]]`. The incremental TOML writer
+    /// (`apply_dirty_path` in `schema.rs`) reads this to walk a
+    /// `<section>.<alias>.<inner>` dirty path through an array of tables.
+    /// Without it, the writer flat-faceplants on `as_table()` at the
+    /// alias segment and silently drops the edit on the floor.
+    ///
+    /// `None` for HashMap sections (alias *is* the TOML key, no further
+    /// hint needed) and for plain `Vec<T>` sections without
+    /// `#[natural_key]` (legacy whole-array `ObjectArray` round-trip,
+    /// no per-element addressing).
+    pub natural_key: Option<&'static str>,
+}
+
+/// Serializable wire representation of a config field for API consumers
+/// (RPC dispatch, gateway, TUI). Single source of truth — replaces the
+/// gateway's local `ListEntry` and the RPC dispatch's ad-hoc JSON.
+///
+/// Built from [`PropFieldInfo`] via [`ConfigFieldEntry::from_prop_field`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConfigFieldEntry {
+    pub path: String,
+    pub category: String,
+    pub kind: PropKind,
+    pub type_hint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+    pub populated: bool,
+    pub is_secret: bool,
+    #[serde(default)]
+    pub is_env_overridden: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enum_variants: Vec<String>,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    /// Tab grouping. `ConfigTab::None` = no tab grouping (flat display).
+    #[serde(default, skip_serializing_if = "ConfigTab::is_none")]
+    pub tab: ConfigTab,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_source: Option<AliasSource>,
+}
+
+impl ConfigFieldEntry {
+    /// Convert a [`PropFieldInfo`] (server-side introspection) into its wire
+    /// representation. Secrets are masked (value omitted). The caller supplies
+    /// `is_env_overridden` from `Config::prop_is_env_overridden`.
+    pub fn from_prop_field(info: PropFieldInfo, is_env_overridden: bool) -> Self {
+        let populated = info.display_value != crate::traits::UNSET_DISPLAY;
+        let is_sensitive = info.is_secret || info.derived_from_secret;
+        let value = if is_sensitive {
+            None
+        } else {
+            Some(serde_json::Value::String(info.display_value))
+        };
+        let enum_variants = info.enum_variants.map(|f| f()).unwrap_or_default();
+        let section = crate::sections::Section::from_key(info.name.split('.').next().unwrap_or(""))
+            .map(|s| s.as_str().to_string());
+
+        Self {
+            path: info.name,
+            category: info.category.to_string(),
+            kind: info.kind,
+            type_hint: info.type_hint.to_string(),
+            value,
+            populated,
+            is_secret: is_sensitive,
+            is_env_overridden,
+            enum_variants,
+            description: info.description.to_string(),
+            section,
+            tab: info.tab,
+            alias_source: info.alias_source,
+        }
+    }
 }
 
 /// One row emitted by the `Configurable` derive's `nested_option_entries()`
@@ -565,9 +961,14 @@ pub struct IntegrationDescriptor {
     pub active: bool,
 }
 
-/// Metadata for one channel type, as returned by [`ChannelsConfig::channels`].
+/// Metadata for one channel type, as returned by [`crate::schema::ChannelsConfig::channels`].
 #[derive(Debug, Clone)]
 pub struct ChannelInfo {
+    /// Canonical kebab-case identifier used in config TOML
+    /// (`[channels.<kind>]`). Matches the field name on
+    /// `ChannelsConfig` so Quickstart and other surfaces can
+    /// reuse the schema's own labeling without a parallel map.
+    pub kind: &'static str,
     pub name: &'static str,
     pub desc: &'static str,
     pub configured: bool,
@@ -579,106 +980,6 @@ pub trait ChannelConfig {
     fn name() -> &'static str;
     /// short description
     fn desc() -> &'static str;
-}
-
-/// A menu item for `OnboardUi::select`, with an optional status badge
-/// (e.g. `[configured]` / `[not set]`) that backends render next to the label.
-#[derive(Debug, Clone)]
-pub struct SelectItem {
-    pub label: String,
-    pub badge: Option<String>,
-}
-
-impl SelectItem {
-    pub fn new(label: impl Into<String>) -> Self {
-        Self {
-            label: label.into(),
-            badge: None,
-        }
-    }
-
-    pub fn with_badge(label: impl Into<String>, badge: impl Into<String>) -> Self {
-        Self {
-            label: label.into(),
-            badge: Some(badge.into()),
-        }
-    }
-}
-
-/// Result of a single prompt — either the value the user chose, or a
-/// navigation signal. Backends return `Answer::Back` when the user presses
-/// the backend's back key (Esc on ratatui / dialoguer). Callers rewind.
-#[derive(Debug, Clone)]
-pub enum Answer<T> {
-    Value(T),
-    Back,
-}
-
-/// Prompt-surface the onboard orchestrator drives.
-///
-/// Async is deliberate: the orchestrator is already async (Config::load_or_init,
-/// Config::save), and a future gateway-backed onboarder (WebSocket → browser)
-/// needs to await network I/O per prompt. A sync trait would force that
-/// backend to bridge sync↔async via blocking threads and channels, which
-/// starves the tokio runtime under concurrent onboarding sessions. Blocking
-/// backends (dialoguer) wrap their calls in `tokio::task::spawn_blocking`.
-///
-/// Idempotency contract: prompts accept a `current` value and pre-populate it
-/// as the default. `secret(has_current=true)` returns `None` when the user
-/// declines to rotate; callers then skip the write. The orchestrator never
-/// calls `config.set_prop` unless the new value differs from `current`.
-#[async_trait::async_trait]
-pub trait OnboardUi: Send {
-    async fn confirm(&mut self, prompt: &str, default: bool) -> anyhow::Result<Answer<bool>>;
-
-    /// Single-line text/number/path input.
-    ///
-    /// - `current`: existing value to pre-fill into the editable buffer
-    ///   (edit mode — user lands on the prompt with the value typed in
-    ///   and can modify it before Enter).
-    /// - `placeholder`: a schema/runtime default to surface as ghost-text
-    ///   when the buffer is empty. Backends that support styled output
-    ///   render this dim; pressing Enter on an empty buffer commits the
-    ///   placeholder as the chosen value.
-    ///
-    /// At most one of `current` / `placeholder` should be `Some` at any
-    /// call site: if the user has set a value already, pre-fill it;
-    /// otherwise surface the default as ghost text. Passing both
-    /// devolves to pre-fill semantics (the placeholder is ignored).
-    async fn string(
-        &mut self,
-        prompt: &str,
-        current: Option<&str>,
-        placeholder: Option<&str>,
-    ) -> anyhow::Result<Answer<String>>;
-
-    /// `Answer::Value(Some(v))` = new secret entered. `Answer::Value(None)` =
-    /// user declined to update an existing secret (only when `has_current`).
-    /// `Answer::Back` = rewind.
-    async fn secret(
-        &mut self,
-        prompt: &str,
-        has_current: bool,
-    ) -> anyhow::Result<Answer<Option<String>>>;
-
-    async fn select(
-        &mut self,
-        prompt: &str,
-        items: &[SelectItem],
-        current: Option<usize>,
-    ) -> anyhow::Result<Answer<usize>>;
-
-    async fn editor(&mut self, hint: &str, initial: &str) -> anyhow::Result<Answer<String>>;
-
-    /// Announce a new section or subsection. `level == 1` = section
-    /// (Providers, Channels, …). `level == 2` = subsection within a section
-    /// (Hardware › Transport). Backends render these persistently so every
-    /// prompt remains anchored to its phase — rendered like Markdown
-    /// headings. `level == 1` resets any prior subsection.
-    fn heading(&mut self, level: u8, text: &str);
-    fn note(&mut self, msg: &str);
-    fn status(&mut self, msg: &str);
-    fn warn(&mut self, msg: &str);
 }
 
 #[cfg(test)]
@@ -706,6 +1007,16 @@ mod secret_field_tests {
         assert_eq!(s, enc1);
         s.decrypt_in_place(&store, "test.s").unwrap();
         assert_eq!(s, "sk-abc");
+    }
+
+    #[test]
+    fn string_op_reference_is_preserved_by_encrypt_in_place() {
+        let (_tmp, store) = store();
+        let mut s = String::from("op://vault/item/field");
+
+        s.encrypt_in_place(&store, "test.s").unwrap();
+
+        assert_eq!(s, "op://vault/item/field");
     }
 
     #[test]

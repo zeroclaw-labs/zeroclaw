@@ -10,6 +10,14 @@ config:
   MD060: false
   MD024:
     allow_different_nesting: true
+  # ADRs use YAML frontmatter `title` as metadata and still render a visible
+  # H1, so do not treat frontmatter titles as the document's sole H1.
+  MD025:
+    front_matter_title: ""
 
 ignores:
   - "target/**"
+  # mdBook's SUMMARY.md uses empty-link syntax `[Label]()` for collapsible,
+  # label-only section parents. That is valid mdBook navigation, not prose,
+  # so MD042 (no-empty-links) does not apply here.
+  - "docs/book/src/SUMMARY.md"

@@ -12,4 +12,6 @@ export const Logs = lazy(() => import('../pages/Logs'));
 export const Doctor = lazy(() => import('../pages/Doctor'));
 export const Pairing = lazy(() => import('../pages/Pairing'));
 export const Canvas = lazy(() => import('../pages/Canvas'));
-export const Onboard = lazy(() => import('../pages/onboard/Onboard'));
+export const AcpConsole = lazy(() => import('../pages/AcpConsole'));
+export const Quickstart = lazy(() => import('../pages/quickstart/Quickstart'));
+export const Skills = lazy(() => import('../pages/Skills'));

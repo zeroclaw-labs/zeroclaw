@@ -47,7 +47,7 @@ impl LucidMemory {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     #[allow(clippy::too_many_arguments)]
     fn with_options(
         alias: &str,
@@ -188,6 +188,9 @@ impl LucidMemory {
                 namespace: "default".into(),
                 importance: None,
                 superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
                 agent_alias: None,
                 agent_id: None,
             });
@@ -275,12 +278,33 @@ impl LucidMemory {
         let output = self.run_lucid_command(&args, self.recall_timeout).await?;
         Ok(Self::parse_lucid_context(&output))
     }
+
+    /// Dimensions of the underlying local SQLite embedder (0 = Noop). Lets
+    /// callers confirm a live embedder refresh reached the local backend (#8359).
+    pub fn embedder_dimensions(&self) -> usize {
+        self.local.embedder_dimensions()
+    }
 }
 
 #[async_trait]
 impl Memory for LucidMemory {
     fn name(&self) -> &str {
         "lucid"
+    }
+
+    fn refresh_embedder(
+        &self,
+        model_provider: &str,
+        api_key: Option<&str>,
+        model: &str,
+        dimensions: usize,
+    ) {
+        // Lucid delegates all local storage/embedding to the wrapped SQLite
+        // backend, so forward the refresh there (#8359). Without this, a
+        // Lucid-backed handle (including the install-wide RPC handle when
+        // `backend = lucid`) would keep a stale embedder.
+        self.local
+            .refresh_embedder(model_provider, api_key, model, dimensions);
     }
 
     async fn store(
@@ -432,6 +456,25 @@ impl Memory for LucidMemory {
             .await
     }
 
+    async fn purge_agent(&self, agent_alias: &str) -> anyhow::Result<usize> {
+        self.local.purge_agent(agent_alias).await
+    }
+
+    async fn export_agent(&self, agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.local.export_agent(agent_alias).await
+    }
+
+    async fn rename_agent(&self, from: &str, to: &str) -> anyhow::Result<usize> {
+        // The remote Lucid daemon has no agent_id concept; alias→UUID lives in
+        // the local SQLite mirror, so rename is a local update (mirrors purge).
+        self.local.rename_agent(from, to).await
+    }
+
+    async fn count_agent(&self, agent_alias: &str) -> anyhow::Result<usize> {
+        // Attribution lives only on the local SQLite mirror (see rename_agent).
+        self.local.count_agent(agent_alias).await
+    }
+
     async fn count(&self) -> anyhow::Result<usize> {
         self.local.count().await
     }
@@ -501,17 +544,42 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
+    /// Lucid must forward `refresh_embedder` to its wrapped local SQLite so a
+    /// Lucid-backed handle (including the install-wide RPC handle when
+    /// `backend = lucid`) picks up a provider-profile change (#8359).
+    #[test]
+    fn refresh_embedder_forwards_to_local_sqlite() {
+        let tmp = TempDir::new().unwrap();
+        let local = SqliteMemory::new("test", tmp.path()).unwrap();
+        let lucid = LucidMemory::new("lucid", tmp.path(), local);
+        assert_eq!(lucid.embedder_dimensions(), 0);
+
+        Memory::refresh_embedder(
+            &lucid,
+            "openai",
+            Some("sk-test"),
+            "text-embedding-3-small",
+            1536,
+        );
+
+        assert_eq!(
+            lucid.embedder_dimensions(),
+            1536,
+            "LucidMemory must forward refresh_embedder to the local SQLite backend"
+        );
+    }
+
     fn write_fake_lucid_script(dir: &Path) -> String {
         let script_path = dir.join("fake-lucid.sh");
-        let script = r#"#!/usr/bin/env bash
-set -euo pipefail
+        let script = r#"#!/bin/sh
+set -eu
 
-if [[ "${1:-}" == "store" ]]; then
+if [ "${1:-}" = "store" ]; then
   echo '{"success":true,"id":"mem_1"}'
   exit 0
 fi
 
-if [[ "${1:-}" == "context" ]]; then
+if [ "${1:-}" = "context" ]; then
   cat <<'EOF'
 <lucid-context>
 Auth context snapshot
@@ -535,15 +603,15 @@ exit 1
 
     fn write_delayed_lucid_script(dir: &Path) -> String {
         let script_path = dir.join("delayed-lucid.sh");
-        let script = r#"#!/usr/bin/env bash
-set -euo pipefail
+        let script = r#"#!/bin/sh
+set -eu
 
-if [[ "${1:-}" == "store" ]]; then
+if [ "${1:-}" = "store" ]; then
   echo '{"success":true,"id":"mem_1"}'
   exit 0
 fi
 
-if [[ "${1:-}" == "context" ]]; then
+if [ "${1:-}" = "context" ]; then
   # Simulate a cold start that is slower than 120ms but below the 500ms timeout.
   sleep 0.2
   cat <<'EOF'
@@ -569,15 +637,15 @@ exit 1
         let script_path = dir.join("probe-lucid.sh");
         let marker = marker_path.display().to_string();
         let script = format!(
-            r#"#!/usr/bin/env bash
-set -euo pipefail
+            r#"#!/bin/sh
+set -eu
 
-if [[ "${{1:-}}" == "store" ]]; then
+if [ "${{1:-}}" = "store" ]; then
   echo '{{"success":true,"id":"mem_store"}}'
   exit 0
 fi
 
-if [[ "${{1:-}}" == "context" ]]; then
+if [ "${{1:-}}" = "context" ]; then
   printf 'context\n' >> "{marker}"
   cat <<'EOF'
 <lucid-context>
@@ -739,15 +807,15 @@ exit 1
         let script_path = dir.join("failing-lucid.sh");
         let marker = marker_path.display().to_string();
         let script = format!(
-            r#"#!/usr/bin/env bash
-set -euo pipefail
+            r#"#!/bin/sh
+set -eu
 
-if [[ "${{1:-}}" == "store" ]]; then
+if [ "${{1:-}}" = "store" ]; then
   echo '{{"success":true,"id":"mem_store"}}'
   exit 0
 fi
 
-if [[ "${{1:-}}" == "context" ]]; then
+if [ "${{1:-}}" = "context" ]; then
   printf 'context\n' >> "{marker}"
   echo "simulated lucid failure" >&2
   exit 1

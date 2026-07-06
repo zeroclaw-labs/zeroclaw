@@ -29,24 +29,9 @@ pub struct AskUserTool {
 }
 
 impl AskUserTool {
-    /// Create a new ask_user tool with an empty channel map.
-    /// Call `channel_map_handle` and write to the returned handle once channels
-    /// are available.
-    pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self {
-            security,
-            channels: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
-    /// Return the shared handle so callers can populate it after channel init.
-    pub fn channel_map_handle(&self) -> ChannelMapHandle {
-        Arc::clone(&self.channels)
-    }
-
-    /// Convenience: populate the channel map from a pre-built map.
-    pub fn populate(&self, map: HashMap<String, Arc<dyn Channel>>) {
-        *self.channels.write() = map;
+    /// Create a new ask_user tool using the given channel map.
+    pub fn new(security: Arc<SecurityPolicy>, channels: ChannelMapHandle) -> Self {
+        Self { security, channels }
     }
 }
 
@@ -231,17 +216,19 @@ impl Tool for AskUserTool {
                 }
             }
         } else if !channel.supports_free_form_ask() {
-            // Free-form ask_user has no first-class ACP method yet. The ACP
-            // elicitation RFD is the future fix — until it lands, agents
+            // Free-form ask_user has no first-class ACP method yet. Phase 1
+            // of the elicitation rollout shipped multiple-choice; free-form
+            // text is Phase 2 of that spec. Until Phase 2 lands, agents
             // talking to ACP clients must supply `choices` so we can route
-            // through `session/request_permission`.
-            // RFD: https://github.com/zed-industries/agent-client-protocol/blob/main/docs/rfds/elicitation.mdx
+            // through `request_choice` → `elicitation/create` (or the
+            // legacy `session/request_permission` fallback for older clients).
+            // ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
                     "Channel '{channel_name}' requires `choices` for ask_user \
-                     (free-form questions await ACP elicitation RFD)"
+                     (free-form questions await ACP elicitation Phase 2)"
                 )),
             });
         }
@@ -264,7 +251,7 @@ impl Tool for AskUserTool {
 
         // Spawn a listener task on the channel
         let listen_channel = Arc::clone(&channel);
-        let listen_handle = tokio::spawn(async move { listen_channel.listen(tx).await });
+        let listen_handle = zeroclaw_spawn::spawn!(async move { listen_channel.listen(tx).await });
 
         let response = tokio::time::timeout(timeout, rx.recv()).await;
 
@@ -399,6 +386,8 @@ mod tests {
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             };
             let _ = tx.send(msg).await;
             Ok(())
@@ -406,20 +395,24 @@ mod tests {
     }
 
     fn make_tool_with_channels(channels: Vec<(&str, Arc<dyn Channel>)>) -> AskUserTool {
-        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()));
-        let map: HashMap<String, Arc<dyn Channel>> = channels
-            .into_iter()
-            .map(|(name, ch)| (name.to_string(), ch))
-            .collect();
-        tool.populate(map);
-        tool
+        let handle = Arc::new(RwLock::new(HashMap::new()));
+        {
+            let mut map = handle.write();
+            for (name, ch) in channels {
+                map.insert(name.to_string(), ch);
+            }
+        }
+        AskUserTool::new(Arc::new(SecurityPolicy::default()), handle)
     }
 
     // ── Metadata tests ──
 
     #[test]
     fn tool_name_and_description() {
-        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = AskUserTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         assert_eq!(tool.name(), "ask_user");
         assert!(!tool.description().is_empty());
         assert!(tool.description().contains("question"));
@@ -427,7 +420,10 @@ mod tests {
 
     #[test]
     fn parameter_schema_validation() {
-        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = AskUserTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["question"].is_object());
@@ -444,7 +440,10 @@ mod tests {
 
     #[test]
     fn spec_matches_metadata() {
-        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = AskUserTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         let spec = tool.spec();
         assert_eq!(spec.name, "ask_user");
         assert_eq!(spec.description, tool.description());
@@ -495,7 +494,10 @@ mod tests {
 
     #[tokio::test]
     async fn empty_channels_returns_not_initialized() {
-        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = AskUserTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         let result = tool.execute(json!({ "question": "Hello?" })).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap().contains("not initialized"));
@@ -570,14 +572,14 @@ mod tests {
 
     #[tokio::test]
     async fn channel_map_handle_allows_late_binding() {
-        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()));
-        let handle = tool.channel_map_handle();
+        let handle = Arc::new(RwLock::new(HashMap::new()));
+        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()), handle.clone());
 
         // Initially empty — tool reports not initialized
         let result = tool.execute(json!({ "question": "Hello?" })).await.unwrap();
         assert!(!result.success);
 
-        // Populate via the handle
+        // Populate via the shared handle
         {
             let mut map = handle.write();
             map.insert(

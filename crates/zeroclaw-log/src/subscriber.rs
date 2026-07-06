@@ -5,6 +5,7 @@
 
 use tracing::Subscriber;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
 use tracing_subscriber::fmt;
 use tracing_subscriber::fmt::FormatFields;
 use tracing_subscriber::fmt::format::Writer;
@@ -14,26 +15,63 @@ use tracing_subscriber::registry::LookupSpan;
 use crate::event::ZeroclawAttribution;
 use crate::layer::LogCaptureLayer;
 
-/// Install the global tracing subscriber: stderr fmt with the
-/// agent-alias-prefixed formatter on top + the `LogCaptureLayer` that
-/// routes structured events to the JSONL writer, broadcast hook, and
-/// Observer bridge.
+/// Install the global tracing subscriber. Two independent axes:
 ///
-/// `default_filter` is the `RUST_LOG`-compatible filter string used
-/// when the environment variable is unset (e.g. `"info"` or
-/// `"info,matrix_sdk=warn"`).
+/// * **Recording floor** — what reaches the `LogCaptureLayer` (and thus
+///   the JSONL writer, broadcast hook, and Observer bridge). Resolved
+///   as: `recording_override` (the `--log-level` flag) if `Some`,
+///   else `RUST_LOG` from the environment, else `default_filter`.
+///
+/// * **Terminal display** — the stderr fmt layer. Gated entirely by
+///   `verbose`: when `false` the fmt layer is muted (no log lines ever
+///   reach the terminal; direct `println!`/stdout is untouched). When
+///   `true` it surfaces events down to the same recording floor.
+///
+/// All filter strings are `RUST_LOG`-compatible directives (e.g.
+/// `"info"` or `"debug,matrix_sdk=warn"`).
+///
+/// Both axes are fixed for the process lifetime — the global subscriber
+/// is installed once and cannot be reconfigured without a restart.
 ///
 /// Panics on subscriber install failure — the daemon cannot operate
 /// without logging.
-pub fn install_global_subscriber(default_filter: &str) {
-    let subscriber = fmt::Subscriber::builder()
+pub fn install_global_subscriber(
+    recording_override: Option<&str>,
+    default_filter: &str,
+    verbose: bool,
+) {
+    // Recording floor: explicit flag wins, then RUST_LOG, then default.
+    let recording_filter = match recording_override {
+        Some(flag) => EnvFilter::new(flag),
+        None => {
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter))
+        }
+    };
+
+    // The fmt (terminal) layer carries its own filter so display can be
+    // muted without touching what the capture layer records. When
+    // verbose is off, an OFF filter discards every event before it
+    // formats — stdout (println!) is unaffected because it never routes
+    // through tracing.
+    let fmt_filter = if verbose {
+        match recording_override {
+            Some(flag) => EnvFilter::new(flag),
+            None => {
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter))
+            }
+        }
+    } else {
+        EnvFilter::new("off")
+    };
+
+    let fmt_layer = fmt::layer()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
-        )
         .event_format(AgentAliasFormatter::new())
-        .finish()
-        .with(LogCaptureLayer);
+        .with_filter(fmt_filter);
+
+    let subscriber = tracing_subscriber::registry()
+        .with(LogCaptureLayer.with_filter(recording_filter))
+        .with(fmt_layer);
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 }

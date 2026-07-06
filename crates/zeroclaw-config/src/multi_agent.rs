@@ -83,7 +83,7 @@ pub enum MemoryBackendKind {
 /// for cross-reference and same-backend invariants at config load.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "agent-workspace"]
+#[prefix = "agent_workspace"]
 #[serde(default)]
 pub struct AgentWorkspaceConfig {
     /// Optional explicit workspace path. `None` = derive from
@@ -114,7 +114,7 @@ pub struct AgentWorkspaceConfig {
 /// allowlist entries must point at same-backend siblings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "agent-memory"]
+#[prefix = "agent_memory"]
 #[serde(default)]
 pub struct AgentMemoryConfig {
     /// The backend kind this agent uses. Defaults to `Sqlite` for new
@@ -122,22 +122,121 @@ pub struct AgentMemoryConfig {
     pub backend: MemoryBackendKind,
 }
 
+/// Preferred output modality for a peer group.
+///
+/// Controls how the agent delivers replies to peers in this group when no
+/// stronger per-turn signal is present. `Mirror` (default) preserves the
+/// existing input-driven behaviour: voice in → voice out, text in → text out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OutputModality {
+    /// Always reply in kind — voice note if user sent voice, text otherwise.
+    #[default]
+    Mirror,
+    /// Always deliver via TTS as a voice note, regardless of input modality.
+    /// Applies to proactive messages (cron, announces) as well as replies.
+    Voice,
+    /// Always deliver as text, even if user sent a voice note.
+    Text,
+}
+
 /// `[peer_groups.<name>]` — mutual-opt-in peer group on a channel type.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "peer-group"]
+#[prefix = "peer_group"]
 #[serde(default)]
 pub struct PeerGroupConfig {
     /// Either a channel type (`"telegram"`) or a dotted channel alias
     /// (`"telegram.work"`). A bare type applies to every alias of that
     /// type; a dotted form scopes the group to that single instance.
-    pub channel: String,
+    pub channel: crate::providers::ChannelRef,
     /// Member agents by alias.
     pub agents: Vec<AgentAlias>,
     /// Non-agent members by channel-native username.
     pub external_peers: Vec<PeerUsername>,
     /// Per-group blocklist; subtracts from the resolved peer set.
     pub ignore: Vec<PeerUsername>,
+    /// Preferred output modality for all peers in this group.
+    /// Defaults to `mirror` (input-driven). Set to `voice` to have the
+    /// agent always reply and deliver proactive messages (cron, announces)
+    /// as TTS voice notes on channels that support audio output.
+    pub output_modality: OutputModality,
+}
+
+/// `[a2a.server]` — inbound A2A discovery server.
+///
+/// Wrapped under `[a2a.server]` (two-level) via [`A2aServerSection`] so the
+/// `a2a` table can grow sibling sub-tables later (e.g. client config) without
+/// a breaking move.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "a2a_server"]
+#[serde(default)]
+pub struct A2aServerConfig {
+    /// Master switch for the inbound A2A surface. Default `false`: no
+    /// well-known route, no per-alias cards, no inbound endpoints.
+    pub enabled: bool,
+    /// Optional advertise-only host override for card endpoint URLs. The
+    /// routes always serve on the gateway's own listener; this only changes
+    /// the host printed in advertised endpoints when A2A is fronted at a
+    /// different address. `None` derives from the gateway host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind: Option<String>,
+    /// Optional advertise-only port override, paired with `bind`. `None`
+    /// derives from the gateway port. Advertise-only: nothing binds here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Externally reachable base URL advertised in card endpoint fields
+    /// (e.g. `https://agents.example.com`). Highest precedence. When empty,
+    /// endpoints fall back to the `bind`/`port` override, then to the
+    /// gateway's own host and port. Set this behind a reverse proxy so
+    /// advertised URLs match the public origin.
+    pub public_base_url: String,
+}
+
+/// `[a2a]` section wrapper. Kept as a
+/// dedicated wrapper so the `a2a` table can host sibling sub-tables (outbound
+/// client config, signing) in later slices without moving `server`.
+///
+/// Server-level exposure gate for A2A agent discovery. Default-closed: the
+/// server serves nothing until `[a2a.server] enabled = true`, and even then
+/// only aliases that opt in via `[agents.<alias>.a2a] published = true`
+/// appear. The discovery routes serve on the gateway's own listener; public
+/// exposure follows the gateway's bind posture. See
+/// `crates/zeroclaw-gateway/src/a2a.rs`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "a2a"]
+#[serde(default)]
+pub struct A2aServerSection {
+    /// Inbound A2A discovery server (`[a2a.server]`).
+    #[nested]
+    pub server: A2aServerConfig,
+}
+
+/// Per-alias A2A publication block (`[agents.<alias>.a2a]`).
+///
+/// Default-closed second gate: even with the server enabled, an alias is
+/// absent from discovery until `published = true`. `exposed_skills` is a
+/// filter over the alias's resolved skill set (from `skill_bundles` /
+/// `mcp_bundles`), never a parallel registry: empty means expose no skills
+/// on the card; a non-empty list selects which resolved skill ids appear.
+/// The bundles remain the single source of truth for what the agent can do.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agent_a2a"]
+#[serde(default)]
+pub struct AgentA2aConfig {
+    /// Publish this alias as a discoverable A2A agent. Default `false`:
+    /// the alias is excluded from the discovery catalog and serves no
+    /// per-alias card even when the server is enabled.
+    pub published: bool,
+    /// Filter selecting which resolved skill ids appear on this alias's
+    /// card. Empty = no skills advertised. Entries that do not resolve to
+    /// a real skill in the alias's bundles are dropped (the bundles are
+    /// canonical; this only selects from them).
+    pub exposed_skills: Vec<String>,
 }
 
 #[cfg(test)]
@@ -290,5 +389,83 @@ ignore = ["@known_spammer"]
         assert!(cfg.agents.is_empty());
         assert!(cfg.external_peers.is_empty());
         assert!(cfg.ignore.is_empty());
+        // Default modality preserves the existing input-driven behavior.
+        assert_eq!(cfg.output_modality, OutputModality::Mirror);
+    }
+
+    #[test]
+    fn output_modality_serializes_snake_case() {
+        let cases = [
+            (OutputModality::Mirror, "\"mirror\""),
+            (OutputModality::Voice, "\"voice\""),
+            (OutputModality::Text, "\"text\""),
+        ];
+        for (modality, expected) in cases {
+            let json = serde_json::to_string(&modality).unwrap();
+            assert_eq!(json, expected, "modality={modality:?}");
+            let back: OutputModality = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, modality);
+        }
+    }
+
+    #[test]
+    fn peer_group_output_modality_parses_voice_and_defaults_to_mirror() {
+        let with_voice: PeerGroupConfig = toml::from_str(
+            r#"
+channel = "telegram"
+external_peers = ["@alice"]
+output_modality = "voice"
+"#,
+        )
+        .unwrap();
+        assert_eq!(with_voice.output_modality, OutputModality::Voice);
+        assert_eq!(with_voice.external_peers[0].as_str(), "@alice");
+
+        let defaulted: PeerGroupConfig = toml::from_str(r#"channel = "telegram""#).unwrap();
+        assert_eq!(defaulted.output_modality, OutputModality::Mirror);
+    }
+
+    #[test]
+    fn a2a_server_config_default_is_closed_with_no_overrides() {
+        let cfg = A2aServerConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.bind.is_none());
+        assert!(cfg.port.is_none());
+        assert!(cfg.public_base_url.is_empty());
+    }
+
+    #[test]
+    fn a2a_server_config_round_trips() {
+        let toml_input = r#"
+enabled = true
+bind = "0.0.0.0"
+port = 9000
+public_base_url = "https://agents.example.com"
+"#;
+        let parsed: A2aServerConfig = toml::from_str(toml_input).unwrap();
+        assert!(parsed.enabled);
+        assert_eq!(parsed.bind.as_deref(), Some("0.0.0.0"));
+        assert_eq!(parsed.port, Some(9000));
+        assert_eq!(parsed.public_base_url, "https://agents.example.com");
+    }
+
+    #[test]
+    fn agent_a2a_config_default_is_unpublished_with_no_skills() {
+        let cfg = AgentA2aConfig::default();
+        assert!(!cfg.published);
+        assert!(cfg.exposed_skills.is_empty());
+    }
+
+    #[test]
+    fn agent_a2a_config_round_trips_with_exposed_skills_filter() {
+        let toml_input = r#"
+published = true
+exposed_skills = ["research", "summarize"]
+"#;
+        let parsed: AgentA2aConfig = toml::from_str(toml_input).unwrap();
+        assert!(parsed.published);
+        assert_eq!(parsed.exposed_skills.len(), 2);
+        assert_eq!(parsed.exposed_skills[0], "research");
+        assert_eq!(parsed.exposed_skills[1], "summarize");
     }
 }

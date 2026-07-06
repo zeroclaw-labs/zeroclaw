@@ -83,7 +83,8 @@ struct CachedApiKey {
 struct ApiChatRequest<'a> {
     model: String,
     messages: Vec<ApiMessage>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -188,7 +189,7 @@ struct ResponseMessage {
 /// Tokens are cached to `~/.config/zeroclaw/copilot/` and refreshed
 /// automatically.
 pub struct CopilotModelProvider {
-    /// `[model_providers.<family>.<alias>]` config-key alias.
+    /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
     github_token: Option<String>,
     /// Mutex ensures only one caller refreshes tokens at a time,
@@ -332,10 +333,8 @@ impl CopilotModelProvider {
                         })
                         .collect::<Vec<_>>();
 
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|s| ApiContent::Text(s.to_string()));
+                    let content = crate::request_payload::non_empty_string_field(&value, "content")
+                        .map(ApiContent::Text);
 
                     return ApiMessage {
                         role: "assistant".to_string(),
@@ -381,7 +380,7 @@ impl CopilotModelProvider {
         messages: Vec<ApiMessage>,
         tools: Option<&[ToolSpec]>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
         let (token, endpoint) = self.get_api_key().await?;
         let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
@@ -391,7 +390,11 @@ impl CopilotModelProvider {
             model: model.to_string(),
             messages,
             temperature,
-            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
+            // Omit tool_choice when the tool list is empty — spec-compliant
+            // validators reject tool_choice without a non-empty tools field.
+            tool_choice: native_tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools: native_tools,
         };
 
@@ -690,8 +693,6 @@ impl ModelProvider for CopilotModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
-
         let mut messages = Vec::new();
         if let Some(system) = system_prompt {
             messages.push(ApiMessage {
@@ -720,7 +721,6 @@ impl ModelProvider for CopilotModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let response = self
             .send_chat_request(Self::convert_messages(messages), None, model, temperature)
             .await?;
@@ -733,7 +733,6 @@ impl ModelProvider for CopilotModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         self.send_chat_request(
             Self::convert_messages(request.messages),
             request.tools,

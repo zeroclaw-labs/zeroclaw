@@ -6,6 +6,7 @@ pub fn run(
     locale: Option<&str>,
     force: bool,
     model_provider: Option<&str>,
+    config_dir: Option<&str>,
     batch: Option<usize>,
 ) -> anyhow::Result<()> {
     let root = repo_root();
@@ -18,6 +19,8 @@ pub fn run(
     require_tool("msgfmt", "apt install gettext / brew install gettext")?;
     require_tool("msgattrib", "apt install gettext / brew install gettext")?;
     require_tool("msgcat", "apt install gettext / brew install gettext")?;
+
+    ensure_po_submodule(&root)?;
 
     let book = book_dir(&root);
     let po_dir = po_dir(&root);
@@ -92,7 +95,7 @@ pub fn run(
         if force {
             if let Some(p) = model_provider {
                 println!("==> {locale}: --force: re-translating all entries");
-                fill(&root, &po_file, locale, true, p, batch)?;
+                fill(&root, &po_file, locale, true, p, config_dir, batch)?;
             } else {
                 println!(
                     "==> {locale}: --force requested but no --model-provider specified — skipping AI step"
@@ -103,7 +106,7 @@ pub fn run(
             if delta > 0 {
                 if let Some(p) = model_provider {
                     println!("==> {locale}: AI-filling {delta} entries");
-                    fill(&root, &po_file, locale, false, p, batch)?;
+                    fill(&root, &po_file, locale, false, p, config_dir, batch)?;
                 } else {
                     println!(
                         "==> {locale}: {delta} entries need translation (use --model-provider <name> to auto-fill)"
@@ -141,6 +144,7 @@ fn fill(
     locale: &str,
     force: bool,
     model_provider: &str,
+    config_dir: Option<&str>,
     batch: Option<usize>,
 ) -> anyhow::Result<()> {
     // Build and invoke the binary directly — `cargo run` wraps the child in a way that
@@ -156,6 +160,9 @@ fn fill(
         .arg(po_file)
         .args(["--locale", locale])
         .args(["--model-provider", model_provider]);
+    if let Some(dir) = config_dir {
+        cmd.args(["--config-dir", dir]);
+    }
     if let Some(b) = batch {
         cmd.args(["--batch", &b.to_string()]);
     }
@@ -169,6 +176,7 @@ fn normalize_gettext_catalog(path: &Path) -> anyhow::Result<()> {
     run_cmd(
         Command::new("msgcat")
             .args([
+                "--use-first",
                 "--sort-output",
                 "--no-wrap",
                 "--add-location=file",

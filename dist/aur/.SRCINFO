@@ -14,7 +14,9 @@ pkgbase = zeroclawlabs
 	depends = gcc-libs
 	depends = openssl
 	provides = zeroclaw
+	provides = zerocode
 	conflicts = zeroclaw
+	conflicts = zerocode
 	source = zeroclawlabs-0.6.9.tar.gz::https://github.com/zeroclaw-labs/zeroclaw/archive/refs/tags/v0.6.9.tar.gz
 	sha256sums = SKIP
 

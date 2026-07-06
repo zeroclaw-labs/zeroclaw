@@ -65,7 +65,7 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
 
     let Some(entry) = entries.iter().find(|e| e.name.to_lowercase() == name_lower) else {
         anyhow::bail!(
-            "Unknown integration: {name}. Check README for supported integrations or run `zeroclaw onboard` to configure channels/model_providers."
+            "Unknown integration: {name}. Check README for supported integrations or run `zeroclaw quickstart` to configure a model provider, then `zeroclaw config set channels.<name>.<field>=<value>` for channels."
         );
     };
 
@@ -88,13 +88,13 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
     // Setup hints. Channel-specific steps that are not yet covered by a
     // standalone book walkthrough stay here so `zeroclaw integration info
     // <name>` keeps producing actionable output. The Chat-category catch-all
-    // handles channels with a stable onboard path and no special prerequisites.
+    // points operators at the per-channel config keys.
     match entry.name.as_str() {
         "Telegram" => {
             println!("  Setup:");
             println!("    1. Message @BotFather on Telegram");
             println!("    2. Create a bot and copy the token");
-            println!("    3. Run: zeroclaw onboard channels");
+            println!("    3. Run: zeroclaw config set channels.telegram.default.bot-token <token>");
             println!("    4. Start: zeroclaw channel start");
         }
         "Discord" => {
@@ -102,13 +102,13 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("    1. Go to https://discord.com/developers/applications");
             println!("    2. Create app → Bot → Copy token");
             println!("    3. Enable MESSAGE CONTENT intent");
-            println!("    4. Run: zeroclaw onboard channels");
+            println!("    4. Run: zeroclaw config set channels.discord.default.bot-token <token>");
         }
         "Slack" => {
             println!("  Setup:");
             println!("    1. Go to https://api.slack.com/apps");
             println!("    2. Create app → Bot Token Scopes → Install");
-            println!("    3. Run: zeroclaw onboard channels");
+            println!("    3. Run: zeroclaw config set channels.slack.default.bot-token <token>");
         }
         "iMessage" => {
             println!("  Setup (macOS only):");
@@ -118,7 +118,7 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
         "OpenRouter" => {
             println!("  Setup:");
             println!("    1. Get API key at https://openrouter.ai/keys");
-            println!("    2. Run: zeroclaw onboard");
+            println!("    2. Run: zeroclaw quickstart --model-provider openrouter --api-key <key>");
             println!("    Access 200+ models with one key.");
         }
         "Ollama" => {
@@ -127,10 +127,20 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("    2. Pull a model: ollama pull llama3");
             println!("    3. Set model_provider to 'ollama' in config.toml");
         }
-        "GitHub" => {
+        "Git" => {
             println!("  Setup:");
-            println!("    1. Create a personal access token at https://github.com/settings/tokens");
-            println!("    2. Add to config: [integrations.github] token = \"ghp_...\"");
+            println!("    1. Create a GitHub App (Settings → Developer settings → GitHub Apps)");
+            println!(
+                "       Permissions: Issues R/W, Pull requests R/W, Metadata R. Webhook: off."
+            );
+            println!("    2. Generate a private key (.pem) and install the app on your repos");
+            println!("    3. Run: zeroclaw config set channels.git.default.provider github");
+            println!("       Run: zeroclaw config set channels.git.default.app-id <id>");
+            println!(
+                "       Run: zeroclaw config set channels.git.default.private-key-path <path>"
+            );
+            println!("       Run: zeroclaw config set channels.git.default.enabled true");
+            println!("    4. Start: zeroclaw channel start");
         }
         "Browser" => {
             println!("  Built-in:");
@@ -150,7 +160,8 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
         }
         _ if entry.category == IntegrationCategory::Chat => {
             println!("  Setup:");
-            println!("    Run: zeroclaw onboard --channels-only");
+            println!("    Run: zeroclaw config set channels.<name>.<field>=<value>");
+            println!("    (see docs/book/src/channels/overview.md for the per-channel field list)");
         }
         _ => {}
     }

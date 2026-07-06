@@ -212,6 +212,40 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     Ok(job)
 }
 
+/// Resolve a job by UUID or by name (case-insensitive). Returns the resolved
+/// job ID. Errors if the name matches zero or multiple jobs.
+///
+/// Name resolution is scoped to `agent_alias`: names are only unique within an
+/// agent's own jobs, so matching across all agents would let one agent mutate
+/// another's job by name and would raise false "ambiguous" errors when two
+/// agents happen to share a name.
+pub fn resolve_job_id_or_name(
+    config: &Config,
+    id_or_name: &str,
+    agent_alias: &str,
+) -> Result<String> {
+    // Fast path: try exact ID lookup first.
+    if let Ok(job) = get_job(config, id_or_name) {
+        return Ok(job.id);
+    }
+
+    // Fallback: search by name within the requesting agent's own jobs.
+    let jobs = list_jobs_by_agent(config, agent_alias)?;
+    let lower = id_or_name.to_lowercase();
+    let matches: Vec<&CronJob> = jobs
+        .iter()
+        .filter(|j| j.name.as_deref().is_some_and(|n| n.to_lowercase() == lower))
+        .collect();
+
+    match matches.len() {
+        0 => anyhow::bail!("No cron job found with id or name '{id_or_name}'"),
+        1 => Ok(matches[0].id.clone()),
+        n => anyhow::bail!(
+            "Ambiguous name '{id_or_name}': matched {n} jobs — use the job ID instead"
+        ),
+    }
+}
+
 pub fn remove_job(config: &Config, id: &str) -> Result<()> {
     let changed = with_initialized_connection(config, |conn| {
         conn.execute("DELETE FROM cron_jobs WHERE id = ?1", params![id])
@@ -222,8 +256,67 @@ pub fn remove_job(config: &Config, id: &str) -> Result<()> {
         anyhow::bail!("Cron job '{id}' not found");
     }
 
-    println!("✅ Removed cron job {id}");
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+            .with_category(::zeroclaw_log::EventCategory::Cron)
+            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+            .with_attrs(::serde_json::json!({"job_id": id})),
+        "Removed cron job"
+    );
     Ok(())
+}
+
+/// Cron jobs owned by `agent_alias`, for the agent-deletion export-then-delete
+/// archive (#7175).
+pub fn list_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<Vec<CronJob>> {
+    let Some(jobs) = with_read_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                    allowed_tools, source, uses_memory, agent_alias
+             FROM cron_jobs WHERE agent_alias = ?1 ORDER BY next_run ASC",
+        )?;
+        let rows = stmt.query_map(params![agent_alias], map_cron_job_row)?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            jobs.push(row?);
+        }
+        Ok(jobs)
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(jobs)
+}
+
+/// Delete every cron job owned by `agent_alias`, returning the row count
+/// (`cron_runs` cascade via their `job_id` FK). A job whose owning agent is gone
+/// can never run, so the agent-deletion cascade removes it (#7175).
+pub fn remove_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<usize> {
+    let changed = with_initialized_connection(config, |conn| {
+        conn.execute(
+            "DELETE FROM cron_jobs WHERE agent_alias = ?1",
+            params![agent_alias],
+        )
+        .context("Failed to delete cron jobs for agent")
+    })?;
+    Ok(changed)
+}
+
+/// Re-point every cron job owned by `from` to `to`, returning the row count.
+/// Called by the agent-rename cascade (#7468): the job keeps running, just
+/// under the renamed owner. `agent_alias` is plain TEXT (not a UUID), so this
+/// is a direct column update.
+pub fn rename_jobs_by_agent(config: &Config, from: &str, to: &str) -> Result<usize> {
+    let changed = with_initialized_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs SET agent_alias = ?2 WHERE agent_alias = ?1",
+            params![from, to],
+        )
+        .context("Failed to rename cron job owner")
+    })?;
+    Ok(changed)
 }
 
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
@@ -235,7 +328,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
                     allowed_tools, source, uses_memory, agent_alias
              FROM cron_jobs
-             WHERE enabled = 1 AND next_run <= ?1
+             WHERE enabled = 1 AND next_run <= ?1 AND locked_at IS NULL
              ORDER BY next_run ASC
              LIMIT ?2",
         )?;
@@ -276,7 +369,7 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
                     allowed_tools, source, uses_memory, agent_alias
              FROM cron_jobs
-             WHERE enabled = 1 AND next_run <= ?1
+             WHERE enabled = 1 AND next_run <= ?1 AND locked_at IS NULL
              ORDER BY next_run ASC",
         )?;
 
@@ -407,14 +500,7 @@ pub fn record_last_run_with_status(
 ) -> Result<()> {
     let bounded_output = truncate_cron_output(output);
     with_initialized_connection(config, |conn| {
-        conn.execute(
-            "UPDATE cron_jobs
-             SET last_run = ?1, last_status = ?2, last_output = ?3
-             WHERE id = ?4",
-            params![finished_at.to_rfc3339(), status, bounded_output, job_id],
-        )
-        .context("Failed to update cron last run fields")?;
-        Ok(())
+        apply_last_run_state(conn, job_id, finished_at, status, &bounded_output)
     })
 }
 
@@ -471,6 +557,98 @@ pub fn reschedule_after_run_with_status(
     }
 }
 
+/// Advance `next_run` of an overdue recurring job to its next future
+/// occurrence without executing the missed run.  For one-shot `At` jobs
+/// there is no future occurrence, so the job is disabled and its last
+/// status is recorded as `skipped`.
+///
+/// Called at scheduler startup when `catch_up_on_startup` is disabled,
+/// so the subsequent normal polling loop won't pick up jobs whose
+/// `next_run` is still in the past.
+pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Result<()> {
+    if matches!(job.schedule, Schedule::At { .. }) {
+        // One-shot job whose scheduled moment has already passed —
+        // disable it so it won't execute late.
+        let bounded_output = truncate_cron_output("skipped — catch_up_on_startup disabled");
+        with_initialized_connection(config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs
+                 SET enabled = 0, last_run = ?1, last_status = 'skipped', last_output = ?2
+                 WHERE id = ?3",
+                params![now.to_rfc3339(), bounded_output, job.id],
+            )
+            .context("Failed to disable overdue one-shot cron job on startup skip")?;
+            Ok(())
+        })
+    } else {
+        // Recurring job — advance next_run to the next future occurrence.
+        let next_run = next_run_for_schedule(&job.schedule, now)?;
+        with_initialized_connection(config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
+                params![next_run.to_rfc3339(), job.id],
+            )
+            .context("Failed to advance next_run on startup skip")?;
+            Ok(())
+        })
+    }
+}
+
+/// Atomically claim a due job for execution.
+///
+/// Sets `locked_at` to `now` only if the row is currently unlocked. The
+/// conditional `WHERE … AND locked_at IS NULL` makes the claim a single atomic
+/// step: at most one caller can transition a job from idle to in-flight. Returns
+/// `true` when this caller won the claim, `false` when the job was already locked
+/// (in flight from an earlier poll, the startup catch-up, or a concurrent
+/// trigger). Combined with the `locked_at IS NULL` filter in `due_jobs` /
+/// `all_overdue_jobs`, this prevents a job that runs longer than the scheduler
+/// poll interval from being launched repeatedly (issue #6037).
+pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bool> {
+    with_initialized_connection(config, |conn| {
+        let claimed = conn
+            .execute(
+                "UPDATE cron_jobs SET locked_at = ?1 WHERE id = ?2 AND locked_at IS NULL",
+                params![now.to_rfc3339(), job_id],
+            )
+            .context("Failed to claim cron job for execution")?;
+        Ok(claimed == 1)
+    })
+}
+
+/// Release a job's in-flight lock once its run has completed.
+///
+/// Best-effort: a row that is missing (deleted one-shot) or already unlocked
+/// simply affects zero rows. `next_run` advancement happens separately in the
+/// reschedule path; this only clears the lock so the job is eligible again.
+pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
+    with_initialized_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs SET locked_at = NULL WHERE id = ?1",
+            params![job_id],
+        )
+        .context("Failed to release cron job lock")?;
+        Ok(())
+    })
+}
+
+/// Clear every in-flight lock, returning the number of rows cleared.
+///
+/// Called once at scheduler startup: any lock present at boot is stale because its
+/// owning run died with the previous process. Clearing it lets the job be
+/// scheduled again instead of staying wedged until manual intervention. Uses the
+/// non-creating read helper so an empty workspace (no cron DB yet) stays untouched.
+pub fn clear_stale_locks(config: &Config) -> Result<usize> {
+    let cleared = with_read_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs SET locked_at = NULL WHERE locked_at IS NOT NULL",
+            [],
+        )
+        .context("Failed to clear stale cron job locks")
+    })?;
+    Ok(cleared.unwrap_or(0))
+}
+
 pub fn record_run(
     config: &Config,
     job_id: &str,
@@ -500,6 +678,46 @@ pub fn record_run(
 
         tx.commit()
             .context("Failed to commit cron run transaction")?;
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn persist_manual_run_result(
+    config: &Config,
+    job: &CronJob,
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+    status: &str,
+    output: Option<&str>,
+    duration_ms: i64,
+) -> Result<()> {
+    let bounded_output = output.map(truncate_cron_output);
+
+    with_initialized_connection(config, |conn| {
+        let tx = conn.unchecked_transaction()?;
+
+        insert_run_and_prune(
+            &tx,
+            config,
+            &job.id,
+            started_at,
+            finished_at,
+            status,
+            bounded_output.as_deref(),
+            duration_ms,
+        )?;
+
+        apply_last_run_state(
+            &tx,
+            &job.id,
+            finished_at,
+            status,
+            bounded_output.as_deref().unwrap_or(""),
+        )?;
+
+        tx.commit()
+            .context("Failed to commit manual cron run result transaction")?;
         Ok(())
     })
 }
@@ -604,6 +822,23 @@ fn insert_run_and_prune(
     )
     .context("Failed to prune cron run history")?;
 
+    Ok(())
+}
+
+fn apply_last_run_state(
+    conn: &Connection,
+    job_id: &str,
+    finished_at: DateTime<Utc>,
+    status: &str,
+    output: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE cron_jobs
+         SET last_run = ?1, last_status = ?2, last_output = ?3
+         WHERE id = ?4",
+        params![finished_at.to_rfc3339(), status, output, job_id],
+    )
+    .context("Failed to update cron last run fields")?;
     Ok(())
 }
 
@@ -1292,6 +1527,11 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     // scheduler treats those as orphans (skip with warning) rather than
     // coercing them to a magic alias.
     add_column_if_missing(conn, "agent_alias", "TEXT NOT NULL DEFAULT ''")?;
+    // In-flight execution lock: RFC3339 timestamp of when a run claimed this job,
+    // or NULL when idle. `due_jobs`/`all_overdue_jobs` skip locked rows so a job that
+    // runs longer than the poll interval cannot be launched again while still in
+    // flight (see `claim_job`/`release_job` and issue #6037).
+    add_column_if_missing(conn, "locked_at", "TEXT")?;
 
     Ok(())
 }
@@ -1319,6 +1559,37 @@ mod tests {
 
     fn cron_db(config: &Config) -> std::path::PathBuf {
         cron_dir(config).join("jobs.db")
+    }
+
+    async fn recv_log_event(
+        rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
+        message: &str,
+        job_id: &str,
+    ) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value))
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|candidate| candidate == message)
+                        && value
+                            .get("attributes")
+                            .and_then(|a| a.get("job_id"))
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|id| id == job_id) =>
+                {
+                    return value;
+                }
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        panic!("did not find log event: {message} for job {job_id}");
     }
 
     #[test]
@@ -1354,6 +1625,119 @@ mod tests {
         assert!(cron_db(&config).exists());
         assert_eq!(get_job(&config, &job.id).unwrap().id, job.id);
         assert_eq!(list_jobs(&config).unwrap().len(), 1);
+    }
+
+    /// Force a job's `next_run` into the past so it is selected by `due_jobs`
+    /// without waiting for its real schedule.
+    fn force_due(config: &Config, job_id: &str) {
+        let past = (Utc::now() - ChronoDuration::hours(1)).to_rfc3339();
+        with_initialized_connection(config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
+                params![past, job_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn claim_job_is_atomic_and_blocks_second_claim() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+
+        assert!(
+            claim_job(&config, &job.id, now).unwrap(),
+            "first claim should win"
+        );
+        assert!(
+            !claim_job(&config, &job.id, now).unwrap(),
+            "second claim must fail while the job is locked"
+        );
+
+        release_job(&config, &job.id).unwrap();
+        assert!(
+            claim_job(&config, &job.id, now).unwrap(),
+            "claim should win again after release"
+        );
+    }
+
+    #[test]
+    fn due_jobs_skips_claimed_jobs() {
+        // Regression for #6037: a job that is in flight must not be selected
+        // again by the scheduler while its previous run is still running.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        force_due(&config, &job.id);
+        let now = Utc::now();
+
+        assert_eq!(
+            due_jobs(&config, now).unwrap().len(),
+            1,
+            "job is due before being claimed"
+        );
+        assert_eq!(all_overdue_jobs(&config, now).unwrap().len(), 1);
+
+        assert!(claim_job(&config, &job.id, now).unwrap());
+
+        assert!(
+            due_jobs(&config, now).unwrap().is_empty(),
+            "a claimed (in-flight) job must not be re-selected by due_jobs"
+        );
+        assert!(
+            all_overdue_jobs(&config, now).unwrap().is_empty(),
+            "a claimed (in-flight) job must not be re-selected by the catch-up path"
+        );
+
+        release_job(&config, &job.id).unwrap();
+        assert_eq!(
+            due_jobs(&config, now).unwrap().len(),
+            1,
+            "after release the job is due again until it is rescheduled"
+        );
+    }
+
+    #[test]
+    fn clear_stale_locks_releases_in_flight_locks() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        force_due(&config, &job.id);
+        let now = Utc::now();
+
+        assert!(claim_job(&config, &job.id, now).unwrap());
+        assert!(due_jobs(&config, now).unwrap().is_empty());
+
+        assert_eq!(
+            clear_stale_locks(&config).unwrap(),
+            1,
+            "the one in-flight lock should be cleared"
+        );
+        assert_eq!(
+            due_jobs(&config, now).unwrap().len(),
+            1,
+            "after clearing the stale lock the job is eligible again"
+        );
+        assert_eq!(
+            clear_stale_locks(&config).unwrap(),
+            0,
+            "clearing again when idle releases nothing"
+        );
+    }
+
+    #[test]
+    fn clear_stale_locks_on_empty_workspace_does_not_create_db() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        assert_eq!(clear_stale_locks(&config).unwrap(), 0);
+        assert!(
+            !cron_db(&config).exists(),
+            "clear_stale_locks must not create the cron DB on an empty workspace"
+        );
     }
 
     #[test]
@@ -1587,6 +1971,28 @@ mod tests {
         assert!(list_jobs(&config).unwrap().is_empty());
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn remove_job_emits_structured_cron_delete_event() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/10 * * * *", "echo roundtrip").unwrap();
+
+        remove_job(&config, &job.id).unwrap();
+
+        let value = recv_log_event(&mut rx, "Removed cron job", &job.id).await;
+        assert_eq!(value["event"]["category"], "cron");
+        assert_eq!(value["event"]["action"], "delete");
+        assert_eq!(value["event"]["outcome"], "success");
+        assert_eq!(value["attributes"]["job_id"], job.id);
+    }
+
     #[test]
     fn due_jobs_filters_by_timestamp_and_enabled() {
         let tmp = TempDir::new().unwrap();
@@ -1594,7 +2000,8 @@ mod tests {
 
         let job = add_job(&config, "test-agent", "* * * * *", "echo due").unwrap();
 
-        let due_now = due_jobs(&config, Utc::now()).unwrap();
+        let before_next_run = job.next_run - ChronoDuration::milliseconds(1);
+        let due_now = due_jobs(&config, before_next_run).unwrap();
         assert!(due_now.is_empty(), "new job should not be due immediately");
 
         let far_future = Utc::now() + ChronoDuration::days(365);
@@ -2247,5 +2654,216 @@ schedule = { kind = "every", every_ms = 300000 }
             health.schedule,
             zeroclaw_config::schema::CronScheduleDecl::Every { every_ms: 300_000 }
         ));
+    }
+
+    #[test]
+    fn skip_missed_run_advances_recurring_job_next_run() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        // Add a cron job that will be "overdue" — its next_run is set based
+        // on the schedule from the current time, so we need to make it past.
+        let job = add_job(&config, "test-agent", "* * * * *", "echo test").unwrap();
+
+        // Force next_run into the past so the job appears overdue.
+        let past = Utc::now() - ChronoDuration::hours(1);
+        with_initialized_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
+                params![past.to_rfc3339(), job.id],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        // Verify it is overdue now.
+        assert!(
+            !all_overdue_jobs(&config, Utc::now()).unwrap().is_empty(),
+            "job with past next_run must appear in overdue"
+        );
+
+        // Skip the missed run.
+        let reloaded = get_job(&config, &job.id).unwrap();
+        skip_missed_run(&config, &reloaded, Utc::now()).unwrap();
+
+        // The job's next_run should now be in the future.
+        let updated = get_job(&config, &job.id).unwrap();
+        assert!(
+            updated.next_run > Utc::now(),
+            "skip_missed_run must advance next_run to the future"
+        );
+        assert!(updated.enabled, "recurring job must stay enabled");
+    }
+
+    #[test]
+    fn skip_missed_run_disables_overdue_oneshot_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let run_at = Utc::now() - ChronoDuration::hours(2);
+        let schedule = Schedule::At { at: run_at };
+        let job = add_job_with_schedule(&config, "test-agent", &schedule, "echo once").unwrap();
+
+        // The add_job_with_schedule should have set next_run = run_at,
+        // so the job is overdue now.
+        assert!(
+            !all_overdue_jobs(&config, Utc::now()).unwrap().is_empty(),
+            "one-shot job with past at-time must be overdue"
+        );
+
+        let reloaded = get_job(&config, &job.id).unwrap();
+        skip_missed_run(&config, &reloaded, Utc::now()).unwrap();
+
+        let updated = get_job(&config, &job.id).unwrap();
+        assert!(
+            !updated.enabled,
+            "overdue one-shot job must be disabled after skip"
+        );
+        assert_eq!(
+            updated.last_status.as_deref(),
+            Some("skipped"),
+            "one-shot job last_status must be 'skipped'"
+        );
+    }
+
+    fn add_job_with_schedule(
+        config: &Config,
+        agent_alias: &str,
+        schedule: &Schedule,
+        command: &str,
+    ) -> Result<CronJob> {
+        let now = Utc::now();
+        let job = CronJob {
+            id: format!("test-job-{}", Uuid::new_v4()),
+            expression: String::new(),
+            schedule: schedule.clone(),
+            command: command.to_string(),
+            prompt: None,
+            name: None,
+            job_type: JobType::Shell,
+            session_target: SessionTarget::Isolated,
+            model: None,
+            agent_alias: agent_alias.to_string(),
+            enabled: true,
+            delivery: DeliveryConfig::default(),
+            delete_after_run: false,
+            allowed_tools: None,
+            uses_memory: false,
+            source: "imperative".to_string(),
+            created_at: now,
+            next_run: next_run_for_schedule(schedule, now).unwrap_or(now),
+            last_run: None,
+            last_status: None,
+            last_output: None,
+        };
+        let job_type_str: String = match &job.job_type {
+            JobType::Shell => "shell".to_string(),
+            JobType::Agent => "agent".to_string(),
+        };
+        let schedule_json = serde_json::to_string(&job.schedule).unwrap();
+        let delivery_json = serde_json::to_string(&job.delivery).unwrap();
+        let allowed_tools_json =
+            crate::cron::store::encode_allowed_tools(job.allowed_tools.as_ref()).unwrap();
+        with_initialized_connection(config, |conn| {
+            conn.execute(
+                "INSERT INTO cron_jobs
+                 (id, expression, command, schedule, job_type, prompt, name,
+                  session_target, model, enabled, delivery, delete_after_run,
+                  allowed_tools, next_run, last_run, last_status, last_output,
+                  uses_memory, source, created_at, agent_alias)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                params![
+                    job.id,
+                    job.expression,
+                    job.command,
+                    schedule_json,
+                    job_type_str.to_string(),
+                    job.prompt,
+                    job.name,
+                    job.session_target.as_str(),
+                    job.model,
+                    if job.enabled { 1 } else { 0 },
+                    delivery_json,
+                    if job.delete_after_run { 1 } else { 0 },
+                    allowed_tools_json,
+                    job.next_run.to_rfc3339(),
+                    job.last_run.map(|t| t.to_rfc3339()),
+                    job.last_status,
+                    job.last_output,
+                    if job.uses_memory { 1 } else { 0 },
+                    job.source,
+                    job.created_at.to_rfc3339(),
+                    job.agent_alias,
+                ],
+            )
+            .context("Failed to insert test cron job")?;
+            Ok(())
+        })?;
+        Ok(job)
+    }
+
+    #[test]
+    fn resolve_job_id_or_name_scopes_name_to_owning_agent() {
+        // Same job name under two agents. Resolving by name as agent-a must
+        // return only agent-a's job — no false ambiguity from agent-b's
+        // identically-named job, and no reaching across the agent boundary.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mine = add_shell_job(
+            &config,
+            "agent-a",
+            Some("daily_sync".into()),
+            Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "echo a",
+            None,
+        )
+        .unwrap();
+        add_shell_job(
+            &config,
+            "agent-b",
+            Some("daily_sync".into()),
+            Schedule::Cron {
+                expr: "0 9 * * *".into(),
+                tz: None,
+            },
+            "echo b",
+            None,
+        )
+        .unwrap();
+
+        let resolved = resolve_job_id_or_name(&config, "daily_sync", "agent-a").unwrap();
+        assert_eq!(
+            resolved, mine.id,
+            "name must resolve to the caller's own job, not the other agent's"
+        );
+    }
+
+    #[test]
+    fn resolve_job_id_or_name_cannot_reach_another_agents_job_by_name() {
+        // Only agent-b owns `secret_job`; agent-a must not be able to resolve it.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        add_shell_job(
+            &config,
+            "agent-b",
+            Some("secret_job".into()),
+            Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "echo b",
+            None,
+        )
+        .unwrap();
+
+        let err = resolve_job_id_or_name(&config, "secret_job", "agent-a").unwrap_err();
+        assert!(
+            err.to_string().contains("No cron job found"),
+            "another agent's job must be unresolvable by name; got: {err}"
+        );
     }
 }

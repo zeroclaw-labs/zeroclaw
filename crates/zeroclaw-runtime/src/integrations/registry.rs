@@ -88,15 +88,15 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
             status: bool_to_status(info.configured),
         });
 
-    let toggles = config
-        .integration_descriptors()
-        .into_iter()
-        .map(|d| IntegrationEntry {
+    let toggles = config.integration_descriptors().into_iter().map(|d| {
+        let category = parse_category(d.category);
+        IntegrationEntry {
             name: d.display_name.to_string(),
             description: d.description.to_string(),
-            category: parse_category(d.category),
+            category,
             status: bool_to_status(d.active),
-        });
+        }
+    });
 
     let providers = zeroclaw_providers::list_model_providers()
         .into_iter()
@@ -228,6 +228,7 @@ mod tests {
             TelegramConfig {
                 enabled: true,
                 bot_token: "123:ABC".into(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -236,6 +237,8 @@ mod tests {
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         let entries = all_integrations(&config);
@@ -261,6 +264,8 @@ mod tests {
             IMessageConfig {
                 enabled: true,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         let entries = all_integrations(&config);
@@ -301,6 +306,8 @@ mod tests {
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         let entries = all_integrations(&config);

@@ -1183,9 +1183,10 @@ impl ImageGenerator {
 
     /// Generate a branded SVG text card with the post title on a gradient background.
     pub fn generate_fallback_card(title: &str, accent_color: &str) -> String {
-        // Truncate title to ~80 chars for clean display
+        // Truncate title to ~80 bytes for clean display without splitting UTF-8.
         let display_title = if title.len() > 80 {
-            format!("{}...", &title[..77])
+            let end = crate::util_helpers::floor_char_boundary(title, 77);
+            format!("{}...", &title[..end])
         } else {
             title.to_string()
         };
@@ -1668,6 +1669,18 @@ mod tests {
         assert!(svg.contains("..."));
         // Should not contain the full 100-char string
         assert!(!svg.contains(&long_title));
+    }
+
+    #[test]
+    fn fallback_card_truncates_multibyte_title_on_utf8_boundary() {
+        let prefix = "A".repeat(76);
+        let title = format!("{prefix}{}tail", "😀");
+        let svg = ImageGenerator::generate_fallback_card(&title, "#0A66C2");
+
+        assert!(svg.contains(&format!("{prefix}...")));
+        assert!(!svg.contains("😀"));
+        assert!(!svg.contains("tail"));
+        assert!(!svg.contains(&title));
     }
 
     #[test]

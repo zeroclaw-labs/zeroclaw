@@ -1,7 +1,11 @@
 use async_trait::async_trait;
+use regex::RegexBuilder;
 use serde_json::json;
+use std::collections::BTreeSet;
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
@@ -11,22 +15,42 @@ const TIMEOUT_SECS: u64 = 30;
 
 /// Search file contents by regex pattern within the workspace.
 ///
-/// Uses ripgrep (`rg`) when available, falling back to `grep -rn -E`.
+/// Uses ripgrep (`rg`) when available, falling back to `grep -rn -E` or an
+/// internal scanner when external search tools are unavailable.
 /// All searches are confined to the workspace directory by security policy.
 pub struct ContentSearchTool {
     security: Arc<SecurityPolicy>,
-    has_rg: bool,
+    backend: SearchBackend,
 }
 
 impl ContentSearchTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        let has_rg = which::which("rg").is_ok();
-        Self { security, has_rg }
+        Self {
+            security,
+            backend: detect_search_backend(),
+        }
     }
 
     #[cfg(test)]
-    fn new_with_backend(security: Arc<SecurityPolicy>, has_rg: bool) -> Self {
-        Self { security, has_rg }
+    fn new_with_backend(security: Arc<SecurityPolicy>, backend: SearchBackend) -> Self {
+        Self { security, backend }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchBackend {
+    Ripgrep,
+    Grep,
+    Internal,
+}
+
+fn detect_search_backend() -> SearchBackend {
+    if which::which("rg").is_ok() {
+        SearchBackend::Ripgrep
+    } else if which::which("grep").is_ok() {
+        SearchBackend::Grep
+    } else {
+        SearchBackend::Internal
     }
 }
 
@@ -38,7 +62,7 @@ impl Tool for ContentSearchTool {
 
     fn description(&self) -> &str {
         "Search file contents by regex pattern within the workspace. \
-         Supports ripgrep (rg) with grep fallback. \
+         Supports ripgrep (rg) with grep or internal fallback. \
          Output modes: 'content' (matching lines with context), \
          'files_with_matches' (file paths only), 'count' (match counts per file). \
          Example: pattern='fn main', include='*.rs', output_mode='content'."
@@ -84,7 +108,7 @@ impl Tool for ContentSearchTool {
                 },
                 "multiline": {
                     "type": "boolean",
-                    "description": "Enable multiline matching (ripgrep only, errors on grep fallback)",
+                    "description": "Enable multiline matching (ripgrep only, errors on non-ripgrep fallback)",
                     "default": false
                 },
                 "max_results": {
@@ -209,8 +233,8 @@ impl Tool for ContentSearchTool {
             });
         }
 
-        // --- Multiline check for grep fallback ---
-        if multiline && !self.has_rg {
+        // --- Multiline check for non-ripgrep fallbacks ---
+        if multiline && self.backend != SearchBackend::Ripgrep {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -220,28 +244,142 @@ impl Tool for ContentSearchTool {
             });
         }
 
-        // --- Build and execute command ---
-        let mut cmd = if self.has_rg {
-            build_rg_command(
+        // --- Parse and format output ---
+        let workspace = &self.security.workspace_dir;
+        let workspace_canon =
+            std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.clone());
+
+        let formatted = match self.backend {
+            SearchBackend::Ripgrep | SearchBackend::Grep => {
+                let raw_stdout = match self
+                    .execute_external_search(
+                        pattern,
+                        &resolved_canon,
+                        output_mode,
+                        include,
+                        case_sensitive,
+                        context_before,
+                        context_after,
+                        multiline,
+                    )
+                    .await
+                {
+                    Ok(output) => output,
+                    Err(result) => return Ok(result),
+                };
+
+                match self.backend {
+                    SearchBackend::Ripgrep => {
+                        format_rg_output(&raw_stdout, &workspace_canon, output_mode, max_results)
+                    }
+                    SearchBackend::Grep => {
+                        format_grep_output(&raw_stdout, &workspace_canon, output_mode, max_results)
+                    }
+                    SearchBackend::Internal => unreachable!(),
+                }
+            }
+            SearchBackend::Internal => {
+                let pattern = pattern.to_string();
+                let resolved_canon = resolved_canon.clone();
+                let workspace_canon = workspace_canon.clone();
+                let output_mode = output_mode.to_string();
+                let include = include.map(str::to_string);
+                let security = (*self.security).clone();
+                let deadline = Instant::now() + Duration::from_secs(TIMEOUT_SECS);
+
+                let task = tokio::task::spawn_blocking(move || {
+                    run_internal_search_with_deadline(
+                        &pattern,
+                        &resolved_canon,
+                        &workspace_canon,
+                        &output_mode,
+                        include.as_deref(),
+                        case_sensitive,
+                        context_before,
+                        context_after,
+                        max_results,
+                        &security,
+                        deadline,
+                    )
+                });
+
+                match tokio::time::timeout(Duration::from_secs(TIMEOUT_SECS), task).await {
+                    Ok(Ok(Ok(output))) => output,
+                    Ok(Ok(Err(e))) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("Search error: {e}")),
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("Search task failed: {e}")),
+                        });
+                    }
+                    Err(_) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("Search timed out after {TIMEOUT_SECS} seconds.")),
+                        });
+                    }
+                }
+            }
+        };
+
+        // Truncate output if too large
+        let final_output = if formatted.len() > MAX_OUTPUT_BYTES {
+            let mut truncated = truncate_utf8(&formatted, MAX_OUTPUT_BYTES).to_string();
+            truncated.push_str("\n\n[Output truncated: exceeded 1 MB limit]");
+            truncated
+        } else {
+            formatted
+        };
+
+        Ok(ToolResult {
+            success: true,
+            output: final_output,
+            error: None,
+        })
+    }
+}
+
+impl ContentSearchTool {
+    async fn execute_external_search(
+        &self,
+        pattern: &str,
+        resolved_canon: &Path,
+        output_mode: &str,
+        include: Option<&str>,
+        case_sensitive: bool,
+        context_before: usize,
+        context_after: usize,
+        multiline: bool,
+    ) -> Result<String, ToolResult> {
+        let mut cmd = match self.backend {
+            SearchBackend::Ripgrep => build_rg_command(
                 pattern,
-                &resolved_canon,
+                resolved_canon,
                 output_mode,
                 include,
                 case_sensitive,
                 context_before,
                 context_after,
                 multiline,
-            )
-        } else {
-            build_grep_command(
+            ),
+            SearchBackend::Grep => build_grep_command(
                 pattern,
-                &resolved_canon,
+                resolved_canon,
                 output_mode,
                 include,
                 case_sensitive,
                 context_before,
                 context_after,
-            )
+            ),
+            SearchBackend::Internal => unreachable!(),
         };
 
         // Security: clear environment, keep only safe variables
@@ -263,14 +401,14 @@ impl Tool for ContentSearchTool {
         {
             Ok(Ok(out)) => out,
             Ok(Err(e)) => {
-                return Ok(ToolResult {
+                return Err(ToolResult {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to execute search command: {e}")),
                 });
             }
             Err(_) => {
-                return Ok(ToolResult {
+                return Err(ToolResult {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Search timed out after {TIMEOUT_SECS} seconds.")),
@@ -282,40 +420,311 @@ impl Tool for ContentSearchTool {
         let exit_code = output.status.code().unwrap_or(-1);
         if exit_code >= 2 {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Ok(ToolResult {
+            return Err(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Search error: {}", stderr.trim())),
             });
         }
 
-        let raw_stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
 
-        // --- Parse and format output ---
-        let workspace = &self.security.workspace_dir;
-        let workspace_canon =
-            std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.clone());
+#[allow(clippy::too_many_arguments)]
+fn run_internal_search_with_deadline(
+    pattern: &str,
+    search_path: &Path,
+    workspace_canon: &Path,
+    output_mode: &str,
+    include: Option<&str>,
+    case_sensitive: bool,
+    context_before: usize,
+    context_after: usize,
+    max_results: usize,
+    security: &SecurityPolicy,
+    deadline: Instant,
+) -> anyhow::Result<String> {
+    check_internal_deadline(deadline)?;
+    let regex = RegexBuilder::new(pattern)
+        .case_insensitive(!case_sensitive)
+        .build()?;
+    let include_pattern = include.map(glob::Pattern::new).transpose()?;
 
-        let formatted = if self.has_rg {
-            format_rg_output(&raw_stdout, &workspace_canon, output_mode, max_results)
-        } else {
-            format_grep_output(&raw_stdout, &workspace_canon, output_mode, max_results)
+    let mut raw_lines = Vec::new();
+    let mut results_seen = 0usize;
+    visit_internal_search_path(
+        search_path,
+        workspace_canon,
+        include_pattern.as_ref(),
+        security,
+        &regex,
+        output_mode,
+        context_before,
+        context_after,
+        max_results,
+        deadline,
+        &mut raw_lines,
+        &mut results_seen,
+    )?;
+
+    Ok(format_line_output(
+        &raw_lines.join("\n"),
+        workspace_canon,
+        output_mode,
+        max_results,
+    ))
+}
+
+fn check_internal_deadline(deadline: Instant) -> anyhow::Result<()> {
+    if Instant::now() >= deadline {
+        anyhow::bail!("Search timed out after {TIMEOUT_SECS} seconds.");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visit_internal_search_path(
+    path: &Path,
+    workspace_canon: &Path,
+    include: Option<&glob::Pattern>,
+    security: &SecurityPolicy,
+    regex: &regex::Regex,
+    output_mode: &str,
+    context_before: usize,
+    context_after: usize,
+    max_results: usize,
+    deadline: Instant,
+    raw_lines: &mut Vec<String>,
+    results_seen: &mut usize,
+) -> anyhow::Result<()> {
+    if *results_seen >= max_results {
+        return Ok(());
+    }
+    check_internal_deadline(deadline)?;
+
+    let Ok(resolved) = std::fs::canonicalize(path) else {
+        return Ok(());
+    };
+    if !security.is_resolved_path_readable(&resolved) {
+        return Ok(());
+    }
+
+    if resolved.is_file() {
+        if internal_include_matches(&resolved, workspace_canon, include) {
+            search_internal_file(
+                &resolved,
+                regex,
+                output_mode,
+                context_before,
+                context_after,
+                max_results,
+                deadline,
+                raw_lines,
+                results_seen,
+            )?;
+        }
+        return Ok(());
+    }
+
+    if !resolved.is_dir() {
+        return Ok(());
+    }
+
+    let Ok(entries) = std::fs::read_dir(&resolved) else {
+        return Ok(());
+    };
+
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        if *results_seen >= max_results {
+            break;
+        }
+        check_internal_deadline(deadline)?;
+
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
         };
+        if file_type.is_symlink() {
+            let Ok(target) = std::fs::canonicalize(&path) else {
+                continue;
+            };
+            if target.is_file()
+                && security.is_resolved_path_readable(&target)
+                && internal_include_matches(&target, workspace_canon, include)
+            {
+                search_internal_file(
+                    &target,
+                    regex,
+                    output_mode,
+                    context_before,
+                    context_after,
+                    max_results,
+                    deadline,
+                    raw_lines,
+                    results_seen,
+                )?;
+            }
+            continue;
+        }
 
-        // Truncate output if too large
-        let final_output = if formatted.len() > MAX_OUTPUT_BYTES {
-            let mut truncated = truncate_utf8(&formatted, MAX_OUTPUT_BYTES).to_string();
-            truncated.push_str("\n\n[Output truncated: exceeded 1 MB limit]");
-            truncated
+        if file_type.is_dir() {
+            visit_internal_search_path(
+                &path,
+                workspace_canon,
+                include,
+                security,
+                regex,
+                output_mode,
+                context_before,
+                context_after,
+                max_results,
+                deadline,
+                raw_lines,
+                results_seen,
+            )?;
+        } else if file_type.is_file()
+            && let Ok(file) = std::fs::canonicalize(&path)
+            && security.is_resolved_path_readable(&file)
+            && internal_include_matches(&file, workspace_canon, include)
+        {
+            search_internal_file(
+                &file,
+                regex,
+                output_mode,
+                context_before,
+                context_after,
+                max_results,
+                deadline,
+                raw_lines,
+                results_seen,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_internal_file(
+    file: &Path,
+    regex: &regex::Regex,
+    output_mode: &str,
+    context_before: usize,
+    context_after: usize,
+    max_results: usize,
+    deadline: Instant,
+    raw_lines: &mut Vec<String>,
+    results_seen: &mut usize,
+) -> anyhow::Result<()> {
+    check_internal_deadline(deadline)?;
+    let Ok(content) = std::fs::read_to_string(file) else {
+        return Ok(());
+    };
+    if content.as_bytes().contains(&0) {
+        return Ok(());
+    }
+
+    match output_mode {
+        "files_with_matches" => {
+            if content.lines().any(|line| regex.is_match(line)) {
+                raw_lines.push(file.to_string_lossy().to_string());
+                *results_seen += 1;
+            }
+        }
+        "count" => {
+            let count = content.lines().filter(|line| regex.is_match(line)).count();
+            if count > 0 {
+                raw_lines.push(format!("{}:{count}", file.to_string_lossy()));
+                *results_seen += 1;
+            }
+        }
+        _ => {
+            append_internal_content_matches(
+                file,
+                &content,
+                regex,
+                context_before,
+                context_after,
+                max_results,
+                raw_lines,
+                results_seen,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn internal_include_matches(
+    path: &Path,
+    workspace_canon: &Path,
+    include: Option<&glob::Pattern>,
+) -> bool {
+    let Some(include) = include else {
+        return true;
+    };
+
+    let relative = path.strip_prefix(workspace_canon).unwrap_or(path);
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+
+    include.matches(&relative) || include.matches(&file_name)
+}
+
+fn append_internal_content_matches(
+    file: &Path,
+    content: &str,
+    regex: &regex::Regex,
+    context_before: usize,
+    context_after: usize,
+    max_results: usize,
+    raw_lines: &mut Vec<String>,
+    results_seen: &mut usize,
+) {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut match_indexes = BTreeSet::new();
+    let mut output_indexes = BTreeSet::new();
+
+    for (idx, line) in lines.iter().enumerate() {
+        if *results_seen + match_indexes.len() >= max_results {
+            break;
+        }
+        if !regex.is_match(line) {
+            continue;
+        }
+        match_indexes.insert(idx);
+
+        let start = idx.saturating_sub(context_before);
+        let end = (idx + context_after).min(lines.len().saturating_sub(1));
+        for context_idx in start..=end {
+            output_indexes.insert(context_idx);
+        }
+    }
+
+    for context_idx in output_indexes {
+        let separator = if match_indexes.contains(&context_idx) {
+            ':'
         } else {
-            formatted
+            '-'
         };
-
-        Ok(ToolResult {
-            success: true,
-            output: final_output,
-            error: None,
-        })
+        raw_lines.push(format!(
+            "{}{}{}{}{}",
+            file.to_string_lossy(),
+            separator,
+            context_idx + 1,
+            separator,
+            lines[context_idx]
+        ));
+        if separator == ':' {
+            *results_seen += 1;
+        }
     }
 }
 
@@ -464,6 +873,7 @@ fn format_line_output(
     let mut truncated = false;
     let mut file_set = std::collections::HashSet::new();
     let mut total_matches: usize = 0;
+    let mut content_limit_reached = false;
 
     for line in raw.lines() {
         if line.is_empty() {
@@ -503,26 +913,37 @@ fn format_line_output(
                 // Track files from both match and context lines.
                 if relativized == "--" {
                     lines.push(relativized);
-                    if lines.len() >= max_results {
-                        truncated = true;
-                        break;
-                    }
                     continue;
                 }
                 if let Some((path, is_match)) = parse_content_line(&relativized) {
+                    if content_limit_reached && is_match {
+                        break;
+                    }
                     file_set.insert(path.to_string());
                     if is_match {
+                        if total_matches >= max_results {
+                            truncated = true;
+                            break;
+                        }
                         total_matches += 1;
+                        if total_matches >= max_results {
+                            truncated = true;
+                            content_limit_reached = true;
+                        }
                     }
                 } else {
                     // Unknown line format: keep output visible and count conservatively as a match.
+                    if total_matches >= max_results {
+                        truncated = true;
+                        break;
+                    }
                     total_matches += 1;
+                    if total_matches >= max_results {
+                        truncated = true;
+                        content_limit_reached = true;
+                    }
                 }
                 lines.push(relativized);
-                if lines.len() >= max_results {
-                    truncated = true;
-                    break;
-                }
             }
         }
     }
@@ -644,6 +1065,16 @@ mod tests {
             workspace_dir: workspace,
             ..SecurityPolicy::default()
         })
+    }
+
+    #[cfg(target_os = "windows")]
+    fn absolute_path_outside_workspace() -> &'static str {
+        r"C:\Windows"
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn absolute_path_outside_workspace() -> &'static str {
+        "/etc"
     }
 
     fn create_test_files(dir: &TempDir) {
@@ -854,7 +1285,7 @@ mod tests {
     async fn content_search_rejects_absolute_path_outside_allowlist() {
         let tool = ContentSearchTool::new(test_security(std::env::temp_dir()));
         let result = tool
-            .execute(json!({"pattern": "test", "path": "/etc"}))
+            .execute(json!({"pattern": "test", "path": absolute_path_outside_workspace()}))
             .await
             .unwrap();
 
@@ -946,7 +1377,7 @@ mod tests {
 
         let tool = ContentSearchTool::new_with_backend(
             test_security(dir.path().to_path_buf()),
-            false, // no rg
+            SearchBackend::Grep,
         );
         let result = tool
             .execute(json!({"pattern": "line1", "multiline": true}))
@@ -955,6 +1386,112 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("ripgrep"));
+    }
+
+    #[tokio::test]
+    async fn content_search_internal_backend_finds_matches_without_external_tools() {
+        let dir = TempDir::new().unwrap();
+        create_test_files(&dir);
+
+        let tool = ContentSearchTool::new_with_backend(
+            test_security(dir.path().to_path_buf()),
+            SearchBackend::Internal,
+        );
+        let result = tool
+            .execute(json!({"pattern": "fn main", "include": "*.rs"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("hello.rs"));
+        assert!(result.output.contains("fn main"));
+        assert!(!result.output.contains("readme.txt"));
+        assert!(result.output.contains("Total: 1 matching lines in 1 files"));
+    }
+
+    #[tokio::test]
+    async fn content_search_internal_backend_merges_overlapping_context_windows() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("ctx.txt"),
+            "before\nmatch one\nmatch two\nafter\n",
+        )
+        .unwrap();
+
+        let tool = ContentSearchTool::new_with_backend(
+            test_security(dir.path().to_path_buf()),
+            SearchBackend::Internal,
+        );
+        let result = tool
+            .execute(json!({
+                "pattern": "match",
+                "context_before": 1,
+                "context_after": 1
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("ctx.txt:2:match one"));
+        assert!(result.output.contains("ctx.txt:3:match two"));
+        assert!(!result.output.contains("ctx.txt-2-match one"));
+        assert!(!result.output.contains("ctx.txt-3-match two"));
+        assert!(result.output.contains("Total: 2 matching lines in 1 files"));
+    }
+
+    #[tokio::test]
+    async fn content_search_internal_backend_max_results_counts_matches_not_context() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("ctx.txt"),
+            "before\nmatch one\nmatch two\nafter\n",
+        )
+        .unwrap();
+
+        let tool = ContentSearchTool::new_with_backend(
+            test_security(dir.path().to_path_buf()),
+            SearchBackend::Internal,
+        );
+        let result = tool
+            .execute(json!({
+                "pattern": "match",
+                "context_before": 1,
+                "context_after": 0,
+                "max_results": 1
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("ctx.txt-1-before"));
+        assert!(result.output.contains("ctx.txt:2:match one"));
+        assert!(!result.output.contains("ctx.txt:3:match two"));
+        assert!(result.output.contains("Total: 1 matching lines in 1 files"));
+    }
+
+    #[test]
+    fn content_search_internal_backend_reports_expired_deadline() {
+        let dir = TempDir::new().unwrap();
+        create_test_files(&dir);
+        let security = test_security(dir.path().to_path_buf());
+        let workspace_canon = std::fs::canonicalize(dir.path()).unwrap();
+
+        let result = run_internal_search_with_deadline(
+            "fn",
+            dir.path(),
+            &workspace_canon,
+            "content",
+            None,
+            true,
+            0,
+            0,
+            MAX_RESULTS,
+            &security,
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("timed out"));
     }
 
     #[test]

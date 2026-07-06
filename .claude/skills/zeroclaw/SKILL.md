@@ -50,21 +50,21 @@ Each `-m` invocation is independent (no conversation history between calls). If 
 
 ## First-Time Setup
 
-If the user hasn't set up ZeroClaw yet (no `~/.zeroclaw/config.toml` exists), guide them through onboarding:
+If the user hasn't set up ZeroClaw yet (no `~/.zeroclaw/config.toml` exists), guide them through quickstart:
 
 ```bash
-zeroclaw onboard                                 # Interactive — walks every section
-zeroclaw onboard --quick --model-provider ollama # Non-interactive quick mode
-zeroclaw onboard channels                        # Re-run the channels section only
+zeroclaw quickstart                                              # Interactive — picks a provider + agent
+zeroclaw quickstart --model-provider ollama --model qwen2.5:7b   # Non-interactive
+zeroclaw config set channels.<name>.<field>=<value>              # Configure a channel after quickstart
 ```
 
-After onboarding, verify everything works:
+After quickstart, verify everything works:
 ```bash
 zeroclaw status
 zeroclaw doctor
 ```
 
-If they already have a config but something is broken, `zeroclaw onboard --channels-only` repairs just the channel configuration without overwriting everything else.
+If they already have a config but a channel is broken, edit just that channel's fields with `zeroclaw config set channels.<name>.<field>=<value>` rather than re-running quickstart (quickstart leaves an existing config alone).
 
 ## Building from Source
 
@@ -157,7 +157,7 @@ To see what's available: `GET /api/tools` (REST) lists all registered tools with
 
 ### Configuration
 
-Edit `~/.zeroclaw/config.toml` directly, or re-run `zeroclaw onboard` to reconfigure.
+Edit `~/.zeroclaw/config.toml` directly, use `zeroclaw config set <key>=<value>` for one field at a time, or delete `~/.zeroclaw/` and re-run `zeroclaw quickstart` for a fresh setup.
 
 **REST:**
 - `GET /api/config` — get current config (secrets masked as `***MASKED***`)

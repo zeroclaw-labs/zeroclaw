@@ -764,7 +764,7 @@ impl Channel for MattermostChannel {
             None => (recipient.to_string(), None),
         };
 
-        let handle = tokio::spawn(async move {
+        let handle = zeroclaw_spawn::spawn!(async move {
             let url = format!("{base_url}/api/v4/users/me/typing");
             loop {
                 let mut body = serde_json::json!({ "channel_id": channel_id });
@@ -994,6 +994,8 @@ impl MattermostChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         })
     }
 }
@@ -1947,6 +1949,7 @@ mod tests {
             model: "whisper-large-v3".to_string(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: 600,
             openai: None,
             deepgram: None,
@@ -1980,6 +1983,7 @@ mod tests {
             model: "whisper-large-v3".to_string(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: 600,
             openai: None,
             deepgram: None,
@@ -2171,6 +2175,7 @@ mod tests {
             model: "whisper-large-v3".to_string(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: 3600,
             openai: None,
             deepgram: None,
@@ -2242,6 +2247,7 @@ mod tests {
                 model: "whisper-large-v3".to_string(),
                 language: None,
                 initial_prompt: None,
+                max_audio_bytes: None,
                 max_duration_secs: 600,
                 openai: None,
                 deepgram: None,
@@ -2296,6 +2302,7 @@ mod tests {
                 model: "whisper-large-v3".to_string(),
                 language: None,
                 initial_prompt: None,
+                max_audio_bytes: None,
                 max_duration_secs: 600,
                 openai: None,
                 deepgram: None,

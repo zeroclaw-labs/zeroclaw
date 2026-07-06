@@ -144,6 +144,8 @@ impl Channel for MatrixTestChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         })
         .await
         .map_err(|e| anyhow::Error::msg(e.to_string()))
@@ -206,6 +208,7 @@ impl Channel for MatrixTestChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        _suppress_voice: bool,
     ) -> anyhow::Result<()> {
         self.events
             .lock()
@@ -421,7 +424,7 @@ async fn draft_full_lifecycle_send_update_finalize() {
     ch.update_draft("user_1", &draft_id, "thinking... partial response")
         .await
         .unwrap();
-    ch.finalize_draft("user_1", &draft_id, "Final complete response")
+    ch.finalize_draft("user_1", &draft_id, "Final complete response", false)
         .await
         .unwrap();
 
@@ -642,6 +645,8 @@ fn channel_message_thread_ts_preserved_on_clone() {
         interruption_scope_id: None,
         attachments: vec![],
         subject: None,
+
+        ..Default::default()
     };
 
     let cloned = msg.clone();
@@ -662,6 +667,8 @@ fn channel_message_none_thread_ts_preserved() {
         interruption_scope_id: None,
         attachments: vec![],
         subject: None,
+
+        ..Default::default()
     };
 
     assert!(msg.clone().thread_ts.is_none());
@@ -719,6 +726,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "discord" => ChannelMessage {
             id: "dc_1".into(),
@@ -732,6 +740,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "slack" => ChannelMessage {
             id: "sl_1".into(),
@@ -745,6 +754,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "imessage" => ChannelMessage {
             id: "im_1".into(),
@@ -758,6 +768,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "irc" => ChannelMessage {
             id: "irc_1".into(),
@@ -771,6 +782,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "email" => ChannelMessage {
             id: "email_1".into(),
@@ -784,6 +796,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "signal" => ChannelMessage {
             id: "sig_1".into(),
@@ -797,6 +810,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "mattermost" => ChannelMessage {
             id: "mm_1".into(),
@@ -810,6 +824,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "whatsapp" => ChannelMessage {
             id: "wa_1".into(),
@@ -823,6 +838,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "nextcloud_talk" => ChannelMessage {
             id: "nc_1".into(),
@@ -836,6 +852,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "wecom" => ChannelMessage {
             id: "wc_1".into(),
@@ -849,6 +866,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "dingtalk" => ChannelMessage {
             id: "dt_1".into(),
@@ -862,6 +880,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "qq" => ChannelMessage {
             id: "qq_1".into(),
@@ -875,6 +894,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "linq" => ChannelMessage {
             id: "lq_1".into(),
@@ -888,6 +908,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "wati" => ChannelMessage {
             id: "wt_1".into(),
@@ -901,6 +922,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         "cli" => ChannelMessage {
             id: "cli_1".into(),
@@ -914,6 +936,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            ..Default::default()
         },
         _ => panic!("Unknown platform: {platform}"),
     }
@@ -1081,7 +1104,7 @@ async fn concurrent_sends_all_recorded() {
 
     for i in 0..20 {
         let ch = Arc::clone(&ch);
-        handles.push(tokio::spawn(async move {
+        handles.push(zeroclaw_spawn::spawn!(async move {
             ch.send(&SendMessage::new(format!("msg_{i}"), format!("user_{i}")))
                 .await
                 .unwrap();
@@ -1102,7 +1125,7 @@ async fn concurrent_typing_events_all_recorded() {
 
     for i in 0..10 {
         let ch = Arc::clone(&ch);
-        handles.push(tokio::spawn(async move {
+        handles.push(zeroclaw_spawn::spawn!(async move {
             ch.start_typing(&format!("user_{i}")).await.unwrap();
             ch.stop_typing(&format!("user_{i}")).await.unwrap();
         }));
@@ -1130,7 +1153,7 @@ async fn concurrent_reactions_all_recorded() {
     for (i, emoji) in emojis.iter().enumerate() {
         let ch = Arc::clone(&ch);
         let emoji = emoji.to_string();
-        handles.push(tokio::spawn(async move {
+        handles.push(zeroclaw_spawn::spawn!(async move {
             ch.add_reaction("chan_1", &format!("msg_{i}"), &emoji)
                 .await
                 .unwrap();
@@ -1219,6 +1242,8 @@ fn channel_message_zero_timestamp() {
         interruption_scope_id: None,
         attachments: vec![],
         subject: None,
+
+        ..Default::default()
     };
     assert_eq!(msg.timestamp, 0);
 }
@@ -1237,6 +1262,8 @@ fn channel_message_max_timestamp() {
         interruption_scope_id: None,
         attachments: vec![],
         subject: None,
+
+        ..Default::default()
     };
     assert_eq!(msg.timestamp, u64::MAX);
 }
@@ -1405,7 +1432,7 @@ async fn minimal_channel_all_defaults_succeed() {
             .is_none()
     );
     assert!(ch.update_draft("u", "m", "t").await.is_ok());
-    assert!(ch.finalize_draft("u", "m", "t").await.is_ok());
+    assert!(ch.finalize_draft("u", "m", "t", false).await.is_ok());
     assert!(ch.cancel_draft("u", "m").await.is_ok());
     assert!(ch.add_reaction("c", "m", "\u{1F440}").await.is_ok());
     assert!(ch.remove_reaction("c", "m", "\u{1F440}").await.is_ok());
@@ -1470,6 +1497,7 @@ async fn full_conversation_lifecycle() {
         &incoming.reply_target,
         &draft_id,
         "Here's what I found: complete answer.",
+        false,
     )
     .await
     .unwrap();

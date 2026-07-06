@@ -1,6 +1,6 @@
 # PR Review Protocol
 
-This is the procedure followed when reviewing a pull request in `zeroclaw-labs/zeroclaw`. It's loaded by the `github-pr-review-session` skill and read by human reviewers — it's authoritative for both.
+This is the procedure followed when reviewing a pull request in `zeroclaw-labs/zeroclaw`. It's loaded by the `github-pr-review-session` skill and read by human reviewers, it's authoritative for both.
 
 The `gh` CLI is assumed available and authenticated.
 
@@ -10,38 +10,62 @@ Run all of these. The data informs every step that follows.
 
 1. **PR overview**
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    gh pr view <number> --repo zeroclaw-labs/zeroclaw
    ```
+
+   </div>
 
    Description, labels, linked issues, validation evidence.
 
 2. **Top-level conversation**
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    gh pr view <number> --comments --repo zeroclaw-labs/zeroclaw
    ```
 
+   </div>
+
 3. **Inline threads (every reply chain)**
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    gh api repos/zeroclaw-labs/zeroclaw/pulls/<number>/comments --paginate
    ```
 
-   Read full reply chains before drawing any conclusion about whether something is open or settled. Note author commitments made in replies — they're load-bearing.
+   </div>
+
+   Read full reply chains before drawing any conclusion about whether something is open or settled. Note author commitments made in replies, they're load-bearing.
 
 4. **Formal reviews**
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    gh api repos/zeroclaw-labs/zeroclaw/pulls/<number>/reviews --paginate
    ```
+
+   </div>
 
    Note which `CHANGES_REQUESTED` are still active (not superseded by a later `APPROVED` or `DISMISSED`). Check whether you've already reviewed this PR.
 
 5. **Relevant foundations documents**
 
    Always read FND-005 (Contribution Culture). For others, use the relevance
-   table below — read what applies to the PR's scope. The ratified versions
+   table below, read what applies to the PR's scope. The ratified versions
    are local files; no API call needed.
 
    | Foundation | Local file |
@@ -55,9 +79,15 @@ Run all of these. The data informs every step that follows.
 
 6. **Diff**
 
-   ```bash
+   <div class="os-tabs-src">
+
+   #### sh
+
+   ```sh
    gh pr diff <number> --repo zeroclaw-labs/zeroclaw
    ```
+
+   </div>
 
    Read the full diff. Cross-check author commitments from step 3 against what actually shipped. Cross-check against the local repository where the change lands.
 
@@ -69,6 +99,8 @@ Before you write a single line of review, name out loud:
 - What's settled (resolved by author, dismissed by reviewer, addressed in a later commit).
 - What's still live (open blockers, unresolved questions, things the author committed to but didn't ship).
 - Who holds active blocks, and whether the diff addresses them.
+- Whether any obvious PR-template, public metadata, or body-claim gaps affect
+  the verdict. Run the full template/truthfulness check before approving.
 
 The take-stock pass is what stops you from re-raising settled points and what surfaces who's actually waiting on what.
 
@@ -78,11 +110,45 @@ Labels are maintainer metadata, not a contributor blocker. If the right label is
 
 Ask the author about labels only when the right label choice is ambiguous or nobody with label permissions is available. Do not request changes or hold merge solely because an author cannot edit labels.
 
+## Template and public artifact checks
+
+Before approving, compare the live PR body against the current
+`.github/pull_request_template.md`. The template is the source of truth: check
+every required and applicable prompt, including conditional sections. Custom
+narrative is fine only when it still satisfies that template contract.
+
+Missing required substance is a review finding. If the content is present but
+the heading or placement needs mechanical cleanup, and a maintainer can safely
+repair it, fix or propose the exact cleanup instead of making the author do
+metadata work. When acting through an assistant, show the exact PR-body or
+metadata diff and get human reviewer approval before mutating GitHub. If the
+missing section is substantive, unsupported, or changes reviewer confidence, do
+not approve until it is filled.
+
+Also run a truthfulness scrub on the public artifacts before choosing a
+verdict:
+
+- Live labels match the PR body's label snapshot and the diff's real risk,
+  size, and type.
+- Linked issue verbs are accurate: use `Closes` / `Fixes` / `Resolves` only
+  when the PR fully resolves the issue; otherwise use `Related`, `Depends on`,
+  or `Supersedes`.
+- Validation evidence names commands that actually ran, includes relevant
+  output or an honest skip reason, and does not treat pending CI as local
+  validation.
+- Security/privacy, compatibility, rollback, and scope-boundary claims match
+  the diff and current behavior.
+- Public text does not include bot/AI attribution footers, local workflow
+  mechanics, private paths, unredacted sensitive logs, excessive raw logs,
+  irrelevant dumps, or stale lifecycle wording. Concise, relevant command
+  output tails in Validation Evidence are expected when the template asks for
+  them.
+
 ## Verdict decision tree
 
 | Situation | Verdict flag |
 |---|---|
-| Your review is approving and no other reviewer holds an active block | `--approve` |
+| Your review is approving, the template/truthfulness checks are satisfied, and no other reviewer holds an active block | `--approve` |
 | Your review is rejecting on substantive grounds you'd block on personally | `--request-changes` |
 | You have nothing new to block on but other reviewers hold active blocks | `--comment` |
 | You have specific findings but they're all 🔵 suggestions or non-blocking clarification questions | `--comment` |
@@ -92,11 +158,11 @@ Ask the author about labels only when the right label choice is ambiguous or nob
 
 Findings in review bodies and inline comments use this PR-review scale, adapted from FND-005. The `✅ [resolved]` entry is for re-reviews that acknowledge addressed findings.
 
-- **🔴 [blocking]** — must be addressed before merge. Use sparingly; every blocker is real or the scale loses meaning.
-- **🟡 [warning]** — should be addressed; not blocking but the reviewer wants the author to look.
-- **🔵 [suggestion]** — optional. Author can accept or pass.
-- **🟢 [praise]** — what's working. Specific praise teaches what to repeat. Generic "great work" teaches nothing.
-- **✅ [resolved]** — explicitly acknowledging that a prior finding has been addressed in a later commit. Use this when you're re-reviewing — it shows the author their work registered.
+- **🔴 [blocking]**: must be addressed before merge. Use sparingly; every blocker is real or the scale loses meaning.
+- **🟡 [warning]**: should be addressed; not blocking but the reviewer wants the author to look.
+- **🔵 [suggestion]**: optional. Author can accept or pass.
+- **🟢 [praise]**: what's working. Specific praise teaches what to repeat. Generic "great work" teaches nothing.
+- **✅ [resolved]**: explicitly acknowledging that a prior finding has been addressed in a later commit. Use this when you're re-reviewing, it shows the author their work registered.
 
 ## Review body Markdown format
 
@@ -129,20 +195,26 @@ Write as a thoughtful senior contributor who has read everything and cares about
   finding tied to a specific line. Anchor the feedback to the code so the
   author can resolve it inline.
 - **Review body** for overall verdict, comprehension summary, cross-references to other PRs, and template-level issues that aren't tied to a specific line.
-- **Bare commit hashes** (never wrap in backticks — GitHub auto-links bare hashes; backticks block the auto-link).
+- **Bare commit hashes** (never wrap in backticks: GitHub auto-links bare hashes; backticks block the auto-link).
 - **`@`-prefixed usernames** in all review content (chat, body, inline). `@WareWolf-MoonWall`, not `WareWolf-MoonWall`.
 
 ## Posting
 
-Write the review body to a file under `tmp/review-<number>.md` first — this is the source of truth for what was posted and lets the user inspect before publishing. Then:
+Write the review body to a file under `tmp/review-<number>.md` first: this is the source of truth for what was posted and lets the user inspect before publishing. Then:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 gh pr review <number> --repo zeroclaw-labs/zeroclaw \
   <--approve | --request-changes | --comment> \
   --body-file tmp/review-<number>.md
 ```
 
-Always show the full draft and get explicit approval from the human before posting. Continuation words like "next" or "move on" don't count as approval — only an unambiguous "yes" / "approve" / "go" does.
+</div>
+
+Always show the full draft and get explicit approval from the human before posting. Continuation words like "next" or "move on" don't count as approval, only an unambiguous "yes" / "approve" / "go" does.
 
 ## After posting
 

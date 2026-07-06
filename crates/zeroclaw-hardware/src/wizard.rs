@@ -164,7 +164,7 @@ pub fn run_setup() -> Result<HardwareConfig> {
     // Datasheet RAG
     if hw_config.enabled {
         let datasheets = Confirm::new()
-            .with_prompt("  Enable datasheet RAG? (index PDF schematics for AI pin lookups)")
+            .with_prompt("  Enable datasheet RAG? (index .md/.txt datasheets for AI pin lookups; PDFs must be converted to text first)")
             .default(true)
             .interact()?;
         hw_config.workspace_datasheets = datasheets;

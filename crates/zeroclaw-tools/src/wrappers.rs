@@ -50,9 +50,9 @@ type PathExtractor = dyn Fn(&serde_json::Value) -> Option<String> + Send + Sync;
 ///
 /// ## Read-tool exception (anti-probing)
 ///
-/// `FileReadTool` (`zeroclaw-runtime::tools::file_read`) and `PdfReadTool` in
-/// this crate intentionally call `record_action()` *themselves* on the
-/// post-`PathGuardedTool` `resolve_candidate` / `canonicalize` failure paths.
+/// `FileReadTool` (`zeroclaw-runtime::tools::file_read`) in this crate
+/// intentionally calls `record_action()` *itself* on the post-`PathGuardedTool`
+/// `resolve_candidate` / `canonicalize` failure paths.
 /// This prevents an attacker from probing path existence for free: each
 /// attempt — successful or failed — consumes exactly one slot.  The outer
 /// `RateLimitedTool` only records on `success: true`, so the totals stay at
@@ -126,7 +126,7 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
 ///
 /// Replaces the `forbidden_path_argument()` guard blocks previously inlined in
 /// tools that accept a path-like argument (`shell`, `file_read`, `file_write`,
-/// `file_edit`, `pdf_read`, `content_search`, `glob_search`, `image_info`).
+/// `file_edit`, `content_search`, `glob_search`, `image_info`).
 ///
 /// Path extraction is argument-name-driven: the wrapper inspects the `"path"`,
 /// `"command"`, `"pattern"`, and `"query"` fields of the JSON argument object.
@@ -244,6 +244,16 @@ mod tests {
         })
     }
 
+    #[cfg(target_os = "windows")]
+    fn absolute_path_outside_workspace() -> &'static str {
+        r"C:\Windows\win.ini"
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn absolute_path_outside_workspace() -> &'static str {
+        "/etc/passwd"
+    }
+
     /// A minimal tool that records how many times `execute` was called.
     struct CountingTool {
         calls: Arc<AtomicUsize>,
@@ -346,7 +356,7 @@ mod tests {
         let (inner, counter) = CountingTool::new();
         let tool = PathGuardedTool::new(inner, policy(AutonomyLevel::Full));
         let result = tool
-            .execute(serde_json::json!({"command": "cat /etc/passwd"}))
+            .execute(serde_json::json!({"command": format!("cat {}", absolute_path_outside_workspace())}))
             .await
             .unwrap();
         assert!(!result.success);
@@ -381,7 +391,7 @@ mod tests {
                     .map(String::from)
             });
         let result = tool
-            .execute(serde_json::json!({"target": "/etc/shadow"}))
+            .execute(serde_json::json!({"target": absolute_path_outside_workspace()}))
             .await
             .unwrap();
         assert!(!result.success);
@@ -401,7 +411,7 @@ mod tests {
         let tool = RateLimitedTool::new(PathGuardedTool::new(inner, sec.clone()), sec);
 
         let blocked = tool
-            .execute(serde_json::json!({"path": "/etc/passwd"}))
+            .execute(serde_json::json!({"path": absolute_path_outside_workspace()}))
             .await
             .unwrap();
         assert!(!blocked.success);
@@ -482,7 +492,7 @@ mod tests {
         let tool = RateLimitedTool::new(PathGuardedTool::new(inner, sec.clone()), sec);
 
         let blocked = tool
-            .execute(serde_json::json!({"path": "/etc/passwd"}))
+            .execute(serde_json::json!({"path": absolute_path_outside_workspace()}))
             .await
             .unwrap();
         assert!(!blocked.success);

@@ -11,7 +11,7 @@ use base64::Engine;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::Config;
@@ -524,29 +524,37 @@ fn build_base_info() -> serde_json::Value {
     })
 }
 
-fn markdown_to_plain_text(text: &str) -> String {
-    // TODO: Cache these Regex values instead of compiling them on every send path.
-    let code_block_re = regex::Regex::new(r"```[^\n]*\n?([\s\S]*?)```").unwrap();
-    let image_re = regex::Regex::new(r"!\[[^\]]*\]\([^)]*\)").unwrap();
-    let link_re = regex::Regex::new(r"\[([^\]]+)\]\([^)]*\)").unwrap();
-    let heading_re = regex::Regex::new(r"(?m)^\s{0,3}#{1,6}\s+").unwrap();
-    let blockquote_re = regex::Regex::new(r"(?m)^>\s?").unwrap();
-    let bullet_re = regex::Regex::new(r"(?m)^\s*[-*+]\s+").unwrap();
-    let emphasis_re = regex::Regex::new(r"(\*\*|__|~~|`|\*)").unwrap();
-    let table_separator_re = regex::Regex::new(r"^\|[\s:|-]+\|$").unwrap();
-    let table_row_re = regex::Regex::new(r"^\|(.+)\|$").unwrap();
+static CODE_BLOCK_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"```[^\n]*\n?([\s\S]*?)```").unwrap());
+static IMAGE_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"!\[[^\]]*\]\([^)]*\)").unwrap());
+static LINK_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\[([^\]]+)\]\([^)]*\)").unwrap());
+static HEADING_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?m)^\s{0,3}#{1,6}\s+").unwrap());
+static BLOCKQUOTE_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?m)^>\s?").unwrap());
+static BULLET_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?m)^\s*[-*+]\s+").unwrap());
+static EMPHASIS_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(\*\*|__|~~|`|\*)").unwrap());
+static TABLE_SEPARATOR_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"^\|[\s:|-]+\|$").unwrap());
+static TABLE_ROW_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"^\|(.+)\|$").unwrap());
 
-    let mut result = code_block_re.replace_all(text, "$1").into_owned();
-    result = image_re.replace_all(&result, "").into_owned();
-    result = link_re.replace_all(&result, "$1").into_owned();
+fn markdown_to_plain_text(text: &str) -> String {
+    let mut result = CODE_BLOCK_RE.replace_all(text, "$1").into_owned();
+    result = IMAGE_RE.replace_all(&result, "").into_owned();
+    result = LINK_RE.replace_all(&result, "$1").into_owned();
 
     let mut lines = Vec::new();
     for line in result.lines() {
-        if table_separator_re.is_match(line) {
+        if TABLE_SEPARATOR_RE.is_match(line) {
             continue;
         }
 
-        if let Some(captures) = table_row_re.captures(line) {
+        if let Some(captures) = TABLE_ROW_RE.captures(line) {
             let inner = captures.get(1).map(|value| value.as_str()).unwrap_or("");
             lines.push(
                 inner
@@ -562,10 +570,10 @@ fn markdown_to_plain_text(text: &str) -> String {
     }
 
     result = lines.join("\n");
-    result = heading_re.replace_all(&result, "").into_owned();
-    result = blockquote_re.replace_all(&result, "").into_owned();
-    result = bullet_re.replace_all(&result, "").into_owned();
-    result = emphasis_re.replace_all(&result, "").into_owned();
+    result = HEADING_RE.replace_all(&result, "").into_owned();
+    result = BLOCKQUOTE_RE.replace_all(&result, "").into_owned();
+    result = BULLET_RE.replace_all(&result, "").into_owned();
+    result = EMPHASIS_RE.replace_all(&result, "").into_owned();
 
     while result.contains("\n\n\n") {
         result = result.replace("\n\n\n", "\n\n");
@@ -906,7 +914,7 @@ impl WeChatChannel {
             let mut cfg = config.write();
             if !cfg.channels.wechat.contains_key(&self.alias) {
                 anyhow::bail!(
-                    "Missing [channels.wechat.{}] section. Run `zeroclaw onboard --channels-only` first",
+                    "Missing [channels.wechat.{}] section. Run `zeroclaw config set channels.wechat.<alias>.app-id=<id>` to configure.",
                     self.alias
                 );
             }
@@ -914,7 +922,7 @@ impl WeChatChannel {
                 .peer_groups
                 .entry(group_name)
                 .or_insert_with(|| PeerGroupConfig {
-                    channel: channel_ref.to_string(),
+                    channel: channel_ref,
                     ..PeerGroupConfig::default()
                 });
             if group
@@ -1284,9 +1292,13 @@ impl WeChatChannel {
             .upload_to_cdn(&upload_param, &filekey, &ciphertext)
             .await?;
 
+        // CDNMedia `aes_key` must be base64(hex(key)).
+        // WeChat client base64-decodes then hex-decodes to recover the 16 bytes.
+        let aes_key_base64 = base64::engine::general_purpose::STANDARD.encode(hex::encode(aes_key));
+
         Ok(UploadedWeChatMedia {
             encrypted_query_param,
-            aes_key_base64: base64::engine::general_purpose::STANDARD.encode(aes_key),
+            aes_key_base64,
             raw_size: payload.bytes.len(),
             encrypted_size: ciphertext.len(),
         })
@@ -1982,6 +1994,10 @@ impl Channel for WeChatChannel {
         "wechat"
     }
 
+    fn supports_draft_updates(&self) -> bool {
+        true
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let recipient = &message.recipient;
         let content = crate::util::strip_tool_call_tags(&message.content);
@@ -2273,6 +2289,8 @@ impl Channel for WeChatChannel {
                     interruption_scope_id: None,
                     attachments: Vec::new(),
                     subject: None,
+
+                    ..Default::default()
                 };
 
                 if tx.send(channel_msg).await.is_err() {
@@ -2332,7 +2350,7 @@ impl Channel for WeChatChannel {
         let url = self.api_url("sendtyping");
         let user_id = recipient.to_string();
 
-        let handle = tokio::spawn(async move {
+        let handle = zeroclaw_spawn::spawn!(async move {
             loop {
                 let body = serde_json::json!({
                     "ilink_user_id": &user_id,
@@ -2361,6 +2379,60 @@ impl Channel for WeChatChannel {
         if let Some(handle) = guard.take() {
             handle.abort();
         }
+        Ok(())
+    }
+
+    async fn send_draft(&self, _msg: &SendMessage) -> anyhow::Result<Option<String>> {
+        // TODO: Re-enable placeholder if WeChat adds message edit/revoke support.
+        //
+        // Current behavior: Return draft_id without sending placeholder.
+        // The final response will be sent in finalize_draft().
+        let draft_id = format!("draft_{}", uuid::Uuid::new_v4());
+        Ok(Some(draft_id))
+    }
+
+    async fn update_draft(
+        &self,
+        _recipient: &str,
+        _draft_id: &str,
+        _content: &str,
+    ) -> anyhow::Result<()> {
+        // WeChat iLink doesn't support message editing.
+        // We accumulate deltas in the draft_updater task and only send the final
+        // message in finalize_draft(). This method is a no-op.
+        Ok(())
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        _draft_id: &str,
+        content: &str,
+        _suppress_voice: bool,
+    ) -> anyhow::Result<()> {
+        // Send the final accumulated response
+        let result = self
+            .send(&SendMessage::new(
+                content.to_string(),
+                recipient.to_string(),
+            ))
+            .await;
+        let _ = self.stop_typing(recipient).await; // Always stop the typing indicator
+        result
+    }
+
+    async fn cancel_draft(&self, recipient: &str, _draft_id: &str) -> anyhow::Result<()> {
+        self.stop_typing(recipient).await
+    }
+
+    async fn update_draft_progress(
+        &self,
+        recipient: &str,
+        _draft_id: &str,
+        _progress: &str,
+    ) -> anyhow::Result<()> {
+        // Use the typing indicator instead of message updates
+        let _ = self.start_typing(recipient).await;
         Ok(())
     }
 }
@@ -2579,12 +2651,22 @@ mod tests {
 
     #[test]
     fn parse_aes_key_accepts_hex_and_base64() {
-        let raw = *b"0123456789abcdef";
+        let raw: [u8; 16] = *b"0123456789abcdef";
         let hex_key = hex::encode(raw);
         let base64_key = base64::engine::general_purpose::STANDARD.encode(raw);
 
+        // Inbound accepts plain hex and base64(raw bytes).
         assert_eq!(parse_aes_key(&hex_key).unwrap(), raw);
         assert_eq!(parse_aes_key(&base64_key).unwrap(), raw);
+
+        // Outbound CDNMedia `aes_key` must be base64(hex(key)), matching the
+        // official @tencent-weixin/openclaw-weixin client (base64-decode then
+        // hex-decode back to 16 bytes). Encoding raw bytes directly is
+        // undecryptable by the client ("image expired"), so it must NOT equal
+        // base64(raw) and must round-trip through the same parser.
+        let outbound = base64::engine::general_purpose::STANDARD.encode(hex::encode(raw));
+        assert_ne!(outbound, base64_key);
+        assert_eq!(parse_aes_key(&outbound).unwrap(), raw);
     }
 
     #[test]

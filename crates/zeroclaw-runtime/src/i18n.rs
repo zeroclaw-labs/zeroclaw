@@ -12,6 +12,48 @@ static CLI_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static CLI_FTL_SOURCES: OnceLock<CliFtlSources> = OnceLock::new();
 static LOCALE: OnceLock<String> = OnceLock::new();
 
+/// The canonical locale registry, embedded from repo-root `locales.toml` at
+/// compile time. Parsed once into a `'static` list so callers (e.g. the RPC
+/// `locales/list` handler) get a long-lived reference with no runtime file I/O.
+static AVAILABLE_LOCALES: OnceLock<Vec<LocaleOption>> = OnceLock::new();
+
+const LOCALES_TOML: &str = include_str!("../../../locales.toml");
+
+/// One selectable locale: its `code` (e.g. `ja`) and display `label`
+/// (e.g. `日本語`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocaleOption {
+    pub code: String,
+    pub label: String,
+}
+
+/// Locales the build knows about, from the embedded `locales.toml`. Cheap:
+/// parsed once, then returns a borrow of the cached `'static` vector.
+pub fn available_locales() -> &'static [LocaleOption] {
+    AVAILABLE_LOCALES
+        .get_or_init(|| {
+            let table: toml::Value =
+                toml::from_str(LOCALES_TOML).expect("embedded locales.toml is valid TOML");
+            table
+                .get("locale")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|e| {
+                            let code = e.get("code").and_then(|v| v.as_str())?;
+                            let label = e.get("label").and_then(|v| v.as_str())?;
+                            Some(LocaleOption {
+                                code: code.to_string(),
+                                label: label.to_string(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .as_slice()
+}
+
 struct CliFtlSources {
     locale: String,
     disk: Option<String>,
@@ -62,6 +104,20 @@ fn cli_ftl_sources() -> &'static CliFtlSources {
     CLI_FTL_SOURCES.get_or_init(|| load_cli_ftl_sources(active_locale()))
 }
 
+/// Resolve a CLI string against the embedded English catalogue only, ignoring
+/// the process locale and the filesystem. Used by tests that assert the
+/// canonical English wording without depending on the host's configured
+/// locale (the global `LOCALE` OnceLock would otherwise make them flaky).
+#[cfg(test)]
+pub(crate) fn get_english_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
+    let english = CliFtlSources {
+        locale: "en".to_string(),
+        disk: None,
+        builtin: None,
+    };
+    format_cli_string_with_args(&english, key, args).unwrap_or_else(|| missing_cli_string(key))
+}
+
 fn missing_cli_string(key: &str) -> String {
     ::zeroclaw_log::record!(
         WARN,
@@ -110,6 +166,9 @@ fn load_cli_ftl_sources(locale: &str) -> CliFtlSources {
 
 fn builtin_cli_ftl_source(locale: &str) -> Option<&'static str> {
     match locale {
+        "es" => Some(include_str!("../locales/es/cli.ftl")),
+        "fr" => Some(include_str!("../locales/fr/cli.ftl")),
+        "ja" => Some(include_str!("../locales/ja/cli.ftl")),
         "zh-CN" => Some(include_str!("../locales/zh-CN/cli.ftl")),
         _ => None,
     }
@@ -190,11 +249,23 @@ fn format_ftl_message(
 }
 
 fn load_ftl_from_disk(locale: &str, filename: &str) -> Option<String> {
-    let workspace_path =
-        workspace_dir_from_config().map(|d| d.join("locales").join(locale).join(filename));
-    let search_paths = [workspace_path];
+    load_ftl_with_reader(locale, filename, |p| std::fs::read_to_string(p).ok())
+}
+
+/// Path-resolution + read wiring for locale FTL, with an injectable reader so
+/// tests can verify which path is consulted without touching the real
+/// filesystem. Production passes `std::fs::read_to_string`.
+fn load_ftl_with_reader(
+    locale: &str,
+    filename: &str,
+    read: impl Fn(&std::path::Path) -> Option<String>,
+) -> Option<String> {
+    let path = zeroclaw_config::schema::ftl_locale_dir(locale)
+        .ok()
+        .map(|d| d.join(filename));
+    let search_paths = [path];
     for path in search_paths.into_iter().flatten() {
-        if let Ok(content) = std::fs::read_to_string(&path) {
+        if let Some(content) = read(&path) {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -207,17 +278,67 @@ fn load_ftl_from_disk(locale: &str, filename: &str) -> Option<String> {
     None
 }
 
-/// Detect locale: config.toml → "en".
+/// Detect locale: config.toml → system locale (via `sys-locale`) → "en".
 pub fn detect_locale() -> String {
-    locale_from_config().unwrap_or_else(|| "en".to_string())
+    locale_from_config()
+        .or_else(locale_from_system)
+        .unwrap_or_else(|| "en".to_string())
+}
+
+/// Auto-detect locale from the OS when config sets none. `sys-locale` is
+/// cross-platform: on Unix it checks `LANGUAGE` > `LC_ALL` > `LC_MESSAGES` >
+/// `LANG`, and on Windows/macOS it queries the OS directly.
+fn locale_from_system() -> Option<String> {
+    pick_locale(sys_locale::get_locales())
+}
+
+/// Pure: take the first candidate that isn't a POSIX "no locale" sentinel.
+/// Split out from `locale_from_system` so it is testable without environment
+/// access. Walks every candidate rather than just the first: `LC_ALL=C`
+/// (common in CI/containers to force deterministic tool output) would
+/// otherwise shadow a perfectly usable `LANG=zh_CN.UTF-8` and we'd give up
+/// instead of trying it.
+fn pick_locale(mut candidates: impl Iterator<Item = String>) -> Option<String> {
+    candidates.find_map(|raw| normalized_env_locale(&raw))
+}
+
+/// Pure: normalize a raw OS locale value, rejecting the POSIX
+/// "no locale configured" sentinels ("", "C", "POSIX"). Split out from
+/// `locale_from_system` so it is testable without environment access —
+/// no test may touch real env vars to verify locale logic.
+fn normalized_env_locale(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("c")
+        || trimmed.eq_ignore_ascii_case("posix")
+    {
+        return None;
+    }
+    Some(normalize_locale(trimmed))
 }
 
 fn read_config_table() -> Option<toml::Table> {
-    let base = directories::BaseDirs::new()?;
-    let candidates = [
-        base.home_dir().join(".zeroclaw/config.toml"),
-        base.config_dir().join("zeroclaw/config.toml"),
-    ];
+    // An explicit config dir is authoritative: when set, locale detection and
+    // FTL loading resolve only against it and never fall back to the home
+    // config. This keeps the lookup hermetic — tests (and sandboxed runs) point
+    // it at a known dir without the host's real ~/.zeroclaw/config.toml leaking
+    // in. Without this, locale detection reads the developer's own config and
+    // is non-deterministic across machines.
+    if let Ok(custom) = std::env::var("ZEROCLAW_CONFIG_DIR") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            let path = std::path::PathBuf::from(trimmed).join("config.toml");
+            return std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|c| c.parse().ok());
+        }
+    }
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(base) = directories::BaseDirs::new() {
+        candidates.push(base.home_dir().join(".zeroclaw/config.toml"));
+        candidates.push(base.config_dir().join("zeroclaw/config.toml"));
+    }
     for path in &candidates {
         if let Ok(contents) = std::fs::read_to_string(path) {
             return contents.parse().ok();
@@ -227,27 +348,19 @@ fn read_config_table() -> Option<toml::Table> {
 }
 
 fn locale_from_config() -> Option<String> {
-    let table = read_config_table()?;
+    locale_from_table(read_config_table())
+}
+
+/// Pure: extract a normalized locale from an already-parsed config table.
+/// Split out from `locale_from_config` so it is testable without filesystem or
+/// environment access — no test may touch the real FS to verify locale logic.
+fn locale_from_table(table: Option<toml::Table>) -> Option<String> {
+    let table = table?;
     let locale = table.get("locale")?.as_str()?.trim().to_string();
     if locale.is_empty() {
         return None;
     }
     Some(normalize_locale(&locale))
-}
-
-fn workspace_dir_from_config() -> Option<std::path::PathBuf> {
-    if let Some(dir) = read_config_table()
-        .as_ref()
-        .and_then(|t| t.get("workspace_dir"))
-        .and_then(|v| v.as_str())
-    {
-        return Some(std::path::PathBuf::from(dir));
-    }
-    Some(
-        directories::BaseDirs::new()?
-            .home_dir()
-            .join(".zeroclaw/workspace"),
-    )
 }
 
 /// Normalize "zh_CN.UTF-8" → "zh-CN".
@@ -420,6 +533,81 @@ mod tests {
     }
 
     #[test]
+    fn doctor_ctxwin_write_failed_formats_in_english_and_japanese() {
+        let cases = [(
+            "cli-doctor-ctxwin-write-failed",
+            &[
+                ("provider_ref", "groq.alias2"),
+                ("error", "simulated write failure"),
+            ][..],
+        )];
+        for pair in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+        ] {
+            let (locale_source, locale) = (pair.0, pair.1);
+            for (key, args) in cases {
+                let value = format_ftl_message(locale_source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                assert!(
+                    value.contains("groq.alias2"),
+                    "{key} in {locale} should inline provider_ref; got: {value:?}"
+                );
+                assert!(
+                    value.contains("simulated write failure"),
+                    "{key} in {locale} should inline error; got: {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn channel_compile_guidance_cli_strings_format_from_fluent() {
+        let cases = [
+            (
+                "cli-selftest-channel-config-uncompiled",
+                &[("compiled", "4"), ("configured", "1"), ("names", "Slack")][..],
+                ["4", "1", "Slack"].as_slice(),
+            ),
+            (
+                "cli-update-prebuilt-channel-note",
+                &[][..],
+                ["Slack", "channel-*"].as_slice(),
+            ),
+            (
+                "cli-channels-not-compiled-entry",
+                &[("name", "Slack")][..],
+                ["Slack"].as_slice(),
+            ),
+        ];
+
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for (key, args, expected_parts) in cases {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for expected in expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}"
+                    );
+                }
+                if key == "cli-update-prebuilt-channel-note" {
+                    assert!(
+                        !value.contains("Discord"),
+                        "{key} in {locale} should not mention Discord because it is in default-channels"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn skills_install_cli_strings_format_from_fluent() {
         type FormatCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
 
@@ -520,6 +708,29 @@ mod tests {
     }
 
     #[test]
+    fn daemon_gateway_bind_cli_strings_format_from_fluent() {
+        // The daemon gateway-bind pre-flight messages (#7895) are routed through
+        // Fluent from src/main.rs via `ta(...)`. Guard the key names and their
+        // `{$host}`/`{$port}` placeholders so a typo can't silently degrade the
+        // operator-facing fail-fast message back to a `{cli-...}` stub.
+        let en = include_str!("../locales/en/cli.ftl");
+        let args = &[("host", "127.0.0.1"), ("port", "9090")][..];
+
+        let already_running =
+            format_ftl_message(en, "en", "cli-daemon-gateway-already-running", args)
+                .expect("cli-daemon-gateway-already-running should format");
+        assert!(already_running.contains("127.0.0.1:9090"));
+        assert!(already_running.contains("ZeroClaw gateway is already running"));
+        assert!(already_running.contains("gateway.port"));
+
+        let port_occupied = format_ftl_message(en, "en", "cli-daemon-gateway-port-occupied", args)
+            .expect("cli-daemon-gateway-port-occupied should format");
+        assert!(port_occupied.contains("127.0.0.1:9090"));
+        assert!(port_occupied.contains("already in use by another process"));
+        assert!(port_occupied.contains("gateway.port"));
+    }
+
+    #[test]
     fn normalize_locale_strips_encoding() {
         assert_eq!(normalize_locale("en_US.UTF-8"), "en-US");
         assert_eq!(normalize_locale("zh_CN.utf8"), "zh-CN");
@@ -527,8 +738,184 @@ mod tests {
     }
 
     #[test]
+    fn normalized_env_locale_rejects_posix_sentinels() {
+        assert_eq!(normalized_env_locale(""), None);
+        assert_eq!(normalized_env_locale("   "), None);
+        assert_eq!(normalized_env_locale("C"), None);
+        assert_eq!(normalized_env_locale("c"), None);
+        assert_eq!(normalized_env_locale("POSIX"), None);
+        assert_eq!(normalized_env_locale("posix"), None);
+    }
+
+    #[test]
+    fn normalized_env_locale_normalizes_posix_format() {
+        assert_eq!(
+            normalized_env_locale("zh_CN.UTF-8"),
+            Some("zh-CN".to_string())
+        );
+        assert_eq!(normalized_env_locale("fr_FR"), Some("fr-FR".to_string()));
+        assert_eq!(normalized_env_locale(" ja "), Some("ja".to_string()));
+    }
+
+    #[test]
+    fn pick_locale_skips_posix_sentinel_to_find_a_usable_candidate() {
+        // LC_ALL=C with LANG=zh_CN.UTF-8 is common in CI/containers: sys-locale
+        // yields "C" as the top-priority candidate, but it must not shadow
+        // the real locale carried by a lower-priority variable.
+        let candidates = ["C".to_string(), "zh-CN".to_string()];
+        assert_eq!(
+            pick_locale(candidates.into_iter()),
+            Some("zh-CN".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_locale_returns_none_when_all_candidates_are_sentinels() {
+        let candidates = ["C".to_string(), "POSIX".to_string(), "".to_string()];
+        assert_eq!(pick_locale(candidates.into_iter()), None);
+    }
+
+    #[test]
     fn detect_locale_defaults_to_en_without_config() {
-        // Locale is config-only. Without a config.toml present, must return "en".
-        assert_eq!(detect_locale(), "en");
+        // Locale is config-only. read_config_table() is pure parsing over a
+        // string; verify the fallback contract without touching the real
+        // filesystem or env. An absent/locale-less table must yield "en".
+        assert_eq!(locale_from_table(None), None);
+        let no_locale: toml::Table = "model = \"x\"".parse().unwrap();
+        assert_eq!(locale_from_table(Some(no_locale)), None);
+        let empty_locale: toml::Table = "locale = \"\"".parse().unwrap();
+        assert_eq!(locale_from_table(Some(empty_locale)), None);
+        // detect_locale layers the "en" fallback over locale_from_table.
+        assert_eq!(
+            locale_from_table(None).unwrap_or_else(|| "en".to_string()),
+            "en"
+        );
+    }
+
+    #[test]
+    fn load_ftl_from_disk_reads_config_dir_data_ftl() {
+        // Verify the loader resolves a locale's FTL path and returns the
+        // reader's content — using an in-memory reader so no real filesystem
+        // or environment is touched. The path must carry the locale and
+        // filename so a fetched catalogue at <dir>/.../<locale>/<file> is found.
+        let seen = std::cell::RefCell::new(Vec::<std::path::PathBuf>::new());
+        let loaded = load_ftl_with_reader("xx", "cli.ftl", |p| {
+            seen.borrow_mut().push(p.to_path_buf());
+            Some("cli-probe = hit\n".to_string())
+        });
+        assert_eq!(loaded.as_deref(), Some("cli-probe = hit\n"));
+
+        let paths = seen.borrow();
+        assert!(!paths.is_empty(), "reader must be consulted with a path");
+        let p = paths[0].to_string_lossy();
+        assert!(p.contains("xx"), "path must carry the locale: {p}");
+        assert!(p.ends_with("cli.ftl"), "path must target the file: {p}");
+    }
+
+    #[test]
+    fn non_english_locales_format_context_window_args() {
+        for locale in ["es", "fr", "ja", "zh-CN"] {
+            let sources = load_cli_ftl_sources(locale);
+
+            for (key, args) in [
+                (
+                    "cli-doctor-ctxwin-set",
+                    vec![("provider_ref", "groq.test"), ("ctx", "131072")],
+                ),
+                (
+                    "cli-doctor-ctxwin-would-set",
+                    vec![("provider_ref", "groq.test"), ("ctx", "131072")],
+                ),
+                (
+                    "cli-doctor-ctxwin-already-set",
+                    vec![("provider_ref", "groq.test"), ("ctx", "131072")],
+                ),
+                (
+                    "cli-doctor-ctxwin-not-found",
+                    vec![("provider_ref", "groq.test")],
+                ),
+                (
+                    "cli-doctor-ctxwin-fetch-failed",
+                    vec![("provider_ref", "groq.test")],
+                ),
+            ] {
+                let formatted = format_cli_string_with_args(&sources, key, &args)
+                    .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                assert!(
+                    formatted.contains("groq.test"),
+                    "{locale}: {key} missing provider_ref in: {formatted}"
+                );
+                if args.iter().any(|(k, _)| *k == "ctx") {
+                    assert!(
+                        formatted.contains("131072"),
+                        "{locale}: {key} missing ctx value in: {formatted}"
+                    );
+                }
+                assert!(
+                    !formatted.contains("{provider_ref}"),
+                    "{locale}: {key} has unformatted placeholder in: {formatted}"
+                );
+                assert!(
+                    !formatted.contains("{ctx}"),
+                    "{locale}: {key} has unformatted placeholder in: {formatted}"
+                );
+            }
+
+            // Test the new update-context-windows about key (no args)
+            let about_formatted = format_cli_string_with_args(
+                &sources,
+                "cli-doctor-update-context-windows-about",
+                &[],
+            )
+            .unwrap_or_else(|| {
+                panic!("{locale}: cli-doctor-update-context-windows-about should format")
+            });
+            assert!(
+                !about_formatted.is_empty(),
+                "{locale}: cli-doctor-update-context-windows-about should not be empty"
+            );
+            if locale == "zh-CN" {
+                assert!(
+                    about_formatted.contains("提供"),
+                    "{locale}: cli-doctor-update-context-windows-about should have Chinese text, got: {about_formatted}"
+                );
+            }
+
+            let bar_formatted = format_cli_string_with_args(
+                &sources,
+                "cli-agent-context-bar",
+                &[
+                    ("used", "1000"),
+                    ("max", "8192"),
+                    ("bar", "██░░"),
+                    ("pct", "12"),
+                ],
+            )
+            .unwrap_or_else(|| panic!("{locale}: cli-agent-context-bar should format"));
+            assert!(
+                bar_formatted.contains("1000"),
+                "{locale}: cli-agent-context-bar missing used value in: {bar_formatted}"
+            );
+            assert!(
+                bar_formatted.contains("8192"),
+                "{locale}: cli-agent-context-bar missing max value in: {bar_formatted}"
+            );
+            assert!(
+                !bar_formatted.contains("{used}"),
+                "{locale}: cli-agent-context-bar has unformatted placeholder in: {bar_formatted}"
+            );
+            assert!(
+                !bar_formatted.contains("{max}"),
+                "{locale}: cli-agent-context-bar has unformatted placeholder in: {bar_formatted}"
+            );
+            assert!(
+                !bar_formatted.contains("{bar}"),
+                "{locale}: cli-agent-context-bar has unformatted placeholder in: {bar_formatted}"
+            );
+            assert!(
+                !bar_formatted.contains("{pct}"),
+                "{locale}: cli-agent-context-bar has unformatted placeholder in: {bar_formatted}"
+            );
+        }
     }
 }

@@ -262,6 +262,8 @@ impl BlueskyChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         })
     }
 
@@ -338,8 +340,9 @@ impl Channel for BlueskyChannel {
 
         // Bluesky posts have a 300-character limit (grapheme clusters).
         // For longer content, truncate with an indicator.
-        let text = if message.content.len() > 300 {
-            format!("{}...", &message.content[..297])
+        let text = if message.content.chars().count() > 300 {
+            let truncated: String = message.content.chars().take(297).collect();
+            format!("{truncated}...")
         } else {
             message.content.clone()
         };
@@ -477,6 +480,15 @@ impl Channel for BlueskyChannel {
 
     async fn health_check(&self) -> bool {
         self.get_access_jwt().await.is_ok()
+    }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator event in the AT Protocol.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 

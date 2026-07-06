@@ -6,12 +6,14 @@
 #![allow(clippy::to_string_in_format_args)]
 #![allow(clippy::useless_format)]
 
+pub mod alias_refs;
 pub mod api_error;
 pub mod autonomy;
 pub mod comment_writer;
 pub mod cost;
 pub mod domain_matcher;
 pub mod env_overrides;
+pub mod field_visibility;
 pub mod helpers;
 pub mod migration;
 pub mod multi_agent;
@@ -19,10 +21,13 @@ pub mod pairing;
 pub mod paths;
 pub mod platform;
 pub mod policy;
+pub mod presets;
 pub mod provider_aliases;
 pub mod providers;
 pub mod scattered_types;
 pub mod schema;
+#[cfg(feature = "schema-export")]
+pub mod schema_markdown;
 pub mod secrets;
 pub mod sections;
 pub mod skill_bundles;
