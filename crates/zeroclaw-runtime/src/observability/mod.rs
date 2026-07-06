@@ -186,6 +186,15 @@ impl Observer for TeeObserver {
 
     fn flush(&self) {
         self.primary.flush();
+        // Fan out to the broadcast hook so short-lived processes (CLI one-shot,
+        // guarded by `FlushGuard`) drain any buffered state — e.g. the Herdr
+        // observer's idle + release_agent notifications — before the runtime
+        // tears down. Long-lived callers (daemon, channels) rely on periodic
+        // export and never construct a `FlushGuard`, so this is a no-op for
+        // them unless they explicitly call `flush()`.
+        if let Some(hook) = current_broadcast_hook() {
+            hook.flush();
+        }
     }
 
     fn name(&self) -> &str {
@@ -669,5 +678,81 @@ mod tests {
         // Dropping after fire must not flush again.
         drop(guard);
         assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    /// `TeeObserver::flush()` must fan out to the broadcast hook, not just
+    /// the primary observer. Without this, short-lived CLI processes would
+    /// exit before buffered hook state (e.g. the Herdr observer's idle +
+    /// release_agent notifications) is drained.
+    #[test]
+    fn tee_observer_flush_drives_broadcast_hook() {
+        let _guard = HOOK_TEST_LOCK.lock();
+        clear_broadcast_hook();
+
+        let hook = Arc::new(CountingObserver::default());
+        set_broadcast_hook(hook.clone());
+
+        let cfg = ObservabilityConfig {
+            backend: ObservabilityBackend::None,
+            ..ObservabilityConfig::default()
+        };
+        let observer = create_observer(&cfg);
+
+        assert_eq!(hook.flushes.load(Ordering::SeqCst), 0);
+        observer.flush();
+        assert_eq!(
+            hook.flushes.load(Ordering::SeqCst),
+            1,
+            "TeeObserver::flush must fan to the broadcast hook"
+        );
+
+        clear_broadcast_hook();
+    }
+
+    /// `FlushGuard::drop` drives `TeeObserver::flush()`, which must in turn
+    /// flush the broadcast hook while it is still installed. This mirrors the
+    /// CLI teardown path in `run()`, where the Herdr `BroadcastHookGuard` is
+    /// declared before the `FlushGuard` so the hook is still live when the
+    /// flush fires.
+    #[test]
+    fn flush_guard_drains_broadcast_hook_on_drop() {
+        let _guard = HOOK_TEST_LOCK.lock();
+        clear_broadcast_hook();
+
+        let hook = Arc::new(CountingObserver::default());
+        let _hook_guard = set_scoped_broadcast_hook(hook.clone());
+
+        let cfg = ObservabilityConfig {
+            backend: ObservabilityBackend::None,
+            ..ObservabilityConfig::default()
+        };
+        let observer: Arc<dyn Observer> = Arc::from(create_observer(&cfg));
+
+        assert_eq!(hook.flushes.load(Ordering::SeqCst), 0);
+
+        // Drop the FlushGuard first — this is the production drop order
+        // (FlushGuard declared after BroadcastHookGuard, so drops first).
+        // The hook must be flushed while still installed.
+        {
+            let _flush_guard = FlushGuard::new(observer.clone());
+            assert_eq!(hook.flushes.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(
+            hook.flushes.load(Ordering::SeqCst),
+            1,
+            "FlushGuard::drop must flush the broadcast hook while it is still installed"
+        );
+
+        // Now drop the hook guard; the hook is removed and subsequent flushes
+        // must not reach it.
+        drop(_hook_guard);
+        observer.flush();
+        assert_eq!(
+            hook.flushes.load(Ordering::SeqCst),
+            1,
+            "no further flushes after the hook is uninstalled"
+        );
+
+        clear_broadcast_hook();
     }
 }

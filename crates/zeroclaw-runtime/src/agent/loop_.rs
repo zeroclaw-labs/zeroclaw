@@ -1229,6 +1229,16 @@ pub async fn run(
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
         let turn_id = uuid::Uuid::new_v4().to_string();
         let channel_name = if interactive { "cli" } else { "daemon" };
+        // Install the Herdr broadcast hook BEFORE the FlushGuard so that, on
+        // teardown, Rust's reverse-declaration drop order fires the FlushGuard
+        // first — while the Herdr hook is still installed — and the Herdr
+        // observer's idle + release_agent notifications get drained via
+        // `TeeObserver::flush()` fanning out to the broadcast hook. The Herdr
+        // guard then drops, removing the hook and releasing the I/O thread.
+        // Daemon/cron/subagent callers pass `interactive = false`; the Herdr
+        // integration is CLI-interactive-only and must not mutate pane state
+        // from those paths.
+        let _herdr_guard = crate::integrations::herdr::try_install_hook(interactive);
         // CLI one-shot / REPL (`interactive = true`) exits before the OTLP batch
         // exporter's background interval fires. Hold a FlushGuard for the rest of
         // this body so every return path — including `?` errors — pushes buffered
@@ -1250,7 +1260,6 @@ pub async fn run(
                  Prometheus is intended for long-running (daemon) deployments."
             );
         }
-        let _herdr_guard = crate::integrations::herdr::try_install_hook();
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let is_subagent_caller = overrides.is_subagent;

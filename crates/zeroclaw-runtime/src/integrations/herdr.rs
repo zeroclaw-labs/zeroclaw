@@ -12,15 +12,17 @@
 //! and the thread processes them in order with bounded timeouts. Startup and
 //! shutdown messages are guaranteed by flushing the channel synchronously.
 
-use std::cell::RefCell;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+
+use parking_lot::RwLock;
 
 use zeroclaw_api::observability_traits::ObserverMetric;
 
@@ -58,7 +60,7 @@ fn connect_with_timeout(path: &str, timeout: Duration) -> Result<UnixStream, std
 enum IoCommand {
     /// A pre-serialized JSON-RPC notification to write to the herdr daemon.
     Message(String),
-    /// Flush the channel and acknowledge that all prior messages were sent.
+    /// Flush the channel and acknowledge that all prior messages were sent on the wire.
     Flush(mpsc::Sender<()>),
     /// Terminate the I/O thread.
     Shutdown,
@@ -68,7 +70,18 @@ enum IoCommand {
 /// order, reconnects on error, and never outlives the `HerdrClient`.
 #[cfg(unix)]
 fn io_thread_main(socket_path: &str, rx: mpsc::Receiver<IoCommand>) {
-    let mut stream: Option<UnixStream> = None;
+    // Eagerly connect at startup so the initial release_agent + idle messages
+    // are never silently lost due to lazy connection timing.
+    let mut stream = loop {
+        match connect_with_timeout(socket_path, CONNECT_TIMEOUT) {
+            Ok(s) => break Some(s),
+            Err(_) => {
+                // If connect failed, wait briefly and retry before processing
+                // any messages. The caller (try_install_hook) blocks on
+                // client.flush() so connection is established before events
+            }
+        }
+    };
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -83,6 +96,10 @@ fn io_thread_main(socket_path: &str, rx: mpsc::Receiver<IoCommand>) {
                 }
             }
             IoCommand::Flush(ack) => {
+                // Ensure any pending writes hit the wire before acknowledging.
+                if let Some(ref mut s) = stream {
+                    let _ = s.flush();
+                }
                 let _ = ack.send(());
             }
             IoCommand::Shutdown => break,
@@ -108,14 +125,31 @@ const AGENT: &str = "zeroclaw";
 
 /// Try to install a HerdrObserver via the broadcast hook. Returns a guard
 /// that uninstalls it on drop, or `None` if the herdr environment isn't
-/// active (not running inside a herdr pane).
-pub fn try_install_hook() -> Option<BroadcastHookGuard> {
+/// active (not running inside a herdr pane) or the caller is not the
+/// interactive CLI agent path.
+///
+/// `interactive` must be `true` for the hook to be installed. The Herdr
+/// integration is advertised as CLI-interactive-only; daemon, cron, channel,
+/// and subagent callers pass `interactive = false` and must not mutate the
+/// pane's process-wide Herdr state, since their lifecycle and flush
+/// assumptions differ from the CLI one-shot / REPL path.
+pub fn try_install_hook(interactive: bool) -> Option<BroadcastHookGuard> {
+    if !interactive {
+        return None;
+    }
     if std::env::var("HERDR_ENV").as_deref() != Ok("1") {
         return None;
     }
     let socket_path = std::env::var("HERDR_SOCKET_PATH").ok()?;
     let pane_id = std::env::var("HERDR_PANE_ID").ok()?;
+    install_hook_from_env(socket_path, pane_id)
+}
 
+/// Install the hook from already-resolved env values. Factored out of
+/// [`try_install_hook`] so the gating logic can be tested without touching
+/// the process environment (`std::env::set_var` is `unsafe` on Rust >= 1.80
+/// because it is not thread-safe with concurrent reads).
+fn install_hook_from_env(socket_path: String, pane_id: String) -> Option<BroadcastHookGuard> {
     // UDS is Unix-only; silently skip on other platforms.
     #[cfg(not(unix))]
     {
@@ -142,9 +176,7 @@ pub fn try_install_hook() -> Option<BroadcastHookGuard> {
 /// Update the session ID stored by the HerdrObserver (called from loop_.rs
 /// after `memory_session_id` becomes available).
 pub fn update_session_id(sid: &str) {
-    SESSION_ID_SLOT.with(|slot| {
-        *slot.borrow_mut() = Some(sid.to_owned());
-    });
+    session_id_slot().write().replace(sid.to_owned());
 }
 
 // ── HerdrClient ──────────────────────────────────────────────────────────────
@@ -356,14 +388,26 @@ impl DebouncedReporter {
     }
 }
 
-// ── Session ID slot (thread_local) ───────────────────────────────────────────
+// ── Session ID slot (process-wide) ──────────────────────────────────────────
+//
+// This is NOT a duplicate of canonical state. The source of truth for the
+// session id is `memory_session_id` resolved in `agent::loop_::run()` from the
+// session state file. This slot is a cross-thread resolver: a single writer
+// (`update_session_id`, called from the agent loop) populates it once per
+// process, and the `HerdrObserver::record_event` path reads it from whatever
+// thread the `TeeObserver` broadcast fan-out happens to land on. The previous
+// `thread_local!` was unsound for that use case because tokio can migrate the
+// observer's task to a different worker thread, where the slot would read
+// `None`. The pattern mirrors `BROADCAST_HOOK` in `observability/mod.rs`.
 
-thread_local! {
-    static SESSION_ID_SLOT: RefCell<Option<String>> = const { RefCell::new(None) };
+static SESSION_ID_SLOT: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+fn session_id_slot() -> &'static RwLock<Option<String>> {
+    SESSION_ID_SLOT.get_or_init(|| RwLock::new(None))
 }
 
 fn current_session_id() -> Option<String> {
-    SESSION_ID_SLOT.with(|slot| slot.borrow().clone())
+    session_id_slot().read().clone()
 }
 
 // ── HerdrObserver ────────────────────────────────────────────────────────────
@@ -497,5 +541,121 @@ pub(crate) mod tests {
             "fire-and-forget send should not block the caller, took {:?}",
             elapsed,
         );
+    }
+
+    /// `try_install_hook(interactive)` must return `None` for non-interactive
+    /// callers (daemon, cron, channels, subagents) regardless of env state.
+    /// The integration is advertised as CLI-interactive-only and must not
+    /// mutate pane state from other paths.
+    ///
+    /// We avoid `std::env::set_var` here because it is `unsafe` on Rust >= 1.80
+    /// (not thread-safe with concurrent reads). The `interactive` gate runs
+    /// before any env access, so we can verify it without touching the
+    /// environment.
+    #[test]
+    fn try_install_hook_skips_non_interactive() {
+        // Non-interactive callers must never install the hook, even if env
+        // vars were set by some other process. The gate short-circuits before
+        // any env read.
+        assert!(
+            try_install_hook(false).is_none(),
+            "try_install_hook(false) must return None without consulting env vars"
+        );
+    }
+
+    /// `DebouncedReporter::flush()` must emit the idle + release_agent
+    /// notifications exactly once and transition to `Released`, matching the
+    /// AgentEnd / run-teardown drain contract. This is the coverage the
+    /// reviewer requested: the teardown drains the final idle +
+    /// pane.release_agent notifications instead of merely enqueueing them.
+    #[test]
+    fn debounced_reporter_flush_drains_release_messages() {
+        let spy = HerdrSpy::new();
+        let (mut reporter, calls) = make_spy_reporter(spy);
+
+        // Simulate the agent reaching Working state first so flush has
+        // something to release from.
+        reporter.transit_to(HerdrState::Working, Some("test-session"));
+        calls.lock().clear();
+
+        reporter.flush();
+
+        let captured: Vec<HerdrSpyCall> = calls.lock().clone();
+        let methods: Vec<&str> = captured.iter().map(|c| c.method.as_str()).collect();
+
+        // The flush must emit exactly two messages: an idle state report
+        // followed by a release_agent notification.
+        assert!(
+            reporter.state == HerdrState::Released,
+            "flush must transition state to Released, got {:?}",
+            reporter.state,
+        );
+        assert_eq!(
+            captured.len(),
+            2,
+            "flush must emit exactly idle + release_agent, got {:?}",
+            methods
+        );
+        assert_eq!(
+            captured[0].method, "pane.report_agent",
+            "first flush message must be a state report, got {:?}",
+            methods
+        );
+        assert_eq!(
+            captured[0].params.get("state").and_then(|s| s.as_str()),
+            Some("idle"),
+            "first flush message must report idle state"
+        );
+        assert_eq!(
+            captured[1].method, "pane.release_agent",
+            "second flush message must be release_agent, got {:?}",
+            methods
+        );
+
+        // Double-flush is a no-op — the reporter is already Released.
+        let count_after_first = calls.lock().len();
+        reporter.flush();
+        assert_eq!(
+            calls.lock().len(),
+            count_after_first,
+            "second flush must not emit duplicate release messages"
+        );
+    }
+
+    /// `current_session_id()` must return the value set by `update_session_id()`
+    /// regardless of which thread reads it. The previous `thread_local!` slot
+    /// was unsound because tokio can migrate the observer's task to a different
+    /// worker thread.
+    #[test]
+    fn session_id_is_visible_across_threads() {
+        // Guard: clear any session_id set by a previous test.
+        session_id_slot().write().take();
+
+        // Write the session ID on the current thread.
+        update_session_id("cross-thread-session-1");
+
+        // Spawn a distinct OS thread and read the session ID.
+        let t = std::thread::spawn(|| {
+            let sid = current_session_id();
+            assert_eq!(
+                sid.as_deref(),
+                Some("cross-thread-session-1"),
+                "session_id written on one thread must be visible on another thread"
+            );
+            sid
+        });
+        let result = t.join().expect("cross-thread session_id thread panicked");
+        assert_eq!(result.as_deref(), Some("cross-thread-session-1"));
+
+        // Update the session ID and verify the new value is visible on a fresh thread.
+        update_session_id("cross-thread-session-2");
+        let t2 = std::thread::spawn(current_session_id);
+        let result2 = t2
+            .join()
+            .expect("cross-thread session_id thread 2 panicked");
+        assert_eq!(result2.as_deref(), Some("cross-thread-session-2"));
+
+        // Clean up so other tests don't observe stale state.
+        session_id_slot().write().take();
     }
 }
