@@ -11,6 +11,7 @@ import {
   type NodeRunState,
   type SopGraph,
   type GraphNode,
+  type GraphPin,
   type GraphWire,
   type FlowRole,
 } from '@/lib/sops';
@@ -81,6 +82,25 @@ function switchPortY(nodeY: number, index: number): number {
   return nodeY + SWITCH_PORT_TOP + index * SWITCH_PORT_GAP;
 }
 
+const DATA_PIN_TOP = 68;
+const DATA_PIN_GAP = 15;
+function dataPinY(nodeY: number, index: number): number {
+  return nodeY + DATA_PIN_TOP + index * DATA_PIN_GAP;
+}
+
+function dataPins(node: GraphNode, side: 'inputs' | 'outputs'): GraphPin[] {
+  return node[side].filter((p) => p.class === 'data');
+}
+
+function nodeHeight(node: GraphNode): number {
+  const pinRows = Math.max(dataPins(node, 'inputs').length, dataPins(node, 'outputs').length);
+  return NODE_H + (pinRows > 0 ? pinRows * DATA_PIN_GAP + 8 : 0);
+}
+
+function dataTypesCompatible(from: string | null, to: string | null): boolean {
+  return from === null || to === null || from === to;
+}
+
 // Vertical offsets of the default output handles from the node's vertical
 // center. Wires must leave from the handle that spawned them, not from a
 // single midpoint, or the rope visually detaches from its port.
@@ -102,6 +122,8 @@ interface Props {
   onRemoveStep?: (n: number) => void;
   onConnect: (from: number, to: number, kind: FlowRole, portIndex?: number) => void;
   onDisconnect: (from: number, to: number, kind: FlowRole, portIndex?: number) => void;
+  onConnectData: (fromStep: number, fromPin: string, toStep: number, toPin: string) => void;
+  onDisconnectData: (toStep: number, toPin: string) => void;
 }
 
 type ContextMenu = { x: number; y: number; step: number | null };
@@ -140,12 +162,15 @@ export default function SopCanvas({
   onRemoveStep,
   onConnect,
   onDisconnect,
+  onConnectData,
+  onDisconnectData,
 }: Props) {
   const [pos, setPos] = useState<Map<number, XY>>(() => seedPositions(graph));
   const [drag, setDrag] = useState<{ step: number; dx: number; dy: number } | null>(null);
   const [linkFrom, setLinkFrom] = useState<number | null>(null);
   const [linkKind, setLinkKind] = useState<FlowRole>('sequence');
   const [linkPort, setLinkPort] = useState<number | undefined>(undefined);
+  const [dataLink, setDataLink] = useState<{ step: number; pin: string; dataType: string | null } | null>(null);
   const [cursor, setCursor] = useState<XY | null>(null);
   const [hoverWire, setHoverWire] = useState<number | null>(null);
   const [menu, setMenu] = useState<ContextMenu | null>(null);
@@ -201,9 +226,9 @@ export default function SopCanvas({
           return next;
         });
       }
-      if (linkFrom !== null) setCursor(p);
+      if (linkFrom !== null || dataLink !== null) setCursor(p);
     },
-    [drag, linkFrom, toLocal],
+    [drag, linkFrom, dataLink, toLocal],
   );
 
   const endDrag = useCallback(() => {
@@ -246,6 +271,25 @@ export default function SopCanvas({
     setLinkPort(port);
     setLinkFrom(step);
   }, []);
+
+  const startDataLink = useCallback((step: number, pin: string, dataType: string | null) => {
+    setDataLink({ step, pin, dataType });
+  }, []);
+
+  const completeDataLink = useCallback(
+    (toStep: number, toPin: string, toType: string | null) => {
+      if (
+        dataLink !== null &&
+        dataLink.step !== toStep &&
+        dataTypesCompatible(dataLink.dataType, toType)
+      ) {
+        onConnectData(dataLink.step, dataLink.pin, toStep, toPin);
+      }
+      setDataLink(null);
+      setCursor(null);
+    },
+    [dataLink, onConnectData],
+  );
 
   const completeLink = useCallback(
     (target: number) => {
@@ -493,6 +537,56 @@ export default function SopCanvas({
               </g>
             );
           })}
+        {graph.wires
+          .filter((w) => w.class === 'data')
+          .map((w, i) => {
+            const a = pos.get(w.from_step);
+            const b = pos.get(w.to_step);
+            if (!a || !b) return null;
+            const fromNode = nodeByStep.get(w.from_step);
+            const toNode = nodeByStep.get(w.to_step);
+            const fromIdx = fromNode
+              ? dataPins(fromNode, 'outputs').findIndex((p) => p.name === w.from_pin)
+              : -1;
+            const toIdx = toNode
+              ? dataPins(toNode, 'inputs').findIndex((p) => p.name === w.to_pin)
+              : -1;
+            const srcY = fromIdx >= 0 ? dataPinY(a.y, fromIdx) : a.y + NODE_H / 2;
+            const dstY = toIdx >= 0 ? dataPinY(b.y, toIdx) : b.y + NODE_H / 2;
+            const d = edgePath(a, b, srcY, dstY);
+            const hovered = hoverWire === -(i + 1);
+            return (
+              <g key={`data-wire-${i}`}>
+                <path
+                  d={d}
+                  fill="none"
+                  stroke="transparent"
+                  strokeWidth={12}
+                  pointerEvents="stroke"
+                  className={readOnly ? '' : 'cursor-pointer'}
+                  onPointerEnter={() => setHoverWire(-(i + 1))}
+                  onPointerLeave={() => setHoverWire((h) => (h === -(i + 1) ? null : h))}
+                  onPointerDown={(e) => {
+                    e.stopPropagation();
+                    if (readOnly || !w.to_pin) return;
+                    onDisconnectData(w.to_step, w.to_pin);
+                  }}
+                >
+                  <title>{t('sops.data_wire_delete_hint')}</title>
+                </path>
+                <path
+                  d={d}
+                  fill="none"
+                  stroke={hovered ? 'var(--color-status-error)' : WIRE_STROKE.data}
+                  strokeWidth={hovered ? 2.5 : 1.75}
+                  strokeDasharray="2 3"
+                  markerEnd="url(#sop-arrow)"
+                  opacity={hovered ? 1 : 0.8}
+                  pointerEvents="none"
+                />
+              </g>
+            );
+          })}
         {linkFrom !== null && cursor && pos.get(linkFrom) ? (
           <path
             d={edgePath(
@@ -509,6 +603,26 @@ export default function SopCanvas({
             strokeWidth={1.75}
             strokeDasharray="4 4"
           />
+        ) : null}
+        {dataLink !== null && cursor && pos.get(dataLink.step) ? (
+          (() => {
+            const src = pos.get(dataLink.step) as XY;
+            const node = nodeByStep.get(dataLink.step);
+            const idx = node ? dataPins(node, 'outputs').findIndex((p) => p.name === dataLink.pin) : -1;
+            return (
+              <path
+                d={edgePath(
+                  src,
+                  { x: cursor.x - NODE_W, y: cursor.y - NODE_H / 2 },
+                  idx >= 0 ? dataPinY(src.y, idx) : undefined,
+                )}
+                fill="none"
+                stroke={WIRE_STROKE.data}
+                strokeWidth={1.75}
+                strokeDasharray="2 3"
+              />
+            );
+          })()
         ) : null}
         {graph.nodes.map((node) => {
           const p = pos.get(node.step);
@@ -586,7 +700,7 @@ export default function SopCanvas({
       >
         <rect
           width={NODE_W}
-          height={NODE_H}
+          height={nodeHeight(node)}
           rx={10}
           fill="var(--pc-bg-surface)"
           stroke={nodeStateStroke(state)}
@@ -697,6 +811,63 @@ export default function SopCanvas({
           </g>
         )}
         <circle cx={0} cy={NODE_H / 2} r={5} fill="var(--pc-border-strong)" />
+        {dataPins(node, 'inputs').map((pin, di) => {
+          const active = dataLink !== null && dataTypesCompatible(dataLink.dataType, pin.data_type ?? null);
+          return (
+            <g key={`din-${pin.name}`}>
+              <circle
+                cx={0}
+                cy={dataPinY(0, di)}
+                r={5}
+                fill={active ? WIRE_STROKE.data : 'var(--pc-bg-surface)'}
+                stroke={WIRE_STROKE.data}
+                strokeWidth={1.5}
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  if (readOnly) return;
+                  if (dataLink !== null) completeDataLink(node.step, pin.name, pin.data_type ?? null);
+                }}
+                onPointerUp={(e) => {
+                  e.stopPropagation();
+                  if (!readOnly && dataLink !== null) {
+                    completeDataLink(node.step, pin.name, pin.data_type ?? null);
+                  }
+                }}
+                className="cursor-crosshair"
+              >
+                <title>
+                  {pin.name}: {pin.data_type ?? t('sops.pin_any')}
+                  {pin.required ? ` (${t('sops.pin_required')})` : ''}
+                </title>
+              </circle>
+              <text x={10} y={dataPinY(0, di) + 3} fontSize="9" fill="var(--pc-text-muted)">
+                {pin.name.slice(0, 18)}
+              </text>
+            </g>
+          );
+        })}
+        {dataPins(node, 'outputs').map((pin, di) => (
+          <g key={`dout-${pin.name}`}>
+            <circle
+              cx={NODE_W}
+              cy={dataPinY(0, di)}
+              r={5}
+              fill={WIRE_STROKE.data}
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                if (!readOnly) startDataLink(node.step, pin.name, pin.data_type ?? null);
+              }}
+              className="cursor-crosshair"
+            >
+              <title>
+                {pin.name}: {pin.data_type ?? t('sops.pin_any')}
+              </title>
+            </circle>
+            <text x={NODE_W - 10} y={dataPinY(0, di) + 3} fontSize="9" textAnchor="end" fill="var(--pc-text-muted)">
+              {pin.name.slice(0, 18)}
+            </text>
+          </g>
+        ))}
       </g>
     );
   }

@@ -50,6 +50,47 @@ function blankStep(number: number): SopStep {
 
 const DRAFT_STORAGE_KEY = 'zeroclaw_sop_draft';
 
+function setArgAtPath(
+  root: Record<string, unknown>,
+  segments: string[],
+  value: string | null,
+): Record<string, unknown> {
+  const head = segments[0];
+  if (head === undefined) return root;
+  const rest = segments.slice(1);
+  const next = { ...root };
+  if (rest.length === 0) {
+    if (value === null) delete next[head];
+    else next[head] = value;
+    return next;
+  }
+  const child = typeof next[head] === 'object' && next[head] !== null ? (next[head] as Record<string, unknown>) : {};
+  next[head] = setArgAtPath(child, rest, value);
+  return next;
+}
+
+function writeStepBinding(sop: Sop, toStep: number, toPin: string, value: string | null): Sop {
+  const segments = toPin.split('.');
+  if (segments[0] !== 'calls') return sop;
+  const callIdx = Number(segments[1]);
+  const argSegments = segments.slice(2);
+  if (Number.isNaN(callIdx) || argSegments.length === 0) return sop;
+  return {
+    ...sop,
+    steps: sop.steps.map((step) => {
+      if (step.number !== toStep || !step.calls) return step;
+      return {
+        ...step,
+        calls: step.calls.map((call, idx) => {
+          if (idx !== callIdx) return call;
+          const args = (call.args ?? {}) as Record<string, unknown>;
+          return { ...call, args: setArgAtPath(args, argSegments, value) };
+        }),
+      };
+    }),
+  };
+}
+
 function loadStoredDraft(): Sop | null {
   try {
     const raw = sessionStorage.getItem(DRAFT_STORAGE_KEY);
@@ -1116,6 +1157,41 @@ export default function Sops() {
     [],
   );
 
+  const onConnectData = useCallback(
+    (fromStep: number, fromPin: string, toStep: number, toPin: string) => {
+      const binding = `{{steps.${fromStep}.${fromPin}}}`;
+      setDraft((d) => {
+        if (!d) return d;
+        const next = writeStepBinding(d, toStep, toPin, binding);
+        graphDraft(next)
+          .then((g) => {
+            setDraft(next);
+            setDraftGraph(g);
+          })
+          .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
+        return next;
+      });
+    },
+    [],
+  );
+
+  const onDisconnectData = useCallback(
+    (toStep: number, toPin: string) => {
+      setDraft((d) => {
+        if (!d) return d;
+        const next = writeStepBinding(d, toStep, toPin, null);
+        graphDraft(next)
+          .then((g) => {
+            setDraft(next);
+            setDraftGraph(g);
+          })
+          .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
+        return next;
+      });
+    },
+    [],
+  );
+
   // Reproject the draft graph from the backend whenever the draft changes so
   // the canvas reflects trigger fan-in, data wires, pins, and layout without
   // re-deriving graph shape client-side. Single source: `graphDraft`.
@@ -1410,6 +1486,8 @@ export default function Sops() {
               }}
               onConnect={onConnect}
               onDisconnect={onDisconnect}
+              onConnectData={onConnectData}
+              onDisconnectData={onDisconnectData}
             />
           ) : null}
         </div>
@@ -1511,6 +1589,8 @@ export default function Sops() {
                     onAddStep={noop}
                     onConnect={noop}
                     onDisconnect={noop}
+                    onConnectData={noop}
+                    onDisconnectData={noop}
                   />
                 ) : (
                   <SopFieldList graph={graph} overlay={overlay} />
