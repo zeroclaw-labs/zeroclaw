@@ -455,6 +455,10 @@ impl App {
         Ok(())
     }
 
+    pub(crate) fn zerocode_ui_config(&self) -> crate::config::UiSection {
+        self.zerocode.ui_config()
+    }
+
     /// Draw the current screen into the given area, beneath the Config
     /// section sub-tab bar (`zeroclaw` / `zerocode`).
     pub(crate) fn draw_into(&mut self, frame: &mut Frame, area: Rect) {

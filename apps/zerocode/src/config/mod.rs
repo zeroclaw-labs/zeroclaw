@@ -66,18 +66,53 @@ impl Default for ThemeSection {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum UiProfile {
-    #[default]
-    Minimal,
-    Rich,
+macro_rules! ui_profiles {
+    ($($variant:ident => ($wire:literal, $fluent:literal)),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub(crate) enum UiProfile {
+            #[default]
+            $($variant),+
+        }
+
+        impl UiProfile {
+            pub(crate) fn variants() -> &'static [Self] {
+                &[$(Self::$variant),+]
+            }
+
+            pub(crate) fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $wire),+
+                }
+            }
+
+            pub(crate) fn fluent_key(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $fluent),+
+                }
+            }
+
+            fn parse(raw: &str) -> Option<Self> {
+                Self::variants()
+                    .iter()
+                    .copied()
+                    .find(|profile| profile.as_str() == raw)
+            }
+        }
+    };
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+ui_profiles! {
+    Minimal => ("minimal", "zc-zerocode-ui-profile-minimal"),
+    Rich => ("rich", "zc-zerocode-ui-profile-rich"),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct UiSection {
     #[serde(default, skip_serializing_if = "is_false")]
     pub show_chat_pane: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub show_adaptive_sidebar: bool,
     #[serde(
         default,
         deserialize_with = "deserialize_ui_profile_or_default",
@@ -86,14 +121,32 @@ pub(crate) struct UiSection {
     pub profile: UiProfile,
 }
 
+impl Default for UiSection {
+    fn default() -> Self {
+        Self {
+            show_chat_pane: false,
+            show_adaptive_sidebar: true,
+            profile: UiProfile::default(),
+        }
+    }
+}
+
 impl UiSection {
     fn is_empty(&self) -> bool {
-        !self.show_chat_pane && self.profile == UiProfile::default()
+        !self.show_chat_pane && self.show_adaptive_sidebar && self.profile == UiProfile::default()
     }
 }
 
 fn is_default_ui_profile(profile: &UiProfile) -> bool {
     *profile == UiProfile::default()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 fn deserialize_ui_profile_or_default<'de, D>(deserializer: D) -> Result<UiProfile, D::Error>
@@ -107,11 +160,8 @@ where
             return Ok(UiProfile::default());
         }
     };
-    if raw == "minimal" {
-        return Ok(UiProfile::Minimal);
-    }
-    if raw == "rich" {
-        return Ok(UiProfile::Rich);
+    if let Some(profile) = UiProfile::parse(&raw) {
+        return Ok(profile);
     }
     eprintln!("zerocode: unknown [ui].profile '{raw}'; using minimal");
     Ok(UiProfile::default())
@@ -421,6 +471,26 @@ fn section_mut_path<'a>(doc: &'a mut toml::Table, keys: &[&str]) -> Result<&'a m
     Ok(cur)
 }
 
+pub(crate) fn persist_ui_profile(config_dir: &Path, profile: UiProfile) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    section_mut(&mut doc, "ui")?.insert(
+        "profile".to_string(),
+        toml::Value::String(profile.as_str().to_string()),
+    );
+    write_document(&path, &doc)
+}
+
+pub(crate) fn persist_show_adaptive_sidebar(config_dir: &Path, enabled: bool) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    section_mut(&mut doc, "ui")?.insert(
+        "show_adaptive_sidebar".to_string(),
+        toml::Value::Boolean(enabled),
+    );
+    write_document(&path, &doc)
+}
+
 pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> {
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
@@ -596,6 +666,31 @@ mod tests {
         assert_eq!(c.ui.profile, UiProfile::Rich);
         let body = toml::to_string_pretty(&c).unwrap();
         assert!(body.contains("profile = \"rich\""), "{body}");
+    }
+
+    #[test]
+    fn ui_profile_variants_are_the_config_registry() {
+        assert!(UiProfile::variants().contains(&UiProfile::Minimal));
+        assert!(UiProfile::variants().contains(&UiProfile::Rich));
+        for profile in UiProfile::variants() {
+            assert_eq!(UiProfile::parse(profile.as_str()), Some(*profile));
+        }
+    }
+
+    #[test]
+    fn persist_ui_settings_preserves_other_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"dracula\"\n\n[ui]\nshow_chat_pane = true\n",
+        );
+        persist_ui_profile(dir.path(), UiProfile::Rich).unwrap();
+        persist_show_adaptive_sidebar(dir.path(), false).unwrap();
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert_eq!(cfg.theme.name, "dracula");
+        assert!(cfg.ui.show_chat_pane);
+        assert_eq!(cfg.ui.profile, UiProfile::Rich);
+        assert!(!cfg.ui.show_adaptive_sidebar);
     }
 
     #[test]

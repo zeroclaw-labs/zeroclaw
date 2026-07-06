@@ -31,7 +31,7 @@ use crate::jsonrpc::RpcOutbound;
 use crate::mouse;
 use crate::theme;
 use crate::turn_status::TurnStatus;
-use crate::ui_render_spec::{RailMode, ThoughtMode, UiRenderSpec};
+use crate::ui_render_spec::{RailMode, SessionStatusMode, ThoughtMode, UiRenderSpec};
 use crate::wire::ToolPresentation;
 
 // Height of the approval popup anchored to the bottom of the content area.
@@ -120,6 +120,7 @@ pub(crate) struct Transcript {
     phase: TranscriptPhase,
     pane_kind: PaneKind,
     ui_profile: UiProfile,
+    show_adaptive_sidebar: bool,
     /// One-shot session id to reattach to on the next session start, set by
     /// the app layer across a reconnect so the rebuilt pane resumes the
     /// pre-disconnect session (the daemon retains it, #7182) instead of
@@ -234,6 +235,7 @@ impl Transcript {
             },
             pane_kind,
             ui_profile,
+            show_adaptive_sidebar: true,
             resume_session_id: None,
             resume_agent_alias: None,
             pick_agent_list_area: Rect::default(),
@@ -252,6 +254,16 @@ impl Transcript {
         self.ui_profile = profile;
         if let TranscriptPhase::Active(state) = &mut self.phase {
             state.set_ui_profile(profile);
+        }
+    }
+
+    pub(crate) fn set_adaptive_sidebar_visible(&mut self, visible: bool) {
+        if self.show_adaptive_sidebar == visible {
+            return;
+        }
+        self.show_adaptive_sidebar = visible;
+        if let TranscriptPhase::Active(state) = &mut self.phase {
+            state.set_adaptive_sidebar_visible(visible);
         }
     }
 
@@ -519,6 +531,7 @@ impl Transcript {
                     session.session_id,
                     agent_alias.to_string(),
                     self.ui_profile,
+                    self.show_adaptive_sidebar,
                 );
                 if self.pane_kind == PaneKind::Code {
                     state.cwd = session.workspace_dir;
@@ -2960,7 +2973,8 @@ fn draw_error(frame: &mut Frame, area: Rect, msg: &str, tab_title: &str) {
 // ── Active code transcript rendering ────────────────────────────────────────
 
 fn render(f: &mut Frame, state: &mut TranscriptState, area: Rect) {
-    let area = if state.adaptive_sidebar_open(area.width) {
+    let sidebar_open = state.adaptive_sidebar_open(area.width);
+    let area = if sidebar_open {
         let sidebar_w = state.queue_sidebar_width(area.width);
         let cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -3002,20 +3016,30 @@ fn render(f: &mut Frame, state: &mut TranscriptState, area: Rect) {
         queue_paused_hint.as_deref(),
     );
 
+    let spec = state.render_spec();
+    let status_text = if sidebar_open {
+        None
+    } else {
+        session_status_text(state, conv_area.width as usize, &spec)
+    };
     let actual_conv = if conv_area.height > 1 {
-        let status_row = Rect::new(
-            conv_area.x,
-            conv_area.y + conv_area.height - 1,
-            conv_area.width,
-            1,
-        );
-        render_session_status_row(f, state, status_row);
-        Rect::new(
-            conv_area.x,
-            conv_area.y,
-            conv_area.width,
-            conv_area.height - 1,
-        )
+        if let Some(text) = status_text {
+            let status_row = Rect::new(
+                conv_area.x,
+                conv_area.y + conv_area.height - 1,
+                conv_area.width,
+                1,
+            );
+            render_session_status_row(f, status_row, text);
+            Rect::new(
+                conv_area.x,
+                conv_area.y,
+                conv_area.width,
+                conv_area.height - 1,
+            )
+        } else {
+            conv_area
+        }
     } else {
         conv_area
     };
@@ -3147,8 +3171,7 @@ fn queue_sidebar_help_entries() -> Vec<crate::widgets::HelpEntry> {
     ]
 }
 
-fn render_session_status_row(f: &mut Frame, state: &TranscriptState, area: Rect) {
-    let text = session_status_text(state, area.width as usize);
+fn render_session_status_row(f: &mut Frame, area: Rect, text: String) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(text, theme::dim_style())))
             .alignment(Alignment::Left),
@@ -3156,19 +3179,17 @@ fn render_session_status_row(f: &mut Frame, state: &TranscriptState, area: Rect)
     );
 }
 
-fn session_status_text(state: &TranscriptState, width: usize) -> String {
-    let mut parts = vec![state.agent_alias.clone()];
-    if let Some(provider) = &state.model_provider_ref {
-        let model = state.model.as_deref().unwrap_or("model");
-        parts.push(format!("{provider}/{model}"));
-    } else if let Some(model) = &state.model {
-        parts.push(model.clone());
+fn session_status_text(
+    state: &TranscriptState,
+    width: usize,
+    spec: &UiRenderSpec,
+) -> Option<String> {
+    match spec.status.session_row {
+        SessionStatusMode::Hidden => None,
+        SessionStatusMode::Workspace => {
+            workspace_status_text(state).map(|text| first_line_preview(&format!(" {text} "), width))
+        }
     }
-    if let Some(cwd) = cwd_status_text(state) {
-        parts.push(cwd);
-    }
-    let line = format!(" {} ", parts.join(" · "));
-    first_line_preview(&line, width)
 }
 
 fn cwd_status_text(state: &TranscriptState) -> Option<String> {
@@ -3185,6 +3206,24 @@ fn cwd_status_text(state: &TranscriptState) -> Option<String> {
         text.push(')');
     }
     Some(text)
+}
+
+fn workspace_status_text(state: &TranscriptState) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(cwd) = state.cwd.as_ref().filter(|cwd| !cwd.is_empty()) {
+        parts.push(cwd.clone());
+    }
+    if let Some(branch) = state
+        .git_branch
+        .as_ref()
+        .filter(|branch| !branch.is_empty())
+    {
+        parts.push(branch.clone());
+    }
+    if let Some(hash) = state.git_hash.as_ref().filter(|hash| !hash.is_empty()) {
+        parts.push(hash.clone());
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 fn render_adaptive_sidebar(f: &mut Frame, state: &mut TranscriptState, area: Rect) {
@@ -3759,9 +3798,9 @@ enum TranscriptRail {
 impl TranscriptRail {
     fn style(self) -> Style {
         match self {
-            Self::User => theme::user_label_style(),
-            Self::Agent => theme::agent_label_style(),
-            Self::Tool => theme::tool_label_style(),
+            Self::User => theme::user_rail_style(),
+            Self::Agent => theme::agent_rail_style(),
+            Self::Tool => theme::tool_rail_style(),
         }
     }
 }
@@ -5296,6 +5335,7 @@ pub struct TranscriptState {
     queue_paused: bool,
     resume_override: bool,
     cancel_started_at: Option<Instant>,
+    show_adaptive_sidebar: bool,
     queue_sidebar_cols: u16,
     /// Selected queued message id for sidebar edit/delete.
     queue_sel: Option<u64>,
@@ -5327,7 +5367,12 @@ impl TranscriptState {
         self.mark_dirty_full();
     }
 
-    pub fn new(session_id: String, agent_alias: String, ui_profile: UiProfile) -> Self {
+    pub fn new(
+        session_id: String,
+        agent_alias: String,
+        ui_profile: UiProfile,
+        show_adaptive_sidebar: bool,
+    ) -> Self {
         Self {
             session_id,
             agent_alias,
@@ -5383,6 +5428,7 @@ impl TranscriptState {
             queue_paused: false,
             resume_override: false,
             cancel_started_at: None,
+            show_adaptive_sidebar,
             queue_sidebar_cols: 36,
             queue_sel: None,
             queue_item_rects: Vec::new(),
@@ -6348,7 +6394,18 @@ impl TranscriptState {
     }
 
     fn adaptive_sidebar_open(&self, area_width: u16) -> bool {
-        self.queue_sidebar_open() || (area_width >= 100 && !self.adaptive_sidebar_rows().is_empty())
+        self.queue_sidebar_open()
+            || (self.show_adaptive_sidebar
+                && area_width >= 100
+                && !self.adaptive_sidebar_rows().is_empty())
+    }
+
+    pub fn set_adaptive_sidebar_visible(&mut self, visible: bool) {
+        if self.show_adaptive_sidebar == visible {
+            return;
+        }
+        self.show_adaptive_sidebar = visible;
+        self.mark_dirty_full();
     }
 
     /// Default the sidebar selection to the front item when nothing is selected
@@ -6762,6 +6819,7 @@ mod tests {
             "sess-1".to_string(),
             "myagent".to_string(),
             UiProfile::Minimal,
+            true,
         )
     }
 
@@ -6774,6 +6832,7 @@ mod tests {
             session_id.to_string(),
             agent_alias.to_string(),
             UiProfile::Minimal,
+            true,
         )
     }
 
@@ -6852,6 +6911,43 @@ mod tests {
                 data: None,
             }),
         );
+    }
+
+    #[tokio::test]
+    async fn transcript_keeps_sidebar_setting_before_session_starts() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut transcript = transcript(client, PaneKind::Code);
+
+        transcript.set_adaptive_sidebar_visible(false);
+
+        assert!(!transcript.show_adaptive_sidebar);
+        let state = TranscriptState::new(
+            "sess-2".to_string(),
+            "myagent".to_string(),
+            UiProfile::Minimal,
+            transcript.show_adaptive_sidebar,
+        );
+        assert!(!state.show_adaptive_sidebar);
+    }
+
+    #[test]
+    fn queue_sidebar_stays_open_when_adaptive_sidebar_hidden() {
+        let mut state = state();
+        state.set_adaptive_sidebar_visible(false);
+        state
+            .enqueue_message("queued".to_string(), Vec::new())
+            .unwrap();
+
+        assert!(state.adaptive_sidebar_open(80));
+    }
+
+    #[test]
+    fn rich_status_row_absent_without_workspace() {
+        let state = state();
+
+        assert!(session_status_text(&state, 80, &UiRenderSpec::rich()).is_none());
     }
 
     const TEST_SPEC: UiRenderSpec = UiRenderSpec::rich();
@@ -7626,6 +7722,9 @@ mod tests {
     fn status_row_omits_debug_and_input_state() {
         let mut state = state();
         state.set_model_identity(Some("openai.work"), Some("gpt-5"));
+        state.cwd = Some("/repo".to_string());
+        state.git_branch = Some("main".to_string());
+        state.git_hash = Some("abc1234".to_string());
         state.context_input_tokens = Some(1234);
         state.context_max_tokens = Some(8192);
         state.turn_in_flight = true;
@@ -7645,15 +7744,20 @@ mod tests {
             InputBarAction::StashedDraft(_)
         ));
 
-        let status = session_status_text(&state, 240);
+        let minimal = session_status_text(&state, 240, &UiRenderSpec::minimal());
+        let rich = session_status_text(&state, 240, &UiRenderSpec::rich()).unwrap_or_default();
 
-        assert!(status.contains("myagent"));
-        assert!(status.contains("openai.work/gpt-5"));
-        assert!(!status.contains("ctx"));
-        assert!(!status.contains("queue"));
-        assert!(!status.contains("history"));
-        assert!(!status.contains("stash"));
-        assert!(!status.contains("editor"));
+        assert!(minimal.is_none());
+        assert!(!rich.contains("myagent"));
+        assert!(!rich.contains("openai.work/gpt-5"));
+        assert!(rich.contains("/repo"));
+        assert!(rich.contains("main"));
+        assert!(rich.contains("abc1234"));
+        assert!(!rich.contains("ctx"));
+        assert!(!rich.contains("queue"));
+        assert!(!rich.contains("history"));
+        assert!(!rich.contains("stash"));
+        assert!(!rich.contains("editor"));
     }
 
     #[test]

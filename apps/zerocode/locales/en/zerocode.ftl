@@ -27,6 +27,7 @@ zc-error-daemon-version-mismatch = Version mismatch: zerocode is { $client_versi
 
 zc-zerocode-tab-theme = Theme
 zc-zerocode-tab-agent-theme = Agent Themes
+zc-zerocode-tab-ui = UI
 zc-zerocode-tab-presets = Presets
 zc-zerocode-tab-bindings = Keybindings
 zc-zerocode-tab-locale = Locale
@@ -51,6 +52,17 @@ zc-zerocode-locale-list-failed = Failed to load locale list: { $err }
 zc-zerocode-locale-pick-first = Select a locale row first, then download its locale file.
 zc-zerocode-help-locale = select / download locale
 zc-zerocode-help-conn = edit connection field
+zc-zerocode-help-toggle-ui = toggle UI setting
+zc-zerocode-bool-true = enabled
+zc-zerocode-bool-false = disabled
+zc-zerocode-save-failed = Save failed: { $error }
+zc-zerocode-ui-title = UI ([ui] — Enter to change)
+zc-zerocode-ui-profile = Profile
+zc-zerocode-ui-adaptive-sidebar = Adaptive sidebar
+zc-zerocode-ui-profile-minimal = minimal
+zc-zerocode-ui-profile-rich = rich
+zc-zerocode-ui-profile-set = UI profile set to { $profile }
+zc-zerocode-ui-sidebar-saved = Adaptive sidebar setting saved
 
 zc-zerocode-capture-prompt = Press a key combination…
 zc-zerocode-capture-modal-title = Assign Key

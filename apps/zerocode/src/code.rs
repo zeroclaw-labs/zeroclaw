@@ -26,6 +26,10 @@ impl Code {
         self.inner.set_ui_profile(profile);
     }
 
+    pub(crate) fn set_adaptive_sidebar_visible(&mut self, visible: bool) {
+        self.inner.set_adaptive_sidebar_visible(visible);
+    }
+
     pub(crate) fn set_resume_session_id(&mut self, sid: Option<String>) {
         self.inner.set_resume_session_id(sid);
     }

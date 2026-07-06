@@ -176,7 +176,7 @@ pub async fn run(
     owns_ephemeral: bool,
 ) -> Result<()> {
     let mut mode = Mode::Dashboard;
-    let ui_config = config::ensure_and_load(config_dir)
+    let mut ui_config = config::ensure_and_load(config_dir)
         .map(|config| config.ui)
         .unwrap_or_default();
     let show_chat_pane = ui_config.show_chat_pane;
@@ -234,6 +234,7 @@ pub async fn run(
                 code_pane.set_resume_agent_alias($resume_code.1);
                 code_pane.set_ui_profile(ui_config.profile);
                 code_pane.init().await?;
+                code_pane.set_adaptive_sidebar_visible(ui_config.show_adaptive_sidebar);
                 let mut chat_pane = transcript::Transcript::new(
                     rpc.clone(),
                     transcript::PaneKind::Chat,
@@ -242,6 +243,7 @@ pub async fn run(
                 chat_pane.set_resume_session_id($resume_chat.0);
                 chat_pane.set_resume_agent_alias($resume_chat.1);
                 chat_pane.init().await?;
+                chat_pane.set_adaptive_sidebar_visible(ui_config.show_adaptive_sidebar);
                 let pending_start_code = {
                     let mut guard = reconnect_state.lock().expect("reconnect state poisoned");
                     match guard.pending_quickstart_code.take() {
@@ -686,7 +688,17 @@ pub async fn run(
 
                 let quit = match mode {
                     Mode::Dashboard => dashboard_pane.handle_key(key).await,
-                    Mode::Config => config_app.handle_key(key, term).await?,
+                    Mode::Config => {
+                        let quit = config_app.handle_key(key, term).await?;
+                        let next = config_app.zerocode_ui_config();
+                        apply_zerocode_ui_config(
+                            &mut ui_config,
+                            next,
+                            &mut code_pane,
+                            &mut chat_pane,
+                        );
+                        quit
+                    }
                     Mode::Doctor => doctor_pane.handle_key(key).await,
                     Mode::Code => code_pane.handle_key(key, term).await,
                     Mode::Chat => chat_pane.handle_key(key, term).await,
@@ -776,6 +788,13 @@ pub async fn run(
                         }
                         Mode::Config => {
                             config_app.handle_mouse(mouse, content_area, term).await?;
+                            let next = config_app.zerocode_ui_config();
+                            apply_zerocode_ui_config(
+                                &mut ui_config,
+                                next,
+                                &mut code_pane,
+                                &mut chat_pane,
+                            );
                         }
                         Mode::Doctor => {
                             doctor_pane.handle_mouse(mouse, content_area);
@@ -812,6 +831,23 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn apply_zerocode_ui_config(
+    ui_config: &mut config::UiSection,
+    next: config::UiSection,
+    code_pane: &mut code::Code,
+    chat_pane: &mut transcript::Transcript,
+) {
+    if ui_config.profile != next.profile {
+        code_pane.set_ui_profile(next.profile);
+        chat_pane.set_ui_profile(next.profile);
+    }
+    if ui_config.show_adaptive_sidebar != next.show_adaptive_sidebar {
+        code_pane.set_adaptive_sidebar_visible(next.show_adaptive_sidebar);
+        chat_pane.set_adaptive_sidebar_visible(next.show_adaptive_sidebar);
+    }
+    *ui_config = next;
 }
 
 /// Resolve every `[theme.agent_override.<alias>]` entry into a ready palette,

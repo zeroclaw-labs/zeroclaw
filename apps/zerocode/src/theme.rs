@@ -320,6 +320,47 @@ pub(crate) fn tool_label_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+fn distinct_role_color(theme: Theme, preferred: Color, used: &[Color]) -> Color {
+    if !used.contains(&preferred) {
+        return preferred;
+    }
+    [
+        theme.title,
+        theme.heading,
+        theme.accent,
+        theme.warn,
+        theme.tool,
+        theme.body,
+        theme.dim,
+        theme.selection_bg,
+    ]
+    .into_iter()
+    .find(|color| !used.contains(color))
+    .unwrap_or(preferred)
+}
+
+fn rail_colors_for(theme: Theme) -> (Color, Color, Color) {
+    let user = distinct_role_color(theme, theme.heading, &[]);
+    let agent = distinct_role_color(theme, theme.accent, &[user]);
+    let tool = distinct_role_color(theme, theme.tool, &[user, agent]);
+    (user, agent, tool)
+}
+
+pub(crate) fn user_rail_style() -> Style {
+    let (user, _, _) = rail_colors_for(active());
+    Style::default().fg(user)
+}
+
+pub(crate) fn agent_rail_style() -> Style {
+    let (_, agent, _) = rail_colors_for(active());
+    Style::default().fg(agent)
+}
+
+pub(crate) fn tool_rail_style() -> Style {
+    let (_, _, tool) = rail_colors_for(active());
+    Style::default().fg(tool)
+}
+
 /// Inline code spans in markdown.
 pub(crate) fn code_inline_style() -> Style {
     Style::default().fg(active().warn)
@@ -580,5 +621,15 @@ mod tests {
             default_theme(),
             theme_by_name(DEFAULT_THEME_NAME).expect("default registered")
         );
+    }
+
+    #[test]
+    fn generated_themes_have_distinct_rail_roles() {
+        for (name, theme) in GENERATED_THEMES {
+            let (user, agent, tool) = rail_colors_for(*theme);
+            assert_ne!(user, agent, "{name} user/agent rail");
+            assert_ne!(user, tool, "{name} user/tool rail");
+            assert_ne!(agent, tool, "{name} agent/tool rail");
+        }
     }
 }
