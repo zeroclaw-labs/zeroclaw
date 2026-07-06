@@ -67,7 +67,6 @@ pub mod model_routing_config;
 pub mod node_capabilities;
 pub mod notion_tool;
 pub mod opencode_cli;
-pub mod pdf_read;
 pub mod pipeline;
 pub mod poll;
 pub mod project_intel;

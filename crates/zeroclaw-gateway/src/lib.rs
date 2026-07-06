@@ -1787,6 +1787,10 @@ pub async fn run_gateway(
         )
         .route("/api/skills/bundles", get(api_skills::handle_list_bundles))
         .route(
+            "/api/skills/slash-option-kinds",
+            get(api_skills::handle_slash_option_kinds),
+        )
+        .route(
             "/api/skills/bundles/{alias}/skills",
             get(api_skills::handle_list_skills).post(api_skills::handle_create_skill),
         )
