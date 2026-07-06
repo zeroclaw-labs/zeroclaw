@@ -23,7 +23,8 @@ use tokio::sync::mpsc;
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    RpcOutbound, SopRunOverlayRequest, SopSaveRequest, SopSelectRequest,
+    RpcOutbound, SopRunOverlayRequest, SopRunRequest, SopRunResponse, SopSaveRequest,
+    SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ChatMessage;
 
@@ -149,6 +150,7 @@ pub enum Method {
     SopsList,
     SopsGet,
     SopsGraph,
+    SopsRun,
     SopsRunOverlay,
     SopsValidate,
     SopsSave,
@@ -255,6 +257,7 @@ impl Method {
         (Method::SopsList, "sops/list"),
         (Method::SopsGet, "sops/get"),
         (Method::SopsGraph, "sops/graph"),
+        (Method::SopsRun, "sops/run"),
         (Method::SopsRunOverlay, "sops/run-overlay"),
         (Method::SopsValidate, "sops/validate"),
         (Method::SopsSave, "sops/save"),
@@ -729,6 +732,7 @@ impl RpcDispatcher {
             Method::SopsList => self.handle_sops_list(),
             Method::SopsGet => self.handle_sops_get(&req.params),
             Method::SopsGraph => self.handle_sops_graph(&req.params),
+            Method::SopsRun => self.handle_sops_run(&req.params).await,
             Method::SopsRunOverlay => self.handle_sops_run_overlay(&req.params),
             Method::SopsValidate => self.handle_sops_validate(&req.params),
             Method::SopsSave => self.handle_sops_save(&req.params),
@@ -3988,6 +3992,66 @@ impl RpcDispatcher {
         ))
     }
 
+    async fn handle_sops_run(&self, params: &Value) -> RpcResult {
+        let req: SopRunRequest = parse_params(params)?;
+
+        if let Some(payload) = req.payload.as_deref()
+            && !payload.trim().is_empty()
+            && serde_json::from_str::<Value>(payload).is_err()
+        {
+            return Err(rpc_err(INVALID_PARAMS, "payload is not valid JSON"));
+        }
+
+        let engine = self
+            .ctx
+            .sop_engine
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+        let audit = self
+            .ctx
+            .sop_audit
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+
+        let payload = req
+            .payload
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+
+        let event = crate::sop::SopEvent {
+            source: crate::sop::SopTriggerSource::Manual,
+            topic: None,
+            payload,
+            timestamp: crate::sop::engine::now_iso8601(),
+        };
+
+        let results =
+            crate::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &req.name).await;
+        crate::sop::dispatch::process_headless_results(&results);
+
+        for result in &results {
+            match result {
+                crate::sop::dispatch::DispatchResult::Started { run_id, .. } => {
+                    return to_result(SopRunResponse {
+                        run_id: run_id.clone(),
+                    });
+                }
+                crate::sop::dispatch::DispatchResult::Skipped { reason, .. }
+                | crate::sop::dispatch::DispatchResult::BlockedUnsafe { reason, .. } => {
+                    return Err(rpc_err(INVALID_PARAMS, reason.clone()));
+                }
+                crate::sop::dispatch::DispatchResult::NoMatch => {}
+            }
+        }
+
+        Err(rpc_err(
+            INVALID_PARAMS,
+            format!("SOP '{}' has no matching manual trigger", req.name),
+        ))
+    }
+
     fn handle_sops_run_overlay(&self, params: &Value) -> RpcResult {
         let req: SopRunOverlayRequest = parse_params(params)?;
         let (dir, mode) = self.sops_dir_and_mode();
@@ -4863,6 +4927,35 @@ mod tests {
             "RPC `sources` must equal the complete SopTriggerSource walk so \
              surfaces cannot drift by reconstructing their own list"
         );
+    }
+
+    #[tokio::test]
+    async fn sops_run_rejects_malformed_payload_before_engine() {
+        // Payload validation runs before the engine lookup, so a malformed JSON
+        // string is rejected with INVALID_PARAMS even on a dispatcher with no
+        // SOP engine wired. This pins the "surface a clear error on malformed
+        // JSON rather than failing the run opaquely" contract.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        let err = d
+            .handle_sops_run(&serde_json::json!({ "name": "any", "payload": "{not json" }))
+            .await
+            .expect_err("malformed payload must be rejected");
+        assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn sops_run_requires_engine() {
+        // A well-formed request against a dispatcher with no SOP engine reports
+        // the subsystem as unavailable rather than panicking or silently
+        // succeeding.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        let err = d
+            .handle_sops_run(&serde_json::json!({ "name": "any", "payload": "{\"k\":1}" }))
+            .await
+            .expect_err("missing engine must error");
+        assert_eq!(err.code, INTERNAL_ERROR);
     }
 
     #[test]

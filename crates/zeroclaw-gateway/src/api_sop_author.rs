@@ -135,6 +135,108 @@ pub async fn handle_sop_graph(
     }
 }
 
+/// Body for `POST /api/sops/{name}/run`: fire a Manual trigger. `payload` is
+/// an optional JSON string handed to the run as the step-1 input. Deserializes
+/// from the shared `SopRunRequest` shape (minus `name`, which comes from the
+/// path).
+#[derive(serde::Deserialize)]
+pub struct SopRunBody {
+    #[serde(default)]
+    pub payload: Option<String>,
+}
+
+/// Fire a Manual run for the named SOP and return its `run_id`.
+///
+/// Thin exposure of the engine dispatch path the `sop_execute` tool uses:
+/// builds a Manual `SopEvent` and calls `dispatch_sop_event_to`, which still
+/// requires the SOP to declare a matching Manual trigger. The returned
+/// `run_id` feeds straight into `sops/{name}/runs/{run_id}/overlay`.
+pub async fn handle_sop_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<SopRunBody>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    if let Some(payload) = body.payload.as_deref()
+        && !payload.trim().is_empty()
+        && serde_json::from_str::<serde_json::Value>(payload).is_err()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "payload is not valid JSON" })),
+        )
+            .into_response();
+    }
+
+    let Some(engine) = state.sop_engine.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "SOP subsystem not enabled" })),
+        )
+            .into_response();
+    };
+    let Some(audit) = state.sop_audit.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "SOP subsystem not enabled" })),
+        )
+            .into_response();
+    };
+
+    let payload = body
+        .payload
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+
+    let event = zeroclaw_runtime::sop::SopEvent {
+        source: zeroclaw_runtime::sop::SopTriggerSource::Manual,
+        topic: None,
+        payload,
+        timestamp: zeroclaw_runtime::sop::engine::now_iso8601(),
+    };
+
+    let results =
+        zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &name).await;
+    zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
+
+    for result in &results {
+        match result {
+            zeroclaw_runtime::sop::dispatch::DispatchResult::Started { run_id, .. } => {
+                return Json(serde_json::json!({ "run_id": run_id })).into_response();
+            }
+            zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { reason, .. } => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": reason })),
+                )
+                    .into_response();
+            }
+            zeroclaw_runtime::sop::dispatch::DispatchResult::BlockedUnsafe { reason, .. } => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({ "error": reason })),
+                )
+                    .into_response();
+            }
+            zeroclaw_runtime::sop::dispatch::DispatchResult::NoMatch => {}
+        }
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": format!("SOP '{name}' has no matching manual trigger")
+        })),
+    )
+        .into_response()
+}
+
 pub async fn handle_sop_run_overlay(
     State(state): State<AppState>,
     headers: HeaderMap,

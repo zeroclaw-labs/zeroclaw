@@ -212,6 +212,18 @@ export function getRunOverlay(name: string, runId: string): Promise<RunOverlay> 
   );
 }
 
+/// Fire a Manual trigger for the named SOP and return the started run id, which
+/// feeds straight into `getRunOverlay` to animate the run. `payload` is an
+/// optional JSON string passed as the step-1 input; the backend rejects
+/// malformed JSON with a clear error. Requires the SOP to declare a manual
+/// trigger.
+export function runSop(name: string, payload?: string): Promise<{ run_id: string }> {
+  return apiFetch<{ run_id: string }>(`/api/sops/${encodeURIComponent(name)}/run`, {
+    method: 'POST',
+    body: JSON.stringify({ payload: payload ?? null }),
+  });
+}
+
 /// Index a run overlay's node states by step number. Shared by every view
 /// that projects run state onto graph nodes.
 export function overlayStateByStep(

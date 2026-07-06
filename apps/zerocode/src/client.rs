@@ -113,6 +113,7 @@ pub mod method {
     pub const SOPS_LIST: &str = "sops/list";
     pub const SOPS_GET: &str = "sops/get";
     pub const SOPS_GRAPH: &str = "sops/graph";
+    pub const SOPS_RUN: &str = "sops/run";
     pub const SOPS_RUN_OVERLAY: &str = "sops/run-overlay";
     pub const SOPS_SAVE: &str = "sops/save";
     pub const SOPS_CREATE: &str = "sops/create";
@@ -1218,6 +1219,23 @@ impl RpcClient {
             serde_json::json!({ "name": name, "run_id": run_id }),
         )
         .await
+    }
+
+    /// Fire a Manual run for `name` with an optional JSON-string payload and
+    /// return its run id. Mirrors the web `runSop` path; the daemon builds the
+    /// Manual `SopEvent` and requires a matching manual trigger.
+    pub async fn sops_run(&self, name: &str, payload: Option<&str>) -> Result<String> {
+        let value: Value = self
+            .call(
+                method::SOPS_RUN,
+                serde_json::json!({ "name": name, "payload": payload }),
+            )
+            .await?;
+        value
+            .get("run_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::Error::msg("sops/run: response missing run_id"))
     }
 
     pub async fn sops_save(&self, sop: Value) -> Result<Value> {

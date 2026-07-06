@@ -21,6 +21,7 @@ pub(crate) struct SopPane {
     graph: SopGraphView,
     layer: RenderLayer,
     run_input: Option<String>,
+    run_payload_input: Option<String>,
     overlay: Option<RunOverlayView>,
     editor: Option<SopEditorState>,
     trigger_registry: crate::client::TriggerSourceRegistryView,
@@ -459,6 +460,7 @@ impl SopPane {
             graph: SopGraphView::default(),
             layer: RenderLayer::default(),
             run_input: None,
+            run_payload_input: None,
             overlay: None,
             editor: None,
             trigger_registry: crate::client::TriggerSourceRegistryView::default(),
@@ -579,10 +581,25 @@ impl SopPane {
             }
             return false;
         }
+        if self.run_payload_input.is_some() {
+            match key.code {
+                KeyCode::Enter => self.submit_run_payload().await, // keyguard: text-entry submit
+                KeyCode::Esc => self.run_payload_input = None,     // keyguard: text-entry cancel
+                KeyCode::Backspace => self.run_payload_backspace(), // keyguard: text-entry edit
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(buf) = self.run_payload_input.as_mut() {
+                        buf.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
         match SopTabAction::from_chord(&key) {
             Some(SopTabAction::Up) => self.select_prev(),
             Some(SopTabAction::Down) => self.select_next(),
             Some(SopTabAction::Enter) => self.load_selected_graph().await,
+            Some(SopTabAction::Run) => self.start_run_payload().await,
             Some(SopTabAction::Watch) => self.run_input = Some(String::new()),
             Some(SopTabAction::New) => {
                 self.editor = Some(SopEditorState::new_create());
@@ -1230,8 +1247,67 @@ impl SopPane {
         }
     }
 
+    /// Open the Manual-run payload prompt, but only when the selected SOP
+    /// actually declares a manual trigger. Keys off the SOP definition, not a
+    /// per-SOP check, matching the web affordance.
+    async fn start_run_payload(&mut self) {
+        let Some(name) = self.selected_name().map(String::from) else {
+            return;
+        };
+        let is_manual = match self.rpc.sops_get(&name).await {
+            Ok(value) => serde_json::from_value::<SopDraft>(value)
+                .map(|d| d.triggers.iter().any(|t| t.kind == "manual"))
+                .unwrap_or(false),
+            Err(e) => {
+                self.error = Some(e.to_string());
+                return;
+            }
+        };
+        if is_manual {
+            self.status = Some("manual run: type JSON payload, Enter to fire".into());
+            self.run_payload_input = Some(String::new());
+        } else {
+            self.status = Some("selected SOP has no manual trigger".into());
+        }
+    }
+
+    async fn submit_run_payload(&mut self) {
+        let Some(name) = self.selected_name().map(String::from) else {
+            self.run_payload_input = None;
+            return;
+        };
+        let payload = self
+            .run_payload_input
+            .take()
+            .map(|b| b.trim().to_string())
+            .unwrap_or_default();
+        if !payload.is_empty() && serde_json::from_str::<serde_json::Value>(&payload).is_err() {
+            self.error = Some("payload is not valid JSON".into());
+            return;
+        }
+        let arg = if payload.is_empty() {
+            None
+        } else {
+            Some(payload.as_str())
+        };
+        match self.rpc.sops_run(&name, arg).await {
+            Ok(run_id) => {
+                self.status = Some(format!("started run {run_id}"));
+                self.error = None;
+                self.load_run_overlay(&run_id).await;
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
     fn run_input_backspace(&mut self) {
         if let Some(buf) = self.run_input.as_mut() {
+            buf.pop();
+        }
+    }
+
+    fn run_payload_backspace(&mut self) {
+        if let Some(buf) = self.run_payload_input.as_mut() {
             buf.pop();
         }
     }
@@ -1242,6 +1318,7 @@ impl SopPane {
             S::Up,
             S::Down,
             S::Enter,
+            S::Run,
             S::Watch,
             S::New,
             S::Edit,
@@ -1569,6 +1646,10 @@ impl SopPane {
             lines.push(String::new());
             lines.push(format!("run id: {buf}_"));
         }
+        if let Some(buf) = &self.run_payload_input {
+            lines.push(String::new());
+            lines.push(format!("manual payload (JSON): {buf}_"));
+        }
         lines
     }
 
@@ -1844,7 +1925,9 @@ fn cell_from_web(coord: f64, origin: f64, web_pitch: f64, cell_pitch: u16) -> u1
         return 0;
     }
     let slots = ((coord - origin) / web_pitch).max(0.0);
-    (slots * f64::from(cell_pitch)).round().min(f64::from(u16::MAX)) as u16
+    (slots * f64::from(cell_pitch))
+        .round()
+        .min(f64::from(u16::MAX)) as u16
 }
 
 fn layout_slots(
@@ -1869,10 +1952,7 @@ fn layout_slots(
             ),
         };
         let x = inner.x.saturating_add(col_cells).saturating_sub(pan_x);
-        let y = inner
-            .y
-            .saturating_add(row_cells)
-            .saturating_sub(pan_y);
+        let y = inner.y.saturating_add(row_cells).saturating_sub(pan_y);
         slots.insert(p.step, Rect::new(x, y, CARD_W, CARD_H));
     }
     slots
@@ -2072,9 +2152,7 @@ fn render_node_card(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CARD_H, CARD_W, COL_GAP, ROW_GAP, layout_slots, trigger_source_walk,
-    };
+    use super::{CARD_H, CARD_W, COL_GAP, ROW_GAP, layout_slots, trigger_source_walk};
     use crate::client::{BoundTriggerSourceView, GraphLayout, TriggerSourceRegistryView};
     use ratatui::layout::Rect;
     use zeroclaw_sop_graph::NodePosition;

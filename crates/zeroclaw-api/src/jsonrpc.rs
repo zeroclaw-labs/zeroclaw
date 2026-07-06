@@ -315,6 +315,24 @@ pub struct SopRunOverlayRequest {
     pub run_id: String,
 }
 
+/// Request payload for `sops/run`: fire a Manual trigger for the named SOP.
+/// `payload` is an optional JSON string handed to the run as the step-1 input;
+/// omitting it starts the run with no payload. The daemon builds the Manual
+/// `SopEvent` and dispatches it on the same path as the `sop_execute` tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopRunRequest {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
+}
+
+/// Response payload for `sops/run`: the id of the run that was started, which
+/// feeds straight into `sops/run-overlay` to animate the run on the canvas.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopRunResponse {
+    pub run_id: String,
+}
+
 /// Request payload for `sops/save` and `sops/create`. The `sop` field is the
 /// wire form of the runtime `Sop`; the daemon deserializes and validates it.
 /// `sops/validate` also accepts this form to validate an unsaved draft.

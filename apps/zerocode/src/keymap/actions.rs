@@ -283,6 +283,7 @@ keyactions! {
         Up     [Chord::char('k'), Chord::key(KeyCode::Up)] => "prev",
         Down   [Chord::char('j'), Chord::key(KeyCode::Down)] => "next",
         Enter  [Chord::key(KeyCode::Enter)] => "load graph",
+        Run    [Chord::char('r'), Chord::char('R')] => "run manual",
         Watch  [Chord::char('w'), Chord::char('W')] => "watch run",
         New    [Chord::char('n')] => "new sop",
         Edit   [Chord::char('e')] => "edit sop",

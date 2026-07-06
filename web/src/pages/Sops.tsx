@@ -13,6 +13,7 @@ import {
   getSopGraph,
   getRunOverlay,
   getSop,
+  runSop,
   saveSop,
   deleteSop,
   wireDraft,
@@ -1398,6 +1399,44 @@ function StepInspector({
 
 const noop = () => {};
 
+/// Build a Manual-run payload skeleton from a SOP's step-1 input JSON Schema.
+/// Registry-driven: the example keys and placeholder value shapes come from the
+/// SOP's own declared `schema.input`, never a hardcoded per-SOP template. Falls
+/// back to an empty object when step 1 declares no input properties.
+function payloadSkeleton(sop: Sop | null): string {
+  const input = sop?.steps?.find((s) => s.number === 1)?.schema?.input;
+  const props =
+    input && typeof input === 'object' && !Array.isArray(input)
+      ? (input as { properties?: Record<string, unknown> }).properties
+      : undefined;
+  if (!props || typeof props !== 'object') return '{}';
+  const skeleton: Record<string, unknown> = {};
+  for (const [key, spec] of Object.entries(props)) {
+    const type =
+      spec && typeof spec === 'object' && !Array.isArray(spec)
+        ? (spec as { type?: string }).type
+        : undefined;
+    skeleton[key] = placeholderForType(type);
+  }
+  return JSON.stringify(skeleton, null, 2);
+}
+
+function placeholderForType(type: string | undefined): unknown {
+  switch (type) {
+    case 'number':
+    case 'integer':
+      return 0;
+    case 'boolean':
+      return false;
+    case 'array':
+      return [];
+    case 'object':
+      return {};
+    default:
+      return '';
+  }
+}
+
 export default function Sops() {
   const [sops, setSops] = useState<SopSummary[]>([]);
   const [selected, setSelected] = useState<string>('');
@@ -1407,6 +1446,9 @@ export default function Sops() {
   const [graphLoading, setGraphLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [runId, setRunId] = useState('');
+  const [runPayload, setRunPayload] = useState('');
+  const [running, setRunning] = useState(false);
+  const [runError, setRunError] = useState<string | null>(null);
   const [overlay, setOverlay] = useState<RunOverlay | null>(null);
   const [overlayError, setOverlayError] = useState<string | null>(null);
   const [draft, setDraft] = useState<Sop | null>(loadStoredDraft);
@@ -1699,6 +1741,46 @@ export default function Sops() {
   const runStateByStep = useMemo(() => overlayStateByStep(overlay), [overlay]);
   const runCallsByStep = useMemo(() => overlayCallsByStep(overlay), [overlay]);
 
+  // A Manual run is only offered when the SOP actually declares a manual
+  // trigger; the payload field and prefill key off this, never a per-SOP check.
+  const hasManualTrigger = useMemo(
+    () => (viewSop?.triggers ?? []).some((tr) => tr.type === 'manual'),
+    [viewSop],
+  );
+
+  // Seed the payload textarea from the SOP's own step-1 input schema so the
+  // example is registry-driven, not hardcoded per SOP. Only runs when the SOP
+  // is manual-triggerable and the user has not already typed a payload.
+  useEffect(() => {
+    if (!hasManualTrigger) {
+      setRunPayload('');
+      return;
+    }
+    setRunPayload((cur) => (cur.trim() ? cur : payloadSkeleton(viewSop)));
+  }, [hasManualTrigger, viewSop]);
+
+  const onRunSop = useCallback(() => {
+    if (!selected) return;
+    const payload = runPayload.trim();
+    if (payload) {
+      try {
+        JSON.parse(payload);
+      } catch {
+        setRunError(t('sops.run_error') + ': invalid JSON');
+        return;
+      }
+    }
+    setRunning(true);
+    setRunError(null);
+    runSop(selected, payload || undefined)
+      .then(({ run_id }) => {
+        setRunId(run_id);
+        setOverlayError(null);
+      })
+      .catch((e) => setRunError(`${t('sops.run_error')}: ${String(e)}`))
+      .finally(() => setRunning(false));
+  }, [selected, runPayload]);
+
   // Keep the inspector pointed at a real step: select the first step when a
   // draft opens and drop the selection when its step is removed.
   useEffect(() => {
@@ -1908,6 +1990,33 @@ export default function Sops() {
                 </button>
               </div>
             </div>
+            {hasManualTrigger ? (
+              <div className="mb-3 space-y-2">
+                <textarea
+                  value={runPayload}
+                  onChange={(e) => setRunPayload(e.target.value)}
+                  placeholder={t('sops.run_payload_placeholder')}
+                  rows={4}
+                  className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 font-mono text-xs text-pc-text"
+                />
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={onRunSop}
+                    disabled={running}
+                    className="inline-flex items-center gap-1 rounded border border-pc-border bg-pc-accent px-3 py-1 text-sm font-medium text-[#0b1220] hover:opacity-90 disabled:opacity-40"
+                  >
+                    {running ? (
+                      <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                    ) : null}
+                    {t('sops.run')}
+                  </button>
+                  {runError ? (
+                    <span className="text-xs text-status-error">{runError}</span>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
             <div className="mb-3 flex flex-wrap items-center gap-2">
               <input
                 type="text"

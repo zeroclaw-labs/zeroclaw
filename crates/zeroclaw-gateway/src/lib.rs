@@ -1707,6 +1707,10 @@ pub async fn run_gateway(
             get(api_sop_author::handle_sop_graph),
         )
         .route(
+            "/api/sops/{name}/run",
+            post(api_sop_author::handle_sop_run),
+        )
+        .route(
             "/api/sops/{name}/full",
             get(api_sop_author::handle_sop_full),
         )
