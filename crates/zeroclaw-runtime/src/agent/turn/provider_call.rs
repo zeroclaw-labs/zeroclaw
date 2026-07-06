@@ -2,7 +2,7 @@
 //! streaming/non-streaming chat dispatch.
 
 use super::context::TurnCtx;
-use super::events::StreamDelta;
+use super::events::{StreamDelta, THINKING_STATUS_PREFIX};
 use super::outcome::{StreamInterruptedAfterOutput, ToolLoopCancelled, is_tool_loop_cancelled};
 use super::redact::scrub_credentials;
 use super::stream_consume::consume_provider_streaming_response;
@@ -52,9 +52,12 @@ pub(crate) async fn announce_llm_request(
     // ── Progress: LLM thinking ────────────────────────────
     if let Some(tx) = ctx.on_delta {
         let phase = if iteration == 0 {
-            "\u{1f914} Thinking...\n".to_string()
+            format!("{THINKING_STATUS_PREFIX}Thinking...\n")
         } else {
-            format!("\u{1f914} Thinking (round {})...\n", iteration + 1)
+            format!(
+                "{THINKING_STATUS_PREFIX}Thinking (round {})...\n",
+                iteration + 1
+            )
         };
         let _ = tx.send(StreamDelta::Status(phase)).await;
     }
@@ -186,6 +189,7 @@ pub(crate) async fn call_provider(
             ctx.on_delta,
             ctx.event_tx,
             ctx.strict_tool_parsing,
+            ctx.draft_reasoning,
         );
         match stream_future.await {
             Ok(streamed) => {
@@ -374,6 +378,7 @@ mod payload_capture_tests {
             pacing,
             strict_tool_parsing: false,
             channel: None,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             agent_alias: None,
             turn_id: "trace-req-test",
         }

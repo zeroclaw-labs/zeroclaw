@@ -12607,6 +12607,22 @@ pub enum StreamMode {
     MultiMessage,
 }
 
+/// Matrix single-message reasoning visibility.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum StreamReasoningMode {
+    /// Do not emit reasoning-derived progress into the Matrix draft.
+    Off,
+    /// Emit liveness-only reasoning status ticks without raw reasoning text.
+    #[default]
+    Status,
+    /// Emit raw provider reasoning text into the Matrix progress draft.
+    Full,
+}
+
 /// Where a channel registers its skill slash commands. `global` (default)
 /// registers application-wide - the commands work everywhere the bot is, but
 /// Discord takes up to ~1h to propagate changes. `guild` registers to each
@@ -13413,6 +13429,13 @@ pub struct MatrixConfig {
     #[tab(Behavior)]
     #[serde(default = "default_true")]
     pub stream_draft_delete: bool,
+    /// Matrix single-message reasoning visibility. `"off"` suppresses
+    /// reasoning-derived draft updates, `"status"` emits liveness ticks without
+    /// raw reasoning text, and `"full"` emits raw provider reasoning text into
+    /// the progress draft.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub stream_reasoning: StreamReasoningMode,
     /// When true, only respond to messages that @-mention the bot in groups.
     /// Direct messages are always processed.
     #[tab(Behavior)]
@@ -13484,6 +13507,7 @@ impl Default for MatrixConfig {
             stream_draft_lines: default_matrix_stream_draft_lines(),
             message_max_bytes: default_matrix_message_max_bytes(),
             stream_draft_delete: default_true(),
+            stream_reasoning: StreamReasoningMode::default(),
             mention_only: false,
             recovery_key: None,
             password: None,
@@ -23811,6 +23835,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             stream_draft_lines: 10,
             message_max_bytes: 48_000,
             stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -23849,6 +23874,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             stream_draft_lines: 10,
             message_max_bytes: 48_000,
             stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -23989,6 +24015,7 @@ allowed_users = ["@u:matrix.org"]
                     stream_draft_lines: 10,
                     message_max_bytes: 48_000,
                     stream_draft_delete: true,
+                    stream_reasoning: StreamReasoningMode::Status,
                     recovery_key: None,
                     mention_only: false,
                     password: None,
@@ -28576,6 +28603,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             stream_draft_lines: 10,
             message_max_bytes: 48_000,
             stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -28613,6 +28641,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             stream_draft_lines: 10,
             message_max_bytes: 48_000,
             stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -28643,6 +28672,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             stream_draft_lines: 10,
             message_max_bytes: 48_000,
             stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -28674,6 +28704,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             stream_draft_lines: 10,
             message_max_bytes: 48_000,
             stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -28716,6 +28747,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 stream_draft_lines: 10,
                 message_max_bytes: 48_000,
                 stream_draft_delete: true,
+                stream_reasoning: StreamReasoningMode::Status,
                 recovery_key: None,
                 mention_only: false,
                 password: None,
@@ -28757,6 +28789,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 stream_draft_lines: 10,
                 message_max_bytes: 48_000,
                 stream_draft_delete: true,
+                stream_reasoning: StreamReasoningMode::Status,
                 recovery_key: None,
                 mention_only: false,
                 password: None,
@@ -28803,6 +28836,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 stream_draft_lines: 10,
                 message_max_bytes: 48_000,
                 stream_draft_delete: true,
+                stream_reasoning: StreamReasoningMode::Status,
                 mention_only: false,
                 recovery_key: None,
                 password: None,
@@ -28917,6 +28951,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             stream_draft_lines: 10,
             message_max_bytes: 48_000,
             stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -28959,6 +28994,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             stream_draft_lines: 10,
             message_max_bytes: 48_000,
             stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -28997,6 +29033,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             stream_draft_lines: 10,
             message_max_bytes: 48_000,
             stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -29030,6 +29067,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             stream_draft_lines: 10,
             message_max_bytes: 48_000,
             stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -29072,6 +29110,9 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let stream = by_name["channels.matrix.stream_mode"];
         assert!(stream.is_enum());
         assert!(stream.enum_variants.is_some());
+        let reasoning = by_name["channels.matrix.stream_reasoning"];
+        assert!(reasoning.is_enum());
+        assert_eq!(reasoning.display_value, "status");
 
         // Secret field — masked
         let token = by_name["channels.matrix.access_token"];
@@ -29100,6 +29141,10 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         assert_eq!(
             mx.get_prop("channels.matrix.user_id").unwrap(),
             "@bot:m.org"
+        );
+        assert_eq!(
+            mx.get_prop("channels.matrix.stream_reasoning").unwrap(),
+            "status"
         );
         assert_eq!(mx.get_prop("channels.matrix.device_id").unwrap(), "<unset>");
         // Secrets return masked value
@@ -29183,6 +29228,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         mx.set_prop("channels.matrix.stream_mode", "multi_message")
             .unwrap();
         assert_eq!(mx.stream_mode, StreamMode::MultiMessage);
+
+        mx.set_prop("channels.matrix.stream_reasoning", "off")
+            .unwrap();
+        assert_eq!(mx.stream_reasoning, StreamReasoningMode::Off);
+
+        mx.set_prop("channels.matrix.stream_reasoning", "full")
+            .unwrap();
+        assert_eq!(mx.stream_reasoning, StreamReasoningMode::Full);
     }
 
     #[test]
@@ -29190,6 +29243,11 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut mx = test_matrix_config();
         let err = mx
             .set_prop("channels.matrix.stream_mode", "invalid")
+            .unwrap_err();
+        assert!(err.to_string().contains("expected one of"));
+
+        let err = mx
+            .set_prop("channels.matrix.stream_reasoning", "raw")
             .unwrap_err();
         assert!(err.to_string().contains("expected one of"));
     }

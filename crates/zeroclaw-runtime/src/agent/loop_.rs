@@ -935,10 +935,11 @@ pub(crate) use super::turn::{
     maybe_inject_channel_delivery_defaults, resolve_display_text,
 };
 pub use super::turn::{
-    DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback, ModelSwitchRequested,
-    PROGRESS_MIN_INTERVAL_MS, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
-    ResolvedRuntimeKnobs, StreamDelta, ToolLoop, ToolLoopCancelled, drain_steering_messages,
-    is_model_switch_requested, is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials,
+    DRAFT_PLACEHOLDER, DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback,
+    ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS, REASONING_FULL_PREFIX, ResolvedAgentExecution,
+    ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs, StreamDelta, THINKING_STATUS_PREFIX,
+    ToolLoop, ToolLoopCancelled, drain_steering_messages, is_model_switch_requested,
+    is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials,
 };
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -9918,6 +9919,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -10004,6 +10006,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -10041,6 +10044,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -10081,6 +10085,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -10121,6 +10126,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -10205,6 +10211,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -10287,6 +10294,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -10372,6 +10380,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -10460,6 +10469,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -10543,6 +10553,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -10629,6 +10640,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -11072,6 +11084,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             true,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -12959,6 +12972,7 @@ Let me check the result."#;
             None,
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should succeed");
@@ -13053,6 +13067,7 @@ Let me check the result."#;
             None,
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should succeed");

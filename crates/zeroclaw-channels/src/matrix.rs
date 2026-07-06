@@ -377,6 +377,9 @@ mod streaming {
 
     use anyhow::{Result, bail};
     use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
+    use zeroclaw_runtime::agent::loop_::{
+        DRAFT_PLACEHOLDER, REASONING_FULL_PREFIX, THINKING_STATUS_PREFIX,
+    };
 
     use super::{StreamMode, markers};
 
@@ -713,9 +716,7 @@ mod streaming {
     /// existing draft immediately so fast operations do not look buffered.
     pub(super) fn single_progress_uses_edit_interval(text: &str) -> bool {
         let trimmed = text.trim_start();
-        trimmed.starts_with("\u{1f914} ") // thinking status, U+1F914
-            || trimmed.starts_with("\u{1f9e0} ") // reasoning/full thinking, U+1F9E0
-            || trimmed.starts_with("\u{1f4ad} ") // thought bubble reasoning, U+1F4AD
+        trimmed.starts_with(THINKING_STATUS_PREFIX) || trimmed.starts_with(REASONING_FULL_PREFIX)
     }
 
     /// Avoid duplicate Matrix edits after rendering confirms that the visible
@@ -816,7 +817,7 @@ mod streaming {
     /// contain undelivered progress after a failed edit, so the delivery
     /// checkpoint is the correct source for the user-visible state.
     pub(super) fn single_cancel_deletes_draft(draft: &SingleDraft, delete_draft: bool) -> bool {
-        delete_draft || draft.last_text == "..."
+        delete_draft || draft.last_text == DRAFT_PLACEHOLDER
     }
 
     pub(super) fn decide_partial_finalize_action(
@@ -4248,14 +4249,25 @@ impl Channel for MatrixChannel {
                     // Delete before the final send so the user's timeline
                     // lands on the final answer rather than a trailing
                     // "message deleted" event after it.
-                    outbound::redact(
+                    if let Err(err) = outbound::redact(
                         client,
                         recipient,
                         &draft.event_id,
                         Some("streaming draft replaced by final response".to_string()),
                     )
                     .await
-                    .context("matrix: single-message draft delete failed before final send")?;
+                    {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"err": err.to_string()})),
+                            "matrix: single-message draft delete failed before final send; sending final response anyway"
+                        );
+                    }
                 }
 
                 if plan.keeps_draft()
@@ -4920,6 +4932,9 @@ mod tests {
         };
         use zeroclaw_api::channel::Channel;
         use zeroclaw_config::schema::{MatrixConfig, StreamMode};
+        use zeroclaw_runtime::agent::loop_::{
+            DRAFT_PLACEHOLDER, REASONING_FULL_PREFIX, THINKING_STATUS_PREFIX,
+        };
 
         fn draft(text: &str, last_edit: Instant) -> PartialDraft {
             PartialDraft {
@@ -4944,7 +4959,7 @@ mod tests {
                 event_id,
                 thread_anchor: None,
                 lines: VecDeque::new(),
-                last_text: "...".to_string(),
+                last_text: DRAFT_PLACEHOLDER.to_string(),
                 last_edit: Instant::now(),
             }
         }
@@ -5084,13 +5099,12 @@ mod tests {
         #[test]
         fn single_only_thinking_progress_uses_edit_debounce() {
             for line in [
-                "\u{1f914} Thinking...\n",
-                "\u{1f914} Thinking (round 2)...\n",
-                "\u{1f9e0} considering options\n",
-                "\u{1f4ad} considering options\n",
+                format!("{THINKING_STATUS_PREFIX}Thinking...\n"),
+                format!("{THINKING_STATUS_PREFIX}Thinking (round 2)...\n"),
+                format!("{REASONING_FULL_PREFIX}considering options\n"),
             ] {
                 assert!(
-                    single_progress_uses_edit_interval(line),
+                    single_progress_uses_edit_interval(&line),
                     "expected debounced thinking/reasoning progress for {line:?}"
                 );
             }
@@ -5153,7 +5167,7 @@ mod tests {
                 "old progress".to_string(),
                 Instant::now(),
             ));
-            assert_eq!(draft.last_text, "...");
+            assert_eq!(draft.last_text, DRAFT_PLACEHOLDER);
         }
 
         #[test]
@@ -5264,7 +5278,7 @@ mod tests {
             let draft =
                 streaming::single_for_update(&mut state, &key).expect("draft remains active");
             assert!(draft.lines.is_empty());
-            assert_eq!(draft.last_text, "...");
+            assert_eq!(draft.last_text, DRAFT_PLACEHOLDER);
         }
 
         #[tokio::test]
@@ -5457,7 +5471,7 @@ mod tests {
             )
             .await
             {
-                Ok(Ok(())) => {}
+                Ok(Ok(_)) => {}
                 Ok(Err(err)) => {
                     let paths = server
                         .received_requests()
@@ -5479,6 +5493,215 @@ mod tests {
                         .map(|request| request.url.path().to_string())
                         .collect::<Vec<_>>();
                     panic!("retained draft finalize timed out; received paths: {paths:?}");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn single_delete_redact_failure_still_sends_final() {
+            let server = MockServer::start().await;
+            let room_id = "!room:server";
+            let draft_id = owned_event_id!("$draft:server");
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/versions$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": ["r0.6.0", "v1.1", "v1.2", "v1.3", "v1.4", "v1.5"],
+                    "unstable_features": {}
+                })))
+                .expect(1..)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/profile/.*/displayname$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "displayname": "ZeroClaw Test"
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/user/.*/account_data/m\.secret_storage\.default_key$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "not found"
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "one_time_key_counts": {}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/query$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "device_keys": {}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/sync$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "next_batch": "s1",
+                    "rooms": {
+                        "join": {
+                            room_id: {
+                                "state": { "events": [] },
+                                "timeline": {
+                                    "limited": false,
+                                    "prev_batch": "t0",
+                                    "events": [{
+                                        "type": "m.room.message",
+                                        "sender": "@bot:server",
+                                        "event_id": draft_id.as_str(),
+                                        "origin_server_ts": 1,
+                                        "content": {
+                                            "msgtype": "m.text",
+                                            "body": "old progress"
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/state/m\.room\.encryption/?$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "room is not encrypted"
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/redact/.*/.*$",
+                ))
+                .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "errcode": "M_FORBIDDEN",
+                    "error": "redact forbidden"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({
+                    "body": "final answer"
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$final:server"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                MatrixConfig {
+                    homeserver: server.uri(),
+                    access_token: Some("secret-token".to_string()),
+                    user_id: Some("@bot:server".to_string()),
+                    device_id: Some("DEVICE".to_string()),
+                    allowed_rooms: vec![room_id.to_string()],
+                    stream_mode: StreamMode::SingleMessage,
+                    stream_draft_delete: true,
+                    reply_in_thread: false,
+                    ack_reactions: Some(false),
+                    ..MatrixConfig::default()
+                },
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            let client = channel.ensure_client().await.expect("matrix client");
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                client.sync_once(SyncSettings::default()),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    let paths = server
+                        .received_requests()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|request| request.url.path().to_string())
+                        .collect::<Vec<_>>();
+                    panic!("mock sync populates joined room: {err}; received paths: {paths:?}");
+                }
+                Err(_) => {
+                    let paths = server
+                        .received_requests()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|request| request.url.path().to_string())
+                        .collect::<Vec<_>>();
+                    panic!("mock sync timed out; received paths: {paths:?}");
+                }
+            }
+
+            let key = super::super::streaming_key(room_id, draft_id.as_str()).expect("draft key");
+            {
+                let draft = single_draft(draft_id.clone());
+                let mut state = channel.streaming_state.write().await;
+                insert_single(&mut state, key, draft).expect("single-message state accepts draft");
+            }
+
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                channel.finalize_draft(room_id, draft_id.as_str(), "final answer"),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    let paths = server
+                        .received_requests()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|request| request.url.path().to_string())
+                        .collect::<Vec<_>>();
+                    panic!(
+                        "redaction failure must not block final send: {err}; received paths: {paths:?}"
+                    );
+                }
+                Err(_) => {
+                    let paths = server
+                        .received_requests()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|request| request.url.path().to_string())
+                        .collect::<Vec<_>>();
+                    panic!("delete-mode finalize timed out; received paths: {paths:?}");
                 }
             }
         }
@@ -6127,6 +6350,7 @@ mod tests {
                 stream_draft_lines: 10,
                 message_max_bytes: 48_000,
                 stream_draft_delete: true,
+                stream_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
                 mention_only: false,
                 recovery_key: None,
                 password: password.map(String::from),

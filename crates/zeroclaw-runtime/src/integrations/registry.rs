@@ -302,6 +302,7 @@ mod tests {
                 stream_draft_lines: 10,
                 message_max_bytes: 48_000,
                 stream_draft_delete: true,
+                stream_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
                 recovery_key: None,
                 password: None,
                 mention_only: false,

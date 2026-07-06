@@ -4,6 +4,8 @@
 //! consolidation is an explicit field here, set per caller. `Default`
 //! preserves today's channel/CLI behaviour.
 
+use zeroclaw_config::schema::StreamReasoningMode;
+
 /// How to handle max-tool-iteration exhaustion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MaxIterationBehavior {
@@ -26,6 +28,10 @@ pub struct LoopKnobs {
     /// contract is to return the model text verbatim and let the embedder
     /// do its own post-processing.
     pub detect_protocol_without_tools: bool,
+    /// Controls whether provider reasoning deltas are reflected into the
+    /// draft/status surface. Raw reasoning is opt-in; the default only emits a
+    /// liveness tick so existing channel progress remains privacy-preserving.
+    pub draft_reasoning: StreamReasoningMode,
 }
 
 impl Default for LoopKnobs {
@@ -34,6 +40,7 @@ impl Default for LoopKnobs {
             dedup_enabled: true,
             max_iteration_behavior: MaxIterationBehavior::GracefulSummary,
             detect_protocol_without_tools: true,
+            draft_reasoning: StreamReasoningMode::Status,
         }
     }
 }

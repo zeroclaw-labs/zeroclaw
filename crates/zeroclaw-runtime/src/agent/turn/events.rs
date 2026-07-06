@@ -16,6 +16,15 @@ pub(crate) const STREAM_CHUNK_MIN_CHARS: usize = 80;
 /// Minimum interval between progress sends to avoid flooding the draft channel.
 pub const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
 
+/// Placeholder text used for newly opened draft messages.
+pub const DRAFT_PLACEHOLDER: &str = "...";
+/// Prefix for liveness-only thinking/reasoning progress.
+pub const THINKING_STATUS_PREFIX: &str = "\u{1f914} ";
+/// Prefix for opt-in raw reasoning progress.
+pub const REASONING_FULL_PREFIX: &str = "\u{1f9e0} ";
+/// Status-mode reasoning tick that does not expose raw reasoning text.
+pub const REASONING_STATUS_TEXT: &str = "\u{1f914} Thinking...\n";
+
 /// Delta sent from the agent loop to the channel's draft updater.
 /// Append-only — no clear/reset variant exists by design.
 #[derive(Debug, Clone)]

@@ -4204,6 +4204,29 @@ fn matrix_single_message_streaming_enabled(
     matrix_single_message_streaming_enabled_for_config(ctx.prompt_config.as_ref(), msg)
 }
 
+fn matrix_stream_reasoning_for_config(
+    config: &zeroclaw_config::schema::Config,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> zeroclaw_config::schema::StreamReasoningMode {
+    if msg.channel != "matrix" {
+        return zeroclaw_config::schema::StreamReasoningMode::default();
+    }
+    let Some(alias) = msg.channel_alias.as_ref() else {
+        return zeroclaw_config::schema::StreamReasoningMode::default();
+    };
+    config.channels.matrix.get(alias).map_or(
+        zeroclaw_config::schema::StreamReasoningMode::default(),
+        |config| config.stream_reasoning,
+    )
+}
+
+fn matrix_stream_reasoning(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> zeroclaw_config::schema::StreamReasoningMode {
+    matrix_stream_reasoning_for_config(ctx.prompt_config.as_ref(), msg)
+}
+
 /// Resolve the effective `ack_reactions` value for a channel message.
 ///
 /// Per-channel overrides (e.g. `[channels.lark.work].ack_reactions`)
@@ -4963,7 +4986,11 @@ async fn process_channel_message_body(
         if let Some(channel) = target_channel.as_ref() {
             match channel
                 .send_draft(
-                    &SendMessage::new("...", &msg.reply_target).in_thread(msg.thread_ts.clone()),
+                    &SendMessage::new(
+                        zeroclaw_runtime::agent::loop_::DRAFT_PLACEHOLDER,
+                        &msg.reply_target,
+                    )
+                    .in_thread(msg.thread_ts.clone()),
                 )
                 .await
             {
@@ -5155,7 +5182,10 @@ async fn process_channel_message_body(
             collector: std::sync::Arc::clone(&tool_receipts_collector),
         }
     });
-    let loop_knobs = LoopKnobs::default();
+    let mut loop_knobs = LoopKnobs::default();
+    if matrix_single_message_streaming {
+        loop_knobs.draft_reasoning = matrix_stream_reasoning(ctx.as_ref(), &msg);
+    }
     let turn_id = uuid::Uuid::new_v4().to_string();
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
