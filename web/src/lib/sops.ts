@@ -1,7 +1,14 @@
 import { apiFetch } from './api';
 import type { components } from './api-generated';
+import { fieldHelp } from './api-descriptions';
 
 type Schemas = components['schemas'];
+
+/// Help text for a field of a generated SOP schema, sourced from Rust `///`
+/// docs via the OpenAPI spec. Thin re-export so SOP surfaces have one import.
+export function sopFieldHelp(schema: string, field: string): string | undefined {
+  return fieldHelp(schema, field);
+}
 
 export type Sop = Schemas['Sop'];
 export type SopStep = Schemas['SopStep'];
