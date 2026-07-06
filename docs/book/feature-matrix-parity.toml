@@ -241,7 +241,7 @@ openclaw = "supported"
 hermes = "supported"
 
 [providers.gemini_cli]
-openclaw = "none"
+openclaw = "supported"
 hermes = "none"
 
 [providers.bedrock]
@@ -281,7 +281,7 @@ openclaw = "supported"
 hermes = "supported"
 
 [providers.perplexity]
-openclaw = "supported"
+openclaw = "none"
 hermes = "supported"
 
 [providers.xai]
