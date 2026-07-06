@@ -2251,6 +2251,17 @@ impl Dashboard {
         )
     }
 
+    fn cron_action_hint(&self) -> String {
+        use crate::keymap::{DashboardTabAction as D, action_key_labels};
+
+        let run = action_key_labels(D::TriggerCron).join("/");
+        let refresh = action_key_labels(D::Refresh).join("/");
+        crate::i18n::t_args(
+            "zc-dashboard-cron-action-hint",
+            &[("run", &run), ("refresh", &refresh)],
+        )
+    }
+
     fn active_list_state_mut(&mut self) -> &mut ListState {
         match self.tab {
             Tab::Sessions => &mut self.session_state,
@@ -2390,17 +2401,6 @@ impl crate::widgets::HelpContext for Dashboard {
             }
         }
         HelpNode::entries(entries)
-    }
-
-    fn cron_action_hint(&self) -> String {
-        use crate::keymap::{DashboardTabAction as D, action_key_labels};
-
-        let run = action_key_labels(D::TriggerCron).join("/");
-        let refresh = action_key_labels(D::Refresh).join("/");
-        crate::i18n::t_args(
-            "zc-dashboard-cron-action-hint",
-            &[("run", &run), ("refresh", &refresh)],
-        )
     }
 }
 
