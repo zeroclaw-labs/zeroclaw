@@ -1063,6 +1063,12 @@ pub async fn run_gateway(
     // Cost tracker — process-global singleton so channels share the same instance
     let cost_tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir);
 
+    // Live model-pricing refresher (once per process; idempotent, no-op unless a
+    // provider sets `live_pricing = true`). Each call re-binds the refresher's
+    // config handle, so reloads that re-instantiate the config Arc are honored
+    // without a restart; shares the global price snapshot the cost path reads.
+    zeroclaw_providers::pricing::spawn_refresher(config_state.clone());
+
     // SSE broadcast channel for real-time events.
     // Use an externally provided sender (e.g. from the daemon) so that other
     // components (cron, heartbeat) can publish events to the same bus.
