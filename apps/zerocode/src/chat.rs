@@ -4686,6 +4686,15 @@ pub struct ChatState {
     pending_approval: Option<PendingApproval>,
     pending_elicitation: Option<PendingElicitation>,
     pub turn_in_flight: bool,
+    /// Set when any streaming text was flushed during the current turn.
+    /// Used by `commit_turn` to decide whether `full_text` is a fallback
+    /// (no streaming happened) or a duplicate (streaming already committed).
+    turn_had_streaming_text: bool,
+    /// Set when any `ToolCall` event arrived during the current turn.
+    /// Used by `commit_turn` to distinguish "empty completion with tool
+    /// calls" (normal — tool output is the visible record) from "empty
+    /// completion with nothing at all" (needs a diagnostic row).
+    turn_had_tool_calls: bool,
     /// Fine-grained label for the input-bar title while a turn is active.
     /// Lockstep with `turn_in_flight` (`Idle` ↔ `false`) but adds the
     /// thinking / responding / tool-call breakdown for the UI.
@@ -4809,6 +4818,8 @@ impl ChatState {
             pending_approval: None,
             pending_elicitation: None,
             turn_in_flight: false,
+            turn_had_streaming_text: false,
+            turn_had_tool_calls: false,
             turn_status: TurnStatus::Idle,
             turn_started_at: Instant::now(),
             show_thoughts: true,
@@ -5417,12 +5428,16 @@ impl ChatState {
     /// Commit any accumulated streaming text as an `AgentMessage` entry.
     /// Called when a tool call interrupts the text stream so that pre-tool
     /// text is committed in conversation order before the `Tool` entry.
-    fn flush_streaming_text(&mut self) {
+    /// Returns `true` if any text was flushed.
+    fn flush_streaming_text(&mut self) -> bool {
         let text = std::mem::take(&mut self.streaming_text);
         if !text.is_empty() {
             self.entries
                 .push(ChatEntry::AgentMessage(Arc::<str>::from(text)));
             self.mark_dirty_append();
+            true
+        } else {
+            false
         }
     }
 
@@ -5473,8 +5488,11 @@ impl ChatState {
                 // Flush any accumulated text and thought before the tool call
                 // so that pre-tool agent text and thinking both appear in
                 // conversation order before the Tool entry.
-                self.flush_streaming_text();
+                if self.flush_streaming_text() {
+                    self.turn_had_streaming_text = true;
+                }
                 self.flush_streaming_thought();
+                self.turn_had_tool_calls = true;
                 if self.turn_in_flight {
                     self.turn_status = TurnStatus::CallingTool(name.clone());
                 }
@@ -5571,9 +5589,30 @@ impl ChatState {
     }
 
     pub fn commit_turn(&mut self, full_text: String, clean: bool) {
-        self.flush_streaming_text();
+        if self.flush_streaming_text() {
+            self.turn_had_streaming_text = true;
+        }
         self.flush_streaming_thought();
-        let _ = full_text;
+        // If no streaming text was accumulated during this turn, use the
+        // daemon-provided final text as a fallback so the turn is never
+        // invisible to the user.
+        if !self.turn_had_streaming_text && !full_text.is_empty() {
+            self.entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(full_text)));
+            self.mark_dirty_append();
+        } else if !self.turn_had_streaming_text && !self.turn_had_tool_calls && full_text.is_empty()
+        {
+            // Turn completed with no streamed text, no tool calls, and no
+            // final content — render a diagnostic so the user knows the
+            // turn finished rather than silently vanishing (#8644).
+            self.entries
+                .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                    "zc-turn-no-output",
+                ))));
+            self.mark_dirty_append();
+        }
+        self.turn_had_streaming_text = false;
+        self.turn_had_tool_calls = false;
         self.mark_dirty_append();
         self.turn_in_flight = false;
         self.turn_status = TurnStatus::Idle;
@@ -5610,6 +5649,8 @@ impl ChatState {
         });
         self.mark_dirty_append();
         self.turn_in_flight = true;
+        self.turn_had_streaming_text = false;
+        self.turn_had_tool_calls = false;
         // Start a fresh status + animation anchor. We're `Working` until the
         // first chunk (thought / message / tool-call) tells us otherwise.
         self.turn_status = TurnStatus::Working;
@@ -7837,6 +7878,62 @@ mod tests {
             matches!(&s.entries()[0], ChatEntry::AgentMessage(t) if t.as_ref() == "Before tool.")
         );
         assert!(matches!(&s.entries()[1], ChatEntry::Tool { .. }));
+    }
+
+    /// When no streaming text was accumulated, commit_turn must use the
+    /// daemon-provided final text as a fallback — rendered exactly once.
+    #[test]
+    fn commit_turn_renders_nonempty_fallback_when_no_streaming() {
+        let mut s = state();
+        s.turn_in_flight = true;
+
+        // No streaming chunks; commit_turn receives non-empty final text.
+        s.commit_turn("Hello from daemon.".to_string(), true);
+
+        assert_eq!(s.entries().len(), 1);
+        assert!(
+            matches!(&s.entries()[0], ChatEntry::AgentMessage(t) if t.as_ref() == "Hello from daemon.")
+        );
+    }
+
+    /// When a turn completes with no streamed text, no tool calls, and no
+    /// final content, commit_turn must render a diagnostic system message
+    /// so the user knows the turn finished (#8644).
+    #[test]
+    fn commit_turn_shows_diagnostic_when_no_output_at_all() {
+        let mut s = state();
+        s.turn_in_flight = true;
+
+        // Empty everything: no streaming, no tools, empty final text.
+        s.commit_turn(String::new(), true);
+
+        assert_eq!(s.entries().len(), 1);
+        assert!(
+            matches!(&s.entries()[0], ChatEntry::SystemMessage(t) if t.as_ref() == "Turn completed with no output."),
+            "expected diagnostic SystemMessage for empty completion, got {:?}",
+            s.entries()[0]
+        );
+    }
+
+    /// When tool calls were made during a turn but no text was streamed and
+    /// final text is empty, commit_turn must NOT add a diagnostic — the tool
+    /// entries are the visible record of work.
+    #[test]
+    fn commit_turn_no_diagnostic_when_tool_calls_present() {
+        let mut s = state();
+        s.turn_in_flight = true;
+
+        s.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc1".to_string(),
+            name: "shell".to_string(),
+            raw_input: serde_json::json!({"command": "ls"}),
+        });
+        s.commit_turn(String::new(), true);
+
+        // Only the Tool entry — no diagnostic needed.
+        assert_eq!(s.entries().len(), 1);
+        assert!(matches!(&s.entries()[0], ChatEntry::Tool { .. }));
     }
 
     #[test]

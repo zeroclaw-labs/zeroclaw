@@ -92,6 +92,7 @@ zc-input-pending-attachments-header = Adjuntos pendientes:
 zc-input-clipboard-error = Error del portapapeles: { $error }
 zc-queue-empty = Nada que enviar.
 zc-cancel-timed-out = La cancelación expiró; el turno se resolvió localmente.
+zc-turn-no-output = Turno completado sin salida.
 zc-queue-full = La cola está llena ({ $cap } máx.). Espera a que se envíen los mensajes.
 zc-queue-title = Cola ({ $count })
 zc-queue-empty-list = No hay mensajes en cola.
