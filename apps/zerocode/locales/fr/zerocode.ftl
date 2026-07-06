@@ -78,6 +78,7 @@ zc-zerocode-agent-theme-cleared = Remplacement effacé pour { $agent }
 zc-zerocode-agent-theme-hint = { $assign } assigner un thème   ·   { $clear } effacer le remplacement
 zc-input-no-pending-attachments = Aucune pièce jointe en attente.
 zc-input-no-clipboard-image = Aucune image dans le presse-papiers.
+zc-input-clipboard-image-unreadable = Impossible de lire l'image du presse-papiers ; réessayez de la copier.
 zc-input-placeholder-chat = Tapez pour discuter
 zc-input-help-completions-navigate = Parcourir les complétions
 zc-input-help-completions-accept = Accepter

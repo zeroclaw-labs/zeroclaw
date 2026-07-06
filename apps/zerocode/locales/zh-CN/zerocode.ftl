@@ -78,6 +78,7 @@ zc-zerocode-agent-theme-cleared = 已清除 { $agent } 的覆盖设置
 zc-zerocode-agent-theme-hint = { $assign } 分配主题   ·   { $clear } 清除覆盖设置
 zc-input-no-pending-attachments = 没有待处理的附件。
 zc-input-no-clipboard-image = 剪贴板中没有图片。
+zc-input-clipboard-image-unreadable = 无法读取剪贴板中的图片，请重新复制。
 zc-input-placeholder-chat = 输入以聊天
 zc-input-help-completions-navigate = 浏览补全项
 zc-input-help-completions-accept = 接受

@@ -8,17 +8,79 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
+/// Number of read attempts when the clipboard advertises an image target but
+/// the byte read comes back empty. A freshly captured screenshot populates the
+/// clipboard asynchronously: the selection owner may advertise the image target
+/// a beat before the pixel data is actually servable, so a single read races
+/// the export and intermittently returns nothing. Re-reading across a short
+/// window absorbs that race so a genuinely-present image always resolves.
+const IMAGE_READ_ATTEMPTS: u32 = 8;
+
+/// Delay between image-read attempts.
+const IMAGE_READ_RETRY_DELAY: Duration = Duration::from_millis(120);
+
 /// Try to read image data from the system clipboard.
 ///
-/// Returns `Some((bytes, mime_type))` on success, `None` if no image
-/// is present or no clipboard tool is available.
+/// Returns `Some((bytes, mime_type))` on success, `None` when the clipboard
+/// genuinely holds no image or no clipboard tool is available.
+///
+/// The read is target-aware and retrying: it first asks the clipboard which
+/// image target it can serve, then reads that exact target with a bounded
+/// retry. Hardcoding `image/png` and reading once (the previous behaviour)
+/// silently lost screenshots whenever the source offered the image under a
+/// different target or had not finished exporting `image/png` yet, which is
+/// why paste "sometimes worked and sometimes didn't."
 pub(crate) fn read_clipboard_image() -> Option<(Vec<u8>, String)> {
     let tool = which_clipboard_tool()?;
-    let output = run_clipboard_tool(&tool)?;
-    if output.is_empty() {
-        return None;
+
+    // Resolve the concrete image target the clipboard can actually serve.
+    // Falls back to `image/png` for tools that don't enumerate targets
+    // (pngpaste, PowerShell) — those always emit PNG bytes directly.
+    let target = image_target_for_tool(&tool);
+
+    for attempt in 0..IMAGE_READ_ATTEMPTS {
+        match run_clipboard_tool(&tool, &target) {
+            Some(bytes) if !bytes.is_empty() => {
+                return Some((bytes, mime_for_target(&target)));
+            }
+            // Empty read while a target is advertised: the export is still
+            // racing the offer. Back off briefly and retry.
+            _ => {
+                if attempt + 1 < IMAGE_READ_ATTEMPTS {
+                    std::thread::sleep(IMAGE_READ_RETRY_DELAY);
+                }
+            }
+        }
     }
-    Some((output, tool.mime_type().to_string()))
+    None
+}
+
+/// Returns `true` when the system clipboard currently advertises a servable
+/// image target. Used to distinguish "no image was ever on the clipboard"
+/// (fall through to text paste) from "an image is present but the byte read
+/// keeps racing the export" (surface a real error instead of silently
+/// dropping the screenshot).
+pub(crate) fn clipboard_has_image() -> bool {
+    match which_clipboard_tool() {
+        Some(ClipboardTool::Xclip) => list_targets_xclip()
+            .map(|t| targets_contain_image(&t))
+            .unwrap_or(false),
+        Some(ClipboardTool::WlPaste) => list_targets_wl_paste()
+            .map(|t| targets_contain_image(&t))
+            .unwrap_or(false),
+        // Direct-PNG tools can't enumerate; treat presence as unknown-false so
+        // callers keep the existing text-fallback behaviour there.
+        Some(ClipboardTool::PngPaste) | Some(ClipboardTool::PowerShellImage) => false,
+        None => false,
+    }
+}
+
+fn targets_contain_image(targets: &[String]) -> bool {
+    targets.iter().any(|t| {
+        ACCEPTED_IMAGE_TARGETS
+            .iter()
+            .any(|wanted| t.eq_ignore_ascii_case(wanted))
+    })
 }
 
 /// Try to read UTF-8 text from the system clipboard.
@@ -65,10 +127,83 @@ enum ClipboardTool {
     PowerShellImage,
 }
 
-impl ClipboardTool {
-    fn mime_type(&self) -> &'static str {
-        "image/png"
+/// Image MIME targets we accept from the clipboard, in preference order.
+/// PNG first (lossless, universally supported by vision models), then common
+/// screenshot-tool alternatives. Selection is intersected with what the
+/// clipboard actually advertises.
+const ACCEPTED_IMAGE_TARGETS: &[&str] = &[
+    "image/png",
+    "image/webp",
+    "image/jpeg",
+    "image/jpg",
+    "image/gif",
+    "image/bmp",
+    "image/tiff",
+];
+
+/// Resolve the concrete image target the clipboard can serve for this tool.
+///
+/// For target-enumerating tools (xclip, wl-paste) this intersects the
+/// clipboard's advertised targets with [`ACCEPTED_IMAGE_TARGETS`] and returns
+/// the highest-preference match. For direct-PNG tools (pngpaste, PowerShell)
+/// enumeration is not available, so it returns `image/png` unconditionally —
+/// those tools re-encode to PNG regardless of the source format.
+fn image_target_for_tool(tool: &ClipboardTool) -> String {
+    let advertised = match tool {
+        ClipboardTool::Xclip => list_targets_xclip(),
+        ClipboardTool::WlPaste => list_targets_wl_paste(),
+        ClipboardTool::PngPaste | ClipboardTool::PowerShellImage => None,
+    };
+    match advertised {
+        Some(targets) => ACCEPTED_IMAGE_TARGETS
+            .iter()
+            .find(|wanted| targets.iter().any(|t| t.eq_ignore_ascii_case(wanted)))
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "image/png".to_string()),
+        None => "image/png".to_string(),
     }
+}
+
+/// Normalize a clipboard target to a MIME type the vision pipeline accepts.
+/// `image/jpg` is a common non-standard target name for JPEG.
+fn mime_for_target(target: &str) -> String {
+    if target.eq_ignore_ascii_case("image/jpg") {
+        "image/jpeg".to_string()
+    } else {
+        target.to_ascii_lowercase()
+    }
+}
+
+fn list_targets_xclip() -> Option<Vec<String>> {
+    let output = Command::new("xclip")
+        .args(["-selection", "clipboard", "-t", "TARGETS", "-o"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_target_lines(&output.stdout))
+}
+
+fn list_targets_wl_paste() -> Option<Vec<String>> {
+    let output = Command::new("wl-paste")
+        .arg("--list-types")
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_target_lines(&output.stdout))
+}
+
+fn parse_target_lines(raw: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(raw)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
 }
 
 /// Clipboard text reader, selected per platform.
@@ -129,16 +264,16 @@ fn which_exists(name: &str) -> bool {
 
 // ── Tool execution ───────────────────────────────────────────────
 
-fn run_clipboard_tool(tool: &ClipboardTool) -> Option<Vec<u8>> {
+fn run_clipboard_tool(tool: &ClipboardTool, target: &str) -> Option<Vec<u8>> {
     let mut cmd = match tool {
         ClipboardTool::Xclip => {
             let mut c = Command::new("xclip");
-            c.args(["-selection", "clipboard", "-t", "image/png", "-o"]);
+            c.args(["-selection", "clipboard", "-t", target, "-o"]);
             c
         }
         ClipboardTool::WlPaste => {
             let mut c = Command::new("wl-paste");
-            c.args(["--type", "image/png"]);
+            c.args(["--type", target]);
             c
         }
         ClipboardTool::PngPaste => {
@@ -263,5 +398,57 @@ mod tests {
         let p = clipboard_temp_path("png");
         assert!(p.to_str().unwrap().ends_with(".png"));
         assert!(p.to_str().unwrap().contains("clipboard_"));
+    }
+
+    #[test]
+    fn parse_target_lines_trims_and_filters() {
+        let raw = b"image/png\n  image/webp \n\nTIMESTAMP\n";
+        let parsed = parse_target_lines(raw);
+        assert_eq!(parsed, vec!["image/png", "image/webp", "TIMESTAMP"]);
+    }
+
+    #[test]
+    fn targets_contain_image_detects_supported() {
+        assert!(targets_contain_image(&[
+            "TIMESTAMP".into(),
+            "text/plain".into(),
+            "image/png".into(),
+        ]));
+        assert!(targets_contain_image(&["IMAGE/PNG".into()]));
+        assert!(!targets_contain_image(&[
+            "TIMESTAMP".into(),
+            "text/plain".into(),
+            "text/html".into(),
+        ]));
+        assert!(!targets_contain_image(&[]));
+    }
+
+    #[test]
+    fn image_target_selection_prefers_png() {
+        // The intersection logic lives in image_target_for_tool via the
+        // advertised list; exercise the preference ordering directly.
+        let advertised = ["image/jpeg".to_string(), "image/png".to_string()];
+        let chosen = ACCEPTED_IMAGE_TARGETS
+            .iter()
+            .find(|w| advertised.iter().any(|t| t.eq_ignore_ascii_case(w)))
+            .map(|t| t.to_string());
+        assert_eq!(chosen.as_deref(), Some("image/png"));
+    }
+
+    #[test]
+    fn image_target_selection_falls_back_to_next_preference() {
+        let advertised = ["image/gif".to_string(), "image/jpeg".to_string()];
+        let chosen = ACCEPTED_IMAGE_TARGETS
+            .iter()
+            .find(|w| advertised.iter().any(|t| t.eq_ignore_ascii_case(w)))
+            .map(|t| t.to_string());
+        assert_eq!(chosen.as_deref(), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn mime_for_target_normalizes_jpg() {
+        assert_eq!(mime_for_target("image/jpg"), "image/jpeg");
+        assert_eq!(mime_for_target("IMAGE/PNG"), "image/png");
+        assert_eq!(mime_for_target("image/webp"), "image/webp");
     }
 }

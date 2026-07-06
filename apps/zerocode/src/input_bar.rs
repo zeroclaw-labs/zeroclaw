@@ -1342,7 +1342,21 @@ impl InputBarState {
                     }
                 }
             }
-            None => self.paste_clipboard_text(),
+            None => {
+                // No bytes came back. Only two things this can mean:
+                //   1. The clipboard genuinely holds no image → fall through to
+                //      the text-paste path (Ctrl+V on selected text).
+                //   2. An image IS advertised but every read raced the source's
+                //      async export → surface a real error rather than silently
+                //      dropping the screenshot and pretending nothing happened.
+                if clipboard::clipboard_has_image() {
+                    InputBarAction::StatusMessage(crate::i18n::t(
+                        "zc-input-clipboard-image-unreadable",
+                    ))
+                } else {
+                    self.paste_clipboard_text()
+                }
+            }
         }
     }
 

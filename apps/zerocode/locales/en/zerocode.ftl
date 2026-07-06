@@ -86,6 +86,7 @@ zc-zerocode-agent-theme-hint = { $assign } assign theme   ·   { $clear } clear 
 
 zc-input-no-pending-attachments = No pending attachments.
 zc-input-no-clipboard-image = Clipboard is empty.
+zc-input-clipboard-image-unreadable = Clipboard image could not be read; try copying it again.
 zc-input-placeholder-chat = Type to chat
 
 zc-input-help-completions-navigate = Navigate completions

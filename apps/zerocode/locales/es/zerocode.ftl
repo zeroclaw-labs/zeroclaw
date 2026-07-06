@@ -78,6 +78,7 @@ zc-zerocode-agent-theme-cleared = Anulación eliminada para { $agent }
 zc-zerocode-agent-theme-hint = { $assign } asignar tema   ·   { $clear } eliminar anulación
 zc-input-no-pending-attachments = No hay adjuntos pendientes.
 zc-input-no-clipboard-image = No hay ninguna imagen en el portapapeles.
+zc-input-clipboard-image-unreadable = No se pudo leer la imagen del portapapeles; intenta copiarla de nuevo.
 zc-input-placeholder-chat = Escribe para chatear
 zc-input-help-completions-navigate = Navegar completados
 zc-input-help-completions-accept = Aceptar
