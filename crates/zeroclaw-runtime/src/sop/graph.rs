@@ -437,8 +437,18 @@ impl SopGraphExt for SopGraph {
 
         binding_data_wires(sop, &nodes, &mut wires, &mut diagnostics);
 
-        let layout = layout_graph(&nodes, &wires);
-
+        let mut layout = layout_graph(&nodes, &wires);
+        for step in &sop.steps {
+            if let Some(p) = step.pos
+                && let Some(np) = layout
+                    .positions
+                    .iter_mut()
+                    .find(|np| np.step == step.number)
+            {
+                np.x = Some(p.x);
+                np.y = Some(p.y);
+            }
+        }
         SopGraph {
             nodes,
             wires,
@@ -507,6 +517,8 @@ fn layout_graph(nodes: &[GraphNode], wires: &[GraphWire]) -> GraphLayout {
             step: *step,
             col: c,
             row: *r,
+            x: None,
+            y: None,
         });
         columns = columns.max(c + 1);
         rows = rows.max(*r + 1);

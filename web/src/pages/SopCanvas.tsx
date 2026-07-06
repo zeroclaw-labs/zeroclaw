@@ -59,10 +59,14 @@ function nodeStateStroke(state: NodeRunState | undefined): string {
 function seedPositions(graph: SopGraph): Map<number, XY> {
   const pos = new Map<number, XY>();
   for (const p of graph.layout.positions) {
-    pos.set(p.step, {
-      x: 24 + p.col * (NODE_W + COL_GAP),
-      y: 24 + p.row * (NODE_H + ROW_GAP),
-    });
+    if (p.x != null && p.y != null) {
+      pos.set(p.step, { x: p.x, y: p.y });
+    } else {
+      pos.set(p.step, {
+        x: 24 + p.col * (NODE_W + COL_GAP),
+        y: 24 + p.row * (NODE_H + ROW_GAP),
+      });
+    }
   }
   return pos;
 }
@@ -124,6 +128,7 @@ interface Props {
   onDisconnect: (from: number, to: number, kind: FlowRole, portIndex?: number) => void;
   onConnectData: (fromStep: number, fromPin: string, toStep: number, toPin: string) => void;
   onDisconnectData: (toStep: number, toPin: string) => void;
+  onMoveNode?: (step: number, x: number, y: number) => void;
 }
 
 type ContextMenu = { x: number; y: number; step: number | null };
@@ -164,6 +169,7 @@ export default function SopCanvas({
   onDisconnect,
   onConnectData,
   onDisconnectData,
+  onMoveNode,
 }: Props) {
   const [pos, setPos] = useState<Map<number, XY>>(() => seedPositions(graph));
   const [drag, setDrag] = useState<{ step: number; dx: number; dy: number } | null>(null);
@@ -232,10 +238,14 @@ export default function SopCanvas({
   );
 
   const endDrag = useCallback(() => {
+    if (drag !== null && onMoveNode) {
+      const p = pos.get(drag.step);
+      if (p) onMoveNode(drag.step, p.x, p.y);
+    }
     setDrag(null);
     panRef.current = null;
     setPanning(false);
-  }, []);
+  }, [drag, pos, onMoveNode]);
 
   // Left-click on empty canvas background starts a drag-scroll pan. Nodes,
   // handles, and wires stop propagation on their own pointerdown, so this only

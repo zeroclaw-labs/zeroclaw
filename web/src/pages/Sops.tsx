@@ -1401,6 +1401,11 @@ export default function Sops() {
             ...d,
             steps: d.steps.map((s, j) => (j === i ? { ...s, ...patch } : s)),
           })),
+        onMoveNode: (step: number, x: number, y: number) =>
+          mutateDraft((d) => ({
+            ...d,
+            steps: d.steps.map((s) => (s.number === step ? { ...s, pos: { x, y } } : s)),
+          })),
         onAddStep: () =>
           mutateDraft((d) => ({ ...d, steps: [...d.steps, blankStep(d.steps.length + 1)] })),
         onRemoveStep: (i: number) =>
@@ -1488,6 +1493,7 @@ export default function Sops() {
               onDisconnect={onDisconnect}
               onConnectData={onConnectData}
               onDisconnectData={onDisconnectData}
+              onMoveNode={editorHandlers.onMoveNode}
             />
           ) : null}
         </div>

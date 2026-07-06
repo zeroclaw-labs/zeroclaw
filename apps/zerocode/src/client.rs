@@ -2113,7 +2113,13 @@ pub struct PlannedToolCall {
     pub pinned: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StepPos {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SopStep {
     pub number: u32,
     pub title: String,
@@ -2130,6 +2136,10 @@ pub struct SopStep {
     pub on_failure: StepFailure,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calls: Vec<PlannedToolCall>,
+    /// Persisted canvas coordinate set by the web Blueprint editor. zerocode
+    /// preserves it verbatim on round-trip; its TUI renders from the grid layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pos: Option<StepPos>,
     /// Editor-local raw JSON text for `calls`; never on the wire.
     #[serde(skip)]
     pub calls_buf: Option<String>,
@@ -2147,12 +2157,13 @@ impl Default for SopStep {
             routing: StepRouting::default(),
             on_failure: StepFailure::Fail,
             calls: Vec::new(),
+            pos: None,
             calls_buf: None,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SopDraft {
     pub name: String,
     pub description: String,

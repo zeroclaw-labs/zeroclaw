@@ -119,17 +119,22 @@ pub struct GraphDiagnostic {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 /// Grid placement for one node: column = longest flow path from an entry,
-/// row = order of insertion within that column.
+/// row = order of insertion within that column. `x`/`y` carry a persisted
+/// canvas coordinate when the node has been dragged; absent otherwise.
 pub struct NodePosition {
     pub step: u32,
     pub col: u32,
     pub row: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 /// Deterministic auto-layout so every surface renders the same picture
 /// without a client-side layout engine.
@@ -142,7 +147,7 @@ pub struct GraphLayout {
     pub rows: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 /// The full projected graph: nodes, wires, validation diagnostics, and a
 /// precomputed layout. Serialized as-is over RPC (`sops/graph`) and HTTP.

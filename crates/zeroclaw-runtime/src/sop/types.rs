@@ -288,8 +288,17 @@ pub struct PlannedToolCall {
     pub pinned: Option<serde_json::Value>,
 }
 
+/// Persisted canvas coordinate for a step node. Written by the Blueprint
+/// editor when a node is dragged; never edited in the step-definition form.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct StepPos {
+    pub x: f64,
+    pub y: f64,
+}
+
 /// A single step in an SOP procedure, parsed from SOP.md.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopStep {
     pub number: u32,
@@ -321,6 +330,10 @@ pub struct SopStep {
     /// `{{steps.N}}` / `{{calls.K}}` bindings validated at save time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calls: Vec<PlannedToolCall>,
+    /// Persisted canvas coordinate, set by dragging the node in the Blueprint
+    /// editor. Absent until the node is moved; not surfaced in the step form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pos: Option<StepPos>,
 }
 
 impl Default for SopStep {
@@ -338,6 +351,7 @@ impl Default for SopStep {
             on_failure: StepFailure::default(),
             mode: None,
             calls: Vec::new(),
+            pos: None,
         }
     }
 }
@@ -397,6 +411,19 @@ pub struct SopManifest {
     pub sop: SopMeta,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub triggers: Vec<SopTrigger>,
+    /// Persisted canvas coordinates per step. Written by the Blueprint editor,
+    /// kept out of SOP.md so step prose stays position-free. Merged back onto
+    /// `SopStep::pos` at load time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub positions: Vec<StepPosition>,
+}
+
+/// One step's persisted canvas coordinate in SOP.toml.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct StepPosition {
+    pub step: u32,
+    pub x: f64,
+    pub y: f64,
 }
 
 /// The `[sop]` table in SOP.toml.
@@ -433,6 +460,17 @@ impl SopManifest {
                 deterministic: sop.deterministic,
             },
             triggers: sop.triggers.clone(),
+            positions: sop
+                .steps
+                .iter()
+                .filter_map(|s| {
+                    s.pos.map(|p| StepPosition {
+                        step: s.number,
+                        x: p.x,
+                        y: p.y,
+                    })
+                })
+                .collect(),
         }
     }
 }

@@ -321,13 +321,18 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
     let manifest: SopManifest = toml::from_str(&toml_content)?;
 
     let md_path = sop_dir.join("SOP.md");
-    let steps = if md_path.exists() {
+    let mut steps = if md_path.exists() {
         let md_content = std::fs::read_to_string(&md_path)?;
         parse_steps(&md_content)
     } else {
         Vec::new()
     };
 
+    for pos in &manifest.positions {
+        if let Some(step) = steps.iter_mut().find(|s| s.number == pos.step) {
+            step.pos = Some(types::StepPos { x: pos.x, y: pos.y });
+        }
+    }
     let SopMeta {
         name,
         description,
@@ -540,6 +545,7 @@ impl StepParseState {
             on_failure: std::mem::take(&mut self.on_failure),
             mode: self.mode.take(),
             calls: std::mem::take(&mut self.calls),
+            pos: None,
         });
         *self = Self::default();
     }
@@ -1081,6 +1087,36 @@ mod tests {
 
         delete_sop(dir.path(), "authoring").unwrap();
         assert!(load_sop_by_name(dir.path(), "authoring", SopExecutionMode::Supervised).is_err());
+    }
+
+    #[test]
+    fn step_pos_roundtrips_via_toml_and_stays_out_of_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s1 = titled_step(1, "First");
+        s1.body = "Do the thing.".into();
+        s1.pos = Some(types::StepPos { x: 320.5, y: -48.0 });
+        let sop = authoring_sop(vec![s1, titled_step(2, "Second")]);
+
+        save_sop(dir.path(), &sop).unwrap();
+
+        let toml = std::fs::read_to_string(dir.path().join("authoring/SOP.toml")).unwrap();
+        assert!(
+            toml.contains("[[positions]]"),
+            "positions block in TOML: {toml}"
+        );
+        let md = std::fs::read_to_string(dir.path().join("authoring/SOP.md")).unwrap();
+        assert!(
+            !md.contains("320.5"),
+            "coordinate must not leak into SOP.md: {md}"
+        );
+
+        let loaded =
+            load_sop_by_name(dir.path(), "authoring", SopExecutionMode::Supervised).unwrap();
+        assert_eq!(
+            loaded.steps[0].pos,
+            Some(types::StepPos { x: 320.5, y: -48.0 })
+        );
+        assert_eq!(loaded.steps[1].pos, None);
     }
 
     #[test]
