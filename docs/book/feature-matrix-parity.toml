@@ -25,6 +25,8 @@
 # A cell is `supported` when the upstream tree ships a first-class module for it,
 # `none` when the tree has no equivalent, and `partial` where support is indirect
 # (e.g. reachable only through a generic gateway rather than a dedicated module).
+# A cell is `planned` when the tree has no module yet but an open upstream feature
+# request tracks it (checked against each repo's issue tracker on 2026-07-06).
 
 # ── Channels ────────────────────────────────────────────────────────────────
 
@@ -180,7 +182,7 @@ hermes = "supported"
 
 [providers.azure]
 openclaw = "supported"
-hermes = "none"
+hermes = "supported"
 
 [providers.anthropic]
 openclaw = "supported"
@@ -207,8 +209,8 @@ openclaw = "supported"
 hermes = "supported"
 
 [providers.doubao]
-openclaw = "none"
-hermes = "none"
+openclaw = "supported"
+hermes = "planned"
 
 [providers.yi]
 openclaw = "none"
@@ -276,11 +278,11 @@ hermes = "none"
 
 [providers.cohere]
 openclaw = "supported"
-hermes = "none"
+hermes = "supported"
 
 [providers.perplexity]
 openclaw = "supported"
-hermes = "none"
+hermes = "supported"
 
 [providers.xai]
 openclaw = "supported"
@@ -300,7 +302,7 @@ hermes = "none"
 
 [providers.deepinfra]
 openclaw = "supported"
-hermes = "none"
+hermes = "planned"
 
 [providers.huggingface]
 openclaw = "supported"
@@ -360,7 +362,7 @@ hermes = "none"
 
 [providers.venice]
 openclaw = "supported"
-hermes = "none"
+hermes = "planned"
 
 [providers.nearai]
 openclaw = "none"
@@ -380,7 +382,7 @@ hermes = "none"
 
 [providers.cloudflare]
 openclaw = "supported"
-hermes = "none"
+hermes = "planned"
 
 [providers.ovh]
 openclaw = "none"
@@ -404,7 +406,7 @@ hermes = "none"
 
 [providers.vllm]
 openclaw = "supported"
-hermes = "none"
+hermes = "planned"
 
 [providers.osaurus]
 openclaw = "none"
@@ -412,7 +414,7 @@ hermes = "none"
 
 [providers.litellm]
 openclaw = "supported"
-hermes = "none"
+hermes = "planned"
 
 [providers.lepton]
 openclaw = "none"
