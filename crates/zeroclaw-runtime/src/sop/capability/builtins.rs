@@ -1,5 +1,3 @@
-use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -203,43 +201,14 @@ impl SopCapability for GitStatusCapability {
     }
 
     fn describe(&self) -> CapabilityInfo {
-        let mut info = git_info(self.id(), "Read git status");
-        info.output_schema = Some(json!({
-            "type": "object",
-            "required": ["clean", "status"],
-            "properties": {
-                "clean": { "type": "boolean" },
-                "status": { "type": "string" }
-            }
-        }));
-        info
+        git_info(self.id(), "Fail-closed placeholder for reading git status")
     }
 
-    fn execute(&self, ctx: CapabilityContext, input: Value) -> Result<CapabilityResult> {
-        let cwd = resolve_cwd(&ctx, &input)?;
-        let output = run_git(&cwd, &["status", "--short"])?;
-        if !output.success {
-            return Ok(output);
-        }
-        let status = output
-            .output
-            .get("stdout")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let clean = status.trim().is_empty();
-        let require_clean = input
-            .get("require_clean")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if require_clean && !clean {
-            return Ok(CapabilityResult::failure("git working tree is not clean"));
-        }
-        Ok(CapabilityResult::success(json!({
-            "clean": clean,
-            "status": status,
-            "cwd": cwd.display().to_string(),
-        })))
+    fn execute(&self, _ctx: CapabilityContext, _input: Value) -> Result<CapabilityResult> {
+        Ok(CapabilityResult::failure(
+            "git.status capability requires an injected tool/policy adapter (workspace-scoped, \
+             sandboxed git access) before it can execute",
+        ))
     }
 }
 
@@ -251,23 +220,14 @@ impl SopCapability for GitDiffCapability {
     }
 
     fn describe(&self) -> CapabilityInfo {
-        git_info(self.id(), "Read git diff")
+        git_info(self.id(), "Fail-closed placeholder for reading git diff")
     }
 
-    fn execute(&self, ctx: CapabilityContext, input: Value) -> Result<CapabilityResult> {
-        let cwd = resolve_cwd(&ctx, &input)?;
-        let mut args = vec!["diff", "--no-ext-diff"];
-        if input.get("stat").and_then(Value::as_bool).unwrap_or(false) {
-            args.push("--stat");
-        }
-        if input
-            .get("cached")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            args.push("--cached");
-        }
-        run_git(&cwd, &args)
+    fn execute(&self, _ctx: CapabilityContext, _input: Value) -> Result<CapabilityResult> {
+        Ok(CapabilityResult::failure(
+            "git.diff capability requires an injected tool/policy adapter (workspace-scoped, \
+             sandboxed git access) before it can execute",
+        ))
     }
 }
 
@@ -279,15 +239,16 @@ impl SopCapability for NotifyChannelCapability {
     }
 
     fn describe(&self) -> CapabilityInfo {
-        info(self.id(), "No-op notification adapter")
+        info(
+            self.id(),
+            "Fail-closed placeholder until a real channel delivery adapter is injected",
+        )
     }
 
-    fn execute(&self, _ctx: CapabilityContext, input: Value) -> Result<CapabilityResult> {
-        Ok(CapabilityResult::success(json!({
-            "delivered": false,
-            "adapter": "noop",
-            "input": input,
-        })))
+    fn execute(&self, _ctx: CapabilityContext, _input: Value) -> Result<CapabilityResult> {
+        Ok(CapabilityResult::failure(
+            "notify.channel capability requires an injected channel-delivery adapter",
+        ))
     }
 }
 
@@ -323,49 +284,8 @@ fn git_info(id: &'static str, description: &'static str) -> CapabilityInfo {
                 "cached": { "type": "boolean" }
             }
         })),
-        output_schema: Some(json!({
-            "type": "object",
-            "required": ["success", "stdout", "stderr"],
-            "properties": {
-                "success": { "type": "boolean" },
-                "stdout": { "type": "string" },
-                "stderr": { "type": "string" }
-            }
-        })),
+        output_schema: None,
     }
-}
-
-fn resolve_cwd(ctx: &CapabilityContext, input: &Value) -> Result<PathBuf> {
-    if let Some(raw) = input.get("cwd").and_then(Value::as_str) {
-        return Ok(PathBuf::from(raw));
-    }
-    if let Some(location) = ctx.sop_location.as_ref() {
-        return Ok(location.clone());
-    }
-    std::env::current_dir().context("resolve current working directory")
-}
-
-fn run_git(cwd: &Path, args: &[&str]) -> Result<CapabilityResult> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .with_context(|| format!("failed to run git in {}", cwd.display()))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    if !output.status.success() {
-        return Ok(CapabilityResult::failure(if stderr.trim().is_empty() {
-            format!("git exited with status {}", output.status)
-        } else {
-            stderr
-        }));
-    }
-    Ok(CapabilityResult::success(json!({
-        "success": true,
-        "stdout": stdout,
-        "stderr": stderr,
-        "cwd": cwd.display().to_string(),
-    })))
 }
 
 #[cfg(test)]
