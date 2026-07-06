@@ -13,12 +13,18 @@
 # Status vocabulary matches the page legend: supported | partial | experimental
 # | planned | none | unknown.
 #
-# Sources (checked 2026-07-04):
-#   OpenClaw channels: https://docs.openclaw.ai/channels
-#   Hermes channels/providers: https://hermesagents.net/integrations
-# OpenClaw does not publish a per-slot provider or per-tool inventory in a form
-# that maps cleanly onto ZeroClaw's registries, so those columns stay `unknown`
-# rather than guessed. Update as authoritative sources are confirmed.
+# Sources (source-walked from the upstream repositories, checked 2026-07-06):
+#   OpenClaw: https://github.com/openclaw/openclaw
+#     channels  -> extensions/ platform plugins + src/channels/
+#     providers -> extensions/ provider plugins (litellm gateway for custom)
+#     tools     -> extensions/openshell + src/ file/glob/ripgrep tooling
+#   Hermes:   https://github.com/NousResearch/hermes-agent
+#     channels  -> plugins/platforms/ + gateway/platforms/
+#     providers -> agent/*_adapter.py + website/docs/integrations/providers.md
+#     tools     -> tools/ (file_operations, shell/bash, grep, search_files)
+# A cell is `supported` when the upstream tree ships a first-class module for it,
+# `none` when the tree has no equivalent, and `partial` where support is indirect
+# (e.g. reachable only through a generic gateway rather than a dedicated module).
 
 # ── Channels ────────────────────────────────────────────────────────────────
 
@@ -36,7 +42,7 @@ hermes = "supported"
 
 [channels.mattermost]
 openclaw = "supported"
-hermes = "none"
+hermes = "supported"
 
 [channels.imessage]
 openclaw = "supported"
@@ -84,7 +90,7 @@ hermes = "none"
 
 [channels.irc]
 openclaw = "supported"
-hermes = "none"
+hermes = "supported"
 
 [channels.lark]
 openclaw = "supported"
@@ -92,7 +98,7 @@ hermes = "supported"
 
 [channels.dingtalk]
 openclaw = "none"
-hermes = "none"
+hermes = "supported"
 
 [channels.wecom]
 openclaw = "none"
@@ -103,7 +109,7 @@ openclaw = "none"
 hermes = "supported"
 
 [channels.wechat]
-openclaw = "supported"
+openclaw = "none"
 hermes = "supported"
 
 [channels.qq]
@@ -159,81 +165,104 @@ openclaw = "none"
 hermes = "none"
 
 [channels.webhook]
-openclaw = "partial"
-hermes = "none"
+openclaw = "supported"
+hermes = "supported"
 
 # ── Provider slots ──────────────────────────────────────────────────────────
-# Hermes values reflect its README/integrations provider list; native adapters
-# are `supported`, OpenAI-compatible-only families are `partial` (reachable as a
-# custom endpoint but not a first-party adapter). OpenClaw provider parity is not
-# published per-slot, so it stays `unknown`.
+# Both trees ship dedicated adapters for the named families; the `custom` slot
+# is a generic OpenAI-compatible passthrough, covered by OpenClaw's litellm
+# extension and Hermes' litellm-backed custom endpoint.
 
 [providers.openai]
-openclaw = "unknown"
+openclaw = "supported"
 hermes = "supported"
 
 [providers.anthropic]
-openclaw = "unknown"
+openclaw = "supported"
 hermes = "supported"
 
 [providers.gemini]
-openclaw = "unknown"
+openclaw = "supported"
 hermes = "supported"
 
 [providers.xai]
-openclaw = "unknown"
+openclaw = "supported"
 hermes = "supported"
 
 [providers.openrouter]
-openclaw = "unknown"
+openclaw = "supported"
 hermes = "supported"
 
 [providers.novita]
-openclaw = "unknown"
+openclaw = "supported"
 hermes = "supported"
 
 [providers.nvidia]
-openclaw = "unknown"
+openclaw = "supported"
 hermes = "supported"
 
 [providers.glm]
-openclaw = "unknown"
+openclaw = "supported"
 hermes = "supported"
 
 [providers.moonshot]
-openclaw = "unknown"
+openclaw = "supported"
 hermes = "supported"
 
 [providers.minimax]
-openclaw = "unknown"
+openclaw = "supported"
 hermes = "supported"
 
 [providers.mistral]
-openclaw = "unknown"
-hermes = "partial"
+openclaw = "supported"
+hermes = "supported"
 
 [providers.huggingface]
-openclaw = "unknown"
+openclaw = "supported"
 hermes = "supported"
 
 [providers.deepseek]
-openclaw = "unknown"
-hermes = "partial"
+openclaw = "supported"
+hermes = "supported"
 
 [providers.perplexity]
-openclaw = "unknown"
-hermes = "partial"
+openclaw = "supported"
+hermes = "supported"
 
 [providers.ollama]
-openclaw = "unknown"
+openclaw = "supported"
 hermes = "supported"
 
 [providers.custom]
-openclaw = "unknown"
+openclaw = "supported"
 hermes = "supported"
 
 # ── Default tools ───────────────────────────────────────────────────────────
-# The default tool set is generic runtime capability (shell, file, memory,
-# scheduling). Both runtimes ship equivalents, but neither publishes a mapping
-# against ZeroClaw's exact tool names, so these stay `unknown` pending a
-# confirmed source rather than an assumed match.
+# The six default tools are generic runtime capability. Both trees ship
+# equivalents: OpenClaw via the openshell extension plus src/ file and
+# glob/ripgrep tooling; Hermes via tools/ (file_operations, shell/bash, grep,
+# search_files). Mapped by capability, not by identical tool name.
+
+[tools.shell]
+openclaw = "supported"
+hermes = "supported"
+
+[tools.file_read]
+openclaw = "supported"
+hermes = "supported"
+
+[tools.file_write]
+openclaw = "supported"
+hermes = "supported"
+
+[tools.file_edit]
+openclaw = "supported"
+hermes = "supported"
+
+[tools.glob_search]
+openclaw = "supported"
+hermes = "supported"
+
+[tools.content_search]
+openclaw = "supported"
+hermes = "supported"
