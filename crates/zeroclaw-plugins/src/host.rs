@@ -200,8 +200,10 @@ impl PluginHost {
         self.loaded.get(name).map(plugin_info_from_loaded)
     }
 
-    /// Install a plugin from a directory path.
-    pub fn install(&mut self, source: &str) -> Result<(), PluginError> {
+    /// Install a plugin from a directory path. Returns the installed
+    /// plugin's manifest name so callers can key follow-up work (config
+    /// seeding, messaging) off the canonical name rather than the source path.
+    pub fn install(&mut self, source: &str) -> Result<String, PluginError> {
         let source_path = PathBuf::from(source);
         let manifest_path = if source_path.is_dir() {
             source_path.join("manifest.toml")
@@ -271,6 +273,7 @@ impl PluginHost {
             }
         }
 
+        let installed_name = manifest.name.clone();
         self.loaded.insert(
             manifest.name.clone(),
             LoadedPlugin {
@@ -281,7 +284,7 @@ impl PluginHost {
             },
         );
 
-        Ok(())
+        Ok(installed_name)
     }
 
     /// Remove a plugin by name.
@@ -1068,7 +1071,7 @@ capabilities = ["tool"]
         assert_eq!(
             host.list_plugins().len(),
             1,
-            "permissive mode must load an unsigned plugin (signed-but-invalid is rejected by enforce_signature_policy, covered in signature.rs)"
+            "permissive mode must load an unsigned plugin (untrusted and invalid signatures also load with a warning in permissive mode, covered in signature.rs)"
         );
     }
 

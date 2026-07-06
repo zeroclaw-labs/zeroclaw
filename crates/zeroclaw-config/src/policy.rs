@@ -183,7 +183,7 @@ impl Default for PerSenderTracker {
 ///   `AccessMode::Read` grants.
 /// - `allowed_roots_write_only`: write but NOT read. Populated from
 ///   `AccessMode::Write` grants. The bot can append/overwrite under
-///   the path but `file_read` / `pdf_read` / `glob_search` /
+///   the path but `file_read` / `glob_search` /
 ///   `content_search` reject it.
 ///
 /// Read-side tools call [`SecurityPolicy::is_resolved_path_readable`],
@@ -226,8 +226,8 @@ pub struct SecurityPolicy {
     /// Directories the agent can write but NOT read under. Populated
     /// from cross-agent `AccessMode::Write` grants at policy
     /// construction time. Empty when no write-only cross-agent access
-    /// is configured. Read-side tools (`file_read`, `pdf_read`,
-    /// `glob_search`, `content_search`) ignore this list; write-side
+    /// is configured. Read-side tools (`file_read`, `glob_search`,
+    /// `content_search`) ignore this list; write-side
     /// tools (`file_write`, `file_edit`, `git_operations`) honor it.
     pub allowed_roots_write_only: Vec<PathBuf>,
     pub max_actions_per_hour: u32,
@@ -1925,7 +1925,7 @@ impl SecurityPolicy {
 
     /// Validate that a resolved path is readable by the current
     /// security policy. Used by read-side tools (`file_read`,
-    /// `pdf_read`, `glob_search`, `content_search`) that should honor
+    /// `glob_search`, `content_search`) that should honor
     /// the read-write `allowed_roots` AND the read-only
     /// `allowed_roots_read_only` lists, plus the universal POSIX
     /// device files (`/dev/null`, `/dev/zero`, `/dev/random`,
@@ -2239,7 +2239,7 @@ impl SecurityPolicy {
     /// Check whether the given raw path falls under
     /// `allowed_roots` (rw), `allowed_roots_read_only`, OR
     /// `allowed_roots_write_only`. Read-side tools (`file_read`,
-    /// `pdf_read`, `glob_search`, `content_search`) call
+    /// `glob_search`, `content_search`) call
     /// [`Self::is_resolved_path_readable`] for the resolved-path form,
     /// which intentionally excludes the write-only tier. This raw-path
     /// helper is the union of all three, used where read+write tools

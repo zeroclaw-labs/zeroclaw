@@ -903,6 +903,7 @@ pub async fn run_gateway(
                 // hardware (exclusive serial holds) that the live turn paths
                 // need. Never connect them for a registry no turn runs against.
                 connect_peripherals: false,
+                emit_assembly_logs: false,
                 exclude_memory: false,
             })
             .await;
@@ -1049,6 +1050,7 @@ pub async fn run_gateway(
             // `config.peripherals` is global - N per-agent opens of the same
             // boards would fail against the first holder anyway).
             connect_peripherals: false,
+            emit_assembly_logs: false,
             exclude_memory: false,
         })
         .await;
@@ -1784,6 +1786,10 @@ pub async fn run_gateway(
             get(api_skills::handle_agent_skills),
         )
         .route("/api/skills/bundles", get(api_skills::handle_list_bundles))
+        .route(
+            "/api/skills/slash-option-kinds",
+            get(api_skills::handle_slash_option_kinds),
+        )
         .route(
             "/api/skills/bundles/{alias}/skills",
             get(api_skills::handle_list_skills).post(api_skills::handle_create_skill),
