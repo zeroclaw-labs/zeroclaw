@@ -57,6 +57,23 @@ export interface SopSummary {
   version: string;
 }
 
+/// One row on the Runs page: a run the engine currently holds (a live run
+/// from its active set or a retained terminal run). Mirrors the Rust
+/// `SopRunSummary` serde shape. Not sourced from the generated OpenAPI
+/// schema because the runs listing is served as a plain JSON envelope, not a
+/// schemars-exported type.
+export interface SopRunSummary {
+  run_id: string;
+  sop_name: string;
+  status: SopRunStatus;
+  current_step: number;
+  total_steps: number;
+  started_at: string;
+  completed_at: string | null;
+  trigger_source: string;
+  active: boolean;
+}
+
 // Canonical canvas geometry fallback, mirroring `LayoutGeometry::CANONICAL` in
 // `zeroclaw-sop-graph`. Every projected graph carries `layout.geometry` on the
 // wire; this is only used when deserializing a response from an older daemon
@@ -261,6 +278,25 @@ export function runStateTone(state: NodeRunState | undefined): RunStateTone {
     case 'failed':
       return 'error';
     case 'skipped':
+      return 'warning';
+    default:
+      return 'neutral';
+  }
+}
+
+/// Semantic tone for a whole-run status (the Runs page's status badge).
+/// Distinct from `runStateTone`, which tones an individual node's state.
+export function runStatusTone(status: SopRunStatus | undefined): RunStateTone {
+  switch (status) {
+    case 'running':
+    case 'pending':
+      return 'accent';
+    case 'completed':
+      return 'success';
+    case 'failed':
+      return 'error';
+    case 'waiting_approval':
+    case 'paused_checkpoint':
       return 'warning';
     default:
       return 'neutral';

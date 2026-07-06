@@ -52,6 +52,7 @@ pub mod tls;
 pub mod voice_duplex;
 pub mod ws;
 pub mod ws_approval;
+pub mod ws_sop_runs;
 
 use anyhow::{Context, Result};
 #[cfg(any(
@@ -1710,6 +1711,7 @@ pub async fn run_gateway(
             "/api/sops/{name}/run",
             post(api_sop_author::handle_sop_run),
         )
+        .route("/api/sops/runs", get(api_sop_author::handle_sop_runs))
         .route(
             "/api/sops/{name}/full",
             get(api_sop_author::handle_sop_full),
@@ -1960,6 +1962,8 @@ pub async fn run_gateway(
         .route("/acp", get(acp::handle_ws_acp))
         // ── WebSocket agent chat ──
         .route("/ws/chat", get(ws::handle_ws_chat))
+        // ── WebSocket SOP runs feed ──
+        .route("/ws/sops/runs", get(ws_sop_runs::handle_ws_sop_runs))
         // ── WebSocket canvas updates ──
         .route("/ws/canvas/{id}", get(canvas::handle_ws_canvas))
         // ── WebSocket node discovery ──

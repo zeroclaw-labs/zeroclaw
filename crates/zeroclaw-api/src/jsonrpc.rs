@@ -333,6 +333,15 @@ pub struct SopRunResponse {
     pub run_id: String,
 }
 
+/// Request payload for `sops/runs`: enumerate runs the engine currently holds
+/// (active plus retained terminal), newest first. `sop` optionally scopes the
+/// listing to a single SOP by name; omitting it lists every SOP's runs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SopRunsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sop: Option<String>,
+}
+
 /// Request payload for `sops/save` and `sops/create`. The `sop` field is the
 /// wire form of the runtime `Sop`; the daemon deserializes and validates it.
 /// `sops/validate` also accepts this form to validate an unsaved draft.

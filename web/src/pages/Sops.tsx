@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { AlertTriangle, XCircle, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { Badge, Card, PageHeader, HelpTip } from '@/components/ui';
 import SopCanvas from './SopCanvas';
 import MarkdownEditor from '@/components/MarkdownEditor';
@@ -1446,6 +1446,7 @@ export default function Sops() {
   const [graphLoading, setGraphLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [runId, setRunId] = useState('');
+  const [searchParams] = useSearchParams();
   const [runPayload, setRunPayload] = useState('');
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
@@ -1666,12 +1667,15 @@ export default function Sops() {
 
   useEffect(() => {
     let active = true;
+    const deepSop = searchParams.get('sop');
+    const deepRun = searchParams.get('run');
     listSops()
       .then((list) => {
         if (!active) return;
         setSops(list);
-        const first = list[0];
-        if (first) setSelected(first.name);
+        const target = deepSop && list.some((s) => s.name === deepSop) ? deepSop : list[0]?.name;
+        if (target) setSelected(target);
+        if (deepRun) setRunId(deepRun);
         setLoading(false);
       })
       .catch((e: unknown) => {
@@ -1682,6 +1686,7 @@ export default function Sops() {
     return () => {
       active = false;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const loadGraph = useCallback((name: string) => {

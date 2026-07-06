@@ -677,6 +677,41 @@ impl ::zeroclaw_api::attribution::Attributable for SopRun {
     }
 }
 
+/// Lightweight projection of a run for list surfaces (Runs page). Carries
+/// just enough to render a row and open the per-run overlay, without the
+/// full step-result payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopRunSummary {
+    pub run_id: String,
+    pub sop_name: String,
+    pub status: SopRunStatus,
+    pub current_step: u32,
+    pub total_steps: u32,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    /// Where the run's trigger came from (manual, a channel, cron, ...).
+    pub trigger_source: String,
+    /// True while the run is live (in the engine's active set) rather than
+    /// a retained terminal record.
+    pub active: bool,
+}
+
+impl SopRunSummary {
+    pub fn from_run(run: &SopRun, active: bool) -> Self {
+        Self {
+            run_id: run.run_id.clone(),
+            sop_name: run.sop_name.clone(),
+            status: run.status,
+            current_step: run.current_step,
+            total_steps: run.total_steps,
+            started_at: run.started_at.clone(),
+            completed_at: run.completed_at.clone(),
+            trigger_source: run.trigger_event.source.to_string(),
+            active,
+        }
+    }
+}
+
 // ── Deterministic workflow state (persistence + resume) ──────────
 
 /// Persisted state for a deterministic workflow run, enabling resume

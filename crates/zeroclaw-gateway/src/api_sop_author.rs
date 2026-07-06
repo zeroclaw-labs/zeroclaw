@@ -7,13 +7,19 @@
 //! transform the submitted SOP and never touch disk.
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use super::AppState;
 use super::api::require_auth;
 use zeroclaw_runtime::sop::SopGraphExt;
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct RunsQuery {
+    #[serde(default)]
+    pub sop: Option<String>,
+}
 
 fn sops_dir_and_mode(
     state: &AppState,
@@ -235,6 +241,31 @@ pub async fn handle_sop_run(
         })),
     )
         .into_response()
+}
+
+pub async fn handle_sop_runs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RunsQuery>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(engine) = state.sop_engine.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "SOP subsystem not enabled" })),
+        )
+            .into_response();
+    };
+    match zeroclaw_runtime::sop::run_summaries_for(engine, query.sop.as_deref()) {
+        Ok(runs) => Json(serde_json::json!({ "runs": runs })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 pub async fn handle_sop_run_overlay(

@@ -16,8 +16,8 @@ use super::store::{
 };
 use super::types::{
     DeterministicRunState, DeterministicSavings, FilesystemEventKind, Sop, SopEvent,
-    SopExecutionMode, SopPriority, SopRun, SopRunAction, SopRunStatus, SopStep, SopStepKind,
-    SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource,
+    SopExecutionMode, SopPriority, SopRun, SopRunAction, SopRunStatus, SopRunSummary, SopStep,
+    SopStepKind, SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource,
 };
 use crate::calendar::{CALENDAR_NO_SHOW_TOPIC, CalendarNoShowEvent};
 use crate::security::{ContentSafety, new_marker_id};
@@ -40,6 +40,11 @@ pub struct SopEngine {
     /// Run-execution metrics collector. Per-engine fresh in `new()` (test
     /// isolation); `build_sop_engine` swaps in the process-shared collector.
     metrics: Arc<SopMetricsCollector>,
+    /// Optional live run-change notifier. When present, every run mutation
+    /// (admission, step advance, terminal finish) publishes the run's fresh
+    /// summary so push surfaces (the Runs WebSocket) can forward it without
+    /// polling. `None` in tests and any embedder that does not want a feed.
+    run_notifier: Option<tokio::sync::broadcast::Sender<SopRunSummary>>,
 }
 
 /// Outcome of one [`SopEngine::run_maintenance_tick`] pass (EPIC A1), for
@@ -77,6 +82,7 @@ impl SopEngine {
             deterministic_savings: DeterministicSavings::default(),
             store: Arc::new(InMemoryRunStore::new()),
             metrics: Arc::new(SopMetricsCollector::new()),
+            run_notifier: None,
         }
     }
 
@@ -94,6 +100,29 @@ impl SopEngine {
     pub fn with_metrics(mut self, metrics: Arc<SopMetricsCollector>) -> Self {
         self.metrics = metrics;
         self
+    }
+
+    /// Attach a live run-change notifier. `build_sop_engine` wires the gateway's
+    /// sender here so run transitions push to the Runs WebSocket. Returns the
+    /// engine unchanged when never called (tests, headless embedders).
+    pub fn with_run_notifier(mut self, tx: tokio::sync::broadcast::Sender<SopRunSummary>) -> Self {
+        self.run_notifier = Some(tx);
+        self
+    }
+
+    /// Subscribe to the live run-change feed if a notifier is attached. Each
+    /// item is a fresh [`SopRunSummary`] for the run that just transitioned.
+    pub fn subscribe_run_changes(&self) -> Option<tokio::sync::broadcast::Receiver<SopRunSummary>> {
+        self.run_notifier.as_ref().map(|tx| tx.subscribe())
+    }
+
+    /// Publish a run's current summary on the notifier, if attached. A send
+    /// error means no live subscribers; that is not a failure, so it is
+    /// dropped. Marked `active` per the caller's chokepoint.
+    fn notify_run(&self, run: &SopRun, active: bool) {
+        if let Some(tx) = self.run_notifier.as_ref() {
+            let _ = tx.send(SopRunSummary::from_run(run, active));
+        }
     }
 
     /// Reconstruct in-flight runs from the store at startup (durable backends).
@@ -188,6 +217,7 @@ impl SopEngine {
                     "SOP engine: failed to persist run"
                 );
             }
+            self.notify_run(run, true);
         }
     }
 
@@ -276,6 +306,7 @@ impl SopEngine {
                 "SOP engine: failed to persist terminal run"
             );
         }
+        self.notify_run(run, false);
     }
 
     fn record_transition_event(
@@ -1239,6 +1270,28 @@ impl SopEngine {
             .iter()
             .filter(|r| sop_name.is_none_or(|name| r.sop_name == name))
             .collect()
+    }
+
+    /// Summaries of every run the engine currently holds: live runs from the
+    /// active set plus retained terminal runs, newest first by start time.
+    /// This is the enumeration the Runs surface polls; it never touches the
+    /// durable store directly, so it reflects exactly what the running engine
+    /// knows (active set + `max_finished_runs` retention window).
+    pub fn run_summaries(&self, sop_name: Option<&str>) -> Vec<SopRunSummary> {
+        let mut out: Vec<SopRunSummary> = self
+            .active_runs
+            .values()
+            .filter(|r| sop_name.is_none_or(|name| r.sop_name == name))
+            .map(|r| SopRunSummary::from_run(r, true))
+            .chain(
+                self.finished_runs
+                    .iter()
+                    .filter(|r| sop_name.is_none_or(|name| r.sop_name == name))
+                    .map(|r| SopRunSummary::from_run(r, false)),
+            )
+            .collect();
+        out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        out
     }
 
     /// Return cumulative deterministic execution savings.
@@ -3175,6 +3228,37 @@ mod tests {
         let run_id = extract_run_id(&action);
         assert!(run_id.starts_with("run-"));
         assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
+        assert_eq!(engine.active_runs().len(), 1);
+    }
+
+    #[test]
+    fn run_notifier_publishes_on_admission() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )])
+        .with_run_notifier(tx);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action);
+        let published = rx
+            .try_recv()
+            .expect("a summary must be published on admission");
+        assert_eq!(published.run_id, run_id);
+        assert_eq!(published.sop_name, "s1");
+        assert!(published.active, "an admitted run is active");
+    }
+
+    #[test]
+    fn run_notifier_absent_is_a_noop() {
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )]);
+        assert!(engine.subscribe_run_changes().is_none());
+        engine.start_run("s1", manual_event()).unwrap();
         assert_eq!(engine.active_runs().len(), 1);
     }
 

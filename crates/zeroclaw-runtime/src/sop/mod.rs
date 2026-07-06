@@ -46,8 +46,8 @@ pub use trigger_registry::{
 };
 pub use types::{
     DeterministicRunState, DeterministicSavings, FilesystemEventKind, PlannedToolCall, Sop,
-    SopEvent, SopExecutionMode, SopPriority, SopRun, SopRunAction, SopRunStatus, SopStep,
-    SopStepKind, SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource, StepSchema,
+    SopEvent, SopExecutionMode, SopPriority, SopRun, SopRunAction, SopRunStatus, SopRunSummary,
+    SopStep, SopStepKind, SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource, StepSchema,
     StepToolCall,
 };
 pub use wire::{WireEdit, WireError, WireOp, apply_wire};
@@ -107,9 +107,11 @@ pub fn build_sop_engine(
         );
         Arc::new(store::InMemoryRunStore::new())
     });
+    let (run_tx, _run_rx) = tokio::sync::broadcast::channel(256);
     let mut engine = SopEngine::new(config)
         .with_store(store)
-        .with_metrics(SopMetricsCollector::shared());
+        .with_metrics(SopMetricsCollector::shared())
+        .with_run_notifier(run_tx);
     engine.reload(workspace_dir);
     engine.restore_runs();
     let engine = Arc::new(Mutex::new(engine));
@@ -222,6 +224,19 @@ pub fn run_overlay_for(
         .ok_or_else(|| anyhow::Error::msg(format!("run '{run_id}' not found")))?;
     let graph = SopGraph::from_sop(sop);
     Ok(RunOverlay::project(&graph, run))
+}
+
+/// Enumerate every run the engine holds (active + retained terminal),
+/// newest first, optionally scoped to one SOP. Errors only if the engine
+/// lock is poisoned. This is the Runs surface's data source.
+pub fn run_summaries_for(
+    engine: &Arc<Mutex<SopEngine>>,
+    sop_name: Option<&str>,
+) -> Result<Vec<SopRunSummary>> {
+    let guard = engine
+        .lock()
+        .map_err(|_| anyhow::Error::msg("SOP engine lock poisoned"))?;
+    Ok(guard.run_summaries(sop_name))
 }
 
 /// Renumber steps to a contiguous 1..=N sequence (positional order wins)
