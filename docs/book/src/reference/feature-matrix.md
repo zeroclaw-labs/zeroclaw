@@ -26,15 +26,15 @@ facts the binary has no knowledge of.
 
 | Mode | Status | Reference |
 |---|---|---|
-| Local CLI (`zeroclaw agent`) | ✅ Supported | [Quickstart](../getting-started/quickstart.md) |
-| Daemon / OS service | ✅ Supported | [Service](../ops/service.md) |
-| Gateway HTTP + web dashboard | ✅ Supported | [Gateway HTTP API](../gateway/api.md), [Web dashboard](../gateway/web-dashboard.md) |
-| ZeroCode terminal UI | ✅ Supported | [ZeroCode](../getting-started/zerocode.md) |
-| Container | ✅ Supported | [Container](../setup/container.md) |
-| Linux / macOS / Windows | ✅ Supported | [Linux](../setup/linux.md), [macOS](../setup/macos.md), [Windows](../setup/windows.md) |
-| FreeBSD / NixOS | ✅ Supported | [FreeBSD](../setup/freebsd.md), [NixOS](../setup/nixos.md) |
-| SBC / edge (Raspberry Pi class) | ✅ Supported | [Hardware](../hardware/index.md) |
-| VPS / cloud VM | ✅ Supported | [Network deployment](../ops/network-deployment.md) |
+| Local CLI (`zeroclaw agent`) | ✅ | [Quickstart](../getting-started/quickstart.md) |
+| Daemon / OS service | ✅ | [Service](../ops/service.md) |
+| Gateway HTTP + web dashboard | ✅ | [Gateway HTTP API](../gateway/api.md), [Web dashboard](../gateway/web-dashboard.md) |
+| ZeroCode terminal UI | ✅ | [ZeroCode](../getting-started/zerocode.md) |
+| Container | ✅ | [Container](../setup/container.md) |
+| Linux / macOS / Windows | ✅ | [Linux](../setup/linux.md), [macOS](../setup/macos.md), [Windows](../setup/windows.md) |
+| FreeBSD / NixOS | ✅ | [FreeBSD](../setup/freebsd.md), [NixOS](../setup/nixos.md) |
+| SBC / edge (Raspberry Pi class) | ✅ | [Hardware](../hardware/index.md) |
+| VPS / cloud VM | ✅ | [Network deployment](../ops/network-deployment.md) |
 
 ## Channel support
 
