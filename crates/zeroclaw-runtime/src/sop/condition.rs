@@ -209,6 +209,13 @@ impl ConditionOp {
             })
             .collect()
     }
+
+    /// Every operator token, for the parser's longest-first scan. Walks the
+    /// same enum the catalog does, so no token literal is hand-listed twice.
+    pub fn catalog_tokens() -> Vec<&'static str> {
+        use strum::IntoEnumIterator;
+        Self::iter().map(Self::token).collect()
+    }
 }
 
 /// Wire shape of one operator for authoring surfaces: the literal `token` to
@@ -218,6 +225,71 @@ impl ConditionOp {
 pub struct ConditionOpSpec {
     pub token: String,
     pub label: String,
+}
+
+/// A condition string decomposed into the three parts an authoring surface
+/// edits: an optional JSON path (absent for `direct` scalar payloads), the
+/// operator token, and the raw comparand. This is the single authority both
+/// the web and zerocode builders round-trip through, so the two surfaces
+/// assemble identical strings from identical parts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConditionParts {
+    pub path: Option<String>,
+    pub op: String,
+    pub value: String,
+}
+
+impl ConditionParts {
+    /// Split a stored condition into parts against the operator catalog.
+    /// Tokens are matched longest first so `>=` wins over `>`. A `$`-prefixed
+    /// input is JSON-path form; anything else is a direct scalar comparison
+    /// with no path. Unmatched input yields an empty `op` so the caller can
+    /// fall back to raw editing without losing the text.
+    #[must_use]
+    pub fn parse(condition: &str) -> Self {
+        let trimmed = condition.trim();
+        let has_path = trimmed.starts_with('$');
+        let scan_from = if has_path {
+            trimmed.trim_start_matches('$').trim_start_matches('.').trim()
+        } else {
+            trimmed
+        };
+        let mut tokens: Vec<&'static str> = ConditionOp::catalog_tokens();
+        tokens.sort_by(|a, b| b.len().cmp(&a.len()));
+        for token in tokens {
+            if let Some(at) = scan_from.find(token) {
+                let left = scan_from[..at].trim().to_string();
+                let right = scan_from[at + token.len()..].trim().to_string();
+                return Self {
+                    path: has_path.then_some(left),
+                    op: token.to_string(),
+                    value: right,
+                };
+            }
+        }
+        Self {
+            path: has_path.then(|| scan_from.trim().to_string()),
+            op: String::new(),
+            value: String::new(),
+        }
+    }
+
+    /// Reassemble a condition string. JSON-path form emits `$.<path> <op>
+    /// <value>`; direct scalar form emits `<op> <value>`. An empty operator
+    /// yields `None` (fire on every event).
+    #[must_use]
+    pub fn build(&self) -> Option<String> {
+        if self.op.is_empty() {
+            return None;
+        }
+        let rhs = format!("{} {}", self.op, self.value);
+        let rhs = rhs.trim();
+        match &self.path {
+            None => Some(rhs.to_string()),
+            Some(p) if p.trim().is_empty() => Some(rhs.to_string()),
+            Some(p) => Some(format!("$.{} {}", p.trim(), rhs)),
+        }
+    }
 }
 
 /// Compare a JSON value against a string comparand using the given operator.
@@ -278,6 +350,81 @@ fn apply_op_f64(lhs: f64, op: ConditionOp, rhs: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ConditionParts round-trip (cross-surface fixture) ───────────────
+    // These fixtures are mirrored verbatim in the web builder test
+    // (web/src/lib/sops.condition.test.ts). The two surfaces must parse and
+    // build identically or a condition authored in one drifts in the other.
+
+    #[test]
+    fn condition_parts_parse_json_path() {
+        let p = ConditionParts::parse("$.value >= 85");
+        assert_eq!(p.path.as_deref(), Some("value"));
+        assert_eq!(p.op, ">=");
+        assert_eq!(p.value, "85");
+    }
+
+    #[test]
+    fn condition_parts_parse_prefers_longest_operator() {
+        let p = ConditionParts::parse("$.temp >= 100");
+        assert_eq!(p.op, ">=", "must not match bare > before >=");
+    }
+
+    #[test]
+    fn condition_parts_parse_direct_scalar_has_no_path() {
+        let p = ConditionParts::parse("> 0");
+        assert_eq!(p.path, None);
+        assert_eq!(p.op, ">");
+        assert_eq!(p.value, "0");
+    }
+
+    #[test]
+    fn condition_parts_parse_nested_path() {
+        let p = ConditionParts::parse("$.data.temp == critical");
+        assert_eq!(p.path.as_deref(), Some("data.temp"));
+        assert_eq!(p.op, "==");
+        assert_eq!(p.value, "critical");
+    }
+
+    #[test]
+    fn condition_parts_build_json_path() {
+        let p = ConditionParts {
+            path: Some("value".into()),
+            op: ">=".into(),
+            value: "85".into(),
+        };
+        assert_eq!(p.build().as_deref(), Some("$.value >= 85"));
+    }
+
+    #[test]
+    fn condition_parts_build_direct_scalar() {
+        let p = ConditionParts {
+            path: None,
+            op: ">".into(),
+            value: "0".into(),
+        };
+        assert_eq!(p.build().as_deref(), Some("> 0"));
+    }
+
+    #[test]
+    fn condition_parts_empty_op_builds_none() {
+        let p = ConditionParts {
+            path: Some("value".into()),
+            op: String::new(),
+            value: "85".into(),
+        };
+        assert_eq!(p.build(), None);
+    }
+
+    #[test]
+    fn condition_parts_round_trip_every_operator() {
+        for spec in ConditionOp::catalog() {
+            let src = format!("$.field {} 5", spec.token);
+            let parsed = ConditionParts::parse(&src);
+            assert_eq!(parsed.op, spec.token);
+            assert_eq!(parsed.build().as_deref(), Some(src.as_str()));
+        }
+    }
 
     // ── evaluate_condition (public API) ─────────────────
 

@@ -2066,8 +2066,10 @@ mod tests {
             bound: vec![BoundTriggerSourceView {
                 source: "webhook".to_string(),
                 fields: vec![],
+                condition: None,
             }],
             channels: vec![],
+            operators: vec![],
         };
         assert_eq!(
             trigger_source_walk(&registry),
@@ -2085,13 +2087,16 @@ mod tests {
                 BoundTriggerSourceView {
                     source: "webhook".to_string(),
                     fields: vec![],
+                    condition: None,
                 },
                 BoundTriggerSourceView {
                     source: "manual".to_string(),
                     fields: vec![],
+                    condition: None,
                 },
             ],
             channels: vec![],
+            operators: vec![],
         };
         assert_eq!(
             trigger_source_walk(&registry),

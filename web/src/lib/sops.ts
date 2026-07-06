@@ -42,6 +42,10 @@ export type BoundTriggerSource = Schemas['BoundTriggerSource'];
 export type TriggerField = Schemas['TriggerField'];
 export type ChannelTriggerKind = Schemas['ChannelTriggerKind'];
 export type ChannelAlias = Schemas['ChannelAlias'];
+export type PayloadContract = Schemas['PayloadContract'];
+export type ConditionField = Schemas['ConditionField'];
+export type ConditionOpSpec = Schemas['ConditionOpSpec'];
+export type ConditionValueType = Schemas['ConditionValueType'];
 export type NodeRunOverlay = Schemas['NodeRunOverlay'];
 export type NodeRunState = Schemas['NodeRunState'];
 export type SopRunStatus = Schemas['SopRunStatus'];
@@ -126,6 +130,63 @@ export function graphDraft(sop: Sop): Promise<SopGraph> {
 /// the surface renders whatever it returns and never hardcodes a channel list.
 export function triggerSources(): Promise<TriggerSourceRegistry> {
   return apiFetch<TriggerSourceRegistry>('/api/sops/trigger-sources');
+}
+
+/// A condition string decomposed into the three parts the guided builder edits:
+/// an optional JSON path (absent for `direct` scalar payloads), an operator
+/// token, and a raw comparand. `raw` preserves the original string so a value
+/// the builder cannot parse round-trips untouched in advanced mode.
+export interface ParsedCondition {
+  path: string | null;
+  op: string;
+  value: string;
+  raw: string;
+}
+
+/// Split a stored condition into (path, op, value) against the walked operator
+/// catalog. Operators are matched longest token first so `>=` wins over `>`.
+/// A `$.`-prefixed path is JSON-path form; anything else is a direct scalar
+/// comparison with no path. Unparseable input yields a null op so the caller
+/// can fall back to the raw text field.
+export function parseCondition(
+  condition: string | null | undefined,
+  operators: ConditionOpSpec[],
+): ParsedCondition {
+  const raw = condition ?? '';
+  const trimmed = raw.trim();
+  const tokens = [...operators]
+    .map((o) => o.token)
+    .sort((a, b) => b.length - a.length);
+  const hasPath = trimmed.startsWith('$');
+  const scanFrom = hasPath ? trimmed.replace(/^\$\.?/, '') : trimmed;
+  for (const token of tokens) {
+    const at = scanFrom.indexOf(token);
+    if (at < 0) continue;
+    const left = scanFrom.slice(0, at).trim();
+    const right = scanFrom.slice(at + token.length).trim();
+    return {
+      path: hasPath ? left : null,
+      op: token,
+      value: right,
+      raw,
+    };
+  }
+  return { path: hasPath ? scanFrom.trim() : null, op: '', value: '', raw };
+}
+
+/// Reassemble a condition string from builder parts. JSON-path form emits
+/// `$.<path> <op> <value>`; direct scalar form emits `<op> <value>`. An empty
+/// operator collapses to `null` (fire on every event).
+export function buildCondition(part: {
+  path: string | null;
+  op: string;
+  value: string;
+}): string | null {
+  if (part.op.length === 0) return null;
+  const rhs = `${part.op} ${part.value}`.trim();
+  if (part.path === null) return rhs;
+  const path = part.path.trim();
+  return path.length > 0 ? `$.${path} ${rhs}`.trim() : rhs;
 }
 
 export function getRunOverlay(name: string, runId: string): Promise<RunOverlay> {

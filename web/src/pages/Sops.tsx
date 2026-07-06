@@ -22,6 +22,8 @@ import {
   overlayStateByStep,
   overlayCallsByStep,
   runStateTone,
+  parseCondition,
+  buildCondition,
   type RunStateTone,
   type WireRole,
   type SopSummary,
@@ -37,6 +39,9 @@ import {
   type TriggerSourceRegistry,
   type BoundTriggerSource,
   type TriggerField,
+  type PayloadContract,
+  type ConditionOpSpec,
+  type ConditionField,
 } from '@/lib/sops';
 
 function blankStep(number: number): SopStep {
@@ -797,6 +802,168 @@ function TriggerFieldInput({
   );
 }
 
+function conditionValueInputType(vt: ConditionField['value_type'] | undefined): string {
+  if (vt === 'number') return 'number';
+  if (vt === 'date_time') return 'datetime-local';
+  return 'text';
+}
+
+/// Guided condition builder. Users pick a payload field (from the source's
+/// walked contract), an operator (from the registry catalog), and a value;
+/// the three assemble into the `$.path op value` string the engine evaluates.
+/// No operator or path is typed blind. `open` payloads (mqtt, amqp, channel)
+/// have no enumerated fields, so the path becomes a free input with an
+/// advanced raw-string escape hatch; `direct` scalar payloads drop the path
+/// entirely. Sources with no contract render nothing (condition unsupported).
+function ConditionBuilder({
+  contract,
+  operators,
+  value,
+  onChange,
+}: {
+  contract: PayloadContract | null | undefined;
+  operators: ConditionOpSpec[];
+  value: string | null;
+  onChange: (next: string | null) => void;
+}) {
+  const parsed = parseCondition(value, operators);
+  const [raw, setRaw] = useState(false);
+  if (!contract) return null;
+
+  const fields = contract.fields ?? [];
+  const isDirect = contract.direct === true;
+  const isOpen = contract.open === true && fields.length === 0 && !isDirect;
+  const selectedField = fields.find((f) => `${f.path}` === parsed.path);
+  const valueType = selectedField?.value_type;
+
+  const emit = (part: { path: string | null; op: string; value: string }) =>
+    onChange(buildCondition(part));
+
+  if (raw && isOpen) {
+    return (
+      <div className="space-y-1">
+        <Field
+          label={t('sops.trigger_condition')}
+          hint={t('sops.condition_raw_hint')}
+          help={sopFieldHelp('SopTrigger', 'condition')}
+        >
+          <input
+            type="text"
+            value={parsed.raw}
+            placeholder={t('sops.trigger_condition_placeholder')}
+            onChange={(e) => onChange(e.target.value.length > 0 ? e.target.value : null)}
+            className={INPUT_CLS}
+          />
+        </Field>
+        <button
+          type="button"
+          onClick={() => setRaw(false)}
+          className="text-xs text-pc-text-muted underline hover:text-pc-accent"
+        >
+          {t('sops.condition_use_builder')}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <fieldset className="space-y-2">
+      <legend className="mb-1 block text-sm text-pc-text-muted">
+        <HelpTip text={sopFieldHelp('SopTrigger', 'condition')}>
+          {t('sops.trigger_condition')}
+        </HelpTip>
+      </legend>
+      <div className="grid grid-cols-[1.4fr_auto_1.4fr] items-end gap-2">
+        {isDirect ? (
+          <div className="text-xs text-pc-text-faint">{t('sops.condition_direct_payload')}</div>
+        ) : isOpen ? (
+          <Field label={t('sops.condition_field')}>
+            <input
+              type="text"
+              value={parsed.path ?? ''}
+              placeholder="path.to.field"
+              onChange={(e) =>
+                emit({ path: e.target.value, op: parsed.op, value: parsed.value })
+              }
+              className={INPUT_CLS}
+            />
+          </Field>
+        ) : (
+          <Field label={t('sops.condition_field')}>
+            <select
+              value={parsed.path ?? ''}
+              onChange={(e) => emit({ path: e.target.value, op: parsed.op, value: parsed.value })}
+              className={INPUT_CLS}
+            >
+              <option value="">{t('sops.condition_pick_field')}</option>
+              {fields.map((f) => (
+                <option key={f.path} value={f.path}>
+                  {f.label}
+                </option>
+              ))}
+            </select>
+          </Field>
+        )}
+        <Field label={t('sops.condition_operator')}>
+          <select
+            value={parsed.op}
+            onChange={(e) =>
+              emit({ path: parsed.path, op: e.target.value, value: parsed.value })
+            }
+            className={INPUT_CLS}
+          >
+            <option value="">{t('sops.condition_any')}</option>
+            {operators.map((op) => (
+              <option key={op.token} value={op.token}>
+                {op.label} ({op.token})
+              </option>
+            ))}
+          </select>
+        </Field>
+        {selectedField?.options && selectedField.options.length > 0 ? (
+          <Field label={t('sops.condition_value')}>
+            <select
+              value={parsed.value}
+              onChange={(e) =>
+                emit({ path: parsed.path, op: parsed.op, value: e.target.value })
+              }
+              className={INPUT_CLS}
+            >
+              <option value="">{t('sops.condition_pick_value')}</option>
+              {selectedField.options.map((opt) => (
+                <option key={opt} value={opt}>
+                  {opt}
+                </option>
+              ))}
+            </select>
+          </Field>
+        ) : (
+          <Field label={t('sops.condition_value')}>
+            <input
+              type={conditionValueInputType(valueType)}
+              value={parsed.value}
+              placeholder={t('sops.condition_value_placeholder')}
+              onChange={(e) =>
+                emit({ path: parsed.path, op: parsed.op, value: e.target.value })
+              }
+              className={INPUT_CLS}
+            />
+          </Field>
+        )}
+      </div>
+      {isOpen ? (
+        <button
+          type="button"
+          onClick={() => setRaw(true)}
+          className="text-xs text-pc-text-muted underline hover:text-pc-accent"
+        >
+          {t('sops.condition_use_raw')}
+        </button>
+      ) : null}
+    </fieldset>
+  );
+}
+
 function ChannelTriggerFields({
   trigger,
   registry,
@@ -841,10 +1008,11 @@ function ChannelTriggerFields({
           </Link>
         </div>
       ) : null}
-      <TriggerFieldInput
-        field={{ name: 'condition', options: [], multi: false, kind: 'expression' }}
+      <ConditionBuilder
+        contract={selected?.condition}
+        operators={registry?.operators ?? []}
         value={trigger.condition}
-        onChange={(next) => onChange({ condition: (next as string | null) ?? null })}
+        onChange={(next) => onChange({ condition: next })}
       />
     </div>
   );
@@ -871,6 +1039,10 @@ function TriggerEditor({
     source === CHANNEL_SOURCE || source === MANUAL_SOURCE
       ? []
       : (bound.find((b) => b.source === source)?.fields ?? []);
+  const boundContract: PayloadContract | null =
+    source === CHANNEL_SOURCE || source === MANUAL_SOURCE
+      ? null
+      : (bound.find((b) => b.source === source)?.condition ?? null);
 
   const sources: string[] = registry?.sources ?? [
     ...bound.map((b: BoundTriggerSource) => b.source),
@@ -924,6 +1096,22 @@ function TriggerEditor({
               }
             />
           ))}
+          {boundContract ? (
+            <ConditionBuilder
+              contract={boundContract}
+              operators={registry?.operators ?? []}
+              value={
+                ((trigger as unknown as Record<string, unknown>).condition as string | null) ??
+                null
+              }
+              onChange={(next) =>
+                onChange({
+                  ...(trigger as unknown as Record<string, unknown>),
+                  condition: next,
+                } as unknown as SopTrigger)
+              }
+            />
+          ) : null}
         </div>
       )}
       <span className="sr-only">{`trigger ${index + 1}`}</span>
