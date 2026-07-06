@@ -1352,8 +1352,9 @@ fn channel_readiness(
 /// probe (`zeroclaw_channels::login_probe`). The probe resolves the same
 /// on-disk session signal each QR-pairing channel uses at startup to decide
 /// between resuming a session and minting a fresh QR code; nothing is
-/// cached and nothing is written. Channels without a probe keep
-/// `authenticated: unknown` and the existing "not checked yet" note.
+/// cached and nothing is written. Channel types without a typed QR-pairing
+/// key (no probe, or feature not compiled) keep `authenticated: unknown`
+/// and the existing "not checked yet" note.
 fn apply_persisted_login_readiness(
     config: &zeroclaw_config::schema::Config,
     info: &zeroclaw_config::schema::ChannelAliasInfo,
@@ -1361,8 +1362,18 @@ fn apply_persisted_login_readiness(
 ) {
     use zeroclaw_channels::login_probe::PersistedLogin;
 
+    // Resolve the string key to the typed QR-pairing channel once; all
+    // downstream dispatch is on the enum.
     let compiled_key = compiled_readiness_key_for_alias(config, info);
-    match zeroclaw_channels::login_probe::persisted_login(compiled_key, config, &info.alias) {
+    let Some(channel) = zeroclaw_channels::listing::qr_pairing_channel(compiled_key) else {
+        readiness.notes.push(format!(
+            "Live readiness is not checked for `{}` channels yet.",
+            info.channel_type
+        ));
+        return;
+    };
+
+    match zeroclaw_channels::login_probe::persisted_login(channel, config, &info.alias) {
         PersistedLogin::Present => {
             readiness.authenticated = ChannelReadinessState::Ready;
             readiness.notes.push(format!(
@@ -1375,12 +1386,6 @@ fn apply_persisted_login_readiness(
             readiness.requirements.push(
                 "Pair this channel: no persisted login session was found on disk.".to_string(),
             );
-        }
-        PersistedLogin::Unsupported => {
-            readiness.notes.push(format!(
-                "Live readiness is not checked for `{}` channels yet.",
-                info.channel_type
-            ));
         }
     }
 }
