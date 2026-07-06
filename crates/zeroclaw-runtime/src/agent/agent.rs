@@ -1196,6 +1196,21 @@ impl Agent {
         self.build_system_prompt()
     }
 
+    /// Execute a registered tool by name against this agent's tool registry.
+    /// Test-only — lets regression tests assert real tool *behavior* (e.g. that
+    /// `tool_search` actually resolves granted deferred MCP tools, not merely
+    /// that it is registered or advertised) without driving a full model turn
+    /// (#8193). Returns `None` when no tool with `name` is registered.
+    #[cfg(test)]
+    pub async fn execute_tool_for_test(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Option<anyhow::Result<zeroclaw_api::tool::ToolResult>> {
+        let tool = crate::agent::tool_execution::find_tool(&self.tools, name)?;
+        Some(tool.execute(args).await)
+    }
+
     /// Hydrate the agent with prior chat messages (e.g. from a session backend).
     ///
     /// Ensures a system prompt is prepended if history is empty, then appends all

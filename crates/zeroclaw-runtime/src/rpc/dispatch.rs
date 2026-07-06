@@ -4308,6 +4308,59 @@ mod tests {
         );
     }
 
+    /// Regression guard for #8193, at the agent layer and *behavioral*.
+    /// `chat_session_new_exposes_tool_search_in_deferred_mcp_mode` proves
+    /// `tool_search` is registered; `chat_session_new_advertises_deferred_mcp_
+    /// section_in_system_prompt` proves it is advertised in the prompt. Neither
+    /// proves that *invoking* `tool_search` returns the granted deferred MCP
+    /// tool — a future regression could register a mis-scoped or empty search
+    /// instance that lists yet resolves nothing ("present but empty"). This
+    /// drives the real `session/new` deferred path, invokes `tool_search`, and
+    /// asserts the granted `<server>__<tool>` stub actually comes back.
+    #[tokio::test]
+    async fn chat_session_new_tool_search_returns_granted_mcp_tool_in_deferred_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let config = make_mcp_granting_config(&tmp, server.uri(), true);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-deferred-search-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-deferred-search-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+
+        let tool_result = agent
+            .execute_tool_for_test("tool_search", json!({ "query": "domains" }))
+            .await
+            .expect("deferred Chat session must expose `tool_search`")
+            .expect("tool_search must execute without error");
+
+        assert!(
+            tool_result.success,
+            "tool_search should succeed; error: {:?}",
+            tool_result.error
+        );
+        assert!(
+            tool_result.output.contains("remote__domains.list"),
+            "tool_search must resolve the granted `<server>__<tool>` stub, not just \
+             be present; output: {}",
+            tool_result.output
+        );
+    }
+
     #[tokio::test]
     async fn chat_session_new_exposes_prefixed_mcp_tool_in_eager_mode() {
         let tmp = tempfile::TempDir::new().unwrap();
