@@ -1265,8 +1265,28 @@ pub async fn handle_api_channel_relink(
             .into_response();
     };
 
+    // Resolve the string key to the typed QR-pairing channel once; probe
+    // and relink dispatch on the same enum. `None` means the channel type
+    // has no relink hook or its feature is not compiled — an explicit
+    // no-op conflict where nothing is touched.
     let compiled_key = compiled_readiness_key_for_alias(&config, &info);
-    match zeroclaw_channels::login_relink::relink(compiled_key, &config, &info.alias) {
+    let Some(qr_channel) = zeroclaw_channels::listing::qr_pairing_channel(compiled_key) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "channel": channel,
+                "outcome": "unsupported",
+                "error": format!(
+                    "channel type {} has no relink operation (it does not use QR-pairing sessions) \
+                     or the feature is not compiled into this binary; nothing was changed",
+                    info.channel_type
+                ),
+            })),
+        )
+            .into_response();
+    };
+
+    match zeroclaw_channels::login_relink::relink(qr_channel, &config, &info.alias) {
         Ok(zeroclaw_channels::login_relink::RelinkOutcome::Cleared { removed }) => {
             ::zeroclaw_log::record!(
                 INFO,
@@ -1293,19 +1313,6 @@ pub async fn handle_api_channel_relink(
             }))
             .into_response()
         }
-        Ok(zeroclaw_channels::login_relink::RelinkOutcome::Unsupported) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "channel": channel,
-                "outcome": "unsupported",
-                "error": format!(
-                    "channel type {} has no relink operation (it does not use QR-pairing sessions) \
-                     or the feature is not compiled into this binary; nothing was changed",
-                    info.channel_type
-                ),
-            })),
-        )
-            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({

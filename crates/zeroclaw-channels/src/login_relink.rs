@@ -15,18 +15,26 @@
 //!
 //! Channels that cannot relink — webhook-token channels, bot-token channels,
 //! the WhatsApp Cloud API backend, or channels whose feature is not compiled
-//! into this binary — report [`RelinkOutcome::Unsupported`] and **nothing is
-//! touched**: no files are removed, no state changes, the operation is an
-//! explicit no-op the caller can surface verbatim.
+//! into this binary — never resolve to a [`QrPairingChannel`] key
+//! ([`crate::listing::qr_pairing_channel`] returns `None`), so they never
+//! reach this hook and **nothing is touched**: no files are removed, no
+//! state changes, the operation is an explicit no-op the caller can surface
+//! verbatim.
 //!
 //! Relinking only clears disk state. A currently running channel keeps its
 //! in-memory session until it restarts; callers own scheduling that restart
 //! (the daemon reload path), which keeps this hook free of lifecycle side
 //! effects and keeps restart policy where it already lives.
 
+use crate::listing::QrPairingChannel;
 use zeroclaw_config::schema::Config;
 
 /// Result of a relink request for one channel alias.
+///
+/// The hook only runs for channels with a typed QR-pairing key
+/// ([`QrPairingChannel`]); "this channel type cannot relink / is not
+/// compiled" is expressed by [`crate::listing::qr_pairing_channel`]
+/// returning `None` at resolution time, not by a variant here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelinkOutcome {
     /// A persisted login existed and its on-disk state was removed. The
@@ -40,29 +48,32 @@ pub enum RelinkOutcome {
     /// nothing was removed. The next channel start already begins a fresh
     /// QR pairing.
     NothingToClear,
-    /// The channel type has no channel-owned relink hook (it does not use
-    /// QR-pairing sessions), or the channel feature is not compiled into
-    /// this binary. Nothing was touched.
-    Unsupported,
 }
 
 /// Clear the persisted login state for a channel alias so its next start
 /// mints a fresh QR pairing.
 ///
-/// `compiled_key` uses the same per-alias key space as
-/// [`crate::listing::is_channel_type_compiled`] and
-/// [`crate::login_probe::persisted_login`] (`"wechat"`, `"whatsapp-web"`,
-/// ...), so callers keep a single dispatch value for probe and relink.
+/// Callers resolve their channel type key to [`QrPairingChannel`] once via
+/// [`crate::listing::qr_pairing_channel`] — the same typed key
+/// [`crate::login_probe::persisted_login`] dispatches on — so probe and
+/// relink share one key space and no string key reaches this function. The
+/// match below is exhaustive over the feature-gated variant set, so adding
+/// a QR-pairing channel without a relink arm is a compile error rather
+/// than a silent fallthrough.
 ///
 /// Errors are I/O failures from removing existing files (permissions, etc.);
 /// absent files are never an error.
-pub fn relink(compiled_key: &str, config: &Config, alias: &str) -> anyhow::Result<RelinkOutcome> {
+pub fn relink(
+    channel: QrPairingChannel,
+    config: &Config,
+    alias: &str,
+) -> anyhow::Result<RelinkOutcome> {
     // Read at use-time in the feature-gated arms below; the binding keeps
     // the signature stable when no QR-pairing channel feature is compiled.
     let (_config, _alias) = (config, alias);
-    match compiled_key {
+    match channel {
         #[cfg(feature = "channel-wechat")]
-        "wechat" => {
+        QrPairingChannel::WeChat => {
             let state_dir = crate::wechat::WeChatChannel::resolve_state_dir(
                 _config
                     .channels
@@ -78,7 +89,7 @@ pub fn relink(compiled_key: &str, config: &Config, alias: &str) -> anyhow::Resul
             }
         }
         #[cfg(feature = "whatsapp-web")]
-        "whatsapp-web" => {
+        QrPairingChannel::WhatsAppWeb => {
             match _config
                 .channels
                 .whatsapp
@@ -95,13 +106,12 @@ pub fn relink(compiled_key: &str, config: &Config, alias: &str) -> anyhow::Resul
                         Ok(RelinkOutcome::Cleared { removed })
                     }
                 }
-                // The `whatsapp-web` compiled key is only selected for
-                // aliases whose config carries a `session_path`; without
-                // one there is nothing on disk to clear.
+                // The WhatsApp Web key is only resolved for aliases whose
+                // config carries a `session_path`; without one there is
+                // nothing on disk to clear.
                 None => Ok(RelinkOutcome::NothingToClear),
             }
         }
-        _ => Ok(RelinkOutcome::Unsupported),
     }
 }
 
@@ -110,15 +120,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn channels_without_a_relink_hook_report_unsupported() {
-        let config = Config::default();
+    fn channels_without_a_relink_hook_resolve_to_no_qr_pairing_key() {
+        // "Unsupported" is decided at key-resolution time: channel types
+        // without QR-pairing sessions never reach the relink hook, so
+        // nothing can be touched for them.
+        assert_eq!(crate::listing::qr_pairing_channel("discord"), None);
         assert_eq!(
-            relink("discord", &config, "default").unwrap(),
-            RelinkOutcome::Unsupported
-        );
-        assert_eq!(
-            relink("whatsapp", &config, "default").unwrap(),
-            RelinkOutcome::Unsupported,
+            crate::listing::qr_pairing_channel("whatsapp"),
+            None,
             "the Cloud API backend has no on-disk session to clear"
         );
     }
@@ -138,7 +147,7 @@ mod tests {
         );
 
         assert_eq!(
-            relink("wechat", &config, "admin").unwrap(),
+            relink(QrPairingChannel::WeChat, &config, "admin").unwrap(),
             RelinkOutcome::NothingToClear,
             "an unpaired channel relinks as a no-op"
         );
@@ -150,7 +159,7 @@ mod tests {
         .unwrap();
         std::fs::write(temp.path().join("sync.json"), r#"{"get_updates_buf": "c"}"#).unwrap();
 
-        match relink("wechat", &config, "admin").unwrap() {
+        match relink(QrPairingChannel::WeChat, &config, "admin").unwrap() {
             RelinkOutcome::Cleared { removed } => assert_eq!(removed.len(), 2),
             other => panic!("expected Cleared, got {other:?}"),
         }
@@ -174,7 +183,7 @@ mod tests {
         );
 
         assert_eq!(
-            relink("whatsapp-web", &config, "admin").unwrap(),
+            relink(QrPairingChannel::WhatsAppWeb, &config, "admin").unwrap(),
             RelinkOutcome::NothingToClear
         );
         assert!(
@@ -183,7 +192,7 @@ mod tests {
         );
 
         std::fs::write(&session_path, b"db").unwrap();
-        match relink("whatsapp-web", &config, "admin").unwrap() {
+        match relink(QrPairingChannel::WhatsAppWeb, &config, "admin").unwrap() {
             RelinkOutcome::Cleared { removed } => assert_eq!(removed.len(), 1),
             other => panic!("expected Cleared, got {other:?}"),
         }
