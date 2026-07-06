@@ -43,14 +43,31 @@ gh api "repos/openclaw/openclaw/contents/<path>" --jq '.content' | base64 -d
 ## Status vocabulary
 
 Cells use the page legend exactly: `supported`, `partial`, `experimental`,
-`planned`, `none`, `unknown`. A cell is:
+`planned`, `none`, `unknown`. The verdict turns on what the tree actually *wires
+and runs*, not on what a module merely defines. Finding a named module is
+necessary but not sufficient: before calling a cell `supported`, rule out the
+downgrade patterns below.
 
-- `supported` when the tree ships a first-class module for it.
-- `partial` when support is indirect (reachable only through a generic gateway,
-  or covers a subset of the surface).
-- `none` when the tree has no equivalent.
+- `supported` when the tree ships a first-class module for it AND it is wired
+  into a real path and on by default. A module that exists but fails one of the
+  downgrade patterns below is not `supported`; it is `partial` or `none` per
+  those rules.
+- `partial` when support is real but qualified. Use it when the module is:
+  - reachable only through a generic gateway rather than a dedicated module, or
+  - covers a subset of the surface, or
+  - **default-off / opt-in** (present but disabled unless explicitly enabled;
+    read the config defaults, not just that the code path exists), or
+  - **selectively wired** (live on some trigger/transport paths, dead on others).
+- `none` when the tree has no equivalent, OR the only match is
+  **defined-but-dead** (a module with no non-test callers) or a
+  **degraded/orphan path** (it starts but produces no end-to-end behavior). A
+  directory name or alias is not a match; the implementing, *called* module is.
 - Leave a walked ZeroClaw row with no TOML entry to render `unknown`; fill it in
   as parity is confirmed rather than guessing.
+
+The loose-alias downgrades in Step 3 are the same rule applied to naming: a
+speech- or image-only module is not LLM-chat `supported`, and a similarly named
+but distinct product (GitHub Copilot vs GitHub Models) is not the same slot.
 
 ## Workflow
 
@@ -74,6 +91,18 @@ inventory (`ChannelsConfig::channels`), `canonical_model_provider_slots`, and
 
 Clone in parallel per the URLs above. Confirm both landed (non-trivial size)
 before walking; an interrupted clone leaves an empty stub.
+
+Capture each clone's exact HEAD before walking:
+
+```bash
+git -C /tmp/parity-openclaw rev-parse HEAD
+git -C /tmp/parity-hermes rev-parse HEAD
+```
+
+That SHA, not just the date, is what pins the verdicts to a reproducible commit.
+`--depth 1` grabs whatever HEAD was current at clone time, so without the SHA a
+re-walk cannot tell what actually moved. You record both in the TOML `Sources`
+header in Step 5.
 
 ### Step 3: Walk every row against real modules
 
@@ -122,8 +151,9 @@ feature request was since merged, the slot is `supported`, not `planned`.
 ### Step 5: Write the TOML
 
 Every key must correspond to a walked row, in the page's canonical order. Keep
-the header's `Sources` block current (repo URLs, per-section walk paths, and the
-`checked` date). For a brand-new comparison concept that is not part of the
+the header's `Sources` block current (repo URLs, the pinned clone-HEAD SHA per
+repo from Step 2, per-section walk paths, and the `checked` date). For a
+brand-new comparison concept that is not part of the
 walked channel/provider/tool registries (SOP, for instance), it does not belong
 in this TOML; hand-author a small section in `feature-matrix.md` itself with a
 static table and note that it is hand-recorded rather than code-walked.
@@ -169,7 +199,8 @@ why, so the verdicts are auditable from the log.
 - Before marking a slot `none`, check the competitor's open issue tracker: an
   open feature request with no module in the tree makes the cell `planned`, not
   `none`. A bug filed against a slot proves it is already `supported`.
-- Keep the TOML `Sources` header current, including the `checked` date.
+- Keep the TOML `Sources` header current, including the `checked` date and the
+  pinned per-repo commit SHA the columns were walked against.
 - Run `cargo test -p xtask --lib feature_matrix` before committing; the guard is
   a hard CI fail.
 - Confirm the rendered tables from the live HTML, not from what you expect.

@@ -13,12 +13,16 @@
 # Status vocabulary matches the page legend: supported | partial | experimental
 # | planned | none | unknown.
 #
-# Sources (source-walked from the upstream repositories, checked 2026-07-06):
+# Sources (source-walked from the upstream repositories, checked 2026-07-06).
+# The @ <sha> is the exact clone HEAD each column was walked against, so the next
+# re-walk diffs a fixed commit instead of re-verifying every slot from scratch.
 #   OpenClaw: https://github.com/openclaw/openclaw
+#     @ 5aa7c6267cc06bd5e33679c4f6845046a677cbb5
 #     channels  -> extensions/ platform plugins + src/channels/
 #     providers -> extensions/ provider plugins (litellm gateway for custom)
 #     tools     -> extensions/openshell + src/ file/glob/ripgrep tooling
 #   Hermes:   https://github.com/NousResearch/hermes-agent
+#     @ 7426c09beee73bdff94d916015bac71384f6bc92
 #     channels  -> plugins/platforms/ + gateway/platforms/
 #     providers -> agent/*_adapter.py + website/docs/integrations/providers.md
 #     tools     -> tools/ (file_operations, shell/bash, grep, search_files)
