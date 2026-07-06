@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { AlertTriangle, XCircle, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import { Badge, Card, PageHeader } from '@/components/ui';
+import { Badge, Card, PageHeader, HelpTip } from '@/components/ui';
 import SopCanvas from './SopCanvas';
+import MarkdownEditor from '@/components/MarkdownEditor';
 import ToolPicker from '@/components/ToolPicker';
 import { PlannedCallsEditor, CapturedCallList } from '@/components/SopCalls';
 import { t } from '@/lib/i18n';
@@ -17,6 +18,7 @@ import {
   wireDraft,
   graphDraft,
   triggerSources,
+  sopFieldHelp,
   overlayStateByStep,
   overlayCallsByStep,
   runStateTone,
@@ -222,10 +224,48 @@ function DiagnosticsPanel({ graph }: { graph: SopGraph }) {
 
 const INPUT_CLS = 'w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text';
 
-function Field({ label, hint, children }: { label: string; hint?: string | null; children: ReactNode }) {
+function StepBodyEditor({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+}) {
+  const [focused, setFocused] = useState(false);
+  return (
+    <div>
+      <span className="mb-1 block text-pc-text-muted text-sm">
+        <HelpTip text={sopFieldHelp('SopStep', 'body')}>{t('sops.step_body_label')}</HelpTip>
+      </span>
+      <MarkdownEditor
+        value={value}
+        onChange={onChange}
+        onFocus={() => setFocused(true)}
+        onBlur={() => setFocused(false)}
+        height={focused ? '20rem' : '4rem'}
+        lineNumbers={focused}
+        placeholder={t('sops.step_body_placeholder')}
+      />
+    </div>
+  );
+}
+
+function Field({
+  label,
+  hint,
+  help,
+  children,
+}: {
+  label: string;
+  hint?: string | null;
+  help?: string | null;
+  children: ReactNode;
+}) {
   return (
     <label className="block text-sm">
-      <span className="mb-1 block text-pc-text-muted">{label}</span>
+      <span className="mb-1 block text-pc-text-muted">
+        {help ? <HelpTip text={help}>{label}</HelpTip> : label}
+      </span>
       {children}
       {hint ? <p className="mt-1 text-xs text-pc-text-faint">{hint}</p> : null}
     </label>
@@ -237,14 +277,16 @@ function TextField({
   value,
   onChange,
   placeholder,
+  help,
 }: {
   label: string;
   value: string;
   onChange: (next: string) => void;
   placeholder?: string;
+  help?: string | null;
 }) {
   return (
-    <Field label={label}>
+    <Field label={label} help={help}>
       <input
         type="text"
         value={value}
@@ -263,6 +305,7 @@ function SelectField({
   options,
   disabled,
   children,
+  help,
 }: {
   label: string;
   value: string;
@@ -270,9 +313,10 @@ function SelectField({
   options?: string[];
   disabled?: boolean;
   children?: ReactNode;
+  help?: string | null;
 }) {
   return (
-    <Field label={label}>
+    <Field label={label} help={help}>
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
@@ -375,13 +419,12 @@ function StepEditor({
           <Trash2 className="h-4 w-4" aria-hidden />
         </button>
       </div>
-      <textarea
-        value={step.body}
-        onChange={(e) => onChange({ body: e.target.value })}
-        placeholder={t('sops.step_body_placeholder')}
-        rows={2}
-        className="mb-2 w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-sm text-pc-text"
-      />
+      <div className="mb-2">
+        <StepBodyEditor
+          value={step.body}
+          onChange={(next) => onChange({ body: next })}
+        />
+      </div>
       <div className="mb-2 space-y-2 text-xs">
         <div>
           <span className="mb-1 block text-pc-text-muted">{t('sops.step_tools_label')}</span>
@@ -608,6 +651,7 @@ function TriggerFieldInput({
   const name = field.name;
   const options = field.options ?? [];
   const hint = triggerFieldHint(name);
+  const help = sopFieldHelp('SopTrigger', name);
 
   if (options.length > 0) {
     if (field.multi) {
@@ -620,7 +664,13 @@ function TriggerFieldInput({
       };
       return (
         <fieldset className="block text-sm">
-          <legend className="mb-1 block text-pc-text-muted">{triggerFieldLabel(name)}</legend>
+          <legend className="mb-1 block text-pc-text-muted">
+            {help ? (
+              <HelpTip text={help}>{triggerFieldLabel(name)}</HelpTip>
+            ) : (
+              triggerFieldLabel(name)
+            )}
+          </legend>
           <div className="flex flex-wrap gap-2">
             {options.map((opt) => (
               <label
@@ -642,7 +692,7 @@ function TriggerFieldInput({
     }
     const current = typeof value === 'string' ? value : '';
     return (
-      <Field label={triggerFieldLabel(name)} hint={hint}>
+      <Field label={triggerFieldLabel(name)} hint={hint} help={help}>
         <select value={current} onChange={(e) => onChange(e.target.value)} className={INPUT_CLS}>
           {options.map((opt) => (
             <option key={opt} value={opt}>
@@ -664,7 +714,7 @@ function TriggerFieldInput({
       ? value
       : '';
   return (
-    <Field label={triggerFieldLabel(name)} hint={hint}>
+    <Field label={triggerFieldLabel(name)} hint={hint} help={help}>
       <input
         type="text"
         value={text}
@@ -952,23 +1002,27 @@ function DraftSidebar({
         label={t('sops.field_name')}
         value={draft.name}
         onChange={(v) => onField({ name: v })}
+        help={sopFieldHelp('Sop', 'name')}
       />
       <TextField
         label={t('sops.field_description')}
         value={draft.description}
         onChange={(v) => onField({ description: v })}
+        help={sopFieldHelp('Sop', 'description')}
       />
       <div className="grid grid-cols-2 gap-3">
         <TextField
           label={t('sops.field_version')}
           value={draft.version}
           onChange={(v) => onField({ version: v })}
+          help={sopFieldHelp('Sop', 'version')}
         />
         <SelectField
           label={t('sops.field_priority')}
           value={draft.priority}
           onChange={(v) => onField({ priority: v as Sop['priority'] })}
           options={['critical', 'high', 'normal', 'low']}
+          help={sopFieldHelp('Sop', 'priority')}
         />
       </div>
       <SelectField
@@ -976,6 +1030,7 @@ function DraftSidebar({
         value={draft.execution_mode}
         onChange={(v) => onField({ execution_mode: v as Sop['execution_mode'] })}
         options={['auto', 'supervised', 'step_by_step', 'priority_based', 'deterministic']}
+        help={sopFieldHelp('Sop', 'execution_mode')}
       />
       <div className="space-y-2">
         <div className="flex items-center justify-between">

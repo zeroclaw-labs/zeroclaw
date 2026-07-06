@@ -1053,6 +1053,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'sops.requires_confirmation': 'confirm',
     'sops.step_title_placeholder': 'Step title',
     'sops.step_body_placeholder': 'Step body / instructions',
+    'sops.step_body_label': 'Instructions',
     'sops.step_tools_placeholder': 'suggested tools (comma-separated)',
     'sops.step_tools_label': 'Suggested tools',
     'sops.trigger_condition_hint':
