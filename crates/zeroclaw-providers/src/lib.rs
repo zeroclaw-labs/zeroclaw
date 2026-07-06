@@ -32,6 +32,7 @@ pub mod kilocli;
 pub mod model_pin;
 pub mod models_dev;
 pub mod multimodal;
+pub(crate) mod native_tool_args;
 pub mod ollama;
 pub mod openai;
 pub mod openai_codex;

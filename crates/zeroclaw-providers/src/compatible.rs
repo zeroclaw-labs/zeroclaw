@@ -1378,24 +1378,8 @@ impl StreamToolCallAccumulator {
         used_tool_call_ids: &mut std::collections::HashSet<String>,
     ) -> Option<ProviderToolCall> {
         let name = self.name?;
-        let arguments = if self.arguments.trim().is_empty() {
-            "{}".to_string()
-        } else {
-            self.arguments
-        };
-        let normalized_arguments = if serde_json::from_str::<serde_json::Value>(&arguments).is_ok()
-        {
-            arguments
-        } else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"function": name, "arguments": arguments})),
-                "Invalid JSON in streamed native tool-call arguments, using empty object"
-            );
-            "{}".to_string()
-        };
+        let normalized_arguments =
+            crate::native_tool_args::normalize_native_tool_call_arguments(&name, self.arguments);
 
         Some(ProviderToolCall {
             id: reserve_tool_call_id_for_contract(
@@ -2394,23 +2378,9 @@ impl OpenAiCompatibleModelProvider {
             .into_iter()
             .filter_map(|tc| {
                 let name = tc.function_name()?;
-                let arguments = tc.function_arguments().unwrap_or_else(|| "{}".to_string());
-                let normalized_arguments = if serde_json::from_str::<serde_json::Value>(&arguments)
-                    .is_ok()
-                {
-                    arguments
-                } else {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(
-                                ::serde_json::json!({"function": name, "arguments": arguments})
-                            ),
-                        "Invalid JSON in native tool-call arguments, using empty object"
-                    );
-                    "{}".to_string()
-                };
+                let arguments = tc.function_arguments().unwrap_or_default();
+                let normalized_arguments =
+                    crate::native_tool_args::normalize_native_tool_call_arguments(&name, arguments);
                 Some(ProviderToolCall {
                     id: self.reserve_tool_call_id(tc.id, &mut used_tool_call_ids),
                     name,
