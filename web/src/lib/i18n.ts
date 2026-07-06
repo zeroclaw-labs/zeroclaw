@@ -1111,7 +1111,10 @@ const translations: Record<Locale, Record<string, string>> = {
     'sops.no_calls': 'No planned calls. The agent picks tools freely at run time.',
     'sops.call_untitled': '(pick a tool)',
     'sops.call_tool': 'Tool',
-    'sops.call_args': 'Args template (JSON)',
+    'sops.call_args': 'Arguments',
+    'sops.arg_unset': '(unset)',
+    'sops.arg_none': 'This tool takes no arguments.',
+    'sops.arg_binding_placeholder': 'value or {{steps.N.path}}',
     'sops.call_binding_hint':
       'String values may embed {{steps.N.path}} (a prior step\u2019s output) or {{calls.K.path}} (an earlier call in this step). A whole-string binding keeps its type; embedded ones interpolate as text.',
     'sops.call_pinned': 'Pinned sample output',

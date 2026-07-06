@@ -37,10 +37,12 @@ export interface ToolPickerProps {
 }
 
 /** A flattened, group-tagged catalog entry. */
-interface CatalogEntry {
+export interface CatalogEntry {
   name: string;
   description: string;
   group: 'agent' | 'cli';
+  /** JSON Schema for the tool's args (agent tools only; CLI tools omit it). */
+  parameters?: unknown;
 }
 
 // Process-wide cache so re-mounting the picker (e.g. reopening the Cron
@@ -62,7 +64,7 @@ function cliDescription(tool: CliTool): string {
   return parts || tool.path;
 }
 
-function loadCatalog(agent?: string): Promise<CatalogEntry[]> {
+export function loadCatalog(agent?: string): Promise<CatalogEntry[]> {
   const key = agent ?? '';
   const cached = catalogCache.get(key);
   if (cached) return Promise.resolve(cached);
@@ -74,6 +76,7 @@ function loadCatalog(agent?: string): Promise<CatalogEntry[]> {
         name: tnt.name,
         description: tnt.description,
         group: 'agent' as const,
+        parameters: tnt.parameters,
       }));
       const cli: CatalogEntry[] = cliTools.map((c: CliTool) => ({
         name: c.name,

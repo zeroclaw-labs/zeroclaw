@@ -10,12 +10,34 @@
 // inspector while watching a run: per call it shows args, display
 // output, and structured output data.
 
-import { useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { ChevronDown, ChevronRight, Pin, Plus, Trash2 } from 'lucide-react';
 import { t } from '@/lib/i18n';
 import type { PlannedToolCall, StepToolCall } from '@/lib/sops';
+import { loadCatalog, type CatalogEntry } from '@/components/ToolPicker';
 
 const INPUT_CLS = 'w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-pc-text';
+
+/// Shared, cached load of the tool catalog (built-in agent tools + CLI tools).
+/// `loadCatalog` is process-cached, so every mounted editor resolves instantly
+/// after the first fetch.
+function useToolCatalog(): CatalogEntry[] | null {
+  const [catalog, setCatalog] = useState<CatalogEntry[] | null>(null);
+  useEffect(() => {
+    let live = true;
+    loadCatalog()
+      .then((entries) => {
+        if (live) setCatalog(entries);
+      })
+      .catch(() => {
+        if (live) setCatalog([]);
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+  return catalog;
+}
 
 function stringify(value: unknown): string {
   return JSON.stringify(value ?? {}, null, 2);
@@ -97,6 +119,290 @@ function Accordion({
   );
 }
 
+/// Single-select over the same tool catalog the scope `ToolPicker` walks
+/// (built-in agent tools + discovered CLI tools). A planned call's tool is a
+/// registry name, never free text. A value not in the catalog (removed tool,
+/// or an MCP tool absent from the default-agent listing) is preserved as its
+/// own option so editing never silently drops it.
+function ToolSelect({
+  value,
+  catalog,
+  onChange,
+}: {
+  value: string;
+  catalog: CatalogEntry[] | null;
+  onChange: (next: string) => void;
+}) {
+  const agent = (catalog ?? []).filter((e) => e.group === 'agent');
+  const cli = (catalog ?? []).filter((e) => e.group === 'cli');
+  const known = (catalog ?? []).some((e) => e.name === value);
+
+  return (
+    <label className="block flex-1 text-xs">
+      <span className="mb-1 block text-pc-text-muted">{t('sops.call_tool')}</span>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className={`${INPUT_CLS} font-mono text-xs`}
+      >
+        <option value="" disabled>
+          {t('sops.call_untitled')}
+        </option>
+        {value && !known ? <option value={value}>{value}</option> : null}
+        {agent.length > 0 ? (
+          <optgroup label={t('tool_picker.group_agent')}>
+            {agent.map((e) => (
+              <option key={e.name} value={e.name}>
+                {e.name}
+              </option>
+            ))}
+          </optgroup>
+        ) : null}
+        {cli.length > 0 ? (
+          <optgroup label={t('tool_picker.group_cli')}>
+            {cli.map((e) => (
+              <option key={e.name} value={e.name}>
+                {e.name}
+              </option>
+            ))}
+          </optgroup>
+        ) : null}
+      </select>
+    </label>
+  );
+}
+
+// ── Schema-driven args editor ────────────────────────────────────────────────
+// A planned call's args are shaped by the selected tool's JSON Schema, so the
+// editor renders one typed field per schema property instead of a raw JSON
+// blob. Any field may instead hold a `{{steps.N.path}}` / `{{calls.K.path}}`
+// binding — a whole-string binding is passed through verbatim and keeps its
+// runtime type. Tools with no usable object schema (unknown tool, or a schema
+// without `properties`) fall back to the JSON textarea so nothing is lost.
+
+interface SchemaProp {
+  type?: string | string[];
+  description?: string;
+  enum?: unknown[];
+}
+
+interface ObjectSchema {
+  properties: Record<string, SchemaProp>;
+  required: string[];
+}
+
+function objectSchema(parameters: unknown): ObjectSchema | null {
+  if (!parameters || typeof parameters !== 'object') return null;
+  const schema = parameters as Record<string, unknown>;
+  const props = schema.properties;
+  if (!props || typeof props !== 'object') return null;
+  const required = Array.isArray(schema.required)
+    ? (schema.required.filter((r) => typeof r === 'string') as string[])
+    : [];
+  return { properties: props as Record<string, SchemaProp>, required };
+}
+
+function primaryType(prop: SchemaProp): string {
+  if (Array.isArray(prop.type)) {
+    return prop.type.find((x) => x !== 'null') ?? 'string';
+  }
+  return prop.type ?? 'string';
+}
+
+function isBinding(value: unknown): value is string {
+  return typeof value === 'string' && value.includes('{{');
+}
+
+/// One schema property → one control. String/number/boolean/enum get native
+/// inputs; array/object properties fall back to a per-key JSON field. A value
+/// holding a `{{…}}` binding always renders as a text input so the binding is
+/// editable regardless of the declared type.
+function SchemaField({
+  name,
+  prop,
+  required,
+  value,
+  onChange,
+}: {
+  name: string;
+  prop: SchemaProp;
+  required: boolean;
+  value: unknown;
+  onChange: (next: unknown) => void;
+}) {
+  const type = primaryType(prop);
+  const label = (
+    <span className="mb-1 block text-pc-text-muted">
+      <span className="font-mono">{name}</span>
+      {required ? <span className="text-status-error"> *</span> : null}
+      {prop.description ? (
+        <span className="ml-1 text-pc-text-faint">{prop.description}</span>
+      ) : null}
+    </span>
+  );
+
+  if (isBinding(value)) {
+    return (
+      <label className="block text-xs">
+        {label}
+        <input
+          type="text"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className={`${INPUT_CLS} font-mono text-xs`}
+        />
+      </label>
+    );
+  }
+
+  if (Array.isArray(prop.enum) && prop.enum.length > 0) {
+    return (
+      <label className="block text-xs">
+        {label}
+        <select
+          value={value === undefined || value === null ? '' : String(value)}
+          onChange={(e) => onChange(e.target.value === '' ? undefined : e.target.value)}
+          className={`${INPUT_CLS} font-mono text-xs`}
+        >
+          <option value="">{t('sops.arg_unset')}</option>
+          {prop.enum.map((opt) => (
+            <option key={String(opt)} value={String(opt)}>
+              {String(opt)}
+            </option>
+          ))}
+        </select>
+      </label>
+    );
+  }
+
+  if (type === 'boolean') {
+    return (
+      <label className="flex items-center gap-2 text-xs">
+        <input
+          type="checkbox"
+          checked={value === true}
+          onChange={(e) => onChange(e.target.checked)}
+        />
+        {label}
+      </label>
+    );
+  }
+
+  if (type === 'number' || type === 'integer') {
+    return (
+      <label className="block text-xs">
+        {label}
+        <input
+          type="text"
+          inputMode="decimal"
+          value={value === undefined || value === null ? '' : String(value)}
+          placeholder={t('sops.arg_binding_placeholder')}
+          onChange={(e) => {
+            const raw = e.target.value.trim();
+            if (raw === '') {
+              onChange(undefined);
+            } else if (raw.includes('{{')) {
+              onChange(raw);
+            } else {
+              const num = Number(raw);
+              onChange(Number.isNaN(num) ? raw : num);
+            }
+          }}
+          className={`${INPUT_CLS} font-mono text-xs`}
+        />
+      </label>
+    );
+  }
+
+  if (type === 'array' || type === 'object') {
+    return (
+      <JsonField
+        label={name + (required ? ' *' : '')}
+        value={value ?? (type === 'array' ? [] : {})}
+        onChange={onChange}
+        placeholder={t('sops.arg_binding_placeholder')}
+        rows={3}
+      />
+    );
+  }
+
+  // string and anything else
+  return (
+    <label className="block text-xs">
+      {label}
+      <input
+        type="text"
+        value={value === undefined || value === null ? '' : String(value)}
+        placeholder={t('sops.arg_binding_placeholder')}
+        onChange={(e) => onChange(e.target.value === '' ? undefined : e.target.value)}
+        className={`${INPUT_CLS} font-mono text-xs`}
+      />
+    </label>
+  );
+}
+
+function SchemaArgsEditor({
+  parameters,
+  args,
+  onChange,
+}: {
+  parameters: unknown;
+  args: unknown;
+  onChange: (next: unknown) => void;
+}) {
+  const schema = useMemo(() => objectSchema(parameters), [parameters]);
+  const current = (args && typeof args === 'object' && !Array.isArray(args)
+    ? args
+    : {}) as Record<string, unknown>;
+
+  if (!schema) {
+    return (
+      <JsonField
+        label={t('sops.call_args')}
+        value={args}
+        onChange={onChange}
+        placeholder={'{"function": "add", "values": "{{steps.1.value}}"}'}
+        rows={4}
+      />
+    );
+  }
+
+  const setField = (name: string, next: unknown) => {
+    const merged = { ...current };
+    if (next === undefined) {
+      delete merged[name];
+    } else {
+      merged[name] = next;
+    }
+    onChange(merged);
+  };
+
+  const names = Object.keys(schema.properties);
+  if (names.length === 0) {
+    return <div className="text-xs text-pc-text-faint">{t('sops.arg_none')}</div>;
+  }
+
+  return (
+    <div className="space-y-2">
+      <span className="block text-xs text-pc-text-muted">{t('sops.call_args')}</span>
+      {names.map((name) => {
+        const prop = schema.properties[name];
+        if (!prop) return null;
+        return (
+          <SchemaField
+            key={name}
+            name={name}
+            prop={prop}
+            required={schema.required.includes(name)}
+            value={current[name]}
+            onChange={(next) => setField(name, next)}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
 export function PlannedCallsEditor({
   calls,
   captured,
@@ -109,6 +415,7 @@ export function PlannedCallsEditor({
   onChange: (next: PlannedToolCall[]) => void;
 }) {
   const [openIdx, setOpenIdx] = useState<number | null>(null);
+  const catalog = useToolCatalog();
   const setCall = (i: number, patch: Partial<PlannedToolCall>) => {
     onChange(calls.map((c, j) => (j === i ? { ...c, ...patch } : c)));
   };
@@ -134,6 +441,7 @@ export function PlannedCallsEditor({
         <div className="space-y-1">
           {calls.map((call, i) => {
             const sample = captured?.find((c) => c.index === i && c.tool === call.tool);
+            const schemaParams = catalog?.find((e) => e.name === call.tool)?.parameters;
             return (
               <Accordion
                 key={i}
@@ -141,7 +449,7 @@ export function PlannedCallsEditor({
                 onToggle={() => setOpenIdx((cur) => (cur === i ? null : i))}
                 header={
                   <>
-                    <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded bg-pc-accent-light text-[10px] font-semibold text-pc-accent">
+                    <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded bg-pc-accent text-[10px] font-semibold text-[#0b1220]">
                       {i}
                     </span>
                     <span className="min-w-0 flex-1 truncate font-mono">
@@ -154,16 +462,11 @@ export function PlannedCallsEditor({
                 }
               >
                 <div className="flex items-end gap-2">
-                  <label className="block flex-1 text-xs">
-                    <span className="mb-1 block text-pc-text-muted">{t('sops.call_tool')}</span>
-                    <input
-                      type="text"
-                      value={call.tool}
-                      onChange={(e) => setCall(i, { tool: e.target.value })}
-                      placeholder="calculator"
-                      className={`${INPUT_CLS} font-mono text-xs`}
-                    />
-                  </label>
+                  <ToolSelect
+                    value={call.tool}
+                    catalog={catalog}
+                    onChange={(next) => setCall(i, { tool: next })}
+                  />
                   <button
                     type="button"
                     onClick={() => {
@@ -176,12 +479,10 @@ export function PlannedCallsEditor({
                     <Trash2 className="h-3.5 w-3.5" aria-hidden />
                   </button>
                 </div>
-                <JsonField
-                  label={t('sops.call_args')}
-                  value={call.args}
+                <SchemaArgsEditor
+                  parameters={schemaParams}
+                  args={call.args}
                   onChange={(next) => setCall(i, { args: next })}
-                  placeholder={'{"function": "add", "values": "{{steps.1.value}}"}'}
-                  rows={4}
                 />
                 <p className="text-xs text-pc-text-faint">{t('sops.call_binding_hint')}</p>
                 <div className="flex items-center justify-between">
@@ -237,7 +538,7 @@ export function CapturedCallList({ calls }: { calls: StepToolCall[] }) {
           onToggle={() => setOpenIdx((cur) => (cur === call.index ? null : call.index))}
           header={
             <>
-              <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded bg-pc-accent-light text-[10px] font-semibold text-pc-accent">
+              <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded bg-pc-accent text-[10px] font-semibold text-[#0b1220]">
                 {call.index}
               </span>
               <span className="min-w-0 flex-1 truncate font-mono">{call.tool}</span>
