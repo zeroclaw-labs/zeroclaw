@@ -2103,6 +2103,17 @@ fn trigger_matches(trigger: &SopTrigger, event: &SopEvent) -> bool {
             SopTriggerSource::Calendar,
         ) => calendar_trigger_matches(calendar_source, calendar_ids, event),
 
+        (SopTrigger::Channel { topic, condition }, SopTriggerSource::Channel) => {
+            let topic_match = event.topic.as_deref().is_some_and(|t| t == topic);
+            if !topic_match {
+                return false;
+            }
+            match condition {
+                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
+                None => true,
+            }
+        }
+
         (SopTrigger::Manual, SopTriggerSource::Manual) => true,
 
         _ => false,
@@ -2446,6 +2457,7 @@ fn parse_iso8601_secs(input: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::store::ProposalKind;
     use super::*;
     use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, ResolveOutcome};
     use crate::sop::step_contract::StepFailure;
@@ -2899,6 +2911,42 @@ mod tests {
             timestamp: now_iso8601(),
         };
         assert_eq!(engine.match_trigger(&event).len(), 1);
+    }
+
+    #[test]
+    fn channel_trigger_matches_exact_topic_and_condition() {
+        let sop = Sop {
+            triggers: vec![SopTrigger::Channel {
+                topic: "git.main:pull_request.opened".into(),
+                condition: Some("$.repo == \"octo/repo\"".into()),
+            }],
+            ..test_sop("git-pr-sop", SopExecutionMode::Auto, SopPriority::Normal)
+        };
+        let engine = engine_with_sops(vec![sop]);
+
+        let event = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.main:pull_request.opened".into()),
+            payload: Some(r#"{"repo":"octo/repo","number":12}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert_eq!(engine.match_trigger(&event).len(), 1);
+
+        let wrong_topic = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.main:issues.opened".into()),
+            payload: Some(r#"{"repo":"octo/repo"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert!(engine.match_trigger(&wrong_topic).is_empty());
+
+        let wrong_payload = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.main:pull_request.opened".into()),
+            payload: Some(r#"{"repo":"other/repo"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert!(engine.match_trigger(&wrong_payload).is_empty());
     }
 
     // ── Cron trigger matching ─────────────────────────
@@ -3568,13 +3616,20 @@ mod tests {
         let now = now_iso8601();
         let proposal = ProposalRecord {
             id: "prop-1".to_string(),
+            kind: ProposalKind::Update,
             status: ProposalStatus::Pending,
             source_run_id: Some("run-1".to_string()),
             sop_name: "s1".to_string(),
             target_content_hash: Some("sha256:abc".to_string()),
+            manifest_toml: "[sop]\nname = \"s1\"\ndescription = \"S1\"\n".to_string(),
+            procedure_markdown: "## Steps\n\n1. **Do** - It.\n".to_string(),
             provenance: serde_json::json!({"producer": "test"}),
             created_at: now.clone(),
             updated_at: now,
+            status_reason: None,
+            applied_at: None,
+            applied_by: None,
+            rollback_path: None,
         };
 
         engine.save_proposal(&proposal).unwrap();
