@@ -4,6 +4,8 @@ import { t } from '@/lib/i18n';
 import {
   runStateTone,
   flowRoleTone,
+  layoutGeometry,
+  CANONICAL_LAYOUT_GEOMETRY,
   type RunStateTone,
   type WireTone,
   type Sop,
@@ -18,10 +20,12 @@ import {
 
 type XY = { x: number; y: number };
 
-const NODE_W = 210;
-const NODE_H = 84;
-const COL_GAP = 130;
-const ROW_GAP = 46;
+// Node box dimensions read from the shared geometry registry
+// (`zeroclaw-sop-graph::LayoutGeometry`). Per-graph placement pitch/origin come
+// off `graph.layout.geometry` in seedPositions; the box size is fixed-canonical
+// and only drives local rendering math, so it binds to the canonical fallback.
+const NODE_W = CANONICAL_LAYOUT_GEOMETRY.node_w;
+const NODE_H = CANONICAL_LAYOUT_GEOMETRY.node_h;
 
 // Wire and node colors read from the gateway theme's semantic status tokens
 // and accent, so the canvas follows light/dark and the active palette instead
@@ -54,17 +58,21 @@ function nodeStateStroke(state: NodeRunState | undefined): string {
 
 /// Seed positions from the backend layout. The layout (columns/rows walked from
 /// the projected edges) is the single source of node placement; the canvas only
-/// maps grid slots onto pixels and lets the user drag from there. No layout is
-/// derived client-side.
+/// maps grid slots onto pixels and lets the user drag from there. Placement
+/// pitch and origin come from the shared geometry registry carried on
+/// `graph.layout.geometry`, so no layout constant is duplicated client-side.
 function seedPositions(graph: SopGraph): Map<number, XY> {
   const pos = new Map<number, XY>();
+  const g = layoutGeometry(graph);
+  const colPitch = g.node_w + g.col_gap;
+  const rowPitch = g.node_h + g.row_gap;
   for (const p of graph.layout.positions) {
     if (p.x != null && p.y != null) {
       pos.set(p.step, { x: p.x, y: p.y });
     } else {
       pos.set(p.step, {
-        x: 24 + p.col * (NODE_W + COL_GAP),
-        y: 24 + p.row * (NODE_H + ROW_GAP),
+        x: g.origin + p.col * colPitch,
+        y: g.origin + p.row * rowPitch,
       });
     }
   }

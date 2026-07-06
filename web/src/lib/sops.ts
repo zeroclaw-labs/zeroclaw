@@ -30,6 +30,7 @@ export type GraphPin = Schemas['GraphPin'];
 export type GraphWire = Schemas['GraphWire'];
 export type GraphDiagnostic = Schemas['GraphDiagnostic'];
 export type GraphLayout = Schemas['GraphLayout'];
+export type LayoutGeometry = Schemas['LayoutGeometry'];
 export type NodePosition = Schemas['NodePosition'];
 export type NodeKind = Schemas['NodeKind'];
 export type PinClass = GraphPin['class'];
@@ -54,6 +55,22 @@ export interface SopSummary {
   name: string;
   description: string;
   version: string;
+}
+
+// Canonical canvas geometry fallback, mirroring `LayoutGeometry::CANONICAL` in
+// `zeroclaw-sop-graph`. Every projected graph carries `layout.geometry` on the
+// wire; this is only used when deserializing a response from an older daemon
+// that predates the field. The Rust registry is the source of truth.
+export const CANONICAL_LAYOUT_GEOMETRY: LayoutGeometry = {
+  node_w: 210,
+  node_h: 84,
+  col_gap: 130,
+  row_gap: 46,
+  origin: 24,
+};
+
+export function layoutGeometry(graph: SopGraph): LayoutGeometry {
+  return graph.layout.geometry ?? CANONICAL_LAYOUT_GEOMETRY;
 }
 
 export async function listSops(): Promise<SopSummary[]> {

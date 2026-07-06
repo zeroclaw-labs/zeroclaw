@@ -20,7 +20,7 @@ pub type ToolSpecs = HashMap<String, ToolSpec>;
 // downstream `crate::sop::graph::GraphPin` path keep working unchanged.
 pub use zeroclaw_sop_graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphNode, GraphPin, GraphSeverity, GraphWire,
-    NodeKind, NodePosition, NodeRunState, PinClass, SopGraph, TRIGGER_NODE_BASE,
+    LayoutGeometry, NodeKind, NodePosition, NodeRunState, PinClass, SopGraph, TRIGGER_NODE_BASE,
 };
 
 /// Rendering style for `render_graph_text`.
@@ -529,6 +529,7 @@ fn layout_graph(nodes: &[GraphNode], wires: &[GraphWire]) -> GraphLayout {
         positions,
         columns,
         rows,
+        ..GraphLayout::default()
     }
 }
 
@@ -1171,7 +1172,14 @@ mod tests {
                         {"step": TRIGGER_NODE_BASE, "col": 0, "row": 0}
                     ],
                     "columns": 2,
-                    "rows": 1
+                    "rows": 1,
+                    "geometry": {
+                        "node_w": 210.0,
+                        "node_h": 84.0,
+                        "col_gap": 130.0,
+                        "row_gap": 46.0,
+                        "origin": 24.0
+                    }
                 }
             })
         );

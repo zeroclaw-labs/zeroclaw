@@ -811,10 +811,12 @@ function conditionValueInputType(vt: ConditionField['value_type'] | undefined): 
 /// Guided condition builder. Users pick a payload field (from the source's
 /// walked contract), an operator (from the registry catalog), and a value;
 /// the three assemble into the `$.path op value` string the engine evaluates.
-/// No operator or path is typed blind. `open` payloads (mqtt, amqp, channel)
-/// have no enumerated fields, so the path becomes a free input with an
-/// advanced raw-string escape hatch; `direct` scalar payloads drop the path
-/// entirely. Sources with no contract render nothing (condition unsupported).
+/// No operator or path is typed blind. Every channel and known-shape source
+/// enumerates its fields, so the builder renders a field picker. Only genuinely
+/// arbitrary payloads (mqtt, amqp) mark `open` and fall back to a free input
+/// with an advanced raw-string escape hatch; `direct` scalar payloads drop the
+/// path entirely. Sources with no contract render nothing (condition
+/// unsupported).
 function ConditionBuilder({
   contract,
   operators,
@@ -1779,30 +1781,30 @@ export default function Sops() {
         </Card>
       ) : null}
       {draft && editorHandlers ? (
-        <div className="space-y-4">
-          <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-[20rem_minmax(0,1fr)]">
-            <DraftSidebar
-              draft={draft}
-              saving={saving}
-              saveError={saveError}
-              selectedStep={selectedStep}
-              selectedTrigger={selectedTrigger}
-              triggerRegistry={triggerRegistry}
-              agentAliases={agentAliases}
-              onSelectStep={setSelectedStep}
-              onField={editorHandlers.onField}
-              onTrigger={editorHandlers.onTrigger}
-              onAddTrigger={editorHandlers.onAddTrigger}
-              onRemoveTrigger={editorHandlers.onRemoveTrigger}
-              onAddStep={editorHandlers.onAddStep}
-              onRemoveStep={editorHandlers.onRemoveStep}
-              onMoveStep={editorHandlers.onMoveStep}
-              onSave={onSaveDraft}
-              onCancel={() => {
-                setDraft(null);
-                setEditingName(null);
-              }}
-            />
+        <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-[20rem_minmax(0,1fr)]">
+          <DraftSidebar
+            draft={draft}
+            saving={saving}
+            saveError={saveError}
+            selectedStep={selectedStep}
+            selectedTrigger={selectedTrigger}
+            triggerRegistry={triggerRegistry}
+            agentAliases={agentAliases}
+            onSelectStep={setSelectedStep}
+            onField={editorHandlers.onField}
+            onTrigger={editorHandlers.onTrigger}
+            onAddTrigger={editorHandlers.onAddTrigger}
+            onRemoveTrigger={editorHandlers.onRemoveTrigger}
+            onAddStep={editorHandlers.onAddStep}
+            onRemoveStep={editorHandlers.onRemoveStep}
+            onMoveStep={editorHandlers.onMoveStep}
+            onSave={onSaveDraft}
+            onCancel={() => {
+              setDraft(null);
+              setEditingName(null);
+            }}
+          />
+          <div className="min-w-0 space-y-4">
             <StepInspector
               draft={draft}
               selectedStep={selectedStep}
@@ -1812,27 +1814,27 @@ export default function Sops() {
               onRemoveStep={editorHandlers.onRemoveStep}
               onMoveStep={editorHandlers.onMoveStep}
             />
+            {draftGraph ? (
+              <SopCanvas
+                draft={draft}
+                graph={draftGraph}
+                selectedStep={selectedStep}
+                runStateByStep={runStateByStep}
+                onSelectStep={setSelectedStep}
+                onSelectTrigger={setSelectedTrigger}
+                onAddStep={editorHandlers.onAddStep}
+                onRemoveStep={(n) => {
+                  const i = draft.steps.findIndex((s) => s.number === n);
+                  if (i >= 0) editorHandlers.onRemoveStep(i);
+                }}
+                onConnect={onConnect}
+                onDisconnect={onDisconnect}
+                onConnectData={onConnectData}
+                onDisconnectData={onDisconnectData}
+                onMoveNode={editorHandlers.onMoveNode}
+              />
+            ) : null}
           </div>
-          {draftGraph ? (
-            <SopCanvas
-              draft={draft}
-              graph={draftGraph}
-              selectedStep={selectedStep}
-              runStateByStep={runStateByStep}
-              onSelectStep={setSelectedStep}
-              onSelectTrigger={setSelectedTrigger}
-              onAddStep={editorHandlers.onAddStep}
-              onRemoveStep={(n) => {
-                const i = draft.steps.findIndex((s) => s.number === n);
-                if (i >= 0) editorHandlers.onRemoveStep(i);
-              }}
-              onConnect={onConnect}
-              onDisconnect={onDisconnect}
-              onConnectData={onConnectData}
-              onDisconnectData={onDisconnectData}
-              onMoveNode={editorHandlers.onMoveNode}
-            />
-          ) : null}
         </div>
       ) : loading ? (
         <Card>

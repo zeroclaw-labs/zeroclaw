@@ -134,7 +134,60 @@ pub struct NodePosition {
     pub y: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+/// Canonical canvas geometry: the pixel box and inter-slot pitch every
+/// surface renders a node with, plus the seed origin a grid slot maps to.
+/// This is the single registry both the web canvas and the zerocode TUI read
+/// from — the web off `GraphLayout.geometry`, zerocode off [`LayoutGeometry::CANONICAL`]
+/// — so neither surface hardcodes its own drifting copy. A slot at
+/// `(col, row)` seeds to `(origin + col*(node_w+col_gap), origin + row*(node_h+row_gap))`,
+/// and a persisted `NodePosition.x`/`y` lives in that same pixel space.
+pub const LAYOUT_NODE_W: f64 = 210.0;
+pub const LAYOUT_NODE_H: f64 = 84.0;
+pub const LAYOUT_COL_GAP: f64 = 130.0;
+pub const LAYOUT_ROW_GAP: f64 = 46.0;
+pub const LAYOUT_ORIGIN: f64 = 24.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// Canvas geometry carried on every serialized graph so the web canvas reads
+/// placement pitch from the wire instead of a local literal. The values are
+/// fixed by [`LayoutGeometry::CANONICAL`]; the struct rides on `GraphLayout`
+/// only to expose them to non-Rust surfaces.
+pub struct LayoutGeometry {
+    pub node_w: f64,
+    pub node_h: f64,
+    pub col_gap: f64,
+    pub row_gap: f64,
+    pub origin: f64,
+}
+
+impl LayoutGeometry {
+    pub const CANONICAL: Self = Self {
+        node_w: LAYOUT_NODE_W,
+        node_h: LAYOUT_NODE_H,
+        col_gap: LAYOUT_COL_GAP,
+        row_gap: LAYOUT_ROW_GAP,
+        origin: LAYOUT_ORIGIN,
+    };
+
+    /// Column pitch: the pixel distance between two adjacent grid columns.
+    pub const fn col_pitch(&self) -> f64 {
+        self.node_w + self.col_gap
+    }
+
+    /// Row pitch: the pixel distance between two adjacent grid rows.
+    pub const fn row_pitch(&self) -> f64 {
+        self.node_h + self.row_gap
+    }
+}
+
+impl Default for LayoutGeometry {
+    fn default() -> Self {
+        Self::CANONICAL
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 /// Deterministic auto-layout so every surface renders the same picture
 /// without a client-side layout engine.
@@ -145,6 +198,19 @@ pub struct GraphLayout {
     pub columns: u32,
     #[serde(default)]
     pub rows: u32,
+    #[serde(default)]
+    pub geometry: LayoutGeometry,
+}
+
+impl Default for GraphLayout {
+    fn default() -> Self {
+        Self {
+            positions: Vec::new(),
+            columns: 0,
+            rows: 0,
+            geometry: LayoutGeometry::CANONICAL,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

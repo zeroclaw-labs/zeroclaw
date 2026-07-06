@@ -1836,21 +1836,42 @@ const CARD_H: u16 = 5;
 const COL_GAP: u16 = 6;
 const ROW_GAP: u16 = 2;
 
+/// Project a persisted web-canvas pixel coordinate onto a terminal slot cell.
+/// `origin` and `web_pitch` come from the shared [`LayoutGeometry`] registry
+/// carried on the graph, so zerocode never hardcodes the web's pixel geometry.
+fn cell_from_web(coord: f64, origin: f64, web_pitch: f64, cell_pitch: u16) -> u16 {
+    if web_pitch <= 0.0 {
+        return 0;
+    }
+    let slots = ((coord - origin) / web_pitch).max(0.0);
+    (slots * f64::from(cell_pitch)).round().min(f64::from(u16::MAX)) as u16
+}
+
 fn layout_slots(
     layout: &GraphLayout,
     inner: Rect,
     pan_x: u16,
     pan_y: u16,
 ) -> std::collections::HashMap<u32, Rect> {
+    let geometry = layout.geometry;
+    let col_pitch = geometry.col_pitch();
+    let row_pitch = geometry.row_pitch();
     let mut slots = std::collections::HashMap::new();
     for p in &layout.positions {
-        let x = inner
-            .x
-            .saturating_add(p.col as u16 * (CARD_W + COL_GAP))
-            .saturating_sub(pan_x);
+        let (col_cells, row_cells) = match (p.x, p.y) {
+            (Some(px), Some(py)) => (
+                cell_from_web(px, geometry.origin, col_pitch, CARD_W + COL_GAP),
+                cell_from_web(py, geometry.origin, row_pitch, CARD_H + ROW_GAP),
+            ),
+            _ => (
+                p.col as u16 * (CARD_W + COL_GAP),
+                p.row as u16 * (CARD_H + ROW_GAP),
+            ),
+        };
+        let x = inner.x.saturating_add(col_cells).saturating_sub(pan_x);
         let y = inner
             .y
-            .saturating_add(p.row as u16 * (CARD_H + ROW_GAP))
+            .saturating_add(row_cells)
             .saturating_sub(pan_y);
         slots.insert(p.step, Rect::new(x, y, CARD_W, CARD_H));
     }
@@ -2051,8 +2072,79 @@ fn render_node_card(
 
 #[cfg(test)]
 mod tests {
-    use super::trigger_source_walk;
-    use crate::client::{BoundTriggerSourceView, TriggerSourceRegistryView};
+    use super::{
+        CARD_H, CARD_W, COL_GAP, ROW_GAP, layout_slots, trigger_source_walk,
+    };
+    use crate::client::{BoundTriggerSourceView, GraphLayout, TriggerSourceRegistryView};
+    use ratatui::layout::Rect;
+    use zeroclaw_sop_graph::NodePosition;
+
+    #[test]
+    fn honored_toml_coords_land_on_matching_slot() {
+        // A node dragged to web grid slot (col 2, row 1) persists TOML
+        // x = 24 + 2*340 = 704, y = 24 + 1*130 = 154. zerocode must place it
+        // on the same slot: col_cells = 2*(CARD_W+COL_GAP), row_cells =
+        // 1*(CARD_H+ROW_GAP), from an origin-cornered inner rect.
+        let layout = GraphLayout {
+            positions: vec![NodePosition {
+                step: 1,
+                col: 0,
+                row: 0,
+                x: Some(704.0),
+                y: Some(154.0),
+            }],
+            columns: 1,
+            rows: 1,
+            ..GraphLayout::default()
+        };
+        let inner = Rect::new(0, 0, 200, 60);
+        let slots = layout_slots(&layout, inner, 0, 0);
+        let rect = slots.get(&1).copied().expect("step 1 placed");
+        assert_eq!(rect.x, 2 * (CARD_W + COL_GAP));
+        assert_eq!(rect.y, CARD_H + ROW_GAP);
+    }
+
+    #[test]
+    fn absent_coords_fall_back_to_grid() {
+        let layout = GraphLayout {
+            positions: vec![NodePosition {
+                step: 1,
+                col: 3,
+                row: 2,
+                x: None,
+                y: None,
+            }],
+            columns: 4,
+            rows: 3,
+            ..GraphLayout::default()
+        };
+        let inner = Rect::new(0, 0, 200, 60);
+        let slots = layout_slots(&layout, inner, 0, 0);
+        let rect = slots.get(&1).copied().expect("step 1 placed");
+        assert_eq!(rect.x, 3 * (CARD_W + COL_GAP));
+        assert_eq!(rect.y, 2 * (CARD_H + ROW_GAP));
+    }
+
+    #[test]
+    fn below_origin_coords_clamp_to_first_slot() {
+        let layout = GraphLayout {
+            positions: vec![NodePosition {
+                step: 1,
+                col: 0,
+                row: 0,
+                x: Some(0.0),
+                y: Some(-48.0),
+            }],
+            columns: 1,
+            rows: 1,
+            ..GraphLayout::default()
+        };
+        let inner = Rect::new(0, 0, 200, 60);
+        let slots = layout_slots(&layout, inner, 0, 0);
+        let rect = slots.get(&1).copied().expect("step 1 placed");
+        assert_eq!(rect.x, 0);
+        assert_eq!(rect.y, 0);
+    }
 
     #[test]
     fn walk_uses_backend_sources_verbatim() {

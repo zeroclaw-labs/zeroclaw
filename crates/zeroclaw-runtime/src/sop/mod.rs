@@ -29,8 +29,8 @@ pub use binding::{
 pub use engine::{MaintenanceSummary, SopEngine};
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphNode, GraphPin, GraphSeverity, GraphWire,
-    NodeKind, NodePosition, NodeRunOverlay, NodeRunState, PinClass, RunOverlay, SopGraph,
-    SopGraphExt, TRIGGER_NODE_BASE, TextGraphFormat, ToolSpecs, render_graph_text,
+    LayoutGeometry, NodeKind, NodePosition, NodeRunOverlay, NodeRunState, PinClass, RunOverlay,
+    SopGraph, SopGraphExt, TRIGGER_NODE_BASE, TextGraphFormat, ToolSpecs, render_graph_text,
 };
 pub use metrics::SopMetricsCollector;
 pub use scope::StepToolScope;
