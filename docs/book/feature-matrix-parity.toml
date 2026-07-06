@@ -169,15 +169,68 @@ openclaw = "supported"
 hermes = "supported"
 
 # ── Provider slots ──────────────────────────────────────────────────────────
-# Both trees ship dedicated adapters for the named families; the `custom` slot
-# is a generic OpenAI-compatible passthrough, covered by OpenClaw's litellm
-# extension and Hermes' litellm-backed custom endpoint.
+# Source-walked from each upstream tree: OpenClaw extensions/ provider plugins
+# (litellm covers the custom passthrough), Hermes agent adapters + the
+# providers.md first-class list + hermes_cli model-setup provider branches. A
+# slot with no dedicated upstream module is `none`, not a guess.
 
 [providers.openai]
 openclaw = "supported"
 hermes = "supported"
 
+[providers.azure]
+openclaw = "supported"
+hermes = "none"
+
 [providers.anthropic]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.moonshot]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.qwen]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.glm]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.minimax]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.zai]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.doubao]
+openclaw = "none"
+hermes = "none"
+
+[providers.yi]
+openclaw = "none"
+hermes = "none"
+
+[providers.hunyuan]
+openclaw = "none"
+hermes = "none"
+
+[providers.qianfan]
+openclaw = "supported"
+hermes = "none"
+
+[providers.baichuan]
+openclaw = "none"
+hermes = "none"
+
+[providers.openrouter]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.ollama]
 openclaw = "supported"
 hermes = "supported"
 
@@ -185,13 +238,133 @@ hermes = "supported"
 openclaw = "supported"
 hermes = "supported"
 
+[providers.gemini_cli]
+openclaw = "none"
+hermes = "none"
+
+[providers.bedrock]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.telnyx]
+openclaw = "none"
+hermes = "none"
+
+[providers.together]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.fireworks]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.groq]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.mistral]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.deepseek]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.atomic_chat]
+openclaw = "none"
+hermes = "none"
+
+[providers.cohere]
+openclaw = "supported"
+hermes = "none"
+
+[providers.perplexity]
+openclaw = "supported"
+hermes = "none"
+
 [providers.xai]
 openclaw = "supported"
 hermes = "supported"
 
-[providers.openrouter]
+[providers.cerebras]
 openclaw = "supported"
 hermes = "supported"
+
+[providers.sambanova]
+openclaw = "none"
+hermes = "none"
+
+[providers.hyperbolic]
+openclaw = "none"
+hermes = "none"
+
+[providers.deepinfra]
+openclaw = "supported"
+hermes = "none"
+
+[providers.huggingface]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.ai21]
+openclaw = "none"
+hermes = "none"
+
+[providers.reka]
+openclaw = "none"
+hermes = "none"
+
+[providers.baseten]
+openclaw = "none"
+hermes = "none"
+
+[providers.nscale]
+openclaw = "none"
+hermes = "none"
+
+[providers.anyscale]
+openclaw = "none"
+hermes = "none"
+
+[providers.nebius]
+openclaw = "none"
+hermes = "none"
+
+[providers.friendli]
+openclaw = "none"
+hermes = "none"
+
+[providers.stepfun]
+openclaw = "supported"
+hermes = "supported"
+
+[providers.aihubmix]
+openclaw = "none"
+hermes = "none"
+
+[providers.siliconflow]
+openclaw = "none"
+hermes = "none"
+
+[providers.astrai]
+openclaw = "none"
+hermes = "none"
+
+[providers.avian]
+openclaw = "none"
+hermes = "none"
+
+[providers.deepmyst]
+openclaw = "none"
+hermes = "none"
+
+[providers.venice]
+openclaw = "supported"
+hermes = "none"
+
+[providers.nearai]
+openclaw = "none"
+hermes = "none"
 
 [providers.novita]
 openclaw = "supported"
@@ -201,37 +374,97 @@ hermes = "supported"
 openclaw = "supported"
 hermes = "supported"
 
-[providers.glm]
+[providers.vercel]
+openclaw = "supported"
+hermes = "none"
+
+[providers.cloudflare]
+openclaw = "supported"
+hermes = "none"
+
+[providers.ovh]
+openclaw = "none"
+hermes = "none"
+
+[providers.copilot]
 openclaw = "supported"
 hermes = "supported"
 
-[providers.moonshot]
+[providers.lmstudio]
 openclaw = "supported"
 hermes = "supported"
 
-[providers.minimax]
+[providers.llamacpp]
+openclaw = "supported"
+hermes = "none"
+
+[providers.sglang]
+openclaw = "supported"
+hermes = "none"
+
+[providers.vllm]
+openclaw = "supported"
+hermes = "none"
+
+[providers.osaurus]
+openclaw = "none"
+hermes = "none"
+
+[providers.litellm]
+openclaw = "supported"
+hermes = "none"
+
+[providers.lepton]
+openclaw = "none"
+hermes = "none"
+
+[providers.manifest]
+openclaw = "none"
+hermes = "none"
+
+[providers.morph]
+openclaw = "none"
+hermes = "none"
+
+[providers.github_models]
+openclaw = "none"
+hermes = "none"
+
+[providers.upstage]
+openclaw = "none"
+hermes = "none"
+
+[providers.featherless]
+openclaw = "none"
+hermes = "none"
+
+[providers.arcee]
 openclaw = "supported"
 hermes = "supported"
 
-[providers.mistral]
-openclaw = "supported"
-hermes = "supported"
+[providers.lambda_ai]
+openclaw = "none"
+hermes = "none"
 
-[providers.huggingface]
-openclaw = "supported"
-hermes = "supported"
+[providers.inception]
+openclaw = "none"
+hermes = "none"
 
-[providers.deepseek]
+[providers.synthetic]
 openclaw = "supported"
-hermes = "supported"
+hermes = "none"
 
-[providers.perplexity]
+[providers.opencode]
 openclaw = "supported"
-hermes = "supported"
+hermes = "none"
 
-[providers.ollama]
+[providers.kilocli]
 openclaw = "supported"
-hermes = "supported"
+hermes = "none"
+
+[providers.kilo]
+openclaw = "supported"
+hermes = "none"
 
 [providers.custom]
 openclaw = "supported"
