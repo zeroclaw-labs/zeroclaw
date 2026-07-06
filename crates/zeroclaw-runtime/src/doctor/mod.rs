@@ -217,11 +217,8 @@ fn codex_auth_wiring_items(codex_profile_present: bool, config: &Config) -> Vec<
 /// report from `run_structured`, mirroring `probe_models`.
 async fn check_codex_auth_wiring(config: &Config) -> Vec<DiagResult> {
     let auth = zeroclaw_providers::auth::AuthService::from_config(config);
-    let codex_profile_present = match auth.load_profiles().await {
-        Ok(data) => data
-            .profiles
-            .keys()
-            .any(|id| id.starts_with("openai-codex:")),
+    let codex_profile_present = match auth.list_profile_ids().await {
+        Ok(ids) => ids.iter().any(|id| id.starts_with("openai-codex:")),
         // Store unreadable: skip rather than emit a "no credentials" warning we
         // cannot substantiate.
         Err(_) => return Vec::new(),
