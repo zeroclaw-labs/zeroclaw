@@ -11,7 +11,8 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 /// Attribution surface for config load/migration emissions. Config loading
 /// runs before any entry-point attribution span exists, so the migration
 /// entry points open their own System-role span; every `record!` inside
-/// then carries role + alias instead of landing un-attributed.
+/// then carries `zc_role = system` and the queryable `system_alias = config`
+/// field instead of landing un-attributed.
 pub(crate) struct ConfigLoadAttribution;
 
 impl zeroclaw_api::attribution::Attributable for ConfigLoadAttribution {
