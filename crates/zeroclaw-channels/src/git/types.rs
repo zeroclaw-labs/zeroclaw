@@ -91,6 +91,44 @@ impl std::fmt::Display for IssueRef {
     }
 }
 
+/// A pull-request reference returned after opening or resolving a PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrRef {
+    pub repo: RepoRef,
+    pub number: u64,
+    /// Web URL for the PR, surfaced back to the caller/SOP for linking.
+    pub url: String,
+}
+
+impl std::fmt::Display for PrRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}#{}", self.repo, self.number)
+    }
+}
+
+/// Parameters for opening a pull request. `head`/`base` are branch names on
+/// the target `repo`; cross-fork heads use the `owner:branch` form the forge
+/// accepts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatePrParams {
+    pub title: String,
+    pub body: String,
+    pub head: String,
+    pub base: String,
+    pub draft: bool,
+}
+
+/// Parameters for updating an existing pull request. Each `Some` field is
+/// applied; `None` leaves the current value untouched. `draft = Some(false)`
+/// marks a draft ready for review; `close = true` closes/supersedes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdatePrParams {
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub draft: Option<bool>,
+    pub close: bool,
+}
+
 /// Errors raised by the git-forge channel and its providers.
 ///
 /// Variants are provider-neutral in shape; messages name the forge where

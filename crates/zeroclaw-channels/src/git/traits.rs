@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 
 use super::events::GitEvent;
 use super::poll::PollStream;
-use super::types::{GitChannelError, IssueRef, RepoRef};
+use super::types::{CreatePrParams, GitChannelError, IssueRef, PrRef, RepoRef, UpdatePrParams};
 
 /// The bot's own identity on the forge.
 pub struct SelfIdentity {
@@ -111,5 +111,20 @@ pub trait GitProvider: Send + Sync {
         &self,
         target: &ReactionTarget,
         emoji: &str,
+    ) -> Result<(), GitChannelError>;
+
+    /// Open a pull request on `repo`; returns the new PR's number and URL.
+    async fn create_pull_request(
+        &self,
+        repo: &RepoRef,
+        params: CreatePrParams,
+    ) -> Result<PrRef, GitChannelError>;
+
+    /// Update an existing pull request: mark a draft ready, edit the body with
+    /// fresh digests, or supersede/close. Each `None` field is left unchanged.
+    async fn update_pull_request(
+        &self,
+        pr: &PrRef,
+        params: UpdatePrParams,
     ) -> Result<(), GitChannelError>;
 }

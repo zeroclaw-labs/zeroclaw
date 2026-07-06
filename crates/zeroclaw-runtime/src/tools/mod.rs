@@ -76,6 +76,7 @@ pub use zeroclaw_tools::file_upload_bundle::FileUploadBundleTool;
 pub use zeroclaw_tools::file_write::FileWriteTool;
 pub use zeroclaw_tools::gemini_cli::GeminiCliTool;
 pub use zeroclaw_tools::git_operations::GitOperationsTool;
+pub use zeroclaw_tools::git_pr::GitPrTool;
 pub use zeroclaw_tools::glob_search::GlobSearchTool;
 pub use zeroclaw_tools::google_workspace::GoogleWorkspaceTool;
 pub use zeroclaw_tools::hardware_board_info::HardwareBoardInfoTool;
@@ -1269,6 +1270,11 @@ pub fn all_tools_with_runtime(
     let reaction_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
     let reaction_tool = ReactionTool::new(security.clone(), Arc::clone(&reaction_handle));
     tool_arcs.push(Arc::new(reaction_tool));
+
+    // Pull-request authoring tool — routes through the git channel via the
+    // same late-bound channel map as the reaction tool.
+    let git_pr_tool = GitPrTool::new(security.clone(), Arc::clone(&reaction_handle));
+    tool_arcs.push(Arc::new(git_pr_tool));
 
     // Channel room-management tool — always registered; owns its own late-bound channel map.
     let channel_room_handle: Option<PerToolChannelHandle> =

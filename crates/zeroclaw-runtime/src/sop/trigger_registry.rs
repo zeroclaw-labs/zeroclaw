@@ -274,15 +274,70 @@ fn condition_contract_for(source: crate::sop::types::SopTriggerSource) -> Option
                 ConditionValueType::Number,
             )],
         }),
-        SopTriggerSource::Mqtt | SopTriggerSource::Amqp | SopTriggerSource::Channel => {
-            Some(PayloadContract {
-                open: true,
-                direct: false,
-                fields: Vec::new(),
-            })
-        }
+        SopTriggerSource::Mqtt | SopTriggerSource::Amqp => Some(PayloadContract {
+            open: true,
+            direct: false,
+            fields: Vec::new(),
+        }),
+        // Channel conditions are resolved per `ChannelKind` in
+        // `channel_condition_fields`, since each channel surfaces its own
+        // enumerable prop set. The blanket source-level contract is unused for
+        // channels and returns nothing.
+        SopTriggerSource::Channel => None,
         // Webhook, Cron, and Manual triggers carry no condition field.
         SopTriggerSource::Webhook | SopTriggerSource::Cron | SopTriggerSource::Manual => None,
+    }
+}
+
+/// The git/forge event types a channel condition can match on `event_type`.
+/// Mirrors the forge channel's `KNOWN_EVENT_TYPES` wire contract; the forge
+/// channel test suite pins the producer side, and
+/// `forge_condition_fields_cover_known_event_types` pins this projection.
+const FORGE_EVENT_TYPES: &[&str] = &[
+    "issue_comment.created",
+    "issues.opened",
+    "pull_request.opened",
+    "pull_request.closed",
+    "pull_request.merged",
+    "pull_request_review_comment.created",
+    "workflow_run.completed",
+    "workflow_run.failed",
+    "release.published",
+];
+
+/// The enumerated prop set a channel surfaces for SOP trigger conditions,
+/// keyed off `ChannelKind`. Every inbound-capable channel returns a closed
+/// field list so the authoring surface always renders a walkable picker and
+/// never a free-text path box. The forge channel surfaces its event envelope;
+/// every conversational channel surfaces the `ChannelMessage` envelope.
+fn channel_condition_fields(kind: ChannelKind) -> PayloadContract {
+    let fields = match kind {
+        ChannelKind::Git => vec![
+            ConditionField::enumerated(
+                "event_type",
+                "Event type",
+                FORGE_EVENT_TYPES.iter().map(|s| (*s).to_string()).collect(),
+            ),
+            ConditionField::new("repo", "Repository", ConditionValueType::String),
+            ConditionField::new("number", "Issue/PR number", ConditionValueType::Number),
+            ConditionField::new("author.login", "Author", ConditionValueType::String),
+            ConditionField::new("title", "Title", ConditionValueType::String),
+            ConditionField::new("body", "Body", ConditionValueType::String),
+        ],
+        _ => vec![
+            ConditionField::new("sender", "Sender", ConditionValueType::String),
+            ConditionField::new("content", "Message text", ConditionValueType::String),
+            ConditionField::new(
+                "channel_alias",
+                "Channel instance",
+                ConditionValueType::String,
+            ),
+        ],
+    };
+    PayloadContract {
+        open: false,
+        direct: false,
+        fields,
     }
 }
 
@@ -321,7 +376,7 @@ pub fn build_registry(configured: &[ConfiguredChannel]) -> TriggerSourceRegistry
                 setup_path: setup_path_for(name),
                 channel: name.to_string(),
                 aliases,
-                condition: condition_contract_for(SopTriggerSource::Channel),
+                condition: Some(channel_condition_fields(kind)),
             }
         })
         .collect();
@@ -550,6 +605,41 @@ mod tests {
                 "channel {name} presence must match inbound_capable"
             );
         }
+    }
+
+    #[test]
+    fn every_channel_surfaces_enumerated_walkable_fields() {
+        // Anti-drift guard: no channel may fall back to a free-typed condition
+        // path. Every inbound channel must enumerate a closed field set so the
+        // authoring surface always renders a walkable picker.
+        let registry = build_registry(&[]);
+        for row in &registry.channels {
+            let contract = row.condition.as_ref().unwrap_or_else(|| {
+                panic!("channel {} must carry a condition contract", row.channel)
+            });
+            assert!(
+                !contract.open,
+                "channel {} must not use the open free-text contract",
+                row.channel
+            );
+            assert!(
+                !contract.fields.is_empty(),
+                "channel {} must enumerate at least one condition field",
+                row.channel
+            );
+        }
+    }
+
+    #[test]
+    fn forge_condition_fields_cover_known_event_types() {
+        let contract = channel_condition_fields(ChannelKind::Git);
+        let event_type = contract
+            .fields
+            .iter()
+            .find(|f| f.path == "event_type")
+            .expect("forge contract must expose event_type");
+        assert_eq!(event_type.value_type, ConditionValueType::Enum);
+        assert_eq!(event_type.options, FORGE_EVENT_TYPES);
     }
 
     #[test]

@@ -343,6 +343,43 @@ impl SendMessage {
     }
 }
 
+/// Request to open a pull request through a forge-backed channel. Channel-neutral
+/// so the `Channel` trait carries no forge-specific types; the git channel maps
+/// this onto its provider's create call.
+#[derive(Debug, Clone)]
+pub struct OpenPullRequest {
+    /// Target repository as `owner/repo`.
+    pub repo: String,
+    pub title: String,
+    pub body: String,
+    /// Source branch (or `owner:branch` for a cross-fork head).
+    pub head: String,
+    /// Target branch to merge into.
+    pub base: String,
+    pub draft: bool,
+}
+
+/// Request to update an existing pull request. Each `None` leaves the current
+/// value unchanged. `draft = Some(false)` marks a draft ready for review;
+/// `close = true` closes/supersedes the PR.
+#[derive(Debug, Clone, Default)]
+pub struct UpdatePullRequest {
+    /// Target repository as `owner/repo`.
+    pub repo: String,
+    pub number: u64,
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub draft: Option<bool>,
+    pub close: bool,
+}
+
+/// The outcome of opening a pull request: its number and web URL.
+#[derive(Debug, Clone)]
+pub struct PullRequestRef {
+    pub number: u64,
+    pub url: String,
+}
+
 /// Core channel trait — implement for any messaging platform.
 ///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
@@ -438,6 +475,26 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         let handle_norm = handle.trim_start_matches('@').to_ascii_lowercase();
         let sender_norm = msg.sender.trim_start_matches('@').to_ascii_lowercase();
         !handle_norm.is_empty() && handle_norm == sender_norm
+    }
+
+    /// Open a pull request through this channel's forge, when supported.
+    ///
+    /// Default is unsupported: only forge-backed channels (the git channel)
+    /// override this. Returns the new PR's number and URL on success.
+    async fn open_pull_request(&self, _request: OpenPullRequest) -> anyhow::Result<PullRequestRef> {
+        anyhow::bail!(
+            "channel '{}' does not support opening pull requests",
+            self.name()
+        )
+    }
+
+    /// Update an existing pull request through this channel's forge, when
+    /// supported. Default is unsupported.
+    async fn update_pull_request(&self, _request: UpdatePullRequest) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "channel '{}' does not support updating pull requests",
+            self.name()
+        )
     }
 
     /// Whether an inbound message is a direct, one-to-one conversation

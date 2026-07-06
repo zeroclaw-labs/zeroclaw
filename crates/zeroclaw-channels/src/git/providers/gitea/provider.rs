@@ -7,7 +7,9 @@ use super::api::GiteaApi;
 use super::mapping;
 use crate::git::poll::PollStream;
 use crate::git::traits::{FetchPage, GitProvider, ReactionTarget, SelfIdentity};
-use crate::git::types::{GitChannelError, IssueRef, RepoRef};
+use crate::git::types::{
+    CreatePrParams, GitChannelError, IssueRef, PrRef, RepoRef, UpdatePrParams,
+};
 
 pub struct GiteaProvider {
     api: GiteaApi,
@@ -231,6 +233,22 @@ impl GitProvider for GiteaProvider {
             }
         }
     }
+
+    async fn create_pull_request(
+        &self,
+        repo: &RepoRef,
+        params: CreatePrParams,
+    ) -> Result<PrRef, GitChannelError> {
+        self.api.create_pull(self.token()?, repo, &params).await
+    }
+
+    async fn update_pull_request(
+        &self,
+        pr: &PrRef,
+        params: UpdatePrParams,
+    ) -> Result<(), GitChannelError> {
+        self.api.update_pull(self.token()?, pr, &params).await
+    }
 }
 
 #[cfg(test)]
@@ -386,5 +404,116 @@ mod tests {
             Some(closed),
             "cursor must advance to the merge time, not created_at"
         );
+    }
+
+    #[tokio::test]
+    async fn gitea_create_pull_posts_and_returns_ref() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/repos/octo/repo/pulls"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "number": 42,
+                "html_url": "https://git.example.org/octo/repo/pulls/42",
+                "title": "Add feature"
+            })))
+            .mount(&server)
+            .await;
+        let provider = GiteaProvider::new(server.uri(), "t".into(), None);
+        let repo = RepoRef::parse("octo/repo").unwrap();
+        let pr = provider
+            .create_pull_request(
+                &repo,
+                CreatePrParams {
+                    title: "Add feature".into(),
+                    body: "Details".into(),
+                    head: "feat/x".into(),
+                    base: "main".into(),
+                    draft: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(pr.number, 42);
+        assert_eq!(pr.url, "https://git.example.org/octo/repo/pulls/42");
+    }
+
+    #[tokio::test]
+    async fn gitea_create_draft_pull_applies_wip_prefix() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/repos/octo/repo/pulls"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "number": 7,
+                "html_url": "https://git.example.org/octo/repo/pulls/7",
+                "title": "Add feature"
+            })))
+            .mount(&server)
+            .await;
+        // The draft prefix is applied via a follow-up PATCH on the new PR.
+        Mock::given(method("PATCH"))
+            .and(path("/repos/octo/repo/pulls/7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "number": 7,
+                "html_url": "https://git.example.org/octo/repo/pulls/7",
+                "title": "WIP: Add feature"
+            })))
+            .mount(&server)
+            .await;
+        let provider = GiteaProvider::new(server.uri(), "t".into(), None);
+        let repo = RepoRef::parse("octo/repo").unwrap();
+        let pr = provider
+            .create_pull_request(
+                &repo,
+                CreatePrParams {
+                    title: "Add feature".into(),
+                    body: String::new(),
+                    head: "feat/x".into(),
+                    base: "main".into(),
+                    draft: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(pr.number, 7);
+    }
+
+    #[tokio::test]
+    async fn gitea_update_pull_marks_ready_strips_wip() {
+        let server = MockServer::start().await;
+        // draft = Some(false) with no explicit title resolves the current title first.
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/repo/pulls/7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "number": 7,
+                "html_url": "https://git.example.org/octo/repo/pulls/7",
+                "title": "WIP: Add feature"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/octo/repo/pulls/7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "number": 7,
+                "html_url": "https://git.example.org/octo/repo/pulls/7",
+                "title": "Add feature"
+            })))
+            .mount(&server)
+            .await;
+        let provider = GiteaProvider::new(server.uri(), "t".into(), None);
+        let pr = PrRef {
+            repo: RepoRef::parse("octo/repo").unwrap(),
+            number: 7,
+            url: String::new(),
+        };
+        provider
+            .update_pull_request(
+                &pr,
+                UpdatePrParams {
+                    draft: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
     }
 }

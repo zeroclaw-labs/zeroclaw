@@ -17,7 +17,9 @@ use super::mapping;
 use super::payloads::InstallationId;
 use crate::git::poll::{PollStream, runs_cursor_candidate};
 use crate::git::traits::{FetchPage, GitProvider, ReactionTarget, SelfIdentity};
-use crate::git::types::{GitChannelError, IssueRef, RepoRef};
+use crate::git::types::{
+    CreatePrParams, GitChannelError, IssueRef, PrRef, RepoRef, UpdatePrParams,
+};
 
 pub struct GithubProvider {
     auth: AppAuth,
@@ -387,6 +389,24 @@ impl GitProvider for GithubProvider {
                 self.api.add_issue_reaction(&token, issue, content).await
             }
         }
+    }
+
+    async fn create_pull_request(
+        &self,
+        repo: &RepoRef,
+        params: CreatePrParams,
+    ) -> Result<PrRef, GitChannelError> {
+        let token = self.token().await?;
+        self.api.create_pull(&token, repo, &params).await
+    }
+
+    async fn update_pull_request(
+        &self,
+        pr: &PrRef,
+        params: UpdatePrParams,
+    ) -> Result<(), GitChannelError> {
+        let token = self.token().await?;
+        self.api.update_pull(&token, pr, &params).await
     }
 }
 

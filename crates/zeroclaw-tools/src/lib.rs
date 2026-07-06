@@ -35,6 +35,7 @@ pub mod file_upload_bundle;
 pub mod file_write;
 pub mod gemini_cli;
 pub mod git_operations;
+pub mod git_pr;
 pub mod glob_search;
 pub mod google_workspace;
 pub mod hardware_board_info;
