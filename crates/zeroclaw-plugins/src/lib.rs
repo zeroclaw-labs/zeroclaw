@@ -1,13 +1,23 @@
 //! WASM plugin system for ZeroClaw.
 //!
-//! Plugins are WebAssembly modules loaded via Extism that can extend
-//! ZeroClaw with custom tools and channels. Enable with `--features plugins-wasm`.
+//! Plugins are WebAssembly components loaded via wasmtime that can extend
+//! ZeroClaw with custom tools and channels. Enable with a `plugins-wasm*` feature.
 
+#[cfg(feature = "plugins-wasmtime")]
+pub mod component;
+#[cfg(feature = "plugins-wasmtime")]
+mod component_logging;
 pub mod error;
 pub mod host;
+pub mod registry;
+#[cfg(feature = "plugins-wasmtime")]
 pub mod runtime;
 pub mod signature;
+#[cfg(feature = "plugins-wasmtime")]
 pub mod wasm_channel;
+#[cfg(feature = "plugins-wasmtime")]
+pub mod wasm_memory;
+#[cfg(feature = "plugins-wasmtime")]
 pub mod wasm_tool;
 
 use serde::{Deserialize, Serialize};
@@ -69,8 +79,9 @@ pub enum PluginPermission {
     FileRead,
     /// Can write to the filesystem (within sandbox)
     FileWrite,
-    /// Can access environment variables
-    EnvRead,
+    /// Can read its own resolved per-plugin config section
+    #[serde(alias = "env_read")]
+    ConfigRead,
     /// Can read agent memory
     MemoryRead,
     /// Can write agent memory

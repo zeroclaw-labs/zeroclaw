@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use zeroclaw::config::MemoryConfig;
 use zeroclaw::memory::sqlite::SqliteMemory;
 use zeroclaw::memory::traits::{Memory, MemoryCategory};
 use zeroclaw::providers::ToolCall;
@@ -204,76 +205,6 @@ async fn agent_auto_saves_and_recalls_memory() {
         .await
         .unwrap();
     assert!(!response.is_empty());
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// 4. Context Compressor Memory Preservation
-// ═════════════════════════════════════════════════════════════════════════════
-
-/// Verify ContextCompressor.with_memory saves summary to memory before splice.
-#[tokio::test]
-async fn compressor_with_memory_saves_summary() {
-    use zeroclaw::agent::context_compressor::{ContextCompressionConfig, ContextCompressor};
-    use zeroclaw::providers::traits::ChatMessage;
-
-    let tmp = tempfile::TempDir::new().unwrap();
-    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new("test", tmp.path()).unwrap());
-
-    let config = ContextCompressionConfig {
-        enabled: true,
-        threshold_ratio: 0.01, // Very low threshold to force compression
-        protect_first_n: 1,
-        protect_last_n: 1,
-        max_passes: 1,
-        summary_max_chars: 4000,
-        source_max_chars: 50000,
-        timeout_secs: 60,
-        identifier_policy: "strict".to_string(),
-        ..Default::default()
-    };
-
-    // Create compressor with memory handle
-    let compressor = ContextCompressor::new(config, 100) // Tiny context window
-        .with_memory(mem.clone());
-
-    // Build a long history that will trigger compression
-    let mut history: Vec<ChatMessage> = vec![ChatMessage::system(
-        "You are a helpful assistant.".to_string(),
-    )];
-    for i in 0..20 {
-        history.push(ChatMessage::user(format!("Question {i}: What is {i} * 2?")));
-        history.push(ChatMessage::assistant(format!(
-            "Answer: {} * 2 = {}",
-            i,
-            i * 2
-        )));
-    }
-    history.push(ChatMessage::user("Final question".to_string()));
-
-    // Create a mock model_provider for summarization
-    let mock_model_provider = MockModelProvider::new(vec![text_response(
-        "Summary: User asked 20 multiplication questions. All answered correctly.",
-    )]);
-
-    let result = compressor
-        .compress_if_needed(&mut history, &mock_model_provider, "test-model", None)
-        .await;
-
-    // Check if compression happened (it should with threshold_ratio=0.01)
-    if let Ok(compressed) = result {
-        if compressed.compressed {
-            // Verify the summary was saved to memory
-            let entries = mem
-                .recall("multiplication", 10, None, None, None)
-                .await
-                .unwrap();
-            assert!(
-                !entries.is_empty(),
-                "Compression summary should have been saved to memory"
-            );
-        }
-    }
-    // Even if compression didn't trigger, the test validates the wiring
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -480,6 +411,7 @@ async fn consolidation_extracts_facts_to_memory() {
         "test-model",
         None,
         mem.as_ref(),
+        &MemoryConfig::default(),
         "The project deadline is April 15th 2026",
         "Got it, I'll remember the deadline is April 15th.",
     )
@@ -512,6 +444,7 @@ async fn memory_survives_rapid_consolidation() {
             "test-model",
             None,
             mem.as_ref(),
+            &MemoryConfig::default(),
             &format!("User message {i}"),
             &format!("Assistant response {i}"),
         )

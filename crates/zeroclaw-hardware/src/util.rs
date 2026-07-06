@@ -50,3 +50,57 @@ pub fn serial_open_baud(path: &str, configured_baud: u32) -> u32 {
         configured_baud
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allows_known_serial_path_prefixes() {
+        for path in [
+            "/dev/ttyACM0",
+            "/dev/ttyUSB1",
+            "/dev/tty.usbmodem14201",
+            "/dev/cu.usbmodem14201",
+            "/dev/tty.usbserial-0001",
+            "/dev/cu.usbserial-0001",
+            "COM3",
+        ] {
+            assert!(is_serial_path_allowed(path), "{path} should be allowed");
+        }
+        // The bare prefix is a prefix of itself.
+        assert!(is_serial_path_allowed("COM"));
+    }
+
+    #[test]
+    fn rejects_paths_outside_the_allowlist() {
+        for path in [
+            "/dev/sda",
+            "/dev/ttyS0",
+            "/etc/passwd",
+            "ttyACM0", // missing /dev/ prefix
+            "/dev/ttyXYZ",
+            "",
+        ] {
+            assert!(!is_serial_path_allowed(path), "{path} should be rejected");
+        }
+    }
+
+    #[test]
+    fn allowlist_hint_lists_every_prefix_with_a_glob() {
+        let hint = serial_path_allowlist_hint();
+        assert!(hint.contains("/dev/ttyACM*"));
+        assert!(hint.contains("/dev/ttyUSB*"));
+        assert!(hint.contains("COM*"));
+        assert!(hint.contains(", "));
+    }
+
+    #[test]
+    fn non_simulated_paths_open_exclusively_at_configured_baud() {
+        // Real device paths are never the dev-sim path, regardless of the
+        // `dev-sim` feature, so they open exclusively at the configured baud.
+        assert!(!should_open_serial_nonexclusive("/dev/ttyACM0"));
+        assert_eq!(serial_open_baud("/dev/ttyACM0", 115_200), 115_200);
+        assert_eq!(serial_open_baud("COM3", 9_600), 9_600);
+    }
+}

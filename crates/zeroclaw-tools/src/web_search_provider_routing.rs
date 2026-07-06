@@ -131,4 +131,27 @@ mod tests {
         assert_eq!(resolved2.canonical_provider, DEFAULT_WEB_SEARCH_PROVIDER);
         assert!(resolved2.used_fallback);
     }
+
+    #[test]
+    fn empty_and_default_route_to_duckduckgo_without_fallback() {
+        for alias in ["", "default"] {
+            let r = resolve_web_search_provider(alias);
+            assert_eq!(r.route, WebSearchProviderRoute::DuckDuckGo);
+            assert_eq!(r.canonical_provider, DEFAULT_WEB_SEARCH_PROVIDER);
+            // An explicit empty / "default" is the configured default, not an
+            // unknown-provider fallback (so it must not set used_fallback).
+            assert!(!r.used_fallback);
+        }
+    }
+
+    #[test]
+    fn resolution_trims_whitespace_and_ignores_case() {
+        let r = resolve_web_search_provider("  BRAVE  ");
+        assert_eq!(r.route, WebSearchProviderRoute::Brave);
+        assert!(!r.used_fallback);
+
+        let r = resolve_web_search_provider("Tavily-Search");
+        assert_eq!(r.route, WebSearchProviderRoute::Tavily);
+        assert!(!r.used_fallback);
+    }
 }

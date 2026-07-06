@@ -13,6 +13,13 @@ pub(crate) struct IterationToolSpecs {
     pub(crate) use_native_tools: bool,
 }
 
+impl IterationToolSpecs {
+    pub(crate) fn refresh_native_tool_mode(&mut self, model_provider: &dyn ModelProvider) {
+        self.use_native_tools =
+            model_provider.supports_native_tools() && !self.tool_specs.is_empty();
+    }
+}
+
 pub(crate) fn build_iteration_tool_specs(
     model_provider: &dyn ModelProvider,
     tools_registry: &[Box<dyn Tool>],
@@ -32,6 +39,7 @@ pub(crate) fn build_iteration_tool_specs(
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                     "activated-tool lock poisoned while assembling iteration tool specs; recovering guard for read"
                 );
@@ -97,6 +105,38 @@ mod tests {
 
         fn alias(&self) -> &str {
             "test-native-tools-provider"
+        }
+    }
+
+    struct PromptToolsProvider;
+
+    #[async_trait]
+    impl ModelProvider for PromptToolsProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: false,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            unreachable!("test provider should not execute chat")
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for PromptToolsProvider {
+        fn role(&self) -> Role {
+            Role::System
+        }
+
+        fn alias(&self) -> &str {
+            "test-prompt-tools-provider"
         }
     }
 
@@ -183,6 +223,22 @@ mod tests {
                 .iter()
                 .any(|spec| spec.name == "docker-mcp__extract_text"),
             "recovered poisoned lock should still expose activated tool specs"
+        );
+    }
+
+    #[test]
+    fn iteration_tool_specs_recomputes_native_mode_for_active_provider() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tool = Box::new(CountingTool::new("read_file", invocations));
+        let mut specs = build_iteration_tool_specs(&NativeToolsProvider, &[tool], &[], None)
+            .expect("native provider with tools should build specs");
+        assert!(specs.use_native_tools);
+
+        specs.refresh_native_tool_mode(&PromptToolsProvider);
+
+        assert!(
+            !specs.use_native_tools,
+            "active provider must decide whether this turn uses native tool transport"
         );
     }
 }
