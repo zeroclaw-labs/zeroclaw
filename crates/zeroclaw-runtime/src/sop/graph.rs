@@ -14,148 +14,14 @@ use super::types::{Sop, SopStep};
 
 pub type ToolSpecs = HashMap<String, ToolSpec>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum_macros::IntoStaticStr)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum PinClass {
-    /// Execution-order edge: which step runs after which.
-    Flow,
-    /// Typed data edge derived from a `{{steps.N}}` binding.
-    Data,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum_macros::IntoStaticStr)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-/// Why a flow wire exists. Mirrors the `StepRouting`/`StepFailure` field it
-/// was derived from, so an editor can write edits back to the right place.
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum FlowRole {
-    /// Implicit fallthrough or explicit `routing.next`.
-    Sequence,
-    /// `routing.depends_on` fan-in: source must complete before target runs.
-    Dependency,
-    /// `on_failure: goto` recovery edge.
-    Failure,
-    /// Named conditional port from `routing.switch`.
-    Switch,
-    /// Derived from the SOP's triggers; read-only, never hand-wired.
-    Trigger,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum NodeKind {
-    /// An executable SOP step.
-    Step,
-    /// A synthetic entry node representing one of the SOP's triggers.
-    Trigger,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-/// One connection point on a node. Flow pins order execution; data pins
-/// carry the step's declared input/output schema type.
-pub struct GraphPin {
-    pub class: PinClass,
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data_type: Option<String>,
-    pub required: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-/// A node in the projected graph: one SOP step, or one synthetic trigger
-/// entry (`step >= TRIGGER_NODE_BASE`, `trigger_index` set).
-pub struct GraphNode {
-    pub step: u32,
-    pub title: String,
-    #[serde(default = "node_kind_step")]
-    pub kind: NodeKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subtitle: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trigger_index: Option<u32>,
-    pub inputs: Vec<GraphPin>,
-    pub outputs: Vec<GraphPin>,
-}
-
-fn node_kind_step() -> NodeKind {
-    NodeKind::Step
-}
-
-/// Node-id offset for synthetic trigger nodes, keeping them disjoint from
-/// real step numbers. Trigger `i` gets node id `TRIGGER_NODE_BASE + i`.
-pub const TRIGGER_NODE_BASE: u32 = 1_000_000;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-/// A directed edge between two nodes. `flow_role` is set for flow wires;
-/// data wires carry the producer/consumer pin names instead.
-pub struct GraphWire {
-    pub class: PinClass,
-    pub from_step: u32,
-    pub to_step: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub flow_role: Option<FlowRole>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub from_pin: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub to_pin: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum_macros::IntoStaticStr)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum GraphSeverity {
-    Warning,
-    Error,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-/// A validation finding anchored to a step. Errors block saving
-/// (`validate_sop_strict`); warnings render but do not block.
-pub struct GraphDiagnostic {
-    pub severity: GraphSeverity,
-    pub step: u32,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-/// Grid placement for one node: column = longest flow path from an entry,
-/// row = order of insertion within that column.
-pub struct NodePosition {
-    pub step: u32,
-    pub col: u32,
-    pub row: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-/// Deterministic auto-layout so every surface renders the same picture
-/// without a client-side layout engine.
-pub struct GraphLayout {
-    pub positions: Vec<NodePosition>,
-    pub columns: u32,
-    pub rows: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-/// The full projected graph: nodes, wires, validation diagnostics, and a
-/// precomputed layout. Serialized as-is over RPC (`sops/graph`) and HTTP.
-pub struct SopGraph {
-    pub nodes: Vec<GraphNode>,
-    pub wires: Vec<GraphWire>,
-    pub diagnostics: Vec<GraphDiagnostic>,
-    pub layout: GraphLayout,
-}
+// Graph wire shape lives in the leaf crate `zeroclaw-sop-graph` so the
+// runtime projection, the gateway JSON Schema, and the zerocode TUI all read
+// one definition. Re-exported here so the projection logic below and every
+// downstream `crate::sop::graph::GraphPin` path keep working unchanged.
+pub use zeroclaw_sop_graph::{
+    FlowRole, GraphDiagnostic, GraphLayout, GraphNode, GraphPin, GraphSeverity, GraphWire,
+    NodeKind, NodePosition, NodeRunState, PinClass, SopGraph, TRIGGER_NODE_BASE,
+};
 
 /// Rendering style for `render_graph_text`.
 pub enum TextGraphFormat {
@@ -399,16 +265,30 @@ fn binding_matches_output(path: &str, pin_name: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('.'))
 }
 
-impl SopGraph {
+/// Projection constructors for the shared `SopGraph` type. `SopGraph` lives
+/// in `zeroclaw-sop-graph`, so the build logic that needs the runtime's
+/// `Sop`/`ToolSpec` hangs off this extension trait instead of an inherent
+/// impl. Call sites keep using `SopGraph::from_sop(..)` with the trait in
+/// scope.
+pub trait SopGraphExt {
     /// Project a SOP into a graph. Never fails: unresolvable references
     /// (missing steps, dangling switch ports, unsatisfied required inputs)
     /// become diagnostics instead of errors, so editors can render and fix
     /// broken drafts.
-    pub fn from_sop(sop: &Sop) -> Self {
+    fn from_sop(sop: &Sop) -> Self;
+
+    fn from_sop_with_specs(sop: &Sop, specs: &ToolSpecs) -> Self;
+
+    /// True when any diagnostic is an error. Errors block `validate_sop_strict`.
+    fn has_errors(&self) -> bool;
+}
+
+impl SopGraphExt for SopGraph {
+    fn from_sop(sop: &Sop) -> Self {
         Self::from_sop_with_specs(sop, &ToolSpecs::new())
     }
 
-    pub fn from_sop_with_specs(sop: &Sop, specs: &ToolSpecs) -> Self {
+    fn from_sop_with_specs(sop: &Sop, specs: &ToolSpecs) -> Self {
         let mut nodes: Vec<GraphNode> = sop.steps.iter().map(|s| node_for(s, specs)).collect();
         let valid_steps: std::collections::HashSet<u32> =
             sop.steps.iter().map(|s| s.number).collect();
@@ -555,11 +435,11 @@ impl SopGraph {
             }
         }
 
-        Self::binding_data_wires(sop, &nodes, &mut wires, &mut diagnostics);
+        binding_data_wires(sop, &nodes, &mut wires, &mut diagnostics);
 
-        let layout = Self::layout(&nodes, &wires);
+        let layout = layout_graph(&nodes, &wires);
 
-        Self {
+        SopGraph {
             nodes,
             wires,
             diagnostics,
@@ -567,201 +447,180 @@ impl SopGraph {
         }
     }
 
-    fn layout(nodes: &[GraphNode], wires: &[GraphWire]) -> GraphLayout {
-        use std::collections::HashMap;
-
-        let mut preds: HashMap<u32, Vec<u32>> = HashMap::new();
-        for node in nodes {
-            preds.entry(node.step).or_default();
-        }
-        for wire in wires.iter().filter(|w| w.class == PinClass::Flow) {
-            preds.entry(wire.to_step).or_default().push(wire.from_step);
-        }
-
-        let mut col: HashMap<u32, u32> = HashMap::new();
-        fn resolve(
-            step: u32,
-            preds: &std::collections::HashMap<u32, Vec<u32>>,
-            col: &mut std::collections::HashMap<u32, u32>,
-            seen: &mut std::collections::HashSet<u32>,
-        ) -> u32 {
-            if let Some(c) = col.get(&step) {
-                return *c;
-            }
-            if !seen.insert(step) {
-                return 0;
-            }
-            let parents = preds.get(&step).cloned().unwrap_or_default();
-            let c = parents
-                .iter()
-                .map(|p| resolve(*p, preds, col, seen) + 1)
-                .max()
-                .unwrap_or(0);
-            seen.remove(&step);
-            col.insert(step, c);
-            c
-        }
-
-        let mut ordered: Vec<u32> = nodes.iter().map(|n| n.step).collect();
-        ordered.sort_unstable();
-        for step in &ordered {
-            let mut seen = std::collections::HashSet::new();
-            resolve(*step, &preds, &mut col, &mut seen);
-        }
-
-        let mut row_by_col: HashMap<u32, u32> = HashMap::new();
-        let mut positions = Vec::with_capacity(nodes.len());
-        let mut columns = 0u32;
-        let mut rows = 0u32;
-        for step in &ordered {
-            let c = col.get(step).copied().unwrap_or(0);
-            let r = row_by_col.entry(c).or_insert(0);
-            positions.push(NodePosition {
-                step: *step,
-                col: c,
-                row: *r,
-            });
-            columns = columns.max(c + 1);
-            rows = rows.max(*r + 1);
-            *r += 1;
-        }
-
-        GraphLayout {
-            positions,
-            columns,
-            rows,
-        }
-    }
-
-    fn binding_data_wires(
-        sop: &Sop,
-        nodes: &[GraphNode],
-        wires: &mut Vec<GraphWire>,
-        diagnostics: &mut Vec<GraphDiagnostic>,
-    ) {
-        let node_by_step: HashMap<u32, &GraphNode> = nodes.iter().map(|n| (n.step, n)).collect();
-
-        for step in &sop.steps {
-            let consumer = node_by_step.get(&step.number);
-            for (call_idx, call) in step.calls.iter().enumerate() {
-                for (arg_path, extracted) in extract_bindings_with_paths(&call.args) {
-                    let binding = match extracted {
-                        ExtractedBinding::Valid(binding) => binding,
-                        ExtractedBinding::Malformed { raw, reason } => {
-                            diagnostics.push(GraphDiagnostic {
-                                severity: GraphSeverity::Error,
-                                step: step.number,
-                                message: format!("malformed binding `{raw}`: {reason}"),
-                            });
-                            continue;
-                        }
-                    };
-                    let BindingScope::Step(producer_step) = binding.scope else {
-                        continue;
-                    };
-                    let to_pin = if arg_path.is_empty() {
-                        format!("calls.{call_idx}")
-                    } else {
-                        format!("calls.{call_idx}.{arg_path}")
-                    };
-                    Self::wire_binding(
-                        &node_by_step,
-                        consumer.copied(),
-                        step.number,
-                        producer_step,
-                        &binding,
-                        &to_pin,
-                        wires,
-                        diagnostics,
-                    );
-                }
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn wire_binding(
-        node_by_step: &HashMap<u32, &GraphNode>,
-        consumer: Option<&GraphNode>,
-        consumer_step: u32,
-        producer_step: u32,
-        binding: &BindingRef,
-        to_pin: &str,
-        wires: &mut Vec<GraphWire>,
-        diagnostics: &mut Vec<GraphDiagnostic>,
-    ) {
-        let Some(producer) = node_by_step.get(&producer_step) else {
-            diagnostics.push(GraphDiagnostic {
-                severity: GraphSeverity::Error,
-                step: consumer_step,
-                message: format!("binding references step {producer_step} which does not exist"),
-            });
-            return;
-        };
-        let from_pin = producer
-            .outputs
-            .iter()
-            .filter(|p| p.class == PinClass::Data)
-            .find(|p| binding_matches_output(&binding.path, &p.name))
-            .or_else(|| {
-                producer
-                    .outputs
-                    .iter()
-                    .find(|p| p.class == PinClass::Data)
-            });
-        let (from_pin_name, from_type) = match from_pin {
-            Some(pin) => (pin.name.clone(), pin.data_type.as_deref()),
-            None => (format!("steps.{producer_step}"), None),
-        };
-        let to_type = consumer
-            .and_then(|c| c.inputs.iter().find(|p| p.name == to_pin))
-            .and_then(|p| p.data_type.as_deref());
-        if !types_compatible(from_type, to_type) {
-            diagnostics.push(GraphDiagnostic {
-                severity: GraphSeverity::Error,
-                step: consumer_step,
-                message: format!(
-                    "data type mismatch: step {} output `{}` ({}) does not satisfy input `{}` ({})",
-                    producer_step,
-                    from_pin_name,
-                    from_type.unwrap_or("any"),
-                    to_pin,
-                    to_type.unwrap_or("any"),
-                ),
-            });
-            return;
-        }
-        wires.push(GraphWire {
-            class: PinClass::Data,
-            from_step: producer_step,
-            to_step: consumer_step,
-            flow_role: None,
-            from_pin: Some(from_pin_name),
-            to_pin: Some(to_pin.to_string()),
-        });
-    }
-
-    /// True when any diagnostic is `Error` severity; such a graph fails
-    /// `validate_sop_strict` and cannot be saved.
-    pub fn has_errors(&self) -> bool {
+    fn has_errors(&self) -> bool {
         self.diagnostics
             .iter()
             .any(|d| d.severity == GraphSeverity::Error)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-/// Per-node execution state projected from a run's step results.
-#[serde(rename_all = "snake_case")]
-pub enum NodeRunState {
-    /// Not reached yet (or run ended before reaching it).
-    Pending,
-    /// The run's current step while the run is live.
-    Active,
-    Completed,
-    Failed,
-    Skipped,
+fn layout_graph(nodes: &[GraphNode], wires: &[GraphWire]) -> GraphLayout {
+    use std::collections::HashMap;
+
+    let mut preds: HashMap<u32, Vec<u32>> = HashMap::new();
+    for node in nodes {
+        preds.entry(node.step).or_default();
+    }
+    for wire in wires.iter().filter(|w| w.class == PinClass::Flow) {
+        preds.entry(wire.to_step).or_default().push(wire.from_step);
+    }
+
+    let mut col: HashMap<u32, u32> = HashMap::new();
+    fn resolve(
+        step: u32,
+        preds: &std::collections::HashMap<u32, Vec<u32>>,
+        col: &mut std::collections::HashMap<u32, u32>,
+        seen: &mut std::collections::HashSet<u32>,
+    ) -> u32 {
+        if let Some(c) = col.get(&step) {
+            return *c;
+        }
+        if !seen.insert(step) {
+            return 0;
+        }
+        let parents = preds.get(&step).cloned().unwrap_or_default();
+        let c = parents
+            .iter()
+            .map(|p| resolve(*p, preds, col, seen) + 1)
+            .max()
+            .unwrap_or(0);
+        seen.remove(&step);
+        col.insert(step, c);
+        c
+    }
+
+    let mut ordered: Vec<u32> = nodes.iter().map(|n| n.step).collect();
+    ordered.sort_unstable();
+    for step in &ordered {
+        let mut seen = std::collections::HashSet::new();
+        resolve(*step, &preds, &mut col, &mut seen);
+    }
+
+    let mut row_by_col: HashMap<u32, u32> = HashMap::new();
+    let mut positions = Vec::with_capacity(nodes.len());
+    let mut columns = 0u32;
+    let mut rows = 0u32;
+    for step in &ordered {
+        let c = col.get(step).copied().unwrap_or(0);
+        let r = row_by_col.entry(c).or_insert(0);
+        positions.push(NodePosition {
+            step: *step,
+            col: c,
+            row: *r,
+        });
+        columns = columns.max(c + 1);
+        rows = rows.max(*r + 1);
+        *r += 1;
+    }
+
+    GraphLayout {
+        positions,
+        columns,
+        rows,
+    }
+}
+
+fn binding_data_wires(
+    sop: &Sop,
+    nodes: &[GraphNode],
+    wires: &mut Vec<GraphWire>,
+    diagnostics: &mut Vec<GraphDiagnostic>,
+) {
+    let node_by_step: HashMap<u32, &GraphNode> = nodes.iter().map(|n| (n.step, n)).collect();
+
+    for step in &sop.steps {
+        let consumer = node_by_step.get(&step.number);
+        for (call_idx, call) in step.calls.iter().enumerate() {
+            for (arg_path, extracted) in extract_bindings_with_paths(&call.args) {
+                let binding = match extracted {
+                    ExtractedBinding::Valid(binding) => binding,
+                    ExtractedBinding::Malformed { raw, reason } => {
+                        diagnostics.push(GraphDiagnostic {
+                            severity: GraphSeverity::Error,
+                            step: step.number,
+                            message: format!("malformed binding `{raw}`: {reason}"),
+                        });
+                        continue;
+                    }
+                };
+                let BindingScope::Step(producer_step) = binding.scope else {
+                    continue;
+                };
+                let to_pin = if arg_path.is_empty() {
+                    format!("calls.{call_idx}")
+                } else {
+                    format!("calls.{call_idx}.{arg_path}")
+                };
+                wire_binding(
+                    &node_by_step,
+                    consumer.copied(),
+                    step.number,
+                    producer_step,
+                    &binding,
+                    &to_pin,
+                    wires,
+                    diagnostics,
+                );
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wire_binding(
+    node_by_step: &HashMap<u32, &GraphNode>,
+    consumer: Option<&GraphNode>,
+    consumer_step: u32,
+    producer_step: u32,
+    binding: &BindingRef,
+    to_pin: &str,
+    wires: &mut Vec<GraphWire>,
+    diagnostics: &mut Vec<GraphDiagnostic>,
+) {
+    let Some(producer) = node_by_step.get(&producer_step) else {
+        diagnostics.push(GraphDiagnostic {
+            severity: GraphSeverity::Error,
+            step: consumer_step,
+            message: format!("binding references step {producer_step} which does not exist"),
+        });
+        return;
+    };
+    let from_pin = producer
+        .outputs
+        .iter()
+        .filter(|p| p.class == PinClass::Data)
+        .find(|p| binding_matches_output(&binding.path, &p.name))
+        .or_else(|| producer.outputs.iter().find(|p| p.class == PinClass::Data));
+    let (from_pin_name, from_type) = match from_pin {
+        Some(pin) => (pin.name.clone(), pin.data_type.as_deref()),
+        None => (format!("steps.{producer_step}"), None),
+    };
+    let to_type = consumer
+        .and_then(|c| c.inputs.iter().find(|p| p.name == to_pin))
+        .and_then(|p| p.data_type.as_deref());
+    if !types_compatible(from_type, to_type) {
+        diagnostics.push(GraphDiagnostic {
+            severity: GraphSeverity::Error,
+            step: consumer_step,
+            message: format!(
+                "data type mismatch: step {} output `{}` ({}) does not satisfy input `{}` ({})",
+                producer_step,
+                from_pin_name,
+                from_type.unwrap_or("any"),
+                to_pin,
+                to_type.unwrap_or("any"),
+            ),
+        });
+        return;
+    }
+    wires.push(GraphWire {
+        class: PinClass::Data,
+        from_step: producer_step,
+        to_step: consumer_step,
+        flow_role: None,
+        from_pin: Some(from_pin_name),
+        to_pin: Some(to_pin.to_string()),
+    });
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1035,7 +894,11 @@ mod tests {
         let specs = ToolSpecs::from([
             (
                 "src".to_string(),
-                spec("src", serde_json::json!({"type": "object"}), Some(serde_json::json!({"type": "object"}))),
+                spec(
+                    "src",
+                    serde_json::json!({"type": "object"}),
+                    Some(serde_json::json!({"type": "object"})),
+                ),
             ),
             (
                 "sink".to_string(),
@@ -1068,12 +931,19 @@ mod tests {
         let mut producer = step(1, "a");
         producer.calls = vec![call("src", serde_json::json!({}))];
         let mut consumer = step(2, "b");
-        consumer.calls = vec![call("sink", serde_json::json!({"value": "{{steps.1.calls.0}}"}))];
+        consumer.calls = vec![call(
+            "sink",
+            serde_json::json!({"value": "{{steps.1.calls.0}}"}),
+        )];
 
         let specs = ToolSpecs::from([
             (
                 "src".to_string(),
-                spec("src", serde_json::json!({"type": "object"}), Some(serde_json::json!({"type": "string"}))),
+                spec(
+                    "src",
+                    serde_json::json!({"type": "object"}),
+                    Some(serde_json::json!({"type": "string"})),
+                ),
             ),
             (
                 "sink".to_string(),
@@ -1099,7 +969,10 @@ mod tests {
     #[test]
     fn binding_to_missing_step_is_error() {
         let mut consumer = step(1, "a");
-        consumer.calls = vec![call("sink", serde_json::json!({"value": "{{steps.9.calls.0}}"}))];
+        consumer.calls = vec![call(
+            "sink",
+            serde_json::json!({"value": "{{steps.9.calls.0}}"}),
+        )];
         let specs = ToolSpecs::from([(
             "sink".to_string(),
             spec("sink", serde_json::json!({"type": "object"}), None),

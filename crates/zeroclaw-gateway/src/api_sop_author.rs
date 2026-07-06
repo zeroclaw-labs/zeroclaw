@@ -13,6 +13,7 @@ use axum::response::{IntoResponse, Response};
 
 use super::AppState;
 use super::api::require_auth;
+use zeroclaw_runtime::sop::SopGraphExt;
 
 fn sops_dir_and_mode(
     state: &AppState,
@@ -291,8 +292,7 @@ pub async fn handle_sop_wire_draft(
         )
             .into_response();
     }
-    let graph =
-        zeroclaw_runtime::sop::SopGraph::from_sop_with_specs(&sop, &sop_tool_specs(&state));
+    let graph = zeroclaw_runtime::sop::SopGraph::from_sop_with_specs(&sop, &sop_tool_specs(&state));
     Json(serde_json::json!({ "sop": sop, "graph": graph })).into_response()
 }
 

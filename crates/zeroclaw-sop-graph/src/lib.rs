@@ -1,0 +1,242 @@
+//! Shared serde projection types for the SOP Blueprint graph. Single source
+//! of the graph wire shape: the runtime builds these, the gateway exports
+//! their JSON Schema, and the zerocode TUI deserializes them off RPC.
+
+use serde::{Deserialize, Serialize};
+
+/// Node-id offset for synthetic trigger nodes, keeping them disjoint from
+/// real step numbers. Trigger `i` gets node id `TRIGGER_NODE_BASE + i`.
+pub const TRIGGER_NODE_BASE: u32 = 1_000_000;
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum_macros::IntoStaticStr,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum PinClass {
+    /// Execution-order edge: which step runs after which.
+    Flow,
+    /// Typed data edge derived from a `{{steps.N}}` binding.
+    Data,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum_macros::IntoStaticStr,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// Why a flow wire exists. Mirrors the `StepRouting`/`StepFailure` field it
+/// was derived from, so an editor can write edits back to the right place.
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum FlowRole {
+    /// Implicit fallthrough or explicit `routing.next`.
+    Sequence,
+    /// `routing.depends_on` fan-in: source must complete before target runs.
+    Dependency,
+    /// `on_failure: goto` recovery edge.
+    Failure,
+    /// Named conditional port from `routing.switch`.
+    Switch,
+    /// Derived from the SOP's triggers; read-only, never hand-wired.
+    Trigger,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NodeKind {
+    /// An executable SOP step.
+    #[default]
+    Step,
+    /// A synthetic entry node representing one of the SOP's triggers.
+    Trigger,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// One connection point on a node. Flow pins order execution; data pins
+/// carry the step's declared input/output schema type.
+pub struct GraphPin {
+    pub class: PinClass,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_type: Option<String>,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// A node in the projected graph: one SOP step, or one synthetic trigger
+/// entry (`step >= TRIGGER_NODE_BASE`, `trigger_index` set).
+pub struct GraphNode {
+    pub step: u32,
+    pub title: String,
+    #[serde(default)]
+    pub kind: NodeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_index: Option<u32>,
+    pub inputs: Vec<GraphPin>,
+    pub outputs: Vec<GraphPin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// A directed edge between two nodes. `flow_role` is set for flow wires;
+/// data wires carry the producer/consumer pin names instead.
+pub struct GraphWire {
+    pub class: PinClass,
+    pub from_step: u32,
+    pub to_step: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_role: Option<FlowRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_pin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_pin: Option<String>,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum_macros::IntoStaticStr,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum GraphSeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// A validation finding anchored to a step. Errors block saving
+/// (`validate_sop_strict`); warnings render but do not block.
+pub struct GraphDiagnostic {
+    pub severity: GraphSeverity,
+    pub step: u32,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// Grid placement for one node: column = longest flow path from an entry,
+/// row = order of insertion within that column.
+pub struct NodePosition {
+    pub step: u32,
+    pub col: u32,
+    pub row: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// Deterministic auto-layout so every surface renders the same picture
+/// without a client-side layout engine.
+pub struct GraphLayout {
+    #[serde(default)]
+    pub positions: Vec<NodePosition>,
+    #[serde(default)]
+    pub columns: u32,
+    #[serde(default)]
+    pub rows: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// The full projected graph: nodes, wires, validation diagnostics, and a
+/// precomputed layout. Serialized as-is over RPC (`sops/graph`) and HTTP.
+pub struct SopGraph {
+    #[serde(default)]
+    pub nodes: Vec<GraphNode>,
+    #[serde(default)]
+    pub wires: Vec<GraphWire>,
+    #[serde(default)]
+    pub diagnostics: Vec<GraphDiagnostic>,
+    #[serde(default)]
+    pub layout: GraphLayout,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// Per-node execution state projected from a run's step results.
+#[serde(rename_all = "snake_case")]
+pub enum NodeRunState {
+    /// Not reached yet (or run ended before reaching it).
+    #[default]
+    Pending,
+    /// The run's current step while the run is live.
+    Active,
+    Completed,
+    Failed,
+    Skipped,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pins_and_wires_round_trip_through_the_snake_case_wire_shape() {
+        let node = GraphNode {
+            step: 1,
+            title: "publish".into(),
+            kind: NodeKind::Step,
+            subtitle: None,
+            trigger_index: None,
+            inputs: vec![GraphPin {
+                class: PinClass::Data,
+                name: "calls.0.body".into(),
+                data_type: Some("string".into()),
+                required: true,
+            }],
+            outputs: vec![GraphPin {
+                class: PinClass::Flow,
+                name: "out".into(),
+                data_type: None,
+                required: false,
+            }],
+        };
+        let wire = GraphWire {
+            class: PinClass::Data,
+            from_step: 1,
+            to_step: 2,
+            flow_role: None,
+            from_pin: Some("result".into()),
+            to_pin: Some("calls.0.body".into()),
+        };
+        let graph = SopGraph {
+            nodes: vec![node],
+            wires: vec![wire],
+            diagnostics: vec![GraphDiagnostic {
+                severity: GraphSeverity::Error,
+                step: 2,
+                message: "missing".into(),
+            }],
+            layout: GraphLayout::default(),
+        };
+
+        let json = serde_json::to_value(&graph).unwrap();
+        assert_eq!(json["nodes"][0]["inputs"][0]["class"], "data");
+        assert_eq!(json["nodes"][0]["outputs"][0]["class"], "flow");
+        assert!(json["nodes"][0]["outputs"][0].get("data_type").is_none());
+        assert_eq!(json["wires"][0]["class"], "data");
+        assert_eq!(json["diagnostics"][0]["severity"], "error");
+
+        let back: SopGraph = serde_json::from_value(json).unwrap();
+        assert_eq!(back, graph);
+    }
+
+    #[test]
+    fn flow_role_serializes_all_variants_snake_case() {
+        for (role, wire) in [
+            (FlowRole::Sequence, "sequence"),
+            (FlowRole::Dependency, "dependency"),
+            (FlowRole::Failure, "failure"),
+            (FlowRole::Switch, "switch"),
+            (FlowRole::Trigger, "trigger"),
+        ] {
+            assert_eq!(serde_json::to_value(role).unwrap(), wire);
+        }
+    }
+}

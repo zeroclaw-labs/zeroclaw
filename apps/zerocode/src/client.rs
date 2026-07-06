@@ -1989,130 +1989,13 @@ pub enum SopStepKind {
     Checkpoint,
 }
 
-// ── SOP wire view types ──────────────────────────────────────────
-//
-// Mirrors of the runtime's `sop::graph` / `sop::trigger_registry` wire
-// shapes, copied (not linked) per zerocode's RPC-only boundary. The pinned
-// pairing tests live in `sop_method_tests` here and in
-// `sop::graph::tests::graph_serializes_to_the_pinned_wire_shape` runtime-side;
-// if the daemon evolves the shape, fix both together.
+// SOP graph wire types are re-exported from `zeroclaw-sop-graph`; only the
+// trigger-registry view types below remain zerocode-local.
 
-/// Per-node execution state from a `sops/run-overlay` result.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeRunState {
-    #[default]
-    Pending,
-    Active,
-    Completed,
-    Failed,
-    Skipped,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PinClass {
-    Flow,
-    Data,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FlowRole {
-    Sequence,
-    Dependency,
-    Failure,
-    Switch,
-    Trigger,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeKind {
-    #[default]
-    Step,
-    Trigger,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct GraphPin {
-    pub class: PinClass,
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data_type: Option<String>,
-    pub required: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct GraphNode {
-    pub step: u32,
-    pub title: String,
-    #[serde(default)]
-    pub kind: NodeKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subtitle: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trigger_index: Option<u32>,
-    pub inputs: Vec<GraphPin>,
-    pub outputs: Vec<GraphPin>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct GraphWire {
-    pub class: PinClass,
-    pub from_step: u32,
-    pub to_step: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub flow_role: Option<FlowRole>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub from_pin: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub to_pin: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GraphSeverity {
-    Warning,
-    Error,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct GraphDiagnostic {
-    pub severity: GraphSeverity,
-    pub step: u32,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct NodePosition {
-    pub step: u32,
-    pub col: u32,
-    pub row: u32,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct GraphLayout {
-    #[serde(default)]
-    pub positions: Vec<NodePosition>,
-    #[serde(default)]
-    pub columns: u32,
-    #[serde(default)]
-    pub rows: u32,
-}
-
-/// Result shape of `sops/graph` and `sops/graph-draft`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct SopGraphView {
-    #[serde(default)]
-    pub nodes: Vec<GraphNode>,
-    #[serde(default)]
-    pub wires: Vec<GraphWire>,
-    #[serde(default)]
-    pub diagnostics: Vec<GraphDiagnostic>,
-    #[serde(default)]
-    pub layout: GraphLayout,
-}
+pub use zeroclaw_sop_graph::{
+    FlowRole, GraphLayout, GraphNode, GraphPin, GraphWire, NodeKind, NodeRunState, PinClass,
+    SopGraph as SopGraphView,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChannelAliasView {
@@ -2838,7 +2721,10 @@ mod sop_method_tests {
         assert_eq!(view.wires[0].flow_role, Some(FlowRole::Trigger));
         assert_eq!(view.wires[1].flow_role, Some(FlowRole::Switch));
         assert_eq!(view.wires[1].from_pin.as_deref(), Some("pr"));
-        assert_eq!(view.diagnostics[0].severity, GraphSeverity::Error);
+        assert_eq!(
+            view.diagnostics[0].severity,
+            zeroclaw_sop_graph::GraphSeverity::Error
+        );
         assert_eq!(view.layout.columns, 2);
     }
 
