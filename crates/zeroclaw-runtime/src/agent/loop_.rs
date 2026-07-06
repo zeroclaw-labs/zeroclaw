@@ -5987,6 +5987,7 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            agent: None,
         };
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
         engine.replace_sops_for_test(vec![sop]);
@@ -6127,6 +6128,7 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            agent: None,
         };
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig {
             step_scope_enforce: true,

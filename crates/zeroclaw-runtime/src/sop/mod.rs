@@ -343,6 +343,7 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
         cooldown_secs,
         max_concurrent,
         deterministic,
+        agent,
     } = manifest.sop;
 
     // When deterministic=true, override execution_mode to Deterministic
@@ -364,6 +365,7 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
         max_concurrent,
         location: Some(sop_dir.to_path_buf()),
         deterministic,
+        agent,
     })
 }
 
@@ -476,6 +478,9 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
                 current.on_failure = parse_step_failure(val);
             } else if let Some(val) = bullet.strip_prefix("mode:") {
                 current.mode = Some(parse_execution_mode(val));
+            } else if let Some(val) = bullet.strip_prefix("agent:") {
+                let trimmed_val = val.trim();
+                current.agent = (!trimmed_val.is_empty()).then(|| trimmed_val.to_string());
             } else if let Some(val) = bullet.strip_prefix("call:") {
                 if let Ok(call) = serde_json::from_str::<PlannedToolCall>(val.trim()) {
                     current.calls.push(call);
@@ -519,6 +524,7 @@ struct StepParseState {
     on_failure: StepFailure,
     mode: Option<SopExecutionMode>,
     calls: Vec<PlannedToolCall>,
+    agent: Option<String>,
 }
 
 impl StepParseState {
@@ -547,6 +553,7 @@ impl StepParseState {
             mode: self.mode.take(),
             calls: std::mem::take(&mut self.calls),
             pos: None,
+            agent: self.agent.take(),
         });
         *self = Self::default();
     }
@@ -732,6 +739,9 @@ fn render_step_bullets(step: &SopStep) -> Vec<String> {
     }
     if let Some(mode) = step.mode {
         bullets.push(format!("mode: {mode}"));
+    }
+    if let Some(agent) = &step.agent {
+        bullets.push(format!("agent: {agent}"));
     }
     for call in &step.calls {
         if let Ok(rendered) = serde_json::to_string(call) {
@@ -957,6 +967,7 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            agent: None,
         }
     }
 
@@ -1257,6 +1268,28 @@ mod tests {
         );
         assert_eq!(step.on_failure, StepFailure::Retry { max: 2 });
         assert_eq!(step.mode, Some(SopExecutionMode::Auto));
+    }
+
+    #[test]
+    fn step_agent_override_roundtrips_through_render_and_parse() {
+        let mut step = titled_step(1, "notify");
+        step.agent = Some("pr_bot".into());
+        let parsed = parse_steps(&render_steps(&[step.clone()]));
+        assert_eq!(parsed[0].agent.as_deref(), Some("pr_bot"));
+
+        let mut plain = titled_step(2, "wait");
+        plain.agent = None;
+        let parsed = parse_steps(&render_steps(&[plain]));
+        assert!(parsed[0].agent.is_none(), "no agent bullet when unset");
+    }
+
+    #[test]
+    fn effective_agent_prefers_step_override_then_parent() {
+        let mut step = titled_step(1, "s");
+        assert_eq!(step.effective_agent(Some("parent")), Some("parent"));
+        assert_eq!(step.effective_agent(None), None);
+        step.agent = Some("override".into());
+        assert_eq!(step.effective_agent(Some("parent")), Some("override"));
     }
 
     fn planned(tool: &str, args: serde_json::Value) -> PlannedToolCall {

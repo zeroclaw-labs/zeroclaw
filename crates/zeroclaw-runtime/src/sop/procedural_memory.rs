@@ -548,6 +548,7 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            agent: None,
         }
     }
 

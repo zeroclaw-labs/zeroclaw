@@ -1220,6 +1220,9 @@ impl SopEngine {
         run.waiting_since = None;
         let context = format_step_context(&sop, run, &step, &self.config);
 
+        let mut step = step;
+        step.agent = step.effective_agent(sop.agent.as_deref()).map(str::to_string);
+
         self.persist_active(run_id);
         Ok(SopRunAction::ExecuteStep {
             run_id: run_id.to_string(),
@@ -2187,6 +2190,10 @@ fn resolve_step_action(
     context: String,
     approval_mode: ApprovalMode,
 ) -> SopRunAction {
+    let mut step = step.clone();
+    step.agent = step.effective_agent(sop.agent.as_deref()).map(str::to_string);
+    let step = &step;
+
     // Steps with requires_confirmation always need approval
     if step.requires_confirmation {
         return SopRunAction::WaitApproval {
@@ -2463,6 +2470,7 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            agent: None,
         }
     }
 
@@ -4488,6 +4496,7 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: true,
+            agent: None,
         }
     }
 
@@ -4698,6 +4707,7 @@ type = "manual"
             max_concurrent: 1,
             location: None,
             deterministic: true,
+            agent: None,
         }
     }
 

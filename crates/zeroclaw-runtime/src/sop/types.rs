@@ -337,6 +337,11 @@ pub struct SopStep {
     /// editor. Absent until the node is moved; not surfaced in the step form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pos: Option<StepPos>,
+    /// Agent alias that runs this step. Overrides the SOP's parent agent when
+    /// set; unset inherits the parent. The named agent's own session, tools,
+    /// and model execute the step body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 impl Default for SopStep {
@@ -355,6 +360,7 @@ impl Default for SopStep {
             mode: None,
             calls: Vec::new(),
             pos: None,
+            agent: None,
         }
     }
 }
@@ -369,6 +375,12 @@ impl SopStep {
             }
         }
         scope
+    }
+
+    /// The agent alias that runs this step: the step's own override when set,
+    /// otherwise the SOP's parent agent.
+    pub fn effective_agent<'a>(&'a self, parent: Option<&'a str>) -> Option<&'a str> {
+        self.agent.as_deref().or(parent)
     }
 }
 
@@ -396,6 +408,12 @@ pub struct Sop {
     /// Steps execute sequentially without LLM round-trips.
     #[serde(default)]
     pub deterministic: bool,
+    /// Parent agent alias that owns this procedure. Every `execute` step runs
+    /// as this agent unless the step names its own `agent` override. Required
+    /// for headless triggers (mqtt, webhook, cron, amqp), which have no
+    /// ambient agent loop to borrow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 fn default_cooldown_secs() -> u64 {
@@ -447,6 +465,10 @@ pub struct SopMeta {
     /// Opt-in deterministic execution (no LLM round-trips between steps).
     #[serde(default)]
     pub deterministic: bool,
+    /// Parent agent alias that owns the procedure. Steps run as this agent
+    /// unless a step overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 impl SopManifest {
@@ -461,6 +483,7 @@ impl SopManifest {
                 cooldown_secs: sop.cooldown_secs,
                 max_concurrent: sop.max_concurrent,
                 deterministic: sop.deterministic,
+                agent: sop.agent.clone(),
             },
             triggers: sop.triggers.clone(),
             positions: sop
