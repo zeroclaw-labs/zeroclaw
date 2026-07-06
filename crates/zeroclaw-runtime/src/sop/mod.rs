@@ -40,8 +40,9 @@ pub use store::{
     SopRunStore, SqliteRunStore, StoreError, build_run_store,
 };
 pub use trigger_registry::{
-    BoundTriggerSource, ChannelAlias, ChannelTriggerKind, ConfiguredChannel, TriggerField,
-    TriggerFieldKind, TriggerSourceRegistry, build_registry, registry_from_config,
+    BoundTriggerSource, ChannelAlias, ChannelTriggerKind, ConditionField, ConditionValueType,
+    ConfiguredChannel, PayloadContract, TriggerField, TriggerFieldKind, TriggerSourceRegistry,
+    build_registry, registry_from_config,
 };
 pub use types::{
     DeterministicRunState, DeterministicSavings, FilesystemEventKind, PlannedToolCall, Sop,

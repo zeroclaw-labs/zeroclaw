@@ -193,6 +193,9 @@ pub enum SopTrigger {
         /// Calendar IDs to scope to; empty matches all of the source's calendars.
         #[serde(default)]
         calendar_ids: Vec<String>,
+        /// Optional expression evaluated against the calendar event payload.
+        #[serde(default)]
+        condition: Option<String>,
     },
     /// Inbound message on a configured agent-loop channel (telegram, discord,
     /// slack, ...). Live: delivered by the channel orchestrator when the
@@ -726,6 +729,7 @@ pub(crate) fn sample_trigger(source: SopTriggerSource) -> SopTrigger {
         SopTriggerSource::Calendar => SopTrigger::Calendar {
             calendar_source: "src".into(),
             calendar_ids: vec![],
+            condition: None,
         },
         SopTriggerSource::Channel => SopTrigger::Channel {
             channel: "telegram".into(),
@@ -771,6 +775,7 @@ mod tests {
         let calendar = SopTrigger::Calendar {
             calendar_source: "microsoft365".into(),
             calendar_ids: vec!["primary".into()],
+            condition: None,
         };
         assert_eq!(calendar.to_string(), "calendar:microsoft365");
 
@@ -861,6 +866,7 @@ mod tests {
         let trigger = SopTrigger::Calendar {
             calendar_source: "microsoft365".into(),
             calendar_ids: vec!["primary".into()],
+            condition: None,
         };
 
         let json = serde_json::to_string(&trigger).unwrap();
@@ -884,7 +890,7 @@ calendar_ids = ["primary", "team"]
         let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
 
         assert!(
-            matches!(trigger, SopTrigger::Calendar { ref calendar_source, ref calendar_ids }
+            matches!(trigger, SopTrigger::Calendar { ref calendar_source, ref calendar_ids, .. }
                 if calendar_source == "microsoft365"
                     && calendar_ids.as_slice() == ["primary", "team"])
         );

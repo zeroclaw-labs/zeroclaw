@@ -111,10 +111,12 @@ impl TriggerBehavior for Filesystem<'_> {
 struct Calendar<'a> {
     calendar_source: &'a str,
     calendar_ids: &'a [String],
+    condition: &'a Option<String>,
 }
 impl TriggerBehavior for Calendar<'_> {
     fn matches(&self, event: &SopEvent) -> bool {
         calendar_trigger_matches(self.calendar_source, self.calendar_ids, event)
+            && condition_holds(self.condition, event)
     }
 }
 
@@ -174,9 +176,11 @@ impl SopTrigger {
             Self::Calendar {
                 calendar_source,
                 calendar_ids,
+                condition,
             } => Box::new(Calendar {
                 calendar_source,
                 calendar_ids,
+                condition,
             }),
             Self::Channel {
                 channel,

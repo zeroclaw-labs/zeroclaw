@@ -28,6 +28,11 @@ pub struct ChannelTriggerKind {
     pub aliases: Vec<ChannelAlias>,
     pub configured: bool,
     pub setup_path: String,
+    /// Condition payload contract for a channel-message trigger. Channel
+    /// payloads are arbitrary, so this is the `open` contract; carried per row
+    /// so the builder reads one shape whether the source is bound or a channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<PayloadContract>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +102,78 @@ impl TriggerField {
 pub struct BoundTriggerSource {
     pub source: String,
     pub fields: Vec<TriggerField>,
+    /// The payload contract a `condition` on this source may reference. Absent
+    /// for sources whose triggers carry no condition (`cron`, `manual`,
+    /// `webhook`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<PayloadContract>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// Value-input widget hint for one condition field, so the authoring surface
+/// renders the right control (text box, number, checkbox, enum select) and
+/// quotes string comparands correctly.
+#[serde(rename_all = "snake_case")]
+pub enum ConditionValueType {
+    #[default]
+    String,
+    Number,
+    Bool,
+    /// One of a finite set carried in `ConditionField::options`.
+    Enum,
+    /// ISO-8601 instant; rendered as a datetime control, compared as a string.
+    DateTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// One field of a trigger payload a condition can reference. `path` is the
+/// JSON path suffix after `$.` (empty for a scalar payload compared directly),
+/// `label` is the human name, `value_type` drives the value control, and
+/// `options` carries the choices when `value_type` is `Enum`.
+pub struct ConditionField {
+    pub path: String,
+    pub label: String,
+    #[serde(default)]
+    pub value_type: ConditionValueType,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+/// The set of payload fields a condition may reference for a given source.
+/// `open` marks sources whose payload is arbitrary user JSON (MQTT, AMQP,
+/// webhook body, channel message): the surface offers a guided path/op/value
+/// builder plus a sample-payload probe rather than a fixed field list. `direct`
+/// marks a scalar payload (peripheral signal) compared with the bare `op value`
+/// form and no path.
+pub struct PayloadContract {
+    pub open: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub direct: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<ConditionField>,
+}
+
+impl ConditionField {
+    fn new(path: &str, label: &str, value_type: ConditionValueType) -> Self {
+        Self {
+            path: path.to_string(),
+            label: label.to_string(),
+            value_type,
+            options: Vec::new(),
+        }
+    }
+
+    fn enumerated(path: &str, label: &str, options: Vec<String>) -> Self {
+        Self {
+            value_type: ConditionValueType::Enum,
+            options,
+            ..Self::new(path, label, ConditionValueType::Enum)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +188,10 @@ pub struct TriggerSourceRegistry {
     pub sources: Vec<String>,
     pub bound: Vec<BoundTriggerSource>,
     pub channels: Vec<ChannelTriggerKind>,
+    /// The comparison operators every condition builder renders. Read from
+    /// [`crate::sop::condition::ConditionOp`], never hand-listed by a surface.
+    #[serde(default)]
+    pub operators: Vec<crate::sop::condition::ConditionOpSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,7 +227,66 @@ pub fn registry_from_config(config: &zeroclaw_config::schema::Config) -> Trigger
     build_registry(&configured)
 }
 
-/// Build the registry by walking the trigger-source and channel enums.
+/// The condition payload contract for one trigger source. This is the single
+/// authority for the fields a `condition` may reference per source; the parser,
+/// evaluator, and every authoring surface agree because they all read it.
+///
+/// Known-shape sources (filesystem, calendar) enumerate their fields; scalar
+/// sources (peripheral) mark `direct`; arbitrary-payload sources (mqtt, amqp,
+/// channel) mark `open`; sources whose trigger carries no condition return
+/// `None`.
+fn condition_contract_for(source: crate::sop::types::SopTriggerSource) -> Option<PayloadContract> {
+    use crate::sop::types::{FilesystemEventKind, SopTriggerSource};
+
+    match source {
+        SopTriggerSource::Filesystem => {
+            let kinds: Vec<String> = FilesystemEventKind::iter()
+                .map(|k| <&'static str>::from(k).to_string())
+                .collect();
+            Some(PayloadContract {
+                open: false,
+                direct: false,
+                fields: vec![
+                    ConditionField::enumerated("event", "Change kind", kinds),
+                    ConditionField::new("path", "Path", ConditionValueType::String),
+                ],
+            })
+        }
+        SopTriggerSource::Calendar => Some(PayloadContract {
+            open: false,
+            direct: false,
+            fields: vec![
+                ConditionField::new("event_id", "Event ID", ConditionValueType::String),
+                ConditionField::new("event_title", "Event title", ConditionValueType::String),
+                ConditionField::new(
+                    "expected_start",
+                    "Expected start",
+                    ConditionValueType::DateTime,
+                ),
+            ],
+        }),
+        SopTriggerSource::Peripheral => Some(PayloadContract {
+            open: false,
+            direct: true,
+            fields: vec![ConditionField::new(
+                "",
+                "Signal value",
+                ConditionValueType::Number,
+            )],
+        }),
+        SopTriggerSource::Mqtt
+        | SopTriggerSource::Amqp
+        | SopTriggerSource::Channel => Some(PayloadContract {
+            open: true,
+            direct: false,
+            fields: Vec::new(),
+        }),
+        // Webhook, Cron, and Manual triggers carry no condition field.
+        SopTriggerSource::Webhook | SopTriggerSource::Cron | SopTriggerSource::Manual => None,
+    }
+}
+
+
 /// Every `SopTriggerSource` except `Channel` becomes a bound source whose field
 /// specs come from the source's own `TriggerBehavior`; every inbound-capable
 /// `ChannelKind` becomes a channel row with whatever configured aliases match
@@ -160,6 +300,7 @@ pub fn build_registry(configured: &[ConfiguredChannel]) -> TriggerSourceRegistry
         .map(|source| BoundTriggerSource {
             source: source.to_string(),
             fields: source.field_specs(),
+            condition: condition_contract_for(source),
         })
         .collect();
 
@@ -181,6 +322,7 @@ pub fn build_registry(configured: &[ConfiguredChannel]) -> TriggerSourceRegistry
                 setup_path: setup_path_for(name),
                 channel: name.to_string(),
                 aliases,
+                condition: condition_contract_for(SopTriggerSource::Channel),
             }
         })
         .collect();
@@ -191,6 +333,7 @@ pub fn build_registry(configured: &[ConfiguredChannel]) -> TriggerSourceRegistry
         sources,
         bound,
         channels,
+        operators: crate::sop::condition::ConditionOp::catalog(),
     }
 }
 
@@ -362,6 +505,7 @@ mod tests {
                 &[
                     ("calendar_source", TriggerFieldKind::Text),
                     ("calendar_ids", TriggerFieldKind::List),
+                    ("condition", TriggerFieldKind::Expression),
                 ],
             ),
             (SopTriggerSource::Manual, &[]),
@@ -443,5 +587,67 @@ mod tests {
         assert!(!discord.configured);
         assert!(discord.aliases.is_empty());
         assert_eq!(discord.setup_path, "/config/channels/discord");
+    }
+
+    #[test]
+    fn condition_field_presence_matches_payload_contract() {
+        // A source exposes a `condition` config field iff it carries a payload
+        // contract. This is the anti-drift guard: add a `condition` field to a
+        // trigger variant and you must give it a contract, and vice-versa.
+        let registry = build_registry(&[]);
+        for bound in &registry.bound {
+            let has_condition_field = bound
+                .fields
+                .iter()
+                .any(|f| f.kind == TriggerFieldKind::Expression);
+            assert_eq!(
+                has_condition_field,
+                bound.condition.is_some(),
+                "source {} has condition field={has_condition_field} but contract={}; \
+                 the payload contract and the `condition` field must agree",
+                bound.source,
+                bound.condition.is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn known_shape_contracts_enumerate_fields() {
+        let registry = build_registry(&[]);
+        let fs = registry
+            .bound
+            .iter()
+            .find(|b| b.source == "filesystem")
+            .and_then(|b| b.condition.as_ref())
+            .expect("filesystem must carry a payload contract");
+        assert!(!fs.open, "filesystem payload is a known shape, not open");
+        assert!(fs.fields.iter().any(|f| f.path == "event"));
+        assert!(fs.fields.iter().any(|f| f.path == "path"));
+
+        let peripheral = registry
+            .bound
+            .iter()
+            .find(|b| b.source == "peripheral")
+            .and_then(|b| b.condition.as_ref())
+            .expect("peripheral must carry a payload contract");
+        assert!(peripheral.direct, "peripheral payload is a bare scalar");
+
+        let mqtt = registry
+            .bound
+            .iter()
+            .find(|b| b.source == "mqtt")
+            .and_then(|b| b.condition.as_ref())
+            .expect("mqtt must carry a payload contract");
+        assert!(mqtt.open, "mqtt payload is arbitrary user JSON");
+    }
+
+    #[test]
+    fn registry_carries_operator_catalog() {
+        let registry = build_registry(&[]);
+        assert_eq!(
+            registry.operators,
+            crate::sop::condition::ConditionOp::catalog(),
+            "registry must surface the operator catalog verbatim"
+        );
     }
 }

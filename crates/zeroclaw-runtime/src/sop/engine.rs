@@ -2794,6 +2794,7 @@ mod tests {
             triggers: vec![SopTrigger::Calendar {
                 calendar_source: "microsoft365".into(),
                 calendar_ids: Vec::new(),
+                condition: None,
             }],
             ..test_sop("calendar-sop", SopExecutionMode::Auto, SopPriority::Normal)
         };
@@ -2815,6 +2816,7 @@ mod tests {
             triggers: vec![SopTrigger::Calendar {
                 calendar_source: "microsoft365".into(),
                 calendar_ids: vec!["primary".into()],
+                condition: None,
             }],
             ..test_sop("calendar-sop", SopExecutionMode::Auto, SopPriority::Normal)
         };
@@ -2856,6 +2858,7 @@ mod tests {
             triggers: vec![SopTrigger::Calendar {
                 calendar_source: "microsoft365".into(),
                 calendar_ids: Vec::new(),
+                condition: None,
             }],
             ..test_sop("calendar-sop", SopExecutionMode::Auto, SopPriority::Normal)
         };

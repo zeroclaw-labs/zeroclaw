@@ -2012,6 +2012,8 @@ pub struct ChannelTriggerKindView {
     pub aliases: Vec<ChannelAliasView>,
     pub configured: bool,
     pub setup_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<PayloadContractView>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -2034,11 +2036,52 @@ pub struct TriggerFieldView {
     pub kind: TriggerFieldKindView,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditionValueTypeView {
+    #[default]
+    String,
+    Number,
+    Bool,
+    Enum,
+    DateTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConditionFieldView {
+    pub path: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub value_type: ConditionValueTypeView,
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PayloadContractView {
+    #[serde(default)]
+    pub open: bool,
+    #[serde(default)]
+    pub direct: bool,
+    #[serde(default)]
+    pub fields: Vec<ConditionFieldView>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConditionOpSpecView {
+    pub token: String,
+    #[serde(default)]
+    pub label: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BoundTriggerSourceView {
     pub source: String,
     #[serde(default)]
     pub fields: Vec<TriggerFieldView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<PayloadContractView>,
 }
 
 /// Result shape of `sops/trigger-sources`.
@@ -2050,6 +2093,8 @@ pub struct TriggerSourceRegistryView {
     pub bound: Vec<BoundTriggerSourceView>,
     #[serde(default)]
     pub channels: Vec<ChannelTriggerKindView>,
+    #[serde(default)]
+    pub operators: Vec<ConditionOpSpecView>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
