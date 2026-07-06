@@ -17,12 +17,14 @@ import {
   createSkill,
   deleteSkill,
   listSkillsInBundle,
+  listSlashOptionKinds,
   readSkill,
   writeSkill,
   type SkillEntry,
   type SkillFrontmatter,
   type SkillSlashChoice,
   type SkillSlashOption,
+  type SlashOptionKindDescriptor,
 } from '../../lib/api';
 
 interface Props {
@@ -588,23 +590,13 @@ function Field({ label, value, onChange, placeholder }: FieldProps) {
 }
 
 // The typed slash-option model (zeroclaw-labs/zeroclaw#8021), shaped after
-// Discord's application command option types. `choices` apply to
-// string/integer/number; `min`/`max` to integer/number; `min_length`/
-// `max_length` to string. The Discord layer drops bounds/choices that don't
-// match the type and sorts required options first, so the editor only needs to
-// gate which inputs are *offered* per type; it does not have to enforce order.
-const SLASH_OPTION_TYPES = [
-  'string',
-  'integer',
-  'number',
-  'boolean',
-  'user',
-  'channel',
-  'role',
-  'mentionable',
-] as const;
-const CHOICEABLE_TYPES = new Set<string>(['string', 'integer', 'number']);
-const NUMERIC_TYPES = new Set<string>(['integer', 'number']);
+// Discord's application command option types. The kind list and which
+// constraints each kind carries (choices / numeric bounds / length bounds) are
+// NOT restated here: the editor fetches the backend registry
+// (`listSlashOptionKinds`, built by walking the backend `SlashOptionKind` enum)
+// and walks it. The Discord layer drops bounds/choices that don't match the
+// type and sorts required options first, so the editor only gates which inputs
+// are *offered* per kind; it does not enforce order.
 
 interface SlashOptionsEditorProps {
   options: SkillSlashOption[];
@@ -618,6 +610,21 @@ interface SlashOptionsEditorProps {
  * SkillFrontmatter::slash_options). Only rendered when the `slash` tag is on.
  */
 function SlashOptionsEditor({ options, onChange }: SlashOptionsEditorProps) {
+  const [kinds, setKinds] = useState<SlashOptionKindDescriptor[]>([]);
+  useEffect(() => {
+    let live = true;
+    listSlashOptionKinds()
+      .then((r) => {
+        if (live) setKinds(r.kinds);
+      })
+      .catch(() => {
+        if (live) setKinds([]);
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+
   const update = (i: number, patch: Partial<SkillSlashOption>) =>
     onChange(options.map((o, idx) => (idx === i ? { ...o, ...patch } : o)));
   const remove = (i: number) => onChange(options.filter((_, idx) => idx !== i));
@@ -632,11 +639,14 @@ function SlashOptionsEditor({ options, onChange }: SlashOptionsEditorProps) {
     next[j] = a;
     onChange(next);
   };
-  const add = () =>
+  const add = () => {
+    const first = kinds[0]?.manifest_name;
+    if (first === undefined) return;
     onChange([
       ...options,
-      { name: '', description: '', type: 'string', required: false },
+      { name: '', description: '', type: first, required: false },
     ]);
+  };
 
   return (
     <div
@@ -656,7 +666,8 @@ function SlashOptionsEditor({ options, onChange }: SlashOptionsEditorProps) {
         <button
           type="button"
           onClick={add}
-          className="btn-secondary text-xs whitespace-nowrap"
+          disabled={kinds.length === 0}
+          className="btn-secondary text-xs whitespace-nowrap disabled:opacity-40"
         >
           + Add option
         </button>
@@ -674,6 +685,7 @@ function SlashOptionsEditor({ options, onChange }: SlashOptionsEditorProps) {
               option={opt}
               index={i}
               count={options.length}
+              kinds={kinds}
               onChange={(patch) => update(i, patch)}
               onRemove={() => remove(i)}
               onMove={(dir) => move(i, dir)}
@@ -689,6 +701,7 @@ interface SlashOptionCardProps {
   option: SkillSlashOption;
   index: number;
   count: number;
+  kinds: SlashOptionKindDescriptor[];
   onChange: (patch: Partial<SkillSlashOption>) => void;
   onRemove: () => void;
   onMove: (dir: -1 | 1) => void;
@@ -698,27 +711,31 @@ function SlashOptionCard({
   option,
   index,
   count,
+  kinds,
   onChange,
   onRemove,
   onMove,
 }: SlashOptionCardProps) {
-  const isNumeric = NUMERIC_TYPES.has(option.type);
-  const isString = option.type === 'string';
-  const hasChoices = CHOICEABLE_TYPES.has(option.type);
+  const kind = kinds.find((k) => k.manifest_name === option.type);
+  const isNumeric = kind?.supports_numeric_bounds ?? false;
+  const isString = kind?.supports_length_bounds ?? false;
+  const hasChoices = kind?.supports_choices ?? false;
 
-  // Switching to a type that no longer supports a constraint clears it, so the
+  // Switching to a kind that no longer supports a constraint clears it, so the
   // saved frontmatter never carries a bound the channel would silently drop.
+  // The capability flags come from the registry, not a hardcoded per-type map.
   const onType = (type: string) => {
+    const next = kinds.find((k) => k.manifest_name === type);
     const patch: Partial<SkillSlashOption> = { type };
-    if (!NUMERIC_TYPES.has(type)) {
+    if (!(next?.supports_numeric_bounds ?? false)) {
       patch.min = null;
       patch.max = null;
     }
-    if (type !== 'string') {
+    if (!(next?.supports_length_bounds ?? false)) {
       patch.min_length = null;
       patch.max_length = null;
     }
-    if (!CHOICEABLE_TYPES.has(type)) patch.choices = [];
+    if (!(next?.supports_choices ?? false)) patch.choices = [];
     onChange(patch);
   };
 
@@ -753,9 +770,13 @@ function SlashOptionCard({
             className="rounded-md border bg-transparent px-2 py-1 text-sm"
             style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text)' }}
           >
-            {SLASH_OPTION_TYPES.map((tp) => (
-              <option key={tp} value={tp} style={{ color: '#000', background: '#fff' }}>
-                {tp}
+            {kinds.map((k) => (
+              <option
+                key={k.manifest_name}
+                value={k.manifest_name}
+                style={{ color: '#000', background: '#fff' }}
+              >
+                {k.manifest_name}
               </option>
             ))}
           </select>
