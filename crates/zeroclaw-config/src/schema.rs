@@ -861,6 +861,20 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_assistant_reasoning: Option<bool>,
+    /// Pull live token prices for this provider's models from its own
+    /// OpenAI-compatible `/models` listing (the gateway is the source of truth
+    /// for its prices), filling cost-tracking rates for models the operator
+    /// has NOT priced under `[cost.rates]` / `pricing`. Models the gateway does
+    /// not price (or providers with no HTTP `/models` listing at all, such as
+    /// a subprocess gateway like `kilocli`) fall back to the public models.dev
+    /// catalog. Configured rates always win; live prices only fill gaps. A
+    /// background task refreshes the price snapshot hourly; the cost-recording
+    /// path reads the cached snapshot and never blocks on the network. Default
+    /// `false`: off means no fetching and behavior identical to a build
+    /// without the feature.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub live_pricing: bool,
     /// Override the provider's default for native tool calling.
     /// `None` (default) honors the provider's built-in choice. `Some(true)`
     /// forces native tool calls on, `Some(false)` forces text-fallback.
@@ -15061,6 +15075,12 @@ pub struct LineConfig {
     #[serde(default)]
     pub proxy_url: Option<String>,
 
+    /// Display name shown as the sender in LINE chat bubbles.
+    /// Defaults to `"AI"` when unset or empty.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub sender_name: Option<String>,
+
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
     #[tab(Behavior)]
@@ -27289,6 +27309,7 @@ dm_policy = "pairing"
 group_policy = "mention"
 allowed_users = []
 webhook_port = 8443
+sender_name = "Popcorn"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         let ln = config.channels.line.get("default").unwrap();
@@ -27298,6 +27319,7 @@ webhook_port = 8443
         assert_eq!(ln.group_policy, LineGroupPolicy::Mention);
         assert_eq!(ln.webhook_port, 8443);
         assert!(ln.proxy_url.is_none());
+        assert_eq!(ln.sender_name.as_deref(), Some("Popcorn"));
     }
 
     #[test]
@@ -27323,6 +27345,7 @@ channel_secret = "sec"
         );
         assert_eq!(ln.webhook_port, 8443, "webhook_port default is 8443");
         assert!(ln.proxy_url.is_none());
+        assert!(ln.sender_name.is_none(), "sender_name default is None");
     }
 
     #[test]

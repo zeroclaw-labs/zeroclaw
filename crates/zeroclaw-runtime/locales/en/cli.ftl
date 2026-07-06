@@ -401,6 +401,9 @@ channel-discord-delivery-failure-note-one = (note: I couldn't deliver {$count} f
 channel-discord-delivery-failure-note-many = (note: I couldn't deliver {$count} files.)
 channel-whatsapp-web-delivery-failure-note-one = (note: I could not deliver {$count} WhatsApp media attachment.)
 channel-whatsapp-web-delivery-failure-note-many = (note: I could not deliver {$count} WhatsApp media attachments.)
+channel-line-bind-success = ✅ Paired! You can now chat.
+channel-line-bind-invalid-code = ❌ Invalid code. Please try again.
+channel-line-bind-rate-limited = ⏳ Too many attempts. Retry in { $secs }s.
 
 # Onboarding — OpenAI auth picker
 onboard-openai-auth-note =
