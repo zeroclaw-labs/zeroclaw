@@ -649,13 +649,6 @@ pub async fn run(
                     continue;
                 }
 
-                // `?` and bare `F1` open help unless the pane is in text-input
-                // mode. The reserved modified help chord (`Ctrl+F1`, kept
-                // literal on macOS where bare `F1` is host-reserved for
-                // brightness) opens help even while the editor owns input, so
-                // Help stays reachable from the text field on every platform.
-                // The bypass is resolved from the keymap registry so an
-                // override to the Help binding carries through.
                 let help_bypasses_text_input = crate::keymap::help_bypasses_text_input(&key);
                 if global == Some(GlobalAction::Help)
                     && (!in_text_input || help_bypasses_text_input)

@@ -96,7 +96,6 @@ impl HelpNode {
         }
     }
 
-    /// Leaf node with a dim section header and entries.
     pub fn titled(title: impl Into<String>, entries: Vec<HelpEntry>) -> Self {
         Self {
             title: Some(title.into()),
