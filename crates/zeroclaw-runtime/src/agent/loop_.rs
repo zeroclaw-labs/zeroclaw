@@ -2647,7 +2647,9 @@ pub async fn run(
                                 // (#5808).
                                 let system_floor =
                                     crate::agent::history::estimate_system_floor_tokens(&history);
-                                let floor_exceeds_budget = system_floor >= eff_max_context_tokens;
+                                let context_token_budget =
+                                    agent.resolved.effective_context_budget();
+                                let floor_exceeds_budget = system_floor >= context_token_budget;
                                 {
                                     let __zc_trim_span = ::zeroclaw_log::info_span!(
                                         target: "zeroclaw_log_internal_scope",
@@ -2667,12 +2669,12 @@ pub async fn run(
                                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                                             .with_attrs(::serde_json::json!({
                                                 "system_floor": system_floor,
-                                                "budget": eff_max_context_tokens,
+                                                "budget": context_token_budget,
                                                 "error_key": "context_floor_exceeds_budget",
                                             })),
                                             crate::agent::history::context_floor_remediation(
                                                 system_floor,
-                                                eff_max_context_tokens,
+                                                context_token_budget,
                                             )
                                         );
                                     } else {
@@ -2694,7 +2696,7 @@ pub async fn run(
                                         "\nError: {e}\n{}\n",
                                         crate::agent::history::context_floor_remediation(
                                             system_floor,
-                                            eff_max_context_tokens,
+                                            context_token_budget,
                                         )
                                     );
                                     break String::new();
