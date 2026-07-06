@@ -2864,7 +2864,9 @@ fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled(format!(" {title} "), theme::title_style()));
+        .border_style(theme::dim_style())
+        .title(Span::styled(format!(" {title} "), theme::title_style()))
+        .style(theme::fill_style());
     let inner = block.inner(area);
     f.render_widget(Clear, area);
     f.render_widget(block, area);
@@ -2893,7 +2895,7 @@ fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
             let head_style = if selected {
                 theme::title_style()
             } else {
-                Style::default()
+                theme::body_style()
             };
             let preview = first_line_preview(&msg.text, inner.width.saturating_sub(4) as usize);
             let tag = if msg.status == QueueItemStatus::Injected {
@@ -2945,7 +2947,9 @@ fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
     // width hard-truncates. Wrapping made long messages spill onto extra rows
     // and pushed the queue out of alignment; the preview is already clipped to
     // the inner width above, and ratatui truncates anything still too wide.
-    let para = Paragraph::new(rows).scroll((scroll, 0));
+    let para = Paragraph::new(rows)
+        .style(theme::fill_style())
+        .scroll((scroll, 0));
     f.render_widget(para, inner);
 }
 
@@ -3640,7 +3644,8 @@ fn render_session_list_overlay(
             " Sessions (Enter=switch, Esc=close) ",
             theme::overlay_border_style(),
         ))
-        .style(theme::overlay_border_style());
+        .border_style(theme::overlay_border_style())
+        .style(theme::fill_style());
 
     let inner = block.inner(overlay_area);
     f.render_widget(block, overlay_area);
@@ -6597,6 +6602,109 @@ mod tests {
             cell.style().bg,
             Some(expected_bg),
             "approval overlay interior must use the active ZeroCode theme background"
+        );
+    }
+
+    #[test]
+    fn queue_sidebar_uses_theme_background_after_clear() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let expected_bg = theme::background();
+        assert_ne!(
+            expected_bg,
+            ratatui::style::Color::Reset,
+            "default ZeroCode theme should provide a concrete sidebar background"
+        );
+
+        let mut s = state();
+        s.enqueue_message("what's happening".to_string(), Vec::new())
+            .expect("queue message");
+        s.enqueue_message("second queued message".to_string(), Vec::new())
+            .expect("queue message");
+        s.ensure_queue_selection();
+
+        let area = Rect::new(0, 0, 36, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_queue_sidebar(frame, &mut s, area);
+            })
+            .expect("draw queue sidebar");
+
+        let cell = &terminal.backend().buffer()[(4, 6)];
+        assert_eq!(
+            cell.style().bg,
+            Some(expected_bg),
+            "queue sidebar interior must use the active ZeroCode theme background"
+        );
+
+        let unselected_text_cell = &terminal.backend().buffer()[(6, 2)];
+        assert_eq!(
+            unselected_text_cell.style().fg,
+            Some(theme::active().body),
+            "unselected queue text must use the active ZeroCode body foreground"
+        );
+        assert_eq!(
+            unselected_text_cell.style().bg,
+            Some(expected_bg),
+            "unselected queue text must keep the themed fill background"
+        );
+    }
+
+    #[test]
+    fn session_list_overlay_uses_theme_background_after_clear() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let expected_bg = theme::background();
+        assert_ne!(
+            expected_bg,
+            ratatui::style::Color::Reset,
+            "default ZeroCode theme should provide a concrete modal background"
+        );
+
+        let sessions = vec![SessionEntry {
+            session_id: "session-1".to_string(),
+            session_key: "session-1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_activity: "2026-01-01T00:00:00Z".to_string(),
+            agent_alias: Some("agent".to_string()),
+            channel_id: None,
+            name: Some("first prompt".to_string()),
+            message_count: 1,
+        }];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 100, 30);
+        let overlay_area = session_list_overlay_area(area);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_session_list_overlay(frame, area, &sessions, &list_state);
+            })
+            .expect("draw session list overlay");
+
+        let cell = &terminal.backend().buffer()[(overlay_area.x + 4, overlay_area.y + 6)];
+        assert_eq!(
+            cell.style().bg,
+            Some(expected_bg),
+            "session list overlay interior must use the active ZeroCode theme background"
+        );
+
+        let selected_text_cell =
+            &terminal.backend().buffer()[(overlay_area.x + 4, overlay_area.y + 1)];
+        assert_eq!(
+            selected_text_cell.style().fg,
+            Some(theme::active().heading),
+            "selected session row must keep the overlay highlight foreground"
+        );
+        assert_eq!(
+            selected_text_cell.style().bg,
+            Some(expected_bg),
+            "selected session row must keep the themed fill background"
         );
     }
 
