@@ -10,7 +10,7 @@
 //! parity entry renders `Unknown`; a parity key the walk no longer produces is a
 //! hard error.
 //!
-//! Outputs (gitignored, derived — `{{#include}}`d at build time):
+//! Outputs (gitignored, derived and included with `{{#include}}` at build time):
 //!   docs/book/src/_snippets/feature-matrix-channels.md
 //!   docs/book/src/_snippets/feature-matrix-providers.md
 //!   docs/book/src/_snippets/feature-matrix-tools.md
