@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex};
 use zeroclaw_config::schema::{SopConfig, SopRunStoreBackend};
 
 pub use model::{
-    ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, RetentionPolicy, SOP_STORE_VERSION,
-    SopEventRecord,
+    ClaimToken, PersistedRun, ProposalKind, ProposalRecord, ProposalStatus, RetentionPolicy,
+    SOP_STORE_VERSION, SopEventRecord,
 };
 pub use sqlite::SqliteRunStore;
 
@@ -578,13 +578,20 @@ mod tests {
     fn proposal(id: &str, status: ProposalStatus) -> ProposalRecord {
         ProposalRecord {
             id: id.to_string(),
+            kind: ProposalKind::Update,
             status,
             source_run_id: None,
             sop_name: "deploy".to_string(),
             target_content_hash: None,
+            manifest_toml: "[sop]\nname = \"deploy\"\ndescription = \"Deploy\"\n".to_string(),
+            procedure_markdown: "## Steps\n\n1. **Deploy** - Do it.\n".to_string(),
             provenance: json!({}),
             created_at: "t".to_string(),
             updated_at: "t".to_string(),
+            status_reason: None,
+            applied_at: None,
+            applied_by: None,
+            rollback_path: None,
         }
     }
 
