@@ -1468,7 +1468,6 @@ impl SopPane {
                     .collect(),
                 _ => vec![
                     (FlowRole::Sequence, None, Color::Green),
-                    (FlowRole::Dependency, None, Color::Yellow),
                     (FlowRole::Failure, None, Color::Red),
                 ],
             };

@@ -371,13 +371,6 @@ export default function SopCanvas({
                 }}
               />
               <MenuItem
-                label={t('sops.menu_wire_dependency')}
-                onClick={() => {
-                  startLink(menu.step as number, 'dependency');
-                  setMenu(null);
-                }}
-              />
-              <MenuItem
                 label={t('sops.menu_wire_failure')}
                 onClick={() => {
                   startLink(menu.step as number, 'failure');
@@ -791,19 +784,6 @@ export default function SopCanvas({
               className="cursor-crosshair"
             >
               <title>{t('sops.handle_sequence')}</title>
-            </circle>
-            <circle
-              cx={NODE_W}
-              cy={NODE_H / 2 + 18}
-              r={5}
-              fill={wireStroke('dependency')}
-              onPointerDown={(e) => {
-                e.stopPropagation();
-                if (!readOnly) startLink(node.step, 'dependency');
-              }}
-              className="cursor-crosshair"
-            >
-              <title>{t('sops.handle_dependency')}</title>
             </circle>
             <circle
               cx={NODE_W}
