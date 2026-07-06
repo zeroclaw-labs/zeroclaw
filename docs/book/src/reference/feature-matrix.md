@@ -13,14 +13,14 @@ facts the binary has no knowledge of.
 
 ## Status legend
 
-| Status | Meaning |
-|---|---|
-| Supported | Implemented and documented; safe to rely on |
-| Partial | Works with caveats or covers a subset of the surface |
-| Experimental | Present but may change; validate before depending on it |
-| Planned | Tracked but not yet implemented |
-| None | Not available on that runtime |
-| Unknown | Parity not yet recorded for that runtime |
+| Status | Icon | Meaning |
+|---|---|---|
+| Supported | ✅ | Implemented and documented; safe to rely on |
+| Partial | 🟡 | Works with caveats or covers a subset of the surface |
+| Experimental | 🧪 | Present but may change; validate before depending on it |
+| Planned | 📋 | Tracked but not yet implemented |
+| None | ❌ | Not available on that runtime |
+| Unknown | ❓ | Parity not yet recorded for that runtime |
 
 ## Runtime and deployment modes
 
