@@ -286,6 +286,13 @@ cli-skills-install-suggestion =
 
     匹配的能力：{$matched}
     下一步：运行 `{$install_command}` 进行安装。
+
+cli-plugin-install-suggestion =
+    看起来此请求需要 `{$name}` 插件，但它尚未安装。
+
+    匹配的能力：{$matched}
+    下一步：运行 `{$install_command}` 进行安装。
+
 cli-completions-long-about =
     为 `zeroclaw` 生成 shell 补全脚本。
 
@@ -385,6 +392,9 @@ cli-skills-create-hint = {"  "}创建一个: mkdir -p ~/.zeroclaw/workspace/skil
 cli-skills-install-hint = {"  "}或安装: zeroclaw skills install <source>
 cli-skills-installed-header = 已安装的技能 ({$count}):
 cli-skills-tags = 标签:  {$tags}
+cli-skills-skipped-header = 已跳过 ({$count}):
+cli-skills-skipped-reason = {"    "}原因: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}在 zeroclaw 配置中设置 `skills.allow_scripts = true` 以启用它。
 cli-sop-none = 未找到 SOP。
 cli-sop-create-hint = {"  "}创建一个: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}然后添加 SOP.toml 和 SOP.md
@@ -551,6 +561,9 @@ cli-agent-not-created = 未创建您的 agent — 磁盘上没有任何更改。
 cli-onboard-deprecated = `zeroclaw onboard` 已弃用 — 请使用 `zeroclaw quickstart`。
 cli-otp-initialized = 已为 ZeroClaw 初始化 OTP 密钥。
 cli-otp-enrollment-uri = 注册 URI：{$uri}
+cli-otp-received = {"  "}✓ OTP 已接收
+cli-secret-captured = {"  "}● 已接收输入 — 按 Enter 保存
+cli-secret-received = {"  "}✓ 密钥已接收
 cli-pairing-enabled = 🔐 已启用 gateway 配对。
 cli-pairing-use-code = {"  "}使用此一次性代码配对新设备：
 cli-pairing-post = {"    "}POST /pair，附带请求头 X-Pairing-Code: {$code}
@@ -721,6 +734,7 @@ cli-channels-build-hint = {"  "}请从源码构建：`./install.sh --source --pr
 cli-channels-start-hint = 启动渠道：zeroclaw channel start
 cli-channels-doctor-hint = 检查健康状况：    zeroclaw channel doctor
 cli-channels-configure-hint = 配置方法：      zeroclaw config set channels.<name>.<field>=<value>
+
 cli-models-set-ok = 默认模型已设置为 "{ $model }" (provider: { $provider })。
 cli-models-status-current = 默认模型: { $model } (provider: { $provider })
 cli-models-status-none = 未配置默认模型。
@@ -732,6 +746,12 @@ history-trim-reason-budget = context token budget exceeded
 turn-ingress-dropped = 此请求未被处理：{ $reason }
 turn-tool-interrupted-before-result = [在此工具产生结果前被用户中断]
 channel-runtime-malformed-tool-output = 我生成了内部工具调用格式错误，无法完成此请求。请重试。
+channel-runtime-new-session = 对话历史已清除。重新开始。
+channel-runtime-stop-sent = 已发送停止信号。
+channel-runtime-stop-no-task = 此发送者范围内没有正在执行的任务。
+channel-runtime-model-empty = 模型 ID 不能为空。请使用 `/model <model-id>`。
+channel-runtime-model-switched = 已切换到模型 `{ $model }`（model_provider：`{ $provider }`）。上下文已保留。
+channel-runtime-request-timeout = ⚠️ 等待模型响应超时，请重试。
 cli-alias-list-empty = （{$section} 下无条目）
 cli-alias-created = 已创建 {$section}.{$alias}
 cli-alias-exists = {$section}.{$alias} 已存在（未更改）

@@ -44,6 +44,7 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
     crate::cmd::mdbook::themes::run(root)?;
     crate::cmd::mdbook::keymap::run(root)?;
     crate::cmd::mdbook::hardware::run(root)?;
+    crate::cmd::mdbook::plugins::run(root)?;
     let mdbook = mdbook_program()?;
     let preprocessor_env = peer_groups_preprocessor_env();
     let tag_dir = tag.unwrap_or(DEFAULT_TAG);

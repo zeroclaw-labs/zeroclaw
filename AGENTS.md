@@ -126,6 +126,10 @@ Every workspace crate carries a stability tier per the Microkernel Architecture 
 | `zeroclaw-plugins` | Experimental | WASM plugin system — foundation for v1.0.0 plugin ecosystem |
 | `zeroclaw-hardware` | Experimental | USB discovery, peripherals, serial |
 | `zeroclaw-macros` | Beta | Tightly coupled to config schema |
+| `zeroclaw-eval` | Experimental | Agent evaluation harness — Phase 0 deterministic replay of LLM trace fixtures |
+| `zeroclaw-spawn` | Beta | Attribution-propagating `tokio::spawn` wrapper layered on `zeroclaw-log` |
+| `robot-kit` | Experimental | Robot control toolkit — drive, vision, speech, sensors, safety |
+| `aardvark-sys` | Experimental | Low-level FFI bindings for Total Phase Aardvark I2C/SPI/GPIO USB adapter; only crate where `unsafe` is permitted |
 
 **Tiers**: Stable = covered by breaking-change policy. Beta = breaking changes permitted in MINOR with changelog notes. Experimental = no stability guarantee.
 
@@ -144,13 +148,18 @@ Tiers are promoted, never demoted, through deliberate team decision.
 - `crates/zeroclaw-channels/src/orchestrator/` — channel lifecycle, routing, media pipeline
 - `crates/zeroclaw-tools/` — tool execution surface (shell, file, memory, browser)
 - `crates/zeroclaw-runtime/` — agent loop, security, cron, SOP, skills, onboarding wizard, observability
+- `crates/zeroclaw-eval/` — agent evaluation harness (Phase 0 deterministic replay)
 - `crates/zeroclaw-memory/` — memory backends (markdown, sqlite, embeddings, vector merge)
 - `crates/zeroclaw-infra/` — shared infrastructure (debounce, session, stall watchdog)
+- `crates/zeroclaw-spawn/` — attribution-propagating `tokio::spawn` wrapper layered on `zeroclaw-log`
 - `crates/zeroclaw-gateway/` — webhook/gateway server (separate binary)
 - `crates/zeroclaw-hardware/` — USB discovery, peripherals, serial, GPIO
-- `crates/zerocode/` — TUI onboarding wizard
+- `crates/robot-kit/` — robot control toolkit (drive, vision, speech, sensors, safety)
+- `crates/aardvark-sys/` — Total Phase Aardvark I2C/SPI/GPIO FFI bindings
+- `apps/zerocode/` — TUI onboarding wizard
 - `crates/zeroclaw-plugins/` — WASM plugin system
 - `crates/zeroclaw-tool-call-parser/` — tool call parsing
+- `apps/tauri/` — Tauri-based desktop GUI
 - `docs/` — topic-based documentation (setup-guides, reference, ops, security, hardware, contributing, maintainers)
 - `.github/` — CI, templates, automation workflows
 
@@ -197,6 +206,7 @@ AI coding assistant skills live in `.claude/skills/`. Use the right one for the 
 
 - `.claude/skills/github-pr-review-session/SKILL.md` — PR review co-pilot; assists **you** as the human reviewer. Resolves the active reviewer from session state or `gh`, uses the RFC feedback taxonomy (🔴/🟡/✅/🔵/🟢), and formats formal review findings as H3 headings that start with the taxonomy emoji. Trigger: `review 1234`, `re-review 1234`, `go through the queue`.
 - `.claude/skills/changelog-generation/SKILL.md` — generates `CHANGELOG-next.md` between stable tags, resolves contributors via GraphQL, feeds the release workflow. Trigger: `generate changelog`, `release notes for v0.7.x`.
+- `.claude/skills/pr-architecture-check/SKILL.md` — Advisory architecture review of a PR diff; validates dependency direction, trait boundaries, extension patterns, crate placement, and core constraints against AGENTS.md and FND-001. Posts a non-blocking comment. Trigger: `arch-check #N`, `architecture check #N`.
 - `.claude/skills/github-issue-triage/SKILL.md` — Issue triage and lifecycle management; manages the backlog, labels, and stale policies. Trigger: `triage issues`, `sweep issues`, `handle issue #N`.
 - `.claude/skills/github-issue/SKILL.md` — Interactively files structured GitHub issues (bug reports or feature requests) using repo templates. Trigger: `file issue`, `report bug`, `feature request`.
 - `.claude/skills/github-pr/SKILL.md` — Opens or updates GitHub PRs, handles validation evidence, and manages PR descriptions. Trigger: `open PR`, `update PR`, `submit for review`.
@@ -228,3 +238,4 @@ Dev-operational contracts — files consumed by AI coding skills and development
 - `@docs/book/src/developing/extension-examples.md` — adding providers, channels, tools, peripherals; tool shared-state contract; architecture boundary rules
 - `@docs/book/src/contributing/privacy.md` — privacy rules and neutral-placeholder palette
 - `@docs/book/src/maintainers/superseding.md` — superseded-PR attribution, PR/commit templates, handoff template
+- `@docs/maintainers/audit-policy.md` — `.cargo/audit.toml` / `deny.toml` ignore rationale and add/remove workflow (tracks #8519, #8059)

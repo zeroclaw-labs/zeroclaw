@@ -40,7 +40,77 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use dialoguer::{Password, Select};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
-use std::io::{ErrorKind, Write};
+use std::io::{BufRead, ErrorKind, Read, Write};
+
+/// Per-line byte cap for stdin reads in interactive CLI modes (the simple_chat
+/// REPL fallback at line 3637 and the Windows-only "press Enter to exit"
+/// prompt at line 401). Matches `zeroclaw_runtime::agent::loop_::
+/// MAX_INTERACTIVE_INPUT_BYTES` (1 MiB) by convention. The cap is duplicated
+/// here — at module level rather than re-declared in each call site — so the
+/// value is visible in one place for both call sites and can be adjusted in
+/// a single edit. Defense against a piped-in flood
+/// (e.g. `head -c 10G /dev/zero | zeroclaw chat`) that would otherwise grow
+/// the per-line `String` until the process OOMs.
+const STDIN_LINE_CAP: usize = 1024 * 1024;
+
+/// Result of [`read_capped_line`].
+#[cfg(not(feature = "agent-runtime"))]
+#[derive(Debug)]
+enum CappedLine {
+    /// A full line under the cap, with the trailing `\n` stripped.
+    Line(String),
+    /// The physical line exceeded `cap`. The remainder has been drained
+    /// and must not be used as a prompt.
+    Truncated,
+    /// EOF with no bytes read.
+    Eof,
+}
+
+/// Read a single line from `reader` bounded at `cap` bytes. Returns
+/// the line with the trailing `\n` stripped or [`CappedLine::Truncated`]
+/// when the cap was hit. When truncated, the rest of the physical line
+/// is drained using a fixed-size scratch buffer so the next call starts
+/// at the next line and no unbounded allocation occurs.
+#[cfg(not(feature = "agent-runtime"))]
+fn read_capped_line<R: std::io::BufRead>(reader: R, cap: usize) -> std::io::Result<CappedLine> {
+    let mut raw = Vec::new();
+    let mut limited = reader.take((cap + 1) as u64);
+    std::io::BufRead::read_until(&mut limited, b'\n', &mut raw)?;
+    let truncated = raw.len() > cap;
+    if truncated {
+        let mut inner = limited.into_inner();
+        discard_until_newline(&mut inner)?;
+        return Ok(CappedLine::Truncated);
+    } else if raw.last() == Some(&b'\n') {
+        raw.pop();
+    }
+    if raw.is_empty() {
+        return Ok(CappedLine::Eof);
+    }
+    Ok(CappedLine::Line(String::from_utf8_lossy(&raw).into_owned()))
+}
+
+/// Discard bytes from `reader` until the next `\n` or EOF, using only
+/// `BufRead::fill_buf` / `consume`. This avoids the unbounded allocation
+/// that `read_until(..., &mut Vec::new())` would incur on an oversized
+/// physical line, and it stops exactly at the newline so the next line
+/// is not consumed.
+#[cfg(not(feature = "agent-runtime"))]
+fn discard_until_newline<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<()> {
+    loop {
+        let buf = reader.fill_buf()?;
+        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            reader.consume(pos + 1);
+            return Ok(());
+        }
+        let len = buf.len();
+        if len == 0 {
+            return Ok(());
+        }
+        reader.consume(len);
+    }
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
@@ -225,8 +295,24 @@ fn pause_after_no_command_help() {
     println!();
     print!("{}", t("cli-press-enter", "Press Enter to exit..."));
     let _ = std::io::stdout().flush();
+    // Cap the read so a piped-in flood (e.g. `dir | zeroclaw` with no
+    // command) cannot blow up RSS in this trivial one-Enter prompt.
+    // See module-level `STDIN_LINE_CAP` for rationale.
     let mut line = String::new();
-    let _ = std::io::stdin().read_line(&mut line);
+    // `Stdin::lock()` returns a `StdinLock<'_>` which is unconditionally
+    // `BufRead` across all target platforms and rustc feature gates; the
+    // unlocked `Stdin` is only `BufRead` on some platforms / under some
+    // feature combinations, so wrap the read in `lock()` to keep the
+    // `no-default-features` build (and 32-bit / Windows) green. The lock
+    // is dropped at the end of this scope, restoring the original
+    // behavior of stdin.
+    let _ = std::io::stdin()
+        .lock()
+        .take((STDIN_LINE_CAP + 1) as u64)
+        .read_line(&mut line);
+    if line.len() > STDIN_LINE_CAP {
+        line.truncate(STDIN_LINE_CAP);
+    }
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -2626,6 +2712,81 @@ fn plugin_host_with_configured_security(
     )
 }
 
+/// Seed an empty `[[plugins.entries]]` block named after a freshly installed
+/// plugin. `config set plugins.entries.<name>.config.<key>` routes through
+/// natural-key path resolution, which only matches entries already present in
+/// live config; without a seeded entry the operator's only recourse is
+/// hand-editing the file. Idempotent: reinstalling a plugin whose entry
+/// already exists leaves the operator's config values untouched.
+#[cfg(feature = "plugins-wasm")]
+async fn seed_plugin_config_entry(
+    config: &mut crate::config::schema::Config,
+    plugin_name: &str,
+) -> Result<()> {
+    // A degraded [plugins] block means the on-disk section is malformed and
+    // the in-memory view is defaults. save_dirty cannot write through the
+    // broken shape (verified: it silently no-ops), so seeding would print a
+    // success message while persisting nothing. The whole-config sentinel
+    // (unparseable TOML) is worse: save_dirty hard-fails parsing the file
+    // and would turn a successful install into a command error. Refuse
+    // honestly in both cases.
+    let whole_config_degraded = config
+        .degraded_security
+        .iter()
+        .any(|s| s == crate::config::migration::WHOLE_CONFIG_SENTINEL);
+    if whole_config_degraded || config.degraded_sections.iter().any(|s| s == "plugins") {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-plugin-config-entry-seed-skipped",
+                &[("name", plugin_name)],
+                "warning: skipped seeding the plugin config entry: the \
+                 [plugins] section on disk is malformed. Repair it, add \
+                 `[[plugins.entries]]` with the plugin name, then set values \
+                 with `zeroclaw config set plugins.entries.<name>.config.<key>`."
+            )
+        );
+        return Ok(());
+    }
+    // Dotted-path routing splits on `.`, so a plugin name containing a dot
+    // (or an empty name) can never be addressed by
+    // `config set plugins.entries.<name>...`, and the per-entry dirty path
+    // `plugins.entries.<name>` cannot round-trip through the natural-key
+    // writer either: save_dirty silently no-ops while the success message
+    // claims otherwise (verified). Skip honestly.
+    if plugin_name.is_empty() || plugin_name.contains('.') {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-plugin-config-entry-seed-unaddressable",
+                &[("name", plugin_name)],
+                "warning: skipped seeding the plugin config entry: the plugin \
+                 name cannot be addressed by a dotted config path. Add a \
+                 `[[plugins.entries]]` block to the config file by hand."
+            )
+        );
+        return Ok(());
+    }
+    let created = config
+        .create_map_key("plugins.entries", plugin_name)
+        .map_err(anyhow::Error::msg)?;
+    if !created {
+        return Ok(());
+    }
+    config.mark_dirty(&format!("plugins.entries.{plugin_name}"));
+    Box::pin(config.save_dirty()).await?;
+    println!(
+        "{}",
+        ta(
+            "cli-plugin-config-entry-seeded",
+            &[("name", plugin_name)],
+            "Seeded config entry. Set plugin config values with \
+             `zeroclaw config set plugins.entries.<name>.config.<key>`."
+        )
+    );
+    Ok(())
+}
+
 #[derive(Subcommand, Debug)]
 enum ConfigCommands {
     /// Dump the full configuration JSON Schema to stdout. With `--path`, returns
@@ -2681,7 +2842,7 @@ enum ConfigCommands {
     },
     /// Migrate the on-disk config to the current schema version (preserves comments)
     Migrate {
-        /// Emit a structured JSON envelope ({migrated, backup_path?, schema_version}) instead of plain text.
+        /// Emit a structured JSON envelope ({migrated, backup_path?, schema_version, valid?, error?}) instead of plain text.
         #[arg(long)]
         json: bool,
     },
@@ -3310,6 +3471,32 @@ async fn main() -> Result<()> {
 
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
+    // Malformed sections the resilient loader dropped to defaults are logged
+    // to the trace file, but the terminal is muted unless --verbose. Echo
+    // them to stderr unconditionally: an operator whose `[plugins]` (or any
+    // other block) silently reset to defaults must see it on every command,
+    // not only when spelunking logs. Security-critical drops additionally
+    // hard-gate serving in gate_security_posture.
+    for section in config
+        .degraded_sections
+        .iter()
+        .chain(config.degraded_security.iter())
+    {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-config-section-degraded",
+                &[
+                    ("section", section),
+                    ("path", &config.config_path.display().to_string()),
+                ],
+                "warning: config section is malformed and was reset to defaults \
+                 for this run. Values in that section are NOT in effect. Run \
+                 `zeroclaw config migrate` to see the parse error, then repair \
+                 the file."
+            )
+        );
+    }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
     #[cfg(feature = "agent-runtime")]
@@ -3415,15 +3602,41 @@ async fn main() -> Result<()> {
                         println!("{response}");
                     }
                     None => {
-                        // Interactive mode
-                        let stdin = std::io::stdin();
-                        let mut line = String::new();
+                        // Interactive mode. Cap the per-line read so a
+                        // piped-in flood (e.g. `head -c 10G /dev/zero |
+                        // zeroclaw chat`) cannot OOM the process — same
+                        // audit-flagged vector the agent-runtime path
+                        // covers in `loop_::read_capped_line`. See
+                        // module-level `STDIN_LINE_CAP` for the cap
+                        // rationale.
+                        // `Stdin::lock()` is taken once per line so that a
+                        // fresh `Take(cap + 1)` is applied to each physical
+                        // line; a cumulative Take across the whole REPL loop
+                        // would mean that after STDIN_LINE_CAP + 1 total
+                        // bytes all later reads returned EOF (Audacity88
+                        // review #8463).
                         loop {
                             eprint!("> ");
-                            line.clear();
-                            if stdin.read_line(&mut line)? == 0 {
-                                break;
-                            }
+                            let line = {
+                                let stdin = std::io::stdin().lock();
+                                match read_capped_line(stdin, STDIN_LINE_CAP) {
+                                    Ok(CappedLine::Eof) => break,
+                                    Ok(CappedLine::Line(s)) => s,
+                                    Ok(CappedLine::Truncated) => {
+                                        // i18n-exempt: no-runtime fallback lacks the Fluent catalogue.
+                                        eprintln!(
+                                            "\nWarning: input line exceeds {} bytes and was discarded.",
+                                            STDIN_LINE_CAP
+                                        );
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        // i18n-exempt: no-runtime fallback lacks the Fluent catalogue.
+                                        eprintln!("\nError reading input: {e}\n");
+                                        break;
+                                    }
+                                }
+                            };
                             let response =
                                 zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
                                     .simple_chat(line.trim(), model_name, Some(final_temperature))
@@ -3940,6 +4153,14 @@ async fn main() -> Result<()> {
                     (None, None)
                 };
 
+                // EPIC A1 + SOP cron: drive periodic maintenance and cron
+                // triggers against the shared engine for this daemon iteration.
+                let sop_maintenance = spawn_sop_maintenance(
+                    sop_engine.as_ref(),
+                    sop_audit.as_ref(),
+                    current_config.sop.maintenance_interval_secs,
+                );
+
                 #[cfg(feature = "gateway")]
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
@@ -4061,7 +4282,11 @@ async fn main() -> Result<()> {
                     registry,
                     ephemeral,
                 ))
-                .await?;
+                .await;
+                if let Some(handle) = sop_maintenance {
+                    handle.abort();
+                }
+                let exit = exit?;
                 match exit {
                     daemon::DaemonExit::Shutdown => break,
                     daemon::DaemonExit::Reload => {
@@ -4670,10 +4895,20 @@ async fn main() -> Result<()> {
                 } else {
                     (None, None)
                 };
-                Box::pin(channels::start_channels(
+                // EPIC A1 + SOP cron: same tick as the full daemon path.
+                let sop_maintenance = spawn_sop_maintenance(
+                    sop_engine.as_ref(),
+                    sop_audit.as_ref(),
+                    config.sop.maintenance_interval_secs,
+                );
+                let result = Box::pin(channels::start_channels(
                     config, None, cancel, sop_engine, sop_audit,
                 ))
-                .await
+                .await;
+                if let Some(handle) = sop_maintenance {
+                    handle.abort();
+                }
+                result
             }
             ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
             other => Box::pin(channels::handle_command(other, &config)).await,
@@ -4694,7 +4929,15 @@ async fn main() -> Result<()> {
 
         Commands::Browse { path } => browse::handle_browse(path, &config),
 
-        Commands::Sop { sop_command } => sop::handle_command(sop_command, &config),
+        Commands::Sop { sop_command } => match sop_command {
+            // Out-of-band approval verbs talk to the running daemon over the
+            // gateway (they must see the daemon's runs, not a throwaway local
+            // engine). List/Validate/Show stay local + synchronous.
+            cmd @ (SopCommands::Approve { .. }
+            | SopCommands::Deny { .. }
+            | SopCommands::Pending) => sop_admin_dispatch(cmd, &config).await,
+            other => sop::handle_command(other, &config),
+        },
 
         Commands::Migrate { migrate_command } => {
             migration::handle_command(migrate_command, &config).await
@@ -5350,12 +5593,30 @@ async fn main() -> Result<()> {
                         }
                     }
                     None => {
+                        // Schema-current files can still carry a section that
+                        // fails typed deserialization (the resilient loader
+                        // resets it to defaults and the CLI points here for
+                        // the precise error). Run the strict path so this
+                        // command actually shows it instead of a dead-end
+                        // "already current".
+                        let strict_error = std::fs::read_to_string(&config.config_path)
+                            .ok()
+                            .and_then(|raw| {
+                                crate::config::migration::migrate_to_current(&raw)
+                                    .err()
+                                    .map(|e| format!("{e:#}"))
+                            });
                         if json {
                             let envelope = serde_json::json!({
                                 "migrated": false,
                                 "schema_version": crate::config::migration::CURRENT_SCHEMA_VERSION,
+                                "valid": strict_error.is_none(),
+                                "error": strict_error,
                             });
                             println!("{}", serde_json::to_string_pretty(&envelope)?);
+                            if strict_error.is_some() {
+                                std::process::exit(1);
+                            }
                         } else {
                             println!(
                                 "{}",
@@ -5364,6 +5625,14 @@ async fn main() -> Result<()> {
                                     "Config already at current schema version."
                                 )
                             );
+                            if let Some(error) = strict_error {
+                                anyhow::bail!(
+                                    "config at {} does not deserialize strictly; the resilient \
+                                     loader is substituting defaults for the failing section. \
+                                     Parse error: {error}",
+                                    config.config_path.display()
+                                );
+                            }
                         }
                     }
                 }
@@ -5783,6 +6052,11 @@ async fn main() -> Result<()> {
             PluginCommands::Search { query, registry } => {
                 let registry_url = plugin_registry::registry_url(registry.as_deref());
                 let index = plugin_registry::fetch_registry_index(&registry_url).await?;
+                zeroclaw::plugins::registry::write_cached_registry_index(
+                    &config.data_dir,
+                    &registry_url,
+                    &index,
+                )?;
                 let matches = plugin_registry::search_entries(&index, &query);
                 if matches.is_empty() {
                     println!(
@@ -5835,7 +6109,7 @@ async fn main() -> Result<()> {
                 }
                 let mut host = plugin_host_with_configured_security(&config)?;
                 if plugin_registry::is_local_plugin_source(&source) {
-                    host.install(&source)?;
+                    let name = host.install(&source)?;
                     println!(
                         "{}",
                         ta(
@@ -5844,6 +6118,7 @@ async fn main() -> Result<()> {
                             "Plugin installed"
                         )
                     );
+                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
                 } else {
                     let registry_url = plugin_registry::registry_url(registry.as_deref());
                     println!(
@@ -5854,10 +6129,14 @@ async fn main() -> Result<()> {
                             "Resolving plugin from registry..."
                         )
                     );
-                    let downloaded =
-                        plugin_registry::download_registry_plugin(&registry_url, &source).await?;
+                    let downloaded = plugin_registry::download_registry_plugin(
+                        &registry_url,
+                        &source,
+                        Some(&config.data_dir),
+                    )
+                    .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
-                    host.install(&plugin_dir)?;
+                    let name = host.install(&plugin_dir)?;
                     println!(
                         "{}",
                         ta(
@@ -5869,6 +6148,7 @@ async fn main() -> Result<()> {
                             "Plugin installed"
                         )
                     );
+                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
                 }
                 Ok(())
             }
@@ -6313,6 +6593,148 @@ async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> R
                 "Failed to connect to gateway: {e}"
             )))
         }
+    }
+}
+
+/// Dispatch the gateway-backed SOP verbs. Requires the `agent-runtime` build (the
+/// gateway HTTP client + `gateway_admin_url` live behind it, like `shutdown_gateway`);
+/// without it these verbs cannot reach the daemon, so they error clearly.
+async fn sop_admin_dispatch(cmd: SopCommands, config: &crate::config::Config) -> Result<()> {
+    #[cfg(feature = "agent-runtime")]
+    {
+        sop_admin_request(cmd, config).await
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        let _ = (cmd, config);
+        anyhow::bail!(
+            "`zeroclaw sop approve/deny/pending` requires the agent-runtime build (the gateway client)"
+        )
+    }
+}
+
+/// CLI -> daemon dispatch for the out-of-band SOP approval verbs (EPIC C, C8).
+/// Posts to `/admin/sop/*` on the running gateway (mirrors `shutdown_gateway`);
+/// never builds a throwaway local engine, which cannot see the daemon's runs.
+#[cfg(feature = "agent-runtime")]
+async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> Result<()> {
+    let host = config.gateway.host.clone();
+    let port = config.gateway.port;
+    let prefix = config.gateway.path_prefix.as_deref();
+    let client = reqwest::Client::new();
+    match cmd {
+        SopCommands::Pending => {
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/pending");
+            let resp = client
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .map_err(|e| anyhow::Error::msg(format!("Failed to connect to gateway: {e}")))?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            if !status.is_success() {
+                let err = body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("request failed");
+                anyhow::bail!("Gateway responded {status}: {err}");
+            }
+            let pending = body
+                .get("pending")
+                .and_then(|p| p.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if pending.is_empty() {
+                println!(
+                    "{}",
+                    t("cli-sop-pending-none", "No SOP runs waiting for approval.")
+                );
+            } else {
+                println!(
+                    "{}",
+                    t("cli-sop-pending-header", "SOP runs waiting for approval:")
+                );
+                for r in pending {
+                    let run_id = r.get("run_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let sop_name = r.get("sop_name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let step = r
+                        .get("step")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        .to_string();
+                    let total = r
+                        .get("total_steps")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        .to_string();
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-sop-pending-row",
+                            &[
+                                ("run_id", run_id),
+                                ("sop_name", sop_name),
+                                ("step", &step),
+                                ("total", &total),
+                            ],
+                            "  (sop run)",
+                        )
+                    );
+                }
+            }
+            Ok(())
+        }
+        SopCommands::Approve { run_id } => {
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/approve");
+            sop_admin_post(&client, &url, serde_json::json!({ "run_id": run_id })).await
+        }
+        SopCommands::Deny { run_id, reason } => {
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/deny");
+            sop_admin_post(
+                &client,
+                &url,
+                serde_json::json!({ "run_id": run_id, "reason": reason }),
+            )
+            .await
+        }
+        // List/Validate/Show are dispatched on the local synchronous path.
+        _ => unreachable!("local SOP verbs are handled by sop::handle_command"),
+    }
+}
+
+/// POST a JSON body to a gateway SOP admin endpoint and report the outcome.
+#[cfg(feature = "agent-runtime")]
+async fn sop_admin_post(
+    client: &reqwest::Client,
+    url: &str,
+    body: serde_json::Value,
+) -> Result<()> {
+    let resp = client
+        .post(url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| anyhow::Error::msg(format!("Failed to connect to gateway: {e}")))?;
+    let status = resp.status();
+    let out: serde_json::Value = resp.json().await.unwrap_or_default();
+    if status.is_success() {
+        println!(
+            "{}",
+            out.get("outcome").and_then(|v| v.as_str()).unwrap_or("ok")
+        );
+        Ok(())
+    } else {
+        // Non-2xx bodies from the SOP routes carry the typed `outcome` label
+        // (e.g. not_waiting -> 404, rejected_self_approval -> 403), not `error`;
+        // prefer it so the operator sees why, falling back to `error`.
+        let detail = out
+            .get("outcome")
+            .and_then(|v| v.as_str())
+            .or_else(|| out.get("error").and_then(|v| v.as_str()))
+            .unwrap_or("request failed");
+        anyhow::bail!("Gateway responded {status}: {detail}");
     }
 }
 
@@ -6997,6 +7419,139 @@ fn gate_security_posture(
         }
     });
     Ok(Some(handle))
+}
+
+/// Spawn the periodic SOP maintenance tick (EPIC A1 + SOP cron): on each interval it
+/// fires fail-closed approval timeouts, reaps expired concurrency-claim leases,
+/// prunes terminal runs past the retention policy, and dispatches cached cron
+/// SOP triggers. Returns `None` (no task) when the tick is disabled
+/// (`interval_secs == 0`) or no SOP engine is configured. The caller owns the
+/// returned handle and aborts it when the foreground daemon/channel run exits.
+/// The tick itself self-approves nothing - timeout handling follows
+/// `approval_timeout_action` (default `escalate`, fail-closed).
+#[cfg(feature = "agent-runtime")]
+fn spawn_sop_maintenance(
+    sop_engine: Option<&std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    interval_secs: u64,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if interval_secs == 0 {
+        return None;
+    }
+    let engine = sop_engine.cloned()?;
+    let audit = sop_audit.cloned();
+    let cron_cache = audit
+        .as_ref()
+        .map(|_| zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine));
+    Some(::zeroclaw_spawn::spawn!(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_cron_check = chrono::Utc::now();
+        loop {
+            ticker.tick().await;
+            let Some(report) = run_sop_maintenance_tick(
+                &engine,
+                audit.as_ref(),
+                cron_cache.as_ref(),
+                &mut last_cron_check,
+            )
+            .await
+            else {
+                continue;
+            };
+            if !report.is_empty() {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "timed_out": report.maintenance.timed_out,
+                            "reaped_claims": report.maintenance.reaped_claims,
+                            "pruned_runs": report.maintenance.pruned_runs,
+                            "cron_started": report.cron_started,
+                            "cron_skipped": report.cron_skipped,
+                            "cron_no_match": report.cron_no_match,
+                        })),
+                    "SOP maintenance tick"
+                );
+            }
+        }
+    }))
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Default)]
+struct SopMaintenanceTickReport {
+    maintenance: zeroclaw_runtime::sop::MaintenanceSummary,
+    cron_started: usize,
+    cron_skipped: usize,
+    cron_blocked_unsafe: usize,
+    cron_no_match: usize,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl SopMaintenanceTickReport {
+    fn is_empty(&self) -> bool {
+        self.maintenance.is_empty()
+            && self.cron_started == 0
+            && self.cron_skipped == 0
+            && self.cron_blocked_unsafe == 0
+            && self.cron_no_match == 0
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn run_sop_maintenance_tick(
+    engine: &std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
+    audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    cron_cache: Option<&zeroclaw_runtime::sop::dispatch::SopCronCache>,
+    last_cron_check: &mut chrono::DateTime<chrono::Utc>,
+) -> Option<SopMaintenanceTickReport> {
+    let maintenance = match engine.lock() {
+        Ok(mut e) => e.run_maintenance_tick(),
+        Err(_) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "SOP maintenance tick: engine lock poisoned; skipping this pass"
+            );
+            return None;
+        }
+    };
+
+    let mut report = SopMaintenanceTickReport {
+        maintenance,
+        ..SopMaintenanceTickReport::default()
+    };
+
+    if let (Some(audit), Some(cache)) = (audit, cron_cache) {
+        let results = zeroclaw_runtime::sop::dispatch::check_sop_cron_triggers(
+            engine,
+            audit,
+            cache,
+            last_cron_check,
+        )
+        .await;
+        for result in &results {
+            match result {
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { .. } => {
+                    report.cron_started += 1;
+                }
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { .. } => {
+                    report.cron_skipped += 1;
+                }
+                zeroclaw_runtime::sop::dispatch::DispatchResult::BlockedUnsafe { .. } => {
+                    report.cron_blocked_unsafe += 1;
+                }
+                zeroclaw_runtime::sop::dispatch::DispatchResult::NoMatch => {
+                    report.cron_no_match += 1;
+                }
+            }
+        }
+        zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
+    }
+
+    Some(report)
 }
 
 #[cfg(feature = "gateway")]
@@ -8156,6 +8711,63 @@ mod tests {
             !created,
             "auto-materialization must stay scoped to typed provider aliases"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_dispatches_cached_cron_triggers() {
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{MemoryConfig, SopConfig};
+        use zeroclaw_memory::traits::Memory;
+        use zeroclaw_runtime::sop::{
+            Sop, SopEngine, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
+        };
+
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![Sop {
+            name: "cron-sop".into(),
+            description: "cron regression".into(),
+            version: "0.1.0".into(),
+            execution_mode: SopExecutionMode::Supervised,
+            priority: SopPriority::Normal,
+            triggers: vec![SopTrigger::Cron {
+                expression: "* * * * *".into(),
+            }],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Step one".into(),
+                body: "Do step one".into(),
+                suggested_tools: vec![],
+                requires_confirmation: false,
+                kind: SopStepKind::default(),
+                schema: None,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 2,
+            location: None,
+            deterministic: false,
+        }]);
+        let engine = Arc::new(Mutex::new(engine));
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mem_cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            ..MemoryConfig::default()
+        };
+        let memory: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let audit = Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(memory));
+        let cache = zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine);
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let report =
+            run_sop_maintenance_tick(&engine, Some(&audit), Some(&cache), &mut last_cron_check)
+                .await
+                .expect("maintenance tick should complete");
+
+        assert_eq!(report.cron_started, 1);
+        assert_eq!(engine.lock().unwrap().active_runs().len(), 1);
     }
 
     #[test]

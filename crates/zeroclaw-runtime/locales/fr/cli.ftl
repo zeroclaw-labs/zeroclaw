@@ -290,6 +290,13 @@ cli-skills-install-suggestion =
 
     Capacité correspondante : {$matched}
     Étape suivante : Exécutez `{$install_command}` pour l'installer.
+
+cli-plugin-install-suggestion =
+    Il semble que cette requête nécessite le plugin `{$name}`, mais il n'est pas installé.
+
+    Capacité correspondante : {$matched}
+    Étape suivante : Exécutez `{$install_command}` pour l'installer.
+
 cli-completions-long-about =
     Génère les scripts de complétion de shell pour `zeroclaw`.
 
@@ -389,6 +396,9 @@ cli-skills-create-hint = {"  "}Créez-en une : mkdir -p ~/.zeroclaw/workspace/sk
 cli-skills-install-hint = {"  "}Ou installez : zeroclaw skills install <source>
 cli-skills-installed-header = Compétences installées ({$count}) :
 cli-skills-tags = Étiquettes :  {$tags}
+cli-skills-skipped-header = Ignorées ({$count}) :
+cli-skills-skipped-reason = {"    "}Raison : {$reason}
+cli-skills-skipped-scripts-hint = {"    "}Définissez `skills.allow_scripts = true` dans votre configuration zeroclaw pour l'activer.
 cli-sop-none = Aucun SOP trouvé.
 cli-sop-create-hint = {"  "}Créez-en un : mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}puis ajoutez SOP.toml et SOP.md
@@ -555,6 +565,9 @@ cli-agent-not-created = Votre agent n'a pas été créé — et rien n'a été m
 cli-onboard-deprecated = `zeroclaw onboard` est obsolète — utilisez `zeroclaw quickstart`.
 cli-otp-initialized = Secret OTP initialisé pour ZeroClaw.
 cli-otp-enrollment-uri = URI d'enregistrement : {$uri}
+cli-otp-received = {"  "}✓ OTP reçu
+cli-secret-captured = {"  "}● Valeur capturée — appuyez sur Entrée pour enregistrer
+cli-secret-received = {"  "}✓ Secret reçu
 cli-pairing-enabled = 🔐 L'appairage de la passerelle est activé.
 cli-pairing-use-code = {"  "}Utilisez ce code à usage unique pour appairer un nouvel appareil :
 cli-pairing-post = {"    "}POST /pair avec l'en-tête X-Pairing-Code: {$code}

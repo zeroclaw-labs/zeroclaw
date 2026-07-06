@@ -32,7 +32,7 @@ GitHub's default squash merge omits the PR number from the commit subject and fo
 
 ## Prerequisites
 
-Requires `gh` CLI ≥ 2.17.0 (for `--subject` and `--body` flags on `gh pr merge`). Verify with:
+Requires `gh` CLI ≥ 2.50.0 (for `--json name,state,bucket` on `gh pr checks`). Verify with:
 
 ```bash
 gh --version
@@ -56,16 +56,21 @@ Then fetch PR metadata:
 
 ```bash
 gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
-  --json number,title,headRefName,baseRefName,state,author,mergeable,reviewDecision
+  --json number,title,headRefName,baseRefName,headRefOid,state,author,mergeable,mergeStateStatus,reviewDecision
 ```
 
-Run pre-flight checks. **Stop at the first failure** and explain clearly:
+Save `headRefOid` as `$HEAD_SHA` for the confirmation and merge command.
 
-| Check | Fail condition | What to tell the user |
+Run pre-flight checks. **Stop at the first stop condition** and explain clearly:
+
+| Check | Condition | Action |
 |---|---|---|
-| PR is open | `state != "OPEN"` | "PR #$NUMBER is already `<state>`, nothing to merge." |
-| Targets master | `baseRefName != "master"` | "PR #$NUMBER targets `<base>`, not master. Confirm before proceeding." |
-| No merge conflicts | `mergeable == "CONFLICTING"` | "PR #$NUMBER has merge conflicts with master. The author must resolve them before this can merge." |
+| PR is open | `state != "OPEN"` | Stop: "PR #$NUMBER is already `<state>`, nothing to merge." |
+| Targets master | `baseRefName != "master"` | Stop unless explicitly confirmed: "PR #$NUMBER targets `<base>`, not master. Confirm before proceeding." |
+| No merge conflicts | `mergeable == "CONFLICTING"` or `mergeStateStatus == "DIRTY"` | Stop: "PR #$NUMBER has merge conflicts or a dirty merge state with master. The author must refresh or resolve conflicts before this can merge." |
+| Merge state known | `mergeStateStatus == "UNKNOWN"` | Refresh/retry once; if still unknown, stop and report that GitHub has not computed mergeability yet. |
+| Not blocked or draft | `mergeStateStatus` is `BLOCKED` / `DRAFT` | Stop and report the blocking gate or draft state. |
+| Behind or unstable | `mergeStateStatus` is `BEHIND` / `UNSTABLE` | Continue to Step 1c, but do not use old green branch checks alone as the freshness basis. |
 
 Then fetch the review decision:
 
@@ -83,25 +88,65 @@ REVIEW_DECISION=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
 Before asking the user to confirm the merge, verify CI status:
 
 ```bash
-gh pr checks "$NUMBER" --repo zeroclaw-labs/zeroclaw
+gh pr checks "$NUMBER" --repo zeroclaw-labs/zeroclaw --required
 ```
 
-Also fetch rollup for a machine-readable summary:
+Also fetch required checks for a machine-readable summary:
 
 ```bash
-gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw \
-  --json statusCheckRollup \
-  --jq '[.statusCheckRollup[]? | {name: .name, state: .state, conclusion: .conclusion}]'
+gh pr checks "$NUMBER" --repo zeroclaw-labs/zeroclaw \
+  --required \
+  --json name,state,bucket
 ```
 
-| State | Action |
+| Bucket value | Action |
 |---|---|
-| All required checks `SUCCESS` | Proceed to Step 2 |
-| Any required check `FAILURE` / `CANCELLED` | Stop — report failing check names; do not merge |
-| Checks `PENDING` / `IN_PROGRESS` | Stop — tell user to wait for CI; offer to retry later |
-| No checks configured | Warn and ask user whether to proceed |
+| `pass` for every required check, including the repo's required aggregate gate (currently `CI Required Gate`) | Proceed to Step 1c |
+| `fail` or `cancel` for any required check | Stop — report failing or cancelled check names; do not merge |
+| `pending` for any required check | Stop — tell user to wait for CI; offer to retry later |
+| `skipping` for any required check | Stop — report the skipped required check names and ask whether the skip is expected before proceeding |
+| No required checks are configured or returned | Warn and ask user whether to proceed |
 
 Do not merge on red CI unless the user explicitly overrides after seeing the failure list.
+
+### Step 1c: Establish the Freshness Basis
+
+Before deriving or confirming the merge command, record why the merge is current
+enough to run. Do not merge merely because the PR branch had green checks at
+some earlier point. This is a merge-readiness gate, not a code-review blocker:
+being behind `master` can require fresh merge evidence before merging without
+making the reviewed implementation itself wrong.
+
+Set `$FRESHNESS_BASIS` to one concrete sentence that names the selected basis
+and evidence. Do not leave it as an option list.
+
+Use one of these freshness bases:
+
+1. **Current official checks** — GitHub reports the PR cleanly mergeable against
+   current `master` (`mergeStateStatus` is `CLEAN` or `HAS_HOOKS`), and all
+   required checks on the current `$HEAD_SHA` are successful.
+2. **Exact queued/merge-result checks** — a merge queue, merge group, or
+   equivalent exact-result CI path has validated the result that will land.
+3. **Exact merge-result smoke** — you locally construct or inspect the exact
+   merge result that will be created, then run an appropriate compile/test smoke
+   for the touched surface. Use this only after the user approves the validation
+   scope, and see the `BEHIND`/`UNSTABLE` constraint below before choosing it
+   over official CI.
+4. **Explicit stale-risk acceptance** — if checks or merge-result validation are
+   stale or unavailable, tell the user exactly what is stale or unverified and
+   get explicit approval to accept that risk for this PR.
+
+When the PR is `BEHIND` or `UNSTABLE`, do not treat old green branch checks as
+merge readiness. If current `master` changed the same files or high-risk shared
+surfaces such as build/CI/config, generated artifacts, public interfaces,
+security or authorization boundaries, provider/channel/runtime paths, or
+required test harnesses, prefer updating the branch and waiting for official CI.
+If updating is unavailable or intentionally skipped, use exact queued or
+merge-result validation, or get explicit stale-risk acceptance that names the
+unverified overlap. Do not run local merge-result smoke as a default substitute
+for official CI.
+
+Carry the selected freshness basis into the confirmation prompt in Step 4.
 
 ### Step 2: Get Commit History
 
@@ -162,13 +207,16 @@ The title should follow conventional commit format, e.g. `feat(scope): descripti
 
 **This step is non-negotiable.** A squash merge into `upstream/master` cannot be undone without a revert commit.
 
-Present the following to the user with `$NUMBER`, `$SUBJECT`, and `$COMMITS` substituted with their actual values — never show variable names or placeholder text:
+Present the following to the user with `$NUMBER`, `$HEAD_SHA`, `$SUBJECT`,
+`$COMMITS`, and `$FRESHNESS_BASIS` substituted with their actual values — never
+show variable names or placeholder text:
 
 ---
 
 **About to run:**
 ```
 gh pr merge $NUMBER --repo zeroclaw-labs/zeroclaw --squash \
+  --match-head-commit "$HEAD_SHA" \
   --subject "$SUBJECT" \
   --body "$COMMITS"
 ```
@@ -176,6 +224,8 @@ gh pr merge $NUMBER --repo zeroclaw-labs/zeroclaw --squash \
 **Effect:**
 - PR #$NUMBER will be permanently merged (state → Merged, purple badge)
 - Issues referenced with closing keywords will auto-close
+- PR head SHA: `$HEAD_SHA`
+- Freshness basis: `$FRESHNESS_BASIS`
 - Squash commit subject: `$SUBJECT`
 - Squash commit body:
   ```
@@ -195,6 +245,7 @@ Only after explicit confirmation in Step 4:
 
 ```bash
 gh pr merge "$NUMBER" --repo zeroclaw-labs/zeroclaw --squash \
+  --match-head-commit "$HEAD_SHA" \
   --subject "$SUBJECT" \
   --body "$COMMITS"
 ```
@@ -219,6 +270,29 @@ Report to the user: merge commit SHA and PR URL.
 
 **Never delete contributor branches.** Do not suggest, offer, or run any branch deletion command — not on the upstream remote, not on forks. Branch cleanup is the contributor's responsibility and is always a human decision.
 
+### Step 7: Public Tracker Follow-Through
+
+After a verified merge, do a final-status pass for public tracker follow-through
+only when the PR is already tied to a public milestone, release, recovery, RFC,
+or umbrella tracker, or when the user asked for tracker cleanup. Use linked
+issues, milestone assignment, PR body references, and existing tracking issue
+entries as the source of truth.
+
+If a public tracker needs an update:
+
+1. Read the current tracker body first.
+2. Match the existing section and row format; do not invent a new tracker
+   structure during merge cleanup.
+3. Prepare the exact tracker or issue-body diff.
+4. Get user approval before editing public issue state unless the approval for
+   the merge explicitly included this specific tracker update.
+5. Verify the public tracker after editing.
+
+If prior milestone/tracker alignment already made the tracker current, report
+`already current`. If there is no known tracker relationship, report that no
+known public tracker follow-up applies. Do not move to the next merge while
+leaving a known public tracker stale.
+
 ## Rules
 
 - **Require a PR number or explicit squash-merge context before triggering** — do not invoke on vague phrases without a clear target.
@@ -230,7 +304,9 @@ Report to the user: merge commit SHA and PR URL.
   privacy rules.
 - **Always assign PR title and commit body to shell variables** — never interpolate untrusted content directly into quoted command arguments.
 - **Always run pre-flight checks** (merge conflicts, review decision, CI status) before confirming — do not skip them even if the user says "just merge it."
+- **Always record a freshness basis before confirming** — refreshed official checks, exact queued/merge-result checks, exact merge-result smoke, or explicit stale-risk acceptance. Do not treat old green branch checks as merge readiness when current `master` could invalidate them.
 - **Always confirm before merging, no exceptions** — show the user the exact expanded command with real values and require an explicit yes. Never infer consent.
 - **If the merge command fails, stop and report verbatim** — do not retry or work around failures automatically.
+- **Always handle public tracker follow-through after a verified merge** — update relevant public trackers with approval, or report that none apply.
 - **Never delete branches** — not on upstream, not on forks. Branch cleanup is always the contributor's decision. Never suggest a deletion command.
 - **Self-merge note:** Maintainers routinely merge their own PRs. If the user is the PR author, proceed normally — just note it in the confirmation summary so it's visible in the audit trail.

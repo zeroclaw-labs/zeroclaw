@@ -531,6 +531,8 @@ async fn handle_webhook(
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         };
 
         if state.tx.send(channel_msg).await.is_err() {
@@ -2014,6 +2016,7 @@ mod tests {
             model: "whisper-1".to_string(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: 120,
             openai: None,
             deepgram: None,

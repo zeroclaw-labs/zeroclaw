@@ -528,6 +528,11 @@ pub async fn compute_drift(in_memory: &zeroclaw_config::schema::Config) -> Vec<D
         if is_gateway_managed_field(name) {
             continue;
         }
+        // Env overrides (`ZEROCLAW_<path>`) apply in memory but never persist to
+        // disk, so a disk comparison always reports drift the operator can't fix.
+        if in_memory.prop_is_env_overridden(name) {
+            continue;
+        }
         let mem = in_memory_props.get(name);
         let disk = on_disk_props.get(name);
         let mem_display = mem
@@ -3725,6 +3730,26 @@ mod tests {
         assert!(
             !drift.iter().any(|d| d.path == "gateway.paired_tokens"),
             "gateway.paired_tokens must never appear in drift, got {drift:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_drift_excludes_env_overridden_secret() {
+        let (_tmp, path) = temp_config_path();
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: path.clone(),
+            ..Default::default()
+        };
+        cfg.save().await.expect("initial save");
+
+        cfg.composio.api_key = Some("injected-via-env".into());
+        cfg.env_overridden_paths =
+            std::collections::HashSet::from(["composio.api_key".to_string()]);
+
+        let drift = compute_drift(&cfg).await;
+        assert!(
+            !drift.iter().any(|d| d.path == "composio.api_key"),
+            "env-overridden secret must never appear in drift, got {drift:?}"
         );
     }
 

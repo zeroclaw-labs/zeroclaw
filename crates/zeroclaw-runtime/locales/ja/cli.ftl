@@ -287,6 +287,13 @@ cli-skills-install-suggestion =
 
     一致した機能: {$matched}
     次: `{$install_command}` を実行してインストールしてください。
+
+cli-plugin-install-suggestion =
+    このリクエストには `{$name}` プラグインが必要なようですが、インストールされていません。
+
+    一致した機能: {$matched}
+    次: `{$install_command}` を実行してインストールしてください。
+
 cli-completions-long-about =
     `zeroclaw` のシェル補完スクリプトを生成します。
 
@@ -386,6 +393,9 @@ cli-skills-create-hint = {"  "}作成: mkdir -p ~/.zeroclaw/workspace/skills/my-
 cli-skills-install-hint = {"  "}またはインストール: zeroclaw skills install <source>
 cli-skills-installed-header = インストール済みのスキル ({$count}):
 cli-skills-tags = タグ:  {$tags}
+cli-skills-skipped-header = スキップ済み ({$count}):
+cli-skills-skipped-reason = {"    "}理由: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}有効にするには、zeroclaw の設定で `skills.allow_scripts = true` を設定してください。
 cli-sop-none = SOP が見つかりません。
 cli-sop-create-hint = {"  "}作成: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}その後 SOP.toml と SOP.md を追加します
@@ -552,6 +562,9 @@ cli-agent-not-created = エージェントは作成されませんでした — 
 cli-onboard-deprecated = `zeroclaw onboard` は非推奨です — `zeroclaw quickstart` を使用してください。
 cli-otp-initialized = ZeroClaw用のOTPシークレットを初期化しました。
 cli-otp-enrollment-uri = 登録URI: {$uri}
+cli-otp-received = {"  "}✓ OTP受信済
+cli-secret-captured = {"  "}● 値を取得しました — Enterで保存
+cli-secret-received = {"  "}✓ 秘密情報受信済
 cli-pairing-enabled = 🔐 ゲートウェイのペアリングが有効です。
 cli-pairing-use-code = {"  "}このワンタイムコードを使って新しいデバイスをペアリングしてください:
 cli-pairing-post = {"    "}POST /pair にヘッダー X-Pairing-Code: {$code} を付けて送信

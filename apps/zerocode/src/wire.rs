@@ -464,3 +464,273 @@ pub struct FsStatError {
 /// raw JSON-RPC notifications) carry arbitrary payloads — the TUI
 /// just forwards them.
 pub type RawValue = Value;
+
+// ── Elicitation wire shapes (ACP `elicitation/create` RFD) ─────
+//
+// Mirrors of `zeroclaw_api::elicitation::*`. Carried locally so
+// `apps/zerocode/Cargo.toml` stays free of `zeroclaw-*` crate deps.
+// Wire keys are camelCase to match the daemon (and the upstream ACP
+// RFD); the channel that emits these requests is `RpcApprovalChannel`
+// in the daemon, which uses the shared `zeroclaw_api` types.
+
+/// Mode discriminator for an outbound `elicitation/create` request.
+/// Phase 1 of the rollout only emits `Form`; `Url` is on the wire
+/// for future use.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ElicitationMode {
+    Form,
+    Url,
+}
+
+/// Params for an inbound `elicitation/create` request from the
+/// daemon. The TUI receives this, surfaces the form to the user,
+/// and ships back an `ElicitationResponseAction` envelope.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ElicitationRequestParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub mode: ElicitationMode,
+    pub message: String,
+    #[serde(rename = "requestedSchema")]
+    pub requested_schema: Value,
+}
+
+/// Action discriminant the TUI returns. The daemon decodes
+/// `Accept { content }` into the original choice text via
+/// `zeroclaw_api::elicitation::decode_*` helpers.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "action", rename_all = "lowercase")]
+pub enum ElicitationResponseAction {
+    Accept {
+        /// For single-select: `{"choice": "choice-<idx>"}`.
+        /// For multi-select: `{"choices": ["choice-<a>", "choice-<b>", …]}`.
+        content: Value,
+    },
+    Decline,
+    Cancel,
+}
+
+/// A single option as parsed from the `oneOf` / `anyOf` schema. The
+/// `const` field carries the wire id (`choice-<idx>`) and the
+/// `title` field carries the human-readable label.
+#[derive(Debug, Clone)]
+pub struct ElicitationChoice {
+    pub const_id: String,
+    pub title: String,
+}
+
+/// Parsed shape of an inbound `requestedSchema` payload. Either
+/// single-select (`Single`) or multi-select (`Multi`). The TUI uses
+/// this to decide which modal to render. Unknown / malformed schemas
+/// fall through as `None`.
+#[derive(Debug, Clone)]
+pub enum ElicitationShape {
+    Single {
+        property: String,
+        choices: Vec<ElicitationChoice>,
+    },
+    Multi {
+        property: String,
+        choices: Vec<ElicitationChoice>,
+        min_items: usize,
+        max_items: usize,
+    },
+}
+
+impl ElicitationShape {
+    /// Best-effort decoder. The daemon always emits the
+    /// `single_select_schema` / `multi_select_schema` shape from
+    /// `zeroclaw-api`, so a return of `None` means a future schema
+    /// shape we don't yet render — the TUI auto-cancels in that case.
+    pub fn from_schema(schema: &Value) -> Option<Self> {
+        let properties = schema.get("properties")?.as_object()?;
+        let (property, prop_schema) = properties.iter().next()?;
+        let property = property.clone();
+
+        // Multi-select: `type: array` with `items.anyOf`.
+        if prop_schema.get("type").and_then(Value::as_str) == Some("array") {
+            let items = prop_schema.get("items")?;
+            let any_of = items.get("anyOf")?.as_array()?;
+            let choices = parse_choice_options(any_of);
+            let min_items = prop_schema
+                .get("minItems")
+                .and_then(Value::as_u64)
+                .unwrap_or(1) as usize;
+            let max_items = prop_schema
+                .get("maxItems")
+                .and_then(Value::as_u64)
+                .unwrap_or(choices.len() as u64) as usize;
+            return Some(Self::Multi {
+                property,
+                choices,
+                min_items,
+                max_items,
+            });
+        }
+
+        // Single-select: `type: string` with `oneOf`.
+        if prop_schema.get("type").and_then(Value::as_str) == Some("string") {
+            let one_of = prop_schema.get("oneOf")?.as_array()?;
+            let choices = parse_choice_options(one_of);
+            if choices.is_empty() {
+                return None;
+            }
+            return Some(Self::Single { property, choices });
+        }
+
+        None
+    }
+
+    /// The schema's first property name — used when building the
+    /// `accept` content envelope to satisfy the issued schema.
+    pub fn property(&self) -> &str {
+        match self {
+            Self::Single { property, .. } | Self::Multi { property, .. } => property,
+        }
+    }
+
+    pub fn choices(&self) -> &[ElicitationChoice] {
+        match self {
+            Self::Single { choices, .. } | Self::Multi { choices, .. } => choices,
+        }
+    }
+}
+
+fn parse_choice_options(items: &[Value]) -> Vec<ElicitationChoice> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let const_id = item.get("const")?.as_str()?.to_string();
+            let title = item
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or(&const_id)
+                .to_string();
+            Some(ElicitationChoice { const_id, title })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod elicitation_wire_tests {
+    use super::*;
+
+    #[test]
+    fn elicitation_response_accept_serializes_with_lowercase_action() {
+        let resp = ElicitationResponseAction::Accept {
+            content: serde_json::json!({ "choice": "choice-1" }),
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["action"], "accept");
+        assert_eq!(v["content"]["choice"], "choice-1");
+    }
+
+    #[test]
+    fn elicitation_response_decline_serializes() {
+        let v = serde_json::to_value(ElicitationResponseAction::Decline).unwrap();
+        assert_eq!(v["action"], "decline");
+    }
+
+    #[test]
+    fn elicitation_response_cancel_serializes() {
+        let v = serde_json::to_value(ElicitationResponseAction::Cancel).unwrap();
+        assert_eq!(v["action"], "cancel");
+    }
+
+    #[test]
+    fn request_params_round_trips_canonical_shape() {
+        let raw = serde_json::json!({
+            "sessionId": "sess-1",
+            "mode": "form",
+            "message": "Pick one",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "choice": {
+                        "type": "string",
+                        "oneOf": [
+                            { "const": "choice-0", "title": "Apple" },
+                            { "const": "choice-1", "title": "Banana" }
+                        ]
+                    }
+                },
+                "required": ["choice"]
+            }
+        });
+        let params: ElicitationRequestParams = serde_json::from_value(raw).unwrap();
+        assert_eq!(params.session_id, "sess-1");
+        assert_eq!(params.mode, ElicitationMode::Form);
+        assert_eq!(params.message, "Pick one");
+    }
+
+    #[test]
+    fn shape_decodes_single_select() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "choice": {
+                    "type": "string",
+                    "oneOf": [
+                        { "const": "choice-0", "title": "Apple" },
+                        { "const": "choice-1", "title": "Banana" }
+                    ]
+                }
+            }
+        });
+        let shape = ElicitationShape::from_schema(&schema).expect("single");
+        match shape {
+            ElicitationShape::Single { property, choices } => {
+                assert_eq!(property, "choice");
+                assert_eq!(choices.len(), 2);
+                assert_eq!(choices[0].const_id, "choice-0");
+                assert_eq!(choices[0].title, "Apple");
+                assert_eq!(choices[1].title, "Banana");
+            }
+            other => panic!("expected Single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shape_decodes_multi_select() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "choices": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 2,
+                    "items": {
+                        "anyOf": [
+                            { "const": "choice-0", "title": "Red" },
+                            { "const": "choice-1", "title": "Green" },
+                            { "const": "choice-2", "title": "Blue" }
+                        ]
+                    }
+                }
+            }
+        });
+        let shape = ElicitationShape::from_schema(&schema).expect("multi");
+        match shape {
+            ElicitationShape::Multi {
+                property,
+                choices,
+                min_items,
+                max_items,
+            } => {
+                assert_eq!(property, "choices");
+                assert_eq!(choices.len(), 3);
+                assert_eq!(min_items, 1);
+                assert_eq!(max_items, 2);
+                assert_eq!(choices[2].title, "Blue");
+            }
+            other => panic!("expected Multi, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shape_returns_none_on_unknown_schema() {
+        let schema = serde_json::json!({ "type": "object", "properties": {} });
+        assert!(ElicitationShape::from_schema(&schema).is_none());
+    }
+}

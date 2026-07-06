@@ -39,6 +39,7 @@ zeroclaw-api = { workspace = true }
 zeroclaw-config = { workspace = true }
 zeroclaw-hardware = { workspace = true }
 zeroclaw-providers = { workspace = true }
+zeroclaw-runtime = { workspace = true, features = ["schema-export"] }
 zeroclaw-gateway = { workspace = true, features = ["schema-export"] }
 zerocode = { workspace = true }
 
