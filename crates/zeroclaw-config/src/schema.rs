@@ -886,6 +886,12 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Context window size (max input tokens) for this model.
+    /// Auto-populated on setup from provider's /models endpoint if available.
+    /// Override manually for custom endpoints or when auto-detection fails.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
     /// Path to a PEM-encoded CA certificate for TLS connections to this provider.
     /// Must be an absolute path; shell expansion (e.g. `~`) is not performed.
     /// Leave unset to use the system's default trust store.
@@ -3282,7 +3288,11 @@ pub struct ResolvedRuntime {
     pub compact_context: bool,
     pub max_tool_iterations: usize,
     pub max_history_messages: usize,
+    /// Token budget for preemptive context/history trimming (from runtime profile).
+    /// NOT the provider `max_tokens` output limit.
     pub max_context_tokens: usize,
+    /// Model's context window (max input tokens) — from provider config.
+    pub model_context_window: usize,
     pub parallel_tools: bool,
     pub tool_dispatcher: String,
     pub strict_tool_parsing: bool,
@@ -3320,6 +3330,7 @@ impl Default for ResolvedRuntime {
             max_tool_iterations: 10,
             max_history_messages: 50,
             max_context_tokens: 32_000,
+            model_context_window: 32_000,
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             strict_tool_parsing: false,
@@ -3922,9 +3933,26 @@ impl Config {
 
     #[must_use]
     pub fn effective_max_context_tokens(&self, agent_alias: &str) -> usize {
+        // Token budget for preemptive context/history trimming (runtime profile override).
+        // This is NOT the provider max_tokens output limit and NOT the model's context window.
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_context_tokens)
             .unwrap_or(32_000)
+    }
+
+    /// Returns the model's context window size (max input tokens).
+    /// Source: provider config `context_window` → fallback 32,000.
+    /// Does NOT check runtime profile (that's for output budget).
+    #[must_use]
+    pub fn effective_model_context_window(&self, agent_alias: &str) -> usize {
+        // 1. Provider config (config.toml) — PRIMARY SOT for model's context window
+        if let Some((_, _, provider_config)) = self.resolved_model_provider_for_agent(agent_alias)
+            && let Some(ctx) = provider_config.context_window
+        {
+            return ctx;
+        }
+        // 2. Hard fallback 32,000 (stub)
+        32_000
     }
 
     #[must_use]
@@ -4005,7 +4033,10 @@ impl Config {
         let mut resolved = ResolvedRuntime {
             max_tool_iterations: self.effective_max_tool_iterations(agent_alias),
             max_history_messages: self.effective_max_history_messages(agent_alias),
+            // Token budget for context/history trimming — from runtime profile
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
+            // Model's context window (max input tokens) — from provider config
+            model_context_window: self.effective_model_context_window(agent_alias),
             compact_context: self.effective_compact_context(agent_alias),
             parallel_tools: self.effective_parallel_tools(agent_alias),
             tool_dispatcher: self.effective_tool_dispatcher(agent_alias),

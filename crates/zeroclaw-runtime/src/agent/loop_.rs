@@ -1,5 +1,18 @@
 use crate::approval::ApprovalManager;
 
+/// Format token count with thousands separators.
+fn format_tokens(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
 /// CLI channel factory, injected by the binary. Returns a `Box<dyn Channel>` for interactive mode.
 pub static CLI_CHANNEL_FN: std::sync::OnceLock<
     Box<dyn Fn() -> Box<dyn zeroclaw_api::channel::Channel> + Send + Sync>,
@@ -1222,9 +1235,9 @@ pub async fn run(
         // Profile values (when set) override the agent's inline fields.
         // See `Config::resolved_agent_config` for precedence rules.
         let eff_max_history_messages = agent.resolved.max_history_messages;
-        let eff_max_context_tokens = agent.resolved.max_context_tokens;
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
+        let eff_model_context_window = agent.resolved.model_context_window;
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -1500,13 +1513,12 @@ pub async fn run(
             .collect();
 
         // ── Initialize locale-aware tool descriptions ──────────────────
-        let i18n_locale = config
+        let _i18n_locale = config
             .locale
             .as_deref()
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
             .unwrap_or_else(crate::i18n::detect_locale);
-        crate::i18n::init(&i18n_locale);
 
         let mut tool_descs: Vec<(&str, &str)> = vec![
             (
@@ -2570,9 +2582,26 @@ pub async fn run(
                                     "Context overflow in interactive loop, attempting recovery"
                                 );
                                 let taken = std::mem::take(&mut history);
+                                // Context overflow recovery: trim to 90% of the model's true
+                                // input capacity, not the runtime trimming budget. After an
+                                // overflow we must fit the provider's real tokenizer, so the
+                                // model window — not the operator's lower max_context_tokens
+                                // — is the correct target. The 10% headroom absorbs (a) the
+                                // under-count from estimate_history_tokens (~4 chars/token;
+                                // history.rs:285), which is what trim_to_recent_turns measures
+                                // against, and (b) room for the assistant reply plus the next
+                                // user turn, so the retried request lands inside the window
+                                // instead of re-overflowing at the same boundary. This CLI
+                                // outer-recovery site is a defense-in-depth fallback behind
+                                // the in-loop recovery at turn/context_recovery.rs:85 (which
+                                // uses its own tokens_now*2/3 heuristic); the two are
+                                // intentionally different — the in-loop path drops
+                                // aggressively before retry, this outer path lands the retry
+                                // inside the window with margin. See the note2.md 🟡 warning.
+                                let recovery_budget = eff_model_context_window * 9 / 10;
                                 let result = crate::agent::history_trim::trim_to_recent_turns(
                                     taken,
-                                    eff_max_context_tokens,
+                                    recovery_budget,
                                 );
                                 if result.trimmed {
                                     let mut trimmed = result.history;
@@ -2654,6 +2683,51 @@ pub async fn run(
                     eprintln!("\nError sending CLI response: {e}\n");
                 }
                 observer.record_event(&ObserverEvent::TurnComplete);
+
+                // Display context usage for this turn.
+                if let Some(ref ctx) = cost_tracking_context {
+                    let usage = ctx.snapshot_turn_usage();
+                    // Use last_input_tokens (absolute provider-reported prompt size)
+                    // instead of accumulated input_tokens. last_input_tokens is the
+                    // accurate "context window fill" measure because the LLM's
+                    // usage.input_tokens already includes the full prompt
+                    // (history + tools + system). Accumulating across rounds
+                    // double-counts the shared history.
+                    let effective_input_tokens = usage.last_input_tokens;
+                    if effective_input_tokens > 0 || usage.output_tokens > 0 {
+                        let max_ctx = eff_model_context_window as u64;
+                        let pct = if max_ctx > 0 {
+                            (effective_input_tokens as f64 / max_ctx as f64 * 100.0).min(100.0)
+                        } else {
+                            0.0
+                        };
+                        let bar_width: usize = 16;
+                        let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
+                        let empty = bar_width.saturating_sub(filled);
+                        let bar = format!(
+                            "[{}{}]",
+                            "\u{2588}".repeat(filled),
+                            "\u{2591}".repeat(empty)
+                        );
+                        let msg = if effective_input_tokens > 0 {
+                            crate::i18n::get_required_cli_string_with_args(
+                                "cli-agent-context-bar",
+                                &[
+                                    ("used", format_tokens(effective_input_tokens).as_str()),
+                                    ("max", format_tokens(max_ctx).as_str()),
+                                    ("bar", &bar),
+                                    ("pct", format!("{:.0}", pct).as_str()),
+                                ],
+                            )
+                        } else {
+                            crate::i18n::get_required_cli_string_with_args(
+                                "cli-agent-context-bar-unknown",
+                                &[("max", format_tokens(max_ctx).as_str())],
+                            )
+                        };
+                        eprintln!("\x1b[2m{}\x1b[0m", msg);
+                    }
+                }
 
                 // Hard cap as a safety net.
                 trim_history(&mut history, eff_max_history_messages);
@@ -2945,13 +3019,12 @@ pub async fn process_message(
             .collect();
 
         // ── Initialize locale-aware tool descriptions ──────────────────
-        let i18n_locale = config
+        let _i18n_locale = config
             .locale
             .as_deref()
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
             .unwrap_or_else(crate::i18n::detect_locale);
-        crate::i18n::init(&i18n_locale);
 
         let mut tool_descs: Vec<(&str, &str)> = vec![
             ("shell", "Execute terminal commands."),
@@ -13023,6 +13096,63 @@ Let me check the result."#;
         ];
         let tokens = super::estimate_history_tokens(&history);
         assert_eq!(tokens, 23);
+    }
+
+    /// Regression for the 🟡 note2.md warning: the CLI outer-recovery trim
+    /// at loop_.rs:~2557 must target *below* the model window, not the full
+    /// window. Trimming to the raw `eff_model_context_window` leaves zero
+    /// headroom: the request that just failed already exceeded the
+    /// provider's real tokenizer, and `trim_to_recent_turns` measures via
+    /// `estimate_history_tokens` (~4 chars/token; history.rs:285), which
+    /// under-counts. The retry would re-overflow at the same boundary.
+    ///
+    /// The fix trims to `eff_model_context_window * 9 / 10` (10% headroom:
+    /// absorbs the heuristic's under-count plus room for the assistant
+    /// reply + next user turn). This test pins that property by feeding a
+    /// history whose estimate *equals* the window — full-window trimming
+    /// would no-op and the retry would fail; the 90% budget forces a trim.
+    #[test]
+    fn cli_outer_recovery_trims_below_model_window_with_headroom() {
+        use crate::agent::history_trim::trim_to_recent_turns;
+
+        let model_context_window: usize = 32_000;
+        let recovery_budget = model_context_window * 9 / 10; // 28_800
+
+        // Build a history whose estimate_history_tokens *exceeds* the
+        // window so a full-window budget would not trim and the retry
+        // would re-overflow, but the 90% budget must trim. 4000 chars per
+        // message ≈ 1004 estimated tokens; 32 user turns + 32 assistant
+        // replies + 1 system ≈ 65 messages × ~1004 = ~65_260 tokens.
+        let big = "x".repeat(4000);
+        let mut history = vec![ChatMessage::system("sys")];
+        for i in 0..32 {
+            history.push(ChatMessage::user(format!("turn {i} {big}").as_str()));
+            history.push(ChatMessage::assistant(format!("reply {i} {big}").as_str()));
+        }
+        let tokens_before = super::estimate_history_tokens(&history);
+        assert!(
+            tokens_before > model_context_window,
+            "fixture must overflow the window: got {tokens_before}"
+        );
+
+        let result = trim_to_recent_turns(history, recovery_budget);
+        assert!(
+            result.trimmed,
+            "recovery must trim when the estimate exceeds the 90% budget"
+        );
+        assert!(
+            result.tokens_after <= recovery_budget,
+            "tokens_after ({}) must be <= recovery_budget ({})",
+            result.tokens_after,
+            recovery_budget
+        );
+        // Headroom must leave us strictly below the model's true window,
+        // so the retried request has room for the reply + next user turn.
+        assert!(
+            result.tokens_after < model_context_window,
+            "headroom must leave us strictly below the model window: got {}",
+            result.tokens_after
+        );
     }
 
     #[tokio::test]

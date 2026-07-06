@@ -1868,6 +1868,103 @@ async fn rename_agent_cascade(
     .into_response()
 }
 
+/// `POST /api/config/model-providers/{type}/{alias}/refresh-context-window`
+/// — fetch and update `context_window` from the provider's /models endpoint.
+///
+/// Returns the updated config value. Only works for providers that expose
+/// `context_length`/`context_window` in their `/models` endpoint
+/// (OpenRouter, Together, Groq, Fireworks, DeepInfra, Hyperbolic, Anyscale, Novita, Nebius).
+///
+/// If the provider doesn't support it or the fetch fails, returns 400 with an error.
+pub async fn handle_refresh_context_window(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path((provider_type, alias)): axum::extract::Path<(String, String)>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let mut working = state.config.read().clone();
+    let path = format!("providers.models.{provider_type}.{alias}");
+
+    // Verify the entry exists
+    if working.get_prop(&format!("{path}.model")).is_err() {
+        return error_response(
+            ConfigApiError::new(
+                ConfigApiCode::PathNotFound,
+                format!("model provider '{provider_type}.{alias}' not found"),
+            )
+            .with_path(&path),
+        );
+    }
+
+    // Build minimal provider config for fetch
+    let model = working
+        .get_prop(&format!("{path}.model"))
+        .ok()
+        .unwrap_or_default();
+    let uri = working.get_prop(&format!("{path}.uri")).ok();
+    // Read api_key via JSON serialization to bypass #[secret] masking in get_prop.
+    let api_key = serde_json::to_value(&working.providers).ok().and_then(|v| {
+        v.pointer(&format!("/models/{provider_type}/{alias}/api_key"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && *s != "<unset>")
+            .map(String::from)
+    });
+
+    let provider_config = zeroclaw_config::schema::ModelProviderConfig {
+        model: Some(model),
+        uri,
+        api_key,
+        ..Default::default()
+    };
+
+    // Fetch context window from provider
+    let context_window = match zeroclaw_providers::fetch_context_window(
+        &provider_type,
+        &provider_config,
+    )
+    .await
+    {
+        Some(ctx) => ctx,
+        None => {
+            return error_response(
+                ConfigApiError::new(
+                    ConfigApiCode::InvalidFormat,
+                    format!("provider '{provider_type}' does not support context window auto-detection or fetch failed"),
+                )
+                .with_path(&path),
+            );
+        }
+    };
+
+    // Update config
+    if let Err(e) = working.set_prop_persistent(
+        &format!("{path}.context_window"),
+        &context_window.to_string(),
+    ) {
+        return error_response(
+            ConfigApiError::new(
+                ConfigApiCode::InternalError,
+                format!("failed to persist context_window: {e}"),
+            )
+            .with_path(&path),
+        );
+    }
+
+    working.mark_dirty(&format!("{path}.context_window"));
+    if let Err(e) = persist_and_swap(&state, working).await {
+        return error_response(e);
+    }
+
+    axum::Json(serde_json::json!({
+        "path": path,
+        "context_window": context_window,
+    }))
+    .into_response()
+}
+
 /// PATCH /api/config — apply a JSON Patch document atomically.
 ///
 /// Body is an array of operations executed in order against an in-memory
@@ -4097,6 +4194,101 @@ mod tests {
         assert!(
             joined.contains("archive"),
             "warnings should mention archive-side failures, got: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_context_window_forwards_api_key() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer test-api-key-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{
+                    "id": "llama-3.1-70b",
+                    "context_length": 4096
+                }]
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let (_tmp, path) = temp_config_path();
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: path.clone(),
+            ..Default::default()
+        };
+        cfg.providers.models.groq.insert(
+            "test".to_string(),
+            zeroclaw_config::schema::GroqModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("llama-3.1-70b".into()),
+                    api_key: Some("test-api-key-123".into()),
+                    uri: Some(mock.uri()),
+                    ..Default::default()
+                },
+            },
+        );
+        cfg.save().await.expect("initial save");
+
+        let state = crate::api::test_state(cfg);
+
+        let app = axum::Router::new()
+            .route(
+                "/api/config/model-providers/{type}/{alias}/refresh-context-window",
+                axum::routing::post(handle_refresh_context_window),
+            )
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/config/model-providers/groq/test/refresh-context-window")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            response.status().is_success(),
+            "expected 200, got {}",
+            response.status()
+        );
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+
+        assert_eq!(json["path"], "providers.models.groq.test");
+        assert_eq!(json["context_window"], 4096);
+        assert!(
+            !body_str.contains("test-api-key-123"),
+            "API key leaked in response body"
+        );
+
+        let requests = mock.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "expected exactly one request to mock");
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer test-api-key-123"
         );
     }
 }

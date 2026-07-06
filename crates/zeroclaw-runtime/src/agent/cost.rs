@@ -22,6 +22,13 @@ pub struct TurnUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd: f64,
+    /// Last provider-reported prompt token count (absolute, not accumulated).
+    /// Matches zerocode's pattern: the LLM's usage.input_tokens already
+    /// includes the full prompt (history + tools + system), so the last value
+    /// is the accurate "how full is the context window" measure. This replaces
+    /// rather than accumulates, avoiding the double-counting bug where
+    /// successive tool-call rounds summed their overlapping prompt sizes.
+    pub last_input_tokens: u64,
 }
 
 pub fn build_model_provider_pricing(config: &Config) -> ModelProviderPricing {
@@ -342,6 +349,10 @@ pub fn record_tool_loop_cost_usage(
             usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
             usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
             usage.cost_usd += cost_usage.cost_usd;
+            // Replace (not accumulate) last_input_tokens with the absolute
+            // provider-reported prompt size — this is the accurate "context
+            // window fill" measure (see TurnUsage doc comment).
+            usage.last_input_tokens = input_tokens;
             true
         } else {
             false
@@ -352,6 +363,9 @@ pub fn record_tool_loop_cost_usage(
         turn_usage.input_tokens = turn_usage.input_tokens.saturating_add(input_tokens);
         turn_usage.output_tokens = turn_usage.output_tokens.saturating_add(output_tokens);
         turn_usage.cost_usd += cost_usage.cost_usd;
+        // Replace (not accumulate) last_input_tokens with the absolute
+        // provider-reported prompt size.
+        turn_usage.last_input_tokens = input_tokens;
     }
 
     if let Some(tracker) = &ctx.tracker
