@@ -2178,7 +2178,15 @@ pub struct CronRunsResult {
 pub struct CronTriggerResult {
     pub id: String,
     pub success: bool,
+    #[serde(default)]
+    pub status: String,
     pub output: String,
+    #[serde(default)]
+    pub duration_ms: Option<i64>,
+    #[serde(default)]
+    pub started_at: String,
+    #[serde(default)]
+    pub finished_at: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

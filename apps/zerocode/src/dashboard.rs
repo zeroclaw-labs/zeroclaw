@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use crate::client::{
     AgentStatusEntry, CostSummaryResult, CronJobEntry, CronRunEntry, CronSchedule,
-    MemoryEntryResult, MessageEntry, RpcClient, SessionEntry, StatusResult, TuiListEntry,
+    CronTriggerResult, MemoryEntryResult, MessageEntry, RpcClient, SessionEntry, StatusResult,
+    TuiListEntry,
 };
 use crate::mouse;
 use crate::theme;
@@ -28,6 +29,13 @@ const SESSION_MESSAGES_PAGE_SIZE: usize = 100;
 
 pub(crate) enum DashboardMouseAction {
     OpenAgentConfig(String),
+}
+
+struct CronTriggerUpdate {
+    job_id: String,
+    result: Result<CronTriggerResult, String>,
+    jobs: Option<Vec<CronJobEntry>>,
+    runs: Option<Result<Vec<CronRunEntry>, String>>,
 }
 
 // ── Tab enum ─────────────────────────────────────────────────────
@@ -87,6 +95,8 @@ pub(crate) struct Dashboard {
     cron_runs_error: Option<String>,
     cron_trigger_job_id: Option<String>,
     cron_trigger_message: Option<String>,
+    cron_trigger_inflight_job_id: Option<String>,
+    cron_trigger_rx: Option<tokio::sync::mpsc::UnboundedReceiver<CronTriggerUpdate>>,
     memories: Vec<MemoryEntryResult>,
     memory_error: Option<String>,
     cost_error: Option<String>,
@@ -156,6 +166,8 @@ impl Dashboard {
             cron_runs_error: None,
             cron_trigger_job_id: None,
             cron_trigger_message: None,
+            cron_trigger_inflight_job_id: None,
+            cron_trigger_rx: None,
             memories: Vec::new(),
             memory_error: None,
             cost_error: None,
@@ -341,6 +353,8 @@ impl Dashboard {
     // ── Drawing ──────────────────────────────────────────────────
 
     pub(crate) fn draw(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        self.drain_cron_trigger_updates();
+
         // Clear stale data when disconnected so panels don't show
         // ghost entries from a previous daemon lifetime.
         if matches!(
@@ -1600,6 +1614,10 @@ impl Dashboard {
                 &crate::i18n::t("zc-dashboard-detail-last-status"),
                 j.last_status.as_deref().unwrap_or("\u{2014}"),
             ),
+            kv(
+                &crate::i18n::t("zc-dashboard-actions"),
+                &self.cron_action_hint(),
+            ),
         ];
 
         if !j.command.is_empty() {
@@ -1661,12 +1679,36 @@ impl Dashboard {
                 format!("{}: {error}", crate::i18n::t("zc-dashboard-runs-error")),
                 theme::error_style(),
             )));
-        } else if self.cron_runs.is_empty() {
+        } else if self.cron_runs.is_empty()
+            && self.cron_trigger_inflight_job_id.as_deref() != Some(j.id.as_str())
+        {
             lines.push(Line::from(Span::styled(
                 crate::i18n::t("zc-dashboard-no-runs"),
                 theme::dim_style(),
             )));
         } else {
+            if self.cron_trigger_inflight_job_id.as_deref() == Some(j.id.as_str()) {
+                lines.push(Line::from(vec![
+                    Span::styled("#... ", theme::dim_style()),
+                    Span::styled(format!("{} ", truncate(&j.id, 24)), theme::dim_style()),
+                    Span::styled(
+                        format!("{:<10}", crate::i18n::t("zc-dashboard-run-pending-status")),
+                        theme::accent_style(),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{}  {}",
+                            crate::i18n::t("zc-dashboard-run-pending-window"),
+                            format_duration_ms(None)
+                        ),
+                        theme::dim_style(),
+                    ),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", crate::i18n::t("zc-dashboard-run-pending-output")),
+                    theme::dim_style(),
+                )));
+            }
             for run in &self.cron_runs {
                 let status_style = cron_run_status_style(&run.status);
                 let run_window = if run.finished_at.trim().is_empty() {
@@ -1845,7 +1887,7 @@ impl Dashboard {
                 }
             }
             Some(DashboardTabAction::TriggerCron) if self.tab == Tab::Cron => {
-                self.trigger_selected_cron().await;
+                self.trigger_selected_cron();
             }
             _ => {}
         }
@@ -1889,7 +1931,7 @@ impl Dashboard {
                 self.poll_data().await;
             }
             Some(DashboardTabAction::TriggerCron) if self.tab == Tab::Cron => {
-                self.trigger_selected_cron().await;
+                self.trigger_selected_cron();
             }
             Some(DashboardTabAction::JumpEnd) => self.jump_to_end(),
             Some(DashboardTabAction::JumpStart) => self.jump_to_start(),
@@ -1963,42 +2005,106 @@ impl Dashboard {
         }
     }
 
-    async fn trigger_selected_cron(&mut self) {
+    fn trigger_selected_cron(&mut self) {
         let Some(idx) = self.selected_cron_index() else {
             self.cron_trigger_job_id = None;
             self.cron_trigger_message = Some(crate::i18n::t("zc-dashboard-no-job"));
             return;
         };
         let job_id = self.cron_jobs[idx].id.clone();
+        if let Some(inflight_id) = self.cron_trigger_inflight_job_id.as_deref() {
+            self.cron_trigger_message = Some(crate::i18n::t_args(
+                "zc-dashboard-run-already-running",
+                &[("id", inflight_id)],
+            ));
+            return;
+        }
+
         self.cron_trigger_job_id = Some(job_id.clone());
-        match self.rpc.cron_trigger(&job_id).await {
-            Ok(result) => {
-                let status = if result.success {
-                    crate::i18n::t("zc-dashboard-run-succeeded")
-                } else {
-                    crate::i18n::t("zc-dashboard-run-failed")
-                };
-                let output = result.output.trim();
-                self.cron_trigger_message = Some(if output.is_empty() {
-                    format!("{status}: {}", result.id)
-                } else {
-                    format!("{status}: {}\n{}", result.id, output)
-                });
-            }
-            Err(e) => {
-                self.cron_trigger_message = Some(format!(
-                    "{}: {e}",
-                    crate::i18n::t("zc-dashboard-run-failed")
-                ));
-            }
-        }
-        if let Ok(c) = self.rpc.cron_list().await {
-            self.cron_jobs = c.jobs;
-        }
-        if self.detail_open {
-            self.load_cron_runs().await;
-        }
+        self.cron_trigger_message = Some(crate::i18n::t_args(
+            "zc-dashboard-run-running",
+            &[("id", &job_id)],
+        ));
+        self.cron_trigger_inflight_job_id = Some(job_id.clone());
+
+        let rpc = Arc::clone(&self.rpc);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.cron_trigger_rx = Some(rx);
+        tokio::spawn(async move {
+            let result = rpc.cron_trigger(&job_id).await.map_err(|e| e.to_string());
+            let jobs = rpc.cron_list().await.ok().map(|c| c.jobs);
+            let runs = Some(
+                rpc.cron_runs(&job_id, Some(20))
+                    .await
+                    .map(|r| r.runs)
+                    .map_err(|e| e.to_string()),
+            );
+            let _ = tx.send(CronTriggerUpdate {
+                job_id,
+                result,
+                jobs,
+                runs,
+            });
+        });
         self.last_poll = None;
+    }
+
+    fn drain_cron_trigger_updates(&mut self) {
+        let Some(mut rx) = self.cron_trigger_rx.take() else {
+            return;
+        };
+        while let Ok(update) = rx.try_recv() {
+            if self.cron_trigger_inflight_job_id.as_deref() == Some(update.job_id.as_str()) {
+                self.cron_trigger_inflight_job_id = None;
+            }
+            self.cron_trigger_job_id = Some(update.job_id.clone());
+            match update.result {
+                Ok(result) => {
+                    let status = if result.success {
+                        crate::i18n::t("zc-dashboard-run-succeeded")
+                    } else {
+                        crate::i18n::t("zc-dashboard-run-failed")
+                    };
+                    let output = result.output.trim();
+                    self.cron_trigger_message = Some(if output.is_empty() {
+                        format!("{status}: {}", result.id)
+                    } else {
+                        format!("{status}: {}\n{}", result.id, output)
+                    });
+                }
+                Err(e) => {
+                    self.cron_trigger_message = Some(format!(
+                        "{}: {e}",
+                        crate::i18n::t("zc-dashboard-run-failed")
+                    ));
+                }
+            }
+            if let Some(jobs) = update.jobs {
+                self.cron_jobs = jobs;
+            }
+            let selected_matches = self
+                .selected_cron_index()
+                .and_then(|idx| self.cron_jobs.get(idx))
+                .is_some_and(|job| job.id == update.job_id);
+            if selected_matches || self.cron_runs_job_id.as_deref() == Some(update.job_id.as_str())
+            {
+                self.cron_runs_job_id = Some(update.job_id.clone());
+                match update.runs {
+                    Some(Ok(runs)) => {
+                        self.cron_runs = runs;
+                        self.cron_runs_error = None;
+                    }
+                    Some(Err(e)) => {
+                        self.cron_runs_error = Some(e);
+                    }
+                    None => {}
+                }
+            }
+            self.last_poll = None;
+        }
+        if self.cron_trigger_inflight_job_id.is_some() {
+            self.cron_trigger_rx = Some(rx);
+        }
     }
 
     /// Lazy-load the full memory entry for the currently-selected row
@@ -2284,6 +2390,17 @@ impl crate::widgets::HelpContext for Dashboard {
             }
         }
         HelpNode::entries(entries)
+    }
+
+    fn cron_action_hint(&self) -> String {
+        use crate::keymap::{DashboardTabAction as D, action_key_labels};
+
+        let run = action_key_labels(D::TriggerCron).join("/");
+        let refresh = action_key_labels(D::Refresh).join("/");
+        crate::i18n::t_args(
+            "zc-dashboard-cron-action-hint",
+            &[("run", &run), ("refresh", &refresh)],
+        )
     }
 }
 
