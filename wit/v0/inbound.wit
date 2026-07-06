@@ -1,0 +1,43 @@
+package zeroclaw:plugin@0.1.0;
+
+/// Host-provided inbound queue for channel plugins that cannot open their own
+/// listener inside the sandbox.
+///
+/// A channel plugin runs in a WASI context with no network and no sockets, so it
+/// cannot accept inbound traffic directly. Instead the host runs the listener
+/// (a webhook server, a vendor tunnel, a polling client) and deposits each
+/// received message into a per-plugin queue. The plugin drains that queue from
+/// its exported `poll-message` by calling `inbound-poll`. This keeps the
+/// network-facing surface in host Rust while the plugin owns only message
+/// shaping and policy.
+///
+/// The record here is intentionally independent of the `channel` interface's
+/// `inbound-message` so that importing `inbound` does not pull the exported
+/// `channel` interface into the host-import graph. The plugin maps these fields
+/// onto whatever its `poll-message` returns.
+@unstable(feature = plugins-wit-v0)
+interface inbound {
+    /// A message handed to the plugin from a host-run listener.
+    @unstable(feature = plugins-wit-v0)
+    record host-inbound-message {
+        id: string,
+        sender: string,
+        reply-target: string,
+        content: string,
+        channel: string,
+        channel-alias: option<string>,
+        timestamp: u64,
+        thread-ts: option<string>,
+        interruption-scope-id: option<string>,
+        subject: option<string>,
+    }
+
+    /// Return the next queued inbound message, or `none` when the queue is
+    /// empty. Non-blocking: the plugin's `poll-message` is expected to back off
+    /// between empty polls exactly as it does today.
+    inbound-poll: func() -> option<host-inbound-message>;
+
+    /// Number of messages currently waiting in the host queue. Lets a plugin
+    /// drain in batches without a sentinel empty poll between each.
+    inbound-pending: func() -> u32;
+}

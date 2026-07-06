@@ -15,6 +15,7 @@ import {
   Logs,
   Pairing,
   Quickstart,
+  Skills,
   Tools,
 } from './lazyPages';
 
@@ -40,6 +41,7 @@ export const Router = () => (
         <Route path="/agent/:alias/workspace" element={<AgentWorkspaceExplorer />} />
         <Route path="/tools" element={<Tools />} />
         <Route path="/cron" element={<Cron />} />
+        <Route path="/skills" element={<Skills />} />
         <Route path="/integrations" element={<Integrations />} />
         <Route path="/memory" element={<Navigate to="/?tab=memories" replace />} />
         <Route path="/config" element={<Config />} />

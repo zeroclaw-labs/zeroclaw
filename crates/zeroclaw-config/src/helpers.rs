@@ -265,6 +265,7 @@ pub fn make_prop_field(
     credential_class: Option<CredentialSurfaceClass>,
     tab: ConfigTab,
     display_secret_terminals: &[&str],
+    alias_source: Option<crate::traits::AliasSource>,
 ) -> PropFieldInfo {
     let display_value = if is_secret || derived_from_secret {
         match table.and_then(|t| t.get(serde_name)) {
@@ -293,6 +294,7 @@ pub fn make_prop_field(
         derived_from_secret,
         credential_class,
         tab,
+        alias_source,
     }
 }
 
@@ -519,7 +521,9 @@ fn parse_prop_value(value_str: &str, kind: PropKind) -> anyhow::Result<toml::Val
             );
             anyhow::Error::msg(format!("Invalid float value '{value_str}'"))
         })?)),
-        PropKind::String | PropKind::Enum => Ok(toml::Value::String(value_str.to_string())),
+        PropKind::String | PropKind::Enum | PropKind::AliasRef => {
+            Ok(toml::Value::String(value_str.to_string()))
+        }
         PropKind::StringArray => {
             let trimmed = value_str.trim();
             // Accept JSON/TOML array syntax: ["a", "b", "c"]

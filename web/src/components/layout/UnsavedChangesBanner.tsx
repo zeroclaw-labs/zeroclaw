@@ -8,6 +8,8 @@
 
 import { useEffect, useState } from 'react';
 import { Save, X } from 'lucide-react';
+import { Button } from '@/components/ui';
+import { t } from '@/lib/i18n';
 import { ApiError, getSections, type ValidationWarning } from '@/lib/api';
 import {
   useConfigDirtyCount,
@@ -82,54 +84,48 @@ export default function UnsavedChangesBanner() {
   };
 
   return (
-    <div
-      className="border-b px-4 py-2 flex flex-col gap-2"
-      style={{
-        background: 'rgba(245, 158, 11, 0.08)',
-        borderColor: 'rgba(245, 158, 11, 0.25)',
-      }}
-    >
+    <div className="border-b border-status-warning/25 bg-status-warning/[0.08] px-4 py-2 flex flex-col gap-2">
       <div className="flex items-center justify-between gap-3 flex-wrap">
-        <div className="text-sm" style={{ color: 'var(--pc-text-primary)' }}>
-          <span style={{ color: 'var(--color-status-warning, #f59e0b)', fontWeight: 600 }}>
-            {dirtyCount} unsaved {dirtyCount === 1 ? 'change' : 'changes'}
+        <div className="text-sm text-pc-text">
+          <span className="font-semibold text-status-warning">
+            {dirtyCount} {dirtyCount === 1 ? t('unsaved_banner.unsaved_change') : t('unsaved_banner.unsaved_changes')}
           </span>
           {sectionList && (
-            <span style={{ color: 'var(--pc-text-secondary)' }}> — in {sectionList}</span>
+            <span className="text-pc-text-secondary"> {t('unsaved_banner.in_sections_prefix')}{sectionList}</span>
           )}
         </div>
         <div className="flex items-center gap-2">
-          <button
-            type="button"
+          <Button
+            size="sm"
+            variant="ghost"
             onClick={() => {
               discardAll();
               setError(null);
               setWarnings([]);
             }}
             disabled={saving}
-            className="btn-secondary inline-flex items-center gap-1 text-xs px-2.5 py-1"
           >
             <X className="h-3.5 w-3.5" />
-            Discard all
-          </button>
-          <button
-            type="button"
+            {t('unsaved_banner.discard_all')}
+          </Button>
+          <Button
+            size="sm"
+            variant="primary"
             onClick={() => void onSave()}
             disabled={saving}
-            className="btn-electric inline-flex items-center gap-1 text-xs px-2.5 py-1"
           >
             <Save className="h-3.5 w-3.5" />
-            {saving ? 'Saving…' : 'Save all'}
-          </button>
+            {saving ? t('unsaved_banner.saving') : t('unsaved_banner.save_all')}
+          </Button>
         </div>
       </div>
       {error && (
-        <p className="text-xs" style={{ color: 'var(--color-status-error, #f87171)' }}>
+        <p className="text-xs text-status-error">
           {error}
         </p>
       )}
       {warnings.length > 0 && (
-        <ul className="text-xs flex flex-col gap-0.5" style={{ color: 'var(--pc-text-secondary)' }}>
+        <ul className="text-xs flex flex-col gap-0.5 text-pc-text-secondary">
           {warnings.map((w, i) => (
             <li key={`${w.path}-${i}`}>
               ⚠ {w.path}: {w.message}

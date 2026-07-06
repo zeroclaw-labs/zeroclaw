@@ -1,7 +1,11 @@
-use crate::cron::store::{RunCompletionAction, persist_run_completion_state, persist_run_result};
+use crate::cron::store::{
+    RunCompletionAction, persist_manual_run_result, persist_run_completion_state,
+    persist_run_result,
+};
 use crate::cron::{
-    CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, due_jobs,
-    next_run_for_schedule, skip_missed_run, sync_declarative_jobs,
+    CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, claim_job,
+    clear_stale_locks, due_jobs, next_run_for_schedule, release_job, skip_missed_run,
+    sync_declarative_jobs,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -11,6 +15,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::time::{self, Duration};
+use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl};
 use zeroclaw_log::Instrument;
@@ -31,11 +36,104 @@ const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
 /// to connected dashboard/SSE clients.
 pub type EventBroadcast = Option<tokio::sync::broadcast::Sender<serde_json::Value>>;
 
+/// True when an LLM-produced output is a *quiet* `NO_REPLY` sentinel — one that
+/// means "nothing to report" — rather than content meant to be delivered.
+///
+/// Cron jobs and heartbeat tasks routinely instruct the model to answer with
+/// `NO_REPLY` when a health/status check finds nothing worth surfacing. The
+/// delivery path must recognise this sentinel and skip sending, otherwise the
+/// literal string "NO_REPLY" is announced to the channel (the bug reported in
+/// zeroclaw-labs/zeroclaw#2128).
+///
+/// # Why only the *quiet* forms are suppressed
+///
+/// The channel reply-intent classifier (see `zeroclaw-channels`
+/// `parse_reply_intent`) emits kinded forms with distinct operational meaning:
+///
+/// - `NO_REPLY` / `NO_REPLY: <reason>` / `NO_REPLY[INFO]: <reason>` — quiet,
+///   "nothing to report". **Suppressed here.**
+/// - `NO_REPLY[REFUSE]: <reason>` — refused for safety/policy/prompt-injection.
+/// - `NO_REPLY[FAIL]: <reason>` — tried but couldn't fulfil (timeout, bad URL,
+///   missing resource).
+///
+/// In the channel path a refusal or failure still surfaces out-of-band via a
+/// chat reaction (🚫 / ⚠️). Cron and heartbeat *announce* delivery have no such
+/// side channel: if we suppressed `NO_REPLY[FAIL]: database check timed out`,
+/// that operator-visible failure would silently vanish into a DEBUG log. So
+/// only the informational/legacy/bare forms are treated as suppressible here;
+/// refusal and failure kinds fall through and are delivered as visible text.
+///
+/// Matching is case-insensitive and trim-tolerant. The kinded `[...]` form is
+/// only treated as a sentinel when the kind is explicitly `INFO`; any other
+/// bracketed kind (including unknown future kinds) is conservatively delivered.
+#[must_use]
+pub fn is_no_reply_sentinel(output: &str) -> bool {
+    let trimmed = output.trim();
+    if trimmed.eq_ignore_ascii_case("NO_REPLY") {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    // Legacy form (`NO_REPLY: ...`) is documented as "treated as INFO".
+    if lower.starts_with("no_reply:") {
+        return true;
+    }
+    // Kinded form (`NO_REPLY[KIND]: ...`): only the informational kind is a
+    // "nothing to report" sentinel. REFUSE / FAIL (and any other/unknown kind)
+    // carry operator-visible meaning and must be delivered, not suppressed.
+    if let Some(rest) = lower.strip_prefix("no_reply[") {
+        if let Some((kind, _)) = rest.split_once(']') {
+            return kind.trim() == "info";
+        }
+        // Malformed `NO_REPLY[...` with no closing bracket: not a clean
+        // sentinel — deliver it rather than guess.
+        return false;
+    }
+    false
+}
+
+/// The delivery decision for an announce-mode cron job or heartbeat task.
+///
+/// Separated from the I/O so the suppression behaviour can be unit-tested
+/// without a registered `DELIVERY_FN`, a live channel, or the full heartbeat
+/// worker. Both the cron announce site (`deliver_if_configured`) and the
+/// heartbeat worker route their suppression decision through
+/// [`announce_delivery_decision`], so a regression that drops the guard at
+/// either site is caught by the decision tests (zeroclaw-labs/zeroclaw#2128).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnounceDecision {
+    /// Send the output to the configured channel.
+    Deliver,
+    /// Suppress delivery: the output is a quiet `NO_REPLY` sentinel.
+    SuppressNoReply,
+}
+
+impl AnnounceDecision {
+    /// True when the announcement should actually be sent to the channel.
+    #[must_use]
+    pub fn should_deliver(self) -> bool {
+        matches!(self, AnnounceDecision::Deliver)
+    }
+}
+
+/// Decide whether an announce-mode output should be delivered or suppressed.
+///
+/// Suppresses only the *quiet* `NO_REPLY` forms (see [`is_no_reply_sentinel`]);
+/// failure/refusal kinds and all real content are delivered.
+#[must_use]
+pub fn announce_delivery_decision(output: &str) -> AnnounceDecision {
+    if is_no_reply_sentinel(output) {
+        AnnounceDecision::SuppressNoReply
+    } else {
+        AnnounceDecision::Deliver
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum CronDeliveryContext {
     Scheduled,
     ToolManual,
     GatewayManual,
+    RpcManual,
 }
 
 impl CronDeliveryContext {
@@ -47,8 +145,20 @@ impl CronDeliveryContext {
             (Self::ToolManual, false) => "cron_run delivery failed",
             (Self::GatewayManual, true) => "manual cron trigger delivery failed (best_effort)",
             (Self::GatewayManual, false) => "manual cron trigger delivery failed",
+            (Self::RpcManual, true) => "RPC cron trigger delivery failed (best_effort)",
+            (Self::RpcManual, false) => "RPC cron trigger delivery failed",
         }
     }
+}
+
+pub struct ManualCronRunResult {
+    pub job_id: String,
+    pub success: bool,
+    pub status: String,
+    pub output: String,
+    pub duration_ms: i64,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
 }
 
 pub struct CronDeliveryOutcome {
@@ -125,7 +235,63 @@ pub async fn deliver_and_classify_run_result(
     }
 }
 
-pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
+pub async fn run_manual_job(
+    config: &Config,
+    job: &CronJob,
+    context: CronDeliveryContext,
+    event_tx: &EventBroadcast,
+) -> ManualCronRunResult {
+    let started_at = Utc::now();
+    let (success, output) = execute_job_now(config, job).await;
+    let finished_at = Utc::now();
+    let duration_ms = (finished_at - started_at).num_milliseconds();
+    let outcome = deliver_and_classify_run_result(config, job, success, output, context).await;
+
+    if let Err(e) = persist_manual_run_result(
+        config,
+        job,
+        started_at,
+        finished_at,
+        &outcome.status,
+        Some(&outcome.output),
+        duration_ms,
+    ) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
+            "manual cron trigger: failed to persist run history"
+        );
+    }
+
+    if let Some(tx) = event_tx {
+        let _ = tx.send(serde_json::json!({
+            "type": "cron_result",
+            "job_id": job.id,
+            "success": outcome.success,
+            "output": &outcome.output,
+            "manual": true,
+            "timestamp": finished_at.to_rfc3339(),
+        }));
+    }
+
+    ManualCronRunResult {
+        job_id: job.id.clone(),
+        success: outcome.success,
+        status: outcome.status,
+        output: outcome.output,
+        duration_ms,
+        started_at,
+        finished_at,
+    }
+}
+
+pub async fn run(
+    config: Config,
+    event_tx: EventBroadcast,
+    cancel: CancellationToken,
+) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -180,6 +346,26 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
         ),
     }
 
+    // ── Stale-lock recovery: any in-flight lock present at boot was left by a
+    //    run that died with the previous process. Clear it so those jobs are
+    //    eligible again instead of being wedged out of `due_jobs` forever.
+    match clear_stale_locks(&config) {
+        Ok(0) => {}
+        Ok(cleared) => ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"cleared": cleared})),
+            "Cleared stale cron in-flight locks at startup"
+        ),
+        Err(e) => ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+            "Failed to clear stale cron in-flight locks at startup"
+        ),
+    }
+
     // ── Startup catch-up: run ALL overdue jobs before entering the
     //    normal polling loop. The regular loop is capped by `max_tasks`,
     //    which could leave some overdue jobs waiting across many cycles
@@ -198,26 +384,44 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
     }
 
     loop {
-        interval.tick().await;
-        // Keep scheduler liveness fresh even when there are no due jobs.
-        crate::health::mark_component_ok(SCHEDULER_COMPONENT);
+        // `select!` between the interval tick and the cancellation
+        // token so the daemon's shutdown path (`channels_cancel.cancel()`
+        // at daemon/mod.rs:584) reaches the scheduler without waiting
+        // for the next tick — and so the loop returns `Ok(())` cleanly
+        // before the supervisor's `.abort()` fallback would fire.
+        tokio::select! {
+            _ = interval.tick() => {
+                // Keep scheduler liveness fresh even when there are no due jobs.
+                crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
-        let jobs = match due_jobs(&config, Utc::now()) {
-            Ok(jobs) => jobs,
-            Err(e) => {
-                crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "Scheduler query failed"
-                );
-                continue;
+                let jobs = match due_jobs(&config, Utc::now()) {
+                    Ok(jobs) => jobs,
+                    Err(e) => {
+                        crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "Scheduler query failed"
+                        );
+                        continue;
+                    }
+                };
+
+                let jobs = claim_due_jobs(&config, jobs);
+                process_due_jobs(&config, jobs, SCHEDULER_COMPONENT, &event_tx).await;
             }
-        };
-
-        process_due_jobs(&config, jobs, SCHEDULER_COMPONENT, &event_tx).await;
+            _ = cancel.cancelled() => {
+                crate::health::mark_component_ok(SCHEDULER_COMPONENT);
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "Cron scheduler shutting down via cancellation token"
+                );
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -279,6 +483,7 @@ async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
         "Scheduler startup: catching up overdue jobs"
     );
 
+    let jobs = claim_due_jobs(config, jobs);
     process_due_jobs(config, jobs, SCHEDULER_COMPONENT, event_tx).await;
 
     ::zeroclaw_log::record!(
@@ -399,6 +604,13 @@ fn cron_agent_run_security_policy(base: &SecurityPolicy, job: &CronJob) -> Secur
     policy
 }
 
+fn cron_agent_session_path(target: &SessionTarget, run_session_id: &str) -> std::path::PathBuf {
+    match target {
+        SessionTarget::Main => std::path::PathBuf::from("main"),
+        SessionTarget::Isolated => std::path::PathBuf::from(format!("cron-{run_session_id}")),
+    }
+}
+
 async fn execute_job_with_retry(
     config: &Config,
     security: &SecurityPolicy,
@@ -435,6 +647,44 @@ async fn execute_job_with_retry(
     (false, last_output)
 }
 
+/// Atomically claim each due job, returning only the jobs this scheduler won.
+///
+/// Claiming is part of selection: a job already in flight (claimed by an earlier
+/// poll, the startup catch-up, or a concurrent trigger) is dropped here so it is
+/// never launched again while a prior run is still running (issue #6037). Each
+/// claimed job's lock is released in `execute_and_persist_job` once its run
+/// completes. Callers pass jobs sourced from `due_jobs` / `all_overdue_jobs`,
+/// which are always DB-backed, so a failed claim means the row is locked (or the
+/// claim query errored) rather than absent.
+fn claim_due_jobs(config: &Config, jobs: Vec<CronJob>) -> Vec<CronJob> {
+    jobs.into_iter()
+        .filter(|job| match claim_job(config, &job.id, Utc::now()) {
+            Ok(true) => true,
+            Ok(false) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"job_id": job.id})),
+                    "Cron job already in flight; skipping duplicate launch"
+                );
+                false
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})
+                        ),
+                    "Cron job: failed to claim in-flight lock; skipping launch"
+                );
+                false
+            }
+        })
+        .collect()
+}
+
 async fn process_due_jobs(
     config: &Config,
     jobs: Vec<CronJob>,
@@ -447,9 +697,13 @@ async fn process_due_jobs(
     let max_concurrent = config.scheduler.max_concurrent.max(1);
     let mut in_flight = stream::iter(jobs.into_iter().filter_map(|job| {
         // Resolve owning agent per-job. Skip orphans with a warning so a
-        // mis-configured job can't take down the scheduler loop.
+        // mis-configured job can't take down the scheduler loop. The job was
+        // claimed in `claim_due_jobs`, so release the lock on every skip path
+        // here — otherwise a skipped job would stay filtered out of `due_jobs`
+        // until restart instead of being retried next poll (issue #6037).
         let Some(agent_alias) = resolve_owning_agent(config, &job) else {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id})), "Cron job has no owning agent; add the alias to an [agents.<x>].cron_jobs list");
+            let _ = release_job(config, &job.id);
             return None;
         };
         let agent_alias = agent_alias.to_owned();
@@ -457,6 +711,7 @@ async fn process_due_jobs(
             Ok(s) => Arc::new(s),
             Err(e) => {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "agent": agent_alias, "error": format!("{}", e)})), "Cron job: failed to build SecurityPolicy for owning agent");
+                let _ = release_job(config, &job.id);
                 return None;
             }
         };
@@ -523,6 +778,20 @@ async fn execute_and_persist_job(
         finished_at,
     ))
     .await;
+
+    // Release the in-flight lock claimed during selection (`claim_due_jobs`) now
+    // that the run (and its reschedule/disable/delete in `persist_job_result`) is
+    // done. A deleted one-shot row simply releases nothing. If this fails the lock
+    // is recovered by `clear_stale_locks` at the next startup (issue #6037).
+    if let Err(e) = release_job(config, &job.id) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
+            "Cron job: failed to release in-flight lock after run"
+        );
+    }
 
     (job.id.clone(), success, output)
 }
@@ -617,12 +886,12 @@ async fn run_agent_job(
     let mut cron_config = config.clone();
     cron_config.memory.auto_save = false;
 
-    // Assign a unique session ID so memories written during this run can be
-    // purged atomically if the run fails (prevents snowball accumulation).
-    // Doubles as the SubAgent run_id in the tracing span so a failed
-    // memory purge can be correlated with its sub-run.
+    // Assign a unique run ID for tracing. Isolated jobs also use it in the
+    // session path so failed-run memory purge stays scoped per execution.
+    // Main-target jobs reuse the stable `main` session path documented in
+    // `session_target`.
     let run_session_id = uuid::Uuid::new_v4().to_string();
-    let session_path = std::path::PathBuf::from(format!("cron-{run_session_id}"));
+    let session_path = cron_agent_session_path(&job.session_target, &run_session_id);
 
     let subagent_span = zeroclaw_log::info_span!(
         "subagent",
@@ -683,26 +952,28 @@ async fn run_agent_job(
             },
         ),
         Err(e) => {
-            // Purge memories written during this failed run so they don't
-            // pollute future recall and cause context snowball. Routes
-            // through the cron-owning agent's per-agent memory wrapper
-            // so the purge stays scoped to the agent that wrote them.
-            // Sanitize the session key so it matches what the runtime
-            // writes via the orchestrator session-key sanitizer.
-            let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
-                "cli:{}",
-                session_path.display()
-            ));
-            if let Ok(mem) = zeroclaw_memory::create_memory_for_agent(
-                config,
-                agent_alias,
-                config
-                    .model_provider_for_agent(agent_alias)
-                    .and_then(|e| e.api_key.as_deref()),
-            )
-            .await
-            {
-                let _ = mem.purge_session(&mem_session_key).await;
+            if matches!(job.session_target, SessionTarget::Isolated) {
+                // Purge memories written during this failed run so they don't
+                // pollute future recall and cause context snowball. Routes
+                // through the cron-owning agent's per-agent memory wrapper
+                // so the purge stays scoped to the agent that wrote them.
+                // Sanitize the session key so it matches what the runtime
+                // writes via the orchestrator session-key sanitizer.
+                let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
+                    "cli:{}",
+                    session_path.display()
+                ));
+                if let Ok(mem) = zeroclaw_memory::create_memory_for_agent(
+                    config,
+                    agent_alias,
+                    config
+                        .model_provider_for_agent(agent_alias)
+                        .and_then(|e| e.api_key.as_deref()),
+                )
+                .await
+                {
+                    let _ = mem.purge_session(&mem_session_key).await;
+                }
             }
             (false, format!("agent job failed: {e}"))
         }
@@ -839,6 +1110,22 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
 async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
+        return Ok(());
+    }
+
+    // Skip delivery when the job's agent signalled "nothing to report" via the
+    // quiet NO_REPLY sentinel. Without this guard the literal sentinel string is
+    // announced to the channel (zeroclaw-labs/zeroclaw#2128). Failure/refusal
+    // kinds (`NO_REPLY[FAIL]` / `NO_REPLY[REFUSE]`) are *not* suppressed — they
+    // carry operator-visible meaning and are delivered as visible text.
+    if !announce_delivery_decision(output).should_deliver() {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({"job_id": job.id})),
+            "Cron job returned NO_REPLY sentinel — skipping delivery"
+        );
         return Ok(());
     }
 
@@ -1064,6 +1351,60 @@ mod tests {
 
     const TEST_AGENT: &str = "test-agent";
 
+    #[test]
+    fn is_no_reply_sentinel_matches_bare_form_case_insensitively() {
+        assert!(is_no_reply_sentinel("NO_REPLY"));
+        assert!(is_no_reply_sentinel("no_reply"));
+        assert!(is_no_reply_sentinel("No_Reply"));
+        // Trim tolerance.
+        assert!(is_no_reply_sentinel("  NO_REPLY  "));
+        assert!(is_no_reply_sentinel("\nNO_REPLY\n"));
+    }
+
+    #[test]
+    fn is_no_reply_sentinel_matches_quiet_info_and_legacy_prefixes() {
+        // Legacy form is documented as "treated as INFO".
+        assert!(is_no_reply_sentinel("NO_REPLY: nothing to report"));
+        assert!(is_no_reply_sentinel("  NO_REPLY: trimmed  "));
+        // Explicit informational kind.
+        assert!(is_no_reply_sentinel("NO_REPLY[INFO]: all healthy"));
+        assert!(is_no_reply_sentinel("no_reply[info]: all healthy"));
+        // Bracket whitespace tolerance.
+        assert!(is_no_reply_sentinel("NO_REPLY[ info ]: spaced"));
+    }
+
+    #[test]
+    fn is_no_reply_sentinel_does_not_suppress_failure_or_refusal_kinds() {
+        // REFUSE / FAIL carry operator-visible meaning. In the cron/heartbeat
+        // announce context there is no reaction side-channel, so suppressing
+        // them would silently drop a failure/refusal the operator must see
+        // (zeroclaw-labs/zeroclaw#2128 review feedback).
+        assert!(!is_no_reply_sentinel(
+            "NO_REPLY[FAIL]: database check timed out"
+        ));
+        assert!(!is_no_reply_sentinel("no_reply[fail]: timed out"));
+        assert!(!is_no_reply_sentinel(
+            "NO_REPLY[REFUSE]: policy prevented the check"
+        ));
+        assert!(!is_no_reply_sentinel("no_reply[refuse]: blocked"));
+        // Unknown/future kinds are conservatively delivered, not suppressed.
+        assert!(!is_no_reply_sentinel("NO_REPLY[WARN]: disk at 90%"));
+        // Malformed kinded form with no closing bracket is delivered.
+        assert!(!is_no_reply_sentinel("NO_REPLY[INFO without close"));
+    }
+
+    #[test]
+    fn is_no_reply_sentinel_rejects_real_content() {
+        assert!(!is_no_reply_sentinel(""));
+        assert!(!is_no_reply_sentinel("   "));
+        assert!(!is_no_reply_sentinel("All systems nominal"));
+        // Sentinel-looking but not a sentinel: word embedded in real prose.
+        assert!(!is_no_reply_sentinel(
+            "The job returned NO_REPLY which means nothing happened"
+        ));
+        assert!(!is_no_reply_sentinel("NO_REPLYING is the status"));
+    }
+
     async fn test_config(tmp: &TempDir) -> Config {
         let mut config = Config {
             data_dir: tmp.path().join("data"),
@@ -1086,8 +1427,8 @@ mod tests {
             TEST_AGENT.to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: format!("openrouter.{TEST_AGENT}").into(),
-                risk_profile: TEST_AGENT.to_string(),
-                runtime_profile: TEST_AGENT.to_string(),
+                risk_profile: TEST_AGENT.into(),
+                runtime_profile: TEST_AGENT.into(),
                 ..Default::default()
             },
         );
@@ -1199,6 +1540,18 @@ mod tests {
     }
 
     #[test]
+    fn cron_agent_session_path_main_is_stable() {
+        assert_eq!(
+            cron_agent_session_path(&SessionTarget::Main, "ignored"),
+            std::path::PathBuf::from("main")
+        );
+        assert_eq!(
+            cron_agent_session_path(&SessionTarget::Isolated, "abc").to_string_lossy(),
+            "cron-abc"
+        );
+    }
+
+    #[test]
     fn cron_agent_run_security_policy_excludes_scheduler_mutation_tools_by_default() {
         let security = SecurityPolicy::default();
         let mut job = test_job("");
@@ -1241,6 +1594,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn run_job_command_success() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
@@ -1254,6 +1608,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_manual_job_persists_history_and_broadcasts() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        let job = cron::add_shell_job_with_approval(
+            &config,
+            TEST_AGENT,
+            Some("manual-run".into()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo rpc-manual-ok",
+            None,
+            true,
+        )
+        .expect("test job should be persisted");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let event_tx = Some(tx);
+
+        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &event_tx).await;
+
+        assert!(result.success);
+        assert_eq!(result.status, "ok");
+        assert!(result.output.contains("rpc-manual-ok"));
+
+        let updated = cron::get_job(&config, &job.id).expect("job state should update");
+        assert_eq!(updated.last_status.as_deref(), Some("ok"));
+        assert!(
+            updated
+                .last_output
+                .as_deref()
+                .is_some_and(|output| output.contains("rpc-manual-ok"))
+        );
+
+        let runs = cron::list_runs(&config, &job.id, 10).expect("run history should list");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+        assert!(
+            runs[0]
+                .output
+                .as_deref()
+                .unwrap_or("")
+                .contains("rpc-manual-ok")
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("manual trigger should broadcast")
+            .expect("broadcast channel should stay open");
+        assert_eq!(event["type"], "cron_result");
+        assert_eq!(event["job_id"], job.id);
+        assert_eq!(event["success"], true);
+        assert_eq!(event["manual"], true);
+        assert!(
+            event["output"]
+                .as_str()
+                .unwrap_or("")
+                .contains("rpc-manual-ok")
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn run_job_command_failure() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
@@ -1267,6 +1689,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn run_job_command_times_out() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -1311,14 +1734,15 @@ mod tests {
             .entry(TEST_AGENT.into())
             .or_default()
             .allowed_commands = vec!["cat".into()];
-        let job = test_job("cat /etc/passwd");
+        let outside_path = absolute_path_outside_workspace();
+        let job = test_job(&format!("cat {outside_path}"));
         let security = test_security(&config);
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
+        assert!(output.contains(outside_path));
     }
 
     #[tokio::test]
@@ -1330,14 +1754,15 @@ mod tests {
             .entry(TEST_AGENT.into())
             .or_default()
             .allowed_commands = vec!["grep".into()];
-        let job = test_job("grep --file=/etc/passwd root ./src");
+        let outside_path = absolute_path_outside_workspace();
+        let job = test_job(&format!("grep --file={outside_path} root ./src"));
         let security = test_security(&config);
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
+        assert!(output.contains(outside_path));
     }
 
     #[tokio::test]
@@ -1349,17 +1774,19 @@ mod tests {
             .entry(TEST_AGENT.into())
             .or_default()
             .allowed_commands = vec!["grep".into()];
-        let job = test_job("grep -f/etc/passwd root ./src");
+        let outside_path = absolute_path_outside_workspace();
+        let job = test_job(&format!("grep -f{outside_path} root ./src"));
         let security = test_security(&config);
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
+        assert!(output.contains(outside_path));
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn run_job_command_blocks_tilde_user_path_argument() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -1379,6 +1806,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn run_job_command_blocks_input_redirection_path_bypass() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -1432,7 +1860,18 @@ mod tests {
         assert!(output.contains("rate limit exceeded"));
     }
 
+    #[cfg(target_os = "windows")]
+    fn absolute_path_outside_workspace() -> &'static str {
+        r"C:\Windows\win.ini"
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn absolute_path_outside_workspace() -> &'static str {
+        "/etc/passwd"
+    }
+
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn execute_job_with_retry_recovers_after_first_failure() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -1465,6 +1904,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn execute_job_with_retry_exhausts_attempts() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -1918,16 +2358,7 @@ mod tests {
     async fn persist_job_result_delivery_failure_best_effort_marks_degraded() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
-        register_delivery_fn(Box::new(
-            |_config, channel, _target, _thread_id, _output| {
-                Box::pin(async move {
-                    if channel == "fail-delivery" {
-                        anyhow::bail!("synthetic delivery failure");
-                    }
-                    Ok(())
-                })
-            },
-        ));
+        register_recording_delivery_fn();
         let mut job = cron::add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
         job.delivery = DeliveryConfig {
             mode: "announce".into(),
@@ -1962,16 +2393,7 @@ mod tests {
     async fn delivery_failure_classification_preserves_empty_output_evidence() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
-        register_delivery_fn(Box::new(
-            |_config, channel, _target, _thread_id, _output| {
-                Box::pin(async move {
-                    if channel == "fail-delivery" {
-                        anyhow::bail!("synthetic delivery failure");
-                    }
-                    Ok(())
-                })
-            },
-        ));
+        register_recording_delivery_fn();
         let mut job = cron::add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
         job.delivery = DeliveryConfig {
             mode: "announce".into(),
@@ -2038,6 +2460,125 @@ mod tests {
 
         // Default delivery mode is not "announce", so should be a no-op.
         assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
+    }
+
+    /// Process-global recorder for the injected delivery fn. `deliver_announcement`
+    /// reads a single `OnceLock`-backed handler, so the whole test binary shares
+    /// one handler regardless of registration order. This recorder is a superset
+    /// of the failure-contract handler the delivery-classification tests rely on:
+    /// it fails for `channel == "fail-delivery"`, counts deliveries on the
+    /// dedicated `count-delivery` channel, and otherwise just succeeds. Counting
+    /// only the dedicated channel keeps the suppression test's count deltas
+    /// immune to deliveries from other tests running in parallel.
+    static DELIVERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Channel name the recorder counts. Used only by the suppression test.
+    const COUNT_CHANNEL: &str = "count-delivery";
+
+    fn register_recording_delivery_fn() {
+        // Idempotent: register_delivery_fn is a no-op once the OnceLock is set,
+        // so repeated calls across tests are safe and the first writer wins. The
+        // handler honours the `fail-delivery` failure contract used by the
+        // delivery-classification tests so it composes regardless of order.
+        register_delivery_fn(Box::new(|_config, channel, _target, _thread, _output| {
+            Box::pin(async move {
+                if channel == "fail-delivery" {
+                    anyhow::bail!("synthetic delivery failure");
+                }
+                if channel == COUNT_CHANNEL {
+                    DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(())
+            })
+        }));
+    }
+
+    fn announce_job() -> CronJob {
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "announce".to_string(),
+            channel: Some(COUNT_CHANNEL.to_string()),
+            to: Some("chat-id".to_string()),
+            thread_id: None,
+            best_effort: true,
+        };
+        job
+    }
+
+    /// Regression for zeroclaw-labs/zeroclaw#2128: the cron announce delivery
+    /// path must NOT call the channel delivery fn for a quiet `NO_REPLY`
+    /// sentinel, but MUST call it for real content and for failure/refusal
+    /// kinds. This exercises `deliver_if_configured` end-to-end, so it fails if
+    /// the suppression guard is removed from that call site.
+    #[tokio::test]
+    async fn deliver_if_configured_suppresses_no_reply_but_delivers_real_and_failure() {
+        register_recording_delivery_fn();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = announce_job();
+        use std::sync::atomic::Ordering::SeqCst;
+
+        // Quiet sentinel forms must NOT trigger delivery.
+        for quiet in [
+            "NO_REPLY",
+            "NO_REPLY: nothing to report",
+            "NO_REPLY[INFO]: healthy",
+        ] {
+            let before = DELIVERED.load(SeqCst);
+            deliver_if_configured(&config, &job, quiet).await.unwrap();
+            assert_eq!(
+                DELIVERED.load(SeqCst),
+                before,
+                "quiet sentinel {quiet:?} must be suppressed (no delivery)"
+            );
+        }
+
+        // Real content must be delivered.
+        let before = DELIVERED.load(SeqCst);
+        deliver_if_configured(&config, &job, "All systems nominal")
+            .await
+            .unwrap();
+        assert_eq!(
+            DELIVERED.load(SeqCst),
+            before + 1,
+            "real content must be delivered"
+        );
+
+        // Failure / refusal kinds must be delivered (operator-visible).
+        for visible in [
+            "NO_REPLY[FAIL]: database check timed out",
+            "NO_REPLY[REFUSE]: policy prevented the check",
+        ] {
+            let before = DELIVERED.load(SeqCst);
+            deliver_if_configured(&config, &job, visible).await.unwrap();
+            assert_eq!(
+                DELIVERED.load(SeqCst),
+                before + 1,
+                "failure/refusal kind {visible:?} must be delivered, not suppressed"
+            );
+        }
+    }
+
+    /// Mirrors the heartbeat worker's suppression decision (daemon/mod.rs).
+    /// The worker computes `suppress_delivery` from `announce_delivery_decision`,
+    /// so this locks the two user-visible heartbeat behaviors from #2128:
+    /// a `NO_REPLY` heartbeat sends nothing, while real output (and the
+    /// empty-output `💓 heartbeat task completed` fallback) still deliver.
+    #[test]
+    fn heartbeat_announce_decision_matches_worker_behavior() {
+        // NO_REPLY heartbeat: suppressed.
+        assert!(!announce_delivery_decision("NO_REPLY").should_deliver());
+        assert!(!announce_delivery_decision("NO_REPLY[INFO]: all good").should_deliver());
+        // Non-sentinel heartbeat output: delivered.
+        assert!(announce_delivery_decision("disk usage 42%").should_deliver());
+        // Empty-output fallback string the worker builds: must deliver.
+        assert!(
+            announce_delivery_decision("💓 heartbeat task completed: db health").should_deliver(),
+            "the empty-output heartbeat fallback must never be mistaken for a sentinel"
+        );
+        // Failure/refusal kinds: delivered (operator-visible).
+        assert!(announce_delivery_decision("NO_REPLY[FAIL]: db timed out").should_deliver());
+        assert!(announce_delivery_decision("NO_REPLY[REFUSE]: blocked by policy").should_deliver());
     }
 
     #[tokio::test]
@@ -2160,6 +2701,61 @@ mod tests {
         assert_eq!(event["job_id"], "test-job");
         assert_eq!(event["success"], false);
         assert!(event["timestamp"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn claim_due_jobs_skips_in_flight_job() {
+        // Regression for #6037: once a due job is claimed for execution, a
+        // subsequent selection pass must not pick it up again until the prior
+        // run releases it — otherwise a job that runs longer than the poll
+        // interval is launched repeatedly.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+
+        let claimed = claim_due_jobs(&config, vec![job.clone()]);
+        assert_eq!(claimed.len(), 1, "first selection claims the job");
+
+        let claimed_again = claim_due_jobs(&config, vec![job.clone()]);
+        assert!(
+            claimed_again.is_empty(),
+            "an in-flight job must be skipped by the next selection pass"
+        );
+
+        cron::release_job(&config, &job.id).unwrap();
+        let after_release = claim_due_jobs(&config, vec![job]);
+        assert_eq!(
+            after_release.len(),
+            1,
+            "after release the job is selectable again"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_due_jobs_releases_lock_for_skipped_orphan_job() {
+        // A job claimed for execution but then skipped by process_due_jobs (here
+        // an orphan with no owning agent) must have its in-flight lock released,
+        // so it is retried on the next poll instead of being wedged out of
+        // due_jobs until restart (issue #6037).
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        // Insert a real, claimable DB row under a configured agent, then drive
+        // process_due_jobs with an in-memory view whose agent_alias is cleared.
+        // With an empty alias and an id bound to no [agents.<x>].cron_jobs list,
+        // resolve_owning_agent returns None, so the job is skipped as an orphan.
+        let job = cron::add_job(&config, TEST_AGENT, "* * * * *", "echo orphan").unwrap();
+        assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
+        let orphan = CronJob {
+            agent_alias: String::new(),
+            ..job.clone()
+        };
+
+        process_due_jobs(&config, vec![orphan], &unique_component("orphan"), &None).await;
+
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "a skipped orphan job's in-flight lock must be released, not leaked"
+        );
     }
 
     #[tokio::test]

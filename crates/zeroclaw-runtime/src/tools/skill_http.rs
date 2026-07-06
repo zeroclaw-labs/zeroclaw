@@ -29,7 +29,7 @@ impl SkillHttpTool {
     /// to prevent collisions with built-in tools.
     pub fn new(skill_name: &str, tool: &crate::skills::SkillTool) -> Self {
         Self {
-            tool_name: format!("{}__{}", skill_name, tool.name),
+            tool_name: crate::tools::skill_tool::composed_tool_name(skill_name, &tool.name),
             tool_description: tool.description.clone(),
             url_template: tool.command.clone(),
             args: tool.args.clone(),
@@ -90,8 +90,30 @@ impl Tool for SkillHttpTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let url = self.substitute_args(&args);
 
-        // Validate URL scheme
-        if !url.starts_with("http://") && !url.starts_with("https://") {
+        // Parse with `reqwest::Url` instead of hand-rolled scheme check. The
+        // pre-fix check only verified the URL prefix, so a template like
+        // `http://{{user}}@{{host}}/...` with attacker-controlled `{{user}}`
+        // could land `http://attacker@127.0.0.1/...` (userinfo bypass).
+        // Reject userinfo outright (parser-level SSRF defense; no skill-author
+        // opt-out). Mirrors the `text_browser` fix in PR #8635.
+        let parsed = match reqwest::Url::parse(&url) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Invalid URL: {e}")),
+                });
+            }
+        };
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("URL userinfo is not allowed".to_string()),
+            });
+        }
+        if !matches!(parsed.scheme(), "http" | "https") {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -165,6 +187,7 @@ impl Tool for SkillHttpTool {
 mod tests {
     use super::*;
     use crate::skills::SkillTool;
+    use serde_json::json;
 
     fn sample_http_tool() -> SkillTool {
         let mut args = HashMap::new();
@@ -178,6 +201,26 @@ mod tests {
             args,
             target: None,
             locked_args: HashMap::new(),
+            timeout_secs: None,
+        }
+    }
+
+    fn wttr_in_weather_tool() -> SkillTool {
+        let mut args = HashMap::new();
+        args.insert(
+            "location".to_string(),
+            "Location to get weather for".to_string(),
+        );
+
+        SkillTool {
+            name: "weather_lookup".to_string(),
+            description: "Fetch weather from wttr.in".to_string(),
+            kind: "http".to_string(),
+            command: "https://wttr.in/{{location}}?format=j1".to_string(),
+            args,
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: None,
         }
     }
 
@@ -211,12 +254,60 @@ mod tests {
     }
 
     #[test]
+    fn skill_http_can_model_minimal_wttr_weather_lookup() {
+        let tool = SkillHttpTool::new("weather_skill", &wttr_in_weather_tool());
+
+        assert_eq!(tool.name(), "weather_skill__weather_lookup");
+        assert_eq!(tool.description(), "Fetch weather from wttr.in");
+
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["location"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["location"]["description"],
+            "Location to get weather for"
+        );
+        assert!(
+            schema["required"]
+                .as_array()
+                .expect("required array")
+                .iter()
+                .any(|name| name == "location")
+        );
+
+        let url = tool.substitute_args(&serde_json::json!({"location": "London"}));
+        assert_eq!(url, "https://wttr.in/London?format=j1");
+    }
+
+    #[test]
     fn skill_http_tool_spec_roundtrip() {
         let tool = SkillHttpTool::new("weather_skill", &sample_http_tool());
         let spec = tool.spec();
         assert_eq!(spec.name, "weather_skill__get_weather");
         assert_eq!(spec.description, "Fetch weather for a city");
         assert_eq!(spec.parameters["type"], "object");
+    }
+
+    #[test]
+    fn skill_http_tool_name_sanitized_for_provider_regex() {
+        // A plugin-namespaced HTTP skill (colons) or a dotted tool name must
+        // still yield a provider-valid function name, the same as shell/builtin
+        // tools, so #6678 cannot survive through the HTTP registration path.
+        let mut st = sample_http_tool();
+        st.name = "fetch.weather".to_string();
+        let tool = SkillHttpTool::new("pr-review-toolkit:code-reviewer", &st);
+        let name = tool.name();
+        assert!(
+            !name.is_empty()
+                && name.len() <= 64
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "HTTP skill tool name `{name}` is not provider-valid",
+        );
+        // A valid name must still pass through unchanged (no spurious suffix).
+        let plain = SkillHttpTool::new("weather_skill", &sample_http_tool());
+        assert_eq!(plain.name(), "weather_skill__get_weather");
     }
 
     #[test]
@@ -229,9 +320,92 @@ mod tests {
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillHttpTool::new("s", &st);
         let schema = tool.parameters_schema();
         assert!(schema["properties"].as_object().unwrap().is_empty());
+    }
+
+    // ── SSRF guards (audit-zeroclaw-2026-07-03.md follow-up finding) ──
+    //
+    // The URL template is operator-trust (skill author), but `{{arg_name}}`
+    // is LLM-supplied at runtime. A template like `http://{{user}}@{{host}}`
+    // with attacker-controlled `{{user}}` would yield a userinfo bypass
+    // (`http://attacker@127.0.0.1/...`). Reject userinfo at the parser layer
+    // so the LLM cannot smuggle a private host through credential syntax.
+
+    fn http_tool_with_command(command: &str) -> SkillHttpTool {
+        let st = SkillTool {
+            name: "fetch".to_string(),
+            description: "test".to_string(),
+            kind: "http".to_string(),
+            command: command.to_string(),
+            args: HashMap::new(),
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: None,
+        };
+        SkillHttpTool::new("test_skill", &st)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_userinfo_targeting_private_host() {
+        // `{{user}}` substitution yields a userinfo prefix. Parser-level
+        // reject, no opt-out (the skill author cannot allow userinfo even
+        // for legitimate credentials in URL).
+        let tool = http_tool_with_command("https://{{user}}@api.example.com/path");
+        let result = tool
+            .execute(json!({"user": "attacker@127.0.0.1"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("userinfo"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_userinfo_with_password() {
+        let tool = http_tool_with_command("https://{{u}}:{{p}}@api.example.com/path");
+        let result = tool
+            .execute(json!({"u": "alice", "p": "secret@10.0.0.1"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("userinfo"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_userinfo_even_when_host_is_public() {
+        // The userinfo reject is parser-level, not policy-level. A
+        // legitimate-looking public host with userinfo is still rejected
+        // so the gate cannot be bypassed by mixing public/private strings.
+        let tool = http_tool_with_command("https://{{u}}@example.com/path");
+        let result = tool.execute(json!({"u": "anyone"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("userinfo"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_non_http_scheme() {
+        // `file://`, `gopher://`, etc. must still be rejected.
+        let tool = http_tool_with_command("file://etc/passwd");
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("http") || err.contains("Invalid URL"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_malformed_url() {
+        // The skill author supplied a template with no scheme, only a host.
+        // `reqwest::Url::parse` rejects it as RelativeUrlWithoutBase.
+        let tool = http_tool_with_command("example.com/ping");
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(err.contains("Invalid URL"), "got: {err}");
     }
 }

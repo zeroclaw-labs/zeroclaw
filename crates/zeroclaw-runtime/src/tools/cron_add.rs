@@ -564,8 +564,8 @@ mod tests {
         config.agents.entry(TEST_AGENT.to_string()).or_insert(
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: format!("openrouter.{TEST_AGENT}").into(),
-                risk_profile: TEST_AGENT.to_string(),
-                runtime_profile: TEST_AGENT.to_string(),
+                risk_profile: TEST_AGENT.into(),
+                runtime_profile: TEST_AGENT.into(),
                 ..Default::default()
             },
         );
@@ -1176,6 +1176,10 @@ mod tests {
         assert!(
             channel_enum.iter().any(|value| value == "webhook"),
             "delivery.channel enum must include webhook"
+        );
+        assert!(
+            channel_enum.iter().any(|value| value == "whatsapp"),
+            "delivery.channel enum must include whatsapp"
         );
 
         let delivery_props = schema["properties"]["delivery"]["properties"]

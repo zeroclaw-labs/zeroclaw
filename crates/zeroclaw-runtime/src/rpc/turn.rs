@@ -1,6 +1,7 @@
 //! Shared turn execution. Single source of truth for spawn-drain-cancel.
 
 use crate::agent::agent::{Agent, StreamedTurnError, StreamedTurnSuccess, TurnEvent};
+use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
 use crate::agent::loop_::is_tool_loop_cancelled;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
@@ -51,6 +52,7 @@ pub async fn execute_turn<F, Fut>(
     prompt: String,
     cancel: CancellationToken,
     attribution: TurnAttribution,
+    cost_context: Option<ToolLoopCostTrackingContext>,
     on_event: F,
 ) -> Result<TurnOutcome, TurnError>
 where
@@ -75,9 +77,25 @@ where
                 model = %attribution.model,
                 channel = %attribution.channel,
             );
-            guard
-                .turn_streamed_with_steering_state(&prompt, event_tx, Some(cancel_clone), None)
-                .instrument(span)
+            // Scope the cost-tracking context so this turn's per-call token
+            // usage is persisted and counted against budgets.
+            // `turn_streamed_with_steering_state` reuses this outer scope; with
+            // no scope set it falls back to a tracker-less `usage_only` context
+            // and model cost is silently dropped (#5221 regression). The scope
+            // must live INSIDE the spawned task — task-locals don't cross the
+            // spawn boundary.
+            TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(
+                    cost_context,
+                    guard
+                        .turn_streamed_with_steering_state(
+                            &prompt,
+                            event_tx,
+                            Some(cancel_clone),
+                            None,
+                        )
+                        .instrument(span),
+                )
                 .await
         })
         .await
@@ -373,6 +391,149 @@ mod tests {
             matches!(outcome, Err(TurnError::AgentError(_))),
             "a genuine agent failure must surface as an error, not a silent \
              cancel"
+        );
+    }
+
+    /// Regression guard for #5221: a turn driven through `execute_turn` with a
+    /// real cost-tracking context must persist token usage to the tracker. The
+    /// RPC/zerocode-TUI path previously ran the turn without scoping the cost
+    /// context, so `turn_streamed_with_steering_state` fell back to a
+    /// tracker-less `usage_only` context and model cost was silently dropped.
+    #[tokio::test]
+    async fn execute_turn_scopes_cost_context_so_usage_is_persisted() {
+        use crate::agent::agent::Agent;
+        use crate::agent::dispatcher::NativeToolDispatcher;
+        use crate::cost::CostTracker;
+        use crate::observability::{NoopObserver, Observer};
+        use async_trait::async_trait;
+        use std::collections::HashMap;
+        use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+        use zeroclaw_api::model_provider::ModelProvider;
+        use zeroclaw_memory::Memory;
+        use zeroclaw_providers::ChatRequest;
+
+        // Minimal provider that returns a final answer carrying non-zero token
+        // usage on the non-streaming `chat` path (the default the engine takes
+        // when the provider does not advertise streaming).
+        struct UsageProvider;
+
+        #[async_trait]
+        impl ModelProvider for UsageProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok("ok".into())
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(1_000),
+                        cached_input_tokens: None,
+                        output_tokens: Some(200),
+                    }),
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        impl Attributable for UsageProvider {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+            fn alias(&self) -> &str {
+                "mock-provider"
+            }
+        }
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let workspace = tempfile::TempDir::new().expect("temp dir");
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    track_per_agent: true,
+                    ..zeroclaw_config::schema::CostConfig::default()
+                },
+                workspace.path(),
+            )
+            .expect("cost tracker should initialize"),
+        );
+        let pricing = Arc::new(HashMap::from([(
+            "mock-provider".to_string(),
+            HashMap::from([
+                ("test-model.input".to_string(), 3.0),
+                ("test-model.output".to_string(), 15.0),
+            ]),
+        )]));
+        let cost_context = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing)
+            .with_agent_alias("rpc-agent");
+
+        let agent = Agent::builder()
+            .model_provider(Box::new(UsageProvider))
+            .tools(vec![])
+            .memory(mem)
+            .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("test-model".into())
+            .model_provider_name("mock-provider".into())
+            .agent_alias("rpc-agent".into())
+            .build()
+            .expect("agent builder should succeed");
+
+        let outcome = execute_turn(
+            Arc::new(Mutex::new(agent)),
+            "hello".to_string(),
+            CancellationToken::new(),
+            TurnAttribution {
+                session_key: Some("s1".into()),
+                agent_alias: "rpc-agent".into(),
+                model_provider: "mock-provider".into(),
+                model: "test-model".into(),
+                channel: "rpc",
+            },
+            Some(cost_context),
+            noop,
+        )
+        .await
+        .expect("turn should complete");
+        assert!(
+            matches!(outcome, TurnOutcome::Completed { .. }),
+            "turn should complete normally"
+        );
+
+        let summary = tracker.get_summary().expect("cost summary");
+        assert_eq!(
+            summary.request_count, 1,
+            "execute_turn must scope the cost context so the turn's usage is \
+             persisted (#5221)"
+        );
+        assert_eq!(summary.total_tokens, 1_200);
+        let agent_summary = tracker
+            .get_summary_for_agent("rpc-agent")
+            .expect("agent-scoped summary");
+        assert_eq!(
+            agent_summary.request_count, 1,
+            "the agent alias must flow through to the persisted cost record"
         );
     }
 }

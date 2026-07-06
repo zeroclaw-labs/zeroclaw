@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
+use zeroclaw_api::ingress::IngressContext;
 use zeroclaw_api::model_provider::TokenUsage;
 use zeroclaw_providers::{ChatResponse, ToolCall};
 
@@ -443,42 +444,52 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
     })];
     let mut history = vec![ChatMessage::user("hi")];
     let (dtx, mut drx) = mpsc::channel(256);
-    let result = crate::agent::loop_::run_tool_call_loop(
-        &provider,
-        &mut history,
-        &tools_registry,
-        &observability::NoopObserver {},
-        "mock",
-        "mock-model",
-        None,
-        true,
-        None,
-        "cli",
-        None,
-        &zeroclaw_config::schema::MultimodalConfig::default(),
-        5,
-        None,
-        Some(dtx),
-        None,
-        &[],
-        &[],
-        None,
-        None,
-        &zeroclaw_config::schema::PacingConfig::default(),
-        false,
-        false,
-        30_000,
-        100_000,
-        None,
-        None,
-        None,
-        None,
-        None, // event_tx
-        None, // steering
-        None, // new_messages_out
-        &crate::agent::loop_::LoopKnobs::default(),
-        None,
-    )
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let result = crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+        exec: crate::agent::loop_::ResolvedAgentExecution {
+            model_access: crate::agent::loop_::ResolvedModelAccess {
+                model_provider: &provider,
+                provider_name: "mock",
+                model: "mock-model",
+                temperature: None,
+            },
+            tools_registry: &tools_registry,
+            observer: &observability::NoopObserver {},
+            silent: true,
+            approval: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 5,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 30_000,
+            context_token_budget: 100_000,
+            receipt_generator: None,
+            knobs: &crate::agent::loop_::LoopKnobs::default(),
+        },
+        history: &mut history,
+        channel_name: "cli",
+        channel_reply_target: None,
+        cancellation_token: None,
+        on_delta: Some(dtx),
+        shared_budget: None,
+        channel: None,
+        collected_receipts: None,
+        event_tx: None,
+        steering: None,
+        new_messages_out: None,
+        image_cache: None,
+        // Phase 1: stamp Internal/Trusted. Real per-transport
+        // stamping is PR C (RFC #6971 §4).
+        ingress: IngressContext::internal(),
+        agent_alias: None,
+        turn_id: &turn_id,
+    })
     .await
     .expect("loop should succeed");
     assert!(result.contains("after-tool answer"));
@@ -830,45 +841,55 @@ async fn safety_net_task_locals_probe_per_entry_path() {
         seen: Arc::clone(&seen),
     })];
     let mut history = vec![ChatMessage::user("probe")];
+    let turn_id = uuid::Uuid::new_v4().to_string();
     crate::agent::loop_::scope_thread_id(
         Some("thread-1".into()),
         crate::agent::loop_::scope_session_key(Some("session-1".into()), async {
-            crate::agent::loop_::run_tool_call_loop(
-                &provider,
-                &mut history,
-                &tools_registry,
-                &observability::NoopObserver {},
-                "mock",
-                "mock-model",
-                None,
-                true,
-                None,
-                "cli",
-                None,
-                &zeroclaw_config::schema::MultimodalConfig::default(),
-                5,
-                None,
-                None,
-                None,
-                &[],
-                &[],
-                None,
-                None,
-                &zeroclaw_config::schema::PacingConfig::default(),
-                false,
-                false,
-                30_000,
-                100_000,
-                None,
-                None,
-                None,
-                None,
-                None, // event_tx
-                None, // steering
-                None, // new_messages_out
-                &crate::agent::loop_::LoopKnobs::default(),
-                None,
-            )
+            crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                exec: crate::agent::loop_::ResolvedAgentExecution {
+                    model_access: crate::agent::loop_::ResolvedModelAccess {
+                        model_provider: &provider,
+                        provider_name: "mock",
+                        model: "mock-model",
+                        temperature: None,
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observability::NoopObserver {},
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    max_tool_iterations: 5,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 30_000,
+                    context_token_budget: 100_000,
+                    receipt_generator: None,
+                    knobs: &crate::agent::loop_::LoopKnobs::default(),
+                },
+                history: &mut history,
+                channel_name: "cli",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                // Phase 1: stamp Internal/Trusted. Real per-transport
+                // stamping is PR C (RFC #6971 §4).
+                ingress: IngressContext::internal(),
+                agent_alias: None,
+                turn_id: &turn_id,
+            })
             .await
         }),
     )

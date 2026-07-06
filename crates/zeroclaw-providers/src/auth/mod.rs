@@ -1,8 +1,10 @@
 pub mod anthropic_token;
+pub mod email_oauth2;
 pub mod gemini_oauth;
 pub mod oauth_common;
 pub mod openai_oauth;
 pub mod profiles;
+pub mod xai_oauth;
 
 use crate::auth::openai_oauth::refresh_access_token;
 use crate::auth::profiles::{
@@ -18,6 +20,7 @@ use zeroclaw_config::schema::Config;
 const OPENAI_CODEX_PROVIDER: &str = "openai-codex";
 const ANTHROPIC_PROVIDER: &str = "anthropic";
 const GEMINI_PROVIDER: &str = "gemini";
+const XAI_PROVIDER: &str = "xai";
 const DEFAULT_PROFILE_NAME: &str = "default";
 const OPENAI_REFRESH_SKEW_SECS: u64 = 90;
 const OPENAI_REFRESH_FAILURE_BACKOFF_SECS: u64 = 10;
@@ -71,6 +74,21 @@ impl AuthService {
         set_active: bool,
     ) -> Result<AuthProfile> {
         let mut profile = AuthProfile::new_oauth(GEMINI_PROVIDER, profile_name, token_set);
+        profile.account_id = account_id;
+        self.store
+            .upsert_profile(profile.clone(), set_active)
+            .await?;
+        Ok(profile)
+    }
+
+    pub async fn store_xai_tokens(
+        &self,
+        profile_name: &str,
+        token_set: crate::auth::profiles::TokenSet,
+        account_id: Option<String>,
+        set_active: bool,
+    ) -> Result<AuthProfile> {
+        let mut profile = AuthProfile::new_oauth(XAI_PROVIDER, profile_name, token_set);
         profile.account_id = account_id;
         self.store
             .upsert_profile(profile.clone(), set_active)
@@ -366,12 +384,219 @@ impl AuthService {
         Ok(updated.token_set.map(|t| t.access_token))
     }
 
+    /// Return a valid xAI OAuth access token, refreshing it when the cached
+    /// token is close to expiry and a refresh token is available.
+    pub async fn get_valid_xai_access_token(
+        &self,
+        profile_override: Option<&str>,
+    ) -> Result<Option<String>> {
+        let data = self.store.load().await?;
+        let Some(profile_id) = select_profile_id(&data, XAI_PROVIDER, profile_override) else {
+            return Ok(None);
+        };
+
+        let Some(profile) = data.profiles.get(&profile_id) else {
+            return Ok(None);
+        };
+
+        let Some(token_set) = profile.token_set.as_ref() else {
+            anyhow::bail!("xAI auth profile is not OAuth-based: {profile_id}");
+        };
+
+        if !token_set.is_expiring_within(Duration::from_secs(OPENAI_REFRESH_SKEW_SECS)) {
+            return Ok(Some(token_set.access_token.clone()));
+        }
+
+        let Some(refresh_token) = token_set.refresh_token.clone() else {
+            return Ok(Some(token_set.access_token.clone()));
+        };
+
+        let refresh_lock = refresh_lock_for_profile(&profile_id);
+        let _guard = refresh_lock.lock().await;
+
+        let data = self.store.load().await?;
+        let Some(latest_profile) = data.profiles.get(&profile_id) else {
+            return Ok(None);
+        };
+        let Some(latest_tokens) = latest_profile.token_set.as_ref() else {
+            anyhow::bail!("xAI auth profile is missing token set: {profile_id}");
+        };
+        if !latest_tokens.is_expiring_within(Duration::from_secs(OPENAI_REFRESH_SKEW_SECS)) {
+            return Ok(Some(latest_tokens.access_token.clone()));
+        }
+
+        let refresh_token = latest_tokens.refresh_token.clone().unwrap_or(refresh_token);
+        if let Some(remaining) = refresh_backoff_remaining(&profile_id) {
+            anyhow::bail!(
+                "xAI token refresh is in backoff for {remaining}s due to previous failures"
+            );
+        }
+
+        let mut refreshed =
+            match refresh_xai_access_token_with_retries(&self.client, &refresh_token).await {
+                Ok(tokens) => {
+                    clear_refresh_backoff(&profile_id);
+                    tokens
+                }
+                Err(err) => {
+                    set_refresh_backoff(
+                        &profile_id,
+                        Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
+                    );
+                    return Err(err);
+                }
+            };
+        if refreshed.refresh_token.is_none() {
+            refreshed
+                .refresh_token
+                .clone_from(&latest_tokens.refresh_token);
+        }
+
+        let account_id = refreshed
+            .id_token
+            .as_deref()
+            .or(Some(refreshed.access_token.as_str()))
+            .and_then(xai_oauth::extract_account_id_from_jwt)
+            .or_else(|| latest_profile.account_id.clone());
+
+        let updated = self
+            .store
+            .update_profile(&profile_id, |profile| {
+                profile.kind = AuthProfileKind::OAuth;
+                profile.token_set = Some(refreshed.clone());
+                profile.account_id.clone_from(&account_id);
+                Ok(())
+            })
+            .await?;
+
+        Ok(updated.token_set.map(|t| t.access_token))
+    }
+
     /// Get Gemini profile info (for model_provider initialization).
     pub async fn get_gemini_profile(
         &self,
         profile_override: Option<&str>,
     ) -> Result<Option<AuthProfile>> {
         self.get_profile(GEMINI_PROVIDER, profile_override).await
+    }
+
+    // ── Generic email OAuth2 ──────────────────────────────────────────────────
+
+    /// Store an OAuth2 token set for an email channel (keyed by channel alias,
+    /// e.g. `"email.hotmail"`). The alias is used as the profile's
+    /// `model_provider` field so profiles are namespaced per channel instance.
+    pub async fn store_email_oauth2_tokens(
+        &self,
+        channel_alias: &str,
+        profile_name: &str,
+        token_set: TokenSet,
+    ) -> Result<AuthProfile> {
+        let profile = AuthProfile::new_oauth(channel_alias, profile_name, token_set);
+        self.store.upsert_profile(profile.clone(), true).await?;
+        Ok(profile)
+    }
+
+    /// Return a valid IMAP OAuth2 bearer token for the given email channel alias.
+    ///
+    /// If the stored access token is near expiry and a refresh token is
+    /// available, a refresh is attempted using the supplied OAuth2 config
+    /// parameters. Returns `None` if no profile exists for this channel.
+    pub async fn get_valid_email_oauth2_token(
+        &self,
+        channel_alias: &str,
+        profile_override: Option<&str>,
+        token_url: &str,
+        client_id: &str,
+        scopes: &[String],
+    ) -> Result<Option<String>> {
+        const SKEW_SECS: u64 = 90;
+
+        let data = self.store.load().await?;
+        let Some(profile_id) = select_profile_id(&data, channel_alias, profile_override) else {
+            return Ok(None);
+        };
+
+        let Some(profile) = data.profiles.get(&profile_id) else {
+            return Ok(None);
+        };
+
+        let Some(token_set) = profile.token_set.as_ref() else {
+            anyhow::bail!("Email OAuth2 profile is not OAuth-based: {profile_id}");
+        };
+
+        if !token_set.is_expiring_within(Duration::from_secs(SKEW_SECS)) {
+            return Ok(Some(token_set.access_token.clone()));
+        }
+
+        let Some(refresh_token) = token_set.refresh_token.clone() else {
+            // No refresh token; return the (possibly expired) access token and
+            // let the IMAP auth failure surface as a log event.
+            return Ok(Some(token_set.access_token.clone()));
+        };
+
+        let refresh_lock = refresh_lock_for_profile(&profile_id);
+        let _guard = refresh_lock.lock().await;
+
+        // Re-load after acquiring lock to avoid duplicate refreshes.
+        let data = self.store.load().await?;
+        let Some(latest_profile) = data.profiles.get(&profile_id) else {
+            return Ok(None);
+        };
+        let Some(latest_tokens) = latest_profile.token_set.as_ref() else {
+            anyhow::bail!("Email OAuth2 profile is missing token set: {profile_id}");
+        };
+        if !latest_tokens.is_expiring_within(Duration::from_secs(SKEW_SECS)) {
+            return Ok(Some(latest_tokens.access_token.clone()));
+        }
+
+        let refresh_token = latest_tokens.refresh_token.clone().unwrap_or(refresh_token);
+
+        if let Some(remaining) = refresh_backoff_remaining(&profile_id) {
+            anyhow::bail!(
+                "Email OAuth2 token refresh is in backoff for {remaining}s due to previous failures"
+            );
+        }
+
+        let mut refreshed = match refresh_email_access_token_with_retries(
+            &self.client,
+            token_url,
+            client_id,
+            &refresh_token,
+            scopes,
+        )
+        .await
+        {
+            Ok(tokens) => {
+                clear_refresh_backoff(&profile_id);
+                tokens
+            }
+            Err(err) => {
+                if !is_non_retryable_oauth_refresh_error(&err) {
+                    set_refresh_backoff(
+                        &profile_id,
+                        Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
+                    );
+                }
+                return Err(err);
+            }
+        };
+
+        if refreshed.refresh_token.is_none() {
+            refreshed
+                .refresh_token
+                .clone_from(&latest_tokens.refresh_token);
+        }
+
+        let updated = self
+            .store
+            .update_profile(&profile_id, |profile| {
+                profile.kind = AuthProfileKind::OAuth;
+                profile.token_set = Some(refreshed.clone());
+                Ok(())
+            })
+            .await?;
+
+        Ok(updated.token_set.map(|t| t.access_token))
     }
 }
 
@@ -389,6 +614,8 @@ pub enum AuthProvider {
     Anthropic,
     #[serde(alias = "google", alias = "vertex")]
     Gemini,
+    #[serde(alias = "grok")]
+    Xai,
 }
 
 impl std::str::FromStr for AuthProvider {
@@ -408,7 +635,7 @@ impl std::str::FromStr for AuthProvider {
                 "auth: unknown auth provider"
             );
             anyhow::Error::msg(format!(
-                "Unknown auth provider `{normalized}`. Supported: openai-codex, anthropic, gemini.",
+                "Unknown auth provider `{normalized}`. Supported: openai-codex, anthropic, gemini, xai.",
             ))
         })
     }
@@ -423,6 +650,7 @@ impl AuthProvider {
             Self::OpenaiCodex => OPENAI_CODEX_PROVIDER,
             Self::Anthropic => ANTHROPIC_PROVIDER,
             Self::Gemini => GEMINI_PROVIDER,
+            Self::Xai => XAI_PROVIDER,
         }
     }
 }
@@ -567,6 +795,138 @@ async fn refresh_gemini_access_token_with_retries(
         );
         anyhow::Error::msg("Gemini token refresh failed")
     }))
+}
+
+async fn refresh_email_access_token_with_retries(
+    client: &reqwest::Client,
+    token_url: &str,
+    client_id: &str,
+    refresh_token: &str,
+    scopes: &[String],
+) -> Result<TokenSet> {
+    let mut last_error: Option<anyhow::Error> = None;
+    let retry_base_delay_ms = oauth_refresh_retry_base_delay_ms();
+
+    for attempt in 1..=OAUTH_REFRESH_MAX_ATTEMPTS {
+        match email_oauth2::refresh_access_token(
+            client,
+            token_url,
+            client_id,
+            refresh_token,
+            scopes,
+        )
+        .await
+        {
+            Ok(tokens) => return Ok(tokens),
+            Err(err) => {
+                let non_retryable = is_non_retryable_oauth_refresh_error(&err);
+                let should_retry = !non_retryable && attempt < OAUTH_REFRESH_MAX_ATTEMPTS;
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"attempt": attempt, "max_attempts": OAUTH_REFRESH_MAX_ATTEMPTS, "retry": should_retry, "non_retryable": non_retryable, "error": format!("{}", err)})), "Email OAuth2 token refresh failed");
+                last_error = Some(err);
+                if should_retry && retry_base_delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(retry_base_delay_ms * attempt as u64))
+                        .await;
+                }
+                if !should_retry {
+                    break;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"oauth_provider": "email"})),
+            "auth: Email OAuth2 token refresh exhausted retries"
+        );
+        anyhow::Error::msg("Email OAuth2 token refresh failed")
+    }))
+}
+
+fn oauth_refresh_retry_base_delay_ms() -> u64 {
+    if cfg!(test) {
+        0
+    } else {
+        OAUTH_REFRESH_RETRY_BASE_DELAY_MS
+    }
+}
+
+async fn refresh_xai_access_token_with_retries(
+    client: &reqwest::Client,
+    refresh_token: &str,
+) -> Result<TokenSet> {
+    let mut last_err = None;
+    for attempt in 0..OAUTH_REFRESH_MAX_ATTEMPTS {
+        match crate::auth::xai_oauth::refresh_access_token(client, refresh_token).await {
+            Ok(tokens) => return Ok(tokens),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt + 1 < OAUTH_REFRESH_MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(
+                        OAUTH_REFRESH_RETRY_BASE_DELAY_MS * (attempt as u64 + 1),
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::Error::msg("xAI OAuth refresh failed")))
+}
+
+fn is_non_retryable_oauth_refresh_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    let msg_lower = msg.to_lowercase();
+
+    if msg_lower.contains("temporarily_unavailable") || msg_lower.contains("server_error") {
+        return false;
+    }
+
+    let permanent_oauth_hints = [
+        "invalid_grant",
+        "invalid_client",
+        "unauthorized_client",
+        "unsupported_grant_type",
+        "invalid_scope",
+        "access_denied",
+    ];
+    if permanent_oauth_hints
+        .iter()
+        .any(|hint| msg_lower.contains(hint))
+    {
+        return true;
+    }
+
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
+        && let Some(status) = reqwest_err.status()
+    {
+        let code = status.as_u16();
+        return status.is_client_error() && code != 429 && code != 408;
+    }
+
+    for word in msg.split(|c: char| !c.is_ascii_digit()) {
+        if let Ok(code) = word.parse::<u16>()
+            && (400..500).contains(&code)
+        {
+            return code != 429 && code != 408;
+        }
+    }
+
+    let auth_failure_hints = [
+        "authentication failed",
+        "auth failed",
+        "unauthorized",
+        "forbidden",
+        "permission denied",
+        "invalid refresh token",
+        "invalid token",
+    ];
+
+    auth_failure_hints
+        .iter()
+        .any(|hint| msg_lower.contains(hint))
 }
 
 fn refresh_lock_for_profile(profile_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -743,10 +1103,19 @@ pub fn clear_pending_oauth_login(config: &Config, model_provider: &str) {
 /// Shared context for auth-flow trait methods. Carries the runtime
 /// dependencies each flow needs (config for OAuth client creds, auth
 /// service for token storage, http client for OAuth round-trips).
+type CliFormatter = dyn Fn(&str, &[(&str, &str)], &str) -> String + Send + Sync;
+
 pub struct AuthFlowContext<'a> {
     pub config: &'a Config,
     pub auth_service: &'a AuthService,
     pub client: &'a reqwest::Client,
+    pub format_cli: &'a CliFormatter,
+}
+
+impl AuthFlowContext<'_> {
+    fn cli_text(&self, key: &str, args: &[(&str, &str)], fallback: &str) -> String {
+        (self.format_cli)(key, args, fallback)
+    }
 }
 
 /// Result of [`AuthProviderFlow::refresh_status`] — caller renders the
@@ -819,6 +1188,7 @@ impl AuthProvider {
             Self::OpenaiCodex => Box::new(OpenaiCodexFlow),
             Self::Gemini => Box::new(GeminiFlow),
             Self::Anthropic => Box::new(AnthropicFlow),
+            Self::Xai => Box::new(XaiFlow),
         }
     }
 }
@@ -1092,7 +1462,7 @@ impl AuthProviderFlow for GeminiFlow {
     ) -> Result<()> {
         if import.is_some() {
             anyhow::bail!(
-                "`auth login --import` currently supports only --model-provider openai-codex.",
+                "`auth login --import` currently supports only --model-provider openai-codex and xai.",
             );
         }
         let (client_id, client_secret) = Self::alias_creds(ctx.config, profile)?;
@@ -1291,10 +1661,294 @@ pub struct AnthropicFlow;
 
 impl AuthProviderFlow for AnthropicFlow {}
 
+// ── xAI impl ───────────────────────────────────────────────────────────
+
+pub struct XaiFlow;
+
+#[async_trait::async_trait]
+impl AuthProviderFlow for XaiFlow {
+    async fn login(
+        &self,
+        ctx: &AuthFlowContext<'_>,
+        profile: &str,
+        device_code: bool,
+        import: Option<&std::path::Path>,
+    ) -> Result<()> {
+        if let Some(import_path) = import {
+            crate::auth::xai_oauth::import_grok_auth_profile(
+                ctx.auth_service,
+                profile,
+                import_path,
+            )
+            .await?;
+            println!(
+                "{}",
+                ctx.cli_text(
+                    "cli-auth-xai-imported",
+                    &[("path", &import_path.display().to_string())],
+                    "Imported xAI auth profile"
+                )
+            );
+            println!(
+                "{}",
+                ctx.cli_text(
+                    "cli-auth-active-for",
+                    &[("provider", "xai"), ("profile", profile)],
+                    "Active profile"
+                )
+            );
+            return Ok(());
+        }
+
+        if device_code {
+            let discovery = crate::auth::xai_oauth::fetch_device_code_discovery(ctx.client).await?;
+            let device = crate::auth::xai_oauth::start_device_code_flow(
+                ctx.client,
+                &discovery.device_authorization_endpoint,
+            )
+            .await?;
+            println!(
+                "{}",
+                ctx.cli_text(
+                    "cli-auth-xai-device-code-started",
+                    &[],
+                    "xAI device-code login started."
+                )
+            );
+            println!(
+                "{}",
+                ctx.cli_text(
+                    "cli-auth-oauth-visit",
+                    &[("uri", &device.verification_uri)],
+                    "Visit"
+                )
+            );
+            println!(
+                "{}",
+                ctx.cli_text(
+                    "cli-auth-oauth-code",
+                    &[("code", &device.user_code)],
+                    "Code"
+                )
+            );
+            if let Some(uri_complete) = &device.verification_uri_complete {
+                println!(
+                    "{}",
+                    ctx.cli_text(
+                        "cli-auth-oauth-fast-link",
+                        &[("uri", uri_complete)],
+                        "Fast link"
+                    )
+                );
+            }
+            let token_set = crate::auth::xai_oauth::poll_device_code_tokens(
+                ctx.client,
+                &discovery.token_endpoint,
+                &device,
+            )
+            .await?;
+            let account_id = token_set
+                .id_token
+                .as_deref()
+                .or(Some(token_set.access_token.as_str()))
+                .and_then(crate::auth::xai_oauth::extract_account_id_from_jwt);
+            ctx.auth_service
+                .store_xai_tokens(profile, token_set, account_id, true)
+                .await?;
+            println!(
+                "{}",
+                ctx.cli_text("cli-auth-saved", &[("profile", profile)], "Saved profile")
+            );
+            println!(
+                "{}",
+                ctx.cli_text(
+                    "cli-auth-active-for",
+                    &[("provider", "xai"), ("profile", profile)],
+                    "Active profile"
+                )
+            );
+            return Ok(());
+        }
+
+        let discovery = crate::auth::xai_oauth::fetch_oauth_discovery(ctx.client).await?;
+        let pkce = crate::auth::xai_oauth::generate_pkce_state();
+        let authorize_url =
+            crate::auth::xai_oauth::build_authorize_url(&discovery.authorization_endpoint, &pkce);
+
+        let pending = PendingOAuthLogin {
+            model_provider: "xai".into(),
+            profile: profile.to_string(),
+            code_verifier: pkce.code_verifier.clone(),
+            state: pkce.state.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        save_pending_oauth_login(ctx.config, &pending)?;
+
+        println!(
+            "{}",
+            ctx.cli_text(
+                "cli-auth-xai-open-oauth-url",
+                &[],
+                "Open this xAI OAuth URL in your browser and authorize access:"
+            )
+        );
+        println!("{authorize_url}");
+        println!();
+
+        let code = match crate::auth::xai_oauth::receive_loopback_code(
+            &pkce.state,
+            std::time::Duration::from_secs(300),
+        )
+        .await
+        {
+            Ok(code) => {
+                clear_pending_oauth_login(ctx.config, "xai");
+                code
+            }
+            Err(e) => {
+                println!(
+                    "{}",
+                    ctx.cli_text(
+                        "cli-auth-callback-capture-failed",
+                        &[("error", &e.to_string())],
+                        "Callback capture failed"
+                    )
+                );
+                println!(
+                    "{}",
+                    ctx.cli_text(
+                        "cli-auth-run-paste-redirect",
+                        &[("provider", "xai"), ("profile", profile)],
+                        "Run paste-redirect"
+                    )
+                );
+                return Ok(());
+            }
+        };
+
+        let token_set = crate::auth::xai_oauth::exchange_code_for_tokens(
+            ctx.client,
+            &discovery.token_endpoint,
+            &code,
+            &pkce,
+        )
+        .await?;
+        let account_id = token_set
+            .id_token
+            .as_deref()
+            .or(Some(token_set.access_token.as_str()))
+            .and_then(crate::auth::xai_oauth::extract_account_id_from_jwt);
+        ctx.auth_service
+            .store_xai_tokens(profile, token_set, account_id, true)
+            .await?;
+        println!(
+            "{}",
+            ctx.cli_text("cli-auth-saved", &[("profile", profile)], "Saved profile")
+        );
+        println!(
+            "{}",
+            ctx.cli_text(
+                "cli-auth-active-for",
+                &[("provider", "xai"), ("profile", profile)],
+                "Active profile"
+            )
+        );
+        Ok(())
+    }
+
+    async fn paste_redirect(
+        &self,
+        ctx: &AuthFlowContext<'_>,
+        profile: &str,
+        input: Option<&str>,
+    ) -> Result<()> {
+        let pending = load_pending_oauth_login(ctx.config, "xai")?.ok_or_else(|| {
+            anyhow::Error::msg(ctx.cli_text(
+                "cli-auth-xai-no-pending-login",
+                &[],
+                "No pending xAI login found. Run `zeroclaw auth login --model-provider xai` first.",
+            ))
+        })?;
+        if pending.profile != profile {
+            anyhow::bail!(
+                "Pending login profile mismatch: pending={}, requested={}",
+                pending.profile,
+                profile,
+            );
+        }
+        let redirect_input = input.ok_or_else(|| {
+            anyhow::Error::msg(ctx.cli_text(
+                "cli-auth-paste-redirect-requires-input",
+                &[],
+                "paste-redirect requires the redirect URL or OAuth code",
+            ))
+        })?;
+        let discovery = crate::auth::xai_oauth::fetch_oauth_discovery(ctx.client).await?;
+        let code =
+            crate::auth::xai_oauth::parse_code_from_redirect(redirect_input, Some(&pending.state))?;
+        let pkce = crate::auth::xai_oauth::restore_pkce_state(
+            pending.code_verifier.clone(),
+            pending.state.clone(),
+        );
+        let token_set = crate::auth::xai_oauth::exchange_code_for_tokens(
+            ctx.client,
+            &discovery.token_endpoint,
+            &code,
+            &pkce,
+        )
+        .await?;
+        let account_id = token_set
+            .id_token
+            .as_deref()
+            .or(Some(token_set.access_token.as_str()))
+            .and_then(crate::auth::xai_oauth::extract_account_id_from_jwt);
+        ctx.auth_service
+            .store_xai_tokens(profile, token_set, account_id, true)
+            .await?;
+        clear_pending_oauth_login(ctx.config, "xai");
+        println!(
+            "{}",
+            ctx.cli_text("cli-auth-saved", &[("profile", profile)], "Saved profile")
+        );
+        println!(
+            "{}",
+            ctx.cli_text(
+                "cli-auth-active-for",
+                &[("provider", "xai"), ("profile", profile)],
+                "Active profile"
+            )
+        );
+        Ok(())
+    }
+
+    async fn refresh_status(
+        &self,
+        ctx: &AuthFlowContext<'_>,
+        profile_override: Option<&str>,
+    ) -> Result<RefreshStatus> {
+        match ctx
+            .auth_service
+            .get_valid_xai_access_token(profile_override)
+            .await?
+        {
+            Some(_) => Ok(RefreshStatus::Refreshed {
+                profile: profile_override.unwrap_or("default").to_string(),
+            }),
+            None => Ok(RefreshStatus::NoProfile),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::profiles::{AuthProfile, AuthProfileKind};
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn normalize_provider_aliases() {
@@ -1353,5 +2007,162 @@ mod tests {
             select_profile_id(&data, "openai-codex", None),
             Some(id_active)
         );
+    }
+
+    #[tokio::test]
+    async fn email_oauth_refresh_retries_transient_failure() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/token",
+            post({
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 0 {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "temporary provider failure",
+                            )
+                                .into_response();
+                        }
+
+                        Json(serde_json::json!({
+                            "access_token": "fresh-email-token",
+                            "expires_in": 3600,
+                            "token_type": "Bearer"
+                        }))
+                        .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind token server");
+        let addr = listener.local_addr().expect("token server addr");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve token server");
+        });
+
+        let temp = tempfile::tempdir().expect("temp auth dir");
+        let auth = AuthService::new(temp.path(), false);
+        auth.store_email_oauth2_tokens(
+            "email.test",
+            DEFAULT_PROFILE_NAME,
+            expired_email_tokens("stale-email-token", "refresh-email-token"),
+        )
+        .await
+        .expect("store email tokens");
+
+        let token = auth
+            .get_valid_email_oauth2_token(
+                "email.test",
+                None,
+                &format!("http://{addr}/token"),
+                "email-client",
+                &["offline_access".to_string()],
+            )
+            .await
+            .expect("refresh should recover after retry");
+
+        assert_eq!(token.as_deref(), Some("fresh-email-token"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn email_oauth_refresh_does_not_retry_permanent_failure() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/token",
+            post(email_oauth_permanent_failure_handler).with_state(Arc::clone(&attempts)),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind token server");
+        let addr = listener.local_addr().expect("token server addr");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve token server");
+        });
+
+        let temp = tempfile::tempdir().expect("temp auth dir");
+        let auth = AuthService::new(temp.path(), false);
+        auth.store_email_oauth2_tokens(
+            "email.test",
+            DEFAULT_PROFILE_NAME,
+            expired_email_tokens("stale-email-token", "invalid-refresh-token"),
+        )
+        .await
+        .expect("store email tokens");
+
+        let err = auth
+            .get_valid_email_oauth2_token(
+                "email.test",
+                None,
+                &format!("http://{addr}/token"),
+                "email-client",
+                &["offline_access".to_string()],
+            )
+            .await
+            .expect_err("invalid refresh token should fail explicitly");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let message = err.to_string();
+        assert!(
+            message.contains("400 Bad Request") || message.contains("invalid_grant"),
+            "unexpected error: {message}"
+        );
+
+        server.abort();
+    }
+
+    #[test]
+    fn email_oauth_refresh_classifier_keeps_permanent_and_transient_errors_separate() {
+        assert!(is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
+            r#"Email OAuth2 token request failed (400 Bad Request): {"error":"invalid_grant"}"#
+        )));
+        assert!(is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
+            "Email OAuth2 token request failed (401 Unauthorized): invalid client"
+        )));
+        assert!(!is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
+            "Email OAuth2 token request failed (429 Too Many Requests): retry later"
+        )));
+        assert!(!is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
+            r#"Email OAuth2 token request failed (400 Bad Request): {"error":"temporarily_unavailable"}"#
+        )));
+        assert!(!is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
+            "Failed to refresh email OAuth2 token: connection reset"
+        )));
+    }
+
+    async fn email_oauth_permanent_failure_handler(
+        State(attempts): State<Arc<AtomicUsize>>,
+    ) -> impl IntoResponse {
+        attempts.fetch_add(1, Ordering::SeqCst);
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "refresh token is invalid"
+            })),
+        )
+    }
+
+    fn expired_email_tokens(access_token: &str, refresh_token: &str) -> TokenSet {
+        TokenSet {
+            access_token: access_token.to_string(),
+            refresh_token: Some(refresh_token.to_string()),
+            id_token: None,
+            expires_at: Some(chrono::Utc::now() - chrono::Duration::minutes(5)),
+            token_type: Some("Bearer".to_string()),
+            scope: Some("offline_access".to_string()),
+        }
     }
 }

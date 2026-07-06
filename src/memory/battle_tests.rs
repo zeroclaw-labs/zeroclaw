@@ -388,6 +388,9 @@ mod tests {
             namespace: "default".into(),
             importance: None,
             superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
             agent_alias: None,
             agent_id: None,
         }];
@@ -412,6 +415,9 @@ mod tests {
             namespace: "default".into(),
             importance: Some(0.7),
             superseded_by: Some("newer_id".into()), // already superseded
+            kind: None,
+            pinned: false,
+            tenant_id: None,
             agent_alias: None,
             agent_id: None,
         }];
@@ -437,6 +443,9 @@ mod tests {
             namespace: "default".into(),
             importance: Some(0.7),
             superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
             agent_alias: None,
             agent_id: None,
         }];
@@ -1045,6 +1054,9 @@ mod tests {
             namespace: "my-namespace".into(),
             importance: Some(0.7),
             superseded_by: Some("newer-id".into()),
+            kind: None,
+            pinned: false,
+            tenant_id: None,
             agent_alias: None,
             agent_id: None,
         };
