@@ -32,7 +32,13 @@ git clone --depth 1 https://github.com/openclaw/openclaw /tmp/parity-openclaw
 git clone --depth 1 https://github.com/NousResearch/hermes-agent /tmp/parity-hermes
 ```
 
-Clone both in parallel, and delete both when finished.
+Clone both in parallel, and delete both when finished. For a quick single-file
+spot-check without a full clone, the GitHub contents API reads any tree file
+directly, which is enough to confirm one module's existence:
+
+```bash
+gh api "repos/openclaw/openclaw/contents/<path>" --jq '.content' | base64 -d
+```
 
 ## Status vocabulary
 
@@ -89,7 +95,31 @@ distinct product (for example GitHub Copilot vs GitHub Models) is not the same
 slot. When in doubt, `grep` the module contents for the capability before
 calling it `supported`.
 
-### Step 4: Write the TOML
+### Step 4: Check the issue tracker for `planned` verdicts
+
+A slot with no module in the tree is not automatically `none`. Before marking
+`none`, check whether the competitor has an open feature request tracking it,
+which makes the cell `planned` instead. Neither project publishes a ROADMAP.md
+or project board, so the open issue tracker is the authoritative planned signal.
+
+Search at the title level and filter to genuine requests, not incidental
+mentions in bug reports:
+
+```bash
+gh api repos/openclaw/openclaw --jq '.open_issues_count'   # confirm the repo and tracker are live
+gh search issues --repo openclaw/openclaw --state open "<slot> in:title" --json number,title,url
+gh search issues --repo NousResearch/hermes-agent --state open "<slot> in:title" --json number,title,url
+```
+
+A raw keyword count is noise: an issue that merely mentions "bedrock" is not a
+roadmap commitment, and a bug filed against a slot proves that slot is already
+`supported` (people only file bugs against features that exist). A title like
+`Feature Request: add <slot> as a native provider` with `state: open` and no
+module in the tree is `planned`. Record the issue number and the check date in
+the TOML header so the verdict is auditable. Re-verify against the tree: if the
+feature request was since merged, the slot is `supported`, not `planned`.
+
+### Step 5: Write the TOML
 
 Every key must correspond to a walked row, in the page's canonical order. Keep
 the header's `Sources` block current (repo URLs, per-section walk paths, and the
@@ -98,7 +128,7 @@ walked channel/provider/tool registries (SOP, for instance), it does not belong
 in this TOML; hand-author a small section in `feature-matrix.md` itself with a
 static table and note that it is hand-recorded rather than code-walked.
 
-### Step 5: Verify with the guard test
+### Step 6: Verify with the guard test
 
 The parity join has a hard-fail CI guard. A TOML key the walk no longer produces,
 or a walked row with a stale key, fails the docs build. Run it:
@@ -110,7 +140,7 @@ cargo test -p xtask --lib feature_matrix
 Both `parity_join_produces_rows_without_stale_keys` and
 `channel_column_is_all_supported_from_walk` must pass.
 
-### Step 6: Regenerate and confirm live
+### Step 7: Regenerate and confirm live
 
 Regenerate the gitignored snippets and confirm zero stray `Unknown`/`❓` remain
 where you filled cells:
@@ -122,7 +152,7 @@ cargo run -p xtask --bin mdbook -- preprocess
 Re-fetch the live page and diff the rendered tables against your intended
 verdicts. Do not claim a cell from memory; read the rendered HTML.
 
-### Step 7: Clean up and commit
+### Step 8: Clean up and commit
 
 Delete both clones. Commit with a scoped, multi-line message that records the
 supported/none counts per column and names any loose matches you downgraded and
@@ -136,6 +166,9 @@ why, so the verdicts are auditable from the log.
 - Read the live rendered page for the row set, not the existing TOML keys.
 - Verify loose alias matches against module contents before marking `supported`;
   downgrade speech/image-only or different-product matches to `none`.
+- Before marking a slot `none`, check the competitor's open issue tracker: an
+  open feature request with no module in the tree makes the cell `planned`, not
+  `none`. A bug filed against a slot proves it is already `supported`.
 - Keep the TOML `Sources` header current, including the `checked` date.
 - Run `cargo test -p xtask --lib feature_matrix` before committing; the guard is
   a hard CI fail.
