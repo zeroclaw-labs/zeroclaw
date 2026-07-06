@@ -12898,7 +12898,9 @@ pub struct InkboxConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
-    /// Inkbox API key (`X-API-Key`). Agent-scoped keys are recommended.
+    /// Agent-scoped Inkbox API key (`X-API-Key`) for this identity. Mint one in
+    /// the Inkbox console. An admin-scoped key also works but is stored
+    /// over-privileged, so an agent-scoped key is strongly preferred.
     #[secret]
     #[tab(Connection)]
     #[quickstart]
