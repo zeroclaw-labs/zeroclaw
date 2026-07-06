@@ -3054,6 +3054,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn whatsapp_web_persistent_mapping_to_wrong_phone_stays_rejected() {
+        // Bypass-adjacent case (#6350 triage): the store resolves the LID to
+        // phone A, but the allowlist contains only phone B. The fallback must
+        // *narrow* to the resolved phone, not broaden the allowlist to admit a
+        // different contact. This pins that a persisted-but-non-allowlisted
+        // mapping is still rejected at the gate.
+        use wacore::store::traits::{LidPnMappingEntry, ProtocolStore};
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap();
+
+        let entry = LidPnMappingEntry {
+            lid: "37207519834264".to_string(),
+            phone_number: "15550001111".to_string(), // resolves to phone A
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_100,
+            learning_source: "usync".to_string(),
+        };
+        ProtocolStore::put_lid_mapping(&store, &entry).await.unwrap();
+
+        let sender = Jid::lid("37207519834264");
+        let mapped_phone = ProtocolStore::get_lid_mapping(&store, sender.user())
+            .await
+            .unwrap()
+            .expect("persisted mapping must be readable through the trait")
+            .phone_number;
+
+        let candidates =
+            WhatsAppWebChannel::sender_phone_candidates(&sender, None, Some(&mapped_phone));
+        let allowlist = vec!["+15551234567".to_string()]; // only phone B
+        let matched = candidates
+            .iter()
+            .any(|c| WhatsAppWebChannel::is_number_allowed_for_list(&allowlist, c));
+        assert!(
+            !matched,
+            "a LID whose persisted mapping resolves to a non-allowlisted phone must stay rejected; candidates={candidates:?}"
+        );
+    }
+
     // ── Reconnect retry state machine tests (exercise production helpers) ──
 
     #[test]
