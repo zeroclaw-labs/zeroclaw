@@ -96,24 +96,29 @@ grants:
   runs against must never do.
 - `exclude_memory` - the ACP memory-tool strip.
 
-Cut-over status (the strangle, one site per PR): the **gateway** constructs through
-`assemble` today - both its registry builders, the dashboard-agent seed and the
-per-agent `/api/tools` listings. That closed the gateway's filter gap by
-construction: its listings previously showed unfiltered built-ins the agent's
-policy denies (live gateway chat resolves through `process_message`, which already
-filtered), plus a `tool_search` stub even when policy denied every deferred MCP
-tool. Two scoping notes keep the listings claim honest: peripherals are excluded
-from listings by design (`connect_peripherals: false` - enumerating them without
-connecting hardware is a future refinement), and `process_message` filters
-built-ins through a variant that admits the canonical read-only defaults at
-non-Full autonomy - a cross-path filter divergence that predates the seam, tracked
-as its own parity row and unified when that surface strangles in.
+Cut-over status (the strangle, one site per PR): the **gateway** (#8640),
+`loop_::run` (#8700), and `process_message` (#8701) all construct through
+`assemble` today. The gateway cut-over - both its registry builders, the
+dashboard-agent seed and the per-agent `/api/tools` listings - closed the
+gateway's filter gap by construction: its listings previously showed
+unfiltered built-ins the agent's policy denies (live gateway chat resolves
+through `process_message`, which already filtered), plus a `tool_search` stub
+even when policy denied every deferred MCP tool. One scoping note keeps the
+listings claim honest: peripherals are excluded from listings by design
+(`connect_peripherals: false` - enumerating them without connecting hardware
+is a future refinement). The `process_message` cut-over closed a second,
+independent divergence: it previously filtered built-ins through
+`filter_channel_builtin_tools`, a variant that admitted the canonical
+read-only defaults past `allowed_tools` at non-Full autonomy, while every
+other path applied the plain `apply_policy_tool_filter`. #8701 retired that
+variant, so every path now applies the same plain filter (ledger A4, backed
+by an in-file positive parity test rather than a divergence characterization).
 
 The remaining hand-rolled sites - the channels orchestrator (`start_channels`),
-`loop_` `run` / `process_message`, `Agent::from_config`, and the delegate
-independent-target builder (`independent_agentic_tools_for_target`, added by #8239
-while this program was in flight - the recurrence the seal exists to end) - migrate
-in follow-up PRs. Once all sites mint through `assemble`, the engine's tools field
+`Agent::from_config`, and the delegate independent-target builder
+(`independent_agentic_tools_for_target`, added by #8239 while this program was
+in flight - the recurrence the seal exists to end) - migrate in follow-up PRs.
+Once all sites mint through `assemble`, the engine's tools field
 seals to `ScopedToolRegistry` (a private-field newtype only `assemble` constructs),
 and handing the engine an unscoped registry - or quietly re-inlining a construction
 site, as a cross-merge did to the channel path once already - becomes a compile
