@@ -264,8 +264,11 @@ impl OpenRouterModelProvider {
                             id: Some(tc.id),
                             kind: Some("function".to_string()),
                             function: NativeFunctionCall {
-                                name: tc.name,
-                                arguments: tc.arguments,
+                                name: tc.name.clone(),
+                                arguments: crate::native_tool_args::normalize_native_tool_call_arguments(
+                                    &tc.name,
+                                    tc.arguments,
+                                ),
                             },
                         })
                         .collect::<Vec<_>>();
@@ -394,11 +397,18 @@ impl OpenRouterModelProvider {
             .tool_calls
             .unwrap_or_default()
             .into_iter()
-            .map(|tc| ProviderToolCall {
-                id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                name: tc.function.name,
-                arguments: tc.function.arguments,
-                extra_content: None,
+            .map(|tc| {
+                let name = tc.function.name.clone();
+                let arguments = crate::native_tool_args::normalize_native_tool_call_arguments(
+                    &name,
+                    tc.function.arguments,
+                );
+                ProviderToolCall {
+                    id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    name,
+                    arguments,
+                    extra_content: None,
+                }
             })
             .collect::<Vec<_>>();
 
@@ -1425,6 +1435,67 @@ mod tests {
         assert_eq!(tool_calls[0].function.name, "shell");
     }
 
+    // ── #8675 tool-call arguments normalization ──────────────────
+    //
+    // Regression coverage for the response-parser half of the issue: a
+    // malformed `tool_calls[].function.arguments` string from a smaller
+    // model (or a server-echoed parse error) must be replaced with "{}"
+    // before the ProviderToolCall is constructed, so the upstream
+    // request body never contains raw broken JSON that strict
+    // OpenRouter-routed upstreams would 400 on.
+
+    fn message_with_tool_call_arguments(arguments: &str) -> NativeResponseMessage {
+        NativeResponseMessage {
+            content: None,
+            tool_calls: Some(vec![NativeToolCall {
+                id: Some("call_8675".into()),
+                kind: Some("function".into()),
+                function: NativeFunctionCall {
+                    name: "shell".into(),
+                    arguments: arguments.into(),
+                },
+            }]),
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn parse_native_response_replaces_malformed_arguments_with_empty_object() {
+        // The realistic malformed cases from #8675: trailing-comma,
+        // truncated object, server-echoed parse error message, and a
+        // model that emits Python-style None. Each must be coerced to
+        // "{}" so the outbound request body stays valid JSON.
+        for malformed in [
+            r#"{"command": "ls""#,
+            r#"{"command": 'ls'}"#,
+            r#"Expecting ',' delimiter: line 1 column 23 (char 22)"#,
+        ] {
+            let parsed =
+                Self::parse_native_response(message_with_tool_call_arguments(malformed));
+            let tc = &parsed.tool_calls[0];
+            assert_eq!(
+                tc.arguments, "{}",
+                "malformed arguments {malformed:?} should be normalized to {{}}"
+            );
+            assert_eq!(tc.name, "shell");
+            assert_eq!(tc.id, "call_8675");
+        }
+    }
+
+    #[test]
+    fn parse_native_response_preserves_valid_arguments() {
+        let parsed = Self::parse_native_response(message_with_tool_call_arguments(
+            r#"{"command":"ls -la"}"#,
+        ));
+        assert_eq!(parsed.tool_calls[0].arguments, r#"{"command":"ls -la"}"#);
+    }
+
+    #[test]
+    fn parse_native_response_normalizes_empty_arguments() {
+        let parsed = Self::parse_native_response(message_with_tool_call_arguments(""));
+        assert_eq!(parsed.tool_calls[0].arguments, "{}");
+    }
+
     #[test]
     fn parse_native_response_converts_to_chat_response() {
         let message = NativeResponseMessage {
@@ -1475,6 +1546,28 @@ mod tests {
         assert_eq!(tool_calls[0].id.as_deref(), Some("call_abc"));
         assert_eq!(tool_calls[0].function.name, "shell");
         assert_eq!(tool_calls[0].function.arguments, r#"{"command":"pwd"}"#);
+    }
+
+    #[test]
+    fn convert_messages_normalizes_malformed_assistant_tool_call_arguments() {
+        // The second half of the #8675 wire path: when an assistant
+        // message round-trips back into the request body with malformed
+        // tool-call arguments, the outbound NativeMessage must carry the
+        // normalized "{}" payload so the upstream never sees broken JSON.
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"Using tool","tool_calls":[{"id":"call_malformed","name":"shell","arguments":"{\"command\":\"ls\""}]}"#
+                .into(),
+        }];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        let tool_calls = converted[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "shell");
+        assert_eq!(
+            tool_calls[0].function.arguments, "{}",
+            "truncated assistant tool-call arguments must be normalized to {{}}"
+        );
     }
 
     #[test]
