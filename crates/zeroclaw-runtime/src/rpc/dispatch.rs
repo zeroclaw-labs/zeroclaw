@@ -1574,7 +1574,7 @@ impl RpcDispatcher {
                 .model_provider_for_agent(&alias)
                 .and_then(|p| p.model.clone())
                 .unwrap_or_default();
-            let max_ctx = Some(cfg.effective_max_context_tokens(&alias) as u64);
+            let max_ctx = Some(cfg.effective_model_context_window(&alias) as u64);
             (alias, mp, m, max_ctx)
         };
 
