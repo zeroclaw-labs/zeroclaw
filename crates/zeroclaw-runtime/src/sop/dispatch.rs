@@ -77,6 +77,28 @@ pub async fn dispatch_sop_event(
     audit: &SopAuditLogger,
     event: SopEvent,
 ) -> Vec<DispatchResult> {
+    dispatch_sop_event_filtered(engine, audit, event, None).await
+}
+
+/// Dispatch an incoming event to one named SOP, after normal trigger matching.
+///
+/// This is useful for channel routers that already selected a configured SOP
+/// name, while still requiring that SOP to declare a matching trigger.
+pub async fn dispatch_sop_event_to(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    event: SopEvent,
+    target_sop: &str,
+) -> Vec<DispatchResult> {
+    dispatch_sop_event_filtered(engine, audit, event, Some(target_sop)).await
+}
+
+async fn dispatch_sop_event_filtered(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    event: SopEvent,
+    target_sop: Option<&str>,
+) -> Vec<DispatchResult> {
     let safety = match engine.lock() {
         Ok(eng) => ContentSafety::from_sop_config(eng.config()),
         Err(e) => {
@@ -115,7 +137,7 @@ pub async fn dispatch_sop_event(
         }
         ScreenVerdict::Block { reason } => {
             if let Err(e) = audit
-                .log_blocked_unsafe(None, event.source, event.topic.as_deref(), &reason)
+                .log_blocked_unsafe(target_sop, event.source, event.topic.as_deref(), &reason)
                 .await
             {
                 ::zeroclaw_log::record!(
@@ -127,7 +149,7 @@ pub async fn dispatch_sop_event(
                 );
             }
             return vec![DispatchResult::BlockedUnsafe {
-                sop_name: None,
+                sop_name: target_sop.map(str::to_string),
                 reason,
             }];
         }
@@ -139,6 +161,7 @@ pub async fn dispatch_sop_event(
             .match_trigger(&event)
             .iter()
             .map(|s| s.name.clone())
+            .filter(|name| target_sop.is_none_or(|target| name == target))
             .collect(),
         Err(e) => {
             crate::health::mark_component_error("sop_dispatch", format!("lock poisoned: {e}"));
@@ -156,7 +179,8 @@ pub async fn dispatch_sop_event(
     if matched_names.is_empty() {
         ::zeroclaw_log::record!(
             DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"target_sop": target_sop})),
             "SOP dispatch: no match for event"
         );
         return vec![DispatchResult::NoMatch];
@@ -790,6 +814,36 @@ mod tests {
         assert!(
             matches!(&results[0], DispatchResult::Started { sop_name, action, .. } if sop_name == "mqtt-sop" && matches!(action.as_ref(), SopRunAction::ExecuteStep { .. }))
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_to_named_sop_filters_matching_channel_triggers() {
+        let channel_trigger = SopTrigger::Channel {
+            topic: "git.main:pull_request.opened".into(),
+            condition: None,
+        };
+        let engine = test_engine(vec![
+            test_sop("pr-triage", vec![channel_trigger.clone()]),
+            test_sop("other-handler", vec![channel_trigger]),
+        ]);
+        let audit = test_audit();
+
+        let event = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.main:pull_request.opened".into()),
+            payload: Some(r#"{"sop":"pr-triage"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+
+        let results = dispatch_sop_event_to(&engine, &audit, event.clone(), "pr-triage").await;
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], DispatchResult::Started { sop_name, .. } if sop_name == "pr-triage")
+        );
+
+        let results = dispatch_sop_event_to(&engine, &audit, event, "missing-sop").await;
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0], DispatchResult::NoMatch));
     }
 
     #[tokio::test]

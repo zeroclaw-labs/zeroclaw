@@ -2007,7 +2007,35 @@ pub async fn run(
                         config.data_dir.clone(),
                         config.skills.skill_creation.clone(),
                     );
-                    match creator.create_from_execution(&msg, &tool_calls, None).await {
+                    // Opt-in reflection synthesizes a `SKILL.md` from a bounded
+                    // slice of the execution; it falls back to `SKILL.toml`
+                    // internally when the provider call or its output is
+                    // unusable. Default path stays the deterministic generator.
+                    let creation_result = if config.skills.skill_creation.reflection_enabled {
+                        // The reflection path makes one post-turn provider call.
+                        // Scope it under TOOL_LOOP_COST_TRACKING_CONTEXT with the
+                        // same `cost_tracking_context` as the parent turn (whose
+                        // scope has already exited here) so the call is budget-
+                        // enforced and its usage is recorded against the same cost
+                        // tracker as the main loop and the skill-review fork below.
+                        TOOL_LOOP_COST_TRACKING_CONTEXT
+                            .scope(
+                                cost_tracking_context.clone(),
+                                creator.create_from_execution_reflected(
+                                    &msg,
+                                    &tool_calls,
+                                    &response,
+                                    None,
+                                    &provider_name,
+                                    model_provider.as_ref(),
+                                    &model_name,
+                                ),
+                            )
+                            .await
+                    } else {
+                        creator.create_from_execution(&msg, &tool_calls, None).await
+                    };
+                    match creation_result {
                         Ok(Some(slug)) => {
                             ::zeroclaw_log::record!(
                                 INFO,
@@ -13805,6 +13833,88 @@ Let me check the result."#;
             after, before,
             "budget-exceeded fork must not make a recorded provider call"
         );
+    }
+
+    #[tokio::test]
+    async fn reflected_skill_creation_records_cost_usage_under_parent_scope() {
+        use super::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        use crate::cost::CostTracker;
+        use crate::skills::creator::{SkillCreator, ToolCallRecord};
+
+        // Reflection's single post-turn provider call returns a valid SKILL.md
+        // with usage. It must go through `chat` (the scripted provider bails on
+        // `chat_with_system`), and record its usage under the parent scope.
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some(
+                    "---\nname: model-picked\ndescription: Build and test the project.\n---\n\n# X\n\nBody.\n"
+                        .to_string(),
+                ),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(800),
+                    output_tokens: Some(120),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let creator = SkillCreator::new(
+            dir.path().to_path_buf(),
+            zeroclaw_config::schema::SkillCreationConfig {
+                enabled: true,
+                reflection_enabled: true,
+                ..zeroclaw_config::schema::SkillCreationConfig::default()
+            },
+        );
+        let tool_calls = vec![
+            ToolCallRecord {
+                name: "shell".to_string(),
+                args: serde_json::json!({ "cmd": "build" }),
+            },
+            ToolCallRecord {
+                name: "shell".to_string(),
+                args: serde_json::json!({ "cmd": "test" }),
+            },
+        ];
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let cost_config = zeroclaw_config::schema::CostConfig {
+            enabled: true,
+            ..zeroclaw_config::schema::CostConfig::default()
+        };
+        let tracker = Arc::new(CostTracker::new(cost_config, workspace.path()).unwrap());
+        let ctx =
+            ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(review_test_pricing()));
+
+        let slug = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                creator.create_from_execution_reflected(
+                    "Build and test the project",
+                    &tool_calls,
+                    "All tests passed.",
+                    None,
+                    "mock-provider",
+                    &model_provider,
+                    "mock-model",
+                ),
+            )
+            .await
+            .unwrap()
+            .expect("a skill should be created from the reflected SKILL.md");
+        assert_eq!(slug, "build-and-test-the-project");
+
+        let summary = tracker.get_summary().unwrap();
+        assert_eq!(
+            summary.request_count, 1,
+            "reflection must record its provider call under the parent cost scope"
+        );
+        assert_eq!(summary.total_tokens, 920);
+        assert!(summary.session_cost_usd > 0.0);
     }
 
     // ── apply_policy_tool_filter coverage ─────────────────────
