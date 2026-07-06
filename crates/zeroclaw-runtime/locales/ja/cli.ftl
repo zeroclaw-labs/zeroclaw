@@ -26,6 +26,7 @@ cli-config-about = ZeroClaw設定を管理
 cli-update-about = ZeroClaw更新を確認・適用
 cli-self-test-about = 診断自己テストを実行
 cli-completions-about = シェル補完スクリプトを生成
+cli-desktop-about = ZeroClawコンパニオンデスクトップアプリを起動
 cli-config-schema-about = 完全な設定JSONスキーマをstdoutにダンプ
 cli-config-list-about = すべての設定プロパティを現在の値とともにリスト表示
 cli-config-get-about = 設定プロパティ値を取得
@@ -302,6 +303,16 @@ cli-completions-long-about =
     source <(zeroclaw completions bash)
     zeroclaw completions zsh > ~/.zfunc/_zeroclaw
     zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish
+cli-desktop-long-about =
+    ZeroClaw コンパニオンデスクトップアプリを起動します。
+
+    コンパニオンアプリは、CLI と同じゲートウェイに接続する軽量のメニューバー/システムトレイアプリケーションです。ダッシュボードへのクイックアクセス、ステータス監視、およびデバイスペアリングを提供します。
+
+    --install を使用して、プラットフォーム用の事前ビルドコンパニオンアプリをダウンロードしてください。
+
+    例:
+    zeroclaw desktop              # コンパニオンアプリを起動
+    zeroclaw desktop --install    # ダウンロードしてインストール
 channel-needs-quickstart-reply = このエージェントはまだ完全にセットアップされていません。返信する前に、オペレーターがQuickstartを実行する必要があります。
 channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web は設定されていますが、'whatsapp-web' 機能がコンパイルされていません。
 channel-whatsapp-web-feature-missing-build = ビルド/実行: cargo build --features whatsapp-web
@@ -382,6 +393,9 @@ cli-skills-create-hint = {"  "}作成: mkdir -p ~/.zeroclaw/workspace/skills/my-
 cli-skills-install-hint = {"  "}またはインストール: zeroclaw skills install <source>
 cli-skills-installed-header = インストール済みのスキル ({$count}):
 cli-skills-tags = タグ:  {$tags}
+cli-skills-skipped-header = スキップ済み ({$count}):
+cli-skills-skipped-reason = {"    "}理由: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}有効にするには、zeroclaw の設定で `skills.allow_scripts = true` を設定してください。
 cli-sop-none = SOP が見つかりません。
 cli-sop-create-hint = {"  "}作成: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}その後 SOP.toml と SOP.md を追加します
@@ -589,6 +603,10 @@ cli-status-service-stopped = 🔴 サービス:       停止
 cli-status-channels = チャンネル:
 cli-status-cli-always = {"  "}CLI:      ✅ 常時
 cli-status-peripherals = 周辺機器:
+cli-desktop-download = ZeroClaw コンパニオンアプリをダウンロード:
+cli-desktop-homebrew = または Homebrew でインストール(近日対応予定):
+cli-desktop-linux-pkg = {"  "}お使いのアーキテクチャ用の .deb または .AppImage をダウンロードしてください。
+cli-desktop-launching = ZeroClaw コンパニオンアプリを起動中...
 cli-status-version = バージョン:     {$v}
 cli-status-workspace = ワークスペース:   {$v}
 cli-status-config = 設定:      {$v}
@@ -627,6 +645,9 @@ cli-status-word-none = (なし)
 cli-status-word-configured = 設定済み
 cli-status-word-not-configured = 未設定
 cli-status-channel-not-compiled = 🚫 設定済み、未コンパイル
+cli-desktop-not-installed = ZeroClaw コンパニオンアプリがインストールされていません。
+cli-desktop-blurb1 = コンパニオンアプリは軽量なメニューバーアプリで、
+cli-desktop-blurb2 = CLI と同じゲートウェイに接続します。
 cli-config-all-configured = すべてのセクションは既に設定済みです。
 cli-config-schema-current = 設定は既に現在のスキーマバージョンです。
 cli-config-applied-ops = {$count} 件の操作を適用しました:
@@ -653,6 +674,7 @@ cli-warn-crypto-provider = 警告: デフォルトの暗号プロバイダーの
 cli-error-label = {"   "}エラー: {$err}
 cli-warn-cost-usage = {"  "}⚠ コスト使用状況を読み込めませんでした: {$err}
 cli-warn-cost-tracker = {"  "}⚠ コストトラッカーを初期化できませんでした: {$err}
+cli-desktop-download-at = {"  "}ダウンロード先: {$url}
 cli-config-legend = 凡例: 💉 env で上書き  🔒 シークレット
 cli-config-secret-set = {$path} は設定されています(暗号化されたシークレット — 値は表示されません)
 cli-config-secret-unset = {$path} は設定されていません(暗号化されたシークレット)
