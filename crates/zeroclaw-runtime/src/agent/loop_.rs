@@ -2554,9 +2554,26 @@ pub async fn run(
                                     "Context overflow in interactive loop, attempting recovery"
                                 );
                                 let taken = std::mem::take(&mut history);
+                                // Context overflow recovery: trim to 90% of the model's true
+                                // input capacity, not the runtime trimming budget. After an
+                                // overflow we must fit the provider's real tokenizer, so the
+                                // model window — not the operator's lower max_context_tokens
+                                // — is the correct target. The 10% headroom absorbs (a) the
+                                // under-count from estimate_history_tokens (~4 chars/token;
+                                // history.rs:285), which is what trim_to_recent_turns measures
+                                // against, and (b) room for the assistant reply plus the next
+                                // user turn, so the retried request lands inside the window
+                                // instead of re-overflowing at the same boundary. This CLI
+                                // outer-recovery site is a defense-in-depth fallback behind
+                                // the in-loop recovery at turn/context_recovery.rs:85 (which
+                                // uses its own tokens_now*2/3 heuristic); the two are
+                                // intentionally different — the in-loop path drops
+                                // aggressively before retry, this outer path lands the retry
+                                // inside the window with margin. See the note2.md 🟡 warning.
+                                let recovery_budget = eff_model_context_window * 9 / 10;
                                 let result = crate::agent::history_trim::trim_to_recent_turns(
                                     taken,
-                                    eff_model_context_window,
+                                    recovery_budget,
                                 );
                                 if result.trimmed {
                                     let mut trimmed = result.history;
@@ -13044,6 +13061,63 @@ Let me check the result."#;
         ];
         let tokens = super::estimate_history_tokens(&history);
         assert_eq!(tokens, 23);
+    }
+
+    /// Regression for the 🟡 note2.md warning: the CLI outer-recovery trim
+    /// at loop_.rs:~2557 must target *below* the model window, not the full
+    /// window. Trimming to the raw `eff_model_context_window` leaves zero
+    /// headroom: the request that just failed already exceeded the
+    /// provider's real tokenizer, and `trim_to_recent_turns` measures via
+    /// `estimate_history_tokens` (~4 chars/token; history.rs:285), which
+    /// under-counts. The retry would re-overflow at the same boundary.
+    ///
+    /// The fix trims to `eff_model_context_window * 9 / 10` (10% headroom:
+    /// absorbs the heuristic's under-count plus room for the assistant
+    /// reply + next user turn). This test pins that property by feeding a
+    /// history whose estimate *equals* the window — full-window trimming
+    /// would no-op and the retry would fail; the 90% budget forces a trim.
+    #[test]
+    fn cli_outer_recovery_trims_below_model_window_with_headroom() {
+        use crate::agent::history_trim::trim_to_recent_turns;
+
+        let model_context_window: usize = 32_000;
+        let recovery_budget = model_context_window * 9 / 10; // 28_800
+
+        // Build a history whose estimate_history_tokens *exceeds* the
+        // window so a full-window budget would not trim and the retry
+        // would re-overflow, but the 90% budget must trim. 4000 chars per
+        // message ≈ 1004 estimated tokens; 32 user turns + 32 assistant
+        // replies + 1 system ≈ 65 messages × ~1004 = ~65_260 tokens.
+        let big = "x".repeat(4000);
+        let mut history = vec![ChatMessage::system("sys")];
+        for i in 0..32 {
+            history.push(ChatMessage::user(format!("turn {i} {big}").as_str()));
+            history.push(ChatMessage::assistant(format!("reply {i} {big}").as_str()));
+        }
+        let tokens_before = super::estimate_history_tokens(&history);
+        assert!(
+            tokens_before > model_context_window,
+            "fixture must overflow the window: got {tokens_before}"
+        );
+
+        let result = trim_to_recent_turns(history, recovery_budget);
+        assert!(
+            result.trimmed,
+            "recovery must trim when the estimate exceeds the 90% budget"
+        );
+        assert!(
+            result.tokens_after <= recovery_budget,
+            "tokens_after ({}) must be <= recovery_budget ({})",
+            result.tokens_after,
+            recovery_budget
+        );
+        // Headroom must leave us strictly below the model's true window,
+        // so the retried request has room for the reply + next user turn.
+        assert!(
+            result.tokens_after < model_context_window,
+            "headroom must leave us strictly below the model window: got {}",
+            result.tokens_after
+        );
     }
 
     #[tokio::test]
