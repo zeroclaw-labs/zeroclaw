@@ -251,7 +251,7 @@ impl SkillCreator {
         // Record spend before output validation, so a malformed reflected body
         // that falls back to SKILL.toml still counts the provider usage.
         if let Some(usage) = resp.usage.as_ref() {
-            crate::agent::cost::record_tool_loop_cost_usage(provider_name, model, usage);
+            crate::agent::cost::record_tool_loop_cost_usage(provider_name, model, usage).await;
         }
         let raw = resp.text.unwrap_or_default();
         Self::normalize_reflected_md(slug, &raw)
