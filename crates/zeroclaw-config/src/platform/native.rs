@@ -45,6 +45,7 @@ pub fn windows_std_cmd_shell_command(command: &str) -> std::process::Command {
 /// Native runtime — full access, runs on Mac/Linux/Windows/Docker/Raspberry Pi
 pub struct NativeRuntime {
     /// Shell binary to invoke for command execution (e.g. `"sh"`, `"bash"`).
+    #[cfg(not(target_os = "windows"))]
     shell: String,
 }
 
@@ -57,7 +58,7 @@ impl Default for NativeRuntime {
 impl NativeRuntime {
     /// Create a native runtime that uses the system default shell (`sh`).
     pub fn new() -> Self {
-        Self { shell: "sh".into() }
+        Self::with_shell("sh".into())
     }
 
     /// Create a native runtime that uses a specific shell binary.
@@ -65,7 +66,16 @@ impl NativeRuntime {
     /// `shell` should be a path or name resolvable via `PATH`,
     /// e.g. `"bash"`, `"/bin/zsh"`, `"/usr/bin/fish"`.
     pub fn with_shell(shell: String) -> Self {
-        Self { shell }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Self { shell }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            drop(shell);
+            Self {}
+        }
     }
 }
 
@@ -350,11 +360,11 @@ mod tests {
     // ── Configurable shell tests ─────────────────────────────
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn native_with_shell_defaults_to_sh() {
         let runtime = NativeRuntime::new();
         let cwd = std::env::temp_dir();
         let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
-        #[cfg(not(target_os = "windows"))]
         assert!(
             format!("{cmd:?}").contains("\"sh\""),
             "default shell should be 'sh', got: {cmd:?}"
@@ -362,11 +372,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn native_with_shell_bash() {
         let runtime = NativeRuntime::with_shell("bash".into());
         let cwd = std::env::temp_dir();
         let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
-        #[cfg(not(target_os = "windows"))]
         assert!(
             format!("{cmd:?}").contains("\"bash\""),
             "configured shell should appear in command debug, got: {cmd:?}"
@@ -374,11 +384,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn native_with_shell_absolute_path() {
         let runtime = NativeRuntime::with_shell("/usr/bin/zsh".into());
         let cwd = std::env::temp_dir();
         let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
-        #[cfg(not(target_os = "windows"))]
         assert!(
             format!("{cmd:?}").contains("/usr/bin/zsh"),
             "absolute path should appear verbatim, got: {cmd:?}"
@@ -386,25 +396,23 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn native_default_and_with_shell_are_different() {
         let default = NativeRuntime::new();
         let configured = NativeRuntime::with_shell("bash".into());
         let cwd = std::env::temp_dir();
-        #[cfg(not(target_os = "windows"))]
-        {
-            let default_debug = format!(
-                "{:?}",
-                default.build_shell_command("echo hi", &cwd).unwrap()
-            );
-            let configured_debug = format!(
-                "{:?}",
-                configured.build_shell_command("echo hi", &cwd).unwrap()
-            );
-            assert_ne!(
-                default_debug, configured_debug,
-                "default shell and configured shell should produce different commands"
-            );
-        }
+        let default_debug = format!(
+            "{:?}",
+            default.build_shell_command("echo hi", &cwd).unwrap()
+        );
+        let configured_debug = format!(
+            "{:?}",
+            configured.build_shell_command("echo hi", &cwd).unwrap()
+        );
+        assert_ne!(
+            default_debug, configured_debug,
+            "default shell and configured shell should produce different commands"
+        );
     }
 
     #[test]
