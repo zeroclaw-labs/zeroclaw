@@ -25,7 +25,7 @@ export function HelpTip({ text, children }: { text?: string | null; children?: R
       {open ? (
         <span
           role="tooltip"
-          className="absolute left-0 top-full z-50 mt-1 max-w-xs whitespace-normal rounded-md border border-pc-border bg-pc-bg-elevated px-2.5 py-1.5 text-xs font-normal leading-snug text-pc-text-primary shadow-lg"
+          className="absolute left-0 top-full z-50 mt-1 max-w-xs whitespace-normal rounded-md border border-pc-border-strong bg-pc-elevated px-2.5 py-1.5 text-xs font-normal leading-snug text-pc-text shadow-lg"
         >
           {text}
         </span>

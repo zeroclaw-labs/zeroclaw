@@ -304,11 +304,24 @@ pub struct StepPos {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SopStep {
+    /// Ordinal position of this step within the procedure. Steps run in
+    /// number order unless routing overrides the sequence; the daemon
+    /// renumbers on save so gaps and reorders normalize to 1..N.
     pub number: u32,
+    /// Short human label for the step, shown on the canvas node and in the
+    /// step list. Leave blank and the surface falls back to "untitled".
     pub title: String,
+    /// The step's instruction body in Markdown. This is the prompt the
+    /// running agent executes for the step; bindings like `{{steps.N}}`
+    /// resolve against prior step outputs at run time.
     pub body: String,
+    /// Advisory tool names surfaced to the agent for this step. Legacy alias
+    /// for `scope.allow`; when `step_scope_enforce` is off these are hints,
+    /// not a hard restriction.
     #[serde(default)]
     pub suggested_tools: Vec<String>,
+    /// Pause for human confirmation before this step runs. Independent of
+    /// `checkpoint` kind and the SOP-level approval gate; both still apply.
     #[serde(default)]
     pub requires_confirmation: bool,
     /// Step kind: `execute` (default) or `checkpoint`.
@@ -390,15 +403,34 @@ impl SopStep {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct Sop {
+    /// Unique procedure name. Doubles as the on-disk directory key, so a
+    /// rename in the editor moves the SOP's folder. Must be non-empty.
     pub name: String,
+    /// Free-text summary of what the procedure does and when it fires. Shown
+    /// in the SOP list and header; purely descriptive, never executed.
     pub description: String,
+    /// Semantic version string for the procedure definition (e.g. `1.0.0`).
+    /// Bump it when you change step behavior so runs are traceable.
     pub version: String,
+    /// Scheduling priority when concurrency limits force a choice between
+    /// runnable procedures: `critical`, `high`, `normal` (default), `low`.
     pub priority: SopPriority,
+    /// How steps are driven: `auto`, `supervised` (default), `step_by_step`,
+    /// `priority_based`, or `deterministic`. `deterministic = true` forces
+    /// the last regardless of this field.
     pub execution_mode: SopExecutionMode,
+    /// Signals that start a run. A procedure may bind several triggers; any
+    /// one firing (subject to its own condition) launches the SOP.
     pub triggers: Vec<SopTrigger>,
+    /// Ordered step definitions. This is the body of the procedure; the
+    /// daemon renumbers and remaps routing refs on save.
     pub steps: Vec<SopStep>,
+    /// Minimum seconds between successive runs of this procedure. `0`
+    /// (default) disables the cooldown and back-to-back runs are allowed.
     #[serde(default = "default_cooldown_secs")]
     pub cooldown_secs: u64,
+    /// Maximum simultaneous runs of this one procedure. Excess trigger
+    /// firings queue or drop per the engine's concurrency policy. Default 1.
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: u32,
     #[serde(skip)]

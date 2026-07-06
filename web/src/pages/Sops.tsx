@@ -395,14 +395,17 @@ function StepEditor({
       className="rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface p-3"
     >
       <div className="mb-2 flex items-center gap-2">
-        <span className="inline-flex h-6 w-6 items-center justify-center rounded bg-pc-accent text-xs font-semibold text-[#0b1220]">
-          {step.number}
-        </span>
+        <HelpTip text={sopFieldHelp('SopStep', 'number')}>
+          <span className="inline-flex h-6 w-6 items-center justify-center rounded bg-pc-accent text-xs font-semibold text-[#0b1220]">
+            {step.number}
+          </span>
+        </HelpTip>
         <input
           type="text"
           value={step.title}
           onChange={(e) => onChange({ title: e.target.value })}
           placeholder={t('sops.step_title_placeholder')}
+          title={sopFieldHelp('SopStep', 'title') ?? undefined}
           className="flex-1 rounded border border-pc-border bg-pc-surface px-2 py-1 text-sm text-pc-text"
         />
         <select
@@ -410,6 +413,7 @@ function StepEditor({
           onChange={(e) => onChange({ kind: e.target.value as SopStep['kind'] })}
           className="rounded border border-pc-border bg-pc-surface px-1.5 py-1 text-xs text-pc-text"
           aria-label={t('sops.step_kind')}
+          title={sopFieldHelp('SopStep', 'kind') ?? undefined}
         >
           <option value="execute">{t('sops.kind_execute')}</option>
           <option value="checkpoint">{t('sops.kind_checkpoint')}</option>
@@ -469,7 +473,11 @@ function StepEditor({
       </div>
       <div className="mb-2 space-y-2 text-xs">
         <div>
-          <span className="mb-1 block text-pc-text-muted">{t('sops.step_tools_label')}</span>
+          <span className="mb-1 block text-pc-text-muted">
+            <HelpTip text={sopFieldHelp('SopStep', 'suggested_tools')}>
+              {t('sops.step_tools_label')}
+            </HelpTip>
+          </span>
           <ToolPicker
             value={step.suggested_tools ?? []}
             onChange={(next) => onChange({ suggested_tools: next })}
@@ -481,7 +489,9 @@ function StepEditor({
             checked={step.requires_confirmation ?? false}
             onChange={(e) => onChange({ requires_confirmation: e.target.checked })}
           />
-          {t('sops.requires_confirmation')}
+          <HelpTip text={sopFieldHelp('SopStep', 'requires_confirmation')}>
+            {t('sops.requires_confirmation')}
+          </HelpTip>
         </label>
       </div>
       <div className="grid grid-cols-3 gap-2 border-t border-pc-border pt-2 text-xs">
@@ -489,6 +499,7 @@ function StepEditor({
           label={t('sops.routing_depends_on')}
           value={(routing.depends_on ?? []).join(', ')}
           placeholder="2, 3"
+          help={sopFieldHelp('StepRouting', 'depends_on')}
           onChange={(v) =>
             setRouting({
               depends_on: v
@@ -498,7 +509,7 @@ function StepEditor({
             })
           }
         />
-        <Field label={t('sops.routing_next')}>
+        <Field label={t('sops.routing_next')} help={sopFieldHelp('StepRouting', 'next')}>
           <input
             type="number"
             value={routing.next ?? ''}
@@ -513,11 +524,13 @@ function StepEditor({
           label={t('sops.routing_when')}
           value={routing.when ?? ''}
           placeholder="$.value > 85"
+          help={sopFieldHelp('StepRouting', 'when')}
           onChange={(v) => setRouting({ when: v || undefined })}
         />
         <SelectField
           label={t('sops.on_failure')}
           value={fkind}
+          help={sopFieldHelp('SopStep', 'on_failure')}
           onChange={(v) => setFailure(v as 'fail' | 'retry' | 'goto')}
         >
           <option value="fail">{t('sops.failure_fail')}</option>
@@ -551,7 +564,9 @@ function StepEditor({
       </div>
       <div className="mt-2 rounded border border-pc-border p-2">
         <div className="mb-1 flex items-center justify-between">
-          <span className="text-xs font-medium text-pc-text">{t('sops.switch_ports')}</span>
+          <span className="text-xs font-medium text-pc-text">
+            <HelpTip text={sopFieldHelp('StepRouting', 'switch')}>{t('sops.switch_ports')}</HelpTip>
+          </span>
           <button
             type="button"
             onClick={() =>
@@ -801,6 +816,7 @@ function ChannelTriggerFields({
           value={trigger.channel}
           onChange={(v) => onChange({ channel: v, alias: null })}
           options={channels.map((c) => c.channel)}
+          help={sopFieldHelp('SopTrigger', 'channel')}
         />
         <SelectField
           label={t('sops.trigger_alias')}
@@ -808,6 +824,7 @@ function ChannelTriggerFields({
           onChange={(v) => onChange({ alias: v.length > 0 ? v : null })}
           disabled={!selected?.configured}
           options={(selected?.aliases ?? []).map((a) => a.alias)}
+          help={sopFieldHelp('SopTrigger', 'alias')}
         >
           <option value="">{t('sops.trigger_alias_any')}</option>
         </SelectField>
@@ -1638,7 +1655,7 @@ export default function Sops() {
           <div className="text-pc-text-muted">{t('sops.empty')}</div>
         </Card>
       ) : (
-        <div className="grid grid-cols-[14rem_1fr] gap-4">
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[14rem_minmax(0,1fr)]">
           <Card className="h-fit p-2">
             <ul className="space-y-1">
               {sops.map((s) => (
@@ -1648,13 +1665,19 @@ export default function Sops() {
                     onClick={() => setSelected(s.name)}
                     className={`w-full rounded px-2 py-1.5 text-left text-sm ${
                       s.name === selected
-                        ? 'bg-pc-accent-light text-pc-accent'
+                        ? 'bg-pc-accent text-[#0b1220]'
                         : 'text-pc-text hover:bg-pc-elevated'
                     }`}
                   >
                     <div className="font-medium">{s.name}</div>
                     {s.description ? (
-                      <div className="truncate text-xs text-pc-text-muted">{s.description}</div>
+                      <div
+                        className={`truncate text-xs ${
+                          s.name === selected ? 'text-[#0b1220]/70' : 'text-pc-text-muted'
+                        }`}
+                      >
+                        {s.description}
+                      </div>
                     ) : null}
                   </button>
                 </li>
@@ -1662,14 +1685,14 @@ export default function Sops() {
             </ul>
           </Card>
           <div>
-            <div className="mb-3 flex items-center gap-2">
+            <div className="mb-3 flex flex-wrap items-center gap-2">
               <span className="font-medium text-pc-text">{selected}</span>
               {graph ? (
                 <Badge tone="neutral">
                   {graph.nodes.length} {t('sops.steps')}
                 </Badge>
               ) : null}
-              <div className="ml-auto flex gap-2">
+              <div className="ml-auto flex flex-wrap gap-2">
                 <button
                   type="button"
                   onClick={() => setLayer((l) => (l === 'visual' ? 'fields' : 'visual'))}
@@ -1695,13 +1718,13 @@ export default function Sops() {
                 </button>
               </div>
             </div>
-            <div className="mb-3 flex items-center gap-2">
+            <div className="mb-3 flex flex-wrap items-center gap-2">
               <input
                 type="text"
                 value={runId}
                 onChange={(e) => setRunId(e.target.value.trim())}
                 placeholder={t('sops.run_id_placeholder')}
-                className="w-64 rounded border border-pc-border bg-pc-surface px-2 py-1 text-sm text-pc-text"
+                className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-sm text-pc-text sm:w-64"
               />
               {overlay ? (
                 <Badge tone={overlay.status === 'failed' ? 'error' : 'ok'}>
