@@ -60,21 +60,21 @@ enum Status {
 impl Status {
     fn cell(self) -> &'static str {
         match self {
-            Status::Supported => "Supported",
-            Status::Partial => "Partial",
-            Status::Experimental => "Experimental",
-            Status::Planned => "Planned",
-            Status::None => "None",
-            Status::Unknown => "Unknown",
+            Status::Supported => "✅",
+            Status::Partial => "🟡",
+            Status::Experimental => "🧪",
+            Status::Planned => "📋",
+            Status::None => "❌",
+            Status::Unknown => "❓",
         }
     }
 }
 
 struct Row {
     label: String,
-    zeroclaw: &'static str,
-    openclaw: &'static str,
-    hermes: &'static str,
+    zeroclaw: Status,
+    openclaw: Status,
+    hermes: Status,
 }
 
 pub fn run(root: &Path) -> Result<()> {
@@ -114,7 +114,10 @@ fn table(header: &str, rows: &[Row]) -> String {
         let _ = writeln!(
             out,
             "| {} | {} | {} | {} |",
-            r.label, r.zeroclaw, r.openclaw, r.hermes
+            r.label,
+            r.zeroclaw.cell(),
+            r.openclaw.cell(),
+            r.hermes.cell()
         );
     }
     out
@@ -129,7 +132,7 @@ fn channels_rows(parity: &Parity) -> Result<Vec<Row>> {
         let (openclaw, hermes) = external_cells(parity.channels.get(info.kind));
         rows.push(Row {
             label: info.name.to_string(),
-            zeroclaw: "Supported",
+            zeroclaw: Status::Supported,
             openclaw,
             hermes,
         });
@@ -146,7 +149,7 @@ fn providers_rows(parity: &Parity) -> Result<Vec<Row>> {
         let (openclaw, hermes) = external_cells(parity.providers.get(slot));
         rows.push(Row {
             label: format!("`{slot}`"),
-            zeroclaw: "Supported",
+            zeroclaw: Status::Supported,
             openclaw,
             hermes,
         });
@@ -165,7 +168,7 @@ fn tools_rows(parity: &Parity) -> Result<Vec<Row>> {
         let (openclaw, hermes) = external_cells(parity.tools.get(&name));
         rows.push(Row {
             label: format!("`{name}`"),
-            zeroclaw: "Supported",
+            zeroclaw: Status::Supported,
             openclaw,
             hermes,
         });
@@ -174,10 +177,10 @@ fn tools_rows(parity: &Parity) -> Result<Vec<Row>> {
     Ok(rows)
 }
 
-fn external_cells(col: Option<&Column>) -> (&'static str, &'static str) {
+fn external_cells(col: Option<&Column>) -> (Status, Status) {
     match col {
-        Some(c) => (c.openclaw.cell(), c.hermes.cell()),
-        None => ("Unknown", "Unknown"),
+        Some(c) => (c.openclaw, c.hermes),
+        None => (Status::Unknown, Status::Unknown),
     }
 }
 
@@ -220,7 +223,7 @@ mod tests {
     fn channel_column_is_all_supported_from_walk() {
         let parity = load_parity(&root()).unwrap();
         for r in channels_rows(&parity).unwrap() {
-            assert_eq!(r.zeroclaw, "Supported");
+            assert_eq!(r.zeroclaw, Status::Supported);
         }
     }
 }
