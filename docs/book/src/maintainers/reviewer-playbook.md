@@ -56,6 +56,23 @@ If any intake check fails, leave one actionable checklist comment and stop. Don'
 - No personal or sensitive data leaked into diff artifacts; tests use neutral, project-scoped placeholders.
 - Naming and architecture boundaries follow project contracts (`AGENTS.md`, [Architecture overview](../architecture/overview.md#core-traits)).
 
+### Typed dispatch for shared key spaces
+
+When a change dispatches over a shared key space, such as wire method names,
+compiled channel type keys, provider slots, or frontend/backend registry keys,
+check that raw strings are resolved at the boundary and the rest of the code
+uses a typed source of truth: an enum, macro-generated table, trait/factory
+registry, or another canonical owner. Do not add parallel string `match` arms,
+hand-typed dispatch tables, or duplicate lists that must be kept in sync by
+reviewer memory.
+
+This is the review form of the repo-root single-source-of-truth rule. The goal
+is not to ban string constants at API boundaries; it is to avoid a second
+dispatch surface where adding a new variant can compile while silently skipping
+one consumer. Good examples are the RPC `Method` registry for wire method names
+and `CHANNEL_COMPILE_SPECS` for channel compile keys, where one canonical owner
+drives downstream coverage.
+
 ### Deep-review checklist (high-risk only)
 
 For `risk:high` PRs, verify a concrete example in each category. One concrete instance beats five generic claims.
