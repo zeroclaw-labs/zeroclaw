@@ -4337,3 +4337,79 @@ mod tests {
         );
     }
 }
+
+/// Attempt to fetch context window from provider's /models endpoint.
+/// Returns `None` on any failure (network, parsing, missing field) — caller uses fallback.
+pub async fn fetch_context_window(
+    provider_type: &str,
+    config: &zeroclaw_config::schema::ModelProviderConfig,
+) -> Option<usize> {
+    match provider_type {
+        "openrouter" => fetch_openrouter_context_window(config).await,
+        "together" | "groq" | "fireworks" | "deepinfra" | "hyperbolic" | "anyscale" | "novita"
+        | "nebius" => fetch_openai_compatible_context_window(provider_type, config).await,
+        _ => None, // anthropic, openai, ollama, bedrock, etc. don't expose it
+    }
+}
+
+async fn fetch_openrouter_context_window(
+    config: &zeroclaw_config::schema::ModelProviderConfig,
+) -> Option<usize> {
+    let client = reqwest::Client::new();
+    let url = config
+        .uri
+        .as_deref()
+        .filter(|s| !s.is_empty() && *s != "<unset>")
+        .unwrap_or("https://openrouter.ai/api/v1/models");
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    let model = config.model.as_deref().unwrap_or("");
+    resp["data"]
+        .as_array()?
+        .iter()
+        .find(|m| m["id"].as_str() == Some(model))?["context_length"]
+        .as_u64()
+        .map(|v| v as usize)
+}
+
+async fn fetch_openai_compatible_context_window(
+    provider_type: &str,
+    config: &zeroclaw_config::schema::ModelProviderConfig,
+) -> Option<usize> {
+    let client = reqwest::Client::new();
+    let default_uri = crate::factory::get_default_url(provider_type);
+    let base_url = config
+        .uri
+        .as_deref()
+        .filter(|s| !s.is_empty() && *s != "<unset>")
+        .or(default_uri)
+        .unwrap_or("");
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let mut req = client.get(&url);
+    if let Some(key) = config.api_key.as_deref() {
+        req = req.bearer_auth(key);
+    }
+    let resp = req
+        .send()
+        .await
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    let model = config.model.as_deref().unwrap_or("");
+    let model_entry = resp["data"]
+        .as_array()?
+        .iter()
+        .find(|m| m["id"].as_str() == Some(model))?;
+    model_entry
+        .get("context_length")
+        .or_else(|| model_entry.get("context_window"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+}
