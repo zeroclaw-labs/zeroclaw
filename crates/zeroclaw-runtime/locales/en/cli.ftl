@@ -944,3 +944,70 @@ cli-doctor-ctxwin-dry-run = Dry run complete — no changes written. Run without
 cli-doctor-ctxwin-none = No updates needed.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window: {$error}
 
+# ── Goal mode control-plane (#8746) ──
+goal-status-running = running
+goal-status-paused = paused
+goal-status-completed = completed
+goal-status-failed = failed
+goal-status-cancelled = cancelled
+goal-status-lost = lost
+goal-status-timed-out = timed out
+
+goal-pause-reason-operator-paused = operator paused
+goal-pause-reason-needs-user-input = needs user input
+goal-pause-reason-human-escalation = human escalation
+goal-pause-reason-external-dependency = external dependency
+goal-pause-reason-provider-unavailable = provider unavailable
+goal-pause-reason-verifier-blocked = verifier blocked
+goal-pause-reason-budget-exhausted = budget exhausted
+goal-pause-reason-budget-unavailable = budget unavailable
+goal-pause-reason-daemon-restarted = daemon restarted
+
+goal-budget-cost-value = ${ $amount }
+goal-budget-limit-unlimited = unlimited
+
+goal-command-help = Goal mode commands:
+  /goal start <objective> — Start a new durable goal
+  /goal objective <new-objective> — Update the current goal's objective
+  /goal status — Show current goal status
+  /goal budget [--tokens=N|unlimited] [--cost=N|unlimited] — Set budget limits
+  /goal pause [reason] — Pause the current goal
+  /goal resume [reason] — Resume a paused goal
+  /goal cancel — Cancel the current goal
+  /goal --help — Show this help message
+
+goal-command-error-disabled = Goal mode is disabled. Enable it with: zeroclaw config set goal.enabled true
+goal-command-error-agent-disabled = Goal mode is not enabled for this agent
+goal-command-error-channel-type-missing = Channel type not configured for goal mode
+goal-command-error-control-plane-unavailable = Control plane unavailable
+goal-command-error-missing-action = Missing action
+goal-command-error-missing-objective = Missing objective
+goal-command-error-unknown-action = Unknown action: { $action }
+goal-command-error-missing-budget = Missing budget value
+goal-command-error-invalid-budget-flag = Invalid budget flag: { $flag }
+goal-command-error-unexpected-arguments = Unexpected arguments: { $args }
+goal-command-error-lookup-failed = Goal lookup failed
+goal-command-error-not-found = Goal not found: { $task_id }
+goal-command-error-no-active-goal = No active goal for this context
+goal-command-error-status-failed = Status lookup failed
+goal-command-error-not-goal = Not a goal task: { $task_id }
+goal-command-error-wrong-agent = Wrong agent for goal: { $task_id }
+goal-command-error-wrong-route = Wrong route for goal: { $task_id }
+goal-command-error-already-terminal = Goal { $task_id } is already { $status }
+goal-command-error-already-running = Goal { $task_id } is already running
+goal-command-error-active-goal-lookup-failed = Active goal lookup failed
+goal-command-error-active-goal-conflict = Active goal conflict
+goal-command-error-start-failed = Failed to start goal
+goal-command-error-update-failed = Failed to update goal: { $task_id }
+goal-command-error-pause-failed = Failed to pause goal: { $task_id }
+goal-command-error-resume-failed = Failed to resume goal: { $task_id }
+goal-command-error-budget-failed = Budget operation failed: { $task_id }
+
+goal-command-paused = Goal { $task_id } paused
+goal-command-resumed = Goal { $task_id } resumed
+goal-command-cancelled = Goal { $task_id } cancelled
+goal-command-budget-exhausted = Goal { $task_id } budget exhausted: { $budget }
+goal-command-budget-unavailable = Goal { $task_id } budget unavailable: { $budget }
+
+goal-terminal-reason-cancelled-by-controller = Cancelled by controller
+

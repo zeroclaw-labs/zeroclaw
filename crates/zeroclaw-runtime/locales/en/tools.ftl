@@ -161,3 +161,11 @@ tool-web-search-tool = Search the web for information. Returns relevant search r
 tool-workspace = Manage multi-client workspaces. Subcommands: list, switch, create, info, export. Each workspace provides isolated memory, audit, secrets, and tool restrictions.
 
 tool-weather = Get current weather conditions and forecast for any location worldwide. Supports city names (in any language or script), IATA airport codes (e.g. 'LAX'), GPS coordinates (e.g. '51.5,-0.1'), postal/zip codes, and domain-based geolocation. Returns temperature, feels-like, humidity, wind speed/direction, precipitation, visibility, pressure, UV index, and cloud cover. Optional 0-3 day forecast with hourly breakdown. Units default to metric (°C, km/h, mm) but can be set to imperial (°F, mph, inches) per request. No API key required.
+
+tool-goal-resume = Resume a paused goal. Provide an optional reason explaining what changed since the pause. The reason is used only as context for the next model turn, not as a durable update to the goal's state.
+tool-goal-resume-reason-description = Optional explanation of what changed since the pause, to be used as context for the next model turn.
+tool-goal-resume-error-missing-context = Missing goal admission context (goal_resume can only be called during a goal turn).
+tool-goal-resume-error-agent-context-mismatched = Agent alias mismatch in goal admission context.
+tool-goal-resume-error-agent-context-mismatched = Agent alias mismatch in goal admission context.
+tool-goal-resume-success-continue = Continue working on this resumed goal now. { $message }
+tool-goal-resume-success-paused = Do not continue this goal now. { $message }
