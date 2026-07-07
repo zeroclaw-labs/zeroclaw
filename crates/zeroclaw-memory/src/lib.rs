@@ -57,7 +57,6 @@ pub mod vector;
 
 pub use agent_scoped::AgentScopedMemory;
 pub use agent_scoped_markdown::{AgentScopedMarkdownMemory, MarkdownPeer};
-#[allow(unused_imports)]
 pub use audit::AuditedMemory;
 #[allow(unused_imports)]
 pub use backend::{
@@ -93,13 +92,15 @@ use zeroclaw_config::schema::{
 };
 
 #[cfg(feature = "memory-postgres")]
-fn build_postgres_memory(storage: &PostgresStorageConfig) -> anyhow::Result<Box<dyn Memory>> {
+fn build_postgres_memory(
+    storage: &PostgresStorageConfig,
+) -> anyhow::Result<postgres::PostgresMemory> {
     use postgres::PostgresMemory;
     let db_url = storage
         .db_url
         .as_deref()
         .context("memory backend 'postgres' requires [storage.postgres.<alias>].db_url")?;
-    let memory = PostgresMemory::new(
+    PostgresMemory::new(
         "postgres",
         db_url,
         &storage.schema,
@@ -107,8 +108,7 @@ fn build_postgres_memory(storage: &PostgresStorageConfig) -> anyhow::Result<Box<
         storage.connect_timeout_secs,
         Some(storage.vector_enabled),
         Some(storage.vector_dimensions),
-    )?;
-    Ok(Box::new(memory))
+    )
 }
 
 #[cfg(not(feature = "memory-postgres"))]
@@ -119,20 +119,41 @@ fn build_postgres_memory(_storage: &PostgresStorageConfig) -> anyhow::Result<Box
     )
 }
 
+/// Wrap the backend in the `AuditedMemory` decorator when
+/// `[memory] audit_enabled = true`; pass it through untouched otherwise
+/// (the default), so the flag-off path is byte-identical to an unwrapped
+/// backend.
+fn wrap_audit<M: Memory + 'static>(
+    memory: M,
+    workspace_dir: &Path,
+    audit_enabled: bool,
+) -> anyhow::Result<Box<dyn Memory>> {
+    if audit_enabled {
+        Ok(Box::new(AuditedMemory::new(memory, workspace_dir)?))
+    } else {
+        Ok(Box::new(memory))
+    }
+}
+
 fn create_memory_with_builders<F>(
     backend_name: &str,
     workspace_dir: &Path,
     mut sqlite_builder: F,
     unknown_context: &str,
+    audit_enabled: bool,
 ) -> anyhow::Result<Box<dyn Memory>>
 where
     F: FnMut() -> anyhow::Result<SqliteMemory>,
 {
     match classify_memory_backend(backend_name) {
-        MemoryBackendKind::Sqlite => Ok(Box::new(sqlite_builder()?)),
+        MemoryBackendKind::Sqlite => wrap_audit(sqlite_builder()?, workspace_dir, audit_enabled),
         MemoryBackendKind::Lucid => {
             let local = sqlite_builder()?;
-            Ok(Box::new(LucidMemory::new("lucid", workspace_dir, local)))
+            wrap_audit(
+                LucidMemory::new("lucid", workspace_dir, local),
+                workspace_dir,
+                audit_enabled,
+            )
         }
         MemoryBackendKind::Postgres => {
             // Postgres requires a typed `[storage.postgres.<alias>]` config, which this
@@ -145,13 +166,21 @@ where
                  call create_memory_with_storage_and_routes instead of create_memory_with_builders"
             )
         }
-        MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
-            Ok(Box::new(MarkdownMemory::new("markdown", workspace_dir)))
+        MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => wrap_audit(
+            MarkdownMemory::new("markdown", workspace_dir),
+            workspace_dir,
+            audit_enabled,
+        ),
+        MemoryBackendKind::None => {
+            wrap_audit(NoneMemory::new("none"), workspace_dir, audit_enabled)
         }
-        MemoryBackendKind::None => Ok(Box::new(NoneMemory::new("none"))),
         MemoryBackendKind::Unknown => {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"backend_name": backend_name, "unknown_context": unknown_context})), "Unknown memory backend '', falling back to markdown");
-            Ok(Box::new(MarkdownMemory::new("markdown", workspace_dir)))
+            wrap_audit(
+                MarkdownMemory::new("markdown", workspace_dir),
+                workspace_dir,
+                audit_enabled,
+            )
         }
     }
 }
@@ -652,13 +681,11 @@ pub fn create_memory_with_storage_and_routes(
                 url, collection
             )
         );
-        return Ok(Box::new(QdrantMemory::new_lazy(
-            "qdrant",
-            &url,
-            &collection,
-            qdrant_api_key,
-            embedder,
-        )));
+        return wrap_audit(
+            QdrantMemory::new_lazy("qdrant", &url, &collection, qdrant_api_key, embedder),
+            workspace_dir,
+            config.audit_enabled,
+        );
     }
 
     if matches!(backend_kind, MemoryBackendKind::Postgres) {
@@ -669,7 +696,18 @@ pub fn create_memory_with_storage_and_routes(
                  referenced by `memory.backend = \"postgres.<alias>\"`"
             ),
         };
-        return build_postgres_memory(pg_cfg);
+        #[cfg(feature = "memory-postgres")]
+        {
+            return wrap_audit(
+                build_postgres_memory(pg_cfg)?,
+                workspace_dir,
+                config.audit_enabled,
+            );
+        }
+        #[cfg(not(feature = "memory-postgres"))]
+        {
+            return build_postgres_memory(pg_cfg);
+        }
     }
 
     create_memory_with_builders(
@@ -684,6 +722,7 @@ pub fn create_memory_with_storage_and_routes(
             )
         },
         "",
+        config.audit_enabled,
     )
 }
 
@@ -697,11 +736,14 @@ pub fn create_memory_for_migration(
         );
     }
 
+    // Migration writes bypass the audit trail: the imported rows are bulk
+    // history, not live memory operations.
     create_memory_with_builders(
         backend,
         workspace_dir,
         || SqliteMemory::new("sqlite", workspace_dir),
         " during migration",
+        false,
     )
 }
 
@@ -837,6 +879,58 @@ mod tests {
         };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
         assert_eq!(mem.name(), "sqlite");
+    }
+
+    #[tokio::test]
+    async fn factory_does_not_create_audit_db_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            ..MemoryConfig::default()
+        };
+        assert!(!cfg.audit_enabled, "audit must stay opt-in by default");
+
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        mem.store("audit_off", "value", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        assert!(!tmp.path().join("memory").join("audit.db").exists());
+    }
+
+    #[tokio::test]
+    async fn factory_wraps_backend_with_audit_when_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            audit_enabled: true,
+            ..MemoryConfig::default()
+        };
+
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        mem.store("audit_on", "value", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let _ = mem.recall("value", 5, None, None, None).await.unwrap();
+
+        let audit_db = tmp.path().join("memory").join("audit.db");
+        let conn = rusqlite::Connection::open(audit_db).unwrap();
+        let stores: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_audit WHERE operation = 'store'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let recalls: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_audit WHERE operation = 'recall'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stores, 1);
+        assert_eq!(recalls, 1);
     }
 
     #[test]

@@ -934,4 +934,76 @@ mod tests {
         assert!(d.is_some(), "YYYY-MM-DD.md should be parsed");
         assert_eq!(d.unwrap(), NaiveDate::from_ymd_opt(2026, 3, 28).unwrap());
     }
+
+    fn seed_audit_db(workspace: &Path) -> PathBuf {
+        fs::create_dir_all(workspace.join("memory")).unwrap();
+        let db_path = workspace.join("memory").join("audit.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_audit (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 operation TEXT NOT NULL,
+                 key TEXT,
+                 namespace TEXT,
+                 session_id TEXT,
+                 timestamp TEXT NOT NULL,
+                 metadata TEXT
+             );",
+        )
+        .unwrap();
+        let stale = (Local::now() - Duration::days(45)).to_rfc3339();
+        let fresh = Local::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memory_audit (operation, timestamp) VALUES ('store', ?1)",
+            params![stale],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memory_audit (operation, timestamp) VALUES ('store', ?1)",
+            params![fresh],
+        )
+        .unwrap();
+        db_path
+    }
+
+    fn audit_row_count(db_path: &Path) -> i64 {
+        let conn = Connection::open(db_path).unwrap();
+        conn.query_row("SELECT COUNT(*) FROM memory_audit", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn prunes_stale_audit_rows_when_audit_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let db_path = seed_audit_db(workspace);
+
+        let mut cfg = default_cfg();
+        cfg.audit_enabled = true;
+        assert_eq!(cfg.audit_retention_days, 30);
+        run_if_due(&cfg, workspace).unwrap();
+
+        assert_eq!(
+            audit_row_count(&db_path),
+            1,
+            "audit rows past audit_retention_days must be pruned"
+        );
+    }
+
+    #[test]
+    fn leaves_audit_rows_alone_when_audit_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let db_path = seed_audit_db(workspace);
+
+        let cfg = default_cfg();
+        assert!(!cfg.audit_enabled);
+        run_if_due(&cfg, workspace).unwrap();
+
+        assert_eq!(
+            audit_row_count(&db_path),
+            2,
+            "hygiene must not touch the audit db while audit is disabled"
+        );
+    }
 }

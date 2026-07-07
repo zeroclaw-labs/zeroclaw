@@ -194,6 +194,19 @@ pub enum ObserverEvent {
         duration: Duration,
         success: bool,
     },
+    /// A memory audit/operator action was recorded on the audit trail.
+    ///
+    /// Carries only bounded labels. The action is an audit verb such as
+    /// `"store"`, `"recall"`, or `"purge"`; raw memory keys and content
+    /// are intentionally excluded from this event.
+    MemoryAudit {
+        /// Bounded audit action name, safe to use as a metric label.
+        action: String,
+        /// Bounded backend identifier (e.g. `"sqlite"`, `"qdrant"`).
+        backend: String,
+        duration: Duration,
+        success: bool,
+    },
     /// A RAG retrieval pass has completed.
     ///
     /// Emitted after vector + keyword retrieval against the hardware
@@ -498,9 +511,16 @@ mod tests {
             num_chunks: 5,
             num_boards: 2,
         };
+        let audit = ObserverEvent::MemoryAudit {
+            action: "store".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(2),
+            success: true,
+        };
 
         assert!(matches!(recall.clone(), ObserverEvent::MemoryRecall { .. }));
         assert!(matches!(store.clone(), ObserverEvent::MemoryStore { .. }));
         assert!(matches!(rag.clone(), ObserverEvent::RagRetrieve { .. }));
+        assert!(matches!(audit.clone(), ObserverEvent::MemoryAudit { .. }));
     }
 }
