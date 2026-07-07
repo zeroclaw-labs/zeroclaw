@@ -1465,7 +1465,14 @@ pub async fn run_gateway(
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
     }
-    println!("  🌐 Web Dashboard: http://{display_addr}{pfx}/");
+    if web_dist_dir.is_some() {
+        println!("  🌐 Web Dashboard: http://{display_addr}{pfx}/");
+    } else {
+        println!(
+            "  ⚠️  Web Dashboard: not available — reinstall with the supported installer \
+             (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to build it"
+        );
+    }
     if let Some(code) = pairing.pairing_code() {
         println!();
         println!("  🔐 PAIRING REQUIRED — use this one-time code:");

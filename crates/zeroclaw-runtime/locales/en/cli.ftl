@@ -401,6 +401,9 @@ channel-discord-delivery-failure-note-one = (note: I couldn't deliver {$count} f
 channel-discord-delivery-failure-note-many = (note: I couldn't deliver {$count} files.)
 channel-whatsapp-web-delivery-failure-note-one = (note: I could not deliver {$count} WhatsApp media attachment.)
 channel-whatsapp-web-delivery-failure-note-many = (note: I could not deliver {$count} WhatsApp media attachments.)
+channel-line-bind-success = ✅ Paired! You can now chat.
+channel-line-bind-invalid-code = ❌ Invalid code. Please try again.
+channel-line-bind-rate-limited = ⏳ Too many attempts. Retry in { $secs }s.
 
 # Onboarding — OpenAI auth picker
 onboard-openai-auth-note =
@@ -422,6 +425,15 @@ onboard-openai-codex-followup =
 cli-web-dist-dir-reason-tilde = starts with `~` which is not expanded
 cli-web-dist-dir-reason-dollar = contains `$` which is not expanded
 cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason}; gateway.web_dist_dir is read verbatim, so expand the value yourself (e.g. an absolute path)
+# Diagnostics emitted by `zeroclaw doctor` cross-checking OpenAI Codex
+# (OAuth/subscription) credentials against OpenAI provider slots that opt in
+# via `requires_openai_auth = true`. A signed-in credential with no slot — or a
+# slot with no credential — otherwise stays silent until the first model call,
+# where it surfaces as a confusing auth error. Companion runtime check in
+# `crates/zeroclaw-runtime/src/doctor/mod.rs`.
+cli-doctor-codex-auth-profile-no-slot = OpenAI Codex credentials are signed in but no model provider slot uses them. Set `requires_openai_auth = true` on an OpenAI provider slot and point an agent's `model_provider` at it, or run `zeroclaw quickstart`.
+cli-doctor-codex-auth-slot-no-profile = OpenAI slot(s) {$slots} set `requires_openai_auth = true` but no OpenAI Codex credentials are signed in. Run `zeroclaw auth login --provider openai-codex`.
+cli-doctor-codex-auth-ok = OpenAI Codex credentials are signed in and referenced by a model provider slot.
 cli-doctor-systemd-linger-enabled = systemd user lingering enabled
 cli-doctor-systemd-linger-disabled = systemd user lingering disabled; user service may stop after logout. Enable with: loginctl enable-linger {$user}
 cli-doctor-systemd-linger-unknown = systemd user lingering could not be checked with loginctl
