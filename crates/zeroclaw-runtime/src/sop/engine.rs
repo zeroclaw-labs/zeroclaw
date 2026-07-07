@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
+use super::capability::SopCapabilityRegistry;
 use super::condition::evaluate_condition;
 use super::load_sops;
 use super::metrics::SopMetricsCollector;
@@ -41,6 +42,8 @@ pub struct SopEngine {
     /// Run-execution metrics collector. Per-engine fresh in `new()` (test
     /// isolation); `build_sop_engine` swaps in the process-shared collector.
     metrics: Arc<SopMetricsCollector>,
+    /// Deterministic capability registry for `kind = "capability"` SOP steps.
+    capabilities: Arc<SopCapabilityRegistry>,
 }
 
 /// Outcome of one [`SopEngine::run_maintenance_tick`] pass (EPIC A1), for
@@ -78,6 +81,7 @@ impl SopEngine {
             deterministic_savings: DeterministicSavings::default(),
             store: Arc::new(InMemoryRunStore::new()),
             metrics: Arc::new(SopMetricsCollector::new()),
+            capabilities: Arc::new(SopCapabilityRegistry::with_builtins()),
         }
     }
 
@@ -97,6 +101,12 @@ impl SopEngine {
         self
     }
 
+    /// Inject a deterministic capability registry. Tests and future daemon
+    /// wiring can replace the built-ins without adding another execution path.
+    pub fn with_capabilities(mut self, capabilities: Arc<SopCapabilityRegistry>) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
     /// Reconstruct in-flight runs from the store at startup (durable backends).
     /// No-op for the in-memory default. Does not overwrite already-present runs.
     pub fn restore_runs(&mut self) {
@@ -490,6 +500,16 @@ impl SopEngine {
 
     /// Report the result of the current step and advance the run.
     /// Returns the next action to take.
+    ///
+    /// Refuses to advance a run whose status is `WaitingApproval` or
+    /// `PausedCheckpoint`: those states mean an external gate is pending
+    /// (an approval, or a deterministic checkpoint resume) and a driver
+    /// supplying a fabricated `SopStepResult` must not be allowed to skip
+    /// the gate. The legitimate path for clearing a `WaitingApproval` gate
+    /// is `resolve_gate` / `clear_waiting_gate`; the legitimate path for
+    /// resuming a `PausedCheckpoint` is `approve_step`. Mirrors the
+    /// status check `approve_step` already performs for the checkpoint
+    /// case.
     pub fn advance_step(&mut self, run_id: &str, result: SopStepResult) -> Result<SopRunAction> {
         let (sop_name, current_step_number) = {
             let run = self.active_runs.get(run_id).ok_or_else(|| {
@@ -502,6 +522,28 @@ impl SopEngine {
                 );
                 anyhow::Error::msg(format!("Active run not found: {run_id}"))
             })?;
+            if matches!(
+                run.status,
+                SopRunStatus::WaitingApproval | SopRunStatus::PausedCheckpoint
+            ) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "status": run.status.to_string(),
+                            "step": run.current_step,
+                        })),
+                    "SOP engine: advance_step rejected — run is paused at a gate"
+                );
+                bail!(
+                    "Run {run_id} is paused at a {} gate; resolve the gate through \
+                     `resolve_gate` (WaitingApproval) or `approve_step` (PausedCheckpoint) \
+                     before advancing with sop_advance",
+                    run.status
+                );
+            }
             (run.sop_name.clone(), run.current_step)
         };
 
@@ -1338,16 +1380,14 @@ impl SopEngine {
         }
     }
 
-    /// Drive a just-started headless deterministic run to a terminal state.
+    /// Drive a just-started headless deterministic run until it blocks or ends.
     ///
     /// Channel-sourced dispatch (filesystem, MQTT, peripheral, cron) has no
-    /// agent loop to execute steps, so a deterministic run that returns
-    /// `DeterministicStep` would otherwise sit in `active_runs` as `Running`
-    /// forever, consuming its `max_concurrent` slot and blocking every later
-    /// event from the same SOP. Advancing each step here drains the chain to
-    /// `Completed`, which evicts the run via `finish_run` and frees the slot so
-    /// the next matching event can fire. A `CheckpointWait` is intentionally
-    /// left paused (an operator gate, not a stuck run).
+    /// agent loop to execute normal `Execute` steps. Capability steps can run
+    /// through the deterministic registry here; driver-required steps fail closed
+    /// so the audit trail never reports a green step that did not execute.
+    /// A `CheckpointWait` is intentionally left paused (an operator gate, not a
+    /// stuck run).
     pub fn drive_headless_deterministic(
         &mut self,
         run_id: &str,
@@ -1356,9 +1396,35 @@ impl SopEngine {
         let mut action = first_action;
         loop {
             match action {
-                SopRunAction::DeterministicStep { ref input, .. } => {
-                    let piped = input.clone();
-                    action = self.advance_deterministic_step(run_id, piped, None)?;
+                SopRunAction::DeterministicStep {
+                    ref step,
+                    ref input,
+                    ..
+                } if step.kind == SopStepKind::Capability => {
+                    let (sop_name, sop) = self.resolve_active_run_sop(run_id)?;
+                    action = self.execute_capability_step(&sop, run_id, step, input.clone())?;
+                    if self.active_runs.contains_key(run_id) {
+                        let run_sop_name = self
+                            .active_runs
+                            .get(run_id)
+                            .map(|run| run.sop_name.as_str())
+                            .unwrap_or(sop_name.as_str());
+                        if run_sop_name != sop.name {
+                            return Ok(action);
+                        }
+                    }
+                }
+                SopRunAction::DeterministicStep {
+                    ref step,
+                    ref run_id,
+                    ..
+                } => {
+                    let sop_name = self
+                        .active_runs
+                        .get(run_id)
+                        .map(|run| run.sop_name.clone())
+                        .unwrap_or_default();
+                    return Ok(self.fail_headless_driverless_step(run_id, &sop_name, step));
                 }
                 terminal => return Ok(terminal),
             }
@@ -1373,55 +1439,105 @@ impl SopEngine {
         step_output: serde_json::Value,
         step_timestamps: Option<(String, Option<String>)>,
     ) -> Result<SopRunAction> {
-        let (sop_name, current_step_number) = {
-            let run = self.active_runs.get(run_id).ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"run_id": run_id})),
-                    "SOP engine: active run not found"
-                );
-                anyhow::Error::msg(format!("Active run not found: {run_id}"))
-            })?;
-            (run.sop_name.clone(), run.current_step)
+        let (_, sop) = self.resolve_active_run_sop(run_id)?;
+        let current_step_number = self
+            .active_runs
+            .get(run_id)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?
+            .current_step;
+        let current_step = self.resolve_sop_step(&sop, current_step_number)?;
+        let (started_at, completed_at) = match step_timestamps {
+            Some((started, completed)) => (started, completed),
+            None => {
+                let run = self
+                    .active_runs
+                    .get(run_id)
+                    .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+                (run.started_at.clone(), Some(now_iso8601()))
+            }
         };
 
-        let sop = self
-            .sops
-            .iter()
-            .find(|s| s.name == sop_name)
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"sop_name": sop_name})),
-                    "SOP engine: sop no longer loaded (definition removed mid-run)"
-                );
-                anyhow::Error::msg(format!("SOP '{sop_name}' no longer loaded"))
-            })?
-            .clone();
+        self.record_deterministic_step_result(
+            run_id,
+            &sop,
+            &current_step,
+            SopStepStatus::Completed,
+            step_output.to_string(),
+            step_output,
+            started_at,
+            completed_at,
+        )
+    }
 
-        let current_step = sop
-            .steps
-            .get((current_step_number.saturating_sub(1)) as usize)
-            .cloned()
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(
-                            ::serde_json::json!({"sop_name": sop_name, "step": current_step_number})
-                        ),
-                    "SOP engine: step no longer exists (definition changed mid-run)"
-                );
-                anyhow::Error::msg(format!(
-                    "SOP '{sop_name}' step {current_step_number} no longer exists (definition changed mid-run)"
-                ))
-            })?;
+    fn execute_capability_step(
+        &mut self,
+        sop: &Sop,
+        run_id: &str,
+        step: &SopStep,
+        input: serde_json::Value,
+    ) -> Result<SopRunAction> {
+        let started_at = now_iso8601();
+        let ctx = super::capability::CapabilityContext {
+            run_id: run_id.to_string(),
+            sop_name: sop.name.clone(),
+            step_number: step.number,
+            sop_location: sop.location.clone(),
+        };
+        let result = self.capabilities.execute_step(ctx, step, input);
+        let completed_at = Some(now_iso8601());
+        match result {
+            Ok(result) if result.success => self.record_deterministic_step_result(
+                run_id,
+                sop,
+                step,
+                SopStepStatus::Completed,
+                result.output.to_string(),
+                result.output,
+                started_at,
+                completed_at,
+            ),
+            Ok(result) => {
+                let error = result
+                    .error
+                    .unwrap_or_else(|| "capability returned failure".to_string());
+                self.record_deterministic_step_result(
+                    run_id,
+                    sop,
+                    step,
+                    SopStepStatus::Failed,
+                    error.clone(),
+                    serde_json::Value::String(error),
+                    started_at,
+                    completed_at,
+                )
+            }
+            Err(e) => {
+                let error = e.to_string();
+                self.record_deterministic_step_result(
+                    run_id,
+                    sop,
+                    step,
+                    SopStepStatus::Failed,
+                    error.clone(),
+                    serde_json::Value::String(error),
+                    started_at,
+                    completed_at,
+                )
+            }
+        }
+    }
 
+    fn record_deterministic_step_result(
+        &mut self,
+        run_id: &str,
+        sop: &Sop,
+        current_step: &SopStep,
+        status: SopStepStatus,
+        recorded_output: String,
+        routed_output: serde_json::Value,
+        started_at: String,
+        completed_at: Option<String>,
+    ) -> Result<SopRunAction> {
         let run = self.active_runs.get_mut(run_id).ok_or_else(|| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1432,61 +1548,103 @@ impl SopEngine {
             );
             anyhow::Error::msg(format!("Active run not found: {run_id}"))
         })?;
-
-        // Record step result
-        let (started_at, completed_at) = match step_timestamps {
-            Some((started, completed)) => (started, completed),
-            None => (run.started_at.clone(), Some(now_iso8601())),
-        };
-        let step_result = SopStepResult {
+        let retry_input = retry_input_value(run, current_step.number);
+        run.step_results.push(SopStepResult {
             step_number: run.current_step,
-            status: SopStepStatus::Completed,
-            output: step_output.to_string(),
+            status,
+            output: recorded_output,
             started_at,
             completed_at,
-        };
-        let retry_input = retry_input_value(run, current_step.number);
-        run.step_results.push(step_result);
+        });
 
-        let mut last_status = SopStepStatus::Completed;
-        if let Err(reason) = self.validate_step_output(&current_step, &step_output) {
-            last_status = SopStepStatus::Failed;
-            let full_reason = format!(
-                "Step {} output schema validation failed: {reason}",
-                current_step.number
-            );
-            self.record_transition_event(
-                run_id,
-                "step_schema_reject",
-                Some(full_reason.clone()),
-                ::serde_json::json!({
-                    "step": current_step.number,
-                    "phase": "output",
-                }),
-            );
-            if let Some(recorded) = self
-                .active_runs
-                .get_mut(run_id)
-                .and_then(|run| run.step_results.last_mut())
-            {
-                recorded.status = SopStepStatus::Failed;
-                recorded.output = full_reason;
+        let mut last_status = status;
+        if status == SopStepStatus::Completed {
+            if let Err(reason) = self.validate_step_output(current_step, &routed_output) {
+                last_status = SopStepStatus::Failed;
+                let full_reason = format!(
+                    "Step {} output schema validation failed: {reason}",
+                    current_step.number
+                );
+                self.record_transition_event(
+                    run_id,
+                    "step_schema_reject",
+                    Some(full_reason.clone()),
+                    ::serde_json::json!({
+                        "step": current_step.number,
+                        "phase": "output",
+                    }),
+                );
+                if let Some(recorded) = self
+                    .active_runs
+                    .get_mut(run_id)
+                    .and_then(|run| run.step_results.last_mut())
+                {
+                    recorded.status = SopStepStatus::Failed;
+                    recorded.output = full_reason;
+                }
+            } else if let Some(run) = self.active_runs.get_mut(run_id) {
+                run.llm_calls_saved += 1;
             }
-        } else if let Some(run) = self.active_runs.get_mut(run_id) {
-            // Each deterministic step saves one LLM call only when the step
-            // produced a valid completed output.
-            run.llm_calls_saved += 1;
         }
 
         self.route_recorded_step(
             run_id,
-            &sop,
-            &current_step,
+            sop,
+            current_step,
             last_status,
             true,
             Some(retry_input),
-            Some(step_output),
+            Some(routed_output),
         )
+    }
+
+    fn resolve_active_run_sop(&self, run_id: &str) -> Result<(String, Sop)> {
+        let sop_name = self
+            .active_runs
+            .get(run_id)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?
+            .sop_name
+            .clone();
+        let sop = self
+            .sops
+            .iter()
+            .find(|s| s.name == sop_name)
+            .cloned()
+            .ok_or_else(|| anyhow::Error::msg(format!("SOP '{sop_name}' no longer loaded")))?;
+        Ok((sop_name, sop))
+    }
+
+    fn fail_headless_driverless_step(
+        &mut self,
+        run_id: &str,
+        sop_name: &str,
+        step: &SopStep,
+    ) -> SopRunAction {
+        let reason = format!(
+            "Headless deterministic SOP step {} '{}' requires an external driver; it was not executed",
+            step.number, step.title
+        );
+        let now = now_iso8601();
+        if let Some(run) = self.active_runs.get_mut(run_id) {
+            run.step_results.push(SopStepResult {
+                step_number: step.number,
+                status: SopStepStatus::Failed,
+                output: reason.clone(),
+                started_at: now.clone(),
+                completed_at: Some(now),
+            });
+        }
+        self.record_transition_event(
+            run_id,
+            "headless_driver_missing",
+            Some(reason.clone()),
+            ::serde_json::json!({
+                "sop_name": sop_name,
+                "step": step.number,
+                "kind": step.kind.to_string(),
+            }),
+        );
+        self.finish_run(run_id, SopRunStatus::Failed, Some(reason))
     }
 
     /// Resume a deterministic run from persisted state.
@@ -1605,47 +1763,51 @@ impl SopEngine {
             return Ok(action);
         }
 
-        if step.kind == SopStepKind::Checkpoint {
-            // Pause at checkpoint — persist state and wait for approval
-            if let Some(run) = self.active_runs.get_mut(run_id) {
-                run.status = SopRunStatus::PausedCheckpoint;
-                run.waiting_since = Some(now_iso8601());
+        match step.kind {
+            SopStepKind::Checkpoint => {
+                // Pause at checkpoint - persist state and wait for approval
+                if let Some(run) = self.active_runs.get_mut(run_id) {
+                    run.status = SopRunStatus::PausedCheckpoint;
+                    run.waiting_since = Some(now_iso8601());
+                }
+
+                let state_file = self.persist_deterministic_state(run_id, sop)?;
+
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    &format!(
+                        "Deterministic SOP run {run_id}: checkpoint at step {} '{}', state persisted to {}",
+                        step.number,
+                        step.title,
+                        state_file.display().to_string()
+                    )
+                );
+
+                // Mirror the paused checkpoint into the shared run store (alongside
+                // the deterministic state file) so a restart leaves a non-terminal
+                // row for restore_runs() to rehydrate.
+                self.persist_active(run_id);
+
+                Ok(SopRunAction::CheckpointWait {
+                    run_id: run_id.to_string(),
+                    step: step.clone(),
+                    state_file,
+                })
             }
+            SopStepKind::Capability => self.execute_capability_step(sop, run_id, step, input),
+            SopStepKind::Execute => {
+                // Persist the active (Running) deterministic run so a restart mid-run
+                // leaves a non-terminal row for restore_runs() to rehydrate. This is
+                // the single sink for start / advance / resume deterministic steps.
+                self.persist_active(run_id);
 
-            let state_file = self.persist_deterministic_state(run_id, sop)?;
-
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                &format!(
-                    "Deterministic SOP run {run_id}: checkpoint at step {} '{}', state persisted to {}",
-                    step.number,
-                    step.title,
-                    state_file.display().to_string()
-                )
-            );
-
-            // Mirror the paused checkpoint into the shared run store (alongside
-            // the deterministic state file) so a restart leaves a non-terminal
-            // row for restore_runs() to rehydrate.
-            self.persist_active(run_id);
-
-            Ok(SopRunAction::CheckpointWait {
-                run_id: run_id.to_string(),
-                step: step.clone(),
-                state_file,
-            })
-        } else {
-            // Persist the active (Running) deterministic run so a restart mid-run
-            // leaves a non-terminal row for restore_runs() to rehydrate. This is
-            // the single sink for start / advance / resume deterministic steps.
-            self.persist_active(run_id);
-
-            Ok(SopRunAction::DeterministicStep {
-                run_id: run_id.to_string(),
-                step: step.clone(),
-                input,
-            })
+                Ok(SopRunAction::DeterministicStep {
+                    run_id: run_id.to_string(),
+                    step: step.clone(),
+                    input,
+                })
+            }
         }
     }
 
@@ -2102,6 +2264,17 @@ fn trigger_matches(trigger: &SopTrigger, event: &SopEvent) -> bool {
             },
             SopTriggerSource::Calendar,
         ) => calendar_trigger_matches(calendar_source, calendar_ids, event),
+
+        (SopTrigger::Channel { topic, condition }, SopTriggerSource::Channel) => {
+            let topic_match = event.topic.as_deref().is_some_and(|t| t == topic);
+            if !topic_match {
+                return false;
+            }
+            match condition {
+                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
+                None => true,
+            }
+        }
 
         (SopTrigger::Manual, SopTriggerSource::Manual) => true,
 
@@ -2900,6 +3073,42 @@ mod tests {
             timestamp: now_iso8601(),
         };
         assert_eq!(engine.match_trigger(&event).len(), 1);
+    }
+
+    #[test]
+    fn channel_trigger_matches_exact_topic_and_condition() {
+        let sop = Sop {
+            triggers: vec![SopTrigger::Channel {
+                topic: "git.main:pull_request.opened".into(),
+                condition: Some("$.repo == \"octo/repo\"".into()),
+            }],
+            ..test_sop("git-pr-sop", SopExecutionMode::Auto, SopPriority::Normal)
+        };
+        let engine = engine_with_sops(vec![sop]);
+
+        let event = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.main:pull_request.opened".into()),
+            payload: Some(r#"{"repo":"octo/repo","number":12}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert_eq!(engine.match_trigger(&event).len(), 1);
+
+        let wrong_topic = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.main:issues.opened".into()),
+            payload: Some(r#"{"repo":"octo/repo"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert!(engine.match_trigger(&wrong_topic).is_empty());
+
+        let wrong_payload = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.main:pull_request.opened".into()),
+            payload: Some(r#"{"repo":"other/repo"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert!(engine.match_trigger(&wrong_payload).is_empty());
     }
 
     // ── Cron trigger matching ─────────────────────────
@@ -3916,6 +4125,126 @@ mod tests {
         let action = engine.start_run("s1", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
         assert!(engine.approve_step(&run_id).is_err());
+    }
+
+    // ── Advance step gate guard (#8678) ─────────────────
+    //
+    // A driver calling `sop_advance` while a run is parked at an external
+    // gate (WaitingApproval or PausedCheckpoint) used to be allowed to
+    // fabricate a Completed step result, record it, and dispatch the next
+    // step — silently bypassing the approval flow or the deterministic
+    // checkpoint resume. `advance_step` now refuses those calls.
+
+    #[test]
+    fn advance_step_rejects_waiting_approval_run() {
+        // requires_confirmation forces the run to WaitApproval on step 1.
+        let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Critical);
+        sop.steps[0].requires_confirmation = true;
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        // Sanity: run is parked at the gate.
+        let run = engine.active_runs().get(&run_id).unwrap();
+        assert_eq!(run.status, SopRunStatus::WaitingApproval);
+        let step_results_before = run.step_results.len();
+
+        // Driver tries to fabricate success for the gated step.
+        let err = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: "fabricated".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap_err();
+
+        // Error must point at the gate, not the run id.
+        assert!(
+            err.to_string().contains("WaitingApproval"),
+            "rejection should mention the gate status, got: {err}"
+        );
+
+        // The run state must be unchanged: still WaitingApproval, no
+        // phantom step result recorded, no next step dispatched.
+        let run = engine.active_runs().get(&run_id).unwrap();
+        assert_eq!(run.status, SopRunStatus::WaitingApproval);
+        assert_eq!(run.step_results.len(), step_results_before);
+    }
+
+    #[test]
+    fn advance_step_rejects_paused_checkpoint_run() {
+        // A deterministic SOP with a Checkpoint step pauses the run in
+        // PausedCheckpoint after step 1 completes. Driving `sop_advance`
+        // directly must be rejected — the only legitimate resume path is
+        // `approve_step`.
+        let mut engine = engine_with_sops(vec![deterministic_sop("det-cp")]);
+        let action = engine.start_run("det-cp", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        // Advance through step 1 (Execute) to reach the checkpoint.
+        engine
+            .advance_deterministic_step(&run_id, serde_json::json!({"ok": true}), None)
+            .unwrap();
+        let run = engine.get_run(&run_id).unwrap();
+        assert_eq!(run.status, SopRunStatus::PausedCheckpoint);
+
+        // Driver tries to fabricate completion of the checkpoint step.
+        let err = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 2,
+                    status: SopStepStatus::Completed,
+                    output: "fabricated".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("PausedCheckpoint"),
+            "rejection should mention the gate status, got: {err}"
+        );
+
+        // The run must still be parked at the checkpoint, not advanced
+        // past it.
+        let run = engine.get_run(&run_id).unwrap();
+        assert_eq!(run.status, SopRunStatus::PausedCheckpoint);
+    }
+
+    #[test]
+    fn advance_step_still_works_for_running_run() {
+        // Control case: a non-paused run must still be drivable through
+        // sop_advance. Without this case, the new guard could be hiding
+        // a regression on the happy path.
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )]);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: "done".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
     }
 
     // ── Context formatting ──────────────────────────────
