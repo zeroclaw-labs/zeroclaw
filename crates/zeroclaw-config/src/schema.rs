@@ -13078,25 +13078,30 @@ pub struct InkboxConfig {
     /// to a realtime model). Requires `realtime_api_key`; when off (or no key),
     /// calls use Inkbox's built-in STT/TTS.
     #[tab(Behavior)]
+    #[quickstart(optional)]
     #[serde(default)]
     pub realtime_enabled: bool,
     /// OpenAI API key for the Realtime call bridge (`OPENAI_API_KEY` is the
     /// usual source). Empty disables realtime regardless of `realtime_enabled`.
     #[secret]
     #[tab(Connection)]
+    #[quickstart(optional)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default)]
     pub realtime_api_key: String,
     /// Realtime model id. Defaults to `gpt-realtime-2`.
     #[tab(Connection)]
+    #[quickstart(optional)]
     #[serde(default = "default_inkbox_realtime_model")]
     pub realtime_model: String,
     /// Realtime voice. Defaults to `cedar`.
     #[tab(Connection)]
+    #[quickstart(optional)]
     #[serde(default = "default_inkbox_realtime_voice")]
     pub realtime_voice: String,
     /// Fall back to Inkbox STT/TTS when the realtime bridge can't connect.
     #[tab(Behavior)]
+    #[quickstart(optional)]
     #[serde(default = "default_true")]
     pub realtime_fallback: bool,
 }

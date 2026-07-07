@@ -2166,7 +2166,18 @@ mod tests {
         );
         let rows = super::field_shape(super::FieldSection::Channel, "inkbox");
         let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
-        for expected in ["api_key", "identity", "signing_key", "base_url"] {
+        for expected in [
+            "api_key",
+            "identity",
+            "signing_key",
+            "base_url",
+            // Realtime-call config is collected in Quickstart too.
+            "realtime_enabled",
+            "realtime_api_key",
+            "realtime_model",
+            "realtime_voice",
+            "realtime_fallback",
+        ] {
             assert!(
                 keys.contains(&expected),
                 "`{expected}` must surface via its `#[quickstart]` annotation; got {keys:?}",
