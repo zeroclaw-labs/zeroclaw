@@ -244,6 +244,48 @@ impl GitForgeTool {
                 body: None,
                 label: "list labels".into(),
             }
+        } else if key == ("label", "create") {
+            let name =
+                Self::str_arg(args, "name").ok_or_else(|| req_field("label", "create", "name"))?;
+            let color = Self::str_arg(args, "color")
+                .ok_or_else(|| req_field("label", "create", "color"))?;
+            let mut body = json!({ "name": name, "color": color });
+            if let Some(d) = Self::str_arg(args, "description") {
+                body["description"] = json!(d);
+            }
+            Planned {
+                method: "POST",
+                path: format!("repos/{repo}/labels"),
+                body: Some(body),
+                label: format!("create label '{name}'"),
+            }
+        } else if key == ("label", "update") {
+            let name =
+                Self::str_arg(args, "name").ok_or_else(|| req_field("label", "update", "name"))?;
+            let mut body = json!({});
+            if let Some(v) = Self::str_arg(args, "new_name") {
+                body["new_name"] = json!(v);
+            }
+            for field in ["color", "description"] {
+                if let Some(v) = Self::str_arg(args, field) {
+                    body[field] = json!(v);
+                }
+            }
+            Planned {
+                method: "PATCH",
+                path: format!("repos/{repo}/labels/{name}"),
+                body: Some(body),
+                label: format!("update label '{name}'"),
+            }
+        } else if key == ("label", "delete") {
+            let name =
+                Self::str_arg(args, "name").ok_or_else(|| req_field("label", "delete", "name"))?;
+            Planned {
+                method: "DELETE",
+                path: format!("repos/{repo}/labels/{name}"),
+                body: None,
+                label: format!("delete label '{name}'"),
+            }
         } else if key == ("label", "add") {
             let n = need_num()?;
             let labels = args
@@ -381,15 +423,21 @@ impl GitForgeTool {
             }
         } else if key == ("pull", "merge") {
             let n = need_num()?;
-            let method_arg = Self::str_arg(args, "method").unwrap_or("merge");
+            let method_arg = Self::str_arg(args, "merge_method")
+                .or_else(|| Self::str_arg(args, "method"))
+                .unwrap_or("merge");
             if !["merge", "squash", "rebase"].contains(&method_arg) {
                 return Err(ferr("tool-git-forge-error-pull-merge-method"));
             }
             let mut body = json!({ "merge_method": method_arg });
-            if let Some(s) = Self::str_arg(args, "subject") {
+            if let Some(s) =
+                Self::str_arg(args, "commit_title").or_else(|| Self::str_arg(args, "subject"))
+            {
                 body["commit_title"] = json!(s);
             }
-            if let Some(m) = Self::str_arg(args, "message") {
+            if let Some(m) =
+                Self::str_arg(args, "commit_message").or_else(|| Self::str_arg(args, "message"))
+            {
                 body["commit_message"] = json!(m);
             }
             Planned {
@@ -400,15 +448,17 @@ impl GitForgeTool {
             }
         } else if key == ("review", "create") {
             let n = need_num()?;
-            let verdict = Self::str_arg(args, "verdict")
-                .ok_or_else(|| req_field("review", "create", "verdict"))?;
+            let verdict = Self::str_arg(args, "event")
+                .or_else(|| Self::str_arg(args, "verdict"))
+                .ok_or_else(|| req_field("review", "create", "event"))?;
+            let normalized = verdict.to_ascii_lowercase();
             let event = [
                 ("approve", "APPROVE"),
                 ("request_changes", "REQUEST_CHANGES"),
                 ("comment", "COMMENT"),
             ]
             .into_iter()
-            .find(|(k, _)| *k == verdict)
+            .find(|(k, _)| *k == normalized)
             .map(|(_, e)| e)
             .ok_or_else(|| {
                 ferr_args(
@@ -426,6 +476,13 @@ impl GitForgeTool {
                 body: Some(body),
                 label: format!("{verdict} review on #{n}"),
             }
+        } else if key == ("review", "list") {
+            Planned {
+                method: "GET",
+                path: format!("repos/{repo}/pulls/{}/reviews", need_num()?),
+                body: None,
+                label: "list reviews".into(),
+            }
         } else if key == ("reviewer", "request") {
             let n = need_num()?;
             let reviewers = args
@@ -438,6 +495,26 @@ impl GitForgeTool {
                 path: format!("repos/{repo}/pulls/{n}/requested_reviewers"),
                 body: Some(json!({ "reviewers": reviewers })),
                 label: format!("request reviewers on #{n}"),
+            }
+        } else if key == ("reviewer", "list") {
+            Planned {
+                method: "GET",
+                path: format!("repos/{repo}/pulls/{}/requested_reviewers", need_num()?),
+                body: None,
+                label: "list requested reviewers".into(),
+            }
+        } else if key == ("reviewer", "remove") {
+            let n = need_num()?;
+            let reviewers = args
+                .get("reviewers")
+                .and_then(Value::as_array)
+                .filter(|a| !a.is_empty())
+                .ok_or_else(|| req_field("reviewer", "remove", "reviewers"))?;
+            Planned {
+                method: "DELETE",
+                path: format!("repos/{repo}/pulls/{n}/requested_reviewers"),
+                body: Some(json!({ "reviewers": reviewers })),
+                label: format!("remove reviewers on #{n}"),
             }
         } else if key == ("comment", "create") {
             let n = need_num()?;
@@ -455,6 +532,15 @@ impl GitForgeTool {
                 path: format!("repos/{repo}/issues/{}/comments", need_num()?),
                 body: None,
                 label: "list comments".into(),
+            }
+        } else if key == ("comment", "delete") {
+            let cid = Self::num_arg(args, "comment_id")
+                .ok_or_else(|| req_field("comment", "delete", "comment_id"))?;
+            Planned {
+                method: "DELETE",
+                path: format!("repos/{repo}/issues/comments/{cid}"),
+                body: None,
+                label: format!("delete comment {cid}"),
             }
         } else {
             return Err(ferr_args(
@@ -505,6 +591,83 @@ impl Tool for GitForgeTool {
                     "type": "integer",
                     "description": "Issue or PR number (for item-scoped actions)"
                 },
+                "title": {
+                    "type": "string",
+                    "description": "Title for pull.create, issue/milestone create/update"
+                },
+                "body": {
+                    "description": "Text body for pull/issue/comment/review, or raw JSON payload for action=raw"
+                },
+                "head": {
+                    "type": "string",
+                    "description": "pull.create: source branch (or owner:branch for a fork head)"
+                },
+                "base": {
+                    "type": "string",
+                    "description": "pull.create/update: target branch"
+                },
+                "draft": {
+                    "type": "boolean",
+                    "description": "pull.create: open as draft"
+                },
+                "state": {
+                    "type": "string",
+                    "description": "open|closed; filters list actions or sets state on update"
+                },
+                "labels": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "label.add: names to attach; pull/issue.list: filter by label"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Label name for label.create/update/delete/remove; new_name renames"
+                },
+                "new_name": {
+                    "type": "string",
+                    "description": "label.update: rename the label to this"
+                },
+                "color": {
+                    "type": "string",
+                    "description": "label.create/update: 6-hex color without '#'"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Description for milestone/label create/update"
+                },
+                "milestone": {
+                    "type": "integer",
+                    "description": "issue.update: numeric milestone id to set (a PR number is a valid issue number)"
+                },
+                "merge_method": {
+                    "type": "string",
+                    "description": "pull.merge: merge|squash|rebase"
+                },
+                "commit_title": {
+                    "type": "string",
+                    "description": "pull.merge: squash/merge commit subject"
+                },
+                "commit_message": {
+                    "type": "string",
+                    "description": "pull.merge: squash/merge commit body"
+                },
+                "event": {
+                    "type": "string",
+                    "description": "review.create: APPROVE|REQUEST_CHANGES|COMMENT"
+                },
+                "reviewers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "reviewer.request/remove: reviewer logins"
+                },
+                "comment_id": {
+                    "type": "integer",
+                    "description": "comment.delete: id of the comment to remove"
+                },
+                "per_page": {
+                    "type": "integer",
+                    "description": "list actions: page size (max 100)"
+                },
                 "method": {
                     "type": "string",
                     "description": "raw only: HTTP verb GET|POST|PATCH|PUT|DELETE"
@@ -512,9 +675,6 @@ impl Tool for GitForgeTool {
                 "path": {
                     "type": "string",
                     "description": "raw only: provider-relative path, e.g. repos/owner/repo/issues/12"
-                },
-                "body": {
-                    "description": "raw only: JSON payload, or typed-call fields passed through where applicable"
                 }
             },
             "required": ["action"]
@@ -876,6 +1036,39 @@ mod tests {
         assert!(result.success);
         assert!(result.output.as_str().contains("milestone"));
         assert!(result.output.as_str().contains("merge_method"));
+    }
+
+    #[test]
+    fn every_described_cell_resolves_in_plan() {
+        let grid = GitForgeTool::describe();
+        let resources = grid["resources"].as_object().expect("resources object");
+        let fields = json!({
+            "number": 1,
+            "comment_id": 1,
+            "milestone": 1,
+            "title": "t",
+            "head": "h",
+            "base": "b",
+            "name": "n",
+            "color": "ffffff",
+            "labels": ["x"],
+            "reviewers": ["u"],
+            "event": "APPROVE",
+            "merge_method": "squash",
+            "body": "y"
+        });
+        for (resource, actions) in resources {
+            for action in actions.as_object().expect("actions object").keys() {
+                let planned = GitForgeTool::plan(resource, action, "octo/repo", &fields);
+                match planned {
+                    Ok(_) => {}
+                    Err(e) => assert!(
+                        !e.contains("describe"),
+                        "described cell {resource}.{action} is not implemented in plan(): {e}"
+                    ),
+                }
+            }
+        }
     }
 
     #[tokio::test]
