@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 
 use super::events::GitEvent;
 use super::poll::PollStream;
-use super::types::{CreatePrParams, GitChannelError, IssueRef, PrRef, RepoRef, UpdatePrParams};
+use super::types::{GitChannelError, IssueRef, RepoRef};
 
 /// The bot's own identity on the forge.
 pub struct SelfIdentity {
@@ -113,18 +113,15 @@ pub trait GitProvider: Send + Sync {
         emoji: &str,
     ) -> Result<(), GitChannelError>;
 
-    /// Open a pull request on `repo`; returns the new PR's number and URL.
-    async fn create_pull_request(
+    /// Low-level, provider-relative forge API call. The transport seam every
+    /// higher-level forge operation is built on: the provider prepends its API
+    /// base, attaches auth, sends `req`, and returns the status plus decoded
+    /// JSON body without raising on non-2xx (the caller inspects the forge's
+    /// own error envelope). This is what lets the `git_forge` tool carry a
+    /// resource/action vocabulary and a `raw` catch-all over one seam, without
+    /// a new trait method per operation.
+    async fn forge_request(
         &self,
-        repo: &RepoRef,
-        params: CreatePrParams,
-    ) -> Result<PrRef, GitChannelError>;
-
-    /// Update an existing pull request: mark a draft ready, edit the body with
-    /// fresh digests, or supersede/close. Each `None` field is left unchanged.
-    async fn update_pull_request(
-        &self,
-        pr: &PrRef,
-        params: UpdatePrParams,
-    ) -> Result<(), GitChannelError>;
+        req: super::types::ForgeRequest,
+    ) -> Result<super::types::ForgeResponse, GitChannelError>;
 }

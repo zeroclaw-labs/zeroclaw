@@ -8741,6 +8741,7 @@ mod tests {
             max_concurrent: 2,
             location: None,
             deterministic: false,
+            agent: None,
         }]);
         let engine = Arc::new(Mutex::new(engine));
 

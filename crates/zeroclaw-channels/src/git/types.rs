@@ -66,6 +66,55 @@ impl std::fmt::Display for RepoRef {
     }
 }
 
+/// HTTP verb for a low-level forge API call. Provider-neutral so the contract
+/// carries no reqwest dependency; each provider maps this onto its own client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgeMethod {
+    Get,
+    Post,
+    Patch,
+    Put,
+    Delete,
+}
+
+impl ForgeMethod {
+    /// Parse a case-insensitive HTTP verb, defaulting unknown input to `Get`
+    /// is refused: callers get `None` so a bad verb never silently becomes a
+    /// read.
+    pub fn parse(s: &str) -> Option<Self> {
+        let upper = s.trim().to_ascii_uppercase();
+        [
+            (Self::Get, "GET"),
+            (Self::Post, "POST"),
+            (Self::Patch, "PATCH"),
+            (Self::Put, "PUT"),
+            (Self::Delete, "DELETE"),
+        ]
+        .into_iter()
+        .find(|(_, name)| *name == upper)
+        .map(|(m, _)| m)
+    }
+}
+
+/// A low-level, provider-relative forge API call. `path` is relative to the
+/// provider's API base (e.g. `repos/owner/repo/issues/12/labels`); the provider
+/// prepends its base URL and attaches auth. `body` is an optional JSON payload.
+#[derive(Debug, Clone)]
+pub struct ForgeRequest {
+    pub method: ForgeMethod,
+    pub path: String,
+    pub body: Option<serde_json::Value>,
+}
+
+/// The outcome of a low-level forge call: the HTTP status and the decoded JSON
+/// body (or `Null` when the response had no body). Non-2xx statuses are returned
+/// here rather than raised, so the caller sees the forge's own error envelope.
+#[derive(Debug, Clone)]
+pub struct ForgeResponse {
+    pub status: u16,
+    pub body: serde_json::Value,
+}
+
 /// An issue or pull-request reference (`owner/repo#number`) — the
 /// channel's `reply_target` / `recipient` wire format.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,44 +138,6 @@ impl std::fmt::Display for IssueRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}#{}", self.repo, self.number)
     }
-}
-
-/// A pull-request reference returned after opening or resolving a PR.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrRef {
-    pub repo: RepoRef,
-    pub number: u64,
-    /// Web URL for the PR, surfaced back to the caller/SOP for linking.
-    pub url: String,
-}
-
-impl std::fmt::Display for PrRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}#{}", self.repo, self.number)
-    }
-}
-
-/// Parameters for opening a pull request. `head`/`base` are branch names on
-/// the target `repo`; cross-fork heads use the `owner:branch` form the forge
-/// accepts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreatePrParams {
-    pub title: String,
-    pub body: String,
-    pub head: String,
-    pub base: String,
-    pub draft: bool,
-}
-
-/// Parameters for updating an existing pull request. Each `Some` field is
-/// applied; `None` leaves the current value untouched. `draft = Some(false)`
-/// marks a draft ready for review; `close = true` closes/supersedes.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct UpdatePrParams {
-    pub title: Option<String>,
-    pub body: Option<String>,
-    pub draft: Option<bool>,
-    pub close: bool,
 }
 
 /// Errors raised by the git-forge channel and its providers.

@@ -432,6 +432,7 @@ type = "manual"
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            agent: None,
         };
 
         let warnings = validate_sop(&sop);
@@ -464,6 +465,7 @@ type = "manual"
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            agent: None,
         };
 
         let warnings = validate_sop(&sop);

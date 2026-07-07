@@ -4,12 +4,9 @@ use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 
 use super::payloads::{
-    CreatedComment, CreatedPull, GITEA_USER_AGENT, GiteaComment, GiteaIssue, GiteaRelease,
-    GiteaRepo, GiteaUser,
+    CreatedComment, GITEA_USER_AGENT, GiteaComment, GiteaIssue, GiteaRelease, GiteaRepo, GiteaUser,
 };
-use crate::git::types::{
-    CreatePrParams, GitChannelError, IssueRef, PrRef, RepoRef, UpdatePrParams,
-};
+use crate::git::types::{GitChannelError, IssueRef, RepoRef};
 
 pub struct GiteaApi {
     base: String,
@@ -269,129 +266,29 @@ impl GiteaApi {
         .await
     }
 
-    pub async fn create_pull(
+    /// Low-level authed call: build `{base}/{path}`, attach `token`, send, and
+    /// return the raw status + decoded JSON body (Null when empty). Non-2xx is
+    /// returned, not raised, so the caller inspects Gitea's error envelope.
+    pub async fn forge_call(
         &self,
         token: &str,
-        repo: &RepoRef,
-        params: &CreatePrParams,
-    ) -> Result<PrRef, GitChannelError> {
-        let url = format!("{}/repos/{repo}/pulls", self.base);
-        let created: CreatedPull = self
-            .execute(
-                "POST /repos/{owner}/{repo}/pulls",
-                self.request(reqwest::Method::POST, url, token)
-                    .json(&serde_json::json!({
-                        "title": params.title,
-                        "body": params.body,
-                        "head": params.head,
-                        "base": params.base,
-                    })),
-            )
-            .await?;
-        // Gitea/Forgejo has no `draft` field on pull creation; a draft is
-        // requested by a `WIP:` title prefix. Apply it here so `params.draft`
-        // is honored uniformly across providers.
-        if params.draft {
-            self.update_pull_wip(token, repo, created.number, &params.title, true)
-                .await?;
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<(u16, serde_json::Value), GitChannelError> {
+        let url = format!("{}/{}", self.base, path.trim_start_matches('/'));
+        let mut req = self.request(method, url, token);
+        if let Some(payload) = body {
+            req = req.json(payload);
         }
-        Ok(PrRef {
-            repo: repo.clone(),
-            number: created.number,
-            url: created.html_url,
-        })
-    }
-
-    async fn update_pull_wip(
-        &self,
-        token: &str,
-        repo: &RepoRef,
-        number: u64,
-        title: &str,
-        wip: bool,
-    ) -> Result<(), GitChannelError> {
-        let stripped = title
-            .trim_start_matches("WIP:")
-            .trim_start_matches("[WIP]")
-            .trim_start();
-        let next = if wip {
-            format!("WIP: {stripped}")
+        let resp = req.send().await?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await?;
+        let value = if text.trim().is_empty() {
+            serde_json::Value::Null
         } else {
-            stripped.to_string()
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
         };
-        let url = format!("{}/repos/{repo}/pulls/{number}", self.base);
-        self.execute_unit(
-            "PATCH /repos/{owner}/{repo}/pulls/{index}",
-            self.request(reqwest::Method::PATCH, url, token)
-                .json(&serde_json::json!({ "title": next })),
-        )
-        .await
-    }
-
-    pub async fn update_pull(
-        &self,
-        token: &str,
-        pr: &PrRef,
-        params: &UpdatePrParams,
-    ) -> Result<(), GitChannelError> {
-        // The draft toggle is title-encoded on Gitea/Forgejo, so it needs the
-        // current or new title. Resolve the effective title first, then send a
-        // single PATCH carrying every requested change.
-        let mut body = serde_json::Map::new();
-        if params.close {
-            body.insert("state".into(), serde_json::json!("closed"));
-        }
-        if let Some(text) = &params.body {
-            body.insert("body".into(), serde_json::json!(text));
-        }
-        let title_change = match (params.draft, &params.title) {
-            (Some(draft), title_opt) => {
-                let base = match title_opt {
-                    Some(t) => t.clone(),
-                    None => self.pull_title(token, &pr.repo, pr.number).await?,
-                };
-                let stripped = base
-                    .trim_start_matches("WIP:")
-                    .trim_start_matches("[WIP]")
-                    .trim_start()
-                    .to_string();
-                Some(if draft {
-                    format!("WIP: {stripped}")
-                } else {
-                    stripped
-                })
-            }
-            (None, Some(t)) => Some(t.clone()),
-            (None, None) => None,
-        };
-        if let Some(title) = title_change {
-            body.insert("title".into(), serde_json::json!(title));
-        }
-        if body.is_empty() {
-            return Ok(());
-        }
-        let url = format!("{}/repos/{}/pulls/{}", self.base, pr.repo, pr.number);
-        self.execute_unit(
-            "PATCH /repos/{owner}/{repo}/pulls/{index}",
-            self.request(reqwest::Method::PATCH, url, token)
-                .json(&serde_json::Value::Object(body)),
-        )
-        .await
-    }
-
-    async fn pull_title(
-        &self,
-        token: &str,
-        repo: &RepoRef,
-        number: u64,
-    ) -> Result<String, GitChannelError> {
-        let url = format!("{}/repos/{repo}/pulls/{number}", self.base);
-        let pull: CreatedPull = self
-            .execute(
-                "GET /repos/{owner}/{repo}/pulls/{index}",
-                self.request(reqwest::Method::GET, url, token),
-            )
-            .await?;
-        Ok(pull.title)
+        Ok((status, value))
     }
 }

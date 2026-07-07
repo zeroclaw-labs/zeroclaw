@@ -14,9 +14,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use zeroclaw_api::channel::{
-    Channel, ChannelMessage, OpenPullRequest, PullRequestRef, SendMessage, UpdatePullRequest,
-};
+use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::GitConfig;
 
 use super::events::{self, EventFilter, GitEvent};
@@ -24,7 +22,7 @@ use super::poll::{PollState, PollStream};
 use super::router::{self, RouteAction, TransportPlan};
 use super::traits::{GitProvider, ReactionTarget, SelfIdentity};
 use super::types::{
-    COMMENT_MAX_CHARS, CreatePrParams, GitChannelError, IssueRef, PrRef, RepoRef, UpdatePrParams,
+    COMMENT_MAX_CHARS, ForgeMethod, ForgeRequest, GitChannelError, IssueRef, RepoRef,
 };
 
 /// The channel key under `[channels.git.<alias>]` — also stamped on every
@@ -607,41 +605,28 @@ impl Channel for GitChannel {
         Ok(())
     }
 
-    async fn open_pull_request(&self, request: OpenPullRequest) -> anyhow::Result<PullRequestRef> {
-        let Some(repo) = RepoRef::parse(&request.repo) else {
-            anyhow::bail!("invalid repo `{}` (expected `owner/repo`)", request.repo);
+    async fn forge_request(
+        &self,
+        request: zeroclaw_api::channel::ForgeApiRequest,
+    ) -> anyhow::Result<zeroclaw_api::channel::ForgeApiResponse> {
+        let Some(method) = ForgeMethod::parse(&request.method) else {
+            anyhow::bail!(
+                "invalid forge HTTP method `{}` (expected GET/POST/PATCH/PUT/DELETE)",
+                request.method
+            );
         };
-        let params = CreatePrParams {
-            title: request.title,
-            body: request.body,
-            head: request.head,
-            base: request.base,
-            draft: request.draft,
-        };
-        let pr = self.provider.create_pull_request(&repo, params).await?;
-        Ok(PullRequestRef {
-            number: pr.number,
-            url: pr.url,
+        let resp = self
+            .provider
+            .forge_request(ForgeRequest {
+                method,
+                path: request.path,
+                body: request.body,
+            })
+            .await?;
+        Ok(zeroclaw_api::channel::ForgeApiResponse {
+            status: resp.status,
+            body: resp.body,
         })
-    }
-
-    async fn update_pull_request(&self, request: UpdatePullRequest) -> anyhow::Result<()> {
-        let Some(repo) = RepoRef::parse(&request.repo) else {
-            anyhow::bail!("invalid repo `{}` (expected `owner/repo`)", request.repo);
-        };
-        let pr = PrRef {
-            repo,
-            number: request.number,
-            url: String::new(),
-        };
-        let params = UpdatePrParams {
-            title: request.title,
-            body: request.body,
-            draft: request.draft,
-            close: request.close,
-        };
-        self.provider.update_pull_request(&pr, params).await?;
-        Ok(())
     }
 }
 

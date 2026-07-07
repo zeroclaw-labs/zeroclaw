@@ -17,9 +17,7 @@ use super::mapping;
 use super::payloads::InstallationId;
 use crate::git::poll::{PollStream, runs_cursor_candidate};
 use crate::git::traits::{FetchPage, GitProvider, ReactionTarget, SelfIdentity};
-use crate::git::types::{
-    CreatePrParams, GitChannelError, IssueRef, PrRef, RepoRef, UpdatePrParams,
-};
+use crate::git::types::{GitChannelError, IssueRef, RepoRef};
 
 pub struct GithubProvider {
     auth: AppAuth,
@@ -391,22 +389,17 @@ impl GitProvider for GithubProvider {
         }
     }
 
-    async fn create_pull_request(
+    async fn forge_request(
         &self,
-        repo: &RepoRef,
-        params: CreatePrParams,
-    ) -> Result<PrRef, GitChannelError> {
+        req: crate::git::types::ForgeRequest,
+    ) -> Result<crate::git::types::ForgeResponse, GitChannelError> {
         let token = self.token().await?;
-        self.api.create_pull(&token, repo, &params).await
-    }
-
-    async fn update_pull_request(
-        &self,
-        pr: &PrRef,
-        params: UpdatePrParams,
-    ) -> Result<(), GitChannelError> {
-        let token = self.token().await?;
-        self.api.update_pull(&token, pr, &params).await
+        let method = crate::git::providers::forge_method_to_reqwest(req.method);
+        let (status, body) = self
+            .api
+            .forge_call(&token, method, &req.path, req.body.as_ref())
+            .await?;
+        Ok(crate::git::types::ForgeResponse { status, body })
     }
 }
 

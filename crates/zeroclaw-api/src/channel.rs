@@ -343,41 +343,26 @@ impl SendMessage {
     }
 }
 
-/// Request to open a pull request through a forge-backed channel. Channel-neutral
-/// so the `Channel` trait carries no forge-specific types; the git channel maps
-/// this onto its provider's create call.
+/// A low-level, provider-relative forge API request routed through a
+/// forge-backed channel. Channel-neutral so the `Channel` trait carries no
+/// forge-specific types; the git channel maps this onto its provider's
+/// `forge_request`. `method` is an uppercase HTTP verb (`GET`/`POST`/`PATCH`/
+/// `PUT`/`DELETE`); `path` is relative to the provider's API base (e.g.
+/// `repos/owner/repo/issues/12/labels`); `body` is an optional JSON payload.
 #[derive(Debug, Clone)]
-pub struct OpenPullRequest {
-    /// Target repository as `owner/repo`.
-    pub repo: String,
-    pub title: String,
-    pub body: String,
-    /// Source branch (or `owner:branch` for a cross-fork head).
-    pub head: String,
-    /// Target branch to merge into.
-    pub base: String,
-    pub draft: bool,
+pub struct ForgeApiRequest {
+    pub method: String,
+    pub path: String,
+    pub body: Option<serde_json::Value>,
 }
 
-/// Request to update an existing pull request. Each `None` leaves the current
-/// value unchanged. `draft = Some(false)` marks a draft ready for review;
-/// `close = true` closes/supersedes the PR.
-#[derive(Debug, Clone, Default)]
-pub struct UpdatePullRequest {
-    /// Target repository as `owner/repo`.
-    pub repo: String,
-    pub number: u64,
-    pub title: Option<String>,
-    pub body: Option<String>,
-    pub draft: Option<bool>,
-    pub close: bool,
-}
-
-/// The outcome of opening a pull request: its number and web URL.
+/// The outcome of a forge API request: the HTTP status and decoded JSON body
+/// (`Null` when the response had no body). Non-2xx statuses are carried here
+/// rather than raised, so the caller inspects the forge's own error envelope.
 #[derive(Debug, Clone)]
-pub struct PullRequestRef {
-    pub number: u64,
-    pub url: String,
+pub struct ForgeApiResponse {
+    pub status: u16,
+    pub body: serde_json::Value,
 }
 
 /// Core channel trait — implement for any messaging platform.
@@ -477,22 +462,17 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         !handle_norm.is_empty() && handle_norm == sender_norm
     }
 
-    /// Open a pull request through this channel's forge, when supported.
-    ///
-    /// Default is unsupported: only forge-backed channels (the git channel)
-    /// override this. Returns the new PR's number and URL on success.
-    async fn open_pull_request(&self, _request: OpenPullRequest) -> anyhow::Result<PullRequestRef> {
+    /// Perform a low-level, provider-relative forge API call through this
+    /// channel's forge, when supported. The single transport seam every
+    /// higher-level forge operation (the `git_forge` tool's resource/action
+    /// grid and its `raw` catch-all) is built on: forge-backed channels (the
+    /// git channel) override this and delegate to their provider; all other
+    /// channels return the default unsupported error. Non-2xx responses are
+    /// returned in `ForgeApiResponse`, not raised, so the caller inspects the
+    /// forge's own error envelope.
+    async fn forge_request(&self, _request: ForgeApiRequest) -> anyhow::Result<ForgeApiResponse> {
         anyhow::bail!(
-            "channel '{}' does not support opening pull requests",
-            self.name()
-        )
-    }
-
-    /// Update an existing pull request through this channel's forge, when
-    /// supported. Default is unsupported.
-    async fn update_pull_request(&self, _request: UpdatePullRequest) -> anyhow::Result<()> {
-        anyhow::bail!(
-            "channel '{}' does not support updating pull requests",
+            "channel '{}' does not support forge API requests",
             self.name()
         )
     }

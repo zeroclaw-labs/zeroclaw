@@ -112,13 +112,3 @@ pub struct GiteaRelease {
 pub struct CreatedComment {
     pub id: u64,
 }
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct CreatedPull {
-    #[serde(alias = "index")]
-    pub number: u64,
-    #[serde(default)]
-    pub html_url: String,
-    #[serde(default)]
-    pub title: String,
-}

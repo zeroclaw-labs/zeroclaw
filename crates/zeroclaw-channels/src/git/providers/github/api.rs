@@ -13,9 +13,7 @@ use super::payloads::{
     GhComment, GhInstallation, GhIssue, GhRelease, GhRepo, GhReviewComment, GhTokenResponse,
     GhWorkflowRun, InstallationId, RepoEventsPage,
 };
-use crate::git::types::{
-    CreatePrParams, GitChannelError, IssueRef, PrRef, RepoRef, UpdatePrParams,
-};
+use crate::git::types::{GitChannelError, IssueRef, RepoRef};
 
 /// Pages followed per list call. GitHub paginates list endpoints with a
 /// `Link: rel="next"` header; following it keeps a single 100-item page
@@ -486,104 +484,6 @@ impl GithubApi {
         .await
     }
 
-    pub async fn create_pull(
-        &self,
-        token: &str,
-        repo: &RepoRef,
-        params: &CreatePrParams,
-    ) -> Result<PrRef, GitChannelError> {
-        #[derive(serde::Deserialize)]
-        struct Created {
-            number: u64,
-            #[serde(default)]
-            html_url: String,
-        }
-        let url = format!("{}/repos/{repo}/pulls", self.base);
-        let created: Created = self
-            .execute(
-                "POST /repos/{owner}/{repo}/pulls",
-                self.request(reqwest::Method::POST, url, token)
-                    .json(&serde_json::json!({
-                        "title": params.title,
-                        "body": params.body,
-                        "head": params.head,
-                        "base": params.base,
-                        "draft": params.draft,
-                    })),
-            )
-            .await?;
-        Ok(PrRef {
-            repo: repo.clone(),
-            number: created.number,
-            url: created.html_url,
-        })
-    }
-
-    pub async fn update_pull(
-        &self,
-        token: &str,
-        pr: &PrRef,
-        params: &UpdatePrParams,
-    ) -> Result<(), GitChannelError> {
-        let mut body = serde_json::Map::new();
-        if let Some(title) = &params.title {
-            body.insert("title".into(), serde_json::json!(title));
-        }
-        if let Some(text) = &params.body {
-            body.insert("body".into(), serde_json::json!(text));
-        }
-        if params.close {
-            body.insert("state".into(), serde_json::json!("closed"));
-        }
-        // GitHub cannot flip draft<->ready via PATCH; ready-for-review is a
-        // GraphQL mutation. Convert-to-draft is likewise GraphQL. The REST
-        // PATCH ignores `draft`, so a draft toggle is applied through the
-        // dedicated ready endpoint below.
-        if !body.is_empty() {
-            let url = format!("{}/repos/{}/pulls/{}", self.base, pr.repo, pr.number);
-            self.execute_unit(
-                "PATCH /repos/{owner}/{repo}/pulls/{n}",
-                self.request(reqwest::Method::PATCH, url, token)
-                    .json(&serde_json::Value::Object(body)),
-            )
-            .await?;
-        }
-        if params.draft == Some(false) {
-            self.mark_pull_ready(token, pr).await?;
-        }
-        Ok(())
-    }
-
-    /// Mark a draft PR ready for review via the GraphQL `markPullRequestReadyForReview`
-    /// mutation (REST has no equivalent). Best-effort: a forge that rejects the
-    /// mutation surfaces the API error to the caller.
-    async fn mark_pull_ready(&self, token: &str, pr: &PrRef) -> Result<(), GitChannelError> {
-        let node = self.pull_node_id(token, pr).await?;
-        let url = format!("{}/graphql", self.base.trim_end_matches("/api/v3"));
-        let query = "mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){clientMutationId}}";
-        self.execute_unit(
-            "POST /graphql markPullRequestReadyForReview",
-            self.request(reqwest::Method::POST, url, token)
-                .json(&serde_json::json!({ "query": query, "variables": { "id": node } })),
-        )
-        .await
-    }
-
-    async fn pull_node_id(&self, token: &str, pr: &PrRef) -> Result<String, GitChannelError> {
-        #[derive(serde::Deserialize)]
-        struct Pull {
-            node_id: String,
-        }
-        let url = format!("{}/repos/{}/pulls/{}", self.base, pr.repo, pr.number);
-        let pull: Pull = self
-            .execute(
-                "GET /repos/{owner}/{repo}/pulls/{n}",
-                self.request(reqwest::Method::GET, url, token),
-            )
-            .await?;
-        Ok(pull.node_id)
-    }
-
     /// `DELETE /repos/{owner}/{repo}/issues/comments/{id}`.
     pub async fn delete_comment(
         &self,
@@ -637,6 +537,32 @@ impl GithubApi {
                 .json(&serde_json::json!({ "content": content })),
         )
         .await
+    }
+
+    /// Low-level authed call: build `{base}/{path}`, attach `token`, send, and
+    /// return the raw status + decoded JSON body (Null when empty). Non-2xx is
+    /// returned, not raised, so the caller inspects GitHub's error envelope.
+    pub async fn forge_call(
+        &self,
+        token: &str,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<(u16, serde_json::Value), GitChannelError> {
+        let url = format!("{}/{}", self.base, path.trim_start_matches('/'));
+        let mut req = self.request(method, url, token);
+        if let Some(payload) = body {
+            req = req.json(payload);
+        }
+        let resp = req.send().await?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await?;
+        let value = if text.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
+        };
+        Ok((status, value))
     }
 }
 
