@@ -31,6 +31,7 @@ pub struct AnthropicModelProvider {
     credential: Option<String>,
     base_url: String,
     max_tokens: u32,
+    timeout_secs: u64,
 }
 
 #[cfg(test)]
@@ -240,10 +241,15 @@ struct NativeContentIn {
 
 impl AnthropicModelProvider {
     pub fn new(alias: &str, credential: Option<&str>) -> Self {
-        Self::with_base_url(alias, credential, None)
+        Self::with_base_url(alias, credential, None, None)
     }
 
-    pub fn with_base_url(alias: &str, credential: Option<&str>, base_url: Option<&str>) -> Self {
+    pub fn with_base_url(
+        alias: &str,
+        credential: Option<&str>,
+        base_url: Option<&str>,
+        timeout_secs: Option<u64>,
+    ) -> Self {
         let base_url = base_url
             .map(|u| u.trim_end_matches('/'))
             .unwrap_or(BASE_URL)
@@ -256,6 +262,7 @@ impl AnthropicModelProvider {
                 .map(ToString::to_string),
             base_url,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            timeout_secs: timeout_secs.unwrap_or(300), // Default to 300 seconds for long-running turns
         }
     }
 
@@ -838,8 +845,8 @@ impl AnthropicModelProvider {
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "model_provider.anthropic",
-            120,
-            10,
+            self.timeout_secs,
+            10, // connect timeout remains 10 seconds
         )
     }
 
@@ -2035,6 +2042,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             "test",
             Some("anthropic-credential"),
             Some("https://api.example.com"),
+            None,
         );
         assert_eq!(p.base_url, "https://api.example.com");
         assert_eq!(p.credential.as_deref(), Some("anthropic-credential"));
@@ -2042,14 +2050,18 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn custom_base_url_trims_trailing_slash() {
-        let p =
-            AnthropicModelProvider::with_base_url("test", None, Some("https://api.example.com/"));
+        let p = AnthropicModelProvider::with_base_url(
+            "test",
+            None,
+            Some("https://api.example.com/"),
+            None,
+        );
         assert_eq!(p.base_url, "https://api.example.com");
     }
 
     #[test]
     fn no_base_url_uses_published_endpoint() {
-        let p = AnthropicModelProvider::with_base_url("test", None, None);
+        let p = AnthropicModelProvider::with_base_url("test", None, None, None);
         assert_eq!(p.base_url, "https://api.anthropic.com");
     }
 
@@ -2883,6 +2895,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
             max_tokens: 4096,
+            timeout_secs: 300,
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)

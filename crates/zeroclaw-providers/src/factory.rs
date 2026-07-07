@@ -982,7 +982,12 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let mut p = crate::anthropic::AnthropicModelProvider::with_base_url(alias, key, api_url);
+        let mut p = crate::anthropic::AnthropicModelProvider::with_base_url(
+            alias,
+            key,
+            api_url,
+            self.base.timeout_secs,
+        );
         if let Some(mt) = opts.provider_max_tokens {
             p = p.with_max_tokens(mt);
         }
