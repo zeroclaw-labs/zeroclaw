@@ -91,6 +91,7 @@ struct ResponsesResponse {
 #[derive(Debug, Default)]
 pub(crate) struct ResponsesStreamState {
     pub(crate) saw_text_delta: bool,
+    pub(crate) saw_completion: bool,
     pub(crate) text_accumulator: String,
     pub(crate) fallback_text: Option<String>,
     pub(crate) tool_calls: HashMap<String, PendingToolCall>,
@@ -831,6 +832,7 @@ pub(crate) fn process_responses_stream_event(
             }
         }
         Some("response.completed" | "response.done") => {
+            state.saw_completion = true;
             if let Some(response) = event
                 .get("response")
                 .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
@@ -868,6 +870,9 @@ pub(crate) fn process_sse_chunk(
     let joined = data_lines.join("\n");
     let trimmed = joined.trim();
     if trimmed.is_empty() || trimmed == "[DONE]" {
+        if trimmed == "[DONE]" {
+            state.saw_completion = true;
+        }
         return Ok(Vec::new());
     }
 
@@ -879,6 +884,9 @@ pub(crate) fn process_sse_chunk(
     for line in data_lines {
         let line = line.trim();
         if line.is_empty() || line == "[DONE]" {
+            if line == "[DONE]" {
+                state.saw_completion = true;
+            }
             continue;
         }
         let event = serde_json::from_str::<Value>(line).map_err(|err| {
@@ -2084,6 +2092,35 @@ data: [DONE]
             parse_sse_turn(payload).unwrap().text.as_deref(),
             Some("Hello world")
         );
+    }
+
+    #[test]
+    fn process_sse_chunk_marks_completion_on_response_completed() {
+        let mut state = ResponsesStreamState::default();
+        let _ = process_sse_chunk(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"hi\"}}",
+            &mut state,
+        )
+        .unwrap();
+        assert!(state.saw_completion);
+    }
+
+    #[test]
+    fn process_sse_chunk_marks_completion_on_done_sentinel() {
+        let mut state = ResponsesStreamState::default();
+        let _ = process_sse_chunk("data: [DONE]", &mut state).unwrap();
+        assert!(state.saw_completion);
+    }
+
+    #[test]
+    fn process_sse_chunk_leaves_completion_unset_on_text_delta() {
+        let mut state = ResponsesStreamState::default();
+        let _ = process_sse_chunk(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}",
+            &mut state,
+        )
+        .unwrap();
+        assert!(!state.saw_completion);
     }
 
     #[test]
