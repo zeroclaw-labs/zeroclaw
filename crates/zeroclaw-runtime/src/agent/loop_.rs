@@ -1251,7 +1251,7 @@ pub async fn run(
         // Daemon/cron/subagent callers pass `interactive = false`; the Herdr
         // integration is CLI-interactive-only and must not mutate pane state
         // from those paths.
-        let _herdr_guard = crate::integrations::herdr::try_install_hook(interactive);
+        let _herdr_guard = crate::integrations::herdr::try_install_hook(interactive, agent_alias);
         // CLI one-shot / REPL (`interactive = true`) exits before the OTLP batch
         // exporter's background interval fires. Hold a FlushGuard for the rest of
         // this body so every return path — including `?` errors — pushes buffered
@@ -1703,7 +1703,19 @@ pub async fn run(
                 )))
             }
         });
-        if let Some(sid) = memory_session_id.as_deref() {
+
+        // Fallback: use agent alias as session identity when no session-state-file.
+        // This ensures herdr can map the pane to a session even without explicit file path.
+        let session_id = memory_session_id
+            .as_deref()
+            .map(|s| s.to_owned())
+            .or_else(|| {
+                Some(zeroclaw_api::session_keys::sanitize_session_key(&format!(
+                    "pane:{agent_alias}"
+                )))
+            });
+
+        if let Some(sid) = session_id.as_deref() {
             crate::integrations::herdr::update_session_id(sid);
         }
 

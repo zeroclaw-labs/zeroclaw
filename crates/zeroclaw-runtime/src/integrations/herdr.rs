@@ -16,6 +16,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -70,36 +71,14 @@ enum IoCommand {
 /// order, reconnects on error, and never outlives the `HerdrClient`.
 #[cfg(unix)]
 fn io_thread_main(socket_path: &str, rx: mpsc::Receiver<IoCommand>) {
-    // Eagerly connect at startup so the initial release_agent + idle messages
-    // are never silently lost due to lazy connection timing.
-    let mut stream = loop {
-        match connect_with_timeout(socket_path, CONNECT_TIMEOUT) {
-            Ok(s) => break Some(s),
-            Err(_) => {
-                // If connect failed, wait briefly and retry before processing
-                // any messages. The caller (try_install_hook) blocks on
-                // client.flush() so connection is established before events
-            }
-        }
-    };
-
     while let Ok(cmd) = rx.recv() {
         match cmd {
             IoCommand::Message(payload) => {
-                if stream.is_none() {
-                    stream = connect_with_timeout(socket_path, CONNECT_TIMEOUT).ok();
-                }
-                if let Some(ref mut s) = stream
-                    && send_on_stream(s, &payload).is_err()
-                {
-                    stream = None;
+                if let Ok(mut stream) = connect_with_timeout(socket_path, CONNECT_TIMEOUT) {
+                    let _ = send_on_stream(&mut stream, &payload);
                 }
             }
             IoCommand::Flush(ack) => {
-                // Ensure any pending writes hit the wire before acknowledging.
-                if let Some(ref mut s) = stream {
-                    let _ = s.flush();
-                }
                 let _ = ack.send(());
             }
             IoCommand::Shutdown => break,
@@ -133,7 +112,7 @@ const AGENT: &str = "zeroclaw";
 /// and subagent callers pass `interactive = false` and must not mutate the
 /// pane's process-wide Herdr state, since their lifecycle and flush
 /// assumptions differ from the CLI one-shot / REPL path.
-pub fn try_install_hook(interactive: bool) -> Option<BroadcastHookGuard> {
+pub fn try_install_hook(interactive: bool, agent_alias: &str) -> Option<BroadcastHookGuard> {
     if !interactive {
         return None;
     }
@@ -142,24 +121,37 @@ pub fn try_install_hook(interactive: bool) -> Option<BroadcastHookGuard> {
     }
     let socket_path = std::env::var("HERDR_SOCKET_PATH").ok()?;
     let pane_id = std::env::var("HERDR_PANE_ID").ok()?;
-    install_hook_from_env(socket_path, pane_id)
+    install_hook_from_env(socket_path, pane_id, agent_alias)
 }
 
 /// Install the hook from already-resolved env values. Factored out of
 /// [`try_install_hook`] so the gating logic can be tested without touching
 /// the process environment (`std::env::set_var` is `unsafe` on Rust >= 1.80
 /// because it is not thread-safe with concurrent reads).
-fn install_hook_from_env(socket_path: String, pane_id: String) -> Option<BroadcastHookGuard> {
+fn install_hook_from_env(
+    socket_path: String,
+    pane_id: String,
+    agent_alias: &str,
+) -> Option<BroadcastHookGuard> {
     // UDS is Unix-only; silently skip on other platforms.
     #[cfg(not(unix))]
     {
-        let _ = (socket_path, pane_id);
+        let _ = (socket_path, pane_id, agent_alias);
         return None;
     }
 
-    let client = HerdrClient::new(socket_path, pane_id);
+    let client = HerdrClient::new(socket_path, pane_id.clone());
+
+    // Compute unique display name: agent alias + last 2 chars of pane_id
+    let display_name = if pane_id.len() > 2 {
+        format!("{}-{}", agent_alias, &pane_id[pane_id.len() - 2..])
+    } else {
+        agent_alias.to_string()
+    };
+    client.report_metadata(&display_name);
+
     // Clear any stale state from a previous crashed session before installing
-    // the observer. The timestamp-based seq ensures this call is accepted even
+    // the observer. The wall-clock-seeded seq ensures this call is accepted even
     // if herdr retains a higher seq from a prior session.
     let _ = client.send("pane.release_agent", &serde_json::Map::new());
     // Report initial idle state so herdr shows the agent immediately, even
@@ -171,12 +163,6 @@ fn install_hook_from_env(socket_path: String, pane_id: String) -> Option<Broadca
     let reporter = DebouncedReporter::new(client);
     let observer = Arc::new(HerdrObserver::new(reporter));
     Some(set_scoped_broadcast_hook(observer))
-}
-
-/// Update the session ID stored by the HerdrObserver (called from loop_.rs
-/// after `memory_session_id` becomes available).
-pub fn update_session_id(sid: &str) {
-    session_id_slot().write().replace(sid.to_owned());
 }
 
 // ── HerdrClient ──────────────────────────────────────────────────────────────
@@ -239,8 +225,9 @@ impl HerdrClient {
         }
     }
 
-    /// Flush pending messages: block until the I/O thread has sent all
-    /// messages that were enqueued before this call.
+    /// Flush pending messages: acknowledge that all prior messages were sent.
+    /// With one-shot connections, each message is sent independently, so flush
+    /// just acknowledges that the I/O thread has processed all queued messages.
     pub(crate) fn flush(&self) {
         #[cfg(unix)]
         if let Some(tx) = &self.io_tx {
@@ -252,10 +239,15 @@ impl HerdrClient {
     }
 
     fn next_seq(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
+        static NEXT_SEQ: OnceLock<AtomicU64> = OnceLock::new();
+        let counter = NEXT_SEQ.get_or_init(|| {
+            let base = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(1_000_000_000_000_000);
+            AtomicU64::new(base)
+        });
+        counter.fetch_add(1, Ordering::Relaxed)
     }
 
     fn request_id(&self) -> String {
@@ -320,6 +312,15 @@ impl HerdrClient {
 
     fn report_released(&self) {
         let _ = self.send("pane.release_agent", &serde_json::Map::new());
+    }
+
+    fn report_metadata(&self, display_agent: &str) {
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "display_agent".into(),
+            serde_json::Value::String(display_agent.into()),
+        );
+        let _ = self.send("pane.report_metadata", &params);
     }
 }
 
@@ -393,9 +394,9 @@ impl DebouncedReporter {
 // This is NOT a duplicate of canonical state. The source of truth for the
 // session id is `memory_session_id` resolved in `agent::loop_::run()` from the
 // session state file. This slot is a cross-thread resolver: a single writer
-// (`update_session_id`, called from the agent loop) populates it once per
-// process, and the `HerdrObserver::record_event` path reads it from whatever
-// thread the `TeeObserver` broadcast fan-out happens to land on. The previous
+// (`update_session_id`, called from the agent loop) populates it, and the
+// `HerdrObserver::record_event` path reads it from whichever thread the
+// `TeeObserver` broadcast fan-out happens to land on. The previous
 // `thread_local!` was unsound for that use case because tokio can migrate the
 // observer's task to a different worker thread, where the slot would read
 // `None`. The pattern mirrors `BROADCAST_HOOK` in `observability/mod.rs`.
@@ -404,6 +405,10 @@ static SESSION_ID_SLOT: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 
 fn session_id_slot() -> &'static RwLock<Option<String>> {
     SESSION_ID_SLOT.get_or_init(|| RwLock::new(None))
+}
+
+pub fn update_session_id(sid: &str) {
+    session_id_slot().write().replace(sid.to_owned());
 }
 
 fn current_session_id() -> Option<String> {
@@ -435,34 +440,35 @@ impl HerdrObserver {
 
 impl Observer for HerdrObserver {
     fn record_event(&self, event: &ObserverEvent) {
+        let sid = current_session_id();
         let mut reporter = self.reporter.lock().expect("herdr observer poisoned");
         match event {
             ObserverEvent::AgentStart { .. } => {
-                reporter.transit_to(HerdrState::Idle, current_session_id().as_deref());
+                reporter.transit_to(HerdrState::Idle, sid.as_deref());
             }
             ObserverEvent::LlmRequest { .. } | ObserverEvent::ToolCallStart { .. } => {
-                reporter.transit_to(HerdrState::Working, current_session_id().as_deref());
+                reporter.transit_to(HerdrState::Working, sid.as_deref());
             }
             ObserverEvent::LlmResponse { .. } => {
-                reporter.transit_to(HerdrState::Working, current_session_id().as_deref());
+                reporter.transit_to(HerdrState::Working, sid.as_deref());
             }
             ObserverEvent::ToolCall { .. } => {
-                reporter.transit_to(HerdrState::Working, current_session_id().as_deref());
+                reporter.transit_to(HerdrState::Working, sid.as_deref());
             }
             ObserverEvent::TurnComplete => {
-                reporter.transit_to(HerdrState::Idle, None);
+                reporter.transit_to(HerdrState::Idle, sid.as_deref());
             }
             ObserverEvent::AgentEnd { .. } => {
-                reporter.transit_to(HerdrState::Released, None);
+                reporter.transit_to(HerdrState::Released, sid.as_deref());
             }
             ObserverEvent::AuthorizationRequested { .. } => {
-                reporter.transit_to(HerdrState::Blocked, None);
+                reporter.transit_to(HerdrState::Blocked, sid.as_deref());
             }
             ObserverEvent::AuthorizationResponded { granted, .. } => {
                 if *granted {
-                    reporter.transit_to(HerdrState::Working, None);
+                    reporter.transit_to(HerdrState::Working, sid.as_deref());
                 } else {
-                    reporter.transit_to(HerdrState::Idle, None);
+                    reporter.transit_to(HerdrState::Idle, sid.as_deref());
                 }
             }
             _ => {}
@@ -567,7 +573,7 @@ pub(crate) mod tests {
         // vars were set by some other process. The gate short-circuits before
         // any env read.
         assert!(
-            try_install_hook(false).is_none(),
+            try_install_hook(false, "test-agent").is_none(),
             "try_install_hook(false) must return None without consulting env vars"
         );
     }
@@ -666,5 +672,35 @@ pub(crate) mod tests {
 
         // Clean up so other tests don't observe stale state.
         session_id_slot().write().take();
+    }
+
+    /// `next_seq()` must return monotonically increasing values starting from
+    /// a wall-clock-seeded base. This ensures restart resilience: a process
+    /// restarted after herdr stores a prior seq will have a higher starting
+    /// value, avoiding silent message rejection.
+    #[test]
+    fn next_seq_is_monotonic_and_restart_safe() {
+        let client = HerdrClient::new(
+            "/tmp/nonexistent-herdr-test-socket.sock".into(),
+            "test-pane".into(),
+        );
+
+        let seq1 = client.next_seq();
+        let seq2 = client.next_seq();
+        let seq3 = client.next_seq();
+
+        assert!(seq2 > seq1, "seq must be monotonic: {} <= {}", seq2, seq1);
+        assert!(seq3 > seq2, "seq must be monotonic: {} <= {}", seq3, seq2);
+
+        let now_micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        assert!(
+            seq1 >= now_micros.saturating_sub(1000),
+            "seq {} should be seeded from wall clock (now ~{})",
+            seq1,
+            now_micros
+        );
     }
 }
