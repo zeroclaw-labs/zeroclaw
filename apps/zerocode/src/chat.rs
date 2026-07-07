@@ -2650,7 +2650,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let turn_status = state.turn_status.clone();
     let turn_started_at = state.turn_started_at;
 
-    let _live_input_tokens = state.context_input_tokens;
+    let _live_input_tokens: Option<u64> = state.context_input_tokens;
 
     // Transient info-bar messages (queue/attach notices, model-switch notes)
     // render at the app level via InfoBar from `state.info_message`. The paused
