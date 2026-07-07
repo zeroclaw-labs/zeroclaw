@@ -391,6 +391,35 @@ fn wrapped_line_count(text: &str, width: u16) -> u16 {
         .unwrap_or(u16::MAX)
 }
 
+fn is_word_character(character: char) -> bool {
+    character == '_' || character.is_alphanumeric()
+}
+
+fn previous_word_boundary(text: &str, cursor: usize) -> Option<usize> {
+    let mut chars = text[..cursor].char_indices().rev();
+
+    let mut target_is_word = None;
+    for (_, character) in chars.by_ref() {
+        if character.is_whitespace() {
+            continue;
+        }
+        target_is_word = Some(is_word_character(character));
+        break;
+    }
+
+    let Some(target_is_word) = target_is_word else {
+        return (cursor > 0).then_some(0);
+    };
+
+    for (index, character) in chars {
+        if character.is_whitespace() || is_word_character(character) != target_is_word {
+            return Some(index + character.len_utf8());
+        }
+    }
+
+    Some(0)
+}
+
 /// Decide which overflow arrows to show for `(up, down)` given the total
 /// content rows, the visible window, and the current scroll offset. Arrows
 /// only appear when content exceeds the window.
@@ -778,6 +807,20 @@ impl InputBarState {
         }
     }
 
+    pub fn delete_previous_word(&mut self) {
+        if self.selection.is_some() {
+            self.delete_selection();
+            self.update_autocomplete();
+            return;
+        }
+        let Some(delete_from) = previous_word_boundary(&self.input, self.cursor) else {
+            return;
+        };
+        self.input.replace_range(delete_from..self.cursor, "");
+        self.cursor = delete_from;
+        self.update_autocomplete();
+    }
+
     pub fn move_cursor_left(&mut self) {
         self.clear_selection();
         if self.cursor > 0 {
@@ -1063,6 +1106,10 @@ impl InputBarState {
             }
             Some(IbWidgetAction::Backspace) => {
                 self.pop_input_char();
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::DeletePreviousWord) => {
+                self.delete_previous_word();
                 return InputBarAction::Consumed;
             }
             Some(IbWidgetAction::ClearInput) => {
@@ -1716,6 +1763,81 @@ mod tests {
         let act = bar.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert!(matches!(act, InputBarAction::Consumed));
         assert_eq!(bar.input(), "");
+    }
+
+    #[test]
+    fn ctrl_w_deletes_previous_word() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello world");
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "hello ");
+        assert_eq!(bar.cursor(), 6);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_trailing_space_and_word() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello world   ");
+        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "hello ");
+        assert_eq!(bar.cursor(), 6);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_word_before_cursor() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello brave world");
+        for _ in 0..5 {
+            bar.move_cursor_left();
+        }
+        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "hello world");
+        assert_eq!(bar.cursor(), 6);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_selection() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello world");
+        bar.selection = Some((6, 11));
+        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "hello ");
+        assert_eq!(bar.cursor(), 6);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_punctuation_run_like_vim() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello world...");
+        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "hello world");
+        assert_eq!(bar.cursor(), 11);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_word_after_punctuation_like_vim() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello-world");
+        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "hello-");
+        assert_eq!(bar.cursor(), 6);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_only_whitespace_before_cursor() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("   ");
+        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "");
+        assert_eq!(bar.cursor(), 0);
     }
 
     #[test]
