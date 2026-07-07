@@ -1278,7 +1278,9 @@ impl App {
             // Create a synthetic entry for global channels settings
             let global_entry = ConfigTemplateEntry {
                 path: "channels.global_settings".to_string(),
-                description: Some("Global channel settings (show_tool_calls, ack_reactions, etc.)".to_string()),
+                description: Some(
+                    "Global channel settings (show_tool_calls, ack_reactions, etc.)".to_string(),
+                ),
                 ..Default::default()
             };
             types.push(global_entry);
@@ -1286,7 +1288,8 @@ impl App {
 
         // Then add the regular type entries
         let prefix = format!("{}.", section_key);
-        let mut regular_types: Vec<ConfigTemplateEntry> = self.templates
+        let mut regular_types: Vec<ConfigTemplateEntry> = self
+            .templates
             .iter()
             .filter(|t| t.path.starts_with(&prefix))
             .cloned()
