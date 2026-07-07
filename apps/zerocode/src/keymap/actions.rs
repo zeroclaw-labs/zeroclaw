@@ -288,6 +288,8 @@ keyactions! {
         New    [Chord::char('n')] => "new sop",
         Edit   [Chord::char('e')] => "edit sop",
         Delete [Chord::char('d')] => "delete sop",
+        Approve [Chord::char('a'), Chord::char('A')] => "approve checkpoint",
+        Deny    [Chord::char('x'), Chord::char('X')] => "deny checkpoint",
         Toggle [Chord::char('v')] => "toggle layer",
         PanLeft  [Chord::shift(KeyCode::Left)] => "pan left",
         PanRight [Chord::shift(KeyCode::Right)] => "pan right",

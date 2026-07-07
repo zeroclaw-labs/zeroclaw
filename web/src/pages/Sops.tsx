@@ -12,6 +12,7 @@ import {
   listSops,
   getSopGraph,
   getRunOverlay,
+  decideSop,
   getSop,
   runSop,
   saveSop,
@@ -1451,6 +1452,7 @@ export default function Sops() {
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
   const [overlay, setOverlay] = useState<RunOverlay | null>(null);
+  const [deciding, setDeciding] = useState(false);
   const [overlayError, setOverlayError] = useState<string | null>(null);
   const [draft, setDraft] = useState<Sop | null>(loadStoredDraft);
   const [editingName, setEditingName] = useState<string | null>(loadStoredEditingName);
@@ -1786,6 +1788,22 @@ export default function Sops() {
       .finally(() => setRunning(false));
   }, [selected, runPayload]);
 
+  const handleDecide = useCallback(
+    (approve: boolean) => {
+      if (!selected || !overlay) return;
+      setDeciding(true);
+      setOverlayError(null);
+      decideSop(selected, overlay.run_id, approve ? 'approve' : { deny: {} })
+        .then((o) => {
+          setOverlay(o);
+          setOverlayError(null);
+        })
+        .catch((e) => setOverlayError(e instanceof Error ? e.message : String(e)))
+        .finally(() => setDeciding(false));
+    },
+    [selected, overlay],
+  );
+
   // Keep the inspector pointed at a real step: select the first step when a
   // draft opens and drop the selection when its step is removed.
   useEffect(() => {
@@ -2035,6 +2053,26 @@ export default function Sops() {
                   {t(`sops.run_status.${overlay.status}`)} · {overlay.current_step}/
                   {overlay.total_steps}
                 </Badge>
+              ) : null}
+              {overlay && (overlay.waiting || overlay.paused) ? (
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={deciding}
+                    onClick={() => handleDecide(true)}
+                    className="rounded border border-pc-border bg-pc-surface px-2 py-1 text-xs text-status-ok hover:bg-pc-surface-hover disabled:opacity-50"
+                  >
+                    {t('sops.approve')}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={deciding}
+                    onClick={() => handleDecide(false)}
+                    className="rounded border border-pc-border bg-pc-surface px-2 py-1 text-xs text-status-error hover:bg-pc-surface-hover disabled:opacity-50"
+                  >
+                    {t('sops.deny')}
+                  </button>
+                </div>
               ) : null}
               {overlayError ? <span className="text-xs text-status-error">{overlayError}</span> : null}
             </div>

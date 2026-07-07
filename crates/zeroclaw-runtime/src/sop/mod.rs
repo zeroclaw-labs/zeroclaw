@@ -21,6 +21,7 @@ pub mod trigger_source;
 pub mod types;
 pub mod wire;
 
+pub use approval::ApprovalDecision;
 pub use audit::SopAuditLogger;
 #[allow(unused_imports)]
 pub use binding::{

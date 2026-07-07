@@ -118,6 +118,7 @@ pub mod method {
     pub const SOPS_SAVE: &str = "sops/save";
     pub const SOPS_CREATE: &str = "sops/create";
     pub const SOPS_DELETE: &str = "sops/delete";
+    pub const SOPS_DECIDE: &str = "sops/decide";
     pub const SOPS_WIRE_DRAFT: &str = "sops/wire-draft";
     pub const SOPS_GRAPH_DRAFT: &str = "sops/graph-draft";
     pub const SOPS_TRIGGER_SOURCES: &str = "sops/trigger-sources";
@@ -1251,6 +1252,18 @@ impl RpcClient {
     pub async fn sops_delete(&self, name: &str) -> Result<Value> {
         self.call(method::SOPS_DELETE, serde_json::json!({ "name": name }))
             .await
+    }
+
+    /// Resolve a paused checkpoint on a live run. `decision` is the raw
+    /// `ApprovalDecision` wire value (`"approve"` or `{"deny": {"reason": ..}}`);
+    /// the daemon deserializes it into the canonical enum. Returns the refreshed
+    /// run overlay so the surface re-renders the post-decision state.
+    pub async fn sops_decide(&self, name: &str, run_id: &str, decision: Value) -> Result<Value> {
+        self.call(
+            method::SOPS_DECIDE,
+            serde_json::json!({ "name": name, "run_id": run_id, "decision": decision }),
+        )
+        .await
     }
 
     pub async fn sops_wire_draft(&self, sop: Value, edit: Value) -> Result<Value> {

@@ -82,7 +82,7 @@ impl EscalateToHumanTool {
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({"name": name})),
-                            "escalate_to_human: alert channel '' not found in channel map"
+                            "escalate_to_human: alert channel not found in channel map"
                         );
                         None
                     }
@@ -97,7 +97,7 @@ impl EscalateToHumanTool {
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({"error": format!("{}", e), "name": name})),
-                    "escalate_to_human: alert to channel '' failed"
+                    "escalate_to_human: alert to channel failed"
                 );
             }
         }

@@ -23,8 +23,8 @@ use tokio::sync::mpsc;
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    RpcOutbound, SopRunOverlayRequest, SopRunRequest, SopRunResponse, SopRunsRequest,
-    SopSaveRequest, SopSelectRequest,
+    RpcOutbound, SopDecideRequest, SopRunOverlayRequest, SopRunRequest, SopRunResponse,
+    SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ChatMessage;
 
@@ -157,6 +157,7 @@ pub enum Method {
     SopsSave,
     SopsCreate,
     SopsDelete,
+    SopsDecide,
     SopsWireDraft,
     SopsGraphDraft,
     SopsTriggerSources,
@@ -265,6 +266,7 @@ impl Method {
         (Method::SopsSave, "sops/save"),
         (Method::SopsCreate, "sops/create"),
         (Method::SopsDelete, "sops/delete"),
+        (Method::SopsDecide, "sops/decide"),
         (Method::SopsWireDraft, "sops/wire-draft"),
         (Method::SopsGraphDraft, "sops/graph-draft"),
         (Method::SopsTriggerSources, "sops/trigger-sources"),
@@ -741,6 +743,7 @@ impl RpcDispatcher {
             Method::SopsSave => self.handle_sops_save(&req.params),
             Method::SopsCreate => self.handle_sops_create(&req.params),
             Method::SopsDelete => self.handle_sops_delete(&req.params),
+            Method::SopsDecide => self.handle_sops_decide(&req.params).await,
             Method::SopsWireDraft => self.handle_sops_wire_draft(&req.params),
             Method::SopsGraphDraft => self.handle_sops_graph_draft(&req.params),
             Method::SopsTriggerSources => self.handle_sops_trigger_sources(),
@@ -4078,6 +4081,57 @@ impl RpcDispatcher {
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
         let overlay = crate::sop::run_overlay_for(&sop, engine, &req.run_id).map_err(|e| {
+            let msg = e.to_string();
+            let code = if msg.contains("not found") {
+                INVALID_PARAMS
+            } else {
+                INTERNAL_ERROR
+            };
+            rpc_err(code, msg)
+        })?;
+        to_result(overlay)
+    }
+
+    async fn handle_sops_decide(&self, params: &Value) -> RpcResult {
+        let req: SopDecideRequest = parse_params(params)?;
+        let decision: crate::sop::approval::ApprovalDecision =
+            serde_json::from_value(req.decision.clone()).map_err(|e| {
+                rpc_err(
+                    INVALID_PARAMS,
+                    format!("decision is not a valid approval decision: {e}"),
+                )
+            })?;
+
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+        let engine = self
+            .ctx
+            .sop_engine
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?
+            .clone();
+
+        let agent_alias = sop.agent.clone().unwrap_or_default();
+        let span = ::zeroclaw_log::info_span!(
+            target: "zeroclaw_log_internal_scope",
+            "zeroclaw_scope",
+            session_key = %req.run_id,
+            agent_alias = %agent_alias,
+            channel = "rpc",
+        );
+        let _guard = span.enter();
+
+        {
+            let mut guard = engine
+                .lock()
+                .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
+            guard
+                .decide_checkpoint(&req.run_id, decision)
+                .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        }
+
+        let overlay = crate::sop::run_overlay_for(&sop, &engine, &req.run_id).map_err(|e| {
             let msg = e.to_string();
             let code = if msg.contains("not found") {
                 INVALID_PARAMS

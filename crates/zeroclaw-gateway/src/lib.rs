@@ -1749,6 +1749,10 @@ pub async fn run_gateway(
             "/api/sops/{name}/runs/{run_id}/overlay",
             get(api_sop_author::handle_sop_run_overlay),
         )
+        .route(
+            "/api/sops/{name}/runs/{run_id}/decide",
+            post(api_sop_author::handle_sop_decide),
+        )
         .route("/api/config/drift", get(api_config::handle_drift))
         .route(
             "/api/config/reload-status",

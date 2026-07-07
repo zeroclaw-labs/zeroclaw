@@ -315,6 +315,18 @@ pub struct SopRunOverlayRequest {
     pub run_id: String,
 }
 
+/// Request payload for `sops/decide`: resolve a paused checkpoint. `name` and
+/// `run_id` select the run; `decision` is the raw `ApprovalDecision` wire value
+/// (`"approve"` or `{"deny": {"reason": "..."}}`), deserialized into the
+/// canonical runtime enum by the handler so no parallel decision enum exists
+/// here to drift from it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopDecideRequest {
+    pub name: String,
+    pub run_id: String,
+    pub decision: serde_json::Value,
+}
+
 /// Request payload for `sops/run`: fire a Manual trigger for the named SOP.
 /// `payload` is an optional JSON string handed to the run as the step-1 input;
 /// omitting it starts the run with no payload. The daemon builds the Manual

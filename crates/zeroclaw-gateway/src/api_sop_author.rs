@@ -308,6 +308,94 @@ pub async fn handle_sop_run_overlay(
     }
 }
 
+/// Resolve a paused checkpoint on a live run. Body carries the raw
+/// `ApprovalDecision` wire value; `Approve` follows the success edge, `Deny`
+/// the step's `on_failure` failure path. Returns the refreshed overlay.
+pub async fn handle_sop_decide(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((name, run_id)): Path<(String, String)>,
+    Json(decision_value): Json<serde_json::Value>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let decision: zeroclaw_runtime::sop::approval::ApprovalDecision =
+        match serde_json::from_value(decision_value) {
+            Ok(d) => d,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("decision is not a valid approval decision: {e}")
+                    })),
+                )
+                    .into_response();
+            }
+        };
+    let (dir, mode) = sops_dir_and_mode(&state);
+    let sop = match zeroclaw_runtime::sop::load_sop_by_name(&dir, &name, mode) {
+        Ok(sop) => sop,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("SOP '{name}': {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let Some(engine) = state.sop_engine.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "SOP subsystem not enabled" })),
+        )
+            .into_response();
+    };
+
+    let agent_alias = sop.agent.clone().unwrap_or_default();
+    let span = ::zeroclaw_log::info_span!(
+        target: "zeroclaw_log_internal_scope",
+        "zeroclaw_scope",
+        session_key = %run_id,
+        agent_alias = %agent_alias,
+        channel = "gateway",
+    );
+    let _guard = span.enter();
+
+    {
+        let mut guard = match engine.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": "SOP engine lock poisoned" })),
+                )
+                    .into_response();
+            }
+        };
+        if let Err(e) = guard.decide_checkpoint(&run_id, decision) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    }
+
+    match zeroclaw_runtime::sop::run_overlay_for(&sop, engine, &run_id) {
+        Ok(overlay) => Json(overlay).into_response(),
+        Err(e) => {
+            let msg = e.to_string();
+            let code = if msg.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (code, Json(serde_json::json!({ "error": msg }))).into_response()
+        }
+    }
+}
+
 pub async fn handle_sop_full(
     State(state): State<AppState>,
     headers: HeaderMap,

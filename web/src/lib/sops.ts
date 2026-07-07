@@ -38,6 +38,7 @@ export type FlowRole = NonNullable<GraphWire['flow_role']>;
 export type GraphSeverity = GraphDiagnostic['severity'];
 
 export type RunOverlay = Schemas['RunOverlay'];
+export type SopApprovalDecision = Schemas['ApprovalDecision'];
 export type TriggerSourceRegistry = Schemas['TriggerSourceRegistry'];
 export type BoundTriggerSource = Schemas['BoundTriggerSource'];
 export type TriggerField = Schemas['TriggerField'];
@@ -239,6 +240,24 @@ export function runSop(name: string, payload?: string): Promise<{ run_id: string
     method: 'POST',
     body: JSON.stringify({ payload: payload ?? null }),
   });
+}
+
+/// Resolve a paused checkpoint on a live run. `decision` is the canonical
+/// `ApprovalDecision` wire shape (generated from the runtime enum): `'approve'`
+/// or `{ deny: { reason? } }`. Returns the refreshed overlay so the caller
+/// re-renders the post-decision run state.
+export function decideSop(
+  name: string,
+  runId: string,
+  decision: SopApprovalDecision,
+): Promise<RunOverlay> {
+  return apiFetch<RunOverlay>(
+    `/api/sops/${encodeURIComponent(name)}/runs/${encodeURIComponent(runId)}/decide`,
+    {
+      method: 'POST',
+      body: JSON.stringify(decision),
+    },
+  );
 }
 
 /// Index a run overlay's node states by step number. Shared by every view

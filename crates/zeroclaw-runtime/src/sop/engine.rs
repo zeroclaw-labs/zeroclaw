@@ -1176,6 +1176,87 @@ impl SopEngine {
         self.advance_deterministic_step(run_id, piped, None)
     }
 
+    /// Resolve a checkpoint decision (`PausedCheckpoint`). `Approve` resumes the
+    /// success path (records the checkpoint `Completed`, pipes forward down
+    /// `routing.next`); `Deny` takes the failure path (records the checkpoint
+    /// `Failed` and routes through the step's `on_failure`, exactly like a step
+    /// that failed execution). This is the single entry point for both outcomes;
+    /// callers never branch on status. `approve_step` is the `Approve`-only alias.
+    pub fn decide_checkpoint(
+        &mut self,
+        run_id: &str,
+        decision: super::approval::ApprovalDecision,
+    ) -> Result<SopRunAction> {
+        match decision {
+            super::approval::ApprovalDecision::Approve => self.approve_step(run_id),
+            super::approval::ApprovalDecision::Deny { reason } => {
+                self.deny_checkpoint(run_id, reason)
+            }
+        }
+    }
+
+    /// Failure path for a denied checkpoint: record the checkpoint step `Failed`
+    /// and route through its `on_failure` policy via the shared deterministic
+    /// record-and-route chokepoint. `Goto` reaches the authored failure step;
+    /// the default `Fail` terminates the run `Failed`. Mirrors `approve_step`'s
+    /// guard so a wrong-status or missing run fails closed with the gate intact.
+    fn deny_checkpoint(&mut self, run_id: &str, reason: Option<String>) -> Result<SopRunAction> {
+        let status = self
+            .active_runs
+            .get(run_id)
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"run_id": run_id})),
+                    "SOP engine: active run not found"
+                );
+                anyhow::Error::msg(format!("Active run not found: {run_id}"))
+            })?
+            .status;
+
+        if status != SopRunStatus::PausedCheckpoint {
+            bail!("Run {run_id} is not paused at a checkpoint (status: {status})");
+        }
+
+        let (_, sop) = self.resolve_active_run_sop(run_id)?;
+        let current_step_number = self
+            .active_runs
+            .get(run_id)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?
+            .current_step;
+        let current_step = self.resolve_sop_step(&sop, current_step_number)?;
+
+        let detail = reason.unwrap_or_else(|| "checkpoint denied by operator".to_string());
+        let now = now_iso8601();
+
+        if let Some(run) = self.active_runs.get_mut(run_id) {
+            run.status = SopRunStatus::Running;
+            run.waiting_since = None;
+        }
+        self.record_transition_event(
+            run_id,
+            "checkpoint_denied",
+            Some(detail.clone()),
+            ::serde_json::json!({
+                "step": current_step.number,
+                "kind": current_step.kind.to_string(),
+            }),
+        );
+
+        self.record_deterministic_step_result(
+            run_id,
+            &sop,
+            &current_step,
+            SopStepStatus::Failed,
+            detail.clone(),
+            serde_json::Value::String(detail),
+            now.clone(),
+            Some(now),
+        )
+    }
+
     /// Clear a `WaitingApproval` gate: flip to Running, build the ExecuteStep
     /// action for the current step, and persist. Shared by `approve_step` (the
     /// agent path) and `resolve_gate` (the out-of-band path) so the transition
@@ -5209,6 +5290,102 @@ type = "manual"
         assert!(
             matches!(action, SopRunAction::Completed { .. }),
             "deterministic run should complete after the post-checkpoint step"
+        );
+    }
+
+    #[test]
+    fn deny_checkpoint_routes_through_on_failure_goto() {
+        // A denied checkpoint takes the failure path: the checkpoint step is
+        // recorded Failed and routed through its `on_failure`. With a Goto, the
+        // run continues at the authored failure-handler step, not the success
+        // successor and not a whole-run cancel.
+        let mut sop = deterministic_sop("det-cp-deny-goto");
+        sop.steps[1].on_failure = StepFailure::Goto { step: 3 };
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine
+            .start_run("det-cp-deny-goto", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        engine
+            .advance_deterministic_step(&run_id, serde_json::json!("s1-out"), None)
+            .unwrap();
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::PausedCheckpoint
+        );
+
+        let action = engine
+            .decide_checkpoint(
+                &run_id,
+                ApprovalDecision::Deny {
+                    reason: Some("not acceptable".into()),
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(action, SopRunAction::DeterministicStep { ref step, .. } if step.number == 3),
+            "denying a checkpoint with on_failure=Goto must route to the failure-handler step"
+        );
+        let cp = engine
+            .get_run(&run_id)
+            .unwrap()
+            .step_results
+            .iter()
+            .find(|r| r.step_number == 2)
+            .expect("checkpoint step recorded");
+        assert_eq!(cp.status, SopStepStatus::Failed);
+    }
+
+    #[test]
+    fn deny_checkpoint_defaults_to_terminal_failure() {
+        // With the default on_failure (Fail), a denied checkpoint terminates the
+        // run Failed. This is distinct from Cancelled: the operator declined and
+        // no failure handler was authored, so the run failed.
+        let mut engine = engine_with_sops(vec![deterministic_sop("det-cp-deny-fail")]);
+        let action = engine
+            .start_run("det-cp-deny-fail", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        engine
+            .advance_deterministic_step(&run_id, serde_json::json!("s1-out"), None)
+            .unwrap();
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::PausedCheckpoint
+        );
+
+        let action = engine
+            .decide_checkpoint(&run_id, ApprovalDecision::Deny { reason: None })
+            .unwrap();
+        assert!(
+            matches!(action, SopRunAction::Failed { .. }),
+            "denying a checkpoint with default on_failure must fail the run"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::Failed
+        );
+    }
+
+    #[test]
+    fn decide_checkpoint_approve_matches_approve_step() {
+        // Approve through the unified decision entry point must behave exactly
+        // like approve_step: resume to the next step down the success edge.
+        let mut engine = engine_with_sops(vec![deterministic_sop("det-cp-approve")]);
+        let action = engine.start_run("det-cp-approve", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        engine
+            .advance_deterministic_step(&run_id, serde_json::json!("s1-out"), None)
+            .unwrap();
+        let action = engine
+            .decide_checkpoint(&run_id, ApprovalDecision::Approve)
+            .unwrap();
+        assert!(
+            matches!(action, SopRunAction::DeterministicStep { ref step, .. } if step.number == 3),
+            "approving via decide_checkpoint must resume to the next step"
         );
     }
 

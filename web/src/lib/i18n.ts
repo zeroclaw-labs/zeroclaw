@@ -1024,6 +1024,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'sops.empty_graph': 'This SOP has no steps to render.',
     'sops.run_id_placeholder': 'Watch a run: paste run id',
     'sops.run': 'Run',
+    'sops.approve': 'Approve',
+    'sops.deny': 'Deny',
     'sops.run_payload_placeholder': 'Manual trigger payload (JSON)',
     'sops.run_error': 'Run failed',
     'sops.run_state.pending': 'pending',

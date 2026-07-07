@@ -2009,6 +2009,26 @@ impl Channel for DiscordChannel {
             };
 
         let mut first_message_id: Option<String> = None;
+        let effective_recipient = if message.recipient.is_empty() {
+            match self.channel_ids.first() {
+                Some(id) => id.as_str(),
+                None => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "discord send has no recipient: message.recipient is empty and no \
+                         channel_ids are configured to fall back to"
+                    );
+                    anyhow::bail!(
+                        "discord send has no recipient: message.recipient is empty and no \
+                         channel_ids are configured to fall back to"
+                    );
+                }
+            }
+        } else {
+            message.recipient.as_str()
+        };
         for (i, chunk) in chunks.iter().enumerate() {
             // Embeds (EPIC C) and interactive components (EPIC B) both ride the
             // FIRST chunk only — Discord attaches embeds and action rows
@@ -2028,7 +2048,7 @@ impl Channel for DiscordChannel {
                     send_discord_message_payload(
                         &client,
                         &self.bot_token,
-                        &message.recipient,
+                        effective_recipient,
                         &payload,
                     )
                     .await?
@@ -2036,7 +2056,7 @@ impl Channel for DiscordChannel {
                     send_discord_message_payload_with_files(
                         &client,
                         &self.bot_token,
-                        &message.recipient,
+                        effective_recipient,
                         &payload,
                         &local_files,
                     )
@@ -2046,13 +2066,13 @@ impl Channel for DiscordChannel {
                 send_discord_message_payload_with_files(
                     &client,
                     &self.bot_token,
-                    &message.recipient,
+                    effective_recipient,
                     &DiscordOutgoing::text(chunk.clone()),
                     &local_files,
                 )
                 .await?
             } else {
-                send_discord_message_json(&client, &self.bot_token, &message.recipient, chunk)
+                send_discord_message_json(&client, &self.bot_token, effective_recipient, chunk)
                     .await?
             };
             if first_message_id.is_none() {

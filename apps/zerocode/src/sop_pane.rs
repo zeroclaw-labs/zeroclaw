@@ -23,6 +23,7 @@ pub(crate) struct SopPane {
     run_input: Option<String>,
     run_payload_input: Option<String>,
     overlay: Option<RunOverlayView>,
+    current_run_id: Option<String>,
     editor: Option<SopEditorState>,
     trigger_registry: crate::client::TriggerSourceRegistryView,
     error: Option<String>,
@@ -435,6 +436,14 @@ struct RunOverlayView {
 }
 
 impl RunOverlayView {
+    /// True when the run is parked awaiting an operator decision. Reads the
+    /// backend-projected `waiting`/`paused` flags (derived server-side from the
+    /// run status) rather than testing status strings here, so the set of
+    /// awaiting states stays owned by the runtime.
+    fn awaiting_decision(&self) -> bool {
+        self.waiting || self.paused
+    }
+
     fn state_of(&self, step: u64) -> Option<NodeRunState> {
         self.node_states
             .iter()
@@ -462,6 +471,7 @@ impl SopPane {
             run_input: None,
             run_payload_input: None,
             overlay: None,
+            current_run_id: None,
             editor: None,
             trigger_registry: crate::client::TriggerSourceRegistryView::default(),
             error: None,
@@ -532,6 +542,45 @@ impl SopPane {
         match self.rpc.sops_run_overlay(&name, run_id).await {
             Ok(value) => {
                 self.overlay = serde_json::from_value(value).ok();
+                self.current_run_id = Some(run_id.to_string());
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    /// Resolve the current run's checkpoint. `approve` picks the success path;
+    /// otherwise the failure path (`deny` with no reason). The decision is the
+    /// `ApprovalDecision` wire shape; the daemon owns interpretation and routing.
+    /// Refreshes the overlay so the post-decision state renders immediately.
+    pub(crate) async fn decide_checkpoint(&mut self, approve: bool) {
+        let Some(name) = self.selected_name().map(String::from) else {
+            return;
+        };
+        let Some(run_id) = self.current_run_id.clone() else {
+            return;
+        };
+        let awaiting = self
+            .overlay
+            .as_ref()
+            .is_some_and(RunOverlayView::awaiting_decision);
+        if !awaiting {
+            self.status = Some("run is not awaiting a decision".into());
+            return;
+        }
+        let decision = if approve {
+            serde_json::json!("approve")
+        } else {
+            serde_json::json!({ "deny": {} })
+        };
+        match self.rpc.sops_decide(&name, &run_id, decision).await {
+            Ok(value) => {
+                self.overlay = serde_json::from_value(value).ok();
+                self.status = Some(if approve {
+                    "checkpoint approved".into()
+                } else {
+                    "checkpoint denied".into()
+                });
                 self.error = None;
             }
             Err(e) => self.error = Some(e.to_string()),
@@ -607,6 +656,8 @@ impl SopPane {
             }
             Some(SopTabAction::Edit) => self.open_editor_for_selected().await,
             Some(SopTabAction::Delete) => self.delete_selected().await,
+            Some(SopTabAction::Approve) => self.decide_checkpoint(true).await,
+            Some(SopTabAction::Deny) => self.decide_checkpoint(false).await,
             Some(SopTabAction::Toggle) => self.toggle_layer(),
             Some(SopTabAction::PanLeft) => self.pan_x = self.pan_x.saturating_sub(4),
             Some(SopTabAction::PanRight) => self.pan_x = self.pan_x.saturating_add(4),
