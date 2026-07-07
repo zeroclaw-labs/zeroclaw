@@ -2864,7 +2864,8 @@ fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled(format!(" {title} "), theme::title_style()));
+        .title(Span::styled(format!(" {title} "), theme::title_style()))
+        .style(theme::fill_style());
     let inner = block.inner(area);
     f.render_widget(Clear, area);
     f.render_widget(block, area);
@@ -3640,7 +3641,7 @@ fn render_session_list_overlay(
             " Sessions (Enter=switch, Esc=close) ",
             theme::overlay_border_style(),
         ))
-        .style(theme::overlay_border_style());
+        .style(theme::fill_style());
 
     let inner = block.inner(overlay_area);
     f.render_widget(block, overlay_area);
