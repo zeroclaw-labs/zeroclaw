@@ -138,6 +138,29 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Insert only if `id` is not already live, atomically under the store lock.
+    /// Returns `Err("session id already in use")` when a live session already
+    /// holds the id. This is the reservation boundary that stops a concurrent
+    /// `session/new` *create* from silently overwriting another live session
+    /// (RFC #7141 F2): `session/new` uses this for a fresh create-with-id, while
+    /// resuming a session the caller already owns uses [`Self::insert`] to
+    /// replace its own live state.
+    pub async fn insert_if_absent(
+        &self,
+        id: String,
+        session: RpcSession,
+    ) -> Result<(), &'static str> {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.contains_key(&id) {
+            return Err("session id already in use");
+        }
+        if sessions.len() >= self.max_sessions {
+            return Err("session limit reached");
+        }
+        sessions.insert(id, session);
+        Ok(())
+    }
+
     pub async fn get_agent(&self, id: &str) -> Option<Arc<Mutex<Agent>>> {
         self.sessions.lock().await.get(id).map(|s| s.agent.clone())
     }

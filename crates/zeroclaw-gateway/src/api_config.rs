@@ -24,6 +24,7 @@ use zeroclaw_config::sections::section_for_path;
 use zeroclaw_config::traits::MaskSecrets;
 
 use super::AppState;
+use crate::api::require_auth;
 
 // ── Request / response shapes ───────────────────────────────────────
 

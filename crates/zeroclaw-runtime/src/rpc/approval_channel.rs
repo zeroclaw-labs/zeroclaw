@@ -166,7 +166,11 @@ impl RpcApprovalChannel {
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel::<ChannelApprovalResponse>();
-        let mut pending_request = self.pending.register(request_id.clone(), tx);
+        // Bind the approval to this channel's session so `session/approve` can be
+        // authorized against the session's owner (RFC #7141 F2).
+        let mut pending_request =
+            self.pending
+                .register(request_id.clone(), self.session_id.clone(), tx);
 
         self.rpc
             .notify(

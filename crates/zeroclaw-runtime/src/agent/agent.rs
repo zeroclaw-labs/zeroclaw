@@ -315,6 +315,31 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
     }
 }
 
+/// Compose a caller principal's profile tool allowlist
+/// (`ResolvedGrants.allowed_tools`) with an agent's own `SecurityPolicy`
+/// allowlist (RFC #7141 F1). An empty/`None` principal list imposes no extra
+/// restriction (parity with `ResolvedGrants::may_use_tool`); otherwise the
+/// result is the intersection with the agent's list, or the principal list
+/// itself when the agent imposed none. The narrowed set is what every
+/// tool-assembly filter then enforces, so an out-of-profile tool cannot survive
+/// on any construction path (built-in, MCP, or deferred/skill discovery).
+fn compose_principal_tool_allowlist(
+    policy_allowed: Option<Vec<String>>,
+    principal_allowed: Option<&[String]>,
+) -> Option<Vec<String>> {
+    let principal_allowed = match principal_allowed {
+        Some(list) if !list.is_empty() => list,
+        _ => return policy_allowed,
+    };
+    Some(match policy_allowed {
+        Some(existing) => existing
+            .into_iter()
+            .filter(|t| principal_allowed.contains(t))
+            .collect(),
+        None => principal_allowed.to_vec(),
+    })
+}
+
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
@@ -1284,6 +1309,7 @@ impl Agent {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -1319,6 +1345,7 @@ impl Agent {
             sop_engine,
             sop_audit,
             canvas_store,
+            None,
         )
         .await
     }
@@ -1327,6 +1354,7 @@ impl Agent {
     /// injects the TUI's captured shell environment so that tools like
     /// `ShellTool` inherit the user's real `PATH`, `SSH_AUTH_SOCK`, etc.
     /// rather than the daemon's stripped-down process environment.
+    #[allow(clippy::too_many_arguments)]
     pub async fn from_config_with_tui_env(
         config: &Config,
         agent_alias: &str,
@@ -1336,6 +1364,9 @@ impl Agent {
         tui_env: Option<std::collections::HashMap<String, String>>,
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
+        // Caller principal's resolved profile tool allowlist, forwarded into the
+        // agent's `SecurityPolicy`. `None`/empty => no restriction.
+        principal_allowed_tools: Option<Vec<String>>,
     ) -> Result<Self> {
         Self::from_config_with_session_cwd_and_mcp_approval_mode(
             config,
@@ -1348,10 +1379,12 @@ impl Agent {
             sop_engine,
             sop_audit,
             None,
+            principal_allowed_tools,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn from_config_with_session_cwd_and_mcp_approval_mode(
         config: &Config,
         agent_alias: &str,
@@ -1363,6 +1396,12 @@ impl Agent {
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
         canvas_store: Option<tools::CanvasStore>,
+        // The caller principal's resolved profile tool allowlist
+        // (`ResolvedGrants.allowed_tools`), when the session is opened by a
+        // scoped principal. Composed into the agent's `SecurityPolicy` below so
+        // the grant is enforced at every tool-assembly filter. `None`/empty =>
+        // no principal restriction (parity with `ResolvedGrants::may_use_tool`).
+        principal_allowed_tools: Option<Vec<String>>,
     ) -> Result<Self> {
         let agent_cfg = config
             .agent(agent_alias)
@@ -1423,6 +1462,17 @@ impl Agent {
                 policy.workspace_dir = cwd.to_path_buf();
                 policy.allowed_roots.push(agent_workspace.clone());
             }
+            // Compose the caller principal's profile allowlist
+            // (`ResolvedGrants.allowed_tools`) into the agent's own
+            // `SecurityPolicy` allowlist so a scoped principal can only reach
+            // the tools its permission profile grants. This flows through every
+            // tool-assembly filter that consults `security` -- the built-in gate
+            // below, plus MCP registration and deferred/skill discovery -- so the
+            // grant cannot be bypassed by runtime tool activation.
+            policy.allowed_tools = compose_principal_tool_allowlist(
+                policy.allowed_tools.take(),
+                principal_allowed_tools.as_deref(),
+            );
             policy
         });
 
@@ -4665,6 +4715,58 @@ mod tests {
             result.is_ok(),
             "openai alias with requires_openai_auth should construct via Codex OAuth path: {}",
             result.err().unwrap()
+        );
+    }
+
+    #[test]
+    fn compose_principal_allowlist_empty_principal_is_no_op() {
+        // Empty/None principal list => the agent's own policy is unchanged
+        // (parity with ResolvedGrants::may_use_tool: empty = no restriction).
+        assert_eq!(super::compose_principal_tool_allowlist(None, None), None);
+        assert_eq!(
+            super::compose_principal_tool_allowlist(None, Some(&[])),
+            None
+        );
+        assert_eq!(
+            super::compose_principal_tool_allowlist(
+                Some(vec!["shell".into(), "file_read".into()]),
+                Some(&[]),
+            ),
+            Some(vec!["shell".into(), "file_read".into()]),
+        );
+    }
+
+    #[test]
+    fn compose_principal_allowlist_adopts_principal_when_agent_unrestricted() {
+        // Agent imposes no allowlist (None) => the principal's list becomes the
+        // effective allowlist.
+        assert_eq!(
+            super::compose_principal_tool_allowlist(None, Some(&["file_read".to_string()]),),
+            Some(vec!["file_read".to_string()]),
+        );
+    }
+
+    #[test]
+    fn compose_principal_allowlist_intersects_with_agent_restriction() {
+        // Both restrict => intersection; a tool the agent allows but the profile
+        // does not is dropped, and vice-versa. Disjoint => empty (deny-all).
+        assert_eq!(
+            super::compose_principal_tool_allowlist(
+                Some(vec![
+                    "shell".into(),
+                    "file_read".into(),
+                    "file_write".into()
+                ]),
+                Some(&["file_read".to_string(), "web_fetch".to_string()]),
+            ),
+            Some(vec!["file_read".to_string()]),
+        );
+        assert_eq!(
+            super::compose_principal_tool_allowlist(
+                Some(vec!["shell".to_string()]),
+                Some(&["file_read".to_string()]),
+            ),
+            Some(vec![]),
         );
     }
 

@@ -757,6 +757,20 @@ impl RpcDispatcher {
                         ),
                     )
                     .await;
+                } else if matches!(method, Method::SessionPrompt) {
+                    // A denied prompt NOTIFICATION must still emit a terminal
+                    // TurnComplete so the Zerocode TUI leaves `working` (it clears
+                    // only on TurnComplete), mirroring the ownership-denial path
+                    // in `handle_session_prompt`. Emitted only to this caller's
+                    // connection, so it never disturbs the session owner.
+                    if let Ok(p) = parse_params::<SessionPromptParams>(&req.params) {
+                        self.emit_turn_complete(
+                            &p.session_id,
+                            crate::rpc::types::TurnCompletionOutcome::Failed,
+                            "turn cancelled by daemon: forbidden".to_string(),
+                        )
+                        .await;
+                    }
                 }
                 return;
             }
@@ -802,7 +816,7 @@ impl RpcDispatcher {
             Method::SessionMessages => self.handle_session_messages(&req.params).await,
             Method::SessionState => self.handle_session_state(&req.params).await,
             Method::SessionDelete => self.handle_session_delete(&req.params).await,
-            Method::SessionApprove => self.handle_session_approve(&req.params),
+            Method::SessionApprove => self.handle_session_approve(&req.params).await,
             Method::SessionKill => self.handle_session_kill(&req.params).await,
 
             // Memory
@@ -1181,34 +1195,230 @@ impl RpcDispatcher {
             .map(|p| p.id.as_str())
     }
 
-    /// Deep check for session-scoped reads/mutations: admits the session
-    /// when unscoped, when the row carries this principal's id, or when the
-    /// row predates principal-keying (NULL column ⇒ legacy/shared row is
-    /// only visible to unscoped connections). Fail-closed on scoped access
-    /// to another principal's session.
-    fn authorize_session_access(
-        &self,
-        session_key_candidates: &[String],
-    ) -> Result<(), JsonRpcError> {
+    /// The caller principal's profile tool allowlist for a new session's tool
+    /// set (RFC #7141). `Some(list)` for a scoped (authenticated, non-admin)
+    /// principal whose profile names a non-empty `allowed_tools`; `None` for
+    /// the shared-operator sentinel, admin principals, and an empty profile
+    /// list -- i.e. no tool restriction (behaviour-neutral, parity with
+    /// [`ResolvedGrants::may_use_tool`]). The returned list is composed into the
+    /// session agent's `SecurityPolicy` so it is enforced at every tool-assembly
+    /// filter, not just the handful of handlers that check grants inline.
+    fn principal_tool_allowlist(&self) -> Option<Vec<String>> {
+        self.principal
+            .as_ref()
+            .filter(|p| p.is_authenticated() && !p.grants.admin)
+            .map(|p| p.grants.allowed_tools.clone())
+            .filter(|tools| !tools.is_empty())
+    }
+
+    /// The persisted key forms a bare session id may appear under in the unified
+    /// backend: raw (channel sessions), `rpc_` (RPC), and `gw_` (gateway).
+    fn session_key_candidates(session_id: &str) -> [String; 3] {
+        [
+            session_id.to_string(),
+            format!("rpc_{session_id}"),
+            format!("gw_{session_id}"),
+        ]
+    }
+
+    /// Whether `session_id` positively resolves, in the unified `session_backend`,
+    /// to a session owned by `scope`. Returns `false` when the session is unknown
+    /// (never existed or was deleted) or owned by another principal -- the
+    /// fail-closed default used to gate access to an EXISTING resource.
+    fn session_owned_by(&self, session_id: &str, scope: &str) -> bool {
+        self.chat_session_ownership(session_id, scope) == Some(true)
+    }
+
+    /// Ownership of a chat session in the unified `session_backend`:
+    /// `None` = the id is not present under any candidate key, `Some(true)` =
+    /// present and every present candidate is owned by `scope`, `Some(false)` =
+    /// present but at least one candidate is owned by another principal (or has a
+    /// NULL owner). ALL candidate key forms (`raw`, `rpc_`, `gw_`) are evaluated,
+    /// not just the first match: the mutating handlers act on every candidate, so
+    /// a raw/`rpc_` collision owned by different principals must fail closed
+    /// rather than authorize on whichever key happens to resolve first. This also
+    /// distinguishes "absent" from "present-but-foreign" for the cross-store
+    /// collision guard.
+    fn chat_session_ownership(&self, session_id: &str, scope: &str) -> Option<bool> {
+        let backend = self.ctx.session_backend.as_ref()?;
+        let mut any_present = false;
+        for key in Self::session_key_candidates(session_id) {
+            if let Some(meta) = backend.get_session_metadata(&key) {
+                any_present = true;
+                if meta.principal_id.as_deref() != Some(scope) {
+                    return Some(false);
+                }
+            }
+        }
+        any_present.then_some(true)
+    }
+
+    /// Fail-closed owner check for accessing an EXISTING resource keyed by a
+    /// session id (a persisted memory row's `session_id`). Unlike creation, which
+    /// may admit an *unknown* session so `session/new` can stamp ownership on
+    /// first use, this DENIES a scoped principal whenever ownership cannot be
+    /// positively proven: an orphaned session id (metadata deleted) or one that
+    /// never existed must not expose its rows. Admin/unscoped are unrestricted.
+    fn authorize_owned_session_strict(&self, session_id: &str) -> Result<(), JsonRpcError> {
         let Some(scope) = self.principal_scope() else {
             return Ok(());
         };
-        let Some(ref backend) = self.ctx.session_backend else {
+        if self.session_owned_by(session_id, scope) {
+            Ok(())
+        } else {
+            Err(rpc_err(
+                FORBIDDEN,
+                "resource is not owned by the authenticated principal",
+            ))
+        }
+    }
+
+    /// Restrict a set of memory rows to what the caller principal may see
+    /// (RFC #7141 F3): session-less rows are shared, session-scoped rows are
+    /// visible only to the owner of that session. This is the fail-closed
+    /// backstop for `memory/list` and `memory/search`, whose backend query
+    /// returns rows from ALL sessions when no `session_id` is supplied -- without
+    /// it, a scoped principal that omits `session_id` would read every
+    /// principal's session-scoped memory. Admin/unscoped connections keep full
+    /// visibility (behaviour-neutral).
+    fn filter_owned_memory(
+        &self,
+        entries: Vec<zeroclaw_api::memory_traits::MemoryEntry>,
+    ) -> Vec<zeroclaw_api::memory_traits::MemoryEntry> {
+        let Some(scope) = self.principal_scope().map(str::to_string) else {
+            return entries;
+        };
+        entries
+            .into_iter()
+            .filter(|e| match e.session_id.as_deref() {
+                None => true,
+                Some(sid) => self.session_owned_by(sid, &scope),
+            })
+            .collect()
+    }
+
+    /// Authorize access to an ACP session by its stored owner (RFC #7141 F2).
+    /// ACP sessions live in a dedicated store (`acp-sessions.db`), not the
+    /// unified `session_backend`, so [`Self::chat_session_ownership`] cannot see
+    /// them; this is their equivalent check. Fail-closed for a scoped principal
+    /// on another principal's session or a NULL-owner legacy row (visible only to
+    /// unscoped connections); admins/sentinel see all.
+    fn authorize_acp_owner(&self, owner: Option<&str>) -> Result<(), JsonRpcError> {
+        let Some(scope) = self.principal_scope() else {
             return Ok(());
         };
-        for key in session_key_candidates {
-            if let Some(meta) = backend.get_session_metadata(key) {
-                return match meta.principal_id.as_deref() {
-                    Some(owner) if owner == scope => Ok(()),
-                    _ => Err(rpc_err(
-                        FORBIDDEN,
-                        "session is not owned by the authenticated principal",
-                    )),
-                };
-            }
+        match owner {
+            Some(o) if o == scope => Ok(()),
+            _ => Err(rpc_err(
+                FORBIDDEN,
+                "ACP session is not owned by the authenticated principal",
+            )),
         }
-        // Unknown session: nothing to protect yet (creation stamps ownership).
-        Ok(())
+    }
+
+    /// Ownership of an ACP session in the dedicated store (looked up off-thread):
+    /// `None` = absent, `Some(true)` = owned by `scope`, `Some(false)` = present
+    /// but a NULL/foreign owner. Same tri-state shape as
+    /// [`Self::chat_session_ownership`] so the gate can tell "absent" from
+    /// "present-but-foreign".
+    async fn acp_session_ownership(
+        &self,
+        session_id: &str,
+        scope: &str,
+    ) -> Result<Option<bool>, JsonRpcError> {
+        let Some(store) = self.ctx.acp_session_store.clone() else {
+            return Ok(None);
+        };
+        let uuid = session_id.to_string();
+        let owner = tokio::task::spawn_blocking(move || store.session_principal(&uuid))
+            .await
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("ACP owner lookup task failed: {e}")))?
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("ACP owner lookup failed: {e}")))?;
+        Ok(match owner {
+            None => None,
+            Some(None) => Some(false),
+            Some(Some(o)) => Some(o == scope),
+        })
+    }
+
+    /// Resolve a scoped principal's ownership of a bare session id across BOTH
+    /// stores as `(chat, acp)` tri-states (`None` absent / `Some(true)` owned /
+    /// `Some(false)` present-but-foreign). The single source of truth for every
+    /// session-id ownership decision (access and creation), so the two gates
+    /// below cannot diverge on the cross-store collision case.
+    async fn resolve_session_ownership(
+        &self,
+        session_id: &str,
+        scope: &str,
+    ) -> Result<(Option<bool>, Option<bool>), JsonRpcError> {
+        let chat = self.chat_session_ownership(session_id, scope);
+        let acp = self.acp_session_ownership(session_id, scope).await?;
+        Ok((chat, acp))
+    }
+
+    /// The one shared per-session ownership gate for accessing an EXISTING
+    /// session by id (RFC #7141 F2): prompt, close, configure, cancel,
+    /// git_branch, kill, delete, messages, state. A bare session id could name a
+    /// row in the unified `session_backend`, the dedicated ACP store, or (via a
+    /// crafted collision) both, and a handler may touch either store -- so a
+    /// scoped principal is admitted only when EVERY store that holds the id
+    /// records them as owner, and at least one store holds it. Present-but-
+    /// foreign in any store, an orphaned/NULL owner, a backend that cannot record
+    /// ownership (e.g. `jsonl`), or an id absent everywhere all FAIL CLOSED. It is
+    /// deliberately stricter than [`Self::authorize_session_new_id`], whose
+    /// absent-is-ok exception is only sound for `session/new` creation.
+    /// Unscoped/admin connections are unrestricted (behaviour-neutral).
+    async fn authorize_session_owner(&self, session_id: &str) -> Result<(), JsonRpcError> {
+        let Some(scope) = self.principal_scope().map(str::to_string) else {
+            return Ok(());
+        };
+        match self.resolve_session_ownership(session_id, &scope).await? {
+            // Present and owned by another principal in ANY store the handler
+            // could reach => deny (this is the cross-store collision guard).
+            (Some(false), _) | (_, Some(false)) => Err(rpc_err(
+                FORBIDDEN,
+                "session is not owned by the authenticated principal",
+            )),
+            // Owned in at least one store, foreign in none => admit.
+            (Some(true), _) | (_, Some(true)) => Ok(()),
+            // Absent from every store => fail closed.
+            (None, None) => Err(rpc_err(
+                FORBIDDEN,
+                "session is not owned by the authenticated principal",
+            )),
+        }
+    }
+
+    /// Ownership gate for `session/new` with an explicit `session_id` (RFC #7141
+    /// F2). Same cross-store resolution as [`Self::authorize_session_owner`], but
+    /// with the creation exception: an id ABSENT from every store is a legitimate
+    /// create-with-id and is admitted (it is stamped to the caller below). Only a
+    /// session ANOTHER principal already owns in either store is denied -- so a
+    /// scoped principal can neither resume a foreign session nor forge a live
+    /// session colliding with a foreign ACP/chat id. Unscoped/admin are
+    /// unrestricted.
+    ///
+    /// Returns whether the caller must RESERVE the live id (`true` only for a
+    /// scoped principal creating a genuinely-new id): persisted ownership isn't
+    /// stamped until after the live session is inserted, so without an
+    /// insert-if-absent reservation two concurrent creates of the same id would
+    /// both pass this gate and the second would overwrite the first's live
+    /// session. A resume of an owned session (or an unscoped caller) replaces its
+    /// own live state and needs no reservation.
+    async fn authorize_session_new_id(&self, session_id: &str) -> Result<bool, JsonRpcError> {
+        let Some(scope) = self.principal_scope().map(str::to_string) else {
+            return Ok(false);
+        };
+        match self.resolve_session_ownership(session_id, &scope).await? {
+            (Some(false), _) | (_, Some(false)) => Err(rpc_err(
+                FORBIDDEN,
+                "session id is owned by another principal",
+            )),
+            // Absent from every store: a create -> reserve the live id.
+            (None, None) => Ok(true),
+            // Owned by the caller: a resume -> replacing own live state is fine.
+            _ => Ok(false),
+        }
     }
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
@@ -1228,13 +1438,24 @@ impl RpcDispatcher {
         let session_id = req
             .session_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        if resuming {
-            self.authorize_session_access(&[
-                session_id.clone(),
-                format!("rpc_{session_id}"),
-                format!("gw_{session_id}"),
-            ])?;
-        }
+        // An explicit `session_id` may name an existing session in EITHER store,
+        // or (via a crafted collision) a foreign row in the other store. Before
+        // we read any workspace/history or construct + insert a live session
+        // under this id, prove the caller may claim it (RFC #7141 F2): resuming a
+        // session it owns and creating a brand-new id are allowed; a session
+        // ANOTHER principal owns in the unified backend OR the ACP store is
+        // denied -- regardless of the requested chat_mode -- so a scoped
+        // principal can never force a cross-store id collision or overwrite
+        // another principal's live session. Metadata-only, so there is no
+        // side-effect path over another principal's row. The returned flag says
+        // whether the live id must be reserved (a scoped create-with-id) so a
+        // concurrent create cannot overwrite the live session before ownership is
+        // stamped below.
+        let reserve_live_id = if resuming {
+            self.authorize_session_new_id(&session_id).await?
+        } else {
+            false
+        };
 
         let config = self.ctx.config.read().clone();
         let chat_mode = req
@@ -1303,6 +1524,9 @@ impl RpcDispatcher {
             tui_env,
             self.ctx.sop_engine.clone(),
             self.ctx.sop_audit.clone(),
+            // Scope this session's tool set to the opening principal's profile
+            // allowlist (RFC #7141 F1) -- enforced in the agent's SecurityPolicy.
+            self.principal_tool_allowlist(),
         )
         .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to create agent: {e}")))?;
@@ -1316,15 +1540,30 @@ impl RpcDispatcher {
         ));
         agent.channel_handles().register_channel("rpc", approval_ch);
 
-        self.ctx
-            .sessions
-            .insert(
-                session_id.clone(),
-                super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
-                    .with_owner(self.tui_id.clone()),
-            )
-            .await
-            .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))?;
+        let rpc_session =
+            super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
+                .with_owner(self.tui_id.clone());
+        // A scoped create reserves the live id (insert-if-absent) so a concurrent
+        // create of the same id cannot overwrite this session before its
+        // ownership is stamped; a resume replaces its own live state (F2).
+        let insert_result = if reserve_live_id {
+            self.ctx
+                .sessions
+                .insert_if_absent(session_id.clone(), rpc_session)
+                .await
+        } else {
+            self.ctx
+                .sessions
+                .insert(session_id.clone(), rpc_session)
+                .await
+        };
+        insert_result.map_err(|e| match e {
+            "session id already in use" => rpc_err(
+                FORBIDDEN,
+                "session id is already in use by another live session",
+            ),
+            _ => rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"),
+        })?;
 
         if let Some(ref tui_id) = self.tui_id {
             let evicted = self
@@ -1404,13 +1643,22 @@ impl RpcDispatcher {
                     let sid = session_id.clone();
                     let alias = req.agent_alias.clone();
                     let cwd_owned = cwd.clone();
+                    // Stamp the creating principal's scope as the ACP session
+                    // owner, mirroring the Chat path's `set_session_principal`
+                    // (RFC #7141 F2). `None` for an unscoped/admin connection.
+                    let owner = self.principal_scope().map(|s| s.to_string());
                     tokio::task::spawn_blocking(move || -> anyhow::Result<AcpSessionNewLoad> {
                         match store_cloned.load_session_for_restore(&sid)? {
                             zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(
                                 data,
                             ) => Ok(AcpSessionNewLoad::Restored(data)),
                             zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing => {
-                                store_cloned.create_session(&sid, &alias, &cwd_owned)?;
+                                store_cloned.create_session(
+                                    &sid,
+                                    &alias,
+                                    &cwd_owned,
+                                    owner.as_deref(),
+                                )?;
                                 Ok(AcpSessionNewLoad::Created)
                             }
                             zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed => {
@@ -1422,6 +1670,10 @@ impl RpcDispatcher {
                 };
                 match loaded {
                     Ok(Ok(AcpSessionNewLoad::Restored(data))) => {
+                        // Ownership was already proven by the metadata-only owner
+                        // check above (which runs before this load and before
+                        // agent construction), so a foreign resume never reaches
+                        // here -- no re-check needed (RFC #7141 F2).
                         message_count = data.messages.len();
                         self.ctx
                             .sessions
@@ -1476,8 +1728,31 @@ impl RpcDispatcher {
                 if let Some(ref backend) = self.ctx.session_backend {
                     let session_key = format!("rpc_{session_id}");
                     let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
-                    if let Some(scope) = self.principal_scope() {
-                        let _ = backend.set_session_principal(&session_key, scope);
+                    if let Some(scope) = self.principal_scope().map(str::to_string) {
+                        // A scoped principal's session MUST carry a provable
+                        // owner. Stamp, then confirm the backend actually
+                        // recorded it: a backend that cannot (e.g. `jsonl`, whose
+                        // `set_session_principal` is a no-op) would leave the
+                        // session unauthenticatable and let another principal
+                        // resume it. Fail the creation -- and skip the history
+                        // load below -- rather than mint an unowned scoped
+                        // session (RFC #7141 F2).
+                        let _ = backend.set_session_principal(&session_key, &scope);
+                        let stamped = backend
+                            .get_session_metadata(&session_key)
+                            .and_then(|m| m.principal_id)
+                            .is_some_and(|owner| owner == scope);
+                        if !stamped {
+                            if let Some(ref hooks) = self.ctx.hooks {
+                                hooks.fire_session_end(&session_id, "rpc").await;
+                            }
+                            self.ctx.sessions.remove(&session_id).await;
+                            return Err(rpc_err(
+                                INTERNAL_ERROR,
+                                "session backend cannot record session ownership; a \
+                                 principal-capable backend is required for authenticated sessions",
+                            ));
+                        }
                     }
                     let stored = backend.load(&session_key);
                     if !stored.is_empty() {
@@ -1502,6 +1777,8 @@ impl RpcDispatcher {
 
     async fn handle_session_close(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        // A scoped principal may only close a session it owns (RFC #7141 F2).
+        self.authorize_session_owner(&req.session_id).await?;
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -1570,6 +1847,10 @@ impl RpcDispatcher {
     async fn handle_session_kill(&self, params: &Value) -> RpcResult {
         let req: SessionKillParams = parse_params(params)?;
         let sid = &req.session_id;
+
+        // A scoped principal may only kill a session it owns -- whether it lives
+        // in the unified backend or the dedicated ACP store (RFC #7141 F2).
+        self.authorize_session_owner(sid).await?;
 
         let chat_mode = self
             .ctx
@@ -1735,6 +2016,9 @@ impl RpcDispatcher {
             tui_env,
             self.ctx.sop_engine.clone(),
             self.ctx.sop_audit.clone(),
+            // Rehydrated ACP session: re-apply the resuming principal's tool
+            // allowlist so recovery cannot widen the grant (RFC #7141 F1).
+            self.principal_tool_allowlist(),
         )
         .await
         .ok()?;
@@ -1788,6 +2072,25 @@ impl RpcDispatcher {
     async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
         let req: SessionPromptParams = parse_params(params)?;
         let sid = &req.session_id;
+
+        // Ownership first: a scoped principal must not drive another principal's
+        // session (RFC #7141 F2). This gate runs before any live-store access or
+        // reaped-ACP rehydrate (`rehydrate_reaped_session`), so it also protects
+        // the durable ACP transcript that rehydrate would otherwise load. The TUI
+        // sends session/prompt as a notification and only leaves the `working`
+        // state on a TurnComplete, so on denial emit an attributed terminal
+        // failure to THIS caller first (mirroring the reaped-session path below);
+        // `emit_turn_complete` targets only the caller's own connection, so it
+        // never disturbs the owner's session.
+        if let Err(e) = self.authorize_session_owner(sid).await {
+            self.emit_turn_complete(
+                sid,
+                crate::rpc::types::TurnCompletionOutcome::Failed,
+                "turn cancelled by daemon: forbidden".to_string(),
+            )
+            .await;
+            return Err(e);
+        }
 
         // Reject blank turns at the RPC boundary. A turn must carry SOMETHING
         // — either prose or an attachment — for the agent to act on. Letting
@@ -2245,6 +2548,8 @@ impl RpcDispatcher {
 
     async fn handle_session_configure(&self, params: &Value) -> RpcResult {
         let req: SessionConfigureParams = parse_params(params)?;
+        // A scoped principal may only reconfigure a session it owns (F2).
+        self.authorize_session_owner(&req.session_id).await?;
 
         let merged = self
             .ctx
@@ -2334,6 +2639,9 @@ impl RpcDispatcher {
 
     async fn handle_session_cancel(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        // A scoped principal may only cancel a turn on a session it owns (F2).
+        // (The tui-id check below is transport ownership, not principal owner.)
+        self.authorize_session_owner(&req.session_id).await?;
         let owner = self
             .ctx
             .sessions
@@ -2397,6 +2705,8 @@ impl RpcDispatcher {
 
     async fn handle_session_git_branch(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        // A scoped principal may only read the workspace of a session it owns (F2).
+        self.authorize_session_owner(&req.session_id).await?;
         let cwd = self
             .ctx
             .sessions
@@ -2485,8 +2795,18 @@ impl RpcDispatcher {
             .list_sessions()
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("acp session list failed: {e}")))?;
 
+        // Restrict the picker to the caller principal's own ACP sessions
+        // (RFC #7141 F2): a scoped principal sees only rows it owns; NULL-owner
+        // and other principals' rows are hidden. Unscoped/admin connections see
+        // all rows (today's behaviour). Same ownership rule as
+        // [`Self::authorize_acp_owner`], applied as a filter for a list.
+        let scope = self.principal_scope();
         let sessions: Vec<SessionEntry> = summaries
             .into_iter()
+            .filter(|s| match scope {
+                None => true,
+                Some(scope) => s.principal_id.as_deref() == Some(scope),
+            })
             .map(|s| SessionEntry {
                 session_id: s.session_uuid.clone(),
                 // ACP sessions are keyed by their UUID directly — no `rpc_`/`gw_`
@@ -2514,14 +2834,12 @@ impl RpcDispatcher {
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
 
+        // Reading a persisted transcript is existing-session access, so it must
+        // fail closed on an unresolved owner (F2), unlike creation.
+        self.authorize_session_owner(&req.session_id).await?;
         // Try the raw id first (channel sessions store as-is), then
         // prefixed variants for RPC/gateway-originated sessions.
-        let candidates = [
-            req.session_id.clone(),
-            format!("rpc_{}", req.session_id),
-            format!("gw_{}", req.session_id),
-        ];
-        self.authorize_session_access(&candidates)?;
+        let candidates = Self::session_key_candidates(&req.session_id);
         let mut raw: Vec<zeroclaw_api::model_provider::ChatMessage> = Vec::new();
         for key in &candidates {
             let loaded = backend.load(key);
@@ -2565,6 +2883,12 @@ impl RpcDispatcher {
         {
             match store.load_session(&req.session_id) {
                 Ok(Some(data)) => {
+                    // ACP sessions live outside `session_backend`, so the
+                    // `authorize_session_access` gate above passed vacuously for
+                    // them. Enforce ownership on the ACP row before replaying
+                    // its transcript (RFC #7141 F2) -- a scoped principal must
+                    // not read another principal's (or a NULL-owner) session.
+                    self.authorize_acp_owner(data.principal_id.as_deref())?;
                     raw = data
                         .messages
                         .into_iter()
@@ -2630,12 +2954,10 @@ impl RpcDispatcher {
             .session_backend
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
-        let candidates = [
-            req.session_id.clone(),
-            format!("rpc_{}", req.session_id),
-            format!("gw_{}", req.session_id),
-        ];
-        self.authorize_session_access(&candidates)?;
+        // Reading live session state is existing-session access -> fail closed on
+        // an unresolved owner for a scoped principal (F2).
+        self.authorize_session_owner(&req.session_id).await?;
+        let candidates = Self::session_key_candidates(&req.session_id);
         for key in &candidates {
             match backend.get_session_state(key) {
                 Ok(Some(ss)) => {
@@ -2658,13 +2980,18 @@ impl RpcDispatcher {
         Err(rpc_err(SESSION_NOT_FOUND, "Session not found"))
     }
 
+    /// `session/delete` closes the live session and removes its rows from the
+    /// unified `session_backend`. It deliberately does NOT drop a durable ACP
+    /// transcript (`acp-sessions.db`): ACP history is long-lived user data that
+    /// survives restarts, and is retired only by `session/kill` (which
+    /// tombstones the durable row). So delete of an ACP-only session returns
+    /// `deleted: true` for the live/backend view while the durable transcript
+    /// persists and remains resumable -- by design.
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
-        self.authorize_session_access(&[
-            req.session_id.clone(),
-            format!("rpc_{}", req.session_id),
-            format!("gw_{}", req.session_id),
-        ])?;
+        // A scoped principal may only delete a session it owns, across both the
+        // unified backend and the dedicated ACP store (RFC #7141 F2).
+        self.authorize_session_owner(&req.session_id).await?;
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -2678,11 +3005,7 @@ impl RpcDispatcher {
         }
         // Remove from persistent backend — try raw id, then prefixed variants.
         if let Some(ref backend) = self.ctx.session_backend {
-            for key in &[
-                req.session_id.clone(),
-                format!("rpc_{}", req.session_id),
-                format!("gw_{}", req.session_id),
-            ] {
+            for key in &Self::session_key_candidates(&req.session_id) {
                 let _ = backend.delete_session(key);
             }
         }
@@ -2692,8 +3015,18 @@ impl RpcDispatcher {
         })
     }
 
-    fn handle_session_approve(&self, params: &Value) -> RpcResult {
+    async fn handle_session_approve(&self, params: &Value) -> RpcResult {
         let p: SessionApproveParams = parse_params(params)?;
+
+        // Authorize the approver against the OWNER of the session the approval
+        // was raised for -- bound to the request at registration -- not the
+        // client-supplied `session_id` or the bare `request_id` (RFC #7141 F2).
+        // Without this, a scoped principal that observed another principal's
+        // `request_id` could approve a tool call in that principal's session.
+        // An unknown/expired request resolves to a harmless no-op below.
+        if let Some(session_id) = self.ctx.approval_pending.session_for(&p.request_id) {
+            self.authorize_session_owner(&session_id).await?;
+        }
 
         let response = match p.decision.as_str() {
             "allow_once" => zeroclaw_api::channel::ChannelApprovalResponse::Approve,
@@ -2729,12 +3062,10 @@ impl RpcDispatcher {
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryListParams = parse_params(params)?;
+        // Explicit session scope must be owned; an omitted scope is caught by the
+        // fail-closed post-filter below (the backend returns all sessions' rows).
         if let Some(ref sid) = req.session_id {
-            self.authorize_session_access(&[
-                sid.clone(),
-                format!("rpc_{sid}"),
-                format!("gw_{sid}"),
-            ])?;
+            self.authorize_owned_session_strict(sid)?;
         }
         let category = req
             .category
@@ -2744,6 +3075,7 @@ impl RpcDispatcher {
             .list(category.as_ref(), req.session_id.as_deref())
             .await
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory list failed: {e}")))?;
+        let entries = self.filter_owned_memory(entries);
         let count = entries.len();
         let entries = truncate_memory_previews(entries);
         to_result(MemoryListResult { entries, count })
@@ -2756,6 +3088,11 @@ impl RpcDispatcher {
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemorySearchParams = parse_params(params)?;
+        // Explicit session scope must be owned; an omitted scope is caught by the
+        // fail-closed post-filter below (recall returns all sessions' rows).
+        if let Some(ref sid) = req.session_id {
+            self.authorize_owned_session_strict(sid)?;
+        }
         let entries = mem
             .recall(
                 &req.query,
@@ -2766,6 +3103,7 @@ impl RpcDispatcher {
             )
             .await
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory search failed: {e}")))?;
+        let entries = self.filter_owned_memory(entries);
         let count = entries.len();
         let entries = truncate_memory_previews(entries);
         to_result(MemorySearchResult { entries, count })
@@ -2787,7 +3125,16 @@ impl RpcDispatcher {
             .await
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory get failed: {e}")))?;
         match entry {
-            Some(e) => to_result(MemoryGetResult { entry: Some(e) }),
+            Some(e) => {
+                // Key-based reads must still honor session ownership: a scoped
+                // principal may only read an entry whose owning session it owns.
+                // Fail closed if the owner cannot be resolved (orphaned row).
+                // Session-less (global) entries carry no per-principal secret.
+                if let Some(ref sid) = e.session_id {
+                    self.authorize_owned_session_strict(sid)?;
+                }
+                to_result(MemoryGetResult { entry: Some(e) })
+            }
             None => Err(rpc_err(
                 INTERNAL_ERROR,
                 format!("Memory key `{}` not found", req.key),
@@ -2802,6 +3149,11 @@ impl RpcDispatcher {
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryStoreParams = parse_params(params)?;
+        // A scoped principal may only write session-scoped memory into a session
+        // it owns; fail closed on an unknown/foreign session id.
+        if let Some(ref sid) = req.session_id {
+            self.authorize_owned_session_strict(sid)?;
+        }
         let category = req
             .category
             .as_deref()
@@ -2823,6 +3175,17 @@ impl RpcDispatcher {
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryDeleteParams = parse_params(params)?;
+        // Authorize on the owning session before deleting by key (mirror get):
+        // a scoped principal may only delete an entry whose session it owns, and
+        // fail closed if that ownership cannot be resolved (orphaned row).
+        if let Some(existing) = mem
+            .get(&req.key)
+            .await
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory delete failed: {e}")))?
+            && let Some(ref sid) = existing.session_id
+        {
+            self.authorize_owned_session_strict(sid)?;
+        }
         mem.forget(&req.key)
             .await
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory delete failed: {e}")))?;
@@ -5200,15 +5563,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn session_approve_resolves_pending_request() {
+    #[tokio::test]
+    async fn session_approve_resolves_pending_request() {
         let dispatcher = make_approval_test_dispatcher();
         let (tx, mut rx) =
             tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
         dispatcher
             .ctx
             .approval_pending
-            .insert("req-allow".to_string(), tx);
+            .insert("req-allow".to_string(), "sess-1".to_string(), tx);
 
         let result = dispatcher
             .handle_session_approve(&json!({
@@ -5216,6 +5579,7 @@ mod tests {
                 "request_id": "req-allow",
                 "decision": "allow_once"
             }))
+            .await
             .unwrap();
 
         assert_eq!(result["session_id"], "sess-1");
@@ -5228,8 +5592,8 @@ mod tests {
         assert!(!dispatcher.ctx.approval_pending.contains("req-allow"));
     }
 
-    #[test]
-    fn session_approve_unknown_request_is_acknowledged_noop() {
+    #[tokio::test]
+    async fn session_approve_unknown_request_is_acknowledged_noop() {
         let dispatcher = make_approval_test_dispatcher();
 
         let result = dispatcher
@@ -5238,12 +5602,74 @@ mod tests {
                 "request_id": "timed-out-req",
                 "decision": "allow_once"
             }))
+            .await
             .unwrap();
 
         assert_eq!(result["session_id"], "sess-1");
         assert_eq!(result["request_id"], "timed-out-req");
         assert_eq!(result["acknowledged"], true);
         assert!(!dispatcher.ctx.approval_pending.contains("timed-out-req"));
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_cannot_approve_foreign_session_request() {
+        // RFC #7141 F2: session/approve resolves by request_id, but the approval
+        // is bound to its originating session at registration. A scoped principal
+        // may only approve a request for a session it owns -- a leaked/observed
+        // request_id from another principal's session must not let it approve
+        // (or reject) that principal's tool call.
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, _sessions, _chat_backend, _acp) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        // Alice owns a session; an approval is raised for it and bound to it.
+        dispatcher.principal = Some(scoped_principal("alice"));
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "appr-sess",
+            }))
+            .await
+            .expect("session/new");
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<ChannelApprovalResponse>();
+        dispatcher
+            .ctx
+            .approval_pending
+            .insert("req-x".to_string(), "appr-sess".to_string(), tx);
+
+        // Mallory (foreign) is denied, and the pending request is left intact.
+        dispatcher.principal = Some(scoped_principal("mallory"));
+        let denied = dispatcher
+            .handle_session_approve(&json!({
+                "session_id": "appr-sess",
+                "request_id": "req-x",
+                "decision": "allow_once"
+            }))
+            .await;
+        assert_eq!(
+            denied.unwrap_err().code,
+            FORBIDDEN,
+            "foreign approval must deny"
+        );
+        assert!(
+            dispatcher.ctx.approval_pending.contains("req-x"),
+            "a denied approval must not resolve the pending request"
+        );
+
+        // The owner may approve it.
+        dispatcher.principal = Some(scoped_principal("alice"));
+        dispatcher
+            .handle_session_approve(&json!({
+                "session_id": "appr-sess",
+                "request_id": "req-x",
+                "decision": "allow_once"
+            }))
+            .await
+            .expect("owner approval must succeed");
+        assert_eq!(rx.try_recv().unwrap(), ChannelApprovalResponse::Approve);
     }
 
     #[test]
@@ -5850,6 +6276,39 @@ mod tests {
             .await;
         let reply: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(reply["error"]["code"], FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn grant_denied_prompt_notification_emits_turn_complete_failed() {
+        // A scoped principal lacking the session grant sends `session/prompt` in
+        // NOTIFICATION form. The coarse grant gate denies it before the handler,
+        // but must still emit a TurnComplete::Failed to this caller so the
+        // Zerocode TUI leaves `working` (the no-hang contract that also covers
+        // the ownership-denial path in `handle_session_prompt`).
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(zeroclaw_config::schema::Config::default(), sessions);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.authenticated = true;
+        let mut principal = zeroclaw_api::principal::Principal::shared_operator();
+        principal.grants = zeroclaw_api::grants::ResolvedGrants::none();
+        dispatcher.principal = Some(principal);
+
+        dispatcher
+            .process_line_for_test(
+                r#"{"jsonrpc":"2.0","method":"session/prompt","params":{"session_id":"X","prompt":"hi"}}"#,
+            )
+            .await;
+
+        let raw = rx.try_recv().expect(
+            "grant-denied prompt notification must emit a TurnComplete so the TUI unblocks",
+        );
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], notification::SESSION_UPDATE);
+        assert_eq!(v["params"]["session_id"], "X");
+        assert_eq!(v["params"]["outcome"], "failed");
     }
 
     #[tokio::test]
@@ -6545,7 +7004,7 @@ mod tests {
         // unified `session_backend`, mirroring the production split.
         let sid = "acp-resume-7799";
         acp_store
-            .create_session(sid, "test-agent", "/tmp/ws")
+            .create_session(sid, "test-agent", "/tmp/ws", None)
             .expect("ACP session row");
         acp_store
             .append_turn(
@@ -7066,6 +7525,595 @@ mod tests {
             result["sessions"].as_array().unwrap().len(),
             2,
             "unscoped connection must see all sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_cannot_access_foreign_acp_session() {
+        // RFC #7141 F2: ACP sessions live in the dedicated store, not the
+        // unified backend, so they need their own ownership gate. A scoped
+        // principal must not see, read, kill, or delete another principal's
+        // ACP session; the owner and an unscoped connection may.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, _sessions, _chat_backend, acp) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        // Alice owns an ACP session in the dedicated store.
+        acp.create_session("acp-iso-001", "test-agent", "/ws/alice", Some("alice"))
+            .unwrap();
+
+        // Mallory (different scoped principal) is denied on every path.
+        dispatcher.principal = Some(scoped_principal("mallory"));
+        let list = dispatcher
+            .handle_session_list_acp(&json!({}))
+            .await
+            .unwrap();
+        assert!(
+            list["sessions"].as_array().unwrap().is_empty(),
+            "foreign ACP session must be hidden from the picker"
+        );
+        for (method, err) in [
+            (
+                "messages",
+                dispatcher
+                    .handle_session_messages(&json!({ "session_id": "acp-iso-001" }))
+                    .await,
+            ),
+            (
+                "kill",
+                dispatcher
+                    .handle_session_kill(&json!({ "session_id": "acp-iso-001" }))
+                    .await,
+            ),
+            (
+                "delete",
+                dispatcher
+                    .handle_session_delete(&json!({ "session_id": "acp-iso-001" }))
+                    .await,
+            ),
+        ] {
+            assert_eq!(
+                err.unwrap_err().code,
+                FORBIDDEN,
+                "foreign ACP {method} must deny"
+            );
+        }
+
+        // Alice (owner) sees only her session in the picker.
+        dispatcher.principal = Some(scoped_principal("alice"));
+        let list = dispatcher
+            .handle_session_list_acp(&json!({}))
+            .await
+            .unwrap();
+        let ids: Vec<String> = list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["session_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["acp-iso-001".to_string()],
+            "owner must see its own ACP session"
+        );
+
+        // An unscoped (shared-operator) connection sees all ACP sessions.
+        dispatcher.principal = Some(zeroclaw_api::principal::Principal::shared_operator());
+        let list = dispatcher
+            .handle_session_list_acp(&json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            list["sessions"].as_array().unwrap().len(),
+            1,
+            "unscoped connection must see all ACP sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_denied_on_foreign_session_handlers() {
+        // RFC #7141 F2: every session-id handler that reads or mutates live
+        // session state must reject a scoped principal that does not own the
+        // session -- above all session/prompt, which would otherwise let one
+        // principal DRIVE another's session (chat or a reaped ACP transcript).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, _sessions, _chat_backend, acp) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        // Alice owns a chat session (stamped via session/new) and a durable ACP
+        // session (present in the store, not live -> the reaped-rehydrate path).
+        dispatcher.principal = Some(scoped_principal("alice"));
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "chat-s",
+            }))
+            .await
+            .expect("session/new");
+        acp.create_session("acp-s", "test-agent", "/ws/alice", Some("alice"))
+            .unwrap();
+
+        // Mallory is denied on every session-id handler.
+        dispatcher.principal = Some(scoped_principal("mallory"));
+        let cases = [
+            (
+                "prompt",
+                dispatcher
+                    .handle_session_prompt(&json!({ "session_id": "chat-s", "prompt": "hi" }))
+                    .await,
+            ),
+            (
+                "close",
+                dispatcher
+                    .handle_session_close(&json!({ "session_id": "chat-s" }))
+                    .await,
+            ),
+            (
+                "configure",
+                dispatcher
+                    .handle_session_configure(&json!({ "session_id": "chat-s" }))
+                    .await,
+            ),
+            (
+                "cancel",
+                dispatcher
+                    .handle_session_cancel(&json!({ "session_id": "chat-s" }))
+                    .await,
+            ),
+            (
+                "git_branch",
+                dispatcher
+                    .handle_session_git_branch(&json!({ "session_id": "chat-s" }))
+                    .await,
+            ),
+            (
+                "kill",
+                dispatcher
+                    .handle_session_kill(&json!({ "session_id": "chat-s" }))
+                    .await,
+            ),
+            (
+                "delete",
+                dispatcher
+                    .handle_session_delete(&json!({ "session_id": "chat-s" }))
+                    .await,
+            ),
+            (
+                // Reaped ACP prompt: denied BEFORE any rehydrate of the transcript.
+                "acp prompt",
+                dispatcher
+                    .handle_session_prompt(&json!({ "session_id": "acp-s", "prompt": "hi" }))
+                    .await,
+            ),
+        ];
+        for (what, result) in cases {
+            assert_eq!(
+                result.unwrap_err().code,
+                FORBIDDEN,
+                "foreign session {what} must deny"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_denied_when_backend_cannot_prove_ownership() {
+        // With no principal-capable backend (here: no session backend at all,
+        // modeling `jsonl`'s no-op ownership), a scoped principal cannot touch a
+        // session by id: the gate FAILS CLOSED rather than admitting on
+        // unresolved ownership. Unscoped/admin connections are unaffected.
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+
+        dispatcher.principal = Some(scoped_principal("mallory"));
+        for (what, result) in [
+            (
+                "prompt",
+                dispatcher
+                    .handle_session_prompt(&json!({ "session_id": "x", "prompt": "hi" }))
+                    .await,
+            ),
+            (
+                "close",
+                dispatcher
+                    .handle_session_close(&json!({ "session_id": "x" }))
+                    .await,
+            ),
+            (
+                "kill",
+                dispatcher
+                    .handle_session_kill(&json!({ "session_id": "x" }))
+                    .await,
+            ),
+            (
+                "delete",
+                dispatcher
+                    .handle_session_delete(&json!({ "session_id": "x" }))
+                    .await,
+            ),
+        ] {
+            assert_eq!(
+                result.unwrap_err().code,
+                FORBIDDEN,
+                "{what} must fail closed without a principal-capable backend"
+            );
+        }
+
+        // The gate is a no-op for an unscoped connection: it reaches the handler
+        // (which reports the session simply does not exist), never FORBIDDEN.
+        dispatcher.principal = Some(zeroclaw_api::principal::Principal::shared_operator());
+        let err = dispatcher
+            .handle_session_kill(&json!({ "session_id": "x" }))
+            .await
+            .unwrap_err();
+        assert_ne!(
+            err.code, FORBIDDEN,
+            "unscoped connection must not be blocked by the owner gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_cannot_create_session_colliding_with_foreign_acp_id() {
+        // RFC #7141 F2: a bare session id names a row in the unified backend OR
+        // the ACP store. session/new must reject an explicit id that ANOTHER
+        // principal already owns in EITHER store, regardless of chat_mode --
+        // before any construction/insert -- so a scoped principal can neither
+        // forge a cross-store collision nor overwrite another principal's session.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, _sessions, _chat_backend, acp) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        // Mallory owns an ACP session with bare id "X".
+        acp.create_session("X", "test-agent", "/ws/mallory", Some("mallory"))
+            .unwrap();
+
+        // Alice cannot create a (default/Chat mode) session under the same id.
+        dispatcher.principal = Some(scoped_principal("alice"));
+        let created = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "X",
+            }))
+            .await;
+        assert_eq!(
+            created.unwrap_err().code,
+            FORBIDDEN,
+            "creating a session colliding with a foreign ACP id must deny before insert"
+        );
+        // Mallory's ACP session is untouched.
+        assert_eq!(
+            acp.session_principal("X").unwrap(),
+            Some(Some("mallory".to_string())),
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_create_cannot_overwrite_live_unpersisted_session() {
+        // RFC #7141 F2 race guard: persisted ownership is stamped only AFTER the
+        // live session is inserted, so a concurrent create of the same id must
+        // not overwrite a live session before it is stamped. A scoped create
+        // reserves the live id (insert-if-absent).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, sessions, chat_backend, _acp) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        // Alice creates a live session "R".
+        dispatcher.principal = Some(scoped_principal("alice"));
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "R",
+            }))
+            .await
+            .expect("session/new");
+        let alice_agent = sessions
+            .get_agent("R")
+            .await
+            .expect("alice session is live");
+
+        // Simulate the pre-stamp window: the id is live in-memory but not
+        // resolvable in the persisted store (drop its metadata row).
+        let _ = chat_backend.delete_session("rpc_R");
+
+        // Mallory races a create of the same id: it passes the persisted gate
+        // (now absent) but the live-id reservation rejects it before it can
+        // overwrite Alice's live session.
+        dispatcher.principal = Some(scoped_principal("mallory"));
+        let raced = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "R",
+            }))
+            .await;
+        assert_eq!(
+            raced.unwrap_err().code,
+            FORBIDDEN,
+            "racing create of a live id must be rejected"
+        );
+
+        // Alice's live session is untouched (same agent handle).
+        let still = sessions
+            .get_agent("R")
+            .await
+            .expect("alice session still live");
+        assert!(
+            Arc::ptr_eq(&alice_agent, &still),
+            "the live session must not be overwritten by a racing create"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_denied_on_candidate_key_collision() {
+        // RFC #7141 F2: a bare id resolves across the raw / `rpc_` / `gw_`
+        // candidate keys, and mutating handlers act on ALL of them. When those
+        // candidates are owned by different principals, ownership must fail closed
+        // (not authorize on whichever key matches first), so Alice cannot delete a
+        // bare id whose `rpc_` form belongs to Mallory.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, _sessions, chat_backend, _acp) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        chat_backend
+            .append("Z", &ChatMessage::user("alice"))
+            .unwrap();
+        chat_backend.set_session_principal("Z", "alice").unwrap();
+        chat_backend
+            .append("rpc_Z", &ChatMessage::user("mallory"))
+            .unwrap();
+        chat_backend
+            .set_session_principal("rpc_Z", "mallory")
+            .unwrap();
+
+        // Alice owns the raw "Z" candidate, but "rpc_Z" is Mallory's -> deny,
+        // because deleting "Z" would remove Mallory's "rpc_Z" too.
+        dispatcher.principal = Some(scoped_principal("alice"));
+        assert_eq!(
+            dispatcher
+                .handle_session_delete(&json!({ "session_id": "Z" }))
+                .await
+                .unwrap_err()
+                .code,
+            FORBIDDEN,
+            "a candidate-key ownership collision must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_denied_on_cross_store_id_collision() {
+        // If a cross-store collision already exists (created out-of-band -- e.g.
+        // before this rule, or by an unscoped connection), the ACCESS gate denies
+        // BOTH principals (fail-closed), so ownership in one store never reaches
+        // the other's row. Build it by ordering: Alice creates chat "Y" (no ACP Y
+        // yet, so creation is allowed), then an ACP "Y" owned by Mallory is added
+        // to the store directly.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, _sessions, chat_backend, acp) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        dispatcher.principal = Some(scoped_principal("alice"));
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "Y",
+            }))
+            .await
+            .expect("session/new (no ACP collision yet)");
+        chat_backend
+            .append("rpc_Y", &ChatMessage::user("alice secret"))
+            .unwrap();
+        acp.create_session("Y", "test-agent", "/ws/mallory", Some("mallory"))
+            .unwrap();
+
+        // Mallory (ACP owner of Y) is denied on every handler that would reach
+        // Alice's chat Y.
+        dispatcher.principal = Some(scoped_principal("mallory"));
+        for (what, result) in [
+            (
+                "messages",
+                dispatcher
+                    .handle_session_messages(&json!({ "session_id": "Y" }))
+                    .await,
+            ),
+            (
+                "prompt",
+                dispatcher
+                    .handle_session_prompt(&json!({ "session_id": "Y", "prompt": "hi" }))
+                    .await,
+            ),
+            (
+                "delete",
+                dispatcher
+                    .handle_session_delete(&json!({ "session_id": "Y" }))
+                    .await,
+            ),
+        ] {
+            assert_eq!(
+                result.unwrap_err().code,
+                FORBIDDEN,
+                "cross-store collision {what} must deny"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_cannot_read_foreign_session_memory() {
+        // RFC #7141 F3: session-scoped memory is authorized on the OWNING
+        // session, not the caller's request. A scoped principal must not read
+        // or delete a memory entry bound to another principal's session; the
+        // owner may.
+        use zeroclaw_api::memory_traits::{Memory, MemoryCategory};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let chat_backend =
+            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let memory: Arc<dyn Memory> =
+            Arc::new(zeroclaw_memory::SqliteMemory::new("test-agent", &data_dir).unwrap());
+        let ctx = RpcContext::for_persistence_tests_with_memory(
+            config,
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+            Some(Arc::clone(&memory)),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+
+        // Alice owns a session; a memory entry is scoped to it.
+        dispatcher.principal = Some(scoped_principal("alice"));
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "mem-sess",
+            }))
+            .await
+            .expect("session/new should succeed");
+        assert_eq!(
+            chat_backend
+                .get_session_metadata("rpc_mem-sess")
+                .unwrap()
+                .principal_id
+                .as_deref(),
+            Some("alice"),
+        );
+        memory
+            .store(
+                "k-secret",
+                "alice private",
+                MemoryCategory::Custom("user".into()),
+                Some("mem-sess"),
+            )
+            .await
+            .expect("store memory scoped to alice's session");
+
+        // Mallory is denied on get and delete of the foreign-session entry.
+        dispatcher.principal = Some(scoped_principal("mallory"));
+        assert_eq!(
+            dispatcher
+                .handle_memory_get(&json!({ "key": "k-secret" }))
+                .await
+                .unwrap_err()
+                .code,
+            FORBIDDEN,
+            "foreign session-scoped memory get must deny"
+        );
+        assert_eq!(
+            dispatcher
+                .handle_memory_delete(&json!({ "key": "k-secret" }))
+                .await
+                .unwrap_err()
+                .code,
+            FORBIDDEN,
+            "foreign session-scoped memory delete must deny"
+        );
+
+        // The owner reads its own entry.
+        dispatcher.principal = Some(scoped_principal("alice"));
+        assert!(
+            dispatcher
+                .handle_memory_get(&json!({ "key": "k-secret" }))
+                .await
+                .is_ok(),
+            "owner must read its own session-scoped memory"
+        );
+
+        // Add a global (session-less) row and an orphaned session-scoped row
+        // (owning session never existed in the backend).
+        memory
+            .store(
+                "k-global",
+                "shared note",
+                MemoryCategory::Custom("user".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        memory
+            .store(
+                "k-orphan",
+                "orphan note",
+                MemoryCategory::Custom("user".into()),
+                Some("ghost-sess"),
+            )
+            .await
+            .unwrap();
+
+        // Mallory: a search that OMITS session_id must not leak Alice's or the
+        // orphaned session-scoped rows -- the backend returns all sessions, so the
+        // fail-closed post-filter is the only thing standing between them. Global
+        // rows stay visible.
+        dispatcher.principal = Some(scoped_principal("mallory"));
+        let res = dispatcher
+            .handle_memory_search(&json!({ "query": "*", "limit": 50 }))
+            .await
+            .unwrap();
+        let mut keys: Vec<String> = res["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["key"].as_str().unwrap().to_string())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["k-global".to_string()],
+            "scoped search without a session id must expose only global rows"
+        );
+        assert!(
+            dispatcher
+                .handle_memory_get(&json!({ "key": "k-global" }))
+                .await
+                .is_ok(),
+            "global (session-less) memory is shared"
+        );
+        assert_eq!(
+            dispatcher
+                .handle_memory_get(&json!({ "key": "k-orphan" }))
+                .await
+                .unwrap_err()
+                .code,
+            FORBIDDEN,
+            "an orphaned session-scoped row must fail closed for a scoped principal"
+        );
+
+        // An unscoped (shared-operator) connection keeps full visibility.
+        dispatcher.principal = Some(zeroclaw_api::principal::Principal::shared_operator());
+        assert!(
+            dispatcher
+                .handle_memory_get(&json!({ "key": "k-orphan" }))
+                .await
+                .is_ok(),
+            "unscoped/admin may read orphaned rows (behaviour-neutral)"
+        );
+        let res = dispatcher
+            .handle_memory_search(&json!({ "query": "*", "limit": 50 }))
+            .await
+            .unwrap();
+        assert!(
+            res["entries"].as_array().unwrap().len() >= 3,
+            "unscoped search must see all rows"
         );
     }
 
@@ -7991,6 +9039,65 @@ mod tests {
             "missing-session is not Completed and not Cancelled — it is a \
              distinct Failed verdict. Folding it into Cancelled would lie \
              about whether the user pressed Esc."
+        );
+    }
+
+    /// RED guard: a scoped principal's `session/prompt` for a session another
+    /// principal owns is DENIED (RFC #7141 F2), but must still emit a terminal
+    /// `TurnComplete::Failed` so the caller's TUI leaves `working` -- the auth
+    /// gate must not silently drop the turn the way an early error would.
+    #[tokio::test]
+    async fn scoped_foreign_prompt_emits_turn_complete_failed() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let chat_backend =
+            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+
+        // Alice owns session "P".
+        dispatcher.principal = Some(scoped_principal("alice"));
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "P",
+            }))
+            .await
+            .expect("session/new");
+        while rx.try_recv().is_ok() {} // drain any create-time notifications
+
+        // Mallory prompts Alice's session: denied, but a TurnComplete::Failed
+        // must be emitted so Mallory's TUI unblocks.
+        dispatcher.principal = Some(scoped_principal("mallory"));
+        let err = dispatcher
+            .handle_session_prompt(&json!({ "session_id": "P", "prompt": "hi" }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, FORBIDDEN, "foreign prompt must deny");
+
+        let mut saw_failed = false;
+        while let Ok(raw) = rx.try_recv() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+                && v["method"] == notification::SESSION_UPDATE
+                && v["params"]["session_id"] == "P"
+                && v["params"]["outcome"] == "failed"
+            {
+                saw_failed = true;
+            }
+        }
+        assert!(
+            saw_failed,
+            "a denied prompt must emit a TurnComplete::Failed so the TUI leaves `working`"
         );
     }
 

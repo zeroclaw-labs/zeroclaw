@@ -28,7 +28,12 @@ use super::tui_identity::TuiRegistry;
 /// handle_session_approve resolves it when the client sends session/approve.
 #[derive(Default)]
 pub struct ApprovalPendingMap {
-    inner: std::sync::Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>,
+    /// `request_id -> (originating session_id, responder)`. The session id binds
+    /// each in-flight approval to the session it was raised for, so
+    /// `session/approve` can be authorized against that session's owner
+    /// (RFC #7141 F2) instead of trusting a client-supplied `session_id` or the
+    /// bare `request_id`.
+    inner: std::sync::Mutex<HashMap<String, (String, oneshot::Sender<ChannelApprovalResponse>)>>,
 }
 
 pub struct PendingApproval {
@@ -55,9 +60,10 @@ impl ApprovalPendingMap {
     pub fn register(
         self: &Arc<Self>,
         request_id: String,
+        session_id: String,
         tx: oneshot::Sender<ChannelApprovalResponse>,
     ) -> PendingApproval {
-        self.insert(request_id.clone(), tx);
+        self.insert(request_id.clone(), session_id, tx);
         PendingApproval {
             map: Arc::clone(self),
             request_id,
@@ -65,24 +71,39 @@ impl ApprovalPendingMap {
         }
     }
 
-    pub fn insert(&self, request_id: String, tx: oneshot::Sender<ChannelApprovalResponse>) {
+    pub fn insert(
+        &self,
+        request_id: String,
+        session_id: String,
+        tx: oneshot::Sender<ChannelApprovalResponse>,
+    ) {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(request_id, tx);
+            .insert(request_id, (session_id, tx));
     }
 
     pub fn resolve(&self, request_id: &str, response: ChannelApprovalResponse) -> bool {
-        let tx = self
+        let entry = self
             .inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(request_id);
-        if let Some(tx) = tx {
+        if let Some((_session_id, tx)) = entry {
             let _ = tx.send(response);
             return true;
         }
         false
+    }
+
+    /// The session id an in-flight approval was raised for, if still pending.
+    /// `session/approve` authorizes the caller against this session's owner.
+    pub fn session_for(&self, request_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(request_id)
+            .map(|(session_id, _)| session_id.clone())
     }
 
     pub fn remove(&self, request_id: &str) -> bool {
@@ -235,6 +256,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            auth_registry: None,
         })
     }
 
@@ -270,11 +292,29 @@ impl RpcContext {
         session_backend: Option<Arc<dyn SessionBackend>>,
         acp_session_store: Option<Arc<AcpSessionStore>>,
     ) -> Arc<Self> {
+        Self::for_persistence_tests_with_memory(
+            config,
+            sessions,
+            session_backend,
+            acp_session_store,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub fn for_persistence_tests_with_memory(
+        config: Config,
+        sessions: Arc<SessionStore>,
+        session_backend: Option<Arc<dyn SessionBackend>>,
+        acp_session_store: Option<Arc<AcpSessionStore>>,
+        memory: Option<Arc<dyn zeroclaw_api::memory_traits::Memory>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             sessions,
             session_backend,
-            memory: None,
+            memory,
             cost_tracker: None,
             event_tx: None,
             reload_tx: None,
@@ -326,7 +366,7 @@ mod tests {
     fn pending_map_insert_and_resolve() {
         let map = ApprovalPendingMap::default();
         let (tx, mut rx) = oneshot::channel::<ChannelApprovalResponse>();
-        map.insert("req-1".to_string(), tx);
+        map.insert("req-1".to_string(), "sess-req-1".to_string(), tx);
         assert!(map.resolve("req-1", ChannelApprovalResponse::Approve));
         assert!(!map.contains("req-1"));
         assert_eq!(rx.try_recv().unwrap(), ChannelApprovalResponse::Approve);
@@ -342,7 +382,7 @@ mod tests {
     fn pending_map_insert_then_drop_is_safe() {
         let map = ApprovalPendingMap::default();
         let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
-        map.insert("req-2".to_string(), tx);
+        map.insert("req-2".to_string(), "sess-req-2".to_string(), tx);
         // _rx is dropped — resolve sends to a closed channel; must not panic
         assert!(map.resolve("req-2", ChannelApprovalResponse::Approve));
         assert!(!map.contains("req-2"));
@@ -352,7 +392,7 @@ mod tests {
     fn pending_map_remove_drops_stale_request() {
         let map = ApprovalPendingMap::default();
         let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
-        map.insert("req-3".to_string(), tx);
+        map.insert("req-3".to_string(), "sess-req-3".to_string(), tx);
         assert!(map.contains("req-3"));
         assert!(map.remove("req-3"));
         assert!(!map.contains("req-3"));
@@ -363,7 +403,7 @@ mod tests {
     fn pending_guard_drop_removes_registered_request() {
         let map = Arc::new(ApprovalPendingMap::default());
         let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
-        let guard = map.register("req-4".to_string(), tx);
+        let guard = map.register("req-4".to_string(), "sess-req-4".to_string(), tx);
         assert!(map.contains("req-4"));
         drop(guard);
         assert!(!map.contains("req-4"));
@@ -373,7 +413,7 @@ mod tests {
     fn pending_guard_can_be_disarmed_after_resolution() {
         let map = Arc::new(ApprovalPendingMap::default());
         let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
-        let mut guard = map.register("req-5".to_string(), tx);
+        let mut guard = map.register("req-5".to_string(), "sess-req-5".to_string(), tx);
         assert!(map.resolve("req-5", ChannelApprovalResponse::Approve));
         guard.disarm();
         drop(guard);
