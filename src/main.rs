@@ -7842,7 +7842,12 @@ async fn run_sop_maintenance_tick(
                 zeroclaw_runtime::sop::dispatch::DispatchResult::Started { .. } => {
                     report.cron_started += 1;
                 }
-                zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { .. } => {
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { .. }
+                | zeroclaw_runtime::sop::dispatch::DispatchResult::Deferred { .. }
+                | zeroclaw_runtime::sop::dispatch::DispatchResult::Coalesced { .. } => {
+                    // A2: deferred (backpressure) / coalesced triggers did not start a
+                    // run this tick; the cron schedule re-fires them next pass. The
+                    // precise outcome is logged by process_headless_results below.
                     report.cron_skipped += 1;
                 }
                 zeroclaw_runtime::sop::dispatch::DispatchResult::BlockedUnsafe { .. } => {
@@ -9186,6 +9191,8 @@ mod tests {
             max_concurrent: 2,
             location: None,
             deterministic: false,
+            admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
             agent: None,
         }]);
         let engine = Arc::new(Mutex::new(engine));

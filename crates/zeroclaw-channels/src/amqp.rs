@@ -7,14 +7,17 @@ use tokio::sync::mpsc;
 use futures_util::StreamExt;
 use lapin::{
     Connection, ConnectionProperties,
-    options::{BasicAckOptions, BasicConsumeOptions, QueueBindOptions, QueueDeclareOptions},
+    options::{
+        BasicAckOptions, BasicConsumeOptions, BasicNackOptions, QueueBindOptions,
+        QueueDeclareOptions,
+    },
     tcp::{OwnedIdentity, OwnedTLSConfig},
     types::FieldTable,
 };
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::SopDispatch;
 use zeroclaw_runtime::sop::audit::SopAuditLogger;
-use zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in;
+use zeroclaw_runtime::sop::dispatch::{dispatch_untrusted_fan_in, results_need_redelivery};
 use zeroclaw_runtime::sop::engine::SopEngine;
 use zeroclaw_runtime::sop::types::SopTriggerSource;
 
@@ -69,6 +72,15 @@ pub struct AmqpChannelConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeliveryOutcome {
     Processed,
+    /// A matched SOP was backpressured (exec slot or pending-approval pool full)
+    /// in SOP-only dispatch mode. The delivery was NOT fully handled: under
+    /// `durable_ack` it must be nack/requeued for redelivery rather than acked,
+    /// so the trigger is retried once capacity frees instead of being lost. Never
+    /// returned for combined `sop_and_agent_loop` dispatch - there, the agent loop
+    /// already consumed the delivery, so a SOP-side overflow is surfaced loudly
+    /// and acked rather than risking a broker redelivery that would double-run
+    /// the agent side (see `route_delivery`).
+    Deferred,
     ReceiverGone,
 }
 
@@ -184,7 +196,7 @@ impl AmqpChannel {
         }
 
         if routes_sop && let (Some(engine), Some(audit)) = (&self.engine, &self.audit) {
-            dispatch_untrusted_fan_in(
+            let results = dispatch_untrusted_fan_in(
                 engine,
                 audit,
                 SopTriggerSource::Amqp,
@@ -192,6 +204,38 @@ impl AmqpChannel {
                 Some(&String::from_utf8_lossy(data)),
             )
             .await;
+            if results_need_redelivery(&results) {
+                if routes_agent {
+                    // Combined `sop_and_agent_loop`: the agent loop ALREADY accepted
+                    // this delivery above (`tx.send` succeeded). Requeuing to retry
+                    // the SOP side would redeliver the SAME broker message to the
+                    // agent loop and double-run its side effects. Without a durable
+                    // intake queue (a separate follow-up) there is nothing to
+                    // durably re-home the backpressured trigger into, so in combined
+                    // mode a SOP-side overflow is a genuine, surfaced-loudly drop
+                    // rather than a broker-level redelivery: the broker-redelivery
+                    // safety net is reserved for SOP-only dispatch, where there is no
+                    // agent handoff to double-run.
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "alias": self.alias,
+                                "routing_key": routing_key,
+                                "dispatch": "sop_and_agent_loop",
+                            })),
+                        "amqp: SOP admission backpressured in combined mode; trigger dropped rather \
+                         than requeued (the agent side already consumed this delivery and must not \
+                         be redelivered)"
+                    );
+                } else {
+                    // SOP-only mode: no agent handoff happened, so signal the
+                    // listener to requeue (not ack) so the trigger is redelivered
+                    // when capacity frees.
+                    return DeliveryOutcome::Deferred;
+                }
+            }
         }
 
         DeliveryOutcome::Processed
@@ -412,6 +456,24 @@ impl Channel for AmqpChannel {
                 DeliveryOutcome::Processed => {
                     if self.durable_ack {
                         delivery.acker.ack(BasicAckOptions::default()).await?;
+                    }
+                }
+                DeliveryOutcome::Deferred => {
+                    // Backpressured: nack with requeue so the broker redelivers the
+                    // trigger once an exec slot / pending-approval slot frees, rather
+                    // than acking it away. `no_ack` is false whenever `durable_ack`
+                    // is set, so a manual nack is valid here. Under sustained
+                    // saturation this drives broker-paced redelivery churn (the
+                    // intended backpressure signal); operators wanting delayed retry
+                    // configure a broker-side dead-letter exchange with a TTL.
+                    if self.durable_ack {
+                        delivery
+                            .acker
+                            .nack(BasicNackOptions {
+                                requeue: true,
+                                ..BasicNackOptions::default()
+                            })
+                            .await?;
                     }
                 }
                 DeliveryOutcome::ReceiverGone => return Ok(()),
@@ -752,5 +814,121 @@ tr7J6RKtO4OsZS/2KoYL8M+o
         assert_eq!(outcome, DeliveryOutcome::Processed);
         let msg = rx.recv().await.expect("agent-loop message delivered");
         assert_eq!(msg.content, "curl");
+    }
+
+    #[tokio::test]
+    async fn deferred_sop_dispatch_requeues_instead_of_acking() {
+        let (engine, audit) = sop_handles_at_exec_slot_full();
+        let ch = try_channel_with(
+            "{name}",
+            "name",
+            SopDispatch::Sop,
+            Some(engine),
+            Some(audit),
+        )
+        .expect("sop-only channel with handles constructs");
+        let (tx, _rx) = mpsc::channel::<ChannelMessage>(1);
+
+        // A second matching delivery is backpressured (slot full). route_delivery must
+        // report Deferred so the listener nacks/requeues it, rather than acking the
+        // trigger away under durable_ack.
+        let outcome = ch
+            .route_delivery("anitya.update", br#"{"name":"curl"}"#, &tx)
+            .await;
+        assert_eq!(
+            outcome,
+            DeliveryOutcome::Deferred,
+            "a backpressured SOP delivery must requeue for redelivery, not ack-and-lose"
+        );
+    }
+
+    /// Build sop/audit handles with `amqp-sop` already occupying its single exec
+    /// slot (`max_concurrent = 1`), so the next matching AMQP delivery is
+    /// backpressured and `dispatch_sop_event` returns a `Deferred` result.
+    fn sop_handles_at_exec_slot_full() -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
+        use zeroclaw_runtime::sop::SopStepKind;
+        use zeroclaw_runtime::sop::engine::now_iso8601;
+        use zeroclaw_runtime::sop::types::{
+            Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopStep, SopTrigger,
+        };
+        let (engine, audit) = sop_handles();
+        {
+            let mut eng = engine.lock().unwrap();
+            eng.set_sops_for_test(vec![Sop {
+                name: "amqp-sop".into(),
+                description: "test".into(),
+                version: "1.0.0".into(),
+                priority: SopPriority::Normal,
+                execution_mode: SopExecutionMode::Auto,
+                triggers: vec![SopTrigger::Amqp {
+                    routing_key: "anitya.update".into(),
+                    condition: None,
+                }],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 1,
+                location: None,
+                deterministic: false,
+                admission_policy: SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+                agent: None,
+            }]);
+            // Fill the single exec slot with an in-flight run.
+            eng.start_run(
+                "amqp-sop",
+                SopEvent {
+                    source: SopTriggerSource::Amqp,
+                    topic: Some("anitya.update".into()),
+                    payload: None,
+                    timestamp: now_iso8601(),
+                },
+            )
+            .expect("first run fills the slot");
+        }
+        (engine, audit)
+    }
+
+    #[tokio::test]
+    async fn combined_mode_acks_sop_overflow_and_agent_gets_exactly_one_message() {
+        // Blocker regression: in combined `sop_and_agent_loop` the agent loop already
+        // accepted the delivery, so requeuing to retry a backpressured SOP side would
+        // redeliver the SAME message to the agent and double-run its side effects. The
+        // channel must ACK (Processed) instead, and the agent must see it exactly once.
+        let (engine, audit) = sop_handles_at_exec_slot_full();
+        let ch = try_channel_with(
+            "{name}",
+            "name",
+            SopDispatch::SopAndAgentLoop,
+            Some(engine),
+            Some(audit),
+        )
+        .expect("combined channel constructs");
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(4);
+
+        let outcome = ch
+            .route_delivery("anitya.update", br#"{"name":"curl"}"#, &tx)
+            .await;
+        assert_eq!(
+            outcome,
+            DeliveryOutcome::Processed,
+            "combined mode ACKs a backpressured SOP delivery (agent already consumed); it must not requeue"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "the agent loop received the delivery once"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the agent loop must NOT be handed a duplicate of the same delivery"
+        );
     }
 }

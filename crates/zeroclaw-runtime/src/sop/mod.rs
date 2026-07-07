@@ -99,9 +99,9 @@ pub fn build_sop_engine(
     workspace_dir: &Path,
     audit_memory: Arc<dyn Memory>,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
-    // Select the run-state backend from config (default: ephemeral in-memory,
-    // unchanged behavior). A backend-open failure must not crash daemon startup,
-    // so fall back to in-memory with a loud log. `workspace_dir` here is the
+    // Select the run-state backend from config (default: durable sqlite, so parked
+    // HITL runs survive a restart). A backend-open failure must not crash daemon
+    // startup, so fall back to in-memory with a loud log. `workspace_dir` here is the
     // daemon data dir (every caller passes `config.data_dir`), so a durable store
     // lands at `<data_dir>/sop/runs.db` unless `[sop] run_state_dir` overrides it.
     let store = store::build_run_store(&config, workspace_dir).unwrap_or_else(|e| {
@@ -404,6 +404,8 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
         cooldown_secs,
         max_concurrent,
         deterministic,
+        admission_policy,
+        max_pending_approvals,
         agent,
     } = manifest.sop;
 
@@ -426,6 +428,8 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
         max_concurrent,
         location: Some(sop_dir.to_path_buf()),
         deterministic,
+        admission_policy,
+        max_pending_approvals,
         agent,
     };
     capability::SopCapabilityRegistry::with_builtins().validate_sop(&sop)?;
@@ -1066,6 +1070,8 @@ mod tests {
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: Default::default(),
+            max_pending_approvals: 0,
             agent: None,
         }
     }
@@ -1535,5 +1541,25 @@ mod tests {
             step.capability_input.clone(),
             Some(json!({"require_clean": true}))
         );
+    }
+
+    #[test]
+    fn load_sop_reads_admission_policy_and_pending_cap() {
+        // A2: admission_policy + max_pending_approvals are user-facing SOP.toml knobs;
+        // prove they survive the SOP.toml -> runtime Sop load path.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("s");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SOP.toml"),
+            "[sop]\nname = \"s\"\ndescription = \"d\"\nadmission_policy = \"drop\"\nmax_pending_approvals = 1\n",
+        )
+        .unwrap();
+        let sop = load_sop(&dir, SopExecutionMode::Supervised).expect("load ok");
+        assert_eq!(
+            sop.admission_policy,
+            crate::sop::types::SopAdmissionPolicy::Drop
+        );
+        assert_eq!(sop.max_pending_approvals, 1);
     }
 }

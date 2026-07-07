@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use super::audit::SopAuditLogger;
 use super::engine::{SopEngine, now_iso8601};
-use super::types::{SopEvent, SopExecutionMode, SopRun, SopRunAction, SopTriggerSource};
+use super::types::{
+    SopAdmission, SopEvent, SopExecutionMode, SopRun, SopRunAction, SopTriggerSource,
+};
 use crate::security::{ContentSafety, ScanOutcome, ScreenVerdict};
 
 // ── Dispatch result ─────────────────────────────────────────────
@@ -25,8 +27,25 @@ pub enum DispatchResult {
         sop_name: String,
         action: Box<SopRunAction>,
     },
-    /// A matching SOP was found but could not start (cooldown / concurrency).
+    /// A matching SOP was found but could not start (cooldown, or the `drop`
+    /// admission policy with no free slot). Logged, not retried.
     Skipped { sop_name: String, reason: String },
+    /// A2: a matching SOP could not admit now (execution slots or the
+    /// pending-approval pool are full) and its admission policy DEFERS rather than
+    /// drops. The outcome is always logged, never silent. Redelivery is transport-
+    /// dependent: a caller with a manual-ack/requeue primitive (AMQP with
+    /// `durable_ack`) MUST redeliver so the trigger is not lost. Transports that
+    /// auto-ack on receive (MQTT via rumqttc, cron ticks) are AT-MOST-ONCE for a
+    /// `Deferred` occurrence - they cannot hold the ack, so `Deferred` there is an
+    /// observability signal, not a redelivery guarantee.
+    Deferred { sop_name: String, reason: String },
+    /// A2: a concurrent trigger collapsed into an already-in-flight run under the
+    /// `coalesce` policy (the latest state is covered by the existing run). Not an
+    /// error; recorded, not retried.
+    Coalesced {
+        sop_name: String,
+        existing_run_id: String,
+    },
     /// Untrusted trigger content was blocked before a run could start.
     BlockedUnsafe {
         sop_name: Option<String>,
@@ -217,6 +236,57 @@ async fn dispatch_sop_event_filtered(
         };
 
         for sop_name in &matched_names {
+            // A2: consult the SOP's admission policy first. Only `Admit` proceeds to
+            // the authoritative CAS start; the other outcomes are surfaced (logged +
+            // carried on a DispatchResult) so a non-admitted trigger is never lost.
+            match eng.evaluate_admission(sop_name) {
+                SopAdmission::Defer { reason } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "sop_name": sop_name, "reason": reason
+                            })),
+                        &format!("SOP dispatch: deferred '{sop_name}' (backpressure): {reason}")
+                    );
+                    results.push(DispatchResult::Deferred {
+                        sop_name: sop_name.clone(),
+                        reason,
+                    });
+                    continue;
+                }
+                SopAdmission::Coalesce { existing_run_id } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "sop_name": sop_name, "existing_run_id": existing_run_id
+                            })),
+                        &format!("SOP dispatch: coalesced '{sop_name}' into run {existing_run_id}")
+                    );
+                    results.push(DispatchResult::Coalesced {
+                        sop_name: sop_name.clone(),
+                        existing_run_id,
+                    });
+                    continue;
+                }
+                SopAdmission::Drop { reason } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "sop_name": sop_name, "reason": reason
+                            })),
+                        &format!("SOP dispatch: dropped '{sop_name}': {reason}")
+                    );
+                    results.push(DispatchResult::Skipped {
+                        sop_name: sop_name.clone(),
+                        reason,
+                    });
+                    continue;
+                }
+                SopAdmission::Admit => {}
+            }
             match eng.start_run(sop_name, event.clone()) {
                 Ok(action) => {
                     // Extract run_id from the action (authoritative source)
@@ -266,16 +336,38 @@ async fn dispatch_sop_event_filtered(
                     });
                 }
                 Err(e) => {
+                    // start_run can fail because the shared CAS exec slot was claimed
+                    // by ANOTHER engine between our dispatch pre-check and the claim
+                    // (both passed evaluate_admission while the slot was free; only one
+                    // wins try_claim_run). Re-classify via evaluate_admission so a
+                    // capacity loss under a non-drop policy becomes Deferred (a durable
+                    // AMQP caller then redelivers) instead of Skipped (acked-and-lost).
+                    // A genuine error (SOP gone, etc.) still maps to Skipped.
+                    let result = match eng.evaluate_admission(sop_name) {
+                        SopAdmission::Defer { reason } => DispatchResult::Deferred {
+                            sop_name: sop_name.clone(),
+                            reason,
+                        },
+                        SopAdmission::Coalesce { existing_run_id } => DispatchResult::Coalesced {
+                            sop_name: sop_name.clone(),
+                            existing_run_id,
+                        },
+                        SopAdmission::Admit | SopAdmission::Drop { .. } => {
+                            DispatchResult::Skipped {
+                                sop_name: sop_name.clone(),
+                                reason: e.to_string(),
+                            }
+                        }
+                    };
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        &format!("SOP dispatch: skipped '{}'", sop_name)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{}", e), "sop_name": sop_name,
+                            })),
+                        &format!("SOP dispatch: start failed for '{sop_name}', reclassified")
                     );
-                    results.push(DispatchResult::Skipped {
-                        sop_name: sop_name.clone(),
-                        reason: e.to_string(),
-                    });
+                    results.push(result);
                 }
             }
         }
@@ -402,6 +494,15 @@ pub fn process_headless_results(results: &[DispatchResult]) {
             DispatchResult::Skipped { sop_name, reason } => {
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"sop_name": sop_name, "reason": reason.to_string()})), &format!("SOP headless dispatch: skipped '{sop_name}': {reason}"));
             }
+            DispatchResult::Deferred { sop_name, reason } => {
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"sop_name": sop_name, "reason": reason.to_string()})), &format!("SOP headless dispatch: deferred '{sop_name}' (backpressure): {reason}"));
+            }
+            DispatchResult::Coalesced {
+                sop_name,
+                existing_run_id,
+            } => {
+                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"sop_name": sop_name, "existing_run_id": existing_run_id})), &format!("SOP headless dispatch: coalesced '{sop_name}' into run {existing_run_id}"));
+            }
             DispatchResult::BlockedUnsafe { sop_name, reason } => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -414,6 +515,19 @@ pub fn process_headless_results(results: &[DispatchResult]) {
             DispatchResult::NoMatch => {}
         }
     }
+}
+
+/// True if any dispatch result was `Deferred` - a trigger backpressured because an
+/// exec slot or the pending-approval pool was full. A durable transport (e.g. AMQP
+/// with `durable_ack`) MUST NOT ack such a delivery: acking would drop the
+/// backpressured trigger. The transport should instead redeliver it (nack/requeue)
+/// so it is retried once capacity frees. `Started` (ran), `Coalesced` (absorbed into
+/// an in-flight run), `Skipped`/`Drop` (deliberately dropped), and `NoMatch` were all
+/// handled and should be acked.
+pub fn results_need_redelivery(results: &[DispatchResult]) -> bool {
+    results
+        .iter()
+        .any(|r| matches!(r, DispatchResult::Deferred { .. }))
 }
 
 /// Headless fan-in chokepoint for untrusted external events (channel
@@ -639,6 +753,12 @@ pub async fn check_sop_cron_triggers(
         }
     }
 
+    // Cron is at-most-once by design: `last_check` always advances to `now`, so a
+    // `Deferred` cron occurrence is NOT retried - the next run is the next scheduled
+    // occurrence. Unlike a durable message transport (AMQP), there is no delivery to
+    // redeliver; `Deferred`/`Coalesced` here are observability signals for the tick,
+    // not a backpressure retry queue. (A pending-cron retry queue would be a separate
+    // feature.)
     *last_check = now;
     all_results
 }
@@ -676,6 +796,8 @@ mod tests {
             max_concurrent: 2,
             location: None,
             deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
             agent: None,
         }
     }
@@ -1484,6 +1606,112 @@ mod tests {
                 .count(),
             0,
             "no fs-det run should remain active after headless completion"
+        );
+    }
+
+    #[test]
+    fn results_need_redelivery_only_for_deferred() {
+        let deferred = vec![DispatchResult::Deferred {
+            sop_name: "s".into(),
+            reason: "slots full".into(),
+        }];
+        assert!(
+            results_need_redelivery(&deferred),
+            "Deferred needs redelivery"
+        );
+
+        let handled = vec![
+            DispatchResult::Skipped {
+                sop_name: "s".into(),
+                reason: "cooldown".into(),
+            },
+            DispatchResult::Coalesced {
+                sop_name: "s".into(),
+                existing_run_id: "run-1".into(),
+            },
+            DispatchResult::NoMatch,
+        ];
+        assert!(
+            !results_need_redelivery(&handled),
+            "Skipped/Coalesced/NoMatch were all handled and must be acked"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_defers_when_exec_slot_full_and_flags_redelivery() {
+        let mut sop = test_sop(
+            "backpressure-sop",
+            vec![SopTrigger::Mqtt {
+                topic: "sensors/temp".into(),
+                condition: None,
+            }],
+        );
+        sop.max_concurrent = 1;
+        let engine = test_engine(vec![sop]);
+        let audit = test_audit();
+        let event = || SopEvent {
+            source: SopTriggerSource::Mqtt,
+            topic: Some("sensors/temp".into()),
+            payload: Some(r#"{"value": 42}"#.into()),
+            timestamp: now_iso8601(),
+        };
+
+        // First trigger fills the single exec slot.
+        let first = dispatch_sop_event(&engine, &audit, event()).await;
+        assert!(matches!(&first[0], DispatchResult::Started { .. }));
+        assert!(
+            !results_need_redelivery(&first),
+            "a started run is handled -> acked"
+        );
+
+        // Second trigger is backpressured (slot full): Deferred, needs redelivery -
+        // never silently dropped.
+        let second = dispatch_sop_event(&engine, &audit, event()).await;
+        assert!(
+            matches!(&second[0], DispatchResult::Deferred { sop_name, .. } if sop_name == "backpressure-sop"),
+            "a full exec slot defers the trigger, got {:?}",
+            second[0]
+        );
+        assert!(
+            results_need_redelivery(&second),
+            "a deferred trigger must be redelivered, not acked"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_coalesces_into_in_flight_run_under_coalesce_policy() {
+        let mut sop = test_sop(
+            "coalesce-sop",
+            vec![SopTrigger::Mqtt {
+                topic: "build/done".into(),
+                condition: None,
+            }],
+        );
+        sop.max_concurrent = 1;
+        sop.admission_policy = crate::sop::types::SopAdmissionPolicy::Coalesce;
+        let engine = test_engine(vec![sop]);
+        let audit = test_audit();
+        let event = || SopEvent {
+            source: SopTriggerSource::Mqtt,
+            topic: Some("build/done".into()),
+            payload: None,
+            timestamp: now_iso8601(),
+        };
+
+        let first = dispatch_sop_event(&engine, &audit, event()).await;
+        let run_id = match &first[0] {
+            DispatchResult::Started { run_id, .. } => run_id.clone(),
+            other => panic!("expected Started, got {other:?}"),
+        };
+        let second = dispatch_sop_event(&engine, &audit, event()).await;
+        assert!(
+            matches!(&second[0], DispatchResult::Coalesced { existing_run_id, .. } if *existing_run_id == run_id),
+            "a second trigger folds into the in-flight run under Coalesce, got {:?}",
+            second[0]
+        );
+        assert!(
+            !results_need_redelivery(&second),
+            "a coalesced trigger was absorbed, not lost -> acked"
         );
     }
 }

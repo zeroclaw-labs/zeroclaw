@@ -181,9 +181,10 @@ impl From<serde_json::Error> for StoreError {
 
 /// Build the configured run store.
 ///
-/// - `persist_runs = false` (default) -> ephemeral [`InMemoryRunStore`] (current behaviour).
-/// - `persist_runs = true`, backend `"sqlite"` (default) -> [`SqliteRunStore`] at
-///   `<run_state_dir | data_dir/sop>/runs.db` (dir created mode-0700).
+/// - `persist_runs = true` (default), backend `"sqlite"` (default) -> [`SqliteRunStore`] at
+///   `<run_state_dir | data_dir/sop>/runs.db` (dir created mode-0700), so in-flight runs -
+///   including runs parked at a HITL approval - survive a restart.
+/// - `persist_runs = false` -> ephemeral [`InMemoryRunStore`] (opt back into non-durable state).
 /// - `persist_runs = true`, backend `"memory"` -> ephemeral [`InMemoryRunStore`] (degraded/tests).
 ///
 /// The backend is the closed `SopRunStoreBackend` enum, so an out-of-set value is
@@ -877,9 +878,24 @@ mod tests {
     }
 
     #[test]
-    fn factory_defaults_to_in_memory() {
-        // persist_runs defaults false -> ephemeral, data_dir untouched.
-        let s = build_run_store(&cfg(), Path::new("/nonexistent")).unwrap();
+    fn factory_defaults_to_durable_sqlite() {
+        // persist_runs now defaults on (HITL admission durability) -> the durable
+        // sqlite backend is selected so a run parked at an approval survives restart.
+        let dir = std::env::temp_dir().join(format!("zc-sop-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut c = cfg();
+        c.run_state_dir = Some(dir.to_string_lossy().into_owned());
+        let s = build_run_store(&c, Path::new("/unused")).unwrap();
+        assert_eq!(s.backend(), "sqlite");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn factory_in_memory_when_persist_disabled() {
+        // Opt back out: persist_runs = false -> ephemeral in-memory, data_dir untouched.
+        let mut c = cfg();
+        c.persist_runs = false;
+        let s = build_run_store(&c, Path::new("/nonexistent")).unwrap();
         assert_eq!(s.backend(), "in-memory");
     }
 

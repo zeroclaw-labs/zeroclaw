@@ -15,6 +15,56 @@ Each SOP must have `SOP.toml`. `SOP.md` is optional, but runs with no parsed ste
 
 ## 2. `SOP.toml`
 
+`SOP.toml` carries the SOP's identity (`name`, `description`, `version`), its
+`triggers`, and its execution knobs. The concurrency-admission fields govern what
+happens when a trigger arrives while this SOP's execution slots are full:
+
+| Field | Default | Effect |
+|---|---:|---|
+| `max_concurrent` | `1` | Maximum runs of this SOP *executing* at once. A run parked at a HITL approval or a deterministic checkpoint releases its slot, so it does not count against this. |
+| `admission_policy` | `parallel` | How a trigger that cannot admit right now is handled (see below). |
+| `max_pending_approvals` | `0` (unlimited) | Upper bound on runs of this SOP parked at a HITL approval simultaneously. Past the bound, further triggers are deferred (backpressure), never silently dropped (except under `drop`). |
+
+`admission_policy` values (`SopAdmissionPolicy`, snake_case):
+
+- `parallel` (default) - admit up to `max_concurrent`; a trigger that cannot admit
+  now is **deferred** (surfaced for backpressure/redelivery on the trigger's
+  transport), never silently dropped. Best for independent work (e.g.
+  PR-approval SOPs).
+- `hold` - serialize: admit only when no run of this SOP is active or parked;
+  other triggers are deferred. For pipelines whose pre-approval steps must not
+  overlap.
+- `coalesce` - collapse a concurrent trigger onto the already-in-flight run (the
+  in-flight run's latest state already covers it).
+- `drop` - legacy fire-and-forget: a trigger that cannot admit is dropped.
+  Explicit opt-in only; never the default.
+
+A deferred trigger's recovery is transport-dependent - there is no in-engine
+durable pending-trigger queue in this version (that is a separate follow-up):
+
+- **AMQP** (`durable_ack = true`, SOP-only dispatch): the delivery is nacked
+  (`requeue = true`) so the broker retries it once there is room.
+- **AMQP combined `sop_and_agent_loop`**: the agent side already consumed the
+  delivery, so a backpressured SOP overflow is logged loudly and ACKed (not
+  redelivered), to avoid double-running the agent side.
+- **MQTT / cron / filesystem / channel-router** (and any other headless source
+  that only logs its dispatch results): no per-message redelivery, so a
+  deferred trigger is dropped after a loud log (the next
+  scheduled/published/observed trigger is the only recovery).
+
+```toml
+[sop]
+name = "deploy-prod"
+description = "Production deploy with approval"
+version = "1.0.0"
+max_concurrent = 1
+admission_policy = "hold"
+max_pending_approvals = 8
+
+[[triggers]]
+type = "manual"
+```
+
 ## 3. `SOP.md` Step Format
 
 Steps are parsed from the `## Steps` section.
@@ -85,6 +135,20 @@ Procedural memory is opt-in. When enabled, `sop_workshop` can create and inspect
 stored SOP proposals, capture completed run context into a candidate procedure,
 and apply an approved proposal to `SOP.toml`/`SOP.md`. Write-back only happens
 through the explicit `apply` action.
+
+### Run Durability
+
+The `[sop]` config also controls whether run state survives a daemon restart:
+
+| Field | Default | Effect |
+|---|---:|---|
+| `persist_runs` | `true` | Persist run state - including runs parked at a HITL approval or a deterministic checkpoint - so they survive a restart. Set `false` for an in-memory-only, non-durable engine. |
+| `run_store_backend` | `"sqlite"` | Durable backend when `persist_runs` is true. `sqlite` writes `runs.db` under the run-state dir. |
+
+`persist_runs = true` is the default so a parked HITL approval is not lost on
+restart (`build_sop_engine` falls back to an in-memory store with a loud log if
+the durable backend cannot open, so this is default-safe); `persist_runs = false`
+is the documented opt-out for an ephemeral engine.
 
 ## 4. Trigger Types
 
