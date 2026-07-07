@@ -34,7 +34,7 @@ use crate::observability::{
 // ── I/O timeouts ──────────────────────────────────────────────────────────────
 
 /// Maximum time to wait for a UDS connect before giving up.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 /// Maximum time to wait for a UDS write or read before giving up.
 const IO_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -157,9 +157,9 @@ fn install_hook_from_env(
     // Report initial idle state so herdr shows the agent immediately, even
     // before any user message triggers a state transition.
     client.report_state("idle", None);
-    // Flush so the I/O thread has sent both messages before the agent loop
-    // starts processing user messages.
-    client.flush();
+    // Startup messages are best-effort; the first ObserverEvent will re-emit
+    // idle if the daemon was unavailable. The I/O thread processes messages
+    // independently and Shutdown is handled via the observer's Drop.
     let reporter = DebouncedReporter::new(client);
     let observer = Arc::new(HerdrObserver::new(reporter));
     Some(set_scoped_broadcast_hook(observer))
@@ -411,6 +411,19 @@ pub fn update_session_id(sid: &str) {
     session_id_slot().write().replace(sid.to_owned());
 }
 
+/// Set the herdr session ID. If `memory_session_id` is present, use it directly.
+/// Otherwise, fall back to `pane:{agent_alias}` for herdr session mapping.
+pub fn set_session_id(agent_alias: &str, memory_session_id: Option<&str>) {
+    let sid = memory_session_id.map(|s| s.to_owned()).or_else(|| {
+        Some(zeroclaw_api::session_keys::sanitize_session_key(&format!(
+            "pane:{agent_alias}"
+        )))
+    });
+    if let Some(sid) = sid {
+        update_session_id(&sid);
+    }
+}
+
 fn current_session_id() -> Option<String> {
     session_id_slot().read().clone()
 }
@@ -554,6 +567,28 @@ pub(crate) mod tests {
         assert!(
             elapsed < Duration::from_millis(100),
             "fire-and-forget send should not block the caller, took {:?}",
+            elapsed,
+        );
+    }
+
+    /// Startup path with stale socket must return quickly. This tests the
+    /// real blocker: install_hook_from_env creates a client, sends two
+    /// messages (release_agent + report_state), and returns. With a stale
+    /// socket, each connect attempt times out in 200ms; two messages = 400ms.
+    /// We allow some slack for thread spawn overhead.
+    #[test]
+    fn startup_with_stale_socket_returns_quickly() {
+        let start = std::time::Instant::now();
+        let _guard = install_hook_from_env(
+            "/tmp/nonexistent-herdr-test-socket.sock".into(),
+            "test-pane".into(),
+            "test-agent",
+        );
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "startup with unavailable herdr socket should return quickly, took {:?}",
             elapsed,
         );
     }

@@ -1708,20 +1708,9 @@ pub async fn run(
             }
         });
 
-        // Fallback: use agent alias as session identity when no session-state-file.
+        // herdr session_id: use memory_session_id if present, else fallback to pane:{alias}.
         // This ensures herdr can map the pane to a session even without explicit file path.
-        let session_id = memory_session_id
-            .as_deref()
-            .map(|s| s.to_owned())
-            .or_else(|| {
-                Some(zeroclaw_api::session_keys::sanitize_session_key(&format!(
-                    "pane:{agent_alias}"
-                )))
-            });
-
-        if let Some(sid) = session_id.as_deref() {
-            crate::integrations::herdr::update_session_id(sid);
-        }
+        crate::integrations::herdr::set_session_id(agent_alias, memory_session_id.as_deref());
 
         // ── Cost tracking context (scoped for CLI / cron / web agents) ──
         let cost_tracking_context =
