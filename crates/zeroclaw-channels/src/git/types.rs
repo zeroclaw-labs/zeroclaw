@@ -148,12 +148,12 @@ impl std::fmt::Display for IssueRef {
 /// provider reuses the same error type without growing it.
 #[derive(Debug, thiserror::Error)]
 pub enum GitChannelError {
-    #[error("failed to read git provider private key at {path}: {source}")]
-    KeyRead {
-        path: String,
-        #[source]
-        source: std::io::Error,
-    },
+    #[error(
+        "GitHub App private key is not configured; set `private_key` to the \
+         RS256 PEM (the contents of the app's `.pem` file, including the \
+         BEGIN/END lines)"
+    )]
+    MissingPrivateKey,
     #[error("git provider JWT error: {0}")]
     Jwt(#[from] jsonwebtoken::errors::Error),
     #[error("git API {endpoint} failed ({status}): {body}")]

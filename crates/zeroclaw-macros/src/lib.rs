@@ -58,6 +58,8 @@ fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
 /// - `#[nested]` on a nested struct or `Option<StructWithSecrets>` field
 ///   delegates secret discovery and setting to the child.
 /// - `#[prefix = "channels.matrix"]` on the struct sets the dotted path prefix.
+/// - `#[multiline]` on a string field hints surfaces to render a multi-line
+///   text area (e.g. a PEM key body) instead of a single-line input.
 ///
 /// # Generated methods
 ///
@@ -129,7 +131,8 @@ fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
         credential_class,
         natural_key,
         tab,
-        group
+        group,
+        multiline
     )
 )]
 pub fn derive_configurable(input: TokenStream) -> TokenStream {
@@ -248,6 +251,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let serde_skip = has_serde_skip(field);
         let derived_from_secret = has_attr(field, "derived_from_secret");
         let is_resource_key = has_attr(field, "resource_key");
+        let is_multiline = has_attr(field, "multiline");
         let natural_key_field = extract_string_attr(&field.attrs, "natural_key");
         let credential_class_expr = match extract_credential_class(&field.attrs) {
             Ok(expr) => expr,
@@ -382,6 +386,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 credential_class: #credential_class_expr,
                                 tab: #tab_token,
                                 alias_source: None,
+                                multiline: false,
                             });
                         }
                     }
@@ -2270,6 +2275,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         credential_class: #credential_class_expr,
                         tab: #tab_token,
                         alias_source: #alias_source_expr,
+                        multiline: #is_multiline,
                     }
                 }
             });
@@ -2290,6 +2296,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     #tab_token,
                     &<#inner_ty as crate::config::HasPropKind>::display_secret_terminals(),
                     #alias_source_expr,
+                    #is_multiline,
                 )
             });
         }

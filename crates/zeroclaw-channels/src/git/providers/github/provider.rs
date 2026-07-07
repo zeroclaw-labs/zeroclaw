@@ -34,12 +34,11 @@ impl GithubProvider {
     pub fn new(
         app_id: u64,
         private_key_pem: Option<String>,
-        private_key_path: String,
         installation_id: Option<u64>,
         proxy_url: Option<String>,
     ) -> Self {
         Self {
-            auth: AppAuth::new(app_id, private_key_pem, private_key_path),
+            auth: AppAuth::new(app_id, private_key_pem),
             api: GithubApi::new(proxy_url),
             configured_installation: installation_id,
             slug: parking_lot::Mutex::new(None),

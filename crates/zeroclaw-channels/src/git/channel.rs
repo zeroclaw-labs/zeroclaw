@@ -47,7 +47,6 @@ fn build_provider(cfg: &GitConfig) -> anyhow::Result<Box<dyn GitProvider>> {
                 Ok(Box::new(super::providers::github::GithubProvider::new(
                     cfg.app_id,
                     cfg.private_key.clone(),
-                    cfg.private_key_path.clone(),
                     cfg.installation_id,
                     cfg.proxy_url.clone(),
                 )))
@@ -793,18 +792,11 @@ mod tests {
         use crate::git::providers::github::api_test_support::with_base;
         use crate::git::providers::github::{GithubProvider, TEST_KEY_PEM};
 
-        fn write_test_key() -> tempfile::NamedTempFile {
-            use std::io::Write;
-            let mut f = tempfile::NamedTempFile::new().unwrap();
-            f.write_all(TEST_KEY_PEM.as_bytes()).unwrap();
-            f
-        }
-
-        fn base_cfg(key_file: &tempfile::NamedTempFile) -> GitConfig {
+        fn base_cfg() -> GitConfig {
             GitConfig {
                 enabled: true,
                 app_id: 1,
-                private_key_path: key_file.path().to_string_lossy().into_owned(),
+                private_key: Some(TEST_KEY_PEM.to_string()),
                 installation_id: Some(77),
                 repos: vec!["octo/repo".into()],
                 ..GitConfig::default()
@@ -816,7 +808,6 @@ mod tests {
             let provider = GithubProvider::new(
                 cfg.app_id,
                 cfg.private_key.clone(),
-                cfg.private_key_path.clone(),
                 cfg.installation_id,
                 None,
             )
@@ -903,8 +894,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
-            let ch = mock_channel(base_cfg(&key), server.uri());
+            let ch = mock_channel(base_cfg(), server.uri());
 
             let filter = test_filter();
             let plan = default_plan();
@@ -967,8 +957,7 @@ mod tests {
                 .await;
             mount_empty(&server, "/repos/octo/repo/issues/comments").await;
 
-            let key = write_test_key();
-            let mut cfg = base_cfg(&key);
+            let mut cfg = base_cfg();
             cfg.events.insert(
                 "pull_request.opened".to_string(),
                 zeroclaw_config::schema::GitEventRoute {
@@ -1053,10 +1042,9 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
             let cfg = GitConfig {
                 events_backbone: true,
-                ..base_cfg(&key)
+                ..base_cfg()
             };
             let ch = mock_channel(cfg, server.uri());
 
@@ -1130,8 +1118,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
-            let mut cfg = base_cfg(&key);
+            let mut cfg = base_cfg();
             cfg.events.insert(
                 "workflow_run.failed".to_string(),
                 zeroclaw_config::schema::GitEventRoute {
@@ -1186,8 +1173,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
-            let ch = mock_channel(base_cfg(&key), server.uri());
+            let ch = mock_channel(base_cfg(), server.uri());
             let filter = test_filter();
             let plan = default_plan();
             let mut state = PollState::new(chrono::Utc::now());
@@ -1227,8 +1213,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
-            let ch = mock_channel(base_cfg(&key), server.uri());
+            let ch = mock_channel(base_cfg(), server.uri());
             let draft_id = ch
                 .send_draft(&SendMessage::new("thinking…", "octo/repo#5"))
                 .await
@@ -1261,8 +1246,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
-            let ch = mock_channel(base_cfg(&key), server.uri());
+            let ch = mock_channel(base_cfg(), server.uri());
             let filter = test_filter();
             let plan = default_plan();
             let mut state = PollState::new(chrono::Utc::now());
@@ -1316,8 +1300,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = write_test_key();
-            let ch = mock_channel(base_cfg(&key), server.uri());
+            let ch = mock_channel(base_cfg(), server.uri());
             let filter = test_filter();
             let plan = default_plan();
             let floor = now - chrono::Duration::hours(1);
@@ -1406,8 +1389,7 @@ mod tests {
                 .await;
             mount_empty(&server, "/repos/octo/repo/issues/comments").await;
 
-            let key = write_test_key();
-            let ch = mock_channel(base_cfg(&key), server.uri());
+            let ch = mock_channel(base_cfg(), server.uri());
             let filter = test_filter();
             let plan = default_plan();
             let mut state = PollState::new(now - chrono::Duration::hours(1));

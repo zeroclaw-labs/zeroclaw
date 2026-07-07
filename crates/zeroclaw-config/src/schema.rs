@@ -16022,17 +16022,11 @@ pub struct GitConfig {
     #[tab(Connection)]
     #[serde(default)]
     pub app_id: u64,
-    /// Path to the app's RS256 private key, the `.pem` file GitHub
-    /// generates on the app's settings page. Should be readable only by
-    /// the daemon user (0600); looser permissions log a startup warning.
-    /// GitHub provider only.
-    #[tab(Connection)]
-    #[serde(default)]
-    pub private_key_path: String,
-    /// RS256 private key PEM, inline and encrypted at rest. Takes precedence
-    /// over `private_key_path` when set. Include the BEGIN/END lines.
-    /// GitHub provider only.
+    /// RS256 private key PEM, the contents of the `.pem` file GitHub
+    /// generates on the app's settings page, inline and encrypted at rest.
+    /// Include the BEGIN/END lines. GitHub provider only.
     #[secret]
+    #[multiline]
     #[credential_class = "encrypted_secret"]
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
@@ -16131,7 +16125,6 @@ impl Default for GitConfig {
             enabled: false,
             provider: default_git_provider(),
             app_id: 0,
-            private_key_path: String::new(),
             private_key: None,
             installation_id: None,
             api_base_url: None,
@@ -21379,7 +21372,6 @@ mod tests {
             r#"
             enabled = true
             app_id = 12345
-            private_key_path = "~/.zeroclaw/github-app.pem"
             events_backbone = true
 
             [events]
