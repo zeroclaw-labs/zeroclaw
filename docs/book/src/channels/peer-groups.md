@@ -51,7 +51,7 @@ shape.
 
 `admin_for_agent_scope = true` extends the group's privilege boundary: in
 addition to being a routable peer, each `external_peers` member is allowed
-to issue `/model --agent <model>` on the bound agent — i.e. switch the
+to issue `/model --agent <model>` on the bound agent, i.e. switch the
 agent's *binding* to a model other than the default. The flag is
 deny-by-default: every group without it explicitly set to `true` denies the
 capability, including groups with non-empty `external_peers`. `/model
