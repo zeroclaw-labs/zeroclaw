@@ -517,18 +517,18 @@ async fn agent_delete_owned_state(
     // Archive the workspace dir alongside the owned-state exports. `workspace`
     // was resolved by the caller before the config entry was removed, so a
     // custom `workspace.path` is preserved (post-removal it would default).
-    if workspace.exists() {
-        if let Err(e) = tokio::fs::rename(&workspace, archive_dir.join("workspace")).await {
-            let es = e.to_string();
-            eprintln!(
-                "{}",
-                mta(
-                    "cli-alias-warn-workspace-archive",
-                    &[("error", es.as_str())],
-                    "warning: workspace archive failed: {$error}"
-                )
-            );
-        }
+    if workspace.exists()
+        && let Err(e) = tokio::fs::rename(&workspace, archive_dir.join("workspace")).await
+    {
+        let es = e.to_string();
+        eprintln!(
+            "{}",
+            mta(
+                "cli-alias-warn-workspace-archive",
+                &[("error", es.as_str())],
+                "warning: workspace archive failed: {$error}"
+            )
+        );
     }
     let report = crate::gateway::agent_owned_state::cascade_owned_state(
         config,

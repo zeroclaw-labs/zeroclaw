@@ -284,10 +284,10 @@ pub async fn handle_command(
             let canonical_skills = skills_dir(workspace_dir)
                 .canonicalize()
                 .unwrap_or_else(|_| skills_dir(workspace_dir));
-            if let Ok(canonical_skill) = skill_path.canonicalize() {
-                if !canonical_skill.starts_with(&canonical_skills) {
-                    anyhow::bail!("Skill path escapes skills directory: {name}");
-                }
+            if let Ok(canonical_skill) = skill_path.canonicalize()
+                && !canonical_skill.starts_with(&canonical_skills)
+            {
+                anyhow::bail!("Skill path escapes skills directory: {name}");
             }
 
             if !skill_path.exists() {
