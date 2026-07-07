@@ -4309,6 +4309,11 @@ async fn main() -> Result<()> {
                             "🔄 Daemon reload — re-reading config from disk"
                         );
                         current_config = Box::pin(Config::load_or_init()).await?;
+                        #[cfg(feature = "agent-runtime")]
+                        observability::runtime_trace::init_from_config(
+                            &current_config.observability,
+                            &current_config.data_dir,
+                        );
                         // Stop the stale nag and re-gate against the fresh
                         // config: a repaired posture silences the warning, a
                         // newly-degraded one (still allowed) restarts it. A
