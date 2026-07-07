@@ -2349,7 +2349,7 @@ mod tests {
         let spec = ToolSpec {
             name: "test".into(),
             description: "A test tool".into(),
-            parameters: serde_json::json!({"type": "object"}),
+            parameters: serde_json::json!({"type": "object"}).into(),
         };
         let json = serde_json::to_string(&spec).unwrap();
         let parsed: ToolSpec = serde_json::from_str(&json).unwrap();

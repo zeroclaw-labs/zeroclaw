@@ -441,8 +441,6 @@ pub fn filter_tool_specs_for_turn(
     groups: &[zeroclaw_config::schema::ToolFilterGroup],
     user_message: &str,
 ) -> Vec<crate::tools::ToolSpec> {
-    use zeroclaw_config::schema::ToolFilterGroupMode;
-
     if groups.is_empty() {
         return tool_specs;
     }
@@ -453,25 +451,37 @@ pub fn filter_tool_specs_for_turn(
         .into_iter()
         .filter(|spec| {
             // Built-in tools always pass through.
-            if !spec.name.starts_with("mcp_") {
-                return true;
-            }
-            // MCP tool: include if any active group matches.
-            groups.iter().any(|group| {
-                let pattern_matches = group.tools.iter().any(|pat| glob_match(pat, &spec.name));
-                if !pattern_matches {
-                    return false;
-                }
-                match group.mode {
-                    ToolFilterGroupMode::Always => true,
-                    ToolFilterGroupMode::Dynamic => group
-                        .keywords
-                        .iter()
-                        .any(|kw| msg_lower.contains(&kw.to_ascii_lowercase())),
-                }
-            })
+            !spec.name.starts_with("mcp_")
+                || mcp_tool_included_for_turn(&spec.name, groups, &msg_lower)
         })
         .collect()
+}
+
+/// Name-only core of [`filter_tool_specs_for_turn`]: whether an MCP tool is
+/// included by at least one active group. Operating on names alone lets
+/// per-turn exclusion computation skip building `ToolSpec`s entirely — specs
+/// carry the full parameter schema, which is exactly the per-turn clone
+/// churn #8642 removes. `msg_lower` must already be lowercased.
+fn mcp_tool_included_for_turn(
+    name: &str,
+    groups: &[zeroclaw_config::schema::ToolFilterGroup],
+    msg_lower: &str,
+) -> bool {
+    use zeroclaw_config::schema::ToolFilterGroupMode;
+
+    groups.iter().any(|group| {
+        let pattern_matches = group.tools.iter().any(|pat| glob_match(pat, name));
+        if !pattern_matches {
+            return false;
+        }
+        match group.mode {
+            ToolFilterGroupMode::Always => true,
+            ToolFilterGroupMode::Dynamic => group
+                .keywords
+                .iter()
+                .any(|kw| msg_lower.contains(&kw.to_ascii_lowercase())),
+        }
+    })
 }
 
 /// Filters a tool spec list by an optional capability allowlist.
@@ -539,16 +549,16 @@ fn compute_excluded_mcp_tools(
     if groups.is_empty() {
         return Vec::new();
     }
-    let filtered_specs = filter_tool_specs_for_turn(
-        tools_registry.iter().map(|t| t.spec()).collect(),
-        groups,
-        user_message,
-    );
-    let included: HashSet<&str> = filtered_specs.iter().map(|s| s.name.as_str()).collect();
+    // Name-only: exclusion needs tool names, never schemas, so avoid
+    // building (and formerly deep-cloning) every spec per turn (#8642).
+    let msg_lower = user_message.to_ascii_lowercase();
     tools_registry
         .iter()
-        .filter(|t| t.name().starts_with("mcp_") && !included.contains(t.name()))
-        .map(|t| t.name().to_string())
+        .map(|t| t.name())
+        .filter(|name| {
+            name.starts_with("mcp_") && !mcp_tool_included_for_turn(name, groups, &msg_lower)
+        })
+        .map(str::to_string)
         .collect()
 }
 
@@ -562,13 +572,23 @@ pub fn native_tool_specs_present_for_turn(
         return Ok(false);
     }
 
-    let iteration_tool_specs = super::turn::build_iteration_tool_specs(
-        model_provider,
-        tools_registry,
-        excluded_tools,
-        activated_tools,
-    )?;
-    Ok(!iteration_tool_specs.tool_specs.is_empty())
+    // Name-only presence check mirroring `build_iteration_tool_specs`'s
+    // filtering, without assembling any specs (#8642): tools are present if
+    // the registry or the activated deferred set has a non-excluded name.
+    let is_excluded = |name: &str| excluded_tools.iter().any(|ex| ex == name);
+    if tools_registry.iter().any(|tool| !is_excluded(tool.name())) {
+        return Ok(true);
+    }
+    let Some(at) = activated_tools else {
+        return Ok(false);
+    };
+    let activated = match at.lock() {
+        Ok(guard) => guard,
+        // Same recovery as build_iteration_tool_specs: a poisoned lock is
+        // still safe for a read-only name scan.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    Ok(activated.tool_names().iter().any(|name| !is_excluded(name)))
 }
 
 /// Elide inlined base64 image data URIs from message content before export.
@@ -10126,7 +10146,7 @@ This is an example, not an invocation."#;
             Some(&[crate::tools::ToolSpec {
                 name: "count_tool".to_string(),
                 description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
+                parameters: serde_json::json!({"type": "object"}).into(),
             }]),
             "mock-model",
             Some(0.0),
@@ -10212,7 +10232,7 @@ This is an example, not an invocation."#;
             Some(&[crate::tools::ToolSpec {
                 name: "count_tool".to_string(),
                 description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
+                parameters: serde_json::json!({"type": "object"}).into(),
             }]),
             "mock-model",
             Some(0.0),
@@ -10289,7 +10309,7 @@ This is an example, not an invocation."#;
             Some(&[crate::tools::ToolSpec {
                 name: "count_tool".to_string(),
                 description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
+                parameters: serde_json::json!({"type": "object"}).into(),
             }]),
             "mock-model",
             Some(0.0),
@@ -10329,7 +10349,7 @@ This is an example, not an invocation."#;
             Some(&[crate::tools::ToolSpec {
                 name: "count_tool".to_string(),
                 description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
+                parameters: serde_json::json!({"type": "object"}).into(),
             }]),
             "mock-model",
             Some(0.0),
@@ -10668,7 +10688,7 @@ This is an example, not an invocation."#;
             Some(&[crate::tools::ToolSpec {
                 name: "count_tool".to_string(),
                 description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
+                parameters: serde_json::json!({"type": "object"}).into(),
             }]),
             "mock-model",
             Some(0.0),
@@ -11274,7 +11294,7 @@ This is an example, not an invocation."#;
         let tools = [crate::tools::ToolSpec {
             name: "count_tool".to_string(),
             description: "Count values".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
+            parameters: serde_json::json!({"type": "object"}).into(),
         }];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
@@ -13313,7 +13333,7 @@ Let me check the result."#;
         crate::tools::ToolSpec {
             name: name.to_string(),
             description: String::new(),
-            parameters: serde_json::json!({}),
+            parameters: serde_json::json!({}).into(),
         }
     }
 
