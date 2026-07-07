@@ -87,7 +87,11 @@ case "$1" in
     ;;
 
   test)
-    run_in_ci "cargo test --locked --verbose"
+    # `--workspace` matches CI's `cargo nextest run --locked --workspace
+    # --exclude zeroclaw-desktop` (#8753): without it, the local gate
+    # compiles and tests only the root package and silently skips
+    # member-crate test targets.
+    run_in_ci "cargo test --locked --workspace --verbose"
     ;;
 
   test-component)
@@ -134,7 +138,7 @@ case "$1" in
 
   all)
     run_in_ci "./scripts/ci/rust_quality_gate.sh"
-    run_in_ci "cargo test --locked --verbose"
+    run_in_ci "cargo test --locked --workspace --verbose"
     run_in_ci "bash tests/manual/test_dockerignore.sh"
     run_in_ci "cargo build --release --locked --verbose"
     run_in_ci "cargo deny check licenses sources"

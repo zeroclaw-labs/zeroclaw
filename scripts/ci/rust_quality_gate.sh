@@ -11,11 +11,16 @@ echo "==> rust quality: cargo fmt --all -- --check"
 cargo fmt --all -- --check
 
 if [ "$MODE" = "strict" ]; then
-    echo "==> rust quality: cargo clippy --locked --all-targets -- -D warnings"
-    cargo clippy --locked --all-targets -- -D warnings
+    echo "==> rust quality: cargo clippy --locked --workspace --all-targets -- -D warnings"
+    # `--workspace` is required: with only the root package listed in the
+    # workspace `members` array, plain `cargo clippy --all-targets` from the
+    # repo root compiles only the root package's targets and silently skips
+    # member-crate lib-test targets. That blind spot has repeatedly let
+    # broken member-crate code land on master (see #8753, #6009, #8702).
+    cargo clippy --locked --workspace --all-targets -- -D warnings
 else
-    echo "==> rust quality: cargo clippy --locked --all-targets -- -D clippy::correctness"
-    cargo clippy --locked --all-targets -- -D clippy::correctness
+    echo "==> rust quality: cargo clippy --locked --workspace --all-targets -- -D clippy::correctness"
+    cargo clippy --locked --workspace --all-targets -- -D clippy::correctness
 fi
 
 echo "==> rust quality: provider dispatch gate (no direct ModelProvider method calls outside ProviderDispatch)"
