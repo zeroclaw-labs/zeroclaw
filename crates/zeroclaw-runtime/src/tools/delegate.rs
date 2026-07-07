@@ -1,6 +1,7 @@
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    TOOL_LOOP_SESSION_KEY, ToolLoop, apply_text_tool_prompt_policy, run_tool_call_loop,
+    TOOL_LOOP_SESSION_KEY, ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
+    run_tool_call_loop,
 };
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
@@ -894,12 +895,29 @@ impl DelegateTool {
             },
         )
         .await;
+        // Fully destructured - deliberately NO `..` - so a future field added to
+        // ScopedAssembled is a compile error here instead of a silent drop. That
+        // silent-drop is exactly how this path lost `pinned_section` when #8711 split
+        // it out of `deferred_section`: the `..` swallowed the new field and a target
+        // with pinned MCP resources would silently lose them from the sub-agent prompt.
+        // The five per-tool channel handles (ask_user/reaction/poll/escalate/
+        // channel_room) are for interactive channel tools this path never surfaces.
         let crate::tools::scoped::ScopedAssembled {
             registry,
-            deferred_section,
+            delegate_handle: _,
+            ask_user_handle: _,
+            reaction_handle: _,
+            poll_handle: _,
+            escalate_handle: _,
+            channel_room_handle: _,
+            mut deferred_section,
+            pinned_section,
             activated_handle,
-            ..
         } = assembled;
+        // Independent delegation injects a single combined MCP prompt block (no
+        // separate pinned slot like `from_config`'s Agent), so compose pinned onto
+        // deferred - the same `append_pinned_mcp_section` `run`/`process_message` use.
+        append_pinned_mcp_section(&mut deferred_section, &pinned_section);
         let mut tools = registry.into_inner();
         tools.retain(|tool| tool.name() != Self::NAME);
         Ok(IndependentTargetTools {
