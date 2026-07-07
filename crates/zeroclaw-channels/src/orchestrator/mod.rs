@@ -2893,14 +2893,13 @@ async fn handle_runtime_command_if_needed(
                         })),
                     "agent-scope /model override rejected"
                 );
-                format!(
-                    "Sender `{sender}` is not authorized for `/model --agent` on \
-                     agent `{agent}`. Use `/model --user {model}` for a session-only \
-                     override, or ask an admin to mark a peer group \
-                     `admin_for_agent_scope = true` with you as a member.",
-                    sender = msg.sender,
-                    agent = ctx.agent_alias,
-                    model = model,
+                zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-runtime-agent-scope-rejected",
+                    &[
+                        ("sender", msg.sender.as_str()),
+                        ("agent", ctx.agent_alias.as_str()),
+                        ("model", model.as_str()),
+                    ],
                 )
             } else {
                 // Resolve provider+model the same way bare `/model` does, then
