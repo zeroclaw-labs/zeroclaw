@@ -100,6 +100,10 @@ zc-input-detached = Detached: { $name }
 zc-input-invalid-index = Invalid index: { $index }
 zc-input-pending-attachments-header = Pending attachments:
 zc-input-clipboard-error = Clipboard error: { $error }
+zc-input-skill-usage = Usage: { $command } <name> [arguments]
+zc-input-skill-not-found = Skill not found for this agent: { $name }
+zc-input-skill-catalog-error = Could not load skills for this agent: { $error }
+zc-input-skill-shortcut-conflicts = Skill shortcuts disabled for reserved names: { $names }. Use { $command } <name> ...
 
 zc-queue-empty = Nothing to send.
 zc-cancel-timed-out = Cancel timed out; turn settled locally.

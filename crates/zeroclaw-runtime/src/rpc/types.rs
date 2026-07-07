@@ -239,6 +239,17 @@ rpc_type! {
 }
 
 rpc_type! {
+    pub struct SessionSkillPromptParams {
+        pub session_id: String,
+        pub skill: String,
+        #[serde(default)]
+        pub arguments: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub attachments: Vec<FileEntry>,
+    }
+}
+
+rpc_type! {
     pub struct SessionPromptResult {
         pub session_id: String,
         pub stop_reason: String,
@@ -844,6 +855,12 @@ rpc_type! {
 rpc_type! {
     pub struct SkillsListResult {
         pub skills: Vec<SkillListEntry>,
+    }
+}
+
+rpc_type! {
+    pub struct AgentSkillsParams {
+        pub agent: String,
     }
 }
 

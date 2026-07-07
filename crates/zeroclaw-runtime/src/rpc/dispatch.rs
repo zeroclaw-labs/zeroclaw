@@ -53,6 +53,7 @@ pub enum Method {
     SessionNew,
     SessionClose,
     SessionPrompt,
+    SessionSkillPrompt,
     SessionConfigure,
     SessionCancel,
     SessionGitBranch,
@@ -106,6 +107,7 @@ pub enum Method {
     // Skills
     SkillsBundles,
     SkillsList,
+    AgentSkills,
     SkillsRead,
     SkillsWrite,
     SkillsDelete,
@@ -157,6 +159,7 @@ impl Method {
         (Method::SessionNew, "session/new"),
         (Method::SessionClose, "session/close"),
         (Method::SessionPrompt, "session/prompt"),
+        (Method::SessionSkillPrompt, "session/skill_prompt"),
         (Method::SessionConfigure, "session/configure"),
         (Method::SessionCancel, "session/cancel"),
         (Method::SessionGitBranch, "session/git_branch"),
@@ -207,6 +210,7 @@ impl Method {
         // Skills
         (Method::SkillsBundles, "skills/bundles"),
         (Method::SkillsList, "skills/list"),
+        (Method::AgentSkills, "agents/skills"),
         (Method::SkillsRead, "skills/read"),
         (Method::SkillsWrite, "skills/write"),
         (Method::SkillsDelete, "skills/delete"),
@@ -267,6 +271,156 @@ fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
         code,
         message: msg.into(),
         data: None,
+    }
+}
+
+fn render_skill_prompt(skill: &crate::skills::Skill, arguments: &str) -> String {
+    let template = if skill.prompts.is_empty() {
+        skill.description.clone()
+    } else {
+        skill.prompts.join("\n\n")
+    };
+    expand_skill_template(&template, arguments)
+}
+
+fn expand_skill_template(template: &str, arguments: &str) -> String {
+    let indexed = split_command_arguments(arguments);
+    let rendered = template.replace("$ARGUMENTS", arguments);
+    let mut rendered = replace_indexed_placeholders(&rendered, &indexed);
+    if !template.contains("$ARGUMENTS")
+        && !has_indexed_placeholder(template)
+        && !arguments.trim().is_empty()
+    {
+        rendered.push_str("\n\n");
+        rendered.push_str(arguments);
+    }
+    rendered
+}
+
+fn replace_indexed_placeholders(template: &str, values: &[String]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            out.push(ch);
+            continue;
+        }
+        let mut digits = String::new();
+        while let Some(next) = chars.peek() {
+            if next.is_ascii_digit() {
+                digits.push(*next);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if digits.is_empty() {
+            out.push(ch);
+            continue;
+        }
+        if let Ok(position) = digits.parse::<usize>()
+            && position > 0
+            && let Some(value) = values.get(position - 1)
+        {
+            out.push_str(value);
+        }
+    }
+    out
+}
+
+fn has_indexed_placeholder(template: &str) -> bool {
+    let bytes = template.as_bytes();
+    for idx in 0..bytes.len().saturating_sub(1) {
+        if bytes[idx] == b'$' && bytes[idx + 1].is_ascii_digit() {
+            return true;
+        }
+    }
+    false
+}
+
+fn split_command_arguments(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in input.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch.is_whitespace() {
+            if !current.is_empty() {
+                args.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
+}
+
+fn agent_skill_entry(skill: crate::skills::EffectiveSkill) -> AgentSkillEntry {
+    let (origin, plugin, bundle) = match skill.origin {
+        crate::skills::SkillOrigin::Workspace => ("workspace", None, None),
+        crate::skills::SkillOrigin::OpenSkills => ("open-skills", None, None),
+        crate::skills::SkillOrigin::Plugin(plugin) => ("plugin", Some(plugin), None),
+        crate::skills::SkillOrigin::Bundle(bundle) => ("bundle", None, Some(bundle)),
+    };
+    AgentSkillEntry {
+        name: skill.name,
+        description: skill.description,
+        origin: origin.to_string(),
+        plugin,
+        bundle,
+        directory: skill.directory.map(|path| path.display().to_string()),
+        editable: skill.editable,
+        shadowed: skill
+            .shadowed
+            .into_iter()
+            .map(|shadow| ShadowedSkillEntry {
+                name: shadow.name,
+                origin: shadow.origin_hint,
+            })
+            .collect(),
+    }
+}
+
+fn dropped_skill_entry(skill: crate::skills::DroppedSkill) -> DroppedSkillEntry {
+    let (reason_kind, reason, scripts_blocked) = match skill.reason {
+        crate::skills::SkillDropReason::AuditFindings {
+            summary,
+            scripts_blocked,
+        } => ("audit_findings", summary, scripts_blocked),
+        crate::skills::SkillDropReason::AuditError(error) => ("audit_error", error, false),
+        crate::skills::SkillDropReason::ManifestParseError(error) => {
+            ("manifest_parse_error", error, false)
+        }
+    };
+    DroppedSkillEntry {
+        name: skill.name,
+        origin: skill.origin_hint,
+        reason_kind: reason_kind.to_string(),
+        reason,
+        scripts_blocked,
+        directory: skill.location.map(|path| path.display().to_string()),
     }
 }
 
@@ -584,17 +738,15 @@ impl RpcDispatcher {
             // Sessions
             Method::SessionNew => self.handle_session_new(&req.params).await,
             Method::SessionClose => self.handle_session_close(&req.params).await,
-            Method::SessionPrompt => {
-                // Always spawn — turn completion is signaled by a
-                // TurnComplete notification, not by this method's response.
-                // The response (empty {} or error) is kept only so legacy
-                // request-form callers don't park forever.
+            Method::SessionPrompt | Method::SessionSkillPrompt => {
                 let handle = self.spawn_handle();
                 let id_clone = id;
                 let params_clone = req.params.clone();
                 let is_notif = is_notification;
                 zeroclaw_spawn::spawn!(async move {
-                    let result = handle.handle_session_prompt(&params_clone).await;
+                    let result = handle
+                        .handle_session_prompt_method(method, &params_clone)
+                        .await;
                     if !is_notif {
                         match result {
                             Ok(_) => handle.send_result(id_clone, serde_json::json!({})).await,
@@ -659,6 +811,7 @@ impl RpcDispatcher {
             // Skills
             Method::SkillsBundles => self.handle_skills_bundles(),
             Method::SkillsList => self.handle_skills_list(&req.params),
+            Method::AgentSkills => self.handle_agent_skills(&req.params),
             Method::SkillsRead => self.handle_skills_read(&req.params),
             Method::SkillsWrite => self.handle_skills_write(&req.params),
             Method::SkillsDelete => self.handle_skills_delete(&req.params),
@@ -1444,8 +1597,56 @@ impl RpcDispatcher {
         self.ctx.sessions.get_agent(sid).await
     }
 
-    async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
-        let req: SessionPromptParams = parse_params(params)?;
+    async fn handle_session_prompt_method(&self, method: Method, params: &Value) -> RpcResult {
+        let req = match method {
+            Method::SessionPrompt => parse_params(params)?,
+            Method::SessionSkillPrompt => self.expand_session_skill_prompt(params).await?,
+            _ => unreachable!("session prompt dispatcher received non-prompt method"),
+        };
+        self.handle_session_prompt(req).await
+    }
+
+    async fn expand_session_skill_prompt(
+        &self,
+        params: &Value,
+    ) -> Result<SessionPromptParams, JsonRpcError> {
+        let req: SessionSkillPromptParams = parse_params(params)?;
+        let skill_name = req.skill.trim();
+        if skill_name.is_empty() {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "session/skill_prompt requires a non-empty `skill`",
+            ));
+        }
+        let agent_alias = match self.ctx.sessions.get_agent_alias(&req.session_id).await {
+            Some(alias) => alias,
+            None => {
+                let _ = self.rehydrate_reaped_session(&req.session_id).await;
+                self.ctx
+                    .sessions
+                    .get_agent_alias(&req.session_id)
+                    .await
+                    .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?
+            }
+        };
+        let config = self.ctx.config.read().clone();
+        let skill = crate::skills::load_skills_for_agent_from_config(&config, &agent_alias)
+            .into_iter()
+            .find(|skill| skill.name == skill_name)
+            .ok_or_else(|| {
+                rpc_err(
+                    INVALID_PARAMS,
+                    format!("Skill not found for agent `{agent_alias}`: {skill_name}"),
+                )
+            })?;
+        Ok(SessionPromptParams {
+            session_id: req.session_id,
+            prompt: render_skill_prompt(&skill, &req.arguments),
+            attachments: req.attachments,
+        })
+    }
+
+    async fn handle_session_prompt(&self, req: SessionPromptParams) -> RpcResult {
         let sid = &req.session_id;
 
         // Reject blank turns at the RPC boundary. A turn must carry SOMETHING
@@ -3355,6 +3556,21 @@ impl RpcDispatcher {
             })
             .collect();
         to_result(SkillsListResult { skills })
+    }
+
+    fn handle_agent_skills(&self, params: &Value) -> RpcResult {
+        let req: AgentSkillsParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let root = config.install_root_dir();
+        let svc = crate::skills::service::SkillsService::new(&config, &root);
+        let set = svc
+            .resolve_effective_skills(&req.agent)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Agent skills failed: {e}")))?;
+        to_result(AgentSkillsResult {
+            agent: req.agent,
+            skills: set.skills.into_iter().map(agent_skill_entry).collect(),
+            dropped: set.dropped.into_iter().map(dropped_skill_entry).collect(),
+        })
     }
 
     fn handle_skills_read(&self, params: &Value) -> RpcResult {
@@ -7543,10 +7759,11 @@ mod tests {
         let (dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
 
         let result = dispatcher
-            .handle_session_prompt(&json!({
-                "session_id": "gone-id",
-                "prompt": "anything",
-            }))
+            .handle_session_prompt(SessionPromptParams {
+                session_id: "gone-id".to_string(),
+                prompt: "anything".to_string(),
+                attachments: Vec::new(),
+            })
             .await;
         assert!(
             result.is_err(),
