@@ -17,6 +17,12 @@ export interface UpgradeDialogProps {
   info: VersionCheckResponse | null;
   /** Whether a version check is currently running. */
   loading: boolean;
+  /** `gateway.check_updates` — false means passive polling is off. The dialog
+   *  can still surface a manual re-check button (see `onRefetch`), but shows
+   *  a dedicated "checks disabled" state instead of a stale/empty version
+   *  summary so the operator cannot mistake an unchecked state for
+   *  "up to date". */
+  checkUpdatesEnabled: boolean;
   /** `gateway.allow_self_upgrade` — gates the Upgrade button. */
   allowSelfUpgrade: boolean;
   /** How a restart is achieved here; `supervised` and `self_respawn` can
@@ -63,6 +69,7 @@ export function UpgradeDialog({
   open,
   info,
   loading,
+  checkUpdatesEnabled,
   allowSelfUpgrade,
   restartMode,
   restartHint,
@@ -325,6 +332,18 @@ export function UpgradeDialog({
           {(view === 'info' || view === 'confirm') &&
             (loading && info == null ? (
               <div className="text-xs text-pc-text-muted">{t('upgrade.checking')}</div>
+            ) : !checkUpdatesEnabled && info == null ? (
+              // `gateway.check_updates=false` and no manual re-check has been
+              // triggered yet. Render an explicit "checks disabled" state
+              // instead of falling through to the version summary — which
+              // would otherwise show an empty latest-version row plus the
+              // misleading `up_to_date` message (an operator who intentionally
+              // disabled polling has not established that they're up to date).
+              // The refresh button in the header remains active so a manual
+              // one-shot re-check can still be run on demand.
+              <div className="text-xs text-pc-text-muted">
+                {t('upgrade.checks_disabled')}
+              </div>
             ) : hasError ? (
               <div className="text-xs text-pc-text-muted">
                 <div className="text-pc-text">{t('upgrade.check_failed')}</div>

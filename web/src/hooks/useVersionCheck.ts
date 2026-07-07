@@ -19,7 +19,10 @@ interface UseVersionCheckResult {
  * field so the version tag degrades gracefully.
  *
  * Pass `enabled = false` (e.g. when `gateway.check_updates` is off) to skip
- * polling entirely.
+ * automatic polling. `refetch()` still runs a one-shot check even when
+ * automatic polling is disabled — the user pressing the refresh button is an
+ * explicit, on-demand check that bypasses the passive-polling flag (matches
+ * the operator's intent when opening the upgrade dialog manually).
  */
 export function useVersionCheck(enabled = true): UseVersionCheckResult {
   const [info, setInfo] = useState<VersionCheckResponse | null>(null);
@@ -28,7 +31,6 @@ export function useVersionCheck(enabled = true): UseVersionCheckResult {
 
   const run = useCallback(
     async (force = false) => {
-      if (!enabled) return;
       setLoading(true);
       try {
         const result = await checkVersion(force ? { force: true } : undefined);
@@ -45,7 +47,7 @@ export function useVersionCheck(enabled = true): UseVersionCheckResult {
         setLoading(false);
       }
     },
-    [enabled],
+    [],
   );
 
   useEffect(() => {
