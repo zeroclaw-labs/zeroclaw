@@ -1271,12 +1271,29 @@ impl App {
     // ── Data loading ─────────────────────────────────────────────
 
     fn types_for_section(&self, section_key: &str) -> Vec<ConfigTemplateEntry> {
+        let mut types: Vec<ConfigTemplateEntry> = Vec::new();
+
+        // Special case: channels section gets a "Global settings" entry first
+        if section_key == "channels" {
+            // Create a synthetic entry for global channels settings
+            let global_entry = ConfigTemplateEntry {
+                path: "channels.global_settings".to_string(),
+                description: Some("Global channel settings (show_tool_calls, ack_reactions, etc.)".to_string()),
+                ..Default::default()
+            };
+            types.push(global_entry);
+        }
+
+        // Then add the regular type entries
         let prefix = format!("{}.", section_key);
-        self.templates
+        let mut regular_types: Vec<ConfigTemplateEntry> = self.templates
             .iter()
             .filter(|t| t.path.starts_with(&prefix))
             .cloned()
-            .collect()
+            .collect();
+
+        types.append(&mut regular_types);
+        types
     }
 
     async fn load_type_alias_counts(&mut self) -> Result<()> {
@@ -1824,8 +1841,20 @@ impl App {
         {
             let section_idx = *section_idx;
             let map_path = tmpl.path.clone();
-            let type_name = map_path.rsplit('.').next().unwrap_or(&map_path).to_string();
             let section_key = self.sections[section_idx].key.clone();
+
+            // Special case: "Global settings" for channels should show root fields directly
+            if map_path == "channels.global_settings" {
+                self.load_fields("channels").await?;
+                self.screen = Screen::FieldList {
+                    section_idx,
+                    prefix: "channels".to_string(),
+                    breadcrumb: vec![section_key, "Global settings".to_string()],
+                };
+                return Ok(());
+            }
+
+            let type_name = map_path.rsplit('.').next().unwrap_or(&map_path).to_string();
             self.load_aliases(&map_path).await?;
             self.screen = Screen::AliasList {
                 section_idx,
