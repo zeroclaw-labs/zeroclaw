@@ -26,6 +26,7 @@ cli-config-about = 管理 ZeroClaw 配置
 cli-update-about = 检查并应用 ZeroClaw 更新
 cli-self-test-about = 运行诊断自检
 cli-completions-about = 生成 shell 补全脚本
+cli-desktop-about = 启动 ZeroClaw 伴侣桌面应用
 cli-config-schema-about = 将完整的配置 JSON Schema 输出到 stdout
 cli-config-list-about = 列出所有配置属性及其当前值
 cli-config-get-about = 获取配置属性值
@@ -126,6 +127,7 @@ cli-models-set-about = 在配置中设置默认模型
 cli-models-status-about = 显示当前模型配置和缓存状态
 cli-doctor-models-about = 探测各提供商的模型目录并报告可用性
 cli-doctor-traces-about = 查询运行时跟踪事件（工具诊断和模型回复）
+cli-doctor-update-context-windows-about = 从提供商的 /models 端点更新 config.toml 中的 context_window
 cli-hardware-discover-about = 枚举 USB 设备并显示已知开发板
 cli-hardware-introspect-about = 通过序列号或设备路径检视设备
 cli-hardware-info-about = 通过 ST-Link 使用 probe-rs 经 USB 获取芯片信息
@@ -301,6 +303,16 @@ cli-completions-long-about =
     source <(zeroclaw completions bash)
     zeroclaw completions zsh > ~/.zfunc/_zeroclaw
     zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish
+cli-desktop-long-about =
+    启动 ZeroClaw 配套桌面应用。
+
+    配套应用是一个轻量级的菜单栏 / 系统托盘应用程序，它连接到与 CLI 相同的网关。它提供对仪表板、状态监控和设备配对的快速访问。
+
+    使用 --install 下载适用于您平台的预构建配套应用。
+
+    示例：
+    zeroclaw desktop              # 启动配套应用
+    zeroclaw desktop --install    # 下载并安装
 channel-needs-quickstart-reply = 此代理尚未完全设置。操作员需要先运行 Quickstart，然后我才能回复。
 channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web 已配置，但未编译 'whatsapp-web' 功能。
 channel-whatsapp-web-feature-missing-build = 使用以下命令构建/运行：cargo build --features whatsapp-web
@@ -381,6 +393,9 @@ cli-skills-create-hint = {"  "}创建一个: mkdir -p ~/.zeroclaw/workspace/skil
 cli-skills-install-hint = {"  "}或安装: zeroclaw skills install <source>
 cli-skills-installed-header = 已安装的技能 ({$count}):
 cli-skills-tags = 标签:  {$tags}
+cli-skills-skipped-header = 已跳过 ({$count}):
+cli-skills-skipped-reason = {"    "}原因: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}在 zeroclaw 配置中设置 `skills.allow_scripts = true` 以启用它。
 cli-sop-none = 未找到 SOP。
 cli-sop-create-hint = {"  "}创建一个: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}然后添加 SOP.toml 和 SOP.md
@@ -588,6 +603,10 @@ cli-status-service-stopped = 🔴 服务：       已停止
 cli-status-channels = 通道：
 cli-status-cli-always = {"  "}CLI:      ✅ 始终
 cli-status-peripherals = 外设：
+cli-desktop-download = 下载 ZeroClaw 配套应用：
+cli-desktop-homebrew = 或通过 Homebrew 安装（即将推出）：
+cli-desktop-linux-pkg = {"  "}下载适合您架构的 .deb 或 .AppImage。
+cli-desktop-launching = 正在启动 ZeroClaw 配套应用...
 cli-status-version = 版本：     {$v}
 cli-status-workspace = 工作区：   {$v}
 cli-status-config = 配置：      {$v}
@@ -626,6 +645,9 @@ cli-status-word-none = （无）
 cli-status-word-configured = 已配置
 cli-status-word-not-configured = 未配置
 cli-status-channel-not-compiled = 🚫 已配置，未编译
+cli-desktop-not-installed = 未安装 ZeroClaw 配套应用。
+cli-desktop-blurb1 = 该配套应用是一个轻量级菜单栏应用，
+cli-desktop-blurb2 = 它连接到与 CLI 相同的网关。
 cli-config-all-configured = 所有部分均已配置。
 cli-config-schema-current = 配置已为当前架构版本。
 cli-config-applied-ops = 已应用 {$count} 个操作：
@@ -652,6 +674,7 @@ cli-warn-crypto-provider = 警告：安装默认加密提供程序失败：{$err
 cli-error-label = {"   "}错误：{$err}
 cli-warn-cost-usage = {"  "}⚠ 无法加载成本使用情况：{$err}
 cli-warn-cost-tracker = {"  "}⚠ 无法初始化成本跟踪器：{$err}
+cli-desktop-download-at = {"  "}下载地址：{$url}
 cli-config-legend = 图例：💉 env 已覆盖  🔒 密钥
 cli-config-secret-set = {$path} 已设置（加密密钥——不显示值）
 cli-config-secret-unset = {$path} 未设置（加密密钥）
@@ -770,3 +793,17 @@ cli-bundle-warn-archive = 警告：bundle 目录归档失败：{$error}
 cli-bundle-deleted = 已删除 skill_bundles.{$alias}（已从 {$count} 个 agent 中移除）
 cli-bundle-warn-move = 警告：bundle 目录移动失败：{$error}
 cli-bundle-renamed = 已重命名 skill_bundles.{$from} → skill_bundles.{$to}
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
+cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
+cli-agent-context-bar-unknown = ctx: 未知 / {$max}
+cli-doctor-ctxwin-already-set = {$provider_ref}: 已有 context_window = {$ctx}
+cli-doctor-ctxwin-no-model = {$provider_ref}: 未配置模型，跳过
+cli-doctor-ctxwin-would-set = {$provider_ref}: 将设置 context_window = {$ctx} (试运行)
+cli-doctor-ctxwin-set = {$provider_ref}: 已设置 context_window = {$ctx}
+cli-doctor-ctxwin-not-found = {$provider_ref}: 找不到要更新的条目
+cli-doctor-ctxwin-fetch-failed = {$provider_ref}: 提供商未暴露上下文窗口或获取失败
+cli-doctor-ctxwin-saved = 已保存 {$updated} 项更新到 config.toml
+cli-doctor-ctxwin-dry-run = 试运行完成 — 未写入更改。去掉 --dry-run 以应用。
+cli-doctor-ctxwin-none = 无需更新。
+cli-doctor-ctxwin-write-failed = {$provider_ref}: 写入 context_window 失败: {$error}

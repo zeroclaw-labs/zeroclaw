@@ -1,11 +1,13 @@
 pub mod active_scope;
 pub mod approval;
 pub mod audit;
+pub mod capability;
 pub mod condition;
 pub mod dispatch;
 pub mod engine;
 pub mod executor;
 pub mod metrics;
+pub mod procedural_memory;
 pub mod route;
 pub mod rundata;
 pub mod schema;
@@ -15,13 +17,16 @@ pub mod store;
 pub mod types;
 
 pub use audit::SopAuditLogger;
+pub use capability::{
+    CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability, SopCapabilityRegistry,
+};
 pub use engine::{MaintenanceSummary, SopEngine};
 pub use metrics::SopMetricsCollector;
 pub use scope::StepToolScope;
 pub use step_contract::{StepFailure, StepRouting};
 pub use store::{
-    ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, SopEventRecord, SopRunStore,
-    SqliteRunStore, StoreError, build_run_store,
+    ClaimToken, PersistedRun, ProposalKind, ProposalRecord, ProposalStatus, SopEventRecord,
+    SopRunStore, SqliteRunStore, StoreError, build_run_store,
 };
 #[allow(unused_imports)]
 pub use types::{
@@ -172,6 +177,8 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
     let steps = if md_path.exists() {
         let md_content = std::fs::read_to_string(&md_path)?;
         parse_steps(&md_content)
+    } else if !manifest.steps.is_empty() {
+        normalize_manifest_steps(manifest.steps)
     } else {
         Vec::new()
     };
@@ -194,7 +201,7 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
         execution_mode.unwrap_or(default_execution_mode)
     };
 
-    Ok(Sop {
+    let sop = Sop {
         name,
         description,
         version,
@@ -206,7 +213,24 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
         max_concurrent,
         location: Some(sop_dir.to_path_buf()),
         deterministic,
-    })
+    };
+    capability::SopCapabilityRegistry::with_builtins().validate_sop(&sop)?;
+    Ok(sop)
+}
+
+fn normalize_manifest_steps(mut steps: Vec<SopStep>) -> Vec<SopStep> {
+    for (idx, step) in steps.iter_mut().enumerate() {
+        if step.number == 0 {
+            step.number = u32::try_from(idx).unwrap_or(u32::MAX).saturating_add(1);
+        }
+        if step.title.is_empty() {
+            step.title = step
+                .capability
+                .clone()
+                .unwrap_or_else(|| step.kind.to_string());
+        }
+    }
+    steps
 }
 
 // ── Markdown step parser ────────────────────────────────────────
@@ -285,17 +309,16 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
                 }
             } else if bullet.starts_with("kind:") {
                 if let Some(val) = bullet.strip_prefix("kind:") {
-                    let val = val.trim();
-                    if val.eq_ignore_ascii_case("checkpoint") {
-                        current.kind = SopStepKind::Checkpoint;
-                    } else {
-                        current.kind = SopStepKind::Execute;
-                    }
+                    current.kind = parse_step_kind(val);
                 }
+            } else if let Some(val) = bullet.strip_prefix("capability:") {
+                current.capability = Some(val.trim().to_string());
+            } else if let Some(val) = bullet.strip_prefix("with:") {
+                current.capability_input = Some(parse_value_fragment(val.trim()));
             } else if let Some(val) = bullet.strip_prefix("input:") {
-                ensure_schema(&mut current.schema).input = Some(parse_schema_fragment(val.trim()));
+                ensure_schema(&mut current.schema).input = Some(parse_value_fragment(val.trim()));
             } else if let Some(val) = bullet.strip_prefix("output:") {
-                ensure_schema(&mut current.schema).output = Some(parse_schema_fragment(val.trim()));
+                ensure_schema(&mut current.schema).output = Some(parse_value_fragment(val.trim()));
             } else if let Some(val) = bullet.strip_prefix("when:") {
                 let val = val.trim();
                 if !val.is_empty() {
@@ -348,6 +371,8 @@ struct StepParseState {
     tools: Vec<String>,
     requires_confirmation: bool,
     kind: SopStepKind,
+    capability: Option<String>,
+    capability_input: Option<serde_json::Value>,
     schema: Option<StepSchema>,
     scope: Option<StepToolScope>,
     routing: StepRouting,
@@ -374,6 +399,8 @@ impl StepParseState {
             suggested_tools: std::mem::take(&mut self.tools),
             requires_confirmation: self.requires_confirmation,
             kind: self.kind,
+            capability: self.capability.take(),
+            capability_input: self.capability_input.take(),
             schema: self.schema.take(),
             scope: self.scope.take(),
             routing: std::mem::take(&mut self.routing),
@@ -399,8 +426,26 @@ fn parse_u32_list(value: &str) -> Vec<u32> {
         .collect()
 }
 
-fn parse_schema_fragment(value: &str) -> serde_json::Value {
-    serde_json::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.into()))
+fn parse_step_kind(value: &str) -> SopStepKind {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "checkpoint" | "approval" => SopStepKind::Checkpoint,
+        "capability" => SopStepKind::Capability,
+        _ => SopStepKind::Execute,
+    }
+}
+
+fn parse_value_fragment(value: &str) -> serde_json::Value {
+    if let Ok(json) = serde_json::from_str(value) {
+        return json;
+    }
+    let wrapped = format!("value = {value}");
+    if let Ok(toml_value) = toml::from_str::<toml::Value>(&wrapped)
+        && let Some(value) = toml_value.get("value")
+        && let Ok(json) = serde_json::to_value(value)
+    {
+        return json;
+    }
+    serde_json::Value::String(value.into())
 }
 
 fn parse_step_failure(value: &str) -> StepFailure {
@@ -575,5 +620,26 @@ mod tests {
         assert_eq!(step.routing.depends_on, vec![1, 2]);
         assert_eq!(step.on_failure, StepFailure::Retry { max: 2 });
         assert_eq!(step.mode, Some(SopExecutionMode::Auto));
+    }
+
+    #[test]
+    fn parse_steps_populates_capability_bullets() {
+        let steps = parse_steps(
+            r#"
+## Steps
+1. **Status** - Check the repository.
+   - kind: capability
+   - capability: git.status
+   - with: { require_clean = true }
+"#,
+        );
+
+        let step = &steps[0];
+        assert_eq!(step.kind, SopStepKind::Capability);
+        assert_eq!(step.capability.as_deref(), Some("git.status"));
+        assert_eq!(
+            step.capability_input.clone(),
+            Some(json!({"require_clean": true}))
+        );
     }
 }

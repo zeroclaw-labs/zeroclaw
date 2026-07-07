@@ -2047,7 +2047,6 @@ fn map_tool_kind(name: &str) -> &'static str {
         | "microsoft365"
         | "model_routing_config"
         | "model_switch"
-        | "pdf_read"
         | "project_intel"
         | "proxy_config"
         | "read_skill"

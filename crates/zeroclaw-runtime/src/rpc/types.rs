@@ -891,6 +891,11 @@ rpc_type! {
         pub reason_kind: String,
         /// Human-readable detail (the audit summary / error text).
         pub reason: String,
+        /// True when the secure-default script policy is the blocker, so the
+        /// dashboard can surface the `skills.allow_scripts = true` remediation
+        /// without parsing `reason`. Additive; old clients ignore it. (#7963)
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub scripts_blocked: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub directory: Option<String>,
     }

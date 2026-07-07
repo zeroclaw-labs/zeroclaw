@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex};
 use zeroclaw_config::schema::{SopConfig, SopRunStoreBackend};
 
 pub use model::{
-    ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, RetentionPolicy, SOP_STORE_VERSION,
-    SopEventRecord,
+    ClaimToken, PersistedRun, ProposalKind, ProposalRecord, ProposalStatus, RetentionPolicy,
+    SOP_STORE_VERSION, SopEventRecord,
 };
 pub use sqlite::SqliteRunStore;
 
@@ -51,10 +51,10 @@ pub trait SopRunStore: Send + Sync {
     fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError>;
     /// Single run by id (latest revision), terminal or not.
     fn load_run(&self, run_id: &str) -> Result<Option<PersistedRun>, StoreError>;
-    /// `completed_at` of the most recently completed terminal run for `sop_name`,
-    /// or `None` if that SOP has no terminal run with a recorded completion. Drives
-    /// the cooldown check off the shared store so every engine holder observes the
-    /// same last-finished marker (not just the engine that ran the SOP).
+    /// `completed_at` of the most recently successful terminal run for `sop_name`,
+    /// or `None` if that SOP has no completed run with a recorded completion.
+    /// Drives the cooldown check off the shared store so every engine holder
+    /// observes the same success marker (not just the engine that ran the SOP).
     fn last_terminal_completed_at(&self, sop_name: &str) -> Result<Option<String>, StoreError>;
 
     // ── CAS claim primitive (concurrency-control) ──
@@ -318,12 +318,14 @@ impl SopRunStore for InMemoryRunStore {
 
     fn last_terminal_completed_at(&self, sop_name: &str) -> Result<Option<String>, StoreError> {
         let g = self.lock()?;
-        // Max `completed_at` over terminal runs for this SOP. Timestamps are
-        // ISO-8601 UTC ("...Z"), which sort lexically in completion order.
+        // Max `completed_at` over successful terminal runs for this SOP.
+        // Timestamps are ISO-8601 UTC ("...Z"), which sort lexically in
+        // completion order.
         Ok(g.terminal
             .iter()
             .filter_map(|id| g.runs.get(id))
             .filter(|r| r.run.sop_name == sop_name)
+            .filter(|r| r.run.status == crate::sop::types::SopRunStatus::Completed)
             .filter_map(|r| r.run.completed_at.clone())
             .max())
     }
@@ -578,13 +580,20 @@ mod tests {
     fn proposal(id: &str, status: ProposalStatus) -> ProposalRecord {
         ProposalRecord {
             id: id.to_string(),
+            kind: ProposalKind::Update,
             status,
             source_run_id: None,
             sop_name: "deploy".to_string(),
             target_content_hash: None,
+            manifest_toml: "[sop]\nname = \"deploy\"\ndescription = \"Deploy\"\n".to_string(),
+            procedure_markdown: "## Steps\n\n1. **Deploy** - Do it.\n".to_string(),
             provenance: json!({}),
             created_at: "t".to_string(),
             updated_at: "t".to_string(),
+            status_reason: None,
+            applied_at: None,
+            applied_by: None,
+            rollback_path: None,
         }
     }
 
