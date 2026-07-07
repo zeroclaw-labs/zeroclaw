@@ -109,7 +109,7 @@ impl GitForgeTool {
                     "read":   "GET repos/{repo}/issues/{number}",
                     "update": "PATCH repos/{repo}/issues/{number} {title?, body?, milestone?, assignees?}",
                     "close":  "PATCH repos/{repo}/issues/{number} {state:closed, state_reason: completed|not_planned}",
-                    "list":   "GET repos/{repo}/issues?state=open"
+                    "list":   "GET repos/{repo}/issues?state=open {state?, labels?, per_page?}"
                 },
                 "pull": {
                     "read":   "GET repos/{repo}/pulls/{number}",
@@ -117,7 +117,8 @@ impl GitForgeTool {
                     "update": "PATCH repos/{repo}/pulls/{number} {title?, body?, state?, base?} (REST cannot flip draft<->ready; use raw GraphQL for that)",
                     "close":  "PATCH repos/{repo}/pulls/{number} {state:closed}",
                     "merge":  "PUT repos/{repo}/pulls/{number}/merge {merge_method: merge|squash|rebase, commit_title?, commit_message?}",
-                    "list":   "GET repos/{repo}/pulls?state=open"
+                    "list":   "GET repos/{repo}/pulls?state=open {state?, labels?, per_page?}",
+                    "files":  "GET repos/{repo}/pulls/{number}/files"
                 },
                 "review": {
                     "create": "POST repos/{repo}/pulls/{number}/reviews {event: APPROVE|REQUEST_CHANGES|COMMENT, body?}",
@@ -145,6 +146,32 @@ impl GitForgeTool {
 
     fn num_arg(args: &Value, key: &str) -> Option<u64> {
         args.get(key).and_then(Value::as_u64)
+    }
+
+    /// Append optional list-filter query params. `labels` accepts a
+    /// comma-joined string or a string array; `per_page` caps the page size
+    /// (clamped to GitHub's 100 max). Unset args are simply omitted, so a bare
+    /// `pull.list` keeps its `state=open` default.
+    fn push_list_filters(qs: &mut String, args: &Value) {
+        if let Some(state) = Self::str_arg(args, "state") {
+            qs.push_str(&format!("&state={state}"));
+        }
+        let labels = Self::str_arg(args, "labels")
+            .map(str::to_string)
+            .or_else(|| {
+                args.get("labels").and_then(Value::as_array).map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+            });
+        if let Some(labels) = labels.filter(|l| !l.trim().is_empty()) {
+            qs.push_str(&format!("&labels={labels}"));
+        }
+        if let Some(per_page) = Self::num_arg(args, "per_page") {
+            qs.push_str(&format!("&per_page={}", per_page.min(100)));
+        }
     }
 
     /// Resolve a `{resource, action}` pair plus args into a planned forge call.
@@ -248,9 +275,11 @@ impl GitForgeTool {
                 label: "read issue".into(),
             }
         } else if key == ("issue", "list") {
+            let mut qs = String::from("state=open");
+            Self::push_list_filters(&mut qs, args);
             Planned {
                 method: "GET",
-                path: format!("repos/{repo}/issues?state=open"),
+                path: format!("repos/{repo}/issues?{qs}"),
                 body: None,
                 label: "list issues".into(),
             }
@@ -327,11 +356,20 @@ impl GitForgeTool {
                 label: "read pull".into(),
             }
         } else if key == ("pull", "list") {
+            let mut qs = String::from("state=open");
+            Self::push_list_filters(&mut qs, args);
             Planned {
                 method: "GET",
-                path: format!("repos/{repo}/pulls?state=open"),
+                path: format!("repos/{repo}/pulls?{qs}"),
                 body: None,
                 label: "list pulls".into(),
+            }
+        } else if key == ("pull", "files") {
+            Planned {
+                method: "GET",
+                path: format!("repos/{repo}/pulls/{}/files", need_num()?),
+                body: None,
+                label: "list pull files".into(),
             }
         } else if key == ("pull", "close") {
             let n = need_num()?;
@@ -853,6 +891,48 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("describe"));
+    }
+
+    #[tokio::test]
+    async fn pull_list_applies_filters() {
+        let mock = Arc::new(ForgeMock::new(200, json!([])));
+        let tool = tool_with(Arc::clone(&mock) as Arc<dyn Channel>);
+        let result = tool
+            .execute(json!({
+                "action": "list",
+                "resource": "pull",
+                "repo": "octo/repo",
+                "labels": ["bug", "help wanted"],
+                "per_page": 200
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "error: {:?}", result.error);
+        let req = mock.last.lock().clone().unwrap();
+        assert_eq!(req.method, "GET");
+        assert_eq!(
+            req.path,
+            "repos/octo/repo/pulls?state=open&labels=bug,help wanted&per_page=100"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_files_lists_changed_paths() {
+        let mock = Arc::new(ForgeMock::new(200, json!([{ "filename": "a.rs" }])));
+        let tool = tool_with(Arc::clone(&mock) as Arc<dyn Channel>);
+        let result = tool
+            .execute(json!({
+                "action": "files",
+                "resource": "pull",
+                "repo": "octo/repo",
+                "number": 7
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "error: {:?}", result.error);
+        let req = mock.last.lock().clone().unwrap();
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.path, "repos/octo/repo/pulls/7/files");
     }
 
     #[test]
