@@ -12,20 +12,28 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use zeroclaw_runtime::rpc::types::{
     AgentSkillEntry, AgentSkillsResult, DroppedSkillEntry, ShadowedSkillEntry, SkillBundleEntry,
     SkillListEntry, SkillsBundlesResult, SkillsListResult, SkillsReadResult,
 };
 use zeroclaw_runtime::skills::{
     DroppedSkill, EffectiveSkill, RemoveMode, ScaffoldOptions, ServiceError, SkillDropReason,
-    SkillFrontmatter, SkillOrigin, SkillsService,
+    SkillFrontmatter, SkillOrigin, SkillsService, SlashOptionKindDescriptor,
 };
 
 use super::AppState;
 use super::api::require_auth;
 
 // ── HTTP-specific request shapes (not shared) ───────────────────────
+
+/// Response for `GET /api/skills/slash-option-kinds`: the canonical registry,
+/// built by walking `SlashOptionKind::ALL`.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct SlashOptionKindsResult {
+    pub kinds: Vec<SlashOptionKindDescriptor>,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SkillCreateBody {
@@ -57,6 +65,22 @@ pub struct DeleteQuery {
 }
 
 // ── Handlers ────────────────────────────────────────────────────────
+
+/// `GET /api/skills/slash-option-kinds` — the canonical typed-slash-option kind
+/// registry (kind list + per-kind constraint capabilities), built by walking
+/// `SlashOptionKind::ALL`. Surfaces read this instead of restating the kind set.
+pub async fn handle_slash_option_kinds(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    Json(SlashOptionKindsResult {
+        kinds: zeroclaw_runtime::skills::slash_option_kinds(),
+    })
+    .into_response()
+}
 
 /// `GET /api/skills/bundles`
 pub async fn handle_list_bundles(State(state): State<AppState>, headers: HeaderMap) -> Response {

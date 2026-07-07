@@ -66,6 +66,11 @@ sender_desc = "the sender's email address"
 sender_example = "sender@example.com"
 
 [[channel]]
+key = "git"
+sender_desc = "the forge username (login) of the comment author"
+sender_example = "octocat"
+
+[[channel]]
 key = "nostr"
 sender_desc = "the sender's hex public key"
 sender_example = "npub1exampleexampleexampleexample"
