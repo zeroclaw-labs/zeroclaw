@@ -2171,12 +2171,9 @@ mod tests {
             "identity",
             "signing_key",
             "base_url",
-            // Realtime-call config is collected in Quickstart too.
+            // Realtime calls: just the toggle + the OpenAI key.
             "realtime_enabled",
             "realtime_api_key",
-            "realtime_model",
-            "realtime_voice",
-            "realtime_fallback",
         ] {
             assert!(
                 keys.contains(&expected),

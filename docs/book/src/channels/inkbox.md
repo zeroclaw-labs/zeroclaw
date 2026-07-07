@@ -26,8 +26,7 @@ gateway.
 
 ## Setup
 
-The fastest path is the onboarding wizard. Run quickstart, open the **Channels**
-step, and pick **Inkbox**:
+Run quickstart, open the **Channels** step, and pick **Inkbox**:
 
 <div class="os-tabs-src">
 
@@ -39,19 +38,33 @@ zeroclaw quickstart
 
 </div>
 
-The wizard either creates a fresh agent identity for you (self-signup with email
-verification) or validates an Inkbox API key you already hold, then offers to
-provision a phone number, mint a webhook signing key, and enable OpenAI Realtime
-calls. It writes the `[channels.inkbox.<alias>]` block and binds it to the agent.
+Quickstart shows Inkbox's schema-derived fields and writes what you enter into a
+`[channels.inkbox.<alias>]` block bound to the agent, the same way every other
+channel is onboarded. It does not create an identity, provision a number, verify
+email, or mint a key for you: get an **agent-scoped API key** and its **identity
+handle** from the [Inkbox console](https://inkbox.ai) first, then paste them here.
 
-To configure by hand instead, set the three essentials (an API key, the agent
-identity handle, and a recommended webhook signing key):
+The fields it collects (everything after `identity` is optional, with sensible
+defaults pre-filled):
+
+| Field | Required | Notes |
+|---|---|---|
+| `api_key` | yes (secret) | agent-scoped Inkbox API key for this identity |
+| `identity` | yes | the agent handle this gateway runs as |
+| `signing_key` | no (secret) | webhook signing key (`whsec_...`) for inbound verification |
+| `base_url` | no | defaults to `https://inkbox.ai` |
+| `realtime_enabled`, `realtime_api_key` | no | turn on OpenAI Realtime calls and the OpenAI key (see below) |
+
+Creating the identity, provisioning a phone number, minting a signing key, and
+enabling iMessage happen in the Inkbox console, not the CLI.
+
+To configure by hand instead, set the essentials directly:
 
 ```toml
 [channels.inkbox.default]
 enabled = true
 identity = "on-call-agent"   # the agent handle this gateway runs as
-# api_key and signing_key are secrets — set them masked (see below)
+# api_key and signing_key are secrets; set them masked (see below)
 ```
 
 ## How inbound traffic arrives

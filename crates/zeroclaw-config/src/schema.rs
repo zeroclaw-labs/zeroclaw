@@ -13091,17 +13091,14 @@ pub struct InkboxConfig {
     pub realtime_api_key: String,
     /// Realtime model id. Defaults to `gpt-realtime-2`.
     #[tab(Connection)]
-    #[quickstart(optional)]
     #[serde(default = "default_inkbox_realtime_model")]
     pub realtime_model: String,
     /// Realtime voice. Defaults to `cedar`.
     #[tab(Connection)]
-    #[quickstart(optional)]
     #[serde(default = "default_inkbox_realtime_voice")]
     pub realtime_voice: String,
     /// Fall back to Inkbox STT/TTS when the realtime bridge can't connect.
     #[tab(Behavior)]
-    #[quickstart(optional)]
     #[serde(default = "default_true")]
     pub realtime_fallback: bool,
 }
