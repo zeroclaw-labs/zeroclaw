@@ -5,6 +5,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::media::MediaAttachment;
 
+/// Reserved `ChannelMessage.subject` prefix that the git/forge channel uses
+/// to label SOP-ingress events for human-readable logs and reply threading.
+/// Routing is NOT keyed on this (see `ChannelMessage::internal_sop_event`);
+/// it lives here so any channel that fills `subject` from user-controlled
+/// data (email) can keep this reserved namespace out of inbound subjects.
+pub const CHANNEL_SOP_SUBJECT_PREFIX: &str = "zeroclaw:sop-event:";
+
 // ── Channel approval types ──────────────────────────────────────
 
 /// Compact description of a tool call presented to the user for approval.
@@ -73,9 +80,19 @@ pub struct ChannelMessage {
     pub attachments: Vec<MediaAttachment>,
     /// Email subject for reply threading.
     pub subject: Option<String>,
+    /// Internal SOP-ingress marker carrying the event topic, set ONLY by the
+    /// git/forge channel producer. The orchestrator routes a message into the
+    /// SOP engine when (and only when) this is `Some`, so the decision can
+    /// never be driven by user-controlled fields like `subject` or `content`.
+    /// `None` for every inbound conversational message. Not part of any wire
+    /// format - this never round-trips through serde.
+    pub internal_sop_event: Option<String>,
     /// When true, the orchestrator records this as context only and must not
     /// start an agent turn or emit visible channel side effects.
     pub passive_context: bool,
+    /// Channel adapter observed that this inbound message explicitly addressed
+    /// the bot through a platform-level signal such as an @mention.
+    pub explicitly_addressed: bool,
     /// Controls whether conversation history is sender-scoped or room-scoped.
     pub conversation_scope: ChannelConversationScope,
 }
@@ -642,6 +659,7 @@ mod tests {
         assert!(msg.attachments.is_empty());
         assert!(msg.subject.is_none());
         assert!(!msg.passive_context);
+        assert!(!msg.explicitly_addressed);
         assert_eq!(msg.conversation_scope, ChannelConversationScope::Sender);
     }
 
