@@ -127,6 +127,7 @@ cli-models-set-about = 在配置中设置默认模型
 cli-models-status-about = 显示当前模型配置和缓存状态
 cli-doctor-models-about = 探测各提供商的模型目录并报告可用性
 cli-doctor-traces-about = 查询运行时跟踪事件（工具诊断和模型回复）
+cli-doctor-update-context-windows-about = 从提供商的 /models 端点更新 config.toml 中的 context_window
 cli-hardware-discover-about = 枚举 USB 设备并显示已知开发板
 cli-hardware-introspect-about = 通过序列号或设备路径检视设备
 cli-hardware-info-about = 通过 ST-Link 使用 probe-rs 经 USB 获取芯片信息
@@ -392,6 +393,9 @@ cli-skills-create-hint = {"  "}创建一个: mkdir -p ~/.zeroclaw/workspace/skil
 cli-skills-install-hint = {"  "}或安装: zeroclaw skills install <source>
 cli-skills-installed-header = 已安装的技能 ({$count}):
 cli-skills-tags = 标签:  {$tags}
+cli-skills-skipped-header = 已跳过 ({$count}):
+cli-skills-skipped-reason = {"    "}原因: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}在 zeroclaw 配置中设置 `skills.allow_scripts = true` 以启用它。
 cli-sop-none = 未找到 SOP。
 cli-sop-create-hint = {"  "}创建一个: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}然后添加 SOP.toml 和 SOP.md
@@ -789,3 +793,17 @@ cli-bundle-warn-archive = 警告：bundle 目录归档失败：{$error}
 cli-bundle-deleted = 已删除 skill_bundles.{$alias}（已从 {$count} 个 agent 中移除）
 cli-bundle-warn-move = 警告：bundle 目录移动失败：{$error}
 cli-bundle-renamed = 已重命名 skill_bundles.{$from} → skill_bundles.{$to}
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
+cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
+cli-agent-context-bar-unknown = ctx: 未知 / {$max}
+cli-doctor-ctxwin-already-set = {$provider_ref}: 已有 context_window = {$ctx}
+cli-doctor-ctxwin-no-model = {$provider_ref}: 未配置模型，跳过
+cli-doctor-ctxwin-would-set = {$provider_ref}: 将设置 context_window = {$ctx} (试运行)
+cli-doctor-ctxwin-set = {$provider_ref}: 已设置 context_window = {$ctx}
+cli-doctor-ctxwin-not-found = {$provider_ref}: 找不到要更新的条目
+cli-doctor-ctxwin-fetch-failed = {$provider_ref}: 提供商未暴露上下文窗口或获取失败
+cli-doctor-ctxwin-saved = 已保存 {$updated} 项更新到 config.toml
+cli-doctor-ctxwin-dry-run = 试运行完成 — 未写入更改。去掉 --dry-run 以应用。
+cli-doctor-ctxwin-none = 无需更新。
+cli-doctor-ctxwin-write-failed = {$provider_ref}: 写入 context_window 失败: {$error}
