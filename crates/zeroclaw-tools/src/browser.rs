@@ -1064,6 +1064,75 @@ impl BrowserTool {
         Ok(())
     }
 
+    /// ComputerUse backend dispatches to a sidecar before `parse_browser_action`
+    /// runs, so `execute_action`'s `validate_screenshot_path` call would
+    /// never see the screenshot `path`. This hook applies the same workspace
+    /// policy / runtime-config / symlink guards to the *raw* `args` JSON
+    /// before any of its params cross the sidecar boundary, and substitutes
+    /// the canonical resolved path back into the args so the sidecar
+    /// receives the same hardened string the other backends use.
+    ///
+    /// Non-screenshot actions pass through unchanged. Screenshot actions
+    /// with no `path` (inline PNG) also pass through unchanged — the sidecar
+    /// never receives a destination string in that case, so there is no
+    /// unverified path to gate.
+    async fn validate_screenshot_path_for_computer_use(
+        &self,
+        action_str: &str,
+        mut args: Value,
+    ) -> anyhow::Result<Value> {
+        if action_str != "screenshot" {
+            return Ok(args);
+        }
+        // Inline PNG (no `path` field, or `path == null`) — nothing to gate.
+        let has_path = args
+            .as_object()
+            .and_then(|obj| obj.get("path"))
+            .map(|v| match v {
+                Value::Null => false,
+                Value::String(s) => !s.is_empty(),
+                _ => true,
+            })
+            .unwrap_or(false);
+        if !has_path {
+            return Ok(args);
+        }
+
+        // Parse a BrowserAction so we can reuse the same validator that
+        // `execute_action` calls for agent-browser / rust-native. The
+        // borrow on `args` ends here.
+        let mut action = match parse_browser_action("screenshot", &args) {
+            Ok(a) => a,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "browser: computer_use screenshot args failed to parse"
+                );
+                return Err(e);
+            }
+        };
+
+        self.validate_screenshot_path(&mut action).await?;
+
+        // Substitute the canonical path back into the args so the sidecar
+        // sees the same string we just verified, closing the
+        // validate-then-forward TOCTOU window. Drop `action` before
+        // borrowing `args` mutably.
+        let rewritten_path = if let BrowserAction::Screenshot { path: Some(p), .. } = action {
+            Some(p)
+        } else {
+            None
+        };
+        if let Some(p) = rewritten_path
+            && let Some(obj) = args.as_object_mut()
+        {
+            obj.insert("path".to_string(), Value::String(p));
+        }
+        Ok(args)
+    }
+
     async fn execute_action(
         &self,
         mut action: BrowserAction,
@@ -1274,7 +1343,23 @@ impl Tool for BrowserTool {
         }
 
         if backend == ResolvedBackend::ComputerUse {
-            return self.execute_computer_use_action(action_str, &args).await;
+            // Screenshot destination paths must clear the same workspace
+            // policy / runtime-config / symlink guards that
+            // `validate_screenshot_path` applies to agent-browser and
+            // rust-native, *before* any params leave the browser tool
+            // for the sidecar. Otherwise the public `screenshot` `path`
+            // parameter can carry an out-of-workspace or
+            // runtime-config-targeting string across the sidecar
+            // boundary unverified.
+            //
+            // Copy `action_str` to a `String` before moving `args` into
+            // the helper, otherwise the `&str` borrow of `args.get("action")`
+            // is still live at the move site.
+            let action_str = action_str.to_owned();
+            let args = self
+                .validate_screenshot_path_for_computer_use(&action_str, args)
+                .await?;
+            return self.execute_computer_use_action(&action_str, &args).await;
         }
 
         if is_computer_use_only_action(action_str) {
@@ -3103,26 +3188,33 @@ mod tests {
         //         <tmp>/ws/            (workspace_dir)
         //
         // runtime_config_dir is `workspace_dir.parent().canonicalize()` = `<tmp>`.
-        // To land a screenshot target *inside* `<tmp>` while still passing
-        // `is_resolved_path_allowed`, we add `<tmp>` to `allowed_roots` and
-        // ask for the relative path `../config.toml`. That resolves to
-        // `<tmp>/config.toml`, whose parent is `<tmp>` — matching the
-        // runtime_config_dir — and whose file name is the protected
-        // `config.toml`. The runtime_config guard must reject it.
+        // We add `<tmp>` to `allowed_roots` so an absolute path inside it
+        // passes `is_resolved_path_allowed`, and we pass `<tmp>/config.toml`
+        // as an *absolute* path. That path does NOT contain a `..` component,
+        // so `is_path_allowed` accepts it, `is_resolved_path_allowed` accepts
+        // it (because `<tmp>` is in `allowed_roots`), and the file's parent
+        // matches the runtime_config_dir — so the runtime-config guard must
+        // reject it. (Earlier version used `../config.toml`, which the
+        // string-level traversal check rejected before reaching this guard.)
         let ws = tmp.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
+        let tmp_canon = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { tokio::fs::canonicalize(tmp.path()).await })
+            .unwrap();
 
         let security = Arc::new(SecurityPolicy {
             workspace_dir: ws.clone(),
             workspace_only: true,
-            allowed_roots: vec![tmp.path().to_path_buf()],
+            allowed_roots: vec![tmp_canon.clone()],
             ..Default::default()
         });
         let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
 
         let rt = tokio::runtime::Runtime::new().unwrap();
+        let target = tmp_canon.join("config.toml");
         let mut action = BrowserAction::Screenshot {
-            path: Some("../config.toml".into()),
+            path: Some(target.to_string_lossy().to_string()),
             full_page: false,
         };
         let err = rt
@@ -3161,5 +3253,172 @@ mod tests {
         };
         rt.block_on(tool.validate_screenshot_path(&mut action))
             .expect("existing regular file inside workspace should be accepted");
+    }
+
+    // ── ComputerUse dispatch hook (round-3) ────────────────────────
+    //
+    // `BrowserTool::execute` previously returned at the ComputerUse backend
+    // branch *before* `parse_browser_action` / `validate_screenshot_path`
+    // ran, so a public `screenshot` `path` parameter crossed the sidecar
+    // boundary unverified. The new
+    // `validate_screenshot_path_for_computer_use` hook applies the same
+    // workspace / runtime-config / symlink guards the other backends use,
+    // and substitutes the canonical resolved path back into the args so
+    // the sidecar sees the same string we just verified. These tests pin
+    // that contract directly at the hook layer (no sidecar required).
+
+    #[test]
+    fn computer_use_screenshot_hook_rejects_traversal_path() {
+        // Out-of-workspace screenshot path must be rejected *before* the
+        // hook returns the rewritten args to the ComputerUse dispatch.
+        // A regression that drops the hook would forward `../etc/passwd`
+        // into the sidecar payload untouched.
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let args = json!({
+            "action": "screenshot",
+            "path": "../etc/passwd",
+            "full_page": false,
+        });
+        let err = rt
+            .block_on(tool.validate_screenshot_path_for_computer_use("screenshot", args))
+            .unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("not allowed") || msg.contains("workspace") || msg.contains("path"),
+            "expected traversal rejection, got: {err}",
+        );
+    }
+
+    #[test]
+    fn computer_use_screenshot_hook_rejects_runtime_config_path() {
+        // Mirrors `validate_screenshot_path_rejects_runtime_config_target`
+        // but at the ComputerUse hook: an absolute path whose parent
+        // matches a runtime_config_dir and whose file name is a protected
+        // config name must be rejected *before* the args cross the sidecar
+        // boundary. A regression that drops the hook would forward
+        // `/tmp/config.toml` into the sidecar payload untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let tmp_canon = rt_canonicalize(tmp.path());
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: ws,
+            workspace_only: true,
+            allowed_roots: vec![tmp_canon.clone()],
+            ..Default::default()
+        });
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let target = tmp_canon.join("config.toml");
+        let args = json!({
+            "action": "screenshot",
+            "path": target.to_string_lossy().to_string(),
+            "full_page": false,
+        });
+        let err = rt
+            .block_on(tool.validate_screenshot_path_for_computer_use("screenshot", args))
+            .unwrap_err();
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("runtime config") || msg.contains("config"),
+            "expected runtime config rejection, got: {err}",
+        );
+    }
+
+    #[test]
+    fn computer_use_screenshot_hook_substitutes_canonical_path() {
+        // Allowed screenshot path inside the workspace must be rewritten
+        // to its canonical form so the sidecar sees the same string we
+        // verified. Without this rewrite, the sidecar would receive a
+        // user-controlled path with no policy gate between validation
+        // and write.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_path_buf();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: ws.clone(),
+            workspace_only: true,
+            ..Default::default()
+        });
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let args = json!({
+            "action": "screenshot",
+            "path": "page.png",
+            "full_page": false,
+        });
+        let rewritten = rt
+            .block_on(tool.validate_screenshot_path_for_computer_use("screenshot", args))
+            .expect("allowed workspace screenshot must be accepted");
+        let rewritten_path = rewritten
+            .get("path")
+            .and_then(|v| v.as_str())
+            .expect("path must be present and a string after rewrite");
+        let expected = ws
+            .canonicalize()
+            .unwrap_or_else(|_| ws.clone())
+            .join("page.png");
+        assert_eq!(
+            rewritten_path,
+            expected.to_string_lossy().as_ref(),
+            "ComputerUse screenshot hook must substitute the canonical resolved path"
+        );
+    }
+
+    #[test]
+    fn computer_use_screenshot_hook_passthrough_for_non_screenshot_actions() {
+        // Non-screenshot actions must pass through with no rewrite —
+        // only the screenshot action has a `path` field that needs
+        // gating. A regression that runs validation on every action
+        // would corrupt unrelated params (click selector, open url, ...).
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let args = json!({
+            "action": "open",
+            "url": "https://example.com",
+        });
+        let out = rt
+            .block_on(tool.validate_screenshot_path_for_computer_use("open", args.clone()))
+            .expect("non-screenshot actions must not fail the hook");
+        assert_eq!(out, args, "non-screenshot args must be returned unchanged");
+    }
+
+    #[test]
+    fn computer_use_screenshot_hook_noop_for_inline_png() {
+        // Screenshot with no `path` (inline PNG return) must pass through
+        // untouched — the sidecar never receives a destination string in
+        // that case, so there is no unverified path to gate. A regression
+        // that tries to canonicalize a missing path would crash or corrupt
+        // the args.
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let args = json!({
+            "action": "screenshot",
+            "full_page": false,
+        });
+        let out = rt
+            .block_on(tool.validate_screenshot_path_for_computer_use("screenshot", args.clone()))
+            .expect("inline-PNG screenshot must not fail the hook");
+        assert_eq!(out, args, "no-path screenshot must be returned unchanged");
+    }
+
+    // Helper used only by the ComputerUse hook tests above — keeps the
+    // test bodies focused on the assertion and avoids repeating the
+    // runtime boilerplate.
+    fn rt_canonicalize(path: &std::path::Path) -> std::path::PathBuf {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { tokio::fs::canonicalize(path).await })
+            .unwrap()
     }
 }
