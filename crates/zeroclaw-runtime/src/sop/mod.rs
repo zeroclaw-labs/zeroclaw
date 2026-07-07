@@ -69,9 +69,16 @@ pub fn build_sop_engine(
         );
         Arc::new(store::InMemoryRunStore::new())
     });
+    // EPIC G: the approval broker (membership + quorum) resolves policies/groups
+    // from the engine's live `[sop.approval]` at use-time; a no-op route adapter
+    // until channel delivery is wired.
+    let approval_broker = Arc::new(approval::ApprovalBroker::with_route(Arc::new(
+        approval::NoopRouteAdapter,
+    )));
     let mut engine = SopEngine::new(config)
         .with_store(store)
-        .with_metrics(SopMetricsCollector::shared());
+        .with_metrics(SopMetricsCollector::shared())
+        .with_approval_broker(approval_broker);
     engine.reload(workspace_dir);
     engine.restore_runs();
     let engine = Arc::new(Mutex::new(engine));
@@ -342,6 +349,15 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
                 current.on_failure = parse_step_failure(val);
             } else if let Some(val) = bullet.strip_prefix("mode:") {
                 current.mode = Some(parse_execution_mode(val));
+            } else if let Some(val) = bullet.strip_prefix("policy:") {
+                // EPIC G: the approval-broker policy (a key in `[sop.approval].policies`)
+                // that gates this step's approval - required-group membership + quorum.
+                let val = val.trim();
+                current.policy = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.to_string())
+                };
             } else {
                 // Continuation body line
                 if !current.body.is_empty() {
@@ -382,6 +398,7 @@ struct StepParseState {
     routing: StepRouting,
     on_failure: StepFailure,
     mode: Option<SopExecutionMode>,
+    policy: Option<String>,
 }
 
 impl StepParseState {
@@ -410,6 +427,7 @@ impl StepParseState {
             routing: std::mem::take(&mut self.routing),
             on_failure: std::mem::take(&mut self.on_failure),
             mode: self.mode.take(),
+            policy: self.policy.take(),
         });
         *self = Self::default();
     }
@@ -624,6 +642,26 @@ mod tests {
         assert_eq!(step.routing.depends_on, vec![1, 2]);
         assert_eq!(step.on_failure, StepFailure::Retry { max: 2 });
         assert_eq!(step.mode, Some(SopExecutionMode::Auto));
+    }
+
+    #[test]
+    fn parse_steps_reads_policy_bullet() {
+        // EPIC G: an approval-broker policy name declared on a step in SOP.md must be
+        // carried onto the parsed step (not hard-coded to None), so the SOP.md path
+        // can express a policied gate the same way the TOML path does.
+        let steps = parse_steps(
+            r#"
+## Steps
+1. **Gate** - Requires the release group.
+   - policy: prod
+2. **Go** - Unpoliced.
+"#,
+        );
+        assert_eq!(steps[0].policy.as_deref(), Some("prod"));
+        assert_eq!(
+            steps[1].policy, None,
+            "a step with no policy bullet stays None"
+        );
     }
 
     #[test]

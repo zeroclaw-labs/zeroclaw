@@ -17,6 +17,25 @@ use crate::sop::engine::now_iso8601;
 use crate::sop::engine::{GateState, SopEngine};
 use crate::sop::types::SopRunStatus;
 
+/// True if `approval_mode` rejects this principal outright: the agent cannot
+/// self-satisfy under `OutOfBandRequired`, and an out-of-band principal cannot
+/// satisfy under `AgentTool`. Shared by `resolve_gate` and the approval
+/// broker's quorum vote-recording path (`ApprovalBroker::resolve`), which must
+/// apply this check BEFORE appending a vote - not just at the final
+/// `resolve_gate` call that reaches quorum - so a principal `approval_mode`
+/// would reject can never durably vote at all, even toward a quorum a
+/// different, valid principal later completes.
+pub(crate) fn is_rejected_by_approval_mode(
+    mode: ApprovalMode,
+    principal: &ApprovalPrincipal,
+) -> bool {
+    match mode {
+        ApprovalMode::Both => false,
+        ApprovalMode::OutOfBandRequired => !principal.is_out_of_band(),
+        ApprovalMode::AgentTool => principal.is_out_of_band(),
+    }
+}
+
 /// Resolve a waiting SOP gate. The ONLY place a `WaitingApproval` gate clears.
 pub fn resolve_gate(
     engine: &mut SopEngine,
@@ -35,13 +54,7 @@ pub fn resolve_gate(
     //    OutOfBandRequired; an out-of-band principal cannot satisfy under AgentTool.
     //    Layered ON TOP of execution_mode/priority/requires_confirmation (those
     //    already decided that the gate exists).
-    let mode = engine.config().approval_mode;
-    let rejected = match mode {
-        ApprovalMode::Both => false,
-        ApprovalMode::OutOfBandRequired => !principal.is_out_of_band(),
-        ApprovalMode::AgentTool => principal.is_out_of_band(),
-    };
-    if rejected {
+    if is_rejected_by_approval_mode(engine.config().approval_mode, &principal) {
         return Ok(ResolveOutcome::RejectedSelfApproval);
     }
 

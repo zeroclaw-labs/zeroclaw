@@ -53,6 +53,10 @@ pub struct SopEngine {
     /// claim standing in for a park that still is not durable. Cleared (and the
     /// claim released) once a later retry persists successfully.
     claims_pending_persist: std::collections::HashSet<String>,
+    /// Approval broker (EPIC G): membership + quorum authorization wrapping the
+    /// `resolve_gate` chokepoint. Defaults to a pass-through (no policies) so
+    /// behavior is unchanged until a `[sop.approval]` policy is configured.
+    approval_broker: Arc<super::approval::ApprovalBroker>,
 }
 
 /// Outcome of one [`SopEngine::run_maintenance_tick`] pass (EPIC A1), for
@@ -92,6 +96,7 @@ impl SopEngine {
             metrics: Arc::new(SopMetricsCollector::new()),
             capabilities: Arc::new(SopCapabilityRegistry::with_builtins()),
             claims_pending_persist: std::collections::HashSet::new(),
+            approval_broker: Arc::new(super::approval::ApprovalBroker::disabled()),
         }
     }
 
@@ -116,6 +121,34 @@ impl SopEngine {
     pub fn with_capabilities(mut self, capabilities: Arc<SopCapabilityRegistry>) -> Self {
         self.capabilities = capabilities;
         self
+    }
+
+    /// Inject the approval broker (built from `[sop.approval]` config). Defaults to
+    /// a pass-through; `build_sop_engine` replaces it with the configured broker.
+    pub fn with_approval_broker(mut self, broker: Arc<super::approval::ApprovalBroker>) -> Self {
+        self.approval_broker = broker;
+        self
+    }
+
+    /// The approval broker (membership + quorum authorization). Callers that must
+    /// deliver an escalation to a policy's second route read it here.
+    pub fn approval_broker(&self) -> Arc<super::approval::ApprovalBroker> {
+        Arc::clone(&self.approval_broker)
+    }
+
+    /// Resolve a gate THROUGH the broker (membership + quorum), then the chokepoint.
+    /// This is the entry point out-of-band surfaces (gateway / CLI / tools) should
+    /// call so a `[sop.approval]` policy is enforced; with no policy it is exactly
+    /// `resolve_gate`. The broker is cloned out first so it does not borrow `self`
+    /// while `self` is mutated by the chokepoint.
+    pub fn resolve_via_broker(
+        &mut self,
+        run_id: &str,
+        decision: super::approval::ApprovalDecision,
+        principal: super::approval::ApprovalPrincipal,
+    ) -> Result<super::approval::BrokerOutcome> {
+        let broker = Arc::clone(&self.approval_broker);
+        broker.resolve(self, run_id, decision, principal)
     }
     /// Reconstruct in-flight runs from the store at startup (durable backends).
     /// No-op for the in-memory default. Does not overwrite already-present runs.
@@ -1886,6 +1919,7 @@ impl SopEngine {
             sop_location: sop.location.clone(),
         };
         let result = self.capabilities.execute_step(ctx, step, input);
+        self.metrics.record_capability_executed(&sop.name);
         let completed_at = Some(now_iso8601());
         match result {
             Ok(result) if result.success => self.record_deterministic_step_result(
@@ -2542,6 +2576,38 @@ impl SopEngine {
         &self.config
     }
 
+    /// The live `[sop.approval]` config - the single source of truth for approval
+    /// groups and policies. The broker resolves membership/policy from this at
+    /// use-time rather than holding a cloned copy that could drift on reload.
+    pub fn approval_config(&self) -> &zeroclaw_config::schema::SopApprovalConfig {
+        &self.config.approval
+    }
+
+    /// The name of the approval policy that applies to the run's currently-waiting
+    /// step, if that step names one. Shared by the broker (membership/quorum) and
+    /// the approval query surfaces so the "which policy applies now" lookup lives in
+    /// exactly one place.
+    pub fn current_step_policy_name(&self, run_id: &str) -> Option<String> {
+        let run = self.get_run(run_id)?;
+        let sop = self.get_sop(&run.sop_name)?;
+        // Match the step by its `number`, NOT by vec position: routed / non-contiguous
+        // step numbers mean position != number, and a positional lookup would read the
+        // wrong step's policy (silently unpolicing a policied gate, or vice versa).
+        let name = sop
+            .steps
+            .iter()
+            .find(|s| s.number == run.current_step)?
+            .policy
+            .as_deref()?
+            .trim();
+        // An empty/whitespace name means "no policy", same as the Markdown parser's
+        // `policy:` bullet (mod.rs). Without this, a TOML `policy = ""` step would
+        // deserialize as `Some("")` and the broker would treat it as a NAMED-but-absent
+        // policy (fail closed, gate stuck waiting forever) instead of unpoliced -
+        // diverging from the equivalent Markdown SOP, which normalizes to `None`.
+        (!name.is_empty()).then(|| name.to_string())
+    }
+
     /// Classify a run's approval gate for `resolve_gate` (idempotency + typed
     /// not-found). `Running` (already approved) and terminal runs are
     /// `AlreadyResolved`; an unknown run or a non-`WaitingApproval` active status
@@ -2584,6 +2650,57 @@ impl SopEngine {
     /// Ordered event/ledger history for a run (from the durable store).
     pub fn run_events(&self, run_id: &str) -> Result<Vec<SopEventRecord>, StoreError> {
         self.store.list_events(run_id)
+    }
+
+    /// EPIC G (broker quorum): record an approver's vote on a still-waiting gate as
+    /// an append-only ledger row (kind `gate_vote`, actor = the principal). Quorum is
+    /// counted from these rows so votes are durable and survive a restart. Distinct
+    /// from `gate_resolved`, which is appended only once the gate actually clears.
+    pub(crate) fn record_gate_vote(
+        &self,
+        run_id: &str,
+        step: u32,
+        principal: &super::approval::ApprovalPrincipal,
+    ) -> Result<(), StoreError> {
+        let ev = SopEventRecord {
+            run_id: run_id.to_string(),
+            seq: 0,
+            ts: now_iso8601(),
+            kind: "gate_vote".to_string(),
+            // `voter_key()` deliberately collapses `Http`/`Ws` to one canonical
+            // `gateway:<id>` voter (same paired token, two transports = one voter),
+            // while the agent/CLI sources stay distinct. See `ApprovalPrincipal::
+            // voter_key`'s own doc for the full canonicalization rationale.
+            actor: Some(principal.voter_key()),
+            reason: None,
+            payload: serde_json::json!({
+                "step": step,
+                "source": principal.source_label(),
+            }),
+        };
+        self.store.append_event(&ev).map(|_| ())
+    }
+
+    /// EPIC G (broker quorum): count the DISTINCT approver identities that have voted
+    /// to approve the gate on `run_id` AT `step` (from the append-only `gate_vote`
+    /// ledger rows). Votes are scoped to the current step, so a multi-gate SOP does
+    /// not carry step-1 votes into step 2; the voter key is source-qualified, so a
+    /// repeat vote by the same identity on the same source counts once. Returns 0 on
+    /// a store error (fail-closed: an unreadable ledger cannot satisfy a quorum).
+    pub(crate) fn distinct_gate_voters(&self, run_id: &str, step: u32) -> usize {
+        let Ok(events) = self.store.list_events(run_id) else {
+            return 0;
+        };
+        let mut voters: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for ev in events {
+            if ev.kind == "gate_vote"
+                && ev.payload.get("step").and_then(|s| s.as_u64()) == Some(u64::from(step))
+                && let Some(actor) = ev.actor
+            {
+                voters.insert(actor);
+            }
+        }
+        voters.len()
     }
 
     /// Record the approval completion metric at the gate-clearing chokepoint, so
@@ -4269,6 +4386,207 @@ mod tests {
         assert!(
             matches!(second.evaluate_admission("s1"), SopAdmission::Defer { .. }),
             "a sibling engine's persisted pending run must count against the cap"
+        );
+    }
+
+    #[test]
+    fn current_step_policy_name_matches_step_number_not_index() {
+        // B#2: a routed SOP with NON-CONTIGUOUS step numbers. The policy lookup must
+        // match the step whose `number` == current_step, not the step at that vec
+        // index - otherwise a positional read silently unpolices (or mis-polices) the
+        // gate.
+        let mut engine = engine_with_sops(vec![]);
+        let mut sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
+        sop.steps = vec![
+            SopStep {
+                number: 1,
+                policy: None,
+                ..SopStep::default()
+            },
+            SopStep {
+                number: 5,
+                policy: Some("prod".into()),
+                ..SopStep::default()
+            },
+        ];
+        engine.set_sops_for_test(vec![sop]);
+        let now = now_iso8601();
+        engine.active_runs.insert(
+            "r1".to_string(),
+            SopRun {
+                run_id: "r1".to_string(),
+                sop_name: "s1".to_string(),
+                trigger_event: manual_event(),
+                frame_marker_id: "m".to_string(),
+                status: SopRunStatus::WaitingApproval,
+                current_step: 5,
+                total_steps: 2,
+                started_at: now.clone(),
+                completed_at: None,
+                step_results: Vec::new(),
+                waiting_since: Some(now),
+                llm_calls_saved: 0,
+            },
+        );
+        assert_eq!(
+            engine.current_step_policy_name("r1").as_deref(),
+            Some("prod"),
+            "policy resolves by step number (5), not vec index"
+        );
+    }
+
+    #[test]
+    fn current_step_policy_name_treats_empty_or_whitespace_as_none() {
+        // A TOML `policy = ""` step deserializes to `Some("")` (types.rs has no empty
+        // normalization, unlike the Markdown parser's `policy:` bullet in mod.rs).
+        // Without normalizing here, the broker would treat "" as a NAMED-but-absent
+        // policy and fail closed (gate stuck waiting forever) - diverging from the
+        // equivalent Markdown SOP, which normalizes empty to unpoliced (`None`).
+        let mut engine = engine_with_sops(vec![]);
+        let mut sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
+        sop.steps = vec![
+            SopStep {
+                number: 1,
+                policy: Some(String::new()),
+                ..SopStep::default()
+            },
+            SopStep {
+                number: 2,
+                policy: Some("   ".into()),
+                ..SopStep::default()
+            },
+        ];
+        engine.set_sops_for_test(vec![sop]);
+        let now = now_iso8601();
+        for (run_id, step) in [("r1", 1u32), ("r2", 2u32)] {
+            engine.active_runs.insert(
+                run_id.to_string(),
+                SopRun {
+                    run_id: run_id.to_string(),
+                    sop_name: "s1".to_string(),
+                    trigger_event: manual_event(),
+                    frame_marker_id: "m".to_string(),
+                    status: SopRunStatus::WaitingApproval,
+                    current_step: step,
+                    total_steps: 2,
+                    started_at: now.clone(),
+                    completed_at: None,
+                    step_results: Vec::new(),
+                    waiting_since: Some(now.clone()),
+                    llm_calls_saved: 0,
+                },
+            );
+        }
+        assert_eq!(
+            engine.current_step_policy_name("r1"),
+            None,
+            "empty-string policy name normalizes to unpoliced, matching Markdown"
+        );
+        assert_eq!(
+            engine.current_step_policy_name("r2"),
+            None,
+            "whitespace-only policy name also normalizes to unpoliced"
+        );
+    }
+
+    #[test]
+    fn capability_step_execution_increments_the_capability_executed_metric() {
+        // record_capability_executed is called unconditionally in
+        // execute_capability_step, before the result is inspected - so the counter
+        // means "attempted", not "succeeded". Proves both the global and per-SOP
+        // counters increment, and that a failing capability still counts as attempted.
+        let metrics = std::sync::Arc::new(super::super::metrics::SopMetricsCollector::new());
+        let mut engine = engine_with_sops(vec![]).with_metrics(metrics.clone());
+        let sop = test_sop("s1", SopExecutionMode::Deterministic, SopPriority::Normal);
+        engine.set_sops_for_test(vec![sop.clone()]);
+        let now = now_iso8601();
+        engine.active_runs.insert(
+            "r1".to_string(),
+            SopRun {
+                run_id: "r1".to_string(),
+                sop_name: "s1".to_string(),
+                trigger_event: manual_event(),
+                frame_marker_id: "m".to_string(),
+                status: SopRunStatus::Running,
+                current_step: 1,
+                total_steps: 1,
+                started_at: now.clone(),
+                completed_at: None,
+                step_results: Vec::new(),
+                waiting_since: None,
+                llm_calls_saved: 0,
+            },
+        );
+        let step = SopStep {
+            number: 1,
+            kind: SopStepKind::Capability,
+            capability: Some("noop".into()),
+            ..SopStep::default()
+        };
+        engine
+            .execute_capability_step(&sop, "r1", &step, serde_json::json!({}))
+            .expect("noop capability always succeeds");
+        assert_eq!(
+            metrics.get_metric_value("sop.capability_executed"),
+            Some(serde_json::json!(1)),
+            "global counter increments on capability execution"
+        );
+        assert_eq!(
+            metrics.get_metric_value("sop.s1.capability_executed"),
+            Some(serde_json::json!(1)),
+            "per-SOP counter increments too"
+        );
+    }
+
+    #[test]
+    fn gate_votes_are_per_step_and_canonical_per_subject() {
+        // Broker quorum reads distinct_gate_voters(run_id, step). Votes are scoped to
+        // the current step (a two-gate SOP does not reuse step-1 votes), and the voter
+        // key is the CANONICAL subject: HTTP and WS share the paired credential, so the
+        // same subject over both transports counts ONCE (cannot inflate quorum), while
+        // a genuinely different source (CLI) is a distinct voter.
+        use crate::sop::approval::ApprovalPrincipal;
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let engine = engine_with_sops(vec![]).with_store(store);
+
+        // Same subject "alice" over HTTP then WS: collapses to gateway:alice.
+        engine
+            .record_gate_vote("run-1", 1, &ApprovalPrincipal::http(Some("alice".into())))
+            .unwrap();
+        engine
+            .record_gate_vote(
+                "run-1",
+                1,
+                &ApprovalPrincipal::ws("c".into(), Some("alice".into())),
+            )
+            .unwrap();
+        // A repeat over HTTP: still the same canonical voter.
+        engine
+            .record_gate_vote("run-1", 1, &ApprovalPrincipal::http(Some("alice".into())))
+            .unwrap();
+        // A CLI actor is a genuinely distinct source (cli:bob).
+        engine
+            .record_gate_vote("run-1", 1, &ApprovalPrincipal::cli(Some("bob".into())))
+            .unwrap();
+        // A vote on step 2 is a separate tally.
+        engine
+            .record_gate_vote("run-1", 2, &ApprovalPrincipal::cli(Some("carol".into())))
+            .unwrap();
+
+        assert_eq!(
+            engine.distinct_gate_voters("run-1", 1),
+            2,
+            "gateway:alice (http+ws collapsed) + cli:bob = 2 distinct step-1 voters"
+        );
+        assert_eq!(
+            engine.distinct_gate_voters("run-1", 2),
+            1,
+            "step-2 quorum does not include step-1 voters"
+        );
+        assert_eq!(
+            engine.distinct_gate_voters("run-1", 3),
+            0,
+            "no votes recorded for step 3"
         );
     }
 

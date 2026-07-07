@@ -94,6 +94,7 @@ mod tests {
             mode: None,
             capability: None,
             capability_input: None,
+            policy: None,
         }
     }
 

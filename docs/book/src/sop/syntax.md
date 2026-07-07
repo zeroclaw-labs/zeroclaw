@@ -96,6 +96,11 @@ Parser behavior:
 - `- on_failure:` accepts `fail`, `retry:<count>`, or `goto:<step>` and is
   enforced for reported step failures and output schema failures.
 - `- mode:` overrides the SOP execution mode for that step.
+- `- policy:` names an approval-broker policy (a key in `[sop.approval].policies`)
+  that gates this step's approval with required-group membership and quorum. Omit
+  it for an unpoliced gate. A step that names a policy absent from
+  `[sop.approval].policies` fails closed (the gate stays waiting) rather than
+  clearing on a single approval.
 
 ### Step Contract Enforcement
 
