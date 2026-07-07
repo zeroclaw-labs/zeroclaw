@@ -316,6 +316,8 @@ mod tests {
     use super::*;
     use crate::schema::Config;
 
+    /// RAII-ish helper: removes the named var on drop so failed asserts don't
+    /// leak state into sibling tests.
     struct EnvVarGuard(&'static str);
     impl EnvVarGuard {
         fn set(name: &'static str, value: &str) -> Self {
@@ -328,6 +330,50 @@ mod tests {
         fn drop(&mut self) {
             // SAFETY: tests serialize on `env_test_lock()`.
             unsafe { std::env::remove_var(self.0) };
+        }
+    }
+
+    /// RAII fixture that fully owns the legacy env-var namespace
+    /// (`TRANSCRIPTION_API_KEY`, `OPENAI_API_KEY`) while the shared
+    /// `env_test_lock()` is held. Snapshots pre-existing values on
+    /// construction, clears them both, and restores originals on drop.
+    /// Tests that exercise `apply_legacy_env_fallbacks` use this instead
+    /// of bare `EnvVarGuard` so their behaviour is deterministic
+    /// regardless of what the dev or CI shell has set.
+    struct LegacyEnvFixture {
+        saved_transcription: Option<String>,
+        saved_openai: Option<String>,
+    }
+    impl LegacyEnvFixture {
+        /// Clear both legacy env vars and snapshot their previous values
+        /// (if any). Callers then set exactly the vars their test needs.
+        fn isolate() -> Self {
+            // SAFETY: caller (the test function) holds `env_test_lock()`.
+            let saved_transcription = std::env::var("TRANSCRIPTION_API_KEY").ok();
+            let saved_openai = std::env::var("OPENAI_API_KEY").ok();
+            unsafe {
+                std::env::remove_var("TRANSCRIPTION_API_KEY");
+                std::env::remove_var("OPENAI_API_KEY");
+            }
+            Self {
+                saved_transcription,
+                saved_openai,
+            }
+        }
+    }
+    impl Drop for LegacyEnvFixture {
+        fn drop(&mut self) {
+            // SAFETY: caller holds `env_test_lock()`.
+            unsafe {
+                match &self.saved_transcription {
+                    Some(v) => std::env::set_var("TRANSCRIPTION_API_KEY", v),
+                    None => std::env::remove_var("TRANSCRIPTION_API_KEY"),
+                }
+                match &self.saved_openai {
+                    Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+                    None => std::env::remove_var("OPENAI_API_KEY"),
+                }
+            }
         }
     }
 
@@ -550,6 +596,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_fallback_transcription_api_key_sets_config() {
         let _guard = super::env_test_lock().await;
+        let _fixture = LegacyEnvFixture::isolate();
         let _v = EnvVarGuard::set("TRANSCRIPTION_API_KEY", "sk-transcription-test");
 
         let mut config = Config::default();
@@ -581,6 +628,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_fallback_openai_api_key_sets_config() {
         let _guard = super::env_test_lock().await;
+        let _fixture = LegacyEnvFixture::isolate();
         let _v = EnvVarGuard::set("OPENAI_API_KEY", "sk-openai-test");
 
         let mut config = Config::default();
@@ -607,6 +655,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_fallback_zoclaw_and_legacy_are_independent() {
         let _guard = super::env_test_lock().await;
+        let _fixture = LegacyEnvFixture::isolate();
         // ZEROCLAW_* through the typed provider path sets
         // providers.transcription.openai.default.api_key.
         // TRANSCRIPTION_API_KEY sets transcription.openai.api_key.
@@ -666,6 +715,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_fallback_injects_into_typed_alias() {
         let _guard = super::env_test_lock().await;
+        let _fixture = LegacyEnvFixture::isolate();
         let _v = EnvVarGuard::set("TRANSCRIPTION_API_KEY", "sk-typed-inject");
 
         let mut config = Config::default();
@@ -720,6 +770,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_fallback_does_not_override_explicit_config() {
         let _guard = super::env_test_lock().await;
+        let _fixture = LegacyEnvFixture::isolate();
         let _v = EnvVarGuard::set("TRANSCRIPTION_API_KEY", "sk-env-value");
 
         let mut config = Config::default();
@@ -749,6 +800,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_fallback_no_env_does_nothing() {
         let _guard = super::env_test_lock().await;
+        let _fixture = LegacyEnvFixture::isolate();
 
         let mut config = Config::default();
         assert!(
