@@ -9,7 +9,7 @@ use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,6 +59,50 @@ pub enum BackgroundTaskStatus {
     Completed,
     Failed,
     Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundResultState {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Lost,
+    TimedOut,
+}
+
+impl BackgroundResultState {
+    fn from_file_status(status: &BackgroundTaskStatus) -> Self {
+        match status {
+            BackgroundTaskStatus::Running => Self::Running,
+            BackgroundTaskStatus::Completed => Self::Completed,
+            BackgroundTaskStatus::Failed => Self::Failed,
+            BackgroundTaskStatus::Cancelled => Self::Cancelled,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Lost => "lost",
+            Self::TimedOut => "timed_out",
+        }
+    }
+
+    fn is_success(self) -> bool {
+        self == Self::Completed
+    }
+
+    fn is_pending(self) -> bool {
+        self == Self::Running
+    }
+
+    fn is_failure(self) -> bool {
+        !matches!(self, Self::Running | Self::Completed)
+    }
 }
 
 /// Tool that delegates a subtask to a named agent with a different
@@ -132,10 +176,55 @@ enum DelegateAdmission {
     Prevalidated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelegateAction {
+    Delegate,
+    CheckResult,
+    ListResults,
+    CancelTask,
+    AwaitSessions,
+}
+
+impl DelegateAction {
+    const ALL: [Self; 5] = [
+        Self::Delegate,
+        Self::CheckResult,
+        Self::ListResults,
+        Self::CancelTask,
+        Self::AwaitSessions,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Delegate => "delegate",
+            Self::CheckResult => "check_result",
+            Self::ListResults => "list_results",
+            Self::CancelTask => "cancel_task",
+            Self::AwaitSessions => "await_sessions",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|action| action.as_str() == value)
+    }
+
+    fn schema_values() -> Vec<&'static str> {
+        Self::ALL.into_iter().map(Self::as_str).collect()
+    }
+
+    fn usage() -> String {
+        Self::schema_values().join("/")
+    }
+}
+
 impl DelegateTool {
     /// Canonical tool name. Referenced by `REENTRANT_AGENT_TOOLS` so a
     /// rename cannot desync the two.
     pub const NAME: &'static str = "delegate";
+    const MAX_AWAIT_SESSIONS_TIMEOUT: Duration = Duration::from_secs(120);
+    const MAX_AWAIT_SESSION_TASK_IDS: usize = 128;
     const INDEPENDENT_ALWAYS_ASK_DOC_REF: &'static str =
         "ZeroClaw docs, \"Delegation & SubAgents\" > \"What's not supported\"";
 
@@ -988,9 +1077,8 @@ impl Tool for DelegateTool {
         "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model \
          (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single \
          prompt by default; with agentic=true it can iterate with a filtered tool-call loop. \
-         Supports background execution (returns a task_id immediately) and parallel execution \
-         (runs multiple agents concurrently). Use action='check_result' with a task_id to \
-         retrieve background results."
+         Supports background execution (returns a task_id immediately), batched background waits \
+         (await_sessions), and parallel execution (runs multiple agents concurrently)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1019,11 +1107,12 @@ impl Tool for DelegateTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["delegate", "check_result", "list_results", "cancel_task"],
+                    "enum": DelegateAction::schema_values(),
                     "description": "Action to perform. Default: 'delegate'. Use 'check_result' to \
-                                    retrieve a background task result, 'list_results' to list all \
-                                    background tasks, 'cancel_task' to cancel a running background task.",
-                    "default": "delegate"
+                                    retrieve a background task result, 'await_sessions' to wait for \
+                                    multiple background results, 'list_results' to list all background \
+                                    tasks, 'cancel_task' to cancel a running background task.",
+                    "default": DelegateAction::Delegate.as_str()
                 },
                 "agent": {
                     "type": "string",
@@ -1064,6 +1153,19 @@ impl Tool for DelegateTool {
                     "type": "string",
                     "description": "Task ID for check_result/cancel_task actions (returned by \
                                     background delegation)."
+                },
+                "task_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "maxItems": Self::MAX_AWAIT_SESSION_TASK_IDS,
+                    "description": "Task IDs for await_sessions."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": Self::MAX_AWAIT_SESSIONS_TIMEOUT.as_millis(),
+                    "description": "Maximum milliseconds for await_sessions to wait before returning partial results. Capped at 120000."
                 }
             },
             "required": []
@@ -1071,25 +1173,27 @@ impl Tool for DelegateTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let action = args
+        let action_value = args
             .get("action")
             .and_then(|v| v.as_str())
-            .unwrap_or("delegate");
+            .unwrap_or_else(|| DelegateAction::Delegate.as_str());
+        let Some(action) = DelegateAction::parse(action_value) else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Unknown action '{action_value}'. Use {}.",
+                    DelegateAction::usage()
+                )),
+            });
+        };
 
         match action {
-            "check_result" => return self.handle_check_result(&args).await,
-            "list_results" => return self.handle_list_results().await,
-            "cancel_task" => return self.handle_cancel_task(&args).await,
-            "delegate" => {} // fall through to delegation logic
-            other => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "Unknown action '{other}'. Use delegate/check_result/list_results/cancel_task."
-                    )),
-                });
-            }
+            DelegateAction::CheckResult => return self.handle_check_result(&args).await,
+            DelegateAction::ListResults => return self.handle_list_results().await,
+            DelegateAction::CancelTask => return self.handle_cancel_task(&args).await,
+            DelegateAction::AwaitSessions => return self.handle_await_sessions(&args).await,
+            DelegateAction::Delegate => {}
         }
 
         // --- Parallel mode ---
@@ -1919,6 +2023,96 @@ impl DelegateTool {
         }
     }
 
+    async fn read_background_result(
+        &self,
+        task_id: &str,
+    ) -> anyhow::Result<Option<BackgroundDelegateResult>> {
+        let result_path = self.results_dir().join(format!("{task_id}.json"));
+        let content = match tokio::fs::read_to_string(&result_path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let result = serde_json::from_str(&content)?;
+        Ok(Some(result))
+    }
+
+    async fn background_result_view(
+        task_id: &str,
+        result: BackgroundDelegateResult,
+    ) -> anyhow::Result<(BackgroundResultState, serde_json::Value)> {
+        if let Some(label) = Self::reconciled_loss_label(task_id, &result.status).await {
+            let state = match label {
+                "lost" => BackgroundResultState::Lost,
+                "timed_out" => BackgroundResultState::TimedOut,
+                _ => BackgroundResultState::from_file_status(&result.status),
+            };
+            return Ok((
+                state,
+                json!({
+                    "task_id": task_id,
+                    "agent": result.agent,
+                    "status": label,
+                    "started_at": result.started_at,
+                    "note": "the owning daemon exited or the task exceeded its max runtime; \
+                             reconciled by the supervision reaper",
+                }),
+            ));
+        }
+        let state = BackgroundResultState::from_file_status(&result.status);
+        Ok((state, serde_json::to_value(result)?))
+    }
+
+    fn task_ids_from_args(args: &serde_json::Value) -> anyhow::Result<Vec<String>> {
+        let values = args
+            .get("task_ids")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| anyhow::Error::msg("Missing 'task_ids' parameter for await_sessions"))?;
+        if values.len() > Self::MAX_AWAIT_SESSION_TASK_IDS {
+            return Err(anyhow::Error::msg(format!(
+                "'task_ids' must contain no more than {} task ids",
+                Self::MAX_AWAIT_SESSION_TASK_IDS
+            )));
+        }
+        let mut task_ids = Vec::with_capacity(values.len());
+        let mut seen = HashSet::with_capacity(values.len());
+        for value in values {
+            let Some(task_id) = value.as_str() else {
+                return Err(anyhow::Error::msg("'task_ids' must contain only strings"));
+            };
+            Self::validate_task_id(task_id).map_err(anyhow::Error::msg)?;
+            if !seen.insert(task_id) {
+                return Err(anyhow::Error::msg(format!(
+                    "Duplicate task_id '{task_id}' in task_ids"
+                )));
+            }
+            task_ids.push(task_id.to_string());
+        }
+        if task_ids.is_empty() {
+            return Err(anyhow::Error::msg(
+                "'task_ids' must contain at least one task id",
+            ));
+        }
+        Ok(task_ids)
+    }
+
+    fn await_timeout(args: &serde_json::Value) -> anyhow::Result<Duration> {
+        let Some(value) = args.get("timeout_ms") else {
+            return Ok(Duration::from_millis(30_000));
+        };
+        let Some(timeout_ms) = value.as_u64() else {
+            return Err(anyhow::Error::msg("'timeout_ms' must be an integer"));
+        };
+        let timeout = Duration::from_millis(timeout_ms);
+        if timeout > Self::MAX_AWAIT_SESSIONS_TIMEOUT {
+            return Err(anyhow::Error::msg(format!(
+                "'timeout_ms' must be no more than {}",
+                Self::MAX_AWAIT_SESSIONS_TIMEOUT.as_millis()
+            )));
+        }
+        Ok(timeout)
+    }
+
     /// Retrieve the result of a background delegate task by task_id.
     async fn handle_check_result(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         let task_id = args
@@ -1944,45 +2138,109 @@ impl DelegateTool {
             });
         }
 
-        let result_path = self.results_dir().join(format!("{task_id}.json"));
-        if !result_path.exists() {
+        let Some(result) = self.read_background_result(task_id).await? else {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("No result found for task_id '{task_id}'")),
             });
-        }
-
-        let content = tokio::fs::read_to_string(&result_path).await?;
-        let result: BackgroundDelegateResult = serde_json::from_str(&content)?;
-
-        // Overlay the control-plane's reconciled view: a crashed/timed-out task whose
-        // flat file still says `Running` is surfaced as lost/timed_out, so the agent
-        // stops polling a task that will never complete.
-        if let Some(label) = Self::reconciled_loss_label(task_id, &result.status).await {
-            return Ok(ToolResult {
-                success: false,
-                output: serde_json::to_string_pretty(&json!({
-                    "task_id": task_id,
-                    "agent": result.agent,
-                    "status": label,
-                    "started_at": result.started_at,
-                    "note": "the owning daemon exited or the task exceeded its max runtime; \
-                             reconciled by the supervision reaper",
-                }))?,
-                error: Some(format!("background task is {label} and will not complete")),
-            });
-        }
+        };
+        let error = result.error.clone();
+        let (state, value) = Self::background_result_view(task_id, result).await?;
+        let success = state.is_success();
 
         Ok(ToolResult {
-            success: result.status == BackgroundTaskStatus::Completed,
-            output: serde_json::to_string_pretty(&result)?,
-            error: if result.status == BackgroundTaskStatus::Completed {
+            success,
+            output: serde_json::to_string_pretty(&value)?,
+            error: if success {
                 None
+            } else if let Some(error) = error {
+                Some(error)
+            } else if state.is_failure() {
+                Some(format!(
+                    "background task is {} and will not complete",
+                    state.as_str()
+                ))
             } else {
-                result.error
+                None
             },
         })
+    }
+
+    async fn handle_await_sessions(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let task_ids = match Self::task_ids_from_args(args) {
+            Ok(task_ids) => task_ids,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error.to_string()),
+                });
+            }
+        };
+        let timeout = match Self::await_timeout(args) {
+            Ok(timeout) => timeout,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error.to_string()),
+                });
+            }
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let mut results = Vec::new();
+            let mut pending = Vec::new();
+            let mut missing = Vec::new();
+            let mut failed = Vec::new();
+
+            for task_id in &task_ids {
+                let Some(result) = self.read_background_result(task_id).await? else {
+                    missing.push(task_id.clone());
+                    continue;
+                };
+                let (state, value) = Self::background_result_view(task_id, result).await?;
+                if state.is_pending() {
+                    pending.push(task_id.clone());
+                } else if state.is_failure() {
+                    failed.push(task_id.clone());
+                }
+                results.push(value);
+            }
+
+            let waiting = !pending.is_empty() || !missing.is_empty();
+            let timed_out = waiting && tokio::time::Instant::now() >= deadline;
+            if !waiting || timed_out {
+                let completed = results
+                    .iter()
+                    .filter(|result| result.get("status") == Some(&json!("completed")))
+                    .count();
+                let success = missing.is_empty() && pending.is_empty() && failed.is_empty();
+                let error = if success {
+                    None
+                } else if timed_out {
+                    Some("one or more background tasks are still pending or missing".into())
+                } else {
+                    Some("one or more background tasks failed or were cancelled".into())
+                };
+                return Ok(ToolResult {
+                    success,
+                    output: serde_json::to_string_pretty(&json!({
+                        "status": if timed_out { "timeout" } else { "complete" },
+                        "completed": completed,
+                        "pending": pending,
+                        "missing": missing,
+                        "failed": failed,
+                        "results": results,
+                    }))?,
+                    error,
+                });
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// List all background delegate task results.
@@ -2826,6 +3084,38 @@ mod tests {
 
             sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    fn background_result(
+        task_id: &str,
+        status: BackgroundTaskStatus,
+        output: Option<&str>,
+        error: Option<&str>,
+    ) -> BackgroundDelegateResult {
+        let finished_at = if status == BackgroundTaskStatus::Running {
+            None
+        } else {
+            Some("2026-06-29T12:00:01Z".to_string())
+        };
+        BackgroundDelegateResult {
+            task_id: task_id.to_string(),
+            agent: "researcher".to_string(),
+            status,
+            output: output.map(str::to_string),
+            error: error.map(str::to_string),
+            started_at: "2026-06-29T12:00:00Z".to_string(),
+            finished_at,
+        }
+    }
+
+    fn write_background_result(workspace: &Path, result: &BackgroundDelegateResult) {
+        let results_dir = workspace.join("delegate_results");
+        std::fs::create_dir_all(&results_dir).unwrap();
+        std::fs::write(
+            results_dir.join(format!("{}.json", result.task_id)),
+            serde_json::to_vec_pretty(result).unwrap(),
+        )
+        .unwrap();
     }
 
     #[derive(Default)]
@@ -5602,6 +5892,334 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap().contains("No result found"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_schema_exposes_action_and_inputs() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let schema = tool.parameters_schema();
+        let action_enum = schema
+            .pointer("/properties/action/enum")
+            .and_then(|value| value.as_array())
+            .expect("action enum exists");
+        assert!(action_enum.iter().any(|value| value == "await_sessions"));
+        assert_eq!(
+            schema.pointer("/properties/task_ids/maxItems"),
+            Some(&json!(DelegateTool::MAX_AWAIT_SESSION_TASK_IDS))
+        );
+        assert_eq!(
+            schema.pointer("/properties/timeout_ms/maximum"),
+            Some(&json!(120000))
+        );
+    }
+
+    #[tokio::test]
+    async fn await_sessions_returns_completed_results() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_done_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let first = uuid::Uuid::new_v4().to_string();
+        let second = uuid::Uuid::new_v4().to_string();
+        write_background_result(
+            &workspace,
+            &background_result(
+                &first,
+                BackgroundTaskStatus::Completed,
+                Some("first output"),
+                None,
+            ),
+        );
+        write_background_result(
+            &workspace,
+            &background_result(
+                &second,
+                BackgroundTaskStatus::Completed,
+                Some("second output"),
+                None,
+            ),
+        );
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [first, second],
+                "timeout_ms": 0
+            }))
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+
+        assert!(result.success, "got error: {:?}", result.error);
+        assert_eq!(output["status"], "complete");
+        assert_eq!(output["completed"], 2);
+        assert_eq!(output["results"].as_array().unwrap().len(), 2);
+        assert!(result.error.is_none());
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_reports_failed_results() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_failed_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        write_background_result(
+            &workspace,
+            &background_result(
+                &task_id,
+                BackgroundTaskStatus::Failed,
+                None,
+                Some("model failed"),
+            ),
+        );
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [task_id],
+                "timeout_ms": 0
+            }))
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+
+        assert!(!result.success);
+        assert_eq!(output["status"], "complete");
+        assert_eq!(output["failed"].as_array().unwrap().len(), 1);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("failed")
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_times_out_with_pending_results() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_pending_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let done = uuid::Uuid::new_v4().to_string();
+        let pending = uuid::Uuid::new_v4().to_string();
+        write_background_result(
+            &workspace,
+            &background_result(&done, BackgroundTaskStatus::Completed, Some("done"), None),
+        );
+        write_background_result(
+            &workspace,
+            &background_result(&pending, BackgroundTaskStatus::Running, None, None),
+        );
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [done, pending],
+                "timeout_ms": 0
+            }))
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+
+        assert!(!result.success);
+        assert_eq!(output["status"], "timeout");
+        assert_eq!(output["completed"], 1);
+        assert_eq!(output["pending"].as_array().unwrap().len(), 1);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("pending")
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_reports_missing_tasks() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_missing_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let missing = uuid::Uuid::new_v4().to_string();
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [missing],
+                "timeout_ms": 0
+            }))
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+
+        assert!(!result.success);
+        assert_eq!(output["status"], "timeout");
+        assert_eq!(output["missing"].as_array().unwrap().len(), 1);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("missing")
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_rejects_duplicate_task_ids() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_duplicate_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [task_id, task_id],
+                "timeout_ms": 0
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        assert!(result.error.unwrap().contains("Duplicate task_id"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_rejects_invalid_task_ids() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_invalid_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": ["../../../etc/shadow"],
+                "timeout_ms": 0
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        assert!(result.error.unwrap().contains("Invalid task_id"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_rejects_too_many_task_ids() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_many_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let task_ids: Vec<String> = (0..=DelegateTool::MAX_AWAIT_SESSION_TASK_IDS)
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect();
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": task_ids,
+                "timeout_ms": 0
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        assert!(result.error.unwrap().contains("no more than"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_rejects_invalid_timeout_ms() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_bad_timeout_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [task_id],
+                "timeout_ms": "later"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains("'timeout_ms' must be an integer")
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_rejects_timeout_ms_over_cap() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_timeout_cap_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [task_id],
+                "timeout_ms": 120001
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        assert!(result.error.unwrap().contains("no more than 120000"));
 
         let _ = std::fs::remove_dir_all(workspace);
     }

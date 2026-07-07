@@ -92,6 +92,8 @@ mod tests {
             routing: StepRouting::default(),
             on_failure: Default::default(),
             mode: None,
+            capability: None,
+            capability_input: None,
         }
     }
 
