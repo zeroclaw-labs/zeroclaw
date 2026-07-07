@@ -1382,7 +1382,8 @@ pub async fn run(
             poll_handle,
             escalate_handle,
             channel_room_handle,
-            deferred_section,
+            mut deferred_section,
+            pinned_section,
             activated_handle,
         } = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
             config: &config,
@@ -1399,6 +1400,9 @@ pub async fn run(
         })
         .await;
         let tools_registry = registry.into_inner();
+        // run injects one combined MCP prompt block: fold the pinned-resources section
+        // onto the deferred tool-search listing (the seam now surfaces them separately).
+        append_pinned_mcp_section(&mut deferred_section, &pinned_section);
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
@@ -2962,6 +2966,7 @@ pub async fn process_message(
             escalate_handle,
             channel_room_handle,
             mut deferred_section,
+            pinned_section,
             activated_handle: activated_handle_pm,
         } = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
             config: &config,
@@ -2978,6 +2983,9 @@ pub async fn process_message(
         })
         .await;
         let tools_registry = registry.into_inner();
+        // process_message injects one combined MCP prompt block: fold pinned resources
+        // onto the deferred tool-search listing (the seam surfaces them separately).
+        append_pinned_mcp_section(&mut deferred_section, &pinned_section);
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
