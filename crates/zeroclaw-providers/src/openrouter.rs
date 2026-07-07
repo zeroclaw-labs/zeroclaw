@@ -265,10 +265,11 @@ impl OpenRouterModelProvider {
                             kind: Some("function".to_string()),
                             function: NativeFunctionCall {
                                 name: tc.name.clone(),
-                                arguments: crate::native_tool_args::normalize_native_tool_call_arguments(
-                                    &tc.name,
-                                    tc.arguments,
-                                ),
+                                arguments:
+                                    crate::native_tool_args::normalize_native_tool_call_arguments(
+                                        &tc.name,
+                                        tc.arguments,
+                                    ),
                             },
                         })
                         .collect::<Vec<_>>();
@@ -1470,8 +1471,9 @@ mod tests {
             r#"{"command": 'ls'}"#,
             r#"Expecting ',' delimiter: line 1 column 23 (char 22)"#,
         ] {
-            let parsed =
-                Self::parse_native_response(message_with_tool_call_arguments(malformed));
+            let parsed = OpenRouterModelProvider::parse_native_response(
+                message_with_tool_call_arguments(malformed),
+            );
             let tc = &parsed.tool_calls[0];
             assert_eq!(
                 tc.arguments, "{}",
@@ -1484,15 +1486,16 @@ mod tests {
 
     #[test]
     fn parse_native_response_preserves_valid_arguments() {
-        let parsed = Self::parse_native_response(message_with_tool_call_arguments(
-            r#"{"command":"ls -la"}"#,
-        ));
+        let parsed = OpenRouterModelProvider::parse_native_response(
+            message_with_tool_call_arguments(r#"{"command":"ls -la"}"#),
+        );
         assert_eq!(parsed.tool_calls[0].arguments, r#"{"command":"ls -la"}"#);
     }
 
     #[test]
     fn parse_native_response_normalizes_empty_arguments() {
-        let parsed = Self::parse_native_response(message_with_tool_call_arguments(""));
+        let parsed =
+            OpenRouterModelProvider::parse_native_response(message_with_tool_call_arguments(""));
         assert_eq!(parsed.tool_calls[0].arguments, "{}");
     }
 
