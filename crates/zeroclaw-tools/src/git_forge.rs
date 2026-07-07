@@ -286,7 +286,7 @@ static CELLS: &[Cell] = &[
     Cell {
         resource: "issue",
         action: "list",
-        doc: "GET repos/{repo}/issues?state=open {state?, labels?, per_page?}",
+        doc: "GET repos/{repo}/issues?state=open {state?, labels?, per_page?, page?}",
         build: |repo, args| {
             let mut qs = String::from("state=open");
             GitForgeTool::push_list_filters(&mut qs, args);
@@ -403,7 +403,7 @@ static CELLS: &[Cell] = &[
     Cell {
         resource: "pull",
         action: "list",
-        doc: "GET repos/{repo}/pulls?state=open {state?, labels?, per_page?}",
+        doc: "GET repos/{repo}/pulls?state=open {state?, labels?, per_page?, page?}",
         build: |repo, args| {
             let mut qs = String::from("state=open");
             GitForgeTool::push_list_filters(&mut qs, args);
@@ -717,6 +717,9 @@ impl GitForgeTool {
         if let Some(per_page) = Self::num_arg(args, "per_page") {
             qs.push_str(&format!("&per_page={}", per_page.min(100)));
         }
+        if let Some(page) = Self::num_arg(args, "page") {
+            qs.push_str(&format!("&page={page}"));
+        }
     }
 
     /// Resolve a `{resource, action}` pair plus args into a planned forge call.
@@ -854,6 +857,10 @@ impl Tool for GitForgeTool {
                 "per_page": {
                     "type": "integer",
                     "description": "list actions: page size (max 100)"
+                },
+                "page": {
+                    "type": "integer",
+                    "description": "list actions: 1-based page number; increment until a short page to exhaust results"
                 },
                 "method": {
                     "type": "string",
