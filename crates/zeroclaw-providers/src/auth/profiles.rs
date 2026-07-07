@@ -168,6 +168,19 @@ impl AuthProfilesStore {
         self.load_locked().await
     }
 
+    /// Read-only listing of persisted profile IDs.
+    ///
+    /// Reads and parses the on-disk store under the shared lock but never
+    /// decrypts token fields and never migrates or writes the payload back.
+    /// Diagnostics that only need to know which profile IDs exist must use
+    /// this instead of `load()`, whose decrypt-and-migrate path can rewrite the
+    /// store as a side effect and can fail on an unrelated undecryptable value.
+    pub async fn list_profile_ids(&self) -> Result<Vec<String>> {
+        let _lock = self.acquire_lock().await?;
+        let persisted = self.read_persisted_locked().await?;
+        Ok(persisted.profiles.into_keys().collect())
+    }
+
     pub async fn upsert_profile(&self, mut profile: AuthProfile, set_active: bool) -> Result<()> {
         let _lock = self.acquire_lock().await?;
         let mut data = self.load_locked().await?;
@@ -743,5 +756,37 @@ mod tests {
 
         let contents = tokio::fs::read_to_string(path).await.unwrap();
         assert!(contents.contains("\"schema_version\": 1"));
+    }
+
+    #[tokio::test]
+    async fn list_profile_ids_lists_without_decrypting_or_rewriting() {
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), true);
+
+        let codex = AuthProfile::new_oauth(
+            "openai-codex",
+            "default",
+            TokenSet {
+                access_token: "access-xyz".into(),
+                refresh_token: Some("refresh-xyz".into()),
+                id_token: None,
+                expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+                token_type: Some("Bearer".into()),
+                scope: None,
+            },
+        );
+        let anthropic = AuthProfile::new_token("anthropic", "default", "token-abc".into());
+        store.upsert_profile(codex.clone(), true).await.unwrap();
+        store.upsert_profile(anthropic, false).await.unwrap();
+
+        let before = tokio::fs::read(store.path()).await.unwrap();
+
+        let ids = store.list_profile_ids().await.unwrap();
+        assert!(ids.iter().any(|id| id == "openai-codex:default"));
+        assert!(ids.iter().any(|id| id == "anthropic:default"));
+
+        // No decrypt-and-migrate side effect: the store bytes are untouched.
+        let after = tokio::fs::read(store.path()).await.unwrap();
+        assert_eq!(before, after, "list_profile_ids must not rewrite the store");
     }
 }
