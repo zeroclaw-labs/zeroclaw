@@ -598,6 +598,27 @@ fn main_binary_name() -> &'static str {
     }
 }
 
+/// Names of top-level *file* artifacts (not directories) the release archive is
+/// allowed to install next to the running binary, beyond the main `zeroclaw`
+/// executable itself. Anything else in the archive's top level is warned about
+/// and skipped — symmetric with how unknown top-level *directories* are
+/// handled, and defense-in-depth for the browser-triggered self-upgrade path:
+/// a compromised or forged release cannot introduce an arbitrarily-named file
+/// beside the running binary just by naming it in its own archive.
+///
+/// Grow this list — and its `.exe` twin on Windows — deliberately when a new
+/// companion ships. The CI release-artifact list is the source of truth this
+/// mirrors (currently: `zerocode` next to `zeroclaw`, plus the `web/dist`
+/// directory that's handled by the whole-directory swap above).
+#[cfg(windows)]
+const KNOWN_COMPANION_FILES: &[&str] = &["zerocode.exe"];
+#[cfg(not(windows))]
+const KNOWN_COMPANION_FILES: &[&str] = &["zerocode"];
+
+fn is_known_companion(name: &str) -> bool {
+    KNOWN_COMPANION_FILES.contains(&name)
+}
+
 /// Wholesale-unpack a `.tar.gz` release archive into `staging`.
 ///
 /// Delegates to `tar::Archive::unpack`, which:
@@ -1034,9 +1055,13 @@ async fn install_companion_artifacts(staging: &Path, current_exe: &Path) {
         }
     }
 
-    // 2. Every *other* top-level file in the archive, swapped into place next
-    //    to the running binary. This catches `zerocode` automatically and any
-    //    future sibling artifact without needing to enumerate names here.
+    // 2. Every *other* top-level file in the archive that is on the explicit
+    //    companion allowlist (see `KNOWN_COMPANION_FILES`), swapped into place
+    //    next to the running binary. Unknown top-level files are warned and
+    //    skipped — symmetric with how unknown top-level *directories* are
+    //    handled below, and narrows the browser-triggered self-upgrade blast
+    //    radius so a compromised or forged release cannot install an
+    //    arbitrarily-named file beside the running binary.
     let Some(install_dir) = current_exe.parent() else {
         ::zeroclaw_log::record!(
             WARN,
@@ -1083,6 +1108,23 @@ async fn install_companion_artifacts(staging: &Path, current_exe: &Path) {
         }
         if name_str == main_name {
             // Already swapped + smoke-tested via the transactional path.
+            continue;
+        }
+        // Everything else must appear on `KNOWN_COMPANION_FILES` explicitly.
+        // Bare-name check: mirrors the file-type gate above and matches how
+        // `install_dir.join(&name)` composes the target path — no traversal
+        // is possible because `read_dir(staging)` only yields staged names.
+        if !is_known_companion(name_str) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"name": name_str})),
+                "Release archive contains a top-level file that is not on the \
+                 companion allowlist — skipping. Add it to KNOWN_COMPANION_FILES \
+                 (and its `.exe` twin on Windows) if it should be installed \
+                 next to the running binary."
+            );
             continue;
         }
         let staged_path = entry.path();
@@ -2212,8 +2254,11 @@ mod tests {
 
     #[tokio::test]
     async fn install_companion_artifacts_swaps_top_level_siblings() {
-        // The generic file-swap loop replaces every top-level file in the
-        // staged tree (except the main binary) into the install dir.
+        // The companion-artifact loop swaps every top-level file that is on
+        // the explicit `KNOWN_COMPANION_FILES` allowlist (currently
+        // `zerocode` / `zerocode.exe`) — and only those. The main binary is
+        // handled earlier by the transactional `swap_binary` path; unknown
+        // top-level files are covered by the sibling test below.
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
@@ -2227,21 +2272,53 @@ mod tests {
         // (it was already handled by the transactional `swap_binary` path).
         std::fs::write(staging.join("zeroclaw"), b"new zeroclaw").unwrap();
         std::fs::write(staging.join("zerocode"), b"new zerocode").unwrap();
-        // A future new sibling — the generic loop should pick it up too.
-        std::fs::write(staging.join("zerodash"), b"new zerodash").unwrap();
 
         install_companion_artifacts(&staging, &exe).await;
 
         // zerocode swapped in.
         let expected_zerocode = bin_dir.join("zerocode");
         assert_eq!(std::fs::read(&expected_zerocode).unwrap(), b"new zerocode");
-        // zerodash also installed without the code knowing its name.
-        assert_eq!(
-            std::fs::read(bin_dir.join("zerodash")).unwrap(),
-            b"new zerodash"
-        );
         // Main binary must be unchanged by the companion pass.
         assert_eq!(std::fs::read(&exe).unwrap(), b"zeroclaw");
+    }
+
+    /// An unknown top-level *file* in the archive (anything not on
+    /// `KNOWN_COMPANION_FILES`) must be skipped — the updater warns rather
+    /// than blindly installing it — so a compromised or forged release cannot
+    /// use the browser-triggered self-upgrade path to introduce an
+    /// arbitrarily-named file next to the running binary. This is symmetric
+    /// with `install_companion_artifacts_skips_unknown_top_level_directories`.
+    #[tokio::test]
+    async fn install_companion_artifacts_skips_unknown_top_level_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let exe = bin_dir.join("zeroclaw");
+        std::fs::write(&exe, b"zeroclaw").unwrap();
+
+        let staging = tmp.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        // Known companion — must be installed.
+        std::fs::write(staging.join("zerocode"), b"new zerocode").unwrap();
+        // Unknown top-level file — must NOT be installed. This is the
+        // defense-in-depth surface: a forged release cannot smuggle a
+        // `zerodash`, `.bashrc`, `evil.so`, etc. next to `zeroclaw` just by
+        // naming it in its own archive.
+        std::fs::write(staging.join("zerodash"), b"unknown artifact").unwrap();
+
+        install_companion_artifacts(&staging, &exe).await;
+
+        // Known companion installed.
+        assert_eq!(
+            std::fs::read(bin_dir.join("zerocode")).unwrap(),
+            b"new zerocode"
+        );
+        // Unknown sibling NOT installed.
+        assert!(
+            !bin_dir.join("zerodash").exists(),
+            "unknown top-level file must not be installed; got it under {}",
+            bin_dir.display()
+        );
     }
 
     /// An unknown top-level directory in the archive (anything other than
