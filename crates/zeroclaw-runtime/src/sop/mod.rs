@@ -115,10 +115,14 @@ pub fn build_sop_engine(
         Arc::new(store::InMemoryRunStore::new())
     });
     let (run_tx, _run_rx) = tokio::sync::broadcast::channel(256);
+    let approval_broker = Arc::new(approval::ApprovalBroker::with_route(Arc::new(
+        approval::NoopRouteAdapter,
+    )));
     let mut engine = SopEngine::new(config)
         .with_store(store)
         .with_metrics(SopMetricsCollector::shared())
-        .with_run_notifier(run_tx);
+        .with_run_notifier(run_tx)
+        .with_approval_broker(approval_broker);
     engine.reload(workspace_dir);
     engine.restore_runs();
     let engine = Arc::new(Mutex::new(engine));
@@ -566,6 +570,13 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
                 if let Ok(call) = serde_json::from_str::<PlannedToolCall>(val.trim()) {
                     current.calls.push(call);
                 }
+            } else if let Some(val) = bullet.strip_prefix("policy:") {
+                let val = val.trim();
+                current.policy = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.to_string())
+                };
             } else {
                 // Continuation body line
                 if !current.body.is_empty() {
@@ -608,6 +619,7 @@ struct StepParseState {
     mode: Option<SopExecutionMode>,
     calls: Vec<PlannedToolCall>,
     agent: Option<String>,
+    policy: Option<String>,
 }
 
 impl StepParseState {
@@ -639,6 +651,7 @@ impl StepParseState {
             calls: std::mem::take(&mut self.calls),
             pos: None,
             agent: self.agent.take(),
+            policy: self.policy.take(),
         });
         *self = Self::default();
     }
@@ -1519,6 +1532,23 @@ mod tests {
         assert_eq!(
             sop.steps[2].calls[0].args,
             json!({"command": "{{steps.1.out}} then {{steps.2.ok}}"})
+        );
+    }
+
+    #[test]
+    fn parse_steps_reads_policy_bullet() {
+        let steps = parse_steps(
+            r#"
+## Steps
+1. **Gate** - Requires the release group.
+   - policy: prod
+2. **Go** - Unpoliced.
+"#,
+        );
+        assert_eq!(steps[0].policy.as_deref(), Some("prod"));
+        assert_eq!(
+            steps[1].policy, None,
+            "a step with no policy bullet stays None"
         );
     }
 

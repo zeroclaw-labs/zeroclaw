@@ -373,6 +373,11 @@ pub struct SopStep {
     /// Capability arguments, serialized as `with` in TOML/JSON definitions.
     #[serde(default, rename = "with", skip_serializing_if = "Option::is_none")]
     pub capability_input: Option<serde_json::Value>,
+    /// Approval policy name (a key in `[sop.approval].policies`) the approval broker
+    /// enforces for this step's gate: required approver group + quorum. `None` keeps
+    /// today's behavior (`approval_mode` alone governs, no membership/quorum).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
 }
 
 impl Default for SopStep {
@@ -394,6 +399,7 @@ impl Default for SopStep {
             agent: None,
             capability: None,
             capability_input: None,
+            policy: None,
         }
     }
 }
