@@ -11,7 +11,10 @@ use zeroclaw_eval::{Mode, SuiteReport};
 
 /// Run a suite of eval cases and return the aggregated report.
 pub async fn run(suite: PathBuf, mode: Mode) -> Result<SuiteReport> {
-    zeroclaw_eval::run_suite(&suite, mode).await
+    // Box the suite future: it drives the full agent loop (which captures the
+    // whole `Config`), so awaiting it inline makes this future exceed clippy's
+    // `large_futures` budget.
+    Box::pin(zeroclaw_eval::run_suite(&suite, mode)).await
 }
 
 /// Output format for the eval report.
