@@ -33,12 +33,13 @@ pub struct GithubProvider {
 impl GithubProvider {
     pub fn new(
         app_id: u64,
+        private_key_pem: Option<String>,
         private_key_path: String,
         installation_id: Option<u64>,
         proxy_url: Option<String>,
     ) -> Self {
         Self {
-            auth: AppAuth::new(app_id, private_key_path),
+            auth: AppAuth::new(app_id, private_key_pem, private_key_path),
             api: GithubApi::new(proxy_url),
             configured_installation: installation_id,
             slug: parking_lot::Mutex::new(None),
@@ -460,7 +461,7 @@ mod tests {
                 .await;
         }
 
-        let provider = GithubProvider::new(0, String::new(), Some(1), None)
+        let provider = GithubProvider::new(0, None, String::new(), Some(1), None)
             .with_api(GithubApi::with_base(server.uri()));
         let repo = RepoRef::parse("octo/repo").unwrap();
         let page = provider.fetch_issues("t", &repo, start).await.unwrap();

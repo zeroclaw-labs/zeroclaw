@@ -15978,6 +15978,15 @@ pub struct GitConfig {
     #[tab(Connection)]
     #[serde(default)]
     pub private_key_path: String,
+    /// RS256 private key PEM, inline and encrypted at rest. Takes precedence
+    /// over `private_key_path` when set. Include the BEGIN/END lines.
+    /// GitHub provider only.
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
     /// Installation ID to act as. When unset, the app's installations are
     /// listed on first use and a sole installation is auto-selected;
     /// startup fails if the app has zero or multiple installations.
@@ -16072,6 +16081,7 @@ impl Default for GitConfig {
             provider: default_git_provider(),
             app_id: 0,
             private_key_path: String::new(),
+            private_key: None,
             installation_id: None,
             api_base_url: None,
             access_token: String::new(),

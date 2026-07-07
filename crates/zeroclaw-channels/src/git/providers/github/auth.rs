@@ -26,6 +26,8 @@ struct Claims {
 
 pub struct AppAuth {
     app_id: u64,
+    /// Inline PEM, preferred over `private_key_path` when set.
+    private_key_pem: Option<String>,
     private_key_path: String,
     /// Parsed encoding key, loaded lazily on first use.
     key: parking_lot::Mutex<Option<EncodingKey>>,
@@ -34,9 +36,10 @@ pub struct AppAuth {
 }
 
 impl AppAuth {
-    pub fn new(app_id: u64, private_key_path: String) -> Self {
+    pub fn new(app_id: u64, private_key_pem: Option<String>, private_key_path: String) -> Self {
         Self {
             app_id,
+            private_key_pem: private_key_pem.filter(|p| !p.trim().is_empty()),
             private_key_path,
             key: parking_lot::Mutex::new(None),
             token: parking_lot::Mutex::new(None),
@@ -87,6 +90,9 @@ impl AppAuth {
     }
 
     fn load_key(&self) -> Result<EncodingKey, GitChannelError> {
+        if let Some(pem) = &self.private_key_pem {
+            return Ok(EncodingKey::from_rsa_pem(pem.as_bytes())?);
+        }
         let path = shellexpand::tilde(&self.private_key_path).into_owned();
         let pem = std::fs::read(&path).map_err(|source| GitChannelError::KeyRead {
             path: path.clone(),
@@ -166,7 +172,7 @@ mod tests {
     fn auth_with_test_key() -> (AppAuth, tempfile::NamedTempFile) {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(TEST_KEY_PEM.as_bytes()).unwrap();
-        let auth = AppAuth::new(12345, file.path().to_string_lossy().into_owned());
+        let auth = AppAuth::new(12345, None, file.path().to_string_lossy().into_owned());
         (auth, file)
     }
 
@@ -194,16 +200,37 @@ mod tests {
 
     #[test]
     fn mint_jwt_fails_when_key_file_missing() {
-        let auth = AppAuth::new(1, "/nonexistent/github-app.pem".into());
+        let auth = AppAuth::new(1, None, "/nonexistent/github-app.pem".into());
         let err = auth.mint_jwt().unwrap_err();
         assert!(matches!(err, GitChannelError::KeyRead { .. }));
+    }
+
+    #[test]
+    fn mint_jwt_uses_inline_pem_over_path() {
+        let auth = AppAuth::new(7, Some(TEST_KEY_PEM.to_string()), "/nonexistent.pem".into());
+        let jwt = auth.mint_jwt_at(1_000_000).unwrap();
+        let claims = decode_payload(&jwt);
+        assert_eq!(claims["iss"], "7");
+    }
+
+    #[test]
+    fn blank_inline_pem_falls_back_to_path() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(TEST_KEY_PEM.as_bytes()).unwrap();
+        let auth = AppAuth::new(
+            9,
+            Some("   ".into()),
+            file.path().to_string_lossy().into_owned(),
+        );
+        let jwt = auth.mint_jwt_at(1_000_000).unwrap();
+        assert_eq!(decode_payload(&jwt)["iss"], "9");
     }
 
     #[test]
     fn mint_jwt_fails_on_garbage_key() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(b"not a pem").unwrap();
-        let auth = AppAuth::new(1, file.path().to_string_lossy().into_owned());
+        let auth = AppAuth::new(1, None, file.path().to_string_lossy().into_owned());
         let err = auth.mint_jwt().unwrap_err();
         assert!(matches!(err, GitChannelError::Jwt(_)));
     }

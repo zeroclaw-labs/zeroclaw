@@ -46,6 +46,7 @@ fn build_provider(cfg: &GitConfig) -> anyhow::Result<Box<dyn GitProvider>> {
             {
                 Ok(Box::new(super::providers::github::GithubProvider::new(
                     cfg.app_id,
+                    cfg.private_key.clone(),
                     cfg.private_key_path.clone(),
                     cfg.installation_id,
                     cfg.proxy_url.clone(),
@@ -814,6 +815,7 @@ mod tests {
         fn mock_channel(cfg: GitConfig, server_uri: String) -> GitChannel {
             let provider = GithubProvider::new(
                 cfg.app_id,
+                cfg.private_key.clone(),
                 cfg.private_key_path.clone(),
                 cfg.installation_id,
                 None,
