@@ -19,6 +19,9 @@ With the Gitea/Forgejo provider, ZeroClaw authenticates with a personal access t
 
 ## Create credentials
 
+> Full step-by-step walkthroughs: [Creating a GitHub App](./git-github-app.md)
+> and [Creating a Gitea / Forgejo token (Codeberg)](./git-gitea-forgejo.md).
+
 For GitHub:
 
 1. GitHub → **Settings → Developer settings → GitHub Apps → New GitHub App**.
