@@ -246,6 +246,8 @@ pub enum SopStepKind {
     Execute,
     /// Checkpoint step — pauses execution and waits for human approval.
     Checkpoint,
+    /// Deterministic capability step - executed by the SOP capability registry.
+    Capability,
 }
 
 impl fmt::Display for SopStepKind {
@@ -253,6 +255,7 @@ impl fmt::Display for SopStepKind {
         match self {
             Self::Execute => write!(f, "execute"),
             Self::Checkpoint => write!(f, "checkpoint"),
+            Self::Capability => write!(f, "capability"),
         }
     }
 }
@@ -310,13 +313,16 @@ pub struct SopStep {
     /// Ordinal position of this step within the procedure. Steps run in
     /// number order unless routing overrides the sequence; the daemon
     /// renumbers on save so gaps and reorders normalize to 1..N.
+    #[serde(default)]
     pub number: u32,
     /// Short human label for the step, shown on the canvas node and in the
     /// step list. Leave blank and the surface falls back to "untitled".
+    #[serde(default)]
     pub title: String,
     /// The step's instruction body in Markdown. This is the prompt the
     /// running agent executes for the step; bindings like `{{steps.N}}`
     /// resolve against prior step outputs at run time.
+    #[serde(default)]
     pub body: String,
     /// Advisory tool names surfaced to the agent for this step. Legacy alias
     /// for `scope.allow`; when `step_scope_enforce` is off these are hints,
@@ -358,6 +364,12 @@ pub struct SopStep {
     /// and model execute the step body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Capability identifier used when `kind = "capability"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    /// Capability arguments, serialized as `with` in TOML/JSON definitions.
+    #[serde(default, rename = "with", skip_serializing_if = "Option::is_none")]
+    pub capability_input: Option<serde_json::Value>,
 }
 
 impl Default for SopStep {
@@ -377,11 +389,27 @@ impl Default for SopStep {
             calls: Vec::new(),
             pos: None,
             agent: None,
+            capability: None,
+            capability_input: None,
         }
     }
 }
 
 impl SopStep {
+    pub fn capability_id(&self) -> Option<&str> {
+        self.capability.as_deref()
+    }
+
+    pub fn capability_call_input(&self, piped_input: serde_json::Value) -> serde_json::Value {
+        let Some(mut configured) = self.capability_input.clone() else {
+            return piped_input;
+        };
+        if let Some(object) = configured.as_object_mut() {
+            object.entry("input").or_insert(piped_input);
+        }
+        configured
+    }
+
     pub fn effective_tool_scope(&self) -> Option<StepToolScope> {
         let mut scope = self.scope.clone();
         if !self.suggested_tools.is_empty() {
@@ -472,6 +500,8 @@ pub struct SopManifest {
     /// `SopStep::pos` at load time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub positions: Vec<StepPosition>,
+    #[serde(default)]
+    pub steps: Vec<SopStep>,
 }
 
 /// One step's persisted canvas coordinate in SOP.toml.
@@ -532,6 +562,7 @@ impl SopManifest {
                     })
                 })
                 .collect(),
+            steps: sop.steps.clone(),
         }
     }
 }
@@ -1100,6 +1131,7 @@ condition = "$.event_type == \"pull_request.opened\""
     fn step_kind_display() {
         assert_eq!(SopStepKind::Execute.to_string(), "execute");
         assert_eq!(SopStepKind::Checkpoint.to_string(), "checkpoint");
+        assert_eq!(SopStepKind::Capability.to_string(), "capability");
     }
 
     #[test]
@@ -1159,6 +1191,8 @@ condition = "$.event_type == \"pull_request.opened\""
                 .unwrap();
         assert!(step.suggested_tools.is_empty());
         assert!(!step.requires_confirmation);
+        assert!(step.capability.is_none());
+        assert!(step.capability_input.is_none());
     }
 
     #[test]
@@ -1175,6 +1209,8 @@ condition = "$.event_type == \"pull_request.opened\""
         assert!(value.get("routing").is_none());
         assert!(value.get("on_failure").is_none());
         assert!(value.get("mode").is_none());
+        assert!(value.get("capability").is_none());
+        assert!(value.get("with").is_none());
     }
 
     #[test]

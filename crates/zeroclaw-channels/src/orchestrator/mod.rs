@@ -7336,8 +7336,21 @@ fn build_channel_by_id(
                     let alias = alias.clone();
                     Arc::new(move || cfg_arc.read().channel_external_peers("line", &alias))
                 };
+                let sender_name_resolver: Arc<dyn Fn() -> Option<String> + Send + Sync> = {
+                    let cfg_arc = config_arc.clone();
+                    let alias = alias.clone();
+                    Arc::new(move || {
+                        cfg_arc
+                            .read()
+                            .channels
+                            .line
+                            .get(&alias)
+                            .and_then(|ln| ln.sender_name.clone())
+                            .filter(|s| !s.is_empty())
+                    })
+                };
                 Ok(Arc::new(
-                    LineChannel::from_config(ln, alias, peer_resolver)
+                    LineChannel::from_config(ln, alias, peer_resolver, sender_name_resolver)
                         .with_persistence(config_arc.clone()),
                 ))
             }
@@ -8655,11 +8668,24 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("line", &alias))
         };
+        let sender_name_resolver: Arc<dyn Fn() -> Option<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                cfg_arc
+                    .read()
+                    .channels
+                    .line
+                    .get(&alias)
+                    .and_then(|ln| ln.sender_name.clone())
+                    .filter(|s| !s.is_empty())
+            })
+        };
         channels.push(ConfiguredChannel {
             display_name: "LINE",
             alias: Some(alias.clone()),
             channel: Arc::new(
-                LineChannel::from_config(ln, alias.clone(), peer_resolver)
+                LineChannel::from_config(ln, alias.clone(), peer_resolver, sender_name_resolver)
                     .with_persistence(config_arc.clone())
                     .with_transcription(config.transcription.clone()),
             ),
@@ -9487,6 +9513,14 @@ pub async fn start_channels(
         cancel.cancelled().await;
         return Ok(());
     }
+
+    // Start the live model-pricing refresher (once per process; idempotent and
+    // a no-op unless some provider sets `live_pricing = true`). Each call
+    // re-binds the refresher's config handle, so reload iterations that
+    // re-instantiate the config Arc (or toggle `live_pricing`) are honored
+    // without a restart. Fills cost rates for models the operator hasn't
+    // priced in `[cost.rates]`.
+    zeroclaw_providers::pricing::spawn_refresher(config_arc.clone());
 
     // Every `[channels.<type>.<alias>]` block is owned by exactly one agent
     // (declared via `agents.<alias>.channels = [...]`). One
