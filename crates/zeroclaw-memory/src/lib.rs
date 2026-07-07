@@ -29,6 +29,7 @@ pub mod audit;
 pub mod backend;
 pub mod budget;
 pub mod chunker;
+pub mod classify;
 pub mod conflict;
 pub mod consolidation;
 pub mod decay;
