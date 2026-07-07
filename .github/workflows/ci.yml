@@ -100,7 +100,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y libudev-dev
+        run: bash scripts/ci/apt_install.sh libudev-dev
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Clippy
@@ -285,11 +285,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install mold linker
         if: runner.os == 'Linux'
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
-            /etc/apt/sources.list.d/azure-cli.list
-          sudo apt-get update -qq
-          sudo apt-get install -y mold
+        run: bash scripts/ci/apt_install.sh mold
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
@@ -358,7 +354,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
         if: matrix.sys_deps != ''
-        run: sudo apt-get update -qq && sudo apt-get install -y ${{ matrix.sys_deps }}
+        run: bash scripts/ci/apt_install.sh ${{ matrix.sys_deps }}
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Check
@@ -423,7 +419,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install 32-bit system libraries
-        run: sudo apt-get update -qq && sudo apt-get install -y gcc-multilib
+        run: bash scripts/ci/apt_install.sh gcc-multilib
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Check (32-bit, no default features)
@@ -469,11 +465,7 @@ jobs:
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install mold linker
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
-            /etc/apt/sources.list.d/azure-cli.list
-          sudo apt-get update -qq
-          sudo apt-get install -y mold
+        run: bash scripts/ci/apt_install.sh mold
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
       - name: Run tests
@@ -527,7 +519,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install Nix
-        run: sudo apt-get update -qq && sudo apt-get install -y nix-bin nix-setup-systemd
+        run: bash scripts/ci/apt_install.sh nix-bin nix-setup-systemd
       - name: Verify Nix
         run: sudo nix --version
       - name: Evaluate Nix module assertions
