@@ -54,6 +54,583 @@ struct Planned {
     label: String,
 }
 
+/// One typed forge operation. The single source of truth: `describe` folds the
+/// [`CELLS`] table into its grid and `plan` looks up the builder in the same
+/// table, so the advertised vocabulary and the executable vocabulary can never
+/// drift apart. `doc` is the endpoint shape shown by `describe` and doubles as
+/// the `raw` cheat-sheet. `build` turns validated args into a [`Planned`].
+struct Cell {
+    resource: &'static str,
+    action: &'static str,
+    doc: &'static str,
+    build: fn(repo: &str, args: &Value) -> Result<Planned, String>,
+}
+
+fn cell_num(args: &Value, resource: &str, action: &str) -> Result<u64, String> {
+    GitForgeTool::num_arg(args, "number").ok_or_else(|| {
+        ferr_args(
+            "tool-git-forge-error-requires-number",
+            &[("resource", resource), ("action", action)],
+        )
+    })
+}
+
+/// The complete typed grid. Add a row here and both `describe` and `plan` pick
+/// it up; there is nowhere else to register a cell.
+static CELLS: &[Cell] = &[
+    Cell {
+        resource: "milestone",
+        action: "list",
+        doc: "GET repos/{repo}/milestones?state=open",
+        build: |repo, _| {
+            Ok(Planned {
+                method: "GET",
+                path: format!("repos/{repo}/milestones?state=open"),
+                body: None,
+                label: "list milestones".into(),
+            })
+        },
+    },
+    Cell {
+        resource: "milestone",
+        action: "read",
+        doc: "GET repos/{repo}/milestones/{number}",
+        build: |repo, args| {
+            Ok(Planned {
+                method: "GET",
+                path: format!(
+                    "repos/{repo}/milestones/{}",
+                    cell_num(args, "milestone", "read")?
+                ),
+                body: None,
+                label: "read milestone".into(),
+            })
+        },
+    },
+    Cell {
+        resource: "milestone",
+        action: "create",
+        doc: "POST repos/{repo}/milestones {title, description?, state?}",
+        build: |repo, args| {
+            let title = GitForgeTool::str_arg(args, "title")
+                .ok_or_else(|| req_field("milestone", "create", "title"))?;
+            let mut body = json!({ "title": title });
+            if let Some(d) = GitForgeTool::str_arg(args, "description") {
+                body["description"] = json!(d);
+            }
+            Ok(Planned {
+                method: "POST",
+                path: format!("repos/{repo}/milestones"),
+                body: Some(body),
+                label: format!("create milestone '{title}'"),
+            })
+        },
+    },
+    Cell {
+        resource: "milestone",
+        action: "update",
+        doc: "PATCH repos/{repo}/milestones/{number} {title?, description?, state?}",
+        build: |repo, args| {
+            let n = cell_num(args, "milestone", "update")?;
+            let mut body = json!({});
+            for field in ["title", "description", "state"] {
+                if let Some(v) = GitForgeTool::str_arg(args, field) {
+                    body[field] = json!(v);
+                }
+            }
+            Ok(Planned {
+                method: "PATCH",
+                path: format!("repos/{repo}/milestones/{n}"),
+                body: Some(body),
+                label: format!("update milestone {n}"),
+            })
+        },
+    },
+    Cell {
+        resource: "milestone",
+        action: "delete",
+        doc: "DELETE repos/{repo}/milestones/{number}",
+        build: |repo, args| {
+            Ok(Planned {
+                method: "DELETE",
+                path: format!(
+                    "repos/{repo}/milestones/{}",
+                    cell_num(args, "milestone", "delete")?
+                ),
+                body: None,
+                label: "delete milestone".into(),
+            })
+        },
+    },
+    Cell {
+        resource: "label",
+        action: "list",
+        doc: "GET repos/{repo}/labels",
+        build: |repo, _| {
+            Ok(Planned {
+                method: "GET",
+                path: format!("repos/{repo}/labels"),
+                body: None,
+                label: "list labels".into(),
+            })
+        },
+    },
+    Cell {
+        resource: "label",
+        action: "create",
+        doc: "POST repos/{repo}/labels {name, color, description?}",
+        build: |repo, args| {
+            let name = GitForgeTool::str_arg(args, "name")
+                .ok_or_else(|| req_field("label", "create", "name"))?;
+            let color = GitForgeTool::str_arg(args, "color")
+                .ok_or_else(|| req_field("label", "create", "color"))?;
+            let mut body = json!({ "name": name, "color": color });
+            if let Some(d) = GitForgeTool::str_arg(args, "description") {
+                body["description"] = json!(d);
+            }
+            Ok(Planned {
+                method: "POST",
+                path: format!("repos/{repo}/labels"),
+                body: Some(body),
+                label: format!("create label '{name}'"),
+            })
+        },
+    },
+    Cell {
+        resource: "label",
+        action: "update",
+        doc: "PATCH repos/{repo}/labels/{name} {new_name?, color?, description?}",
+        build: |repo, args| {
+            let name = GitForgeTool::str_arg(args, "name")
+                .ok_or_else(|| req_field("label", "update", "name"))?;
+            let mut body = json!({});
+            if let Some(v) = GitForgeTool::str_arg(args, "new_name") {
+                body["new_name"] = json!(v);
+            }
+            for field in ["color", "description"] {
+                if let Some(v) = GitForgeTool::str_arg(args, field) {
+                    body[field] = json!(v);
+                }
+            }
+            Ok(Planned {
+                method: "PATCH",
+                path: format!("repos/{repo}/labels/{name}"),
+                body: Some(body),
+                label: format!("update label '{name}'"),
+            })
+        },
+    },
+    Cell {
+        resource: "label",
+        action: "delete",
+        doc: "DELETE repos/{repo}/labels/{name}",
+        build: |repo, args| {
+            let name = GitForgeTool::str_arg(args, "name")
+                .ok_or_else(|| req_field("label", "delete", "name"))?;
+            Ok(Planned {
+                method: "DELETE",
+                path: format!("repos/{repo}/labels/{name}"),
+                body: None,
+                label: format!("delete label '{name}'"),
+            })
+        },
+    },
+    Cell {
+        resource: "label",
+        action: "add",
+        doc: "POST repos/{repo}/issues/{number}/labels {labels:[..]}",
+        build: |repo, args| {
+            let n = cell_num(args, "label", "add")?;
+            let labels = args
+                .get("labels")
+                .and_then(Value::as_array)
+                .filter(|a| !a.is_empty())
+                .ok_or_else(|| req_field("label", "add", "labels"))?;
+            Ok(Planned {
+                method: "POST",
+                path: format!("repos/{repo}/issues/{n}/labels"),
+                body: Some(json!({ "labels": labels })),
+                label: format!("add labels to #{n}"),
+            })
+        },
+    },
+    Cell {
+        resource: "label",
+        action: "remove",
+        doc: "DELETE repos/{repo}/issues/{number}/labels/{name}",
+        build: |repo, args| {
+            let n = cell_num(args, "label", "remove")?;
+            let name = GitForgeTool::str_arg(args, "name")
+                .ok_or_else(|| req_field("label", "remove", "name"))?;
+            Ok(Planned {
+                method: "DELETE",
+                path: format!("repos/{repo}/issues/{n}/labels/{name}"),
+                body: None,
+                label: format!("remove label '{name}' from #{n}"),
+            })
+        },
+    },
+    Cell {
+        resource: "issue",
+        action: "read",
+        doc: "GET repos/{repo}/issues/{number}",
+        build: |repo, args| {
+            Ok(Planned {
+                method: "GET",
+                path: format!("repos/{repo}/issues/{}", cell_num(args, "issue", "read")?),
+                body: None,
+                label: "read issue".into(),
+            })
+        },
+    },
+    Cell {
+        resource: "issue",
+        action: "list",
+        doc: "GET repos/{repo}/issues?state=open {state?, labels?, per_page?}",
+        build: |repo, args| {
+            let mut qs = String::from("state=open");
+            GitForgeTool::push_list_filters(&mut qs, args);
+            Ok(Planned {
+                method: "GET",
+                path: format!("repos/{repo}/issues?{qs}"),
+                body: None,
+                label: "list issues".into(),
+            })
+        },
+    },
+    Cell {
+        resource: "issue",
+        action: "update",
+        doc: "PATCH repos/{repo}/issues/{number} {title?, body?, milestone?}",
+        build: |repo, args| {
+            let n = cell_num(args, "issue", "update")?;
+            let mut body = json!({});
+            for field in ["title", "body"] {
+                if let Some(v) = GitForgeTool::str_arg(args, field) {
+                    body[field] = json!(v);
+                }
+            }
+            if let Some(m) = GitForgeTool::num_arg(args, "milestone") {
+                body["milestone"] = json!(m);
+            }
+            Ok(Planned {
+                method: "PATCH",
+                path: format!("repos/{repo}/issues/{n}"),
+                body: Some(body),
+                label: format!("update issue #{n}"),
+            })
+        },
+    },
+    Cell {
+        resource: "issue",
+        action: "close",
+        doc: "PATCH repos/{repo}/issues/{number} {state:closed, state_reason: completed|not_planned}",
+        build: |repo, args| {
+            let n = cell_num(args, "issue", "close")?;
+            let reason = GitForgeTool::str_arg(args, "reason").unwrap_or("completed");
+            if reason != "completed" && reason != "not_planned" {
+                return Err(ferr("tool-git-forge-error-issue-close-reason"));
+            }
+            Ok(Planned {
+                method: "PATCH",
+                path: format!("repos/{repo}/issues/{n}"),
+                body: Some(json!({ "state": "closed", "state_reason": reason })),
+                label: format!("close issue #{n} as {reason}"),
+            })
+        },
+    },
+    Cell {
+        resource: "pull",
+        action: "create",
+        doc: "POST repos/{repo}/pulls {title, head, base, draft?, body?}",
+        build: |repo, args| {
+            let title = GitForgeTool::str_arg(args, "title")
+                .ok_or_else(|| req_field("pull", "create", "title"))?;
+            let head = GitForgeTool::str_arg(args, "head")
+                .ok_or_else(|| req_field("pull", "create", "head"))?;
+            let base = GitForgeTool::str_arg(args, "base")
+                .ok_or_else(|| req_field("pull", "create", "base"))?;
+            let mut body = json!({
+                "title": title,
+                "head": head,
+                "base": base,
+                "draft": args.get("draft").and_then(Value::as_bool).unwrap_or(false),
+            });
+            if let Some(b) = GitForgeTool::str_arg(args, "body") {
+                body["body"] = json!(b);
+            }
+            Ok(Planned {
+                method: "POST",
+                path: format!("repos/{repo}/pulls"),
+                body: Some(body),
+                label: format!("open pull '{title}'"),
+            })
+        },
+    },
+    Cell {
+        resource: "pull",
+        action: "update",
+        doc: "PATCH repos/{repo}/pulls/{number} {title?, body?, state?, base?} (REST cannot flip draft<->ready; use raw GraphQL for that)",
+        build: |repo, args| {
+            let n = cell_num(args, "pull", "update")?;
+            let mut body = json!({});
+            for field in ["title", "body", "state", "base"] {
+                if let Some(v) = GitForgeTool::str_arg(args, field) {
+                    body[field] = json!(v);
+                }
+            }
+            Ok(Planned {
+                method: "PATCH",
+                path: format!("repos/{repo}/pulls/{n}"),
+                body: Some(body),
+                label: format!("update pull #{n}"),
+            })
+        },
+    },
+    Cell {
+        resource: "pull",
+        action: "read",
+        doc: "GET repos/{repo}/pulls/{number}",
+        build: |repo, args| {
+            Ok(Planned {
+                method: "GET",
+                path: format!("repos/{repo}/pulls/{}", cell_num(args, "pull", "read")?),
+                body: None,
+                label: "read pull".into(),
+            })
+        },
+    },
+    Cell {
+        resource: "pull",
+        action: "list",
+        doc: "GET repos/{repo}/pulls?state=open {state?, labels?, per_page?}",
+        build: |repo, args| {
+            let mut qs = String::from("state=open");
+            GitForgeTool::push_list_filters(&mut qs, args);
+            Ok(Planned {
+                method: "GET",
+                path: format!("repos/{repo}/pulls?{qs}"),
+                body: None,
+                label: "list pulls".into(),
+            })
+        },
+    },
+    Cell {
+        resource: "pull",
+        action: "files",
+        doc: "GET repos/{repo}/pulls/{number}/files",
+        build: |repo, args| {
+            Ok(Planned {
+                method: "GET",
+                path: format!(
+                    "repos/{repo}/pulls/{}/files",
+                    cell_num(args, "pull", "files")?
+                ),
+                body: None,
+                label: "list pull files".into(),
+            })
+        },
+    },
+    Cell {
+        resource: "pull",
+        action: "close",
+        doc: "PATCH repos/{repo}/pulls/{number} {state:closed}",
+        build: |repo, args| {
+            let n = cell_num(args, "pull", "close")?;
+            Ok(Planned {
+                method: "PATCH",
+                path: format!("repos/{repo}/pulls/{n}"),
+                body: Some(json!({ "state": "closed" })),
+                label: format!("close pull #{n}"),
+            })
+        },
+    },
+    Cell {
+        resource: "pull",
+        action: "merge",
+        doc: "PUT repos/{repo}/pulls/{number}/merge {merge_method: merge|squash|rebase, commit_title?, commit_message?}",
+        build: |repo, args| {
+            let n = cell_num(args, "pull", "merge")?;
+            let method_arg = GitForgeTool::str_arg(args, "merge_method")
+                .or_else(|| GitForgeTool::str_arg(args, "method"))
+                .unwrap_or("merge");
+            if !["merge", "squash", "rebase"].contains(&method_arg) {
+                return Err(ferr("tool-git-forge-error-pull-merge-method"));
+            }
+            let mut body = json!({ "merge_method": method_arg });
+            if let Some(s) = GitForgeTool::str_arg(args, "commit_title")
+                .or_else(|| GitForgeTool::str_arg(args, "subject"))
+            {
+                body["commit_title"] = json!(s);
+            }
+            if let Some(m) = GitForgeTool::str_arg(args, "commit_message")
+                .or_else(|| GitForgeTool::str_arg(args, "message"))
+            {
+                body["commit_message"] = json!(m);
+            }
+            Ok(Planned {
+                method: "PUT",
+                path: format!("repos/{repo}/pulls/{n}/merge"),
+                body: Some(body),
+                label: format!("{method_arg}-merge pull #{n}"),
+            })
+        },
+    },
+    Cell {
+        resource: "review",
+        action: "create",
+        doc: "POST repos/{repo}/pulls/{number}/reviews {event: APPROVE|REQUEST_CHANGES|COMMENT, body?}",
+        build: |repo, args| {
+            let n = cell_num(args, "review", "create")?;
+            let verdict = GitForgeTool::str_arg(args, "event")
+                .or_else(|| GitForgeTool::str_arg(args, "verdict"))
+                .ok_or_else(|| req_field("review", "create", "event"))?;
+            let normalized = verdict.to_ascii_lowercase();
+            let event = [
+                ("approve", "APPROVE"),
+                ("request_changes", "REQUEST_CHANGES"),
+                ("comment", "COMMENT"),
+            ]
+            .into_iter()
+            .find(|(k, _)| *k == normalized)
+            .map(|(_, e)| e)
+            .ok_or_else(|| {
+                ferr_args(
+                    "tool-git-forge-error-review-verdict",
+                    &[("verdict", verdict)],
+                )
+            })?;
+            let mut body = json!({ "event": event });
+            if let Some(b) = GitForgeTool::str_arg(args, "body") {
+                body["body"] = json!(b);
+            }
+            Ok(Planned {
+                method: "POST",
+                path: format!("repos/{repo}/pulls/{n}/reviews"),
+                body: Some(body),
+                label: format!("{verdict} review on #{n}"),
+            })
+        },
+    },
+    Cell {
+        resource: "review",
+        action: "list",
+        doc: "GET repos/{repo}/pulls/{number}/reviews",
+        build: |repo, args| {
+            Ok(Planned {
+                method: "GET",
+                path: format!(
+                    "repos/{repo}/pulls/{}/reviews",
+                    cell_num(args, "review", "list")?
+                ),
+                body: None,
+                label: "list reviews".into(),
+            })
+        },
+    },
+    Cell {
+        resource: "reviewer",
+        action: "request",
+        doc: "POST repos/{repo}/pulls/{number}/requested_reviewers {reviewers:[..]}",
+        build: |repo, args| {
+            let n = cell_num(args, "reviewer", "request")?;
+            let reviewers = args
+                .get("reviewers")
+                .and_then(Value::as_array)
+                .filter(|a| !a.is_empty())
+                .ok_or_else(|| req_field("reviewer", "request", "reviewers"))?;
+            Ok(Planned {
+                method: "POST",
+                path: format!("repos/{repo}/pulls/{n}/requested_reviewers"),
+                body: Some(json!({ "reviewers": reviewers })),
+                label: format!("request reviewers on #{n}"),
+            })
+        },
+    },
+    Cell {
+        resource: "reviewer",
+        action: "list",
+        doc: "GET repos/{repo}/pulls/{number}/requested_reviewers",
+        build: |repo, args| {
+            Ok(Planned {
+                method: "GET",
+                path: format!(
+                    "repos/{repo}/pulls/{}/requested_reviewers",
+                    cell_num(args, "reviewer", "list")?
+                ),
+                body: None,
+                label: "list requested reviewers".into(),
+            })
+        },
+    },
+    Cell {
+        resource: "reviewer",
+        action: "remove",
+        doc: "DELETE repos/{repo}/pulls/{number}/requested_reviewers {reviewers:[..]}",
+        build: |repo, args| {
+            let n = cell_num(args, "reviewer", "remove")?;
+            let reviewers = args
+                .get("reviewers")
+                .and_then(Value::as_array)
+                .filter(|a| !a.is_empty())
+                .ok_or_else(|| req_field("reviewer", "remove", "reviewers"))?;
+            Ok(Planned {
+                method: "DELETE",
+                path: format!("repos/{repo}/pulls/{n}/requested_reviewers"),
+                body: Some(json!({ "reviewers": reviewers })),
+                label: format!("remove reviewers on #{n}"),
+            })
+        },
+    },
+    Cell {
+        resource: "comment",
+        action: "create",
+        doc: "POST repos/{repo}/issues/{number}/comments {body}",
+        build: |repo, args| {
+            let n = cell_num(args, "comment", "create")?;
+            let cbody = GitForgeTool::str_arg(args, "body")
+                .ok_or_else(|| req_field("comment", "create", "body"))?;
+            Ok(Planned {
+                method: "POST",
+                path: format!("repos/{repo}/issues/{n}/comments"),
+                body: Some(json!({ "body": cbody })),
+                label: format!("comment on #{n}"),
+            })
+        },
+    },
+    Cell {
+        resource: "comment",
+        action: "list",
+        doc: "GET repos/{repo}/issues/{number}/comments",
+        build: |repo, args| {
+            Ok(Planned {
+                method: "GET",
+                path: format!(
+                    "repos/{repo}/issues/{}/comments",
+                    cell_num(args, "comment", "list")?
+                ),
+                body: None,
+                label: "list comments".into(),
+            })
+        },
+    },
+    Cell {
+        resource: "comment",
+        action: "delete",
+        doc: "DELETE repos/{repo}/issues/comments/{comment_id}",
+        build: |repo, args| {
+            let cid = GitForgeTool::num_arg(args, "comment_id")
+                .ok_or_else(|| req_field("comment", "delete", "comment_id"))?;
+            Ok(Planned {
+                method: "DELETE",
+                path: format!("repos/{repo}/issues/comments/{cid}"),
+                body: None,
+                label: format!("delete comment {cid}"),
+            })
+        },
+    },
+];
+
 impl GitForgeTool {
     pub fn new(security: Arc<SecurityPolicy>, channels: ChannelMapHandle) -> Self {
         Self { channels, security }
@@ -82,59 +659,27 @@ impl GitForgeTool {
     /// The self-documenting grid returned by the `describe` action. Each typed
     /// cell carries its method + path template so `describe` doubles as the
     /// `raw` cheat-sheet: no separate hand-maintained endpoint doc to drift.
+    /// Fold the [`CELLS`] table into the self-documenting grid returned by the
+    /// `describe` action. Nothing is hand-listed here; the endpoint shapes come
+    /// straight from each cell's `doc`, so `describe` cannot advertise a cell
+    /// that `plan` does not build.
     fn describe() -> Value {
+        let mut resources = serde_json::Map::new();
+        for cell in CELLS {
+            let entry = resources
+                .entry(cell.resource)
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Value::Object(actions) = entry {
+                actions.insert(cell.action.into(), Value::String(cell.doc.into()));
+            }
+        }
         json!({
             "note": "Give repo as 'owner/repo'. For issue/pull ops give 'number'. \
                      Typed cells validate success beyond a 2xx; use 'raw' for anything \
                      not listed here. Speak GitHub-canonical field names; the Gitea/Forgejo \
                      provider translates them (merge verb/keys, review event spelling, and \
                      drops state_reason) so cells behave uniformly across forges.",
-            "resources": {
-                "milestone": {
-                    "list":   "GET repos/{repo}/milestones?state=open",
-                    "read":   "GET repos/{repo}/milestones/{number}",
-                    "create": "POST repos/{repo}/milestones {title, description?, state?}",
-                    "update": "PATCH repos/{repo}/milestones/{number} {title?, description?, state?}",
-                    "delete": "DELETE repos/{repo}/milestones/{number}"
-                },
-                "label": {
-                    "list":   "GET repos/{repo}/labels",
-                    "create": "POST repos/{repo}/labels {name, color, description?}",
-                    "update": "PATCH repos/{repo}/labels/{name} {new_name?, color?, description?}",
-                    "delete": "DELETE repos/{repo}/labels/{name}",
-                    "add":    "POST repos/{repo}/issues/{number}/labels {labels:[..]}",
-                    "remove": "DELETE repos/{repo}/issues/{number}/labels/{name}"
-                },
-                "issue": {
-                    "read":   "GET repos/{repo}/issues/{number}",
-                    "update": "PATCH repos/{repo}/issues/{number} {title?, body?, milestone?, assignees?}",
-                    "close":  "PATCH repos/{repo}/issues/{number} {state:closed, state_reason: completed|not_planned}",
-                    "list":   "GET repos/{repo}/issues?state=open {state?, labels?, per_page?}"
-                },
-                "pull": {
-                    "read":   "GET repos/{repo}/pulls/{number}",
-                    "create": "POST repos/{repo}/pulls {title, head, base, draft?, body?}",
-                    "update": "PATCH repos/{repo}/pulls/{number} {title?, body?, state?, base?} (REST cannot flip draft<->ready; use raw GraphQL for that)",
-                    "close":  "PATCH repos/{repo}/pulls/{number} {state:closed}",
-                    "merge":  "PUT repos/{repo}/pulls/{number}/merge {merge_method: merge|squash|rebase, commit_title?, commit_message?}",
-                    "list":   "GET repos/{repo}/pulls?state=open {state?, labels?, per_page?}",
-                    "files":  "GET repos/{repo}/pulls/{number}/files"
-                },
-                "review": {
-                    "create": "POST repos/{repo}/pulls/{number}/reviews {event: APPROVE|REQUEST_CHANGES|COMMENT, body?}",
-                    "list":   "GET repos/{repo}/pulls/{number}/reviews"
-                },
-                "reviewer": {
-                    "request": "POST repos/{repo}/pulls/{number}/requested_reviewers {reviewers:[..]}",
-                    "remove":  "DELETE repos/{repo}/pulls/{number}/requested_reviewers {reviewers:[..]}",
-                    "list":    "GET repos/{repo}/pulls/{number}/requested_reviewers"
-                },
-                "comment": {
-                    "create": "POST repos/{repo}/issues/{number}/comments {body}",
-                    "list":   "GET repos/{repo}/issues/{number}/comments",
-                    "delete": "DELETE repos/{repo}/issues/comments/{comment_id}"
-                }
-            }
+            "resources": Value::Object(resources),
         })
     }
 
@@ -177,378 +722,20 @@ impl GitForgeTool {
     /// Resolve a `{resource, action}` pair plus args into a planned forge call.
     /// Returns an error string when the pair is unknown or required args are
     /// missing — the model gets a precise reason, never a silent misfire.
+    /// Resolve a `{resource, action}` pair plus args into a planned forge call
+    /// by finding the matching row in [`CELLS`] and running its builder. Returns
+    /// a precise error when the pair is unknown or a required arg is missing.
     fn plan(resource: &str, action: &str, repo: &str, args: &Value) -> Result<Planned, String> {
-        let num = || Self::num_arg(args, "number");
-        let need_num = || {
-            num().ok_or_else(|| {
-                ferr_args(
-                    "tool-git-forge-error-requires-number",
-                    &[("resource", resource), ("action", action)],
-                )
-            })
-        };
-
-        let key = (resource, action);
-        let planned = if key == ("milestone", "list") {
-            Planned {
-                method: "GET",
-                path: format!("repos/{repo}/milestones?state=open"),
-                body: None,
-                label: "list milestones".into(),
-            }
-        } else if key == ("milestone", "read") {
-            Planned {
-                method: "GET",
-                path: format!("repos/{repo}/milestones/{}", need_num()?),
-                body: None,
-                label: "read milestone".into(),
-            }
-        } else if key == ("milestone", "create") {
-            let title = Self::str_arg(args, "title")
-                .ok_or_else(|| req_field("milestone", "create", "title"))?;
-            let mut body = json!({ "title": title });
-            if let Some(d) = Self::str_arg(args, "description") {
-                body["description"] = json!(d);
-            }
-            Planned {
-                method: "POST",
-                path: format!("repos/{repo}/milestones"),
-                body: Some(body),
-                label: format!("create milestone '{title}'"),
-            }
-        } else if key == ("milestone", "update") {
-            let n = need_num()?;
-            let mut body = json!({});
-            for field in ["title", "description", "state"] {
-                if let Some(v) = Self::str_arg(args, field) {
-                    body[field] = json!(v);
-                }
-            }
-            Planned {
-                method: "PATCH",
-                path: format!("repos/{repo}/milestones/{n}"),
-                body: Some(body),
-                label: format!("update milestone {n}"),
-            }
-        } else if key == ("milestone", "delete") {
-            Planned {
-                method: "DELETE",
-                path: format!("repos/{repo}/milestones/{}", need_num()?),
-                body: None,
-                label: "delete milestone".into(),
-            }
-        } else if key == ("label", "list") {
-            Planned {
-                method: "GET",
-                path: format!("repos/{repo}/labels"),
-                body: None,
-                label: "list labels".into(),
-            }
-        } else if key == ("label", "create") {
-            let name =
-                Self::str_arg(args, "name").ok_or_else(|| req_field("label", "create", "name"))?;
-            let color = Self::str_arg(args, "color")
-                .ok_or_else(|| req_field("label", "create", "color"))?;
-            let mut body = json!({ "name": name, "color": color });
-            if let Some(d) = Self::str_arg(args, "description") {
-                body["description"] = json!(d);
-            }
-            Planned {
-                method: "POST",
-                path: format!("repos/{repo}/labels"),
-                body: Some(body),
-                label: format!("create label '{name}'"),
-            }
-        } else if key == ("label", "update") {
-            let name =
-                Self::str_arg(args, "name").ok_or_else(|| req_field("label", "update", "name"))?;
-            let mut body = json!({});
-            if let Some(v) = Self::str_arg(args, "new_name") {
-                body["new_name"] = json!(v);
-            }
-            for field in ["color", "description"] {
-                if let Some(v) = Self::str_arg(args, field) {
-                    body[field] = json!(v);
-                }
-            }
-            Planned {
-                method: "PATCH",
-                path: format!("repos/{repo}/labels/{name}"),
-                body: Some(body),
-                label: format!("update label '{name}'"),
-            }
-        } else if key == ("label", "delete") {
-            let name =
-                Self::str_arg(args, "name").ok_or_else(|| req_field("label", "delete", "name"))?;
-            Planned {
-                method: "DELETE",
-                path: format!("repos/{repo}/labels/{name}"),
-                body: None,
-                label: format!("delete label '{name}'"),
-            }
-        } else if key == ("label", "add") {
-            let n = need_num()?;
-            let labels = args
-                .get("labels")
-                .and_then(Value::as_array)
-                .filter(|a| !a.is_empty())
-                .ok_or_else(|| req_field("label", "add", "labels"))?;
-            Planned {
-                method: "POST",
-                path: format!("repos/{repo}/issues/{n}/labels"),
-                body: Some(json!({ "labels": labels })),
-                label: format!("add labels to #{n}"),
-            }
-        } else if key == ("label", "remove") {
-            let n = need_num()?;
-            let name =
-                Self::str_arg(args, "name").ok_or_else(|| req_field("label", "remove", "name"))?;
-            Planned {
-                method: "DELETE",
-                path: format!("repos/{repo}/issues/{n}/labels/{name}"),
-                body: None,
-                label: format!("remove label '{name}' from #{n}"),
-            }
-        } else if key == ("issue", "read") {
-            Planned {
-                method: "GET",
-                path: format!("repos/{repo}/issues/{}", need_num()?),
-                body: None,
-                label: "read issue".into(),
-            }
-        } else if key == ("issue", "list") {
-            let mut qs = String::from("state=open");
-            Self::push_list_filters(&mut qs, args);
-            Planned {
-                method: "GET",
-                path: format!("repos/{repo}/issues?{qs}"),
-                body: None,
-                label: "list issues".into(),
-            }
-        } else if key == ("issue", "update") {
-            let n = need_num()?;
-            let mut body = json!({});
-            for field in ["title", "body"] {
-                if let Some(v) = Self::str_arg(args, field) {
-                    body[field] = json!(v);
-                }
-            }
-            if let Some(m) = Self::num_arg(args, "milestone") {
-                body["milestone"] = json!(m);
-            }
-            Planned {
-                method: "PATCH",
-                path: format!("repos/{repo}/issues/{n}"),
-                body: Some(body),
-                label: format!("update issue #{n}"),
-            }
-        } else if key == ("issue", "close") {
-            let n = need_num()?;
-            let reason = Self::str_arg(args, "reason").unwrap_or("completed");
-            if reason != "completed" && reason != "not_planned" {
-                return Err(ferr("tool-git-forge-error-issue-close-reason"));
-            }
-            Planned {
-                method: "PATCH",
-                path: format!("repos/{repo}/issues/{n}"),
-                body: Some(json!({ "state": "closed", "state_reason": reason })),
-                label: format!("close issue #{n} as {reason}"),
-            }
-        } else if key == ("pull", "create") {
-            let title =
-                Self::str_arg(args, "title").ok_or_else(|| req_field("pull", "create", "title"))?;
-            let head =
-                Self::str_arg(args, "head").ok_or_else(|| req_field("pull", "create", "head"))?;
-            let base =
-                Self::str_arg(args, "base").ok_or_else(|| req_field("pull", "create", "base"))?;
-            let mut body = json!({
-                "title": title,
-                "head": head,
-                "base": base,
-                "draft": args.get("draft").and_then(Value::as_bool).unwrap_or(false),
-            });
-            if let Some(b) = Self::str_arg(args, "body") {
-                body["body"] = json!(b);
-            }
-            Planned {
-                method: "POST",
-                path: format!("repos/{repo}/pulls"),
-                body: Some(body),
-                label: format!("open pull '{title}'"),
-            }
-        } else if key == ("pull", "update") {
-            let n = need_num()?;
-            let mut body = json!({});
-            for field in ["title", "body", "state", "base"] {
-                if let Some(v) = Self::str_arg(args, field) {
-                    body[field] = json!(v);
-                }
-            }
-            Planned {
-                method: "PATCH",
-                path: format!("repos/{repo}/pulls/{n}"),
-                body: Some(body),
-                label: format!("update pull #{n}"),
-            }
-        } else if key == ("pull", "read") {
-            Planned {
-                method: "GET",
-                path: format!("repos/{repo}/pulls/{}", need_num()?),
-                body: None,
-                label: "read pull".into(),
-            }
-        } else if key == ("pull", "list") {
-            let mut qs = String::from("state=open");
-            Self::push_list_filters(&mut qs, args);
-            Planned {
-                method: "GET",
-                path: format!("repos/{repo}/pulls?{qs}"),
-                body: None,
-                label: "list pulls".into(),
-            }
-        } else if key == ("pull", "files") {
-            Planned {
-                method: "GET",
-                path: format!("repos/{repo}/pulls/{}/files", need_num()?),
-                body: None,
-                label: "list pull files".into(),
-            }
-        } else if key == ("pull", "close") {
-            let n = need_num()?;
-            Planned {
-                method: "PATCH",
-                path: format!("repos/{repo}/pulls/{n}"),
-                body: Some(json!({ "state": "closed" })),
-                label: format!("close pull #{n}"),
-            }
-        } else if key == ("pull", "merge") {
-            let n = need_num()?;
-            let method_arg = Self::str_arg(args, "merge_method")
-                .or_else(|| Self::str_arg(args, "method"))
-                .unwrap_or("merge");
-            if !["merge", "squash", "rebase"].contains(&method_arg) {
-                return Err(ferr("tool-git-forge-error-pull-merge-method"));
-            }
-            let mut body = json!({ "merge_method": method_arg });
-            if let Some(s) =
-                Self::str_arg(args, "commit_title").or_else(|| Self::str_arg(args, "subject"))
-            {
-                body["commit_title"] = json!(s);
-            }
-            if let Some(m) =
-                Self::str_arg(args, "commit_message").or_else(|| Self::str_arg(args, "message"))
-            {
-                body["commit_message"] = json!(m);
-            }
-            Planned {
-                method: "PUT",
-                path: format!("repos/{repo}/pulls/{n}/merge"),
-                body: Some(body),
-                label: format!("{method_arg}-merge pull #{n}"),
-            }
-        } else if key == ("review", "create") {
-            let n = need_num()?;
-            let verdict = Self::str_arg(args, "event")
-                .or_else(|| Self::str_arg(args, "verdict"))
-                .ok_or_else(|| req_field("review", "create", "event"))?;
-            let normalized = verdict.to_ascii_lowercase();
-            let event = [
-                ("approve", "APPROVE"),
-                ("request_changes", "REQUEST_CHANGES"),
-                ("comment", "COMMENT"),
-            ]
-            .into_iter()
-            .find(|(k, _)| *k == normalized)
-            .map(|(_, e)| e)
-            .ok_or_else(|| {
-                ferr_args(
-                    "tool-git-forge-error-review-verdict",
-                    &[("verdict", verdict)],
-                )
-            })?;
-            let mut body = json!({ "event": event });
-            if let Some(b) = Self::str_arg(args, "body") {
-                body["body"] = json!(b);
-            }
-            Planned {
-                method: "POST",
-                path: format!("repos/{repo}/pulls/{n}/reviews"),
-                body: Some(body),
-                label: format!("{verdict} review on #{n}"),
-            }
-        } else if key == ("review", "list") {
-            Planned {
-                method: "GET",
-                path: format!("repos/{repo}/pulls/{}/reviews", need_num()?),
-                body: None,
-                label: "list reviews".into(),
-            }
-        } else if key == ("reviewer", "request") {
-            let n = need_num()?;
-            let reviewers = args
-                .get("reviewers")
-                .and_then(Value::as_array)
-                .filter(|a| !a.is_empty())
-                .ok_or_else(|| req_field("reviewer", "request", "reviewers"))?;
-            Planned {
-                method: "POST",
-                path: format!("repos/{repo}/pulls/{n}/requested_reviewers"),
-                body: Some(json!({ "reviewers": reviewers })),
-                label: format!("request reviewers on #{n}"),
-            }
-        } else if key == ("reviewer", "list") {
-            Planned {
-                method: "GET",
-                path: format!("repos/{repo}/pulls/{}/requested_reviewers", need_num()?),
-                body: None,
-                label: "list requested reviewers".into(),
-            }
-        } else if key == ("reviewer", "remove") {
-            let n = need_num()?;
-            let reviewers = args
-                .get("reviewers")
-                .and_then(Value::as_array)
-                .filter(|a| !a.is_empty())
-                .ok_or_else(|| req_field("reviewer", "remove", "reviewers"))?;
-            Planned {
-                method: "DELETE",
-                path: format!("repos/{repo}/pulls/{n}/requested_reviewers"),
-                body: Some(json!({ "reviewers": reviewers })),
-                label: format!("remove reviewers on #{n}"),
-            }
-        } else if key == ("comment", "create") {
-            let n = need_num()?;
-            let cbody = Self::str_arg(args, "body")
-                .ok_or_else(|| req_field("comment", "create", "body"))?;
-            Planned {
-                method: "POST",
-                path: format!("repos/{repo}/issues/{n}/comments"),
-                body: Some(json!({ "body": cbody })),
-                label: format!("comment on #{n}"),
-            }
-        } else if key == ("comment", "list") {
-            Planned {
-                method: "GET",
-                path: format!("repos/{repo}/issues/{}/comments", need_num()?),
-                body: None,
-                label: "list comments".into(),
-            }
-        } else if key == ("comment", "delete") {
-            let cid = Self::num_arg(args, "comment_id")
-                .ok_or_else(|| req_field("comment", "delete", "comment_id"))?;
-            Planned {
-                method: "DELETE",
-                path: format!("repos/{repo}/issues/comments/{cid}"),
-                body: None,
-                label: format!("delete comment {cid}"),
-            }
-        } else {
-            return Err(ferr_args(
+        match CELLS
+            .iter()
+            .find(|c| c.resource == resource && c.action == action)
+        {
+            Some(cell) => (cell.build)(repo, args),
+            None => Err(ferr_args(
                 "tool-git-forge-error-unknown-cell",
                 &[("resource", resource), ("action", action)],
-            ));
-        };
-        Ok(planned)
+            )),
+        }
     }
 }
 
@@ -1036,39 +1223,6 @@ mod tests {
         assert!(result.success);
         assert!(result.output.as_str().contains("milestone"));
         assert!(result.output.as_str().contains("merge_method"));
-    }
-
-    #[test]
-    fn every_described_cell_resolves_in_plan() {
-        let grid = GitForgeTool::describe();
-        let resources = grid["resources"].as_object().expect("resources object");
-        let fields = json!({
-            "number": 1,
-            "comment_id": 1,
-            "milestone": 1,
-            "title": "t",
-            "head": "h",
-            "base": "b",
-            "name": "n",
-            "color": "ffffff",
-            "labels": ["x"],
-            "reviewers": ["u"],
-            "event": "APPROVE",
-            "merge_method": "squash",
-            "body": "y"
-        });
-        for (resource, actions) in resources {
-            for action in actions.as_object().expect("actions object").keys() {
-                let planned = GitForgeTool::plan(resource, action, "octo/repo", &fields);
-                match planned {
-                    Ok(_) => {}
-                    Err(e) => assert!(
-                        !e.contains("describe"),
-                        "described cell {resource}.{action} is not implemented in plan(): {e}"
-                    ),
-                }
-            }
-        }
     }
 
     #[tokio::test]
