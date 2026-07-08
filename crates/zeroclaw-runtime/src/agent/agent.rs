@@ -322,7 +322,10 @@ pub struct Agent {
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
     tool_dispatcher: Box<dyn ToolDispatcher>,
-    memory_strategy: Arc<dyn zeroclaw_api::memory_traits::MemoryStrategy>,
+    /// Stable half of the engine's memory-context injection policy
+    /// (recall limit, relevance floor, budgets). Threaded into `ToolLoop`
+    /// as `TurnMemory.cfg` on every turn.
+    memory_inject_cfg: crate::agent::memory_inject::MemoryInjectConfig,
     config: zeroclaw_config::schema::AliasedAgentConfig,
     multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     model_name: String,
@@ -490,7 +493,7 @@ pub struct AgentBuilder {
     observer: Option<Arc<dyn Observer>>,
     prompt_builder: Option<SystemPromptBuilder>,
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
-    memory_strategy: Option<Arc<dyn zeroclaw_api::memory_traits::MemoryStrategy>>,
+    memory_inject_cfg: Option<crate::agent::memory_inject::MemoryInjectConfig>,
     config: Option<zeroclaw_config::schema::AliasedAgentConfig>,
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
@@ -538,7 +541,7 @@ impl AgentBuilder {
             observer: None,
             prompt_builder: None,
             tool_dispatcher: None,
-            memory_strategy: None,
+            memory_inject_cfg: None,
             config: None,
             multimodal_config: None,
             model_name: None,
@@ -602,11 +605,14 @@ impl AgentBuilder {
         self
     }
 
-    pub fn memory_strategy(
+    /// Stable half of the engine's memory-context injection policy. When
+    /// unset, defaults preserve the legacy loader shape (recall limit 5,
+    /// the schema-default relevance floor).
+    pub fn memory_inject_cfg(
         mut self,
-        memory_strategy: Arc<dyn zeroclaw_api::memory_traits::MemoryStrategy>,
+        cfg: crate::agent::memory_inject::MemoryInjectConfig,
     ) -> Self {
-        self.memory_strategy = Some(memory_strategy);
+        self.memory_inject_cfg = Some(cfg);
         self
     }
 
@@ -809,11 +815,6 @@ impl AgentBuilder {
             tools.retain(|t| !zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&t.name()));
         }
 
-        let workspace_dir = self
-            .workspace_dir
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-
         let memory: Arc<dyn Memory> = if exclude_memory {
             Arc::new(zeroclaw_memory::NoneMemory::new("none"))
         } else {
@@ -828,14 +829,6 @@ impl AgentBuilder {
                 anyhow::Error::msg("memory is required")
             })?
         };
-        // No-memory sessions must not retain a caller-provided strategy that
-        // still closes over persistent memory.
-        let memory_strategy = if exclude_memory {
-            None
-        } else {
-            self.memory_strategy
-        };
-
         Ok(Agent {
             model_provider: self.model_provider.ok_or_else(|| {
                 ::zeroclaw_log::record!(
@@ -872,14 +865,12 @@ impl AgentBuilder {
                 );
                 anyhow::Error::msg("tool_dispatcher is required")
             })?,
-            memory_strategy: memory_strategy.unwrap_or_else(|| {
-                Arc::new(
-                    crate::agent::memory_strategy::DefaultMemoryStrategy::with_config(
-                        memory.clone(),
-                        zeroclaw_config::schema::MemoryConfig::default(),
-                        workspace_dir.clone(),
-                    ),
-                )
+            memory_inject_cfg: self.memory_inject_cfg.unwrap_or_else(|| {
+                crate::agent::memory_inject::MemoryInjectConfig {
+                    min_relevance_score: zeroclaw_config::schema::MemoryConfig::default()
+                        .min_relevance_score,
+                    ..Default::default()
+                }
             }),
             config: self.config.unwrap_or_default(),
             multimodal_config: self.multimodal_config.unwrap_or_default(),
@@ -1041,12 +1032,49 @@ impl Agent {
         transcript
     }
 
+    /// Whether this turn will have a per-turn memory preamble injected that
+    /// the response-cache key does not capture.
+    ///
+    /// Memory injection (`agent::memory_inject`) runs inside the turn engine
+    /// and prepends a `[Memory context]` block to the last user message
+    /// AFTER the response-cache key has been computed from the bare
+    /// transcript. That block varies with memory state, so a cache keyed on
+    /// the transcript alone could serve a stale, memory-conditioned answer
+    /// for the same user text. When injection is active, the response cache
+    /// must be bypassed (both read and write) rather than key on a prompt
+    /// the model never actually saw.
+    ///
+    /// `NoneMemory` recalls nothing, so its turns never vary and stay
+    /// cacheable. For a real backend, mirror the engine's own decision
+    /// (`turn/mod.rs`): the direct and streamed `Agent::turn` paths both run
+    /// under the `AgentDirect` ingress origin with no spawn suppression, so
+    /// the policy is `Inject` whenever a session-scoped or unscoped recall
+    /// could contribute entries.
+    fn memory_injection_active(&self) -> bool {
+        if self.memory.name() == "none" {
+            return false;
+        }
+        matches!(
+            crate::agent::memory_inject::resolve_inject_policy(
+                zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                self.memory_session_id.is_some(),
+                false,
+            ),
+            crate::agent::memory_inject::InjectPolicy::Inject { .. }
+        )
+    }
+
     fn response_cache_key_for_messages(
         &self,
         messages: &[ChatMessage],
         effective_model: &str,
     ) -> Option<String> {
-        if self.temperature != Some(0.0) || self.response_cache.is_none() {
+        // Bypass the cache when a per-turn memory preamble the key cannot see
+        // will be injected downstream (see `memory_injection_active`).
+        if self.temperature != Some(0.0)
+            || self.response_cache.is_none()
+            || self.memory_injection_active()
+        {
             return None;
         }
 
@@ -1081,16 +1109,8 @@ impl Agent {
         user_message: &str,
         new_msgs: &mut Vec<ConversationMessage>,
     ) {
-        let context = self
-            .memory_strategy
-            .load_context(
-                &*self.observer,
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
-            .await
-            .unwrap_or_default();
-
+        // Memory context is injected once in the engine, keyed on the
+        // ingress origin (agent::memory_inject).
         if self.auto_save {
             let store_start = std::time::Instant::now();
             let store_result = self
@@ -1111,11 +1131,7 @@ impl Agent {
         }
 
         let now = self.current_turn_datetime().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = if context.is_empty() {
-            format!("[{now}] {user_message}")
-        } else {
-            format!("{context}[{now}] {user_message}")
-        };
+        let enriched = format!("[{now}] {user_message}");
 
         let user_msg = ConversationMessage::Chat(ChatMessage::user(enriched));
         new_msgs.push(user_msg.clone());
@@ -1540,6 +1556,7 @@ impl Agent {
                 connect_mcp: initialize_mcp,
                 connect_peripherals: false,
                 exclude_memory,
+                list_deferred_mcp_specs: false,
                 emit_assembly_logs: true,
             },
         )
@@ -1613,14 +1630,11 @@ impl Agent {
             .observer(observer)
             .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)
-            .memory_strategy(Arc::new(
-                crate::agent::memory_strategy::DefaultMemoryStrategy::with_config_and_limit(
-                    memory.clone(),
-                    config.memory.clone(),
-                    security.workspace_dir.clone(),
-                    config.effective_memory_recall_limit(agent_alias),
-                ),
-            ))
+            .memory_inject_cfg(crate::agent::memory_inject::MemoryInjectConfig {
+                limit: config.effective_memory_recall_limit(agent_alias),
+                min_relevance_score: config.memory.min_relevance_score,
+                ..Default::default()
+            })
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(
                 config
@@ -2096,16 +2110,8 @@ impl Agent {
                 )));
         }
 
-        let context = self
-            .memory_strategy
-            .load_context(
-                &*self.observer,
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
-            .await
-            .unwrap_or_default();
-
+        // Memory context is injected once in the engine, keyed on the
+        // ingress origin (agent::memory_inject).
         if self.auto_save {
             let store_start = std::time::Instant::now();
             let store_result = self
@@ -2132,11 +2138,7 @@ impl Agent {
         let date_str =
             format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
 
-        let enriched = if context.is_empty() {
-            format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
-        } else {
-            format!("[CURRENT DATE & TIME: {date_str}]\n\n{context}\n\n{user_message}")
-        };
+        let enriched = format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}");
 
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
@@ -2298,9 +2300,16 @@ impl Agent {
                         steering: None,
                         new_messages_out: Some(&mut loop_new_messages),
                         image_cache: Some(&mut self.image_cache),
-                        // Phase 1: stamp Internal/Trusted. Real per-transport
-                        // stamping is PR C (RFC #6971 §4).
-                        ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                        // Direct embedded Agent::turn call; source/transport/
+                        // trust stay placeholders, not yet stamped at the edge.
+                        memory: Some(crate::agent::memory_inject::TurnMemory {
+                            handle: self.memory.as_ref(),
+                            query: user_message.to_string(),
+                            sessions: vec![self.memory_session_id.clone()],
+                            suppress: false,
+                            cfg: self.memory_inject_cfg,
+                        }),
+                        ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
                         agent_alias: agent_alias_for_loop.as_deref(),
                         turn_id: &turn_id,
                     }),
@@ -2782,9 +2791,16 @@ impl Agent {
                             steering: None,
                             new_messages_out: Some(&mut round_added),
                             image_cache: Some(&mut self.image_cache),
-                            // Phase 1: stamp Internal/Trusted. Real per-transport
-                            // stamping is PR C (RFC #6971 §4).
-                            ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                            // Direct embedded Agent::turn call; source/transport/
+                            // trust stay placeholders, not yet stamped at the edge.
+                            memory: Some(crate::agent::memory_inject::TurnMemory {
+                                handle: self.memory.as_ref(),
+                                query: user_message.to_string(),
+                                sessions: vec![self.memory_session_id.clone()],
+                                suppress: false,
+                                cfg: self.memory_inject_cfg,
+                            }),
+                            ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
                             agent_alias: agent_alias_for_loop.as_deref(),
                             turn_id: &turn_id,
                         }),
@@ -6392,6 +6408,247 @@ mod tests {
             seen_b.lock().len(),
             1,
             "fresh transcript must not reuse a cache entry written for a different prior transcript"
+        );
+    }
+
+    // Regression: the response cache must not serve one agent's
+    // memory-conditioned answer to another. The turn engine prepends a
+    // `[Memory context]` preamble to the last user message AFTER the
+    // response-cache key is computed from the bare transcript, so two agents
+    // that see the SAME user text but recall DIFFERENT memory produce the same
+    // pre-injection key. Pre-fix, agent B hit agent A's cache entry and was
+    // served A's answer (conditioned on A's memory) without ever running the
+    // model against B's own memory. The fix bypasses the cache whenever a real
+    // backend injects; a `none`-backend control proves the shared cache
+    // otherwise does hit, so the test distinguishes the fix rather than passing
+    // because the cache never works.
+    #[tokio::test]
+    async fn response_cache_does_not_cross_serve_memory_conditioned_answers() {
+        // A backend whose recall always returns one Core entry with the given
+        // content, so injection yields a deterministic, agent-specific preamble.
+        // name() != "none" marks it a real, injecting backend for the gate.
+        struct FixtureRecallMemory {
+            content: String,
+        }
+        #[async_trait]
+        impl Memory for FixtureRecallMemory {
+            fn name(&self) -> &str {
+                "fixture"
+            }
+            async fn store(
+                &self,
+                _: &str,
+                _: &str,
+                _: MemoryCategory,
+                _: Option<&str>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn recall(
+                &self,
+                _: &str,
+                _: usize,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+                Ok(vec![zeroclaw_memory::MemoryEntry {
+                    id: "deploy".into(),
+                    key: "deploy".into(),
+                    content: self.content.clone(),
+                    category: MemoryCategory::Core,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    session_id: None,
+                    score: None,
+                    namespace: "default".into(),
+                    importance: None,
+                    superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
+                    agent_alias: None,
+                    agent_id: None,
+                }])
+            }
+            async fn get(&self, _: &str) -> anyhow::Result<Option<zeroclaw_memory::MemoryEntry>> {
+                Ok(None)
+            }
+            async fn list(
+                &self,
+                _: Option<&MemoryCategory>,
+                _: Option<&str>,
+            ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+                Ok(vec![])
+            }
+            async fn forget(&self, _: &str) -> anyhow::Result<bool> {
+                Ok(true)
+            }
+            async fn forget_for_agent(&self, _: &str, _: &str) -> anyhow::Result<bool> {
+                Ok(true)
+            }
+            async fn count(&self) -> anyhow::Result<usize> {
+                Ok(1)
+            }
+            async fn health_check(&self) -> bool {
+                true
+            }
+            async fn store_with_agent(
+                &self,
+                _: &str,
+                _: &str,
+                _: MemoryCategory,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: Option<f64>,
+                _: Option<&str>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn recall_for_agents(
+                &self,
+                _: &[&str],
+                query: &str,
+                limit: usize,
+                session_id: Option<&str>,
+                since: Option<&str>,
+                until: Option<&str>,
+            ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+                self.recall(query, limit, session_id, since, until).await
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for FixtureRecallMemory {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Memory(
+                    ::zeroclaw_api::attribution::MemoryKind::InMemory,
+                )
+            }
+            fn alias(&self) -> &str {
+                "FixtureRecallMemory"
+            }
+        }
+
+        // Frozen clock so both turns share a byte-identical bare transcript (the
+        // per-turn `[CURRENT DATE & TIME]` prefix is otherwise second-precision),
+        // which is what makes the two pre-injection cache keys collide.
+        let fixed = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+
+        let last_user = |seen: &Arc<Mutex<Vec<Vec<ChatMessage>>>>| -> String {
+            seen.lock()
+                .last()
+                .expect("a model call was captured")
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .expect("a user message")
+                .content
+                .clone()
+        };
+
+        let build =
+            |mem: Arc<dyn Memory>,
+             seen: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+             cache: Arc<zeroclaw_memory::response_cache::ResponseCache>| {
+                let provider = Box::new(TranscriptCaptureModelProvider {
+                    responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                        text: Some("answer".into()),
+                        tool_calls: vec![],
+                        usage: None,
+                        reasoning_content: None,
+                    }]),
+                    seen_messages: seen,
+                });
+                Agent::builder()
+                    .model_provider(provider)
+                    .tools(vec![])
+                    .memory(mem)
+                    .observer(observer.clone())
+                    .response_cache(Some(cache))
+                    .tool_dispatcher(Box::new(NativeToolDispatcher))
+                    .workspace_dir(std::path::PathBuf::from("/tmp"))
+                    .model_name("test-model".into())
+                    .temperature(Some(0.0))
+                    .turn_datetime(move || fixed)
+                    .build()
+                    .expect("agent builder should succeed")
+            };
+
+        const PROMPT: &str = "what is the deploy target";
+
+        // Harm case: same prompt, DIFFERENT recalled memory, one shared cache.
+        let harm_dir = tempfile::tempdir().expect("cache dir");
+        let harm_cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(harm_dir.path(), 60, 100)
+                .expect("response cache"),
+        );
+        let seen_a = Arc::new(Mutex::new(Vec::new()));
+        let seen_b = Arc::new(Mutex::new(Vec::new()));
+        let mut agent_a = build(
+            Arc::new(FixtureRecallMemory {
+                content: "the deploy target is prod-3-alpha".into(),
+            }),
+            seen_a.clone(),
+            harm_cache.clone(),
+        );
+        let mut agent_b = build(
+            Arc::new(FixtureRecallMemory {
+                content: "the deploy target is prod-9-beta".into(),
+            }),
+            seen_b.clone(),
+            harm_cache.clone(),
+        );
+        agent_a.turn(PROMPT).await.expect("turn a");
+        agent_b.turn(PROMPT).await.expect("turn b");
+
+        assert_eq!(seen_a.lock().len(), 1, "agent A always runs the model");
+        assert!(
+            last_user(&seen_a).contains("prod-3-alpha"),
+            "agent A's model call must see A's injected memory"
+        );
+        // Pre-fix, B's key equals A's (both pre-injection) so B is served A's
+        // prod-3 answer and never runs against its own prod-9 memory.
+        assert_eq!(
+            seen_b.lock().len(),
+            1,
+            "agent B must run the model, not reuse A's cache entry keyed on the shared pre-injection transcript"
+        );
+        assert!(
+            last_user(&seen_b).contains("prod-9-beta"),
+            "agent B's model call must see B's OWN injected memory, not A's"
+        );
+
+        // Control: `none` backend injects nothing, so the two transcripts really
+        // are identical and the shared cache DOES hit: the second agent is
+        // served from cache and never reaches the model. This proves the harm
+        // case is not passing merely because the cache never works.
+        let ctrl_dir = tempfile::tempdir().expect("cache dir");
+        let ctrl_cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(ctrl_dir.path(), 60, 100)
+                .expect("response cache"),
+        );
+        let none_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let none_mem = || -> Arc<dyn Memory> {
+            Arc::from(
+                zeroclaw_memory::create_memory(&none_cfg, std::path::Path::new("/tmp"), None)
+                    .expect("none memory"),
+            )
+        };
+        let seen_c = Arc::new(Mutex::new(Vec::new()));
+        let seen_d = Arc::new(Mutex::new(Vec::new()));
+        let mut agent_c = build(none_mem(), seen_c.clone(), ctrl_cache.clone());
+        let mut agent_d = build(none_mem(), seen_d.clone(), ctrl_cache.clone());
+        agent_c.turn(PROMPT).await.expect("turn c");
+        agent_d.turn(PROMPT).await.expect("turn d");
+        assert_eq!(seen_c.lock().len(), 1, "agent C always runs the model");
+        assert_eq!(
+            seen_d.lock().len(),
+            0,
+            "control: with no injection the identical prompt is served from the shared response cache"
         );
     }
 

@@ -1538,6 +1538,24 @@ impl Chat {
             Some(ChatTabAction::FastScrollDown) => {
                 state.scroll_down(5);
             }
+            Some(ChatTabAction::ScrollUp) => {
+                state.scroll_up(1);
+            }
+            Some(ChatTabAction::ScrollDown) => {
+                state.scroll_down(1);
+            }
+            Some(ChatTabAction::PageUp) => {
+                state.page_up();
+            }
+            Some(ChatTabAction::PageDown) => {
+                state.page_down();
+            }
+            Some(ChatTabAction::JumpStart) => {
+                state.scroll_to_top();
+            }
+            Some(ChatTabAction::JumpEnd) => {
+                state.scroll_to_bottom();
+            }
             Some(ChatTabAction::BrowseUpVim)
                 if state.in_browse_mode()
                     && state.pending_approval().is_none()
@@ -2263,6 +2281,15 @@ impl Chat {
         }
     }
 
+    pub(crate) fn wants_quit_chord(&self) -> bool {
+        match &self.phase {
+            ChatPhase::Active(s) => {
+                s.turn_in_flight && !matches!(s.turn_status, TurnStatus::Cancelling)
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn wants_text_input(&self) -> bool {
         match &self.phase {
             // CWD picker always captures text input.
@@ -2481,10 +2508,6 @@ impl crate::widgets::HelpContext for Chat {
                         crate::i18n::t("zc-chat-help-scroll-conversation"),
                     ),
                     E::key("t", crate::i18n::t("zc-chat-help-toggle-thoughts")),
-                    E::key(
-                        "/toggle-thinking",
-                        crate::i18n::t("zc-chat-help-toggle-thinking-cmd"),
-                    ),
                     E::spacer(),
                     E::key(
                         chord_label(ChatTabAction::NewSession),
@@ -2492,7 +2515,7 @@ impl crate::widgets::HelpContext for Chat {
                     ),
                     E::key(
                         chord_label(ChatTabAction::SwitchSession),
-                        crate::i18n::t("zc-chat-help-session-list"),
+                        crate::i18n::t("zc-chat-help-switch-session"),
                     ),
                     E::spacer(),
                     E::key(
@@ -5012,6 +5035,25 @@ impl ChatState {
         }
     }
 
+    pub fn page_up(&mut self) {
+        self.scroll_up(self.last_inner_height.max(1));
+    }
+
+    pub fn page_down(&mut self) {
+        self.scroll_down(self.last_inner_height.max(1));
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.pinned_to_bottom = false;
+        self.scroll_offset = 0;
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        let max = self.last_total_rows.saturating_sub(self.last_inner_height);
+        self.scroll_offset = max;
+        self.pinned_to_bottom = true;
+    }
+
     pub fn title(&self) -> String {
         self.title_parts()
             .into_iter()
@@ -6050,6 +6092,36 @@ mod tests {
         assert!(
             chat.wants_text_input(),
             "an active pending elicitation must claim modal focus"
+        );
+    }
+
+    #[tokio::test]
+    async fn wants_quit_chord_tracks_in_flight_turn_state() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Active(Box::new(state()));
+
+        assert!(
+            !chat.wants_quit_chord(),
+            "idle pane must leave Ctrl+C to the quit modal"
+        );
+
+        if let ChatPhase::Active(s) = &mut chat.phase {
+            s.turn_in_flight = true;
+        }
+        assert!(
+            chat.wants_quit_chord(),
+            "an in-flight turn must consume Ctrl+C to cancel before quit"
+        );
+
+        if let ChatPhase::Active(s) = &mut chat.phase {
+            s.enter_cancelling();
+        }
+        assert!(
+            !chat.wants_quit_chord(),
+            "an already-cancelling turn must not re-consume Ctrl+C"
         );
     }
 
@@ -7583,6 +7655,32 @@ mod tests {
             s.enqueue_message("overflow".to_string(), Vec::new())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn page_and_jump_scroll_move_the_viewport() {
+        let mut s = state();
+        s.last_total_rows = 100;
+        s.last_inner_height = 10;
+        s.scroll_to_bottom();
+        let bottom = s.scroll_offset;
+        assert_eq!(bottom, 90);
+        assert!(s.pinned_to_bottom);
+
+        s.page_up();
+        assert_eq!(s.scroll_offset, 80);
+        assert!(!s.pinned_to_bottom);
+
+        s.scroll_to_top();
+        assert_eq!(s.scroll_offset, 0);
+        assert!(!s.pinned_to_bottom);
+
+        s.page_down();
+        assert_eq!(s.scroll_offset, 10);
+
+        s.scroll_to_bottom();
+        assert_eq!(s.scroll_offset, bottom);
+        assert!(s.pinned_to_bottom);
     }
 
     #[test]
