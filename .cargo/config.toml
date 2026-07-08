@@ -21,11 +21,19 @@ linker = "aarch64-linux-gnu-gcc"
 rustflags = ["-C", "link-arg=-static", "-C", "link-arg=-Wl,-z,stack-size=8388608"]
 
 # Windows targets
+#
+# `+crt-static` statically links the MSVC C runtime (vcruntime140.dll,
+# msvcp140.dll, ucrtbase.dll) into the final binary so the release zip is a
+# true self-contained executable and users no longer need to install the
+# Visual C++ Redistributable to run it (see docs/book/src/setup/windows.md).
+# The size cost is ~200 KB per exe under LTO; the tradeoff is acceptable for
+# a CLI tool distributed via GitHub Releases, which ships new builds for any
+# CRT-level security fix regardless.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "link-arg=/STACK:8388608"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/STACK:8388608"]
 
 [target.i686-pc-windows-msvc]
-rustflags = ["-C", "link-arg=/STACK:8388608"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/STACK:8388608"]
 
 [target.x86_64-pc-windows-gnu]
 rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]

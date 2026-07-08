@@ -5,7 +5,7 @@ use directories::UserDirs;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -46,8 +46,10 @@ const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
 const CLAWHUB_DOMAIN: &str = "clawhub.ai";
 const CLAWHUB_WWW_DOMAIN: &str = "www.clawhub.ai";
 const CLAWHUB_DOWNLOAD_API: &str = "https://clawhub.ai/api/v1/download";
-const MAX_CLAWHUB_ZIP_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
 const MAX_CLAWHUB_ERROR_BODY_CHARS: usize = 512;
+const MAX_SKILL_ZIP_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_SKILL_ZIP_ENTRIES: usize = 500;
+const MAX_SKILL_ZIP_EXPANSION_RATIO: u64 = 10;
 
 // ─── Skills registry (zeroclaw-skills) ────────────────────────────────────────
 const SKILLS_REGISTRY_REPO_URL: &str = "https://github.com/zeroclaw-labs/zeroclaw-skills";
@@ -97,8 +99,14 @@ pub struct Skill {
 /// dashboard can show the same reason without re-running the audit. (#7963)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillDropReason {
-    /// `audit_*` returned Ok(report) with findings; String = report.summary().
-    AuditFindings(String),
+    /// `audit_*` returned Ok(report) with findings. `summary` = report.summary();
+    /// `scripts_blocked` is true when the secure-default script policy is the
+    /// blocker, so consumers can offer the `skills.allow_scripts = true` hint
+    /// without re-parsing the human-readable summary.
+    AuditFindings {
+        summary: String,
+        scripts_blocked: bool,
+    },
     /// `audit_*` returned Err (unauditable); String = error message.
     AuditError(String),
     /// Audit passed but SKILL.toml/manifest.toml failed to parse.
@@ -129,6 +137,120 @@ pub struct ShadowedSkill {
     pub name: String,
     /// Origin of the LOSER: `"open-skills"` | `"plugin"` | `"bundle"`.
     pub origin_hint: String,
+}
+
+/// The canonical set of typed slash-option kinds a skill may declare. This enum
+/// is the single source of truth for both the kind list and which constraints
+/// each kind carries: any surface that offers a kind picker or gates constraint
+/// inputs walks these variants and reads their capability methods rather than
+/// restating them. Discord's `OptKind` is the wire projection of this set,
+/// built by mapping each variant, so a new variant here forces a decision in
+/// every exhaustive `match` on both sides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SlashOptionKind {
+    String,
+    Integer,
+    Number,
+    Boolean,
+    User,
+    Channel,
+    Role,
+    Mentionable,
+}
+
+impl SlashOptionKind {
+    /// Every kind, in the order surfaces should offer them. Walked (not
+    /// restated) by every registry consumer.
+    pub const ALL: [Self; 8] = [
+        Self::String,
+        Self::Integer,
+        Self::Number,
+        Self::Boolean,
+        Self::User,
+        Self::Channel,
+        Self::Role,
+        Self::Mentionable,
+    ];
+
+    /// The canonical `type` token written in frontmatter.
+    pub fn manifest_name(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Integer => "integer",
+            Self::Number => "number",
+            Self::Boolean => "boolean",
+            Self::User => "user",
+            Self::Channel => "channel",
+            Self::Role => "role",
+            Self::Mentionable => "mentionable",
+        }
+    }
+
+    /// Predefined `choices` apply only to string/integer/number options.
+    pub fn supports_choices(self) -> bool {
+        match self {
+            Self::String | Self::Integer | Self::Number => true,
+            Self::Boolean | Self::User | Self::Channel | Self::Role | Self::Mentionable => false,
+        }
+    }
+
+    /// `min`/`max` numeric bounds apply only to integer/number options.
+    pub fn supports_numeric_bounds(self) -> bool {
+        match self {
+            Self::Integer | Self::Number => true,
+            Self::String
+            | Self::Boolean
+            | Self::User
+            | Self::Channel
+            | Self::Role
+            | Self::Mentionable => false,
+        }
+    }
+
+    /// `min_length`/`max_length` bounds apply only to string options.
+    pub fn supports_length_bounds(self) -> bool {
+        match self {
+            Self::String => true,
+            Self::Integer
+            | Self::Number
+            | Self::Boolean
+            | Self::User
+            | Self::Channel
+            | Self::Role
+            | Self::Mentionable => false,
+        }
+    }
+
+    /// The wire-facing capability row for this kind, consumed by API surfaces.
+    pub fn descriptor(self) -> SlashOptionKindDescriptor {
+        SlashOptionKindDescriptor {
+            manifest_name: self.manifest_name().to_string(),
+            supports_choices: self.supports_choices(),
+            supports_numeric_bounds: self.supports_numeric_bounds(),
+            supports_length_bounds: self.supports_length_bounds(),
+        }
+    }
+}
+
+/// Serialized capability row for one [`SlashOptionKind`], as published to
+/// surfaces (the web dashboard mirrors this shape). Built by walking
+/// [`SlashOptionKind::ALL`]; never hand-authored.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct SlashOptionKindDescriptor {
+    pub manifest_name: String,
+    pub supports_choices: bool,
+    pub supports_numeric_bounds: bool,
+    pub supports_length_bounds: bool,
+}
+
+/// The full registry, produced by exhaustively walking [`SlashOptionKind::ALL`].
+pub fn slash_option_kinds() -> Vec<SlashOptionKindDescriptor> {
+    SlashOptionKind::ALL
+        .into_iter()
+        .map(SlashOptionKind::descriptor)
+        .collect()
 }
 
 /// A typed option a `slash`-tagged skill exposes on its slash command. Shaped
@@ -408,11 +530,10 @@ pub fn print_install_tier_banner(name: &str, version: Option<&str>, tier: SkillT
 }
 
 /// Emit a user-visible warning when a skill directory is skipped due to audit
-/// findings. When the findings mention blocked scripts and `allow_scripts` is
-/// `false`, the message includes actionable remediation guidance so users know
-/// how to enable their skill.
-fn warn_skipped_skill(path: &Path, summary: &str, allow_scripts: bool) {
-    let scripts_blocked = summary.contains("script-like files are blocked");
+/// findings. When `scripts_blocked` is set and `allow_scripts` is `false`, the
+/// message includes actionable remediation guidance so users know how to enable
+/// their skill.
+fn warn_skipped_skill(path: &Path, summary: &str, scripts_blocked: bool, allow_scripts: bool) {
     if scripts_blocked && !allow_scripts {
         ::zeroclaw_log::record!(
             WARN,
@@ -754,11 +875,15 @@ fn load_skills_from_directory_uncached(
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
                 let summary = report.summary();
-                warn_skipped_skill(&path, &summary, allow_scripts);
+                let scripts_blocked = report.scripts_blocked;
+                warn_skipped_skill(&path, &summary, scripts_blocked, allow_scripts);
                 dropped.push(DroppedSkill {
                     name: dir_stem(&path),
                     origin_hint: "workspace".into(),
-                    reason: SkillDropReason::AuditFindings(summary),
+                    reason: SkillDropReason::AuditFindings {
+                        summary,
+                        scripts_blocked,
+                    },
                     location: Some(path.clone()),
                 });
                 continue;
@@ -879,11 +1004,15 @@ fn load_open_skills_from_directory_uncached(
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
                 let summary = report.summary();
-                warn_skipped_skill(&path, &summary, allow_scripts);
+                let scripts_blocked = report.scripts_blocked;
+                warn_skipped_skill(&path, &summary, scripts_blocked, allow_scripts);
                 dropped.push(DroppedSkill {
                     name: dir_stem(&path),
                     origin_hint: "open-skills".into(),
-                    reason: SkillDropReason::AuditFindings(summary),
+                    reason: SkillDropReason::AuditFindings {
+                        summary,
+                        scripts_blocked,
+                    },
                     location: Some(path.clone()),
                 });
                 continue;
@@ -997,6 +1126,7 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> (Vec<Skill>, Vec<Dr
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
                 let summary = report.summary();
+                let scripts_blocked = report.scripts_blocked;
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1010,7 +1140,10 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> (Vec<Skill>, Vec<Dr
                 dropped.push(DroppedSkill {
                     name: dir_stem(&path),
                     origin_hint: "open-skills".into(),
-                    reason: SkillDropReason::AuditFindings(summary),
+                    reason: SkillDropReason::AuditFindings {
+                        summary,
+                        scripts_blocked,
+                    },
                     location: Some(path.clone()),
                 });
                 continue;
@@ -1555,6 +1688,38 @@ pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
     )
 }
 
+/// The skill-tool `kind`s that register as callable tool specs (invocable via
+/// function calling), as opposed to prompt-only descriptions. Shared by the
+/// registry converter (`skills_to_tools_with_context_and_runtime`, which gates
+/// its per-kind dispatch on it) and the prompt renderer, so the two cannot
+/// drift. `builtin` and `mcp` are elevation wrappers.
+fn is_registered_skill_tool_kind(kind: &str) -> bool {
+    matches!(kind, "shell" | "script" | "http" | "builtin" | "mcp")
+}
+
+/// Whether a skill tool should be advertised as callable in the system prompt,
+/// from what is statically knowable in the manifest.
+///
+/// `shell`/`script`/`http` always register. `builtin`/`mcp` are elevation
+/// wrappers that register only when they name a `target` to elevate to
+/// (`resolve_elevated_tool` returns `None` without one) - so a manifest that
+/// omits `target` must NOT be advertised as callable, or the model is told to
+/// invoke a `skill__tool` the converter skipped. Runtime resolvability of that
+/// target (e.g. a disconnected MCP server) is not knowable at prompt-build time;
+/// that residual is the same best-effort the prompt has always carried for
+/// `builtin`. Previously the renderer classified by kind alone and omitted `mcp`
+/// entirely, so `mcp` tools rendered as non-callable while the registry exposed
+/// them, and target-less `builtin`/`mcp` tools rendered callable while it did not.
+fn skill_tool_is_prompt_callable(tool: &SkillTool) -> bool {
+    if !is_registered_skill_tool_kind(tool.kind.as_str()) {
+        return false;
+    }
+    match tool.kind.as_str() {
+        "builtin" | "mcp" => tool.target.as_deref().is_some_and(|t| !t.trim().is_empty()),
+        _ => true,
+    }
+}
+
 /// Build the "Available Skills" system prompt section with configurable verbosity.
 pub fn skills_to_prompt_with_mode(
     skills: &[Skill],
@@ -1613,18 +1778,21 @@ pub fn skills_to_prompt_with_mode(
         }
 
         if !skill.tools.is_empty() {
-            // Tools with known kinds (shell, script, http) are registered as
-            // callable tool specs and can be invoked directly via function calling.
-            // We note them here for context but mark them as callable.
+            // Callable (registered as a callable tool spec, invocable directly via
+            // function calling) vs prompt-only is decided by
+            // `skill_tool_is_prompt_callable`, which mirrors what the registry
+            // converter actually registers: shell/script/http always, builtin/mcp
+            // only when they name a target to elevate to. This keeps the prompt
+            // from advertising `skill__tool` names the converter skipped.
             let registered: Vec<_> = skill
                 .tools
                 .iter()
-                .filter(|t| matches!(t.kind.as_str(), "shell" | "script" | "http" | "builtin"))
+                .filter(|t| skill_tool_is_prompt_callable(t))
                 .collect();
             let unregistered: Vec<_> = skill
                 .tools
                 .iter()
-                .filter(|t| !matches!(t.kind.as_str(), "shell" | "script" | "http" | "builtin"))
+                .filter(|t| !skill_tool_is_prompt_callable(t))
                 .collect();
 
             if !registered.is_empty() {
@@ -1761,6 +1929,18 @@ pub fn skills_to_tools_with_context_and_runtime(
     let mut tools: Vec<Box<dyn zeroclaw_api::tool::Tool>> = Vec::new();
     for skill in skills {
         for tool in &skill.tools {
+            if !is_registered_skill_tool_kind(tool.kind.as_str()) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "Unknown skill tool kind '{}' for {}.{}, skipping",
+                        tool.kind, skill.name, tool.name
+                    )
+                );
+                continue;
+            }
             match tool.kind.as_str() {
                 "shell" | "script" => {
                     let inner = crate::skills::skill_tool::SkillShellTool::new_with_runtime(
@@ -1794,17 +1974,9 @@ pub fn skills_to_tools_with_context_and_runtime(
                         tools.push(t);
                     }
                 }
-                other => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        &format!(
-                            "Unknown skill tool kind '{}' for {}.{}, skipping",
-                            other, skill.name, tool.name
-                        )
-                    );
-                }
+                // `is_registered_skill_tool_kind` above admits only the kinds
+                // dispatched here, so any other kind was already skipped.
+                other => unreachable!("registered skill kind '{other}' not dispatched"),
             }
         }
     }
@@ -2246,34 +2418,171 @@ fn is_unsafe_zip_entry_name(raw_name: &str) -> bool {
         || raw_name.contains(':')
 }
 
-/// Securely extract a downloaded skill zip into `dest`.
-///
-/// Rejects archives larger than `max_bytes` and any entry whose path could
-/// escape `dest`. On a rejected entry the partially-created `dest` is removed
-/// before returning. Shared by the ClawHub installer and unit-tested directly.
+fn checked_zip_size_add(total: u64, next: u64, label: &str) -> Result<u64> {
+    total
+        .checked_add(next)
+        .with_context(|| format!("skill zip rejected: {label} size overflow"))
+}
+
+fn append_skill_zip_chunk(bytes: &mut Vec<u8>, chunk: &[u8], max_bytes: u64) -> Result<()> {
+    let current_len = u64::try_from(bytes.len()).context("skill zip buffer length overflow")?;
+    let chunk_len = u64::try_from(chunk.len()).context("skill zip chunk length overflow")?;
+    let next_len = checked_zip_size_add(current_len, chunk_len, "downloaded")?;
+    if next_len > max_bytes {
+        anyhow::bail!("skill zip rejected: too large ({next_len} bytes > {max_bytes})");
+    }
+    bytes.extend_from_slice(chunk);
+    Ok(())
+}
+
+async fn download_skill_zip_bytes(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
+    if let Some(len) = response.content_length()
+        && len > max_bytes
+    {
+        anyhow::bail!("skill zip rejected: too large ({len} bytes > {max_bytes})");
+    }
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read skill zip response body")?
+    {
+        append_skill_zip_chunk(&mut bytes, &chunk, max_bytes)?;
+    }
+    Ok(bytes)
+}
+
+fn exceeds_skill_zip_ratio(uncompressed_bytes: u64, compressed_bytes: u64) -> bool {
+    compressed_bytes > 0
+        && uncompressed_bytes > compressed_bytes.saturating_mul(MAX_SKILL_ZIP_EXPANSION_RATIO)
+}
+
+fn validate_skill_zip_limits<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    max_bytes: u64,
+) -> Result<u64> {
+    let entry_count = archive.len();
+    if entry_count > MAX_SKILL_ZIP_ENTRIES {
+        anyhow::bail!(
+            "skill zip rejected: too many entries ({} > {})",
+            entry_count,
+            MAX_SKILL_ZIP_ENTRIES
+        );
+    }
+
+    let mut compressed_bytes = 0_u64;
+    let mut uncompressed_bytes = 0_u64;
+    for i in 0..entry_count {
+        let entry = archive.by_index(i)?;
+        let raw_name = entry.name().to_string();
+        if is_unsafe_zip_entry_name(&raw_name) {
+            anyhow::bail!("zip entry contains unsafe path: {raw_name}");
+        }
+
+        let entry_compressed_bytes = entry.compressed_size();
+        let entry_uncompressed_bytes = entry.size();
+        if entry_uncompressed_bytes > 0 && entry_compressed_bytes == 0 {
+            anyhow::bail!(
+                "skill zip rejected: entry '{}' has invalid compression ratio",
+                raw_name
+            );
+        }
+
+        compressed_bytes =
+            checked_zip_size_add(compressed_bytes, entry_compressed_bytes, "compressed")?;
+        uncompressed_bytes =
+            checked_zip_size_add(uncompressed_bytes, entry_uncompressed_bytes, "uncompressed")?;
+
+        if uncompressed_bytes > max_bytes {
+            anyhow::bail!(
+                "skill zip rejected: extracted size too large ({} bytes > {})",
+                uncompressed_bytes,
+                max_bytes
+            );
+        }
+        if exceeds_skill_zip_ratio(uncompressed_bytes, compressed_bytes) {
+            anyhow::bail!(
+                "skill zip rejected: expansion ratio exceeds {}x",
+                MAX_SKILL_ZIP_EXPANSION_RATIO
+            );
+        }
+    }
+
+    Ok(compressed_bytes)
+}
+
 fn extract_zip_secure(bytes: Vec<u8>, dest: &Path, max_bytes: u64) -> Result<()> {
-    if bytes.len() as u64 > max_bytes {
+    let archive_len = u64::try_from(bytes.len()).context("skill zip buffer length overflow")?;
+    if archive_len > max_bytes {
         anyhow::bail!(
             "skill zip rejected: too large ({} bytes > {})",
-            bytes.len(),
+            archive_len,
             max_bytes
         );
     }
 
-    std::fs::create_dir_all(dest)?;
-
     let cursor = Cursor::new(bytes);
     let mut archive = ZipArchive::new(cursor).context("downloaded content is not a valid zip")?;
+    let compressed_bytes = validate_skill_zip_limits(&mut archive, max_bytes)?;
 
+    std::fs::create_dir_all(dest)?;
+    let result = extract_validated_skill_zip(&mut archive, dest, max_bytes, compressed_bytes);
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(dest);
+    }
+    result
+}
+
+fn copy_zip_entry_bounded<R: Read, W: Write>(
+    entry: &mut R,
+    output: &mut W,
+    extracted_bytes: &mut u64,
+    max_bytes: u64,
+    compressed_bytes: u64,
+) -> Result<()> {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read_bytes = entry.read(&mut buffer)?;
+        if read_bytes == 0 {
+            return Ok(());
+        }
+
+        let read_bytes = u64::try_from(read_bytes).context("skill zip read length overflow")?;
+        let next_extracted = checked_zip_size_add(*extracted_bytes, read_bytes, "extracted")?;
+        if next_extracted > max_bytes {
+            anyhow::bail!(
+                "skill zip rejected: extracted size too large ({} bytes > {})",
+                next_extracted,
+                max_bytes
+            );
+        }
+        if exceeds_skill_zip_ratio(next_extracted, compressed_bytes) {
+            anyhow::bail!(
+                "skill zip rejected: expansion ratio exceeds {}x",
+                MAX_SKILL_ZIP_EXPANSION_RATIO
+            );
+        }
+
+        let read_len = usize::try_from(read_bytes).context("skill zip write length overflow")?;
+        output.write_all(&buffer[..read_len])?;
+        *extracted_bytes = next_extracted;
+    }
+}
+
+fn extract_validated_skill_zip<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    dest: &Path,
+    max_bytes: u64,
+    compressed_bytes: u64,
+) -> Result<()> {
+    let mut extracted_bytes = 0_u64;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         let raw_name = entry.name().to_string();
-
-        if is_unsafe_zip_entry_name(&raw_name) {
-            let _ = std::fs::remove_dir_all(dest);
-            anyhow::bail!("zip entry contains unsafe path: {raw_name}");
-        }
-
         let out_path = dest.join(&raw_name);
         if entry.is_dir() {
             std::fs::create_dir_all(&out_path)?;
@@ -2290,7 +2599,13 @@ fn extract_zip_secure(bytes: Vec<u8>, dest: &Path, max_bytes: u64) -> Result<()>
                 out_path.display().to_string()
             )
         })?;
-        std::io::copy(&mut entry, &mut out_file)?;
+        copy_zip_entry_bounded(
+            &mut entry,
+            &mut out_file,
+            &mut extracted_bytes,
+            max_bytes,
+            compressed_bytes,
+        )?;
     }
 
     Ok(())
@@ -2334,8 +2649,8 @@ pub async fn install_clawhub_skill_source(
         anyhow::bail!("{}", format_clawhub_download_failure(status, &body));
     }
 
-    let bytes = resp.bytes().await?.to_vec();
-    extract_zip_secure(bytes, &installed_dir, MAX_CLAWHUB_ZIP_BYTES)?;
+    let bytes = download_skill_zip_bytes(resp, MAX_SKILL_ZIP_BYTES).await?;
+    extract_zip_secure(bytes, &installed_dir, MAX_SKILL_ZIP_BYTES)?;
 
     let has_manifest = installed_dir.join("SKILL.md").exists()
         || installed_dir.join("SKILL.toml").exists()
@@ -2753,6 +3068,93 @@ fn namespace_plugin_skill(plugin_name: &str, mut skill: Skill) -> Skill {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+    use std::io::{self, Write};
+
+    #[test]
+    fn slash_option_kinds_registry_is_walked_from_the_enum() {
+        // The published registry is exactly `SlashOptionKind::ALL` walked into
+        // descriptors, in order. No hand-authored rows: adding a variant to the
+        // enum extends this without touching the builder.
+        let registry = slash_option_kinds();
+        assert_eq!(registry.len(), SlashOptionKind::ALL.len());
+        for (descriptor, kind) in registry.iter().zip(SlashOptionKind::ALL) {
+            assert_eq!(descriptor.manifest_name, kind.manifest_name());
+            assert_eq!(descriptor.supports_choices, kind.supports_choices());
+            assert_eq!(
+                descriptor.supports_numeric_bounds,
+                kind.supports_numeric_bounds()
+            );
+            assert_eq!(
+                descriptor.supports_length_bounds,
+                kind.supports_length_bounds()
+            );
+        }
+    }
+
+    #[test]
+    fn only_scalar_kinds_carry_bounds_and_choices() {
+        // Capability invariants the surfaces depend on: numeric bounds imply a
+        // scalar with choices; length bounds are string-only.
+        for kind in SlashOptionKind::ALL {
+            if kind.supports_numeric_bounds() || kind.supports_length_bounds() {
+                assert!(
+                    kind.supports_choices(),
+                    "{:?} carries bounds but is not choiceable",
+                    kind.manifest_name()
+                );
+            }
+        }
+        assert!(SlashOptionKind::String.supports_length_bounds());
+        assert!(!SlashOptionKind::String.supports_numeric_bounds());
+        assert!(SlashOptionKind::Integer.supports_numeric_bounds());
+        assert!(!SlashOptionKind::Integer.supports_length_bounds());
+    }
+
+    struct CountingWriter {
+        written: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.written += buffer.len();
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ChunkReader {
+        chunks: Vec<Vec<u8>>,
+        index: usize,
+    }
+
+    impl Read for ChunkReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let Some(chunk) = self.chunks.get(self.index) else {
+                return Ok(0);
+            };
+            let copied = chunk.len().min(buffer.len());
+            buffer[..copied].copy_from_slice(&chunk[..copied]);
+            self.index += 1;
+            Ok(copied)
+        }
+    }
+
+    fn make_skill_zip(entries: &[(&str, &[u8])], method: zip::CompressionMethod) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default().compression_method(method);
+            for (name, body) in entries {
+                writer.start_file(*name, opts).unwrap();
+                writer.write_all(body).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buf
+    }
 
     #[test]
     fn parse_simple_frontmatter_keeps_blank_line_in_block_scalar() {
@@ -2951,23 +3353,31 @@ mod registry_tests {
     }
 
     #[test]
+    fn test_append_skill_zip_chunk_accepts_within_limit() {
+        let mut bytes = b"abc".to_vec();
+        append_skill_zip_chunk(&mut bytes, b"def", 6).unwrap();
+        assert_eq!(bytes, b"abcdef");
+    }
+
+    #[test]
+    fn test_append_skill_zip_chunk_rejects_oversize() {
+        let mut bytes = b"abc".to_vec();
+        let err = append_skill_zip_chunk(&mut bytes, b"defg", 6)
+            .expect_err("oversize chunk must be rejected");
+        assert!(err.to_string().contains("too large"), "got: {err}");
+        assert_eq!(bytes, b"abc");
+    }
+
+    #[test]
     fn test_extract_zip_secure_happy_path() {
-        use std::io::Write;
-        let mut buf = Vec::new();
-        {
-            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            w.start_file("SKILL.md", opts).unwrap();
-            w.write_all(b"# demo").unwrap();
-            w.start_file("scripts/run.txt", opts).unwrap();
-            w.write_all(b"echo hi").unwrap();
-            w.finish().unwrap();
-        }
+        let buf = make_skill_zip(
+            &[("SKILL.md", b"# demo"), ("scripts/run.txt", b"echo hi")],
+            zip::CompressionMethod::Stored,
+        );
 
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("skill");
-        extract_zip_secure(buf, &dest, MAX_CLAWHUB_ZIP_BYTES).unwrap();
+        extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(dest.join("SKILL.md")).unwrap(),
@@ -2980,17 +3390,8 @@ mod registry_tests {
     }
 
     #[test]
-    fn test_extract_zip_secure_rejects_oversize() {
-        use std::io::Write;
-        let mut buf = Vec::new();
-        {
-            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            w.start_file("SKILL.md", opts).unwrap();
-            w.write_all(b"# demo").unwrap();
-            w.finish().unwrap();
-        }
+    fn test_extract_zip_secure_rejects_oversize_archive() {
+        let buf = make_skill_zip(&[("SKILL.md", b"# demo")], zip::CompressionMethod::Stored);
 
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("skill");
@@ -3000,6 +3401,181 @@ mod registry_tests {
             !dest.exists(),
             "dest must not be created when the zip is rejected for size"
         );
+    }
+
+    #[test]
+    fn test_extract_zip_secure_rejects_too_many_entries() {
+        let entries: Vec<(String, Vec<u8>)> = (0..=MAX_SKILL_ZIP_ENTRIES)
+            .map(|index| (format!("files/{index}.txt"), b"x".to_vec()))
+            .collect();
+        let entry_refs: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(name, body)| (name.as_str(), body.as_slice()))
+            .collect();
+        let buf = make_skill_zip(&entry_refs, zip::CompressionMethod::Stored);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES)
+            .expect_err("zip with too many entries must be rejected");
+        assert!(err.to_string().contains("too many entries"), "got: {err}");
+        assert!(!dest.exists(), "dest must not be created for rejected zip");
+    }
+
+    #[test]
+    fn test_copy_zip_entry_bounded_stops_before_limit_overwrite() {
+        let payload = vec![b'a'; 1024];
+        let mut reader = Cursor::new(payload);
+        let mut writer = CountingWriter { written: 0 };
+        let mut extracted_bytes = 0;
+
+        let err = copy_zip_entry_bounded(&mut reader, &mut writer, &mut extracted_bytes, 500, 1024)
+            .expect_err("bounded copy must reject before writing over the cap");
+
+        assert!(
+            err.to_string().contains("extracted size too large"),
+            "got: {err}"
+        );
+        assert_eq!(writer.written, 0);
+        assert_eq!(extracted_bytes, 0);
+    }
+
+    #[test]
+    fn test_copy_zip_entry_bounded_preserves_prior_valid_write() {
+        let mut reader = ChunkReader {
+            chunks: vec![vec![b'a'; 400], vec![b'b'; 200]],
+            index: 0,
+        };
+        let mut writer = CountingWriter { written: 0 };
+        let mut extracted_bytes = 0;
+
+        let err = copy_zip_entry_bounded(&mut reader, &mut writer, &mut extracted_bytes, 500, 1024)
+            .expect_err("bounded copy must reject the chunk that crosses the cap");
+
+        assert!(
+            err.to_string().contains("extracted size too large"),
+            "got: {err}"
+        );
+        assert_eq!(writer.written, 400);
+        assert_eq!(extracted_bytes, 400);
+    }
+
+    #[test]
+    fn test_extract_zip_secure_rejects_extracted_size_limit() {
+        let payload = vec![b'a'; 1024];
+        let buf = make_skill_zip(&[("SKILL.md", &payload)], zip::CompressionMethod::Deflated);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, 500)
+            .expect_err("zip exceeding extracted size limit must be rejected");
+        assert!(
+            err.to_string().contains("extracted size too large"),
+            "got: {err}"
+        );
+        assert!(!dest.exists(), "dest must not be created for rejected zip");
+    }
+
+    #[test]
+    fn test_extract_zip_secure_rejects_expansion_ratio() {
+        let payload = vec![b'a'; 1024];
+        let buf = make_skill_zip(&[("SKILL.md", &payload)], zip::CompressionMethod::Deflated);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES)
+            .expect_err("zip exceeding expansion ratio must be rejected");
+        assert!(err.to_string().contains("expansion ratio"), "got: {err}");
+        assert!(!dest.exists(), "dest must not be created for rejected zip");
+    }
+
+    /// Regression: an entry whose central directory understates the real
+    /// uncompressed size must be rejected during extraction, not silently
+    /// truncated on disk.
+    #[test]
+    fn test_extract_zip_secure_rejects_lying_declared_size() {
+        // 60 MiB payload, but we patch the central directory to claim 1 byte.
+        let payload = vec![b'a'; 60 * 1024 * 1024];
+        let mut buf = make_skill_zip(&[("big.bin", &payload)], zip::CompressionMethod::Stored);
+        patch_zip_central_directory_uncompressed_size(&mut buf, 1);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES)
+            .expect_err("lying declared size must be rejected during extraction");
+        assert!(
+            err.to_string().contains("too large"),
+            "expected size error, got: {err}"
+        );
+        assert!(
+            !dest.exists(),
+            "dest must not be created when lying declared size is rejected"
+        );
+    }
+
+    /// Regression: multiple entries can each declare a small uncompressed size
+    /// while their actual payloads collectively exceed the cap. The cumulative
+    /// guard must count bytes actually extracted, not declared sizes.
+    #[test]
+    fn test_extract_zip_secure_rejects_multi_entry_lying_declared_size() {
+        const ENTRY_SIZE: usize = 10 * 1024 * 1024; // 10 MiB each
+        const ENTRY_COUNT: usize = 6; // 60 MiB total > 50 MiB cap
+        const LIED_SIZE: u32 = 8 * 1024 * 1024; // 48 MiB declared total < 50 MiB cap
+
+        let mut entries = Vec::new();
+        for i in 0..ENTRY_COUNT {
+            entries.push((format!("big{i}.bin"), vec![b'a'; ENTRY_SIZE]));
+        }
+        let entry_refs: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(name, body)| (name.as_str(), body.as_slice()))
+            .collect();
+        let mut buf = make_skill_zip(&entry_refs, zip::CompressionMethod::Stored);
+        patch_all_zip_central_directory_uncompressed_sizes(&mut buf, LIED_SIZE);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("skill");
+        let err = extract_zip_secure(buf, &dest, MAX_SKILL_ZIP_BYTES)
+            .expect_err("multi-entry lying declared sizes must be rejected");
+        assert!(
+            err.to_string().contains("too large"),
+            "expected size error, got: {err}"
+        );
+        assert!(
+            !dest.exists(),
+            "dest must not be created when archive cap is exceeded"
+        );
+    }
+
+    /// Overwrite the uncompressed-size field in the first central-directory
+    /// header of a zip file.
+    fn patch_zip_central_directory_uncompressed_size(zip: &mut [u8], new_size: u32) {
+        const CDH_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+        for i in 0..zip.len().saturating_sub(CDH_SIGNATURE.len()) {
+            if zip[i..i + CDH_SIGNATURE.len()] == CDH_SIGNATURE {
+                let start = i + 24;
+                zip[start..start + 4].copy_from_slice(&new_size.to_le_bytes());
+                return;
+            }
+        }
+        panic!("central directory signature not found in test zip");
+    }
+
+    /// Overwrite the uncompressed-size field in every central-directory header
+    /// of a zip file.
+    fn patch_all_zip_central_directory_uncompressed_sizes(zip: &mut [u8], new_size: u32) {
+        const CDH_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+        let mut patched = 0;
+        for i in 0..zip.len().saturating_sub(CDH_SIGNATURE.len()) {
+            if zip[i..i + CDH_SIGNATURE.len()] == CDH_SIGNATURE {
+                let start = i + 24;
+                zip[start..start + 4].copy_from_slice(&new_size.to_le_bytes());
+                patched += 1;
+            }
+        }
+        if patched == 0 {
+            panic!("central directory signature not found in test zip");
+        }
     }
 
     #[test]
@@ -3658,8 +4234,63 @@ description = "fine"
         ));
     }
 
-    /// Behavioral assertion for the open-skills swallow-site fix.
-    /// Same shape as the workspace test above; covers `load_open_skills_from_directory`.
+    /// #7861: a workspace skill bundling a shell script under the secure
+    /// default (`allow_scripts = false`) is dropped as an audit finding whose
+    /// summary carries the scripts-blocked marker, and is absent from the
+    /// loaded set. Flipping `allow_scripts = true` loads it and empties the
+    /// dropped set. This is what `zeroclaw skills list` surfaces as "Skipped".
+    #[test]
+    fn workspace_script_bundling_skill_reported_as_scripts_blocked_drop() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        let script_dir = skills_dir.join("script-skill");
+        std::fs::create_dir_all(&script_dir).unwrap();
+        std::fs::write(
+            script_dir.join("SKILL.md"),
+            "---\nname: script-skill\ndescription: bundles a shell helper\n---\n# Script Skill\n",
+        )
+        .unwrap();
+        std::fs::write(script_dir.join("helper.sh"), "echo hi\n").unwrap();
+
+        let (skills, dropped) = load_skills_from_directory(&skills_dir, false);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !names.contains(&"script-skill"),
+            "script-bundling skill must be dropped at the secure default; got: {names:?}"
+        );
+        assert_eq!(dropped.len(), 1, "the script skill must be reported");
+        assert_eq!(dropped[0].origin_hint, "workspace");
+        match &dropped[0].reason {
+            SkillDropReason::AuditFindings {
+                summary,
+                scripts_blocked,
+            } => {
+                assert!(
+                    *scripts_blocked,
+                    "reason must flag scripts as the blocker; got: {summary}"
+                );
+                assert!(
+                    summary.contains("script-like files are blocked"),
+                    "summary must describe the script block; got: {summary}"
+                );
+            }
+            other => panic!("expected AuditFindings, got: {other:?}"),
+        }
+
+        let (skills, dropped) = load_skills_from_directory(&skills_dir, true);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"script-skill"),
+            "script-bundling skill must load once allow_scripts=true; got: {names:?}"
+        );
+        assert!(
+            dropped.is_empty(),
+            "no drops expected with allow_scripts=true; got: {dropped:?}"
+        );
+    }
     #[test]
     fn open_skills_swallow_site_skips_invalid_toml_without_panicking() {
         use tempfile::TempDir;
@@ -3760,6 +4391,143 @@ mod prompt_callable_name_tests {
         assert!(
             !prompt.contains("pr-review-toolkit:code-reviewer__run.lint"),
             "prompt advertised the raw, unsanitized composed name:\n{prompt}",
+        );
+    }
+
+    fn tool_with_target(name: &str, kind: &str, target: &str) -> SkillTool {
+        SkillTool {
+            target: Some(target.to_string()),
+            ..tool(name, kind)
+        }
+    }
+
+    #[test]
+    fn prompt_callable_predicate_matches_registration_preconditions() {
+        // shell/script/http always register -> always prompt-callable.
+        assert!(skill_tool_is_prompt_callable(&tool("run", "shell")));
+        assert!(skill_tool_is_prompt_callable(&tool("run", "script")));
+        assert!(skill_tool_is_prompt_callable(&tool("fetch", "http")));
+        // builtin/mcp are elevation wrappers: callable only WITH a target.
+        assert!(skill_tool_is_prompt_callable(&tool_with_target(
+            "gen",
+            "mcp",
+            "images__generate"
+        )));
+        assert!(skill_tool_is_prompt_callable(&tool_with_target(
+            "sh", "builtin", "shell"
+        )));
+        // ... and NOT callable without one (the converter's resolve_elevated_tool
+        // would return None, so advertising them callable lies to the model).
+        assert!(!skill_tool_is_prompt_callable(&tool("gen", "mcp")));
+        assert!(!skill_tool_is_prompt_callable(&tool("sh", "builtin")));
+        // A whitespace-only target is as good as absent.
+        assert!(!skill_tool_is_prompt_callable(&tool_with_target(
+            "gen", "mcp", "   "
+        )));
+        // unknown kinds are never callable.
+        assert!(!skill_tool_is_prompt_callable(&tool("x", "weird")));
+    }
+
+    #[test]
+    fn converter_skips_targetless_elevation_matching_the_prompt_predicate() {
+        // The end-to-end invariant the renderer relies on: the registry converter
+        // registers exactly the tools `skill_tool_is_prompt_callable` marks callable
+        // (for what is statically decidable). A target-less builtin/mcp elevation
+        // tool is skipped by the converter, so it must not be advertised callable.
+        let security = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+        let skill = Skill {
+            name: "ops".to_string(),
+            description: "d".to_string(),
+            description_localizations: Default::default(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![
+                tool("run", "shell"),  // always registers
+                tool("orphan", "mcp"), // no target -> skipped
+                tool("sh", "builtin"), // no target -> skipped
+            ],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            location: None,
+        };
+
+        let registered: Vec<String> =
+            crate::skills::skills_to_tools(std::slice::from_ref(&skill), security)
+                .iter()
+                .map(|t| t.name().to_string())
+                .collect();
+
+        // shell registers; the target-less elevation tools do not - matching the
+        // prompt predicate for each.
+        for t in &skill.tools {
+            let composed = crate::tools::skill_tool::composed_tool_name(&skill.name, &t.name);
+            let in_registry = registered.iter().any(|n| n == &composed);
+            assert_eq!(
+                in_registry,
+                skill_tool_is_prompt_callable(t),
+                "prompt-callable and registry-registered must agree for {} ({}): registry={in_registry}",
+                t.name,
+                t.kind,
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_lists_mcp_with_target_as_callable_and_targetless_as_not() {
+        let skill = Skill {
+            name: "imagegen".to_string(),
+            description: "d".to_string(),
+            description_localizations: Default::default(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![
+                tool_with_target("generate", "mcp", "images__generate"),
+                tool("orphan", "mcp"), // no target -> not registered
+            ],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            location: None,
+        };
+
+        let prompt = skills_to_prompt_with_mode(
+            std::slice::from_ref(&skill),
+            Path::new("/tmp"),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        );
+
+        // The callable block comes first, the unregistered <tools> block after.
+        let callable_idx = prompt
+            .find("<callable_tools")
+            .expect("callable_tools block");
+        let tools_at = prompt
+            .find("<tools>")
+            .expect("unregistered <tools> block present for the target-less mcp tool");
+        assert!(
+            callable_idx < tools_at,
+            "callable block precedes unregistered block"
+        );
+
+        // The targeted mcp tool is advertised as callable (composed name, under
+        // <callable_tools>, before the unregistered block).
+        let callable = crate::tools::skill_tool::composed_tool_name(&skill.name, "generate");
+        let callable_at = prompt
+            .find(&format!("<name>{callable}</name>"))
+            .expect("targeted mcp skill tool must be present as a callable name");
+        assert!(
+            callable_at > callable_idx && callable_at < tools_at,
+            "targeted mcp skill tool must render under <callable_tools>:\n{prompt}"
+        );
+
+        // The target-less mcp tool renders under the unregistered <tools> block
+        // (raw name, after the callable block) - the converter would skip it.
+        let orphan_at = prompt
+            .find("<name>orphan</name>")
+            .expect("target-less mcp skill tool must be present under <tools>");
+        assert!(
+            orphan_at > tools_at,
+            "target-less mcp skill tool must render as unregistered, not callable:\n{prompt}"
         );
     }
 }

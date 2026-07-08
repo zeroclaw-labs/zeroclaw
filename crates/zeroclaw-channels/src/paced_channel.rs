@@ -49,6 +49,7 @@ enum PacedOp {
         recipient: String,
         message_id: String,
         text: String,
+        suppress_voice: bool,
     },
 }
 
@@ -77,7 +78,12 @@ impl PacedOp {
                 recipient,
                 message_id,
                 text,
-            } => inner.finalize_draft(&recipient, &message_id, &text).await,
+                suppress_voice,
+            } => {
+                inner
+                    .finalize_draft(&recipient, &message_id, &text, suppress_voice)
+                    .await
+            }
         }
     }
 }
@@ -423,7 +429,13 @@ impl Channel for PacedChannel {
             .await
     }
 
-    async fn finalize_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        suppress_voice: bool,
+    ) -> Result<()> {
         // Finalise is the terminal write to the draft — route it through the
         // same pacing queue as `send` so a burst of streamed replies respects
         // the floor and the overflow contract. The op preserves its identity
@@ -433,6 +445,7 @@ impl Channel for PacedChannel {
             recipient: recipient.to_string(),
             message_id: message_id.to_string(),
             text: text.to_string(),
+            suppress_voice,
         })
         .await
     }
@@ -569,6 +582,7 @@ mod tests {
             _recipient: &str,
             _message_id: &str,
             _text: &str,
+            _suppress_voice: bool,
         ) -> Result<()> {
             self.finalize_drafts.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -784,7 +798,7 @@ mod tests {
         };
         let paced = PacedChannel::wrap(inner, &cfg);
         paced
-            .finalize_draft("alice", "msg-1", "final text")
+            .finalize_draft("alice", "msg-1", "final text", false)
             .await
             .unwrap();
         // A draft finalization must edit the existing draft via the inner
@@ -822,7 +836,7 @@ mod tests {
         // Second op (a finalize) is queued behind the floor and drained by
         // the worker — it must still dispatch as a finalize, not a send.
         paced
-            .finalize_draft("alice", "msg-1", "final text")
+            .finalize_draft("alice", "msg-1", "final text", false)
             .await
             .unwrap();
         assert_eq!(
