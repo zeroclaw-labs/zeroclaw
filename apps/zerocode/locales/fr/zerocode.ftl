@@ -413,4 +413,5 @@ zc-config-footer-action-back-to-files = retour aux fichiers
 zc-config-footer-action-back-to-skills = retour aux compétences
 zc-config-footer-action-help = aide
 zc-config-footer-action-new-line = nouvelle ligne
+zc-config-channels-global-settings = Paramètres globaux
 zc-config-field-edit-hint = { $keys } → appuyez pour modifier

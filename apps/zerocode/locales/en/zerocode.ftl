@@ -401,6 +401,7 @@ zc-chat-copied-clipboard = Copied to clipboard
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section
 zc-config-breadcrumb-new = New
+zc-config-channels-global-settings = Global settings
 
 zc-config-personality-over-limit = Over { $limit } char limit — cannot save
 zc-config-alias-create-hint = Enter a name for the new alias

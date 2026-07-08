@@ -413,4 +413,5 @@ zc-config-footer-action-back-to-files = ファイルに戻る
 zc-config-footer-action-back-to-skills = スキルに戻る
 zc-config-footer-action-help = ヘルプ
 zc-config-footer-action-new-line = 改行
+zc-config-channels-global-settings = グローバル設定
 zc-config-field-edit-hint = { $keys } → 押して編集
