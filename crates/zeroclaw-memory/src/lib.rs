@@ -4,10 +4,11 @@
 //! ## Reserved Key Prefixes
 //!
 //! The following key prefixes are reserved for the auto-save system. Any memory
-//! stored under these keys will be **excluded from context assembly** by all
-//! three context-building paths (`build_context`, `DefaultMemoryLoader`, and
-//! `should_skip_memory_context_entry`). Do not use these prefixes for semantic
-//! memories that should surface in agent context.
+//! stored under these keys will be **excluded from context assembly** by the
+//! engine's unified memory-context renderer (`agent::memory_inject` in
+//! `zeroclaw-runtime`), which applies this skip set on every injection path.
+//! Do not use these prefixes for semantic memories that should surface in
+//! agent context.
 //!
 //! | Prefix | Purpose | Detection function |
 //! |---|---|---|
@@ -173,8 +174,9 @@ pub fn is_assistant_autosave_key(key: &str) -> bool {
 }
 
 /// Auto-save key used for raw user messages captured per-turn.
-/// Re-injecting these into build_context causes exponential bloat: each recalled
-/// entry contains prior generations' context verbatim, growing unboundedly.
+/// Re-injecting these into the memory-context preamble causes exponential
+/// bloat: each recalled entry contains prior generations' context verbatim,
+/// growing unboundedly; the engine's memory-context skip set filters them.
 /// Consolidated knowledge is already promoted to Core/Daily entries.
 pub fn is_user_autosave_key(key: &str) -> bool {
     let normalized = key.trim().to_ascii_lowercase();
