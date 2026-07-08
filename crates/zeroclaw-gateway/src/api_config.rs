@@ -4181,4 +4181,91 @@ mod tests {
             "warnings should mention archive-side failures, got: {joined}"
         );
     }
+
+    fn config_with_telegram_alias(
+        tmp: &tempfile::TempDir,
+        alias: &str,
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = temp_config(tmp);
+        config.channels.telegram.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                bot_token: "test-token".to_string(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    /// Trust-boundary regression: the bind route must reject an
+    /// unauthenticated request before any config mutation. Pairing is
+    /// required and no token is presented, so the handler returns 401 and
+    /// leaves the peer group untouched.
+    #[tokio::test]
+    async fn channel_bind_rejects_unauthenticated_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_with_telegram_alias(&tmp, "alerts");
+        let mut state = test_state(config);
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+
+        let (status, _json) = response_json(
+            handle_api_channel_bind(
+                axum::extract::State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::Json(ChannelBindBody {
+                    channel_type: "telegram".to_string(),
+                    alias: "alerts".to_string(),
+                    identity: "123456789".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            state
+                .config
+                .read()
+                .channel_external_peers("telegram", "alerts")
+                .is_empty(),
+            "a rejected bind must not mutate the peer group"
+        );
+    }
+
+    /// Trust-boundary regression: binding into a `[channels.telegram.<alias>]`
+    /// that does not exist must 404 rather than mint a peer group the runtime
+    /// never resolves authorization from.
+    #[tokio::test]
+    async fn channel_bind_phantom_alias_is_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_with_telegram_alias(&tmp, "alerts");
+        let state = test_state(config);
+
+        let (status, _json) = response_json(
+            handle_api_channel_bind(
+                axum::extract::State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::Json(ChannelBindBody {
+                    channel_type: "telegram".to_string(),
+                    alias: "ghost".to_string(),
+                    identity: "123456789".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            state
+                .config
+                .read()
+                .channel_external_peers("telegram", "ghost")
+                .is_empty(),
+            "a phantom-alias bind must not create a peer group"
+        );
+    }
 }
