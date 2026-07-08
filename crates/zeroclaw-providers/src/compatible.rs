@@ -204,9 +204,12 @@ fn normalize_models_with_pricing(
 }
 
 /// Convert models.dev IDs into `ModelInfo` entries without pricing.
-/// The models.dev catalog does not serve pricing data, so this function
-/// documents the intentional data-loss contract: callers should expect
-/// `pricing: None` on every returned entry.
+/// The models.dev catalog does serve per-1M-token cost data, but this listing
+/// surface intentionally does not carry it (`ModelPricing` is per-token
+/// strings; converting here would change what onboarding and the rates editor
+/// display): callers should expect `pricing: None` on every returned entry.
+/// Cost tracking consumes the catalog's `cost` block separately via
+/// `models_dev::pricing_from_catalog` (see `pricing.rs`).
 fn models_dev_to_model_info(ids: Vec<String>) -> Vec<zeroclaw_api::model_provider::ModelInfo> {
     use zeroclaw_api::model_provider::ModelInfo;
     ids.into_iter()
@@ -1904,8 +1907,12 @@ impl OpenAiCompatibleModelProvider {
             items
                 .iter()
                 .map(|tool| {
+                    // Owned copy is required here: the per-model sanitizer
+                    // (`convert_tool_specs_for_model`) mutates these Value
+                    // trees in place, so they cannot share the registry's
+                    // Arc-backed schema (#8642).
                     let params = zeroclaw_api::schema::SchemaCleanr::clean_for_openai(
-                        tool.parameters.clone(),
+                        (*tool.parameters).clone(),
                     );
                     serde_json::json!({
                         "type": "function",
@@ -4694,7 +4701,8 @@ mod tests {
                     "command": { "type": "string" }
                 },
                 "required": ["command"]
-            }),
+            })
+            .into(),
         }];
 
         let output = OpenAiCompatibleModelProvider::with_prompt_guided_tool_instructions(
