@@ -34,6 +34,20 @@ pub struct AppAuth {
     token: parking_lot::Mutex<Option<CachedToken>>,
 }
 
+impl std::fmt::Debug for AppAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppAuth")
+            .field("app_id", &self.app_id)
+            .field(
+                "private_key_pem",
+                &self.private_key_pem.as_ref().map(|_| "***"),
+            )
+            .field("key", &"<redacted>")
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
 impl AppAuth {
     pub fn new(app_id: u64, private_key_pem: Option<String>) -> Self {
         Self {
@@ -184,6 +198,23 @@ mod tests {
         let auth = AppAuth::new(1, Some("not a pem".into()));
         let err = auth.mint_jwt().unwrap_err();
         assert!(matches!(err, GitChannelError::Jwt(_)));
+    }
+
+    #[test]
+    fn debug_redacts_inline_private_key() {
+        let auth = AppAuth::new(
+            7,
+            Some(
+                "-----BEGIN RSA PRIVATE KEY-----\nSUPERSECRETPEM\n-----END RSA PRIVATE KEY-----"
+                    .into(),
+            ),
+        );
+        let out = format!("{auth:?}");
+        assert!(
+            !out.contains("SUPERSECRETPEM"),
+            "Debug must not print the raw private key PEM"
+        );
+        assert!(out.contains("***"), "Debug must mask the private key");
     }
 
     #[test]

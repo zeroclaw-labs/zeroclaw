@@ -460,7 +460,7 @@ mod tests {
                 .await;
         }
 
-        let provider = GithubProvider::new(0, None, String::new(), Some(1), None)
+        let provider = GithubProvider::new(0, None, Some(1), None)
             .with_api(GithubApi::with_base(server.uri()));
         let repo = RepoRef::parse("octo/repo").unwrap();
         let page = provider.fetch_issues("t", &repo, start).await.unwrap();
