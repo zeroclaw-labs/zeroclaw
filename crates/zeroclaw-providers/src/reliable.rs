@@ -1761,6 +1761,12 @@ impl ModelProvider for ReliableModelProvider {
             .any(|entry| entry.provider.supports_streaming_tool_events())
     }
 
+    fn streams_text_with_tools(&self) -> bool {
+        self.model_providers
+            .iter()
+            .any(|entry| entry.provider.streams_text_with_tools())
+    }
+
     fn stream_chat(
         &self,
         request: ChatRequest<'_>,

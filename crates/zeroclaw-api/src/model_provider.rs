@@ -667,6 +667,16 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         false
     }
 
+    /// Whether streaming still yields correct visible text when tools are
+    /// present even though tool calls are not emitted as structured stream
+    /// events. True for providers that carry tool calls in the text stream
+    /// (parsed downstream from the accumulated response), so the runtime can
+    /// stream visible text live instead of falling back to a single terminal
+    /// payload.
+    fn streams_text_with_tools(&self) -> bool {
+        false
+    }
+
     /// Streaming chat with optional system prompt. See `simple_chat` for
     /// the `temperature` contract.
     fn stream_chat_with_system(
@@ -812,6 +822,10 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
 
     fn supports_streaming_tool_events(&self) -> bool {
         self.as_ref().supports_streaming_tool_events()
+    }
+
+    fn streams_text_with_tools(&self) -> bool {
+        self.as_ref().streams_text_with_tools()
     }
 
     fn stream_chat_with_system(

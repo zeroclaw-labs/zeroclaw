@@ -126,6 +126,18 @@ use zeroclaw_api::channel::Channel;
 use zeroclaw_api::ingress::{IngressContext, IngressDecision};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 
+fn should_consume_provider_stream(
+    has_delta_sink: bool,
+    supports_streaming: bool,
+    has_tools: bool,
+    supports_streaming_tool_events: bool,
+    streams_text_with_tools: bool,
+) -> bool {
+    has_delta_sink
+        && supports_streaming
+        && (!has_tools || supports_streaming_tool_events || streams_text_with_tools)
+}
+
 /// Maximum malformed internal tool-protocol retries before returning a safe fallback.
 pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
 
@@ -552,9 +564,15 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         let active_provider_supports_streaming = active_model_provider.supports_streaming();
         let active_provider_supports_streaming_tool_events =
             active_model_provider.supports_streaming_tool_events();
-        let should_consume_provider_stream = (on_delta.is_some() || event_tx.is_some())
-            && active_provider_supports_streaming
-            && (request_tools.is_none() || active_provider_supports_streaming_tool_events);
+        let active_provider_streams_text_with_tools =
+            active_model_provider.streams_text_with_tools();
+        let should_consume_provider_stream = should_consume_provider_stream(
+            on_delta.is_some() || event_tx.is_some(),
+            active_provider_supports_streaming,
+            request_tools.is_some(),
+            active_provider_supports_streaming_tool_events,
+            active_provider_streams_text_with_tools,
+        );
         if ::zeroclaw_log::debug_enabled() {
             ::zeroclaw_log::record!(
                 DEBUG,
@@ -1427,6 +1445,48 @@ fn refresh_prompt_anchor(history: &mut [ChatMessage], use_native_tools: bool) {
 mod surface3_tests {
     use super::*;
     use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
+
+    #[test]
+    fn stream_gate_off_without_a_delta_sink() {
+        assert!(!should_consume_provider_stream(
+            false, true, false, true, true
+        ));
+    }
+
+    #[test]
+    fn stream_gate_off_when_provider_cannot_stream() {
+        assert!(!should_consume_provider_stream(
+            true, false, false, true, true
+        ));
+    }
+
+    #[test]
+    fn stream_gate_on_without_tools_when_streaming() {
+        assert!(should_consume_provider_stream(
+            true, true, false, false, false
+        ));
+    }
+
+    #[test]
+    fn stream_gate_on_with_tools_and_native_tool_events() {
+        assert!(should_consume_provider_stream(
+            true, true, true, true, false
+        ));
+    }
+
+    #[test]
+    fn stream_gate_on_with_tools_when_provider_streams_text_from_text_tools() {
+        assert!(should_consume_provider_stream(
+            true, true, true, false, true
+        ));
+    }
+
+    #[test]
+    fn stream_gate_off_with_tools_when_provider_neither_streams_tool_events_nor_text_tools() {
+        assert!(!should_consume_provider_stream(
+            true, true, true, false, false
+        ));
+    }
 
     fn make_system_prompt(anchor: &str) -> ChatMessage {
         ChatMessage::system(format!(

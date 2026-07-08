@@ -68,6 +68,10 @@ impl ModelProvider for ModelPinnedProvider {
         self.inner.supports_streaming_tool_events()
     }
 
+    fn streams_text_with_tools(&self) -> bool {
+        self.inner.streams_text_with_tools()
+    }
+
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         ProviderDispatch::from_ref(&*self.inner).list_models().await
     }

@@ -2998,6 +2998,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         self.native_tool_calling
     }
 
+    fn streams_text_with_tools(&self) -> bool {
+        true
+    }
+
     fn stream_chat(
         &self,
         request: ProviderChatRequest<'_>,
@@ -5065,6 +5069,25 @@ mod tests {
     /// Confirm that `strip_native_tool_messages` is a no-op when the model_provider
     /// has `native_tool_calling = true` — tool-role and assistant-with-tool-calls
     /// messages must pass through unchanged.
+    #[test]
+    fn text_tool_compat_provider_streams_text_with_tools() {
+        let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+            "test",
+            "TextTool",
+            "https://example.com",
+            None,
+            AuthStyle::Bearer,
+        );
+        assert!(
+            !<OpenAiCompatibleModelProvider as ModelProvider>::supports_streaming_tool_events(&p),
+            "merge_system_into_user provider is text-tool, not native"
+        );
+        assert!(
+            <OpenAiCompatibleModelProvider as ModelProvider>::streams_text_with_tools(&p),
+            "text-tool compat provider must still stream visible text when tools are present"
+        );
+    }
+
     #[test]
     fn strip_native_tool_messages_passthrough_when_native_tool_calling_enabled() {
         let messages = vec![

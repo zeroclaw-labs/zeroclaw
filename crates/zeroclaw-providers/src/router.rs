@@ -309,6 +309,12 @@ impl ModelProvider for RouterModelProvider {
             .any(|(_, model_provider)| model_provider.supports_streaming_tool_events())
     }
 
+    fn streams_text_with_tools(&self) -> bool {
+        self.model_providers
+            .iter()
+            .any(|(_, model_provider)| model_provider.streams_text_with_tools())
+    }
+
     fn stream_chat_with_system(
         &self,
         system_prompt: Option<&str>,
