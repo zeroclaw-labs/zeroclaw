@@ -3243,6 +3243,7 @@ impl AssistantChannelOutcome {
 
 async fn classify_channel_reply_intent(
     model_provider: &dyn ModelProvider,
+    provider_name: &str,
     system_prompt: &str,
     history: &[ChatMessage],
     model: &str,
@@ -3286,10 +3287,23 @@ async fn classify_channel_reply_intent(
         let _ = writeln!(convo, "[{role}] {safe_content}");
     }
 
-    let response = ProviderDispatch::from_ref(model_provider)
-        .chat_with_system(Some(system_prompt), &convo, model, temperature)
+    // Route through the metered provider seam so the classifier's budget check
+    // and token usage are recorded like an in-loop call (no-op when unscoped).
+    let messages = [ChatMessage::system(system_prompt), ChatMessage::user(convo)];
+    let access = ResolvedModelAccess {
+        model_provider,
+        provider_name,
+        model,
+        temperature,
+    };
+    let response = access
+        .run_model_query(zeroclaw_providers::ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        })
         .await?;
-    Ok(parse_reply_intent(&response))
+    Ok(parse_reply_intent(&response.text.unwrap_or_default()))
 }
 
 /// Parse the classifier's raw output into an `AssistantChannelOutcome`. Pure
@@ -4861,6 +4875,18 @@ async fn process_channel_message_body(
         .as_ref()
         .map(|c| c.is_direct_message(&msg))
         .unwrap_or(false);
+    // The per-turn cost-tracking context, built once here so the reply-intent
+    // classifier's provider call (below) is metered under the SAME context as
+    // the tool loop (scoped near the loop). The classifier runs before the loop,
+    // so without this hoist its spend would go unrecorded.
+    let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
+        zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
+            state.tracker,
+            state.model_provider_pricing,
+        )
+        .with_agent_alias(state.agent_alias.as_str())
+    });
+
     let classifier_intent = if should_bypass_reply_intent_precheck(&msg, direct_message) {
         AssistantChannelOutcome::Reply(String::new())
     } else {
@@ -4882,15 +4908,23 @@ async fn process_channel_message_body(
             )
         });
 
-        classify_channel_reply_intent(
-            classifier_provider_arc.as_ref(),
-            history[0].content.as_str(),
-            &history,
-            classifier_model_owned.as_str(),
-            classifier_temperature.or(runtime_defaults.defaults.temperature),
-        )
-        .await
-        .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
+        let classifier_provider_name =
+            ::zeroclaw_api::attribution::Attributable::alias(classifier_provider_arc.as_ref())
+                .to_string();
+        zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                cost_tracking_context.clone(),
+                classify_channel_reply_intent(
+                    classifier_provider_arc.as_ref(),
+                    &classifier_provider_name,
+                    history[0].content.as_str(),
+                    &history,
+                    classifier_model_owned.as_str(),
+                    classifier_temperature.or(runtime_defaults.defaults.temperature),
+                ),
+            )
+            .await
+            .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
     };
 
     // ACP sessions are direct user requests — there is no broadcast,
@@ -5162,13 +5196,8 @@ async fn process_channel_message_body(
         ctx.max_tool_iterations,
         scale_cap,
     );
-    let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
-        zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
-            state.tracker,
-            state.model_provider_pricing,
-        )
-        .with_agent_alias(state.agent_alias.as_str())
-    });
+    // `cost_tracking_context` is built earlier (above the reply-intent classifier)
+    // so the classifier's provider call is metered under the same context.
     let llm_call_start = Instant::now();
     #[allow(clippy::cast_possible_truncation)]
     let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
@@ -12878,6 +12907,84 @@ api_key = "anthropic-key"
         fn alias(&self) -> &str {
             "DummyModelProvider"
         }
+    }
+
+    /// Provider returning a `REPLY` verdict WITH token usage, to prove the
+    /// reply-intent classifier records usage through the metered seam.
+    struct ClassifierUsageProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ClassifierUsageProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("REPLY".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("REPLY".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(100),
+                    output_tokens: Some(20),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for ClassifierUsageProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "classifier-usage"
+        }
+    }
+
+    // P3: the reply-intent classifier now routes its provider call through the
+    // metered seam, so under a cost-tracking scope its token usage is recorded
+    // (before this it was a fully unmetered provider call running pre-scope).
+    #[tokio::test]
+    async fn reply_intent_classifier_records_usage_through_the_metered_seam() {
+        let provider = ClassifierUsageProvider;
+        let history = vec![ChatMessage::user("hey bot, please do X")];
+        let ctx = zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = std::sync::Arc::clone(&ctx.turn_usage);
+
+        let outcome = zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                super::classify_channel_reply_intent(
+                    &provider,
+                    "custom",
+                    "system prompt",
+                    &history,
+                    "test-model",
+                    None,
+                ),
+            )
+            .await
+            .expect("classify should succeed");
+
+        assert!(matches!(outcome, super::AssistantChannelOutcome::Reply(_)));
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 100);
+        assert_eq!(recorded.output_tokens, 20);
     }
 
     struct FormatErrorModelProvider;
