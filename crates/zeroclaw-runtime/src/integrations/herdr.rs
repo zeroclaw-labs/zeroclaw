@@ -142,11 +142,16 @@ fn install_hook_from_env(
 
     let client = HerdrClient::new(socket_path, pane_id.clone());
 
-    // Compute unique display name: agent alias + last 2 chars of pane_id
-    let display_name = if pane_id.len() > 2 {
-        format!("{}-{}", agent_alias, &pane_id[pane_id.len() - 2..])
-    } else {
-        agent_alias.to_string()
+    // Compute unique display name: agent alias + last 2 chars of pane_id.
+    // Use char-aware slicing to handle multi-byte UTF-8 pane IDs safely.
+    let display_name = {
+        let chars: Vec<char> = pane_id.chars().collect();
+        if chars.len() > 2 {
+            let suffix: String = chars[chars.len() - 2..].iter().collect();
+            format!("{}-{}", agent_alias, suffix)
+        } else {
+            agent_alias.to_string()
+        }
     };
     client.report_metadata(&display_name);
 
@@ -610,6 +615,19 @@ pub(crate) mod tests {
         assert!(
             try_install_hook(false, "test-agent").is_none(),
             "try_install_hook(false) must return None without consulting env vars"
+        );
+    }
+
+    /// Non-ASCII pane IDs (e.g., emoji) must not panic on UTF-8 slicing.
+    /// This tests the fix for the blocker: display_name uses char-aware
+    /// suffix extraction instead of byte indexing, which would panic on
+    /// multi-byte characters like 🦀.
+    #[test]
+    fn non_ascii_pane_id_does_not_panic() {
+        let _guard = install_hook_from_env(
+            "/tmp/nonexistent-herdr-test-socket.sock".into(),
+            "test-🦀".into(),
+            "test-agent",
         );
     }
 
