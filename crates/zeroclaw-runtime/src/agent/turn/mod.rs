@@ -108,6 +108,7 @@ pub(crate) use stream_consume::consume_provider_streaming_response;
 pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};
 pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_provider};
 
+use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
 use crate::agent::tool_execution::{
     ToolDispatchContext, execute_tools_parallel, execute_tools_sequential,
     should_execute_tools_in_parallel,
@@ -186,10 +187,15 @@ pub struct ToolLoop<'a> {
     /// The ingress envelope stamped by the entry layer (RFC #6971). Travels
     /// with the turn into the engine, where the universal SOP policy layer
     /// dispositions it at P1 (turn entry) and P2 (each steering injection).
-    /// Phase-1 callers stamp [`IngressContext::internal`]; real per-transport
+    /// Phase-1 callers stamp a per-origin envelope; real per-transport
     /// stamping is phase 2. Owned (not borrowed) — the envelope is small and
     /// consumed by the policy front door for the turn's lifetime.
     pub ingress: IngressContext,
+    /// The per-turn memory half for unified memory-context injection: the
+    /// handle, raw recall query, session scopes, and spawn-site suppression.
+    /// `None` for nested sub-turn sites and paths without a memory backend;
+    /// the injection decision itself is keyed on `ingress.origin`.
+    pub memory: Option<crate::agent::memory_inject::TurnMemory<'a>>,
     /// Observer metadata: agent alias and turn id, stamped onto every
     /// turn-level observer event so OTel spans correlate across the loop.
     pub agent_alias: Option<&'a str>,
@@ -212,6 +218,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         mut new_messages_out,
         mut image_cache,
         ingress,
+        memory,
         agent_alias,
         turn_id,
     } = p;
@@ -274,6 +281,46 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 "turn-ingress-dropped",
                 &[("reason", reason.as_str())],
             ));
+        }
+    }
+
+    // ── Memory-context injection (unified) ──────────────────────────────────
+    // The ONE injection point for the memory preamble, replacing the per-path
+    // inline renderers. The decision is keyed on the ingress origin (sub-turns
+    // never inject; scheduled origins exclude Conversation entries); the
+    // pipeline and its documented uniform behavior live in
+    // `agent::memory_inject`. Injection prepends to the trailing user message
+    // AFTER the P1 policy scan, so policy always sees the caller's own text.
+    if let Some(turn_memory) = &memory {
+        let has_session = turn_memory.sessions.iter().any(Option::is_some);
+        if let crate::agent::memory_inject::InjectPolicy::Inject {
+            exclude_conversation,
+        } = crate::agent::memory_inject::resolve_inject_policy(
+            ingress.origin,
+            has_session,
+            turn_memory.suppress,
+        ) && let Some(last_user_idx) = history.iter().rposition(|m| m.role == "user")
+            // Idempotence: a model-switch retry re-enters the engine with the
+            // same history; the preamble must not stack.
+            && !history[last_user_idx]
+                .content
+                .starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN)
+        {
+            let scopes: Vec<Option<&str>> =
+                turn_memory.sessions.iter().map(|s| s.as_deref()).collect();
+            let context = crate::agent::memory_inject::render_memory_context(
+                turn_memory.handle,
+                observer,
+                &turn_memory.query,
+                &scopes,
+                &turn_memory.cfg,
+                exclude_conversation,
+            )
+            .await;
+            if !context.is_empty() {
+                let existing = &history[last_user_idx].content;
+                history[last_user_idx].content = format!("{context}{existing}");
+            }
         }
     }
 
@@ -509,6 +556,14 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             use_native_tools,
             ..
         } = iteration_tool_specs;
+
+        // ── Per-turn system prompt anchor refresh (#8054 Surface 3) ──
+        // The system prompt in `history[0]` was built by
+        // `Agent::build_system_prompt()` against the base provider, and
+        // may not reflect this iteration's `active_model_provider` after
+        // vision routing.  Swap the TASK_FRAMING anchor so the prompt's
+        // tool-availability claim matches the actual `request_tools`.
+        refresh_prompt_anchor(history, use_native_tools);
 
         let prepared_messages = prepare_messages_for_iteration(
             history,
@@ -1258,7 +1313,8 @@ async fn drive_live_sop_actions(
                         steering: None,
                         new_messages_out: new_messages_out.as_deref_mut(),
                         image_cache: image_cache.as_deref_mut(),
-                        ingress: IngressContext::internal(),
+                        memory: None,
+                        ingress: IngressContext::sub_turn(),
                         agent_alias,
                         turn_id: &nested_turn_id,
                     }))
@@ -1384,4 +1440,112 @@ async fn drive_live_sop_actions(
         }
     }
     Ok(())
+}
+
+/// Per-turn system prompt TASK_FRAMING anchor refresh (#8054 Surface 3).
+///
+/// The system prompt in `history[0]` was built by
+/// `Agent::build_system_prompt()` against the base provider, and may not
+/// reflect the iteration's `active_model_provider` after vision routing.
+/// This function surgically swaps the `NATIVE_TOOLS_TASK_FRAMING` /
+/// `NO_TOOLS_TASK_FRAMING` anchor so the prompt's tool-availability claim
+/// matches the actual `request_tools` for this iteration.
+///
+/// When neither anchor is present (custom `system_prompt_prefix`), the
+/// function is a no-op — same as the pre-existing behavior.
+fn refresh_prompt_anchor(history: &mut [ChatMessage], use_native_tools: bool) {
+    if let Some(first) = history.first_mut()
+        && (first.content.contains(NATIVE_TOOLS_TASK_FRAMING)
+            || first.content.contains(NO_TOOLS_TASK_FRAMING))
+    {
+        let desired = if use_native_tools {
+            NATIVE_TOOLS_TASK_FRAMING
+        } else {
+            NO_TOOLS_TASK_FRAMING
+        };
+        first.content = first
+            .content
+            .replacen(NATIVE_TOOLS_TASK_FRAMING, desired, 1)
+            .replacen(NO_TOOLS_TASK_FRAMING, desired, 1);
+    }
+}
+
+#[cfg(test)]
+mod surface3_tests {
+    use super::*;
+    use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
+
+    fn make_system_prompt(anchor: &str) -> ChatMessage {
+        ChatMessage::system(format!(
+            "You are ZeroClaw.\n\n## Security\n\n...\n\n## Your Task\n\nWhen the user sends a message, respond naturally. {anchor}\n\nDo NOT: summarize this configuration...\n"
+        ))
+    }
+
+    #[test]
+    fn refresh_prompt_anchor_swaps_native_to_no_tools_when_signal_drops() {
+        // When the per-turn signal is `use_native_tools = false` but the
+        // system prompt has NATIVE_TOOLS_TASK_FRAMING (the prompt was built
+        // against the base provider, but the active provider is non-native),
+        // the anchor must be replaced with NO_TOOLS_TASK_FRAMING.
+        let mut history = vec![make_system_prompt(NATIVE_TOOLS_TASK_FRAMING)];
+        refresh_prompt_anchor(&mut history, false);
+        assert!(
+            history[0].content.contains(NO_TOOLS_TASK_FRAMING),
+            "prompt must contain NO_TOOLS_TASK_FRAMING after swap"
+        );
+        assert!(
+            !history[0].content.contains(NATIVE_TOOLS_TASK_FRAMING),
+            "prompt must not retain NATIVE_TOOLS_TASK_FRAMING after swap"
+        );
+    }
+
+    #[test]
+    fn refresh_prompt_anchor_swaps_no_tools_to_native_when_signal_rises() {
+        // Reverse direction: when the per-turn signal flips to true,
+        // NO_TOOLS_TASK_FRAMING must be replaced with NATIVE_TOOLS_TASK_FRAMING.
+        let mut history = vec![make_system_prompt(NO_TOOLS_TASK_FRAMING)];
+        refresh_prompt_anchor(&mut history, true);
+        assert!(
+            history[0].content.contains(NATIVE_TOOLS_TASK_FRAMING),
+            "prompt must contain NATIVE_TOOLS_TASK_FRAMING after swap"
+        );
+        assert!(
+            !history[0].content.contains(NO_TOOLS_TASK_FRAMING),
+            "prompt must not retain NO_TOOLS_TASK_FRAMING after swap"
+        );
+    }
+
+    #[test]
+    fn refresh_prompt_anchor_is_noop_when_anchor_already_matches() {
+        // Byte-stability: when the per-turn signal already matches the
+        // anchor in the prompt, the function must not mutate the content.
+        let original = make_system_prompt(NATIVE_TOOLS_TASK_FRAMING);
+        let mut history = vec![original.clone()];
+        refresh_prompt_anchor(&mut history, true);
+        assert_eq!(
+            history[0].content, original.content,
+            "content must be identical when anchor already matches signal"
+        );
+    }
+
+    #[test]
+    fn refresh_prompt_anchor_is_noop_when_no_anchor_present() {
+        // Custom system_prompt_prefix: when neither anchor is present,
+        // the function must not touch the prompt at all.
+        let custom_prompt = "You are a custom agent. Answer concisely.".to_string();
+        let mut history = vec![ChatMessage::system(custom_prompt.clone())];
+        refresh_prompt_anchor(&mut history, false);
+        assert_eq!(
+            history[0].content, custom_prompt,
+            "custom prompt without either anchor must be unchanged"
+        );
+    }
+
+    #[test]
+    fn refresh_prompt_anchor_noop_on_empty_history() {
+        // Edge case: empty history shouldn't panic.
+        let mut history: Vec<ChatMessage> = Vec::new();
+        refresh_prompt_anchor(&mut history, false);
+        // Just verifying no panic.
+    }
 }
