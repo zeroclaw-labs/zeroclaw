@@ -6403,7 +6403,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            ingress: IngressContext::agent_direct(),
+            memory: None,
             agent_alias: None,
             turn_id: &turn_id,
         })
