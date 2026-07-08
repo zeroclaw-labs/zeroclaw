@@ -41,6 +41,22 @@ pub enum ChannelApprovalResponse {
     DenyWithEdit { replacement: String },
 }
 
+/// An approval response together with the back-channel that produced it.
+///
+/// When a channel fans a single approval request out to several registered
+/// back-channels (the agent's approval bridge does this so an ACP editor and a
+/// WebSocket dashboard can both answer), `decided_by` names the back-channel
+/// that actually answered, so the approval audit trail can attribute the
+/// decision to the deciding surface. Because the attribution travels with the
+/// returned decision, concurrent approvals on the same channel instance cannot
+/// cross-wire it. Ordinary single channels leave it `None` — their own
+/// [`Channel::name`] already identifies the surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributedApprovalResponse {
+    pub response: ChannelApprovalResponse,
+    pub decided_by: Option<String>,
+}
+
 /// Conversation history scope for an inbound channel message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChannelConversationScope {
@@ -533,16 +549,29 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(None)
     }
 
-    /// The name of the back-channel that produced the most recent
-    /// [`Channel::request_approval`] decision, when this channel fans a single
-    /// request out to several registered back-channels (the agent's approval
-    /// bridge does this so an ACP editor and a WebSocket dashboard can both
-    /// answer). Ordinary single channels return `None` — their own
-    /// [`Channel::name`] already identifies the deciding surface — so the
-    /// approval audit trail can record the channel that actually decided
-    /// instead of the turn loop's static channel name.
-    fn last_decision_channel(&self) -> Option<String> {
-        None
+    /// Like [`Channel::request_approval`], but also reports which back-channel
+    /// produced the decision when this channel fans the request out to several
+    /// registered back-channels (the agent's approval bridge does this so an
+    /// ACP editor and a WebSocket dashboard can both answer). The attribution
+    /// travels with the returned decision, so concurrent approvals on the same
+    /// channel instance cannot cross-wire it.
+    ///
+    /// The default implementation delegates to [`Channel::request_approval`]
+    /// and reports no specific back-channel (`decided_by: None`), which keeps
+    /// the deciding surface as the channel's own [`Channel::name`]. Only a
+    /// fan-out bridge needs to override this.
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
+        Ok(self
+            .request_approval(recipient, request)
+            .await?
+            .map(|response| AttributedApprovalResponse {
+                response,
+                decided_by: None,
+            }))
     }
 
     /// Ask the user a multiple-choice question and return the chosen option's text.
