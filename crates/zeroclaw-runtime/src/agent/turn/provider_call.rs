@@ -379,9 +379,12 @@ mod payload_capture_tests {
         }
     }
 
-    /// Read the next broadcast `llm_request` record within a 2s deadline,
-    /// recovering from `Lagged` errors caused by parallel workspace tests
-    /// firing into the same global broadcast hook.
+    /// Read the next broadcast `llm_request` record for THIS test's turn
+    /// (`trace-req-test`) within a 2s deadline, recovering from `Lagged`
+    /// errors and skipping records emitted by other loop-driving tests: the
+    /// capture subscriber is process-global, so any concurrently-running
+    /// `run_tool_call_loop` test also emits `llm_request` records into the
+    /// same broadcast hook.
     async fn next_llm_request(
         rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
     ) -> serde_json::Value {
@@ -391,7 +394,13 @@ mod payload_capture_tests {
             let step = remaining.min(std::time::Duration::from_millis(50));
             match tokio::time::timeout(step, rx.recv()).await {
                 Ok(Ok(value)) => {
-                    if value.get("message").and_then(|v| v.as_str()) == Some("llm_request") {
+                    let ours = value
+                        .get("attributes")
+                        .and_then(|a| a.get("trace_id"))
+                        .and_then(|v| v.as_str())
+                        == Some("trace-req-test");
+                    if ours && value.get("message").and_then(|v| v.as_str()) == Some("llm_request")
+                    {
                         return value;
                     }
                 }

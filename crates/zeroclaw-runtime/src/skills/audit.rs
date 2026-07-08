@@ -17,6 +17,7 @@ pub struct SkillAuditOptions {
 pub struct SkillAuditReport {
     pub files_scanned: usize,
     pub findings: Vec<String>,
+    pub scripts_blocked: bool,
 }
 
 impl SkillAuditReport {
@@ -96,6 +97,7 @@ pub fn audit_open_skill_markdown(path: &Path, repo_root: &Path) -> Result<SkillA
     let mut report = SkillAuditReport {
         files_scanned: 1,
         findings: Vec::new(),
+        ..Default::default()
     };
     audit_markdown_file(&canonical_repo, &canonical_path, &mut report)?;
     Ok(report)
@@ -151,6 +153,7 @@ fn audit_path(
     }
 
     if !options.allow_scripts && is_unsupported_script_file(path) {
+        report.scripts_blocked = true;
         report.findings.push(format!(
             "{rel}: script-like files are blocked by skill security policy."
         ));

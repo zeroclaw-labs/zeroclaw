@@ -49,6 +49,21 @@ for readme in README.md docs/i18n/*/README.md; do
     "version-v${VERSION}-blue\" alt=\"Version v${VERSION}\""
 done
 
+# ── Tauri desktop app config ───────────────────────────────────────
+echo "Tauri config..."
+TAURI_CONF="$REPO_ROOT/apps/tauri/tauri.conf.json"
+if [[ -f "$TAURI_CONF" ]]; then
+  if command -v jq >/dev/null 2>&1; then
+    jq --arg v "$VERSION" '.version = $v' "$TAURI_CONF" > "$TAURI_CONF.tmp" \
+      && mv "$TAURI_CONF.tmp" "$TAURI_CONF"
+  else
+    sed -i '' -E "s|\"version\": \"[^\"]+\"|\"version\": \"$VERSION\"|" "$TAURI_CONF" 2>/dev/null \
+      || sed -i -E "s|\"version\": \"[^\"]+\"|\"version\": \"$VERSION\"|" "$TAURI_CONF"
+  fi
+  echo "  updated: apps/tauri/tauri.conf.json"
+  changed=$((changed + 1))
+fi
+
 # ── Windows installer (setup.bat) ──────────────────────────────────
 echo "Windows setup.bat..."
 bump "setup.bat" \

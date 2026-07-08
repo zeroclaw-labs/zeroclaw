@@ -65,6 +65,7 @@ pub async fn handle_command(
 
             // Build the ordered (label, skills) groups to display.
             let mut rendered: Vec<(String, Vec<Skill>)> = Vec::new();
+            let mut skipped: Vec<DroppedSkill> = Vec::new();
             if let Some(ref b) = bundle {
                 // A single bundle's on-disk skills.
                 let dir =
@@ -90,12 +91,15 @@ pub async fn handle_command(
                         )
                     );
                 }
+                let (skills, dropped, _shadowed) =
+                    load_skills_for_agent_from_config_audited(config, a);
+                skipped.extend(dropped);
                 rendered.push((
                     get_required_cli_string_with_args(
                         "cli-skills-list-group-agent",
                         &[("alias", a)],
                     ),
-                    load_skills_for_agent_from_config(config, a),
+                    skills,
                 ));
             } else {
                 // Full inventory: every bundle, then the agent-agnostic sources
@@ -117,9 +121,11 @@ pub async fn handle_command(
                         ));
                     }
                 }
+                let (skills, dropped) = load_skills_with_config_audited(&config.data_dir, config);
+                skipped.extend(dropped);
                 rendered.push((
                     get_required_cli_string("cli-skills-list-group-global"),
-                    load_skills_with_config(&config.data_dir, config),
+                    skills,
                 ));
             }
 
@@ -150,6 +156,43 @@ pub async fn handle_command(
                     println!();
                 }
             }
+            if !skipped.is_empty() {
+                println!();
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-skipped-header",
+                        &[("count", &skipped.len().to_string())],
+                    )
+                );
+                println!();
+                for entry in &skipped {
+                    let (reason, scripts_blocked) = match &entry.reason {
+                        SkillDropReason::AuditFindings {
+                            summary,
+                            scripts_blocked,
+                        } => (summary.clone(), *scripts_blocked),
+                        SkillDropReason::AuditError(s) | SkillDropReason::ManifestParseError(s) => {
+                            (s.clone(), false)
+                        }
+                    };
+                    println!("  {}", console::style(&entry.name).yellow().bold());
+                    println!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-skills-skipped-reason",
+                            &[("reason", &reason)],
+                        )
+                    );
+                    if scripts_blocked && !config.skills.allow_scripts {
+                        println!(
+                            "{}",
+                            get_required_cli_string("cli-skills-skipped-scripts-hint")
+                        );
+                    }
+                }
+            }
+            println!();
             Ok(())
         }
         crate::SkillCommands::Audit { source } => {
@@ -380,7 +423,11 @@ pub async fn handle_command(
                         .collect::<Vec<_>>()
                         .join(", ");
                     anyhow::bail!(
-                        "skill '{name}' exists in multiple locations ({locs}); pass --bundle to choose one"
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-skills-multiple-locations-bundle",
+                            &[("name", &name), ("locations", &locs)],
+                        )
                     );
                 }
             }
@@ -617,7 +664,11 @@ fn locate_installed_skill_dir(config: &crate::config::Config, name: &str) -> Res
                 .collect::<Vec<_>>()
                 .join(", ");
             anyhow::bail!(
-                "skill '{name}' exists in multiple locations ({locs}); pass an explicit path to disambiguate"
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-skills-multiple-locations-path",
+                    &[("name", name), ("locations", &locs)],
+                )
             )
         }
     }
