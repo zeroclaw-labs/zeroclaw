@@ -1,6 +1,6 @@
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    TOOL_LOOP_SESSION_KEY, ToolLoop, run_tool_call_loop,
+    TOOL_LOOP_SESSION_KEY, ToolLoop, apply_text_tool_prompt_policy, run_tool_call_loop,
 };
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
@@ -217,6 +217,37 @@ impl DelegateAction {
     fn usage() -> String {
         Self::schema_values().join("/")
     }
+}
+
+/// The independent-delegate registry plus the deferred-MCP side-channels the
+/// sub-agent turn needs. Independent delegation assembles the target's full
+/// runtime registry (built-ins + granted MCP + skills), and deferred MCP mode
+/// surfaces its tools through a prompt section (`deferred_section`) and a live
+/// activated set (`activated_handle`) that the sub-agent loop must inject and
+/// thread - exactly as a fresh target turn (`Agent::from_config`) does.
+struct IndependentTargetTools {
+    tools: Vec<Box<dyn Tool>>,
+    /// The deferred-MCP + pinned-resources system-prompt section (empty unless
+    /// the target has granted MCP bundles under deferred loading).
+    deferred_section: String,
+    /// Live handle to the deferred-MCP activated set (Some only when a deferred
+    /// `tool_search` tool was registered), threaded into the sub-agent turn loop.
+    activated_handle: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    /// The TARGET agent's workspace dir (`config.agent_workspace_dir(target)`),
+    /// resolved once here so the sub-agent's skill *prompt* content is built from
+    /// the same workspace its skill *tools* were loaded from - matching a fresh
+    /// target turn (`loop_.rs` uses `config.agent_workspace_dir(agent_alias)` for
+    /// both). Without this the prompt would describe the *caller's* skills while
+    /// the tools come from the target's.
+    workspace_dir: PathBuf,
+    /// The TARGET agent's skills, loaded via the canonical per-agent loader
+    /// (`load_skills_for_agent_from_config`, which unions the workspace,
+    /// open-skills, plugin, and `skill_bundles` sources). Threaded into the
+    /// sub-agent prompt so the SkillsSection describes exactly the skill tools
+    /// that were assembled; `build_enriched_system_prompt`'s local bundle resolver
+    /// only sees `skill_bundles`, so without this override the prompt could omit
+    /// skills the delegate can actually call.
+    skills: Vec<crate::skills::Skill>,
 }
 
 impl DelegateTool {
@@ -747,15 +778,18 @@ impl DelegateTool {
     /// Bounded agentic delegation starts from the caller's already-filtered
     /// `parent_tools`. Independent delegation is intentionally different: it is
     /// equivalent to starting a fresh target-agent turn, so the registry comes
-    /// from `all_tools_with_runtime()` using the target risk profile, target
-    /// workspace, target memory, and target provider credentials. The only
-    /// cross-cutting restriction retained here is stripping `delegate` itself,
-    /// because recursive agentic delegation is still not supported.
+    /// from the target risk profile, target workspace, target memory, and target
+    /// provider credentials, assembled through the same `ScopedToolRegistry::assemble`
+    /// seam a real target turn uses - including the target's granted MCP-bundle
+    /// tools and callable skill tools. The only cross-cutting restriction retained
+    /// here is stripping `delegate` itself, because recursive agentic delegation is
+    /// still not supported. Returns the registry plus the deferred-MCP prompt section
+    /// and activated-set handle the caller threads into the sub-agent turn.
     async fn independent_agentic_tools_for_target(
         &self,
         agent_name: &str,
         target_policy: Arc<SecurityPolicy>,
-    ) -> anyhow::Result<Vec<Box<dyn Tool>>> {
+    ) -> anyhow::Result<IndependentTargetTools> {
         let config = self
             .root_config
             .as_ref()
@@ -818,37 +852,64 @@ impl DelegateTool {
             None,
         );
 
-        // Route the independent-target registry through the one gated `assemble`
-        // seam. Tool-set-neutral on this path: assemble's built-in filter runs
-        // against the TARGET's SecurityPolicy (target tools, not the caller's),
-        // caller_allowed is None (no per-run allowlist here), and MCP / peripherals
-        // / skill-tools / memory-strip are all off, exactly what this builder did by
-        // hand. `emit_assembly_logs: true` because this is an execution surface (the
-        // target then runs a turn), so operators get the same "which tools were
-        // admitted / did policy drop tools" audit breadcrumbs the other execution
-        // paths emit. The `delegate` tool is stripped afterward because
-        // `all_tools_with_runtime` unconditionally injects it and an independent
-        // delegate must not be able to recurse into further delegation.
+        // Load the TARGET agent's skills - the same "fresh turn" loader run() and
+        // from_config use (`_from_config` resolves the target's workspace + skill_bundles
+        // from the alias) - so an independent delegate exposes the target's callable skill
+        // tools, not an empty set. Resolve the target workspace explicitly too, so the
+        // caller can build the sub-agent's skill *prompt* from the SAME workspace these
+        // skill *tools* came from (the loader resolves `config.agent_workspace_dir(target)`
+        // internally). NB: this is the target's config workspace, not `target_policy
+        // .workspace_dir` (which policy_for_target rebinds to the caller's cwd when caller
+        // and target share a risk profile) - matching loop_.rs, which uses
+        // `config.agent_workspace_dir(agent_alias)` for both skills and prompt.
+        let target_workspace = config.agent_workspace_dir(agent_name);
+        let skills = crate::skills::load_skills_for_agent_from_config(config, agent_name);
+
+        // Route the independent-target registry through the one gated seam - the same
+        // `assemble` seam run(), process_message, and the gateway use. Independent
+        // delegation is "like opening a fresh chat with the target"
+        // (docs/book/src/agents/delegation.md), so it assembles the TARGET's FULL runtime
+        // registry: assemble step 2 filters with the TARGET's SecurityPolicy (the #8239
+        // invariant - target tools, not the caller's), `connect_mcp: true` connects the
+        // target's granted MCP bundles (omission is not a grant), and the target's skills
+        // register as tools. caller_allowed is None (no per-run allowlist here).
+        // `connect_peripherals` stays FALSE deliberately: a delegate sub-loop must not open
+        // the serial hardware the live daemon holds exclusively. `emit_assembly_logs: true`
+        // because this is an execution surface. The `delegate` tool is stripped afterward
+        // because `all_tools_with_runtime` injects it and an independent delegate must not
+        // recurse into further delegation.
         let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
                 config,
                 agent_alias: agent_name,
                 security: &target_policy,
                 built: all_tools_result,
-                skills: &[],
+                skills: &skills,
                 runtime,
                 caller_allowed: None,
-                connect_mcp: false,
+                connect_mcp: true,
                 connect_peripherals: false,
                 exclude_memory: false,
+                list_deferred_mcp_specs: false,
                 emit_assembly_logs: true,
             },
         )
         .await;
-        let mut tools = assembled.registry.into_inner();
-
+        let crate::tools::scoped::ScopedAssembled {
+            registry,
+            deferred_section,
+            activated_handle,
+            ..
+        } = assembled;
+        let mut tools = registry.into_inner();
         tools.retain(|tool| tool.name() != Self::NAME);
-        Ok(tools)
+        Ok(IndependentTargetTools {
+            tools,
+            deferred_section,
+            activated_handle,
+            workspace_dir: target_workspace,
+            skills,
+        })
     }
 
     /// Resolve `model_provider` ("type.alias") → (provider_type, credential, model, temperature).
@@ -1409,6 +1470,7 @@ impl DelegateTool {
             &[],
             &self.workspace_dir,
             false,
+            None,
         );
         let system_prompt_ref = enriched_system_prompt.as_deref();
 
@@ -2413,6 +2475,44 @@ impl DelegateTool {
         self.cancellation_token.cancel();
     }
 
+    /// Compose an independent sub-agent's system prompt from the base (tools /
+    /// skills / identity) prompt and the target's deferred-MCP section.
+    ///
+    /// This mirrors a fresh target turn: the deferred-tools section is first run
+    /// through the turn engine's `apply_text_tool_prompt_policy`, which *clears*
+    /// it for a non-native, strict-tool-parsing target (such a target cannot use
+    /// the text `tool_search` protocol, so a fresh turn never advertises it). Only
+    /// then is a non-empty section appended. Reusing the shared policy helper keeps
+    /// the delegate path from drifting from the engine. The throwaway tool-descs
+    /// vec is intentionally unused - `build_enriched_system_prompt` already applied
+    /// the policy to the tool descriptions; here we only want its effect on the
+    /// deferred section.
+    fn compose_independent_system_prompt(
+        base: Option<String>,
+        mut deferred_section: String,
+        native_tools: bool,
+        strict_tool_parsing: bool,
+    ) -> Option<String> {
+        let mut ignored_tool_descs: Vec<(&str, &str)> = Vec::new();
+        apply_text_tool_prompt_policy(
+            native_tools,
+            strict_tool_parsing,
+            &mut ignored_tool_descs,
+            &mut deferred_section,
+        );
+        if deferred_section.is_empty() {
+            return base;
+        }
+        match base {
+            Some(mut p) => {
+                p.push_str("\n\n");
+                p.push_str(&deferred_section);
+                Some(p)
+            }
+            None => Some(deferred_section),
+        }
+    }
+
     /// Build an enriched system prompt for a sub-agent by composing structured
     /// operational sections (tools, skills, workspace, datetime, shell policy)
     /// with the per-agent identity files loaded from the target's own
@@ -2427,21 +2527,37 @@ impl DelegateTool {
         sub_tools: &[Box<dyn Tool>],
         workspace_dir: &Path,
         sends_native_tool_specs: bool,
+        skills_override: Option<&[crate::skills::Skill]>,
     ) -> Option<String> {
-        // Resolve skill bundle directories. With one or more configured
-        // bundles, load + concat skills from each. With none, fall back to
-        // the workspace default.
-        let bundle_dirs = self.resolve_skill_bundle_dirs(&agent_config.skill_bundles);
-        let skills: Vec<_> = if bundle_dirs.is_empty() {
-            let default_dir = crate::skills::skills_dir(workspace_dir);
-            crate::skills::load_skills_from_directory(&default_dir, false).0
-        } else {
-            bundle_dirs
-                .into_iter()
-                .flat_map(|dir| {
-                    crate::skills::load_skills_from_directory(&workspace_dir.join(dir), false).0
-                })
-                .collect()
+        // Skills for the prompt. An independent delegate passes the canonical
+        // per-agent skill set (`skills_override`) - the SAME set its skill tools
+        // were assembled from - so the SkillsSection describes exactly the exposed
+        // tools. Bounded delegation (override None) falls back to local bundle
+        // resolution: with configured bundles, load + concat from each; otherwise
+        // the workspace default. (The local resolver only sees `skill_bundles`,
+        // which is why independent delegation overrides it.)
+        let resolved_skills: Vec<crate::skills::Skill>;
+        let skills: &[crate::skills::Skill] = match skills_override {
+            Some(s) => s,
+            None => {
+                let bundle_dirs = self.resolve_skill_bundle_dirs(&agent_config.skill_bundles);
+                resolved_skills = if bundle_dirs.is_empty() {
+                    let default_dir = crate::skills::skills_dir(workspace_dir);
+                    crate::skills::load_skills_from_directory(&default_dir, false).0
+                } else {
+                    bundle_dirs
+                        .into_iter()
+                        .flat_map(|dir| {
+                            crate::skills::load_skills_from_directory(
+                                &workspace_dir.join(dir),
+                                false,
+                            )
+                            .0
+                        })
+                        .collect()
+                };
+                &resolved_skills
+            }
         };
 
         // Determine shell policy instructions when the `shell` tool is in the
@@ -2472,7 +2588,7 @@ impl DelegateTool {
             agent_workspace_dir: workspace_dir,
             model_name,
             tools: prompt_tools,
-            skills: &skills,
+            skills,
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
@@ -2594,13 +2710,34 @@ impl DelegateTool {
             DelegateAdmission::Prevalidated => Arc::clone(&self.security),
         };
         let target_mode = self.mode_for_target(agent_name);
+        // Deferred-MCP side-channels for an INDEPENDENT target: its sub-agent turn must
+        // inject the deferred-tools prompt section and thread the activated set, exactly as
+        // a fresh target turn does. Bounded delegation leaves these empty (it starts from
+        // the parent's already-built registry, not the target's assembled one).
+        let mut sub_deferred_section = String::new();
+        let mut sub_activated: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>> = None;
+        // For an INDEPENDENT target, build the sub-agent's system prompt (skills, identity)
+        // from the TARGET's workspace, not the caller's - so skill *prompt* content matches
+        // the skill *tools* assembled above. `None` for bounded delegation, which keeps the
+        // caller's `self.workspace_dir`.
+        let mut sub_workspace: Option<PathBuf> = None;
+        // The target's canonical skills (Some for independent), so the prompt's SkillsSection
+        // describes exactly the assembled skill tools rather than the local bundle resolver's
+        // narrower view. None for bounded delegation (local resolution).
+        let mut sub_skills: Option<Vec<crate::skills::Skill>> = None;
         let sub_tools: Vec<Box<dyn Tool>> = match target_mode {
             DelegateExecutionMode::Independent => {
                 match self
                     .independent_agentic_tools_for_target(agent_name, Arc::clone(&target_policy))
                     .await
                 {
-                    Ok(tools) => tools,
+                    Ok(independent) => {
+                        sub_deferred_section = independent.deferred_section;
+                        sub_activated = independent.activated_handle;
+                        sub_workspace = Some(independent.workspace_dir);
+                        sub_skills = Some(independent.skills);
+                        independent.tools
+                    }
                     Err(e) => {
                         return Ok(ToolResult {
                             success: false,
@@ -2663,13 +2800,28 @@ impl DelegateTool {
         prompt_agent_config.resolved = loop_runtime.clone();
 
         // Build enriched system prompt with tools, skills, workspace, datetime context.
+        // Independent delegation builds it from the TARGET's workspace (`sub_workspace`), so
+        // the skill prompt content matches the target's skill tools; bounded delegation
+        // keeps the caller's `self.workspace_dir`.
+        let prompt_workspace = sub_workspace.as_deref().unwrap_or(&self.workspace_dir);
         let enriched_system_prompt = self.build_enriched_system_prompt(
             agent_name,
             &prompt_agent_config,
             model,
             &sub_tools,
-            &self.workspace_dir,
+            prompt_workspace,
             model_provider.supports_native_tools(),
+            sub_skills.as_deref(),
+        );
+        // Independent delegates surface the target's deferred MCP tools the way a fresh
+        // target turn does. See `compose_independent_system_prompt`: it applies the turn
+        // engine's text-tool prompt policy to the deferred section (so a non-native strict
+        // target suppresses it, exactly as a fresh turn would) and then appends it.
+        let enriched_system_prompt = Self::compose_independent_system_prompt(
+            enriched_system_prompt,
+            sub_deferred_section,
+            model_provider.supports_native_tools(),
+            loop_runtime.strict_tool_parsing,
         );
 
         let mut history = Vec::new();
@@ -2712,7 +2864,10 @@ impl DelegateTool {
                         approval: None,
                         multimodal_config: &self.multimodal_config,
                         hooks: None,
-                        activated_tools: None,
+                        // Thread the target's deferred-MCP activated set so `tool_search`
+                        // can activate the target's deferred tools mid-turn (Some only for
+                        // an independent target with granted deferred-MCP bundles).
+                        activated_tools: sub_activated.as_ref(),
                         model_switch_callback: None,
                         // delegate subagents don't support approval
                         receipt_generator,
@@ -2746,7 +2901,8 @@ impl DelegateTool {
                 image_cache: None,
                 // Phase 1: stamp Internal/Trusted. Real per-transport
                 // stamping is PR C (RFC #6971 §4).
-                ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                memory: None,
+                ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
                 agent_alias: Some(agent_name),
                 turn_id: &turn_id,
             })
@@ -4837,6 +4993,7 @@ mod tests {
                 &prompt_tools,
                 Path::new("/tmp"),
                 false,
+                None,
             )
             .expect("prompt should render");
         assert!(
@@ -5555,7 +5712,15 @@ mod tests {
             .with_workspace_dir(workspace.clone());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                None,
+            )
             .unwrap();
 
         assert!(prompt.contains("## Tools"), "should contain tools section");
@@ -5626,7 +5791,15 @@ mod tests {
             .with_workspace_dir(workspace.to_path_buf());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                None,
+            )
             .unwrap();
 
         assert!(
@@ -5676,7 +5849,15 @@ mod tests {
             .with_workspace_dir(workspace.to_path_buf());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                None,
+            )
             .unwrap();
 
         assert!(
@@ -5748,7 +5929,15 @@ mod tests {
             .with_workspace_dir(workspace.clone());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                None,
+            )
             .unwrap();
 
         assert!(
@@ -5781,7 +5970,15 @@ mod tests {
             .with_workspace_dir(workspace.clone());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                None,
+            )
             .unwrap();
 
         assert!(
@@ -7499,7 +7696,8 @@ mod tests {
         let tools = tool
             .independent_agentic_tools_for_target("target", target_policy)
             .await
-            .expect("target-owned registry builds");
+            .expect("target-owned registry builds")
+            .tools;
         let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
 
         assert!(
@@ -7513,6 +7711,218 @@ mod tests {
         assert!(
             !tool_names.contains(&"echo_tool"),
             "independent target must not inherit parent-only tools"
+        );
+    }
+
+    /// An independent delegate now receives the TARGET agent's callable SKILL tools,
+    /// not just its built-ins -- matching a fresh target turn. A skill declared in the
+    /// target's workspace surfaces as `{skill}__{tool}`. This fails on the old
+    /// `skills: &[]` wiring (the built-in-only registry).
+    #[tokio::test]
+    async fn independent_delegate_receives_target_skill_tools() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        // A skill with one shell tool, in the TARGET agent's workspace.
+        let target_ws = tmp.path().join("target-workspace");
+        let skill_dir = target_ws.join("skills").join("pdfify");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            r#"[skill]
+name = "pdfify"
+description = "test skill for independent-delegate skill wiring"
+version = "0.1.0"
+
+[[tools]]
+name = "run"
+description = "run pdfify"
+kind = "shell"
+command = "echo hi"
+"#,
+        )
+        .unwrap();
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec!["echo_tool".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["shell".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Independent,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(target_ws.clone()),
+                    ..Default::default()
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(DelegateTestRuntime))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        let target_policy = tool
+            .policy_for_target("target")
+            .expect("independent target policy resolves");
+
+        let independent = tool
+            .independent_agentic_tools_for_target("target", target_policy)
+            .await
+            .expect("target-owned registry builds");
+        let names: Vec<String> = independent
+            .tools
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+
+        // The target skill tool reaches the delegate even though the target's allowed_tools
+        // is ["shell"]: skill tools are granted via skill config (skill_bundles/workspace),
+        // NOT the built-in allowlist, and builtin-kind skill tools are scoped-elevation
+        // wrappers meant to stay callable off the allowlist. Only excluded_tools subtracts a
+        // skill tool (see the seam fix in `register_skill_tools`), so this is correct
+        // documented behavior, not an allowlist bypass.
+        assert!(
+            names.iter().any(|n| n == "pdfify__run"),
+            "independent delegate must expose the target's skill tools (fails with skills:&[]); got {names:?}"
+        );
+        // The #8239 invariants still hold alongside the new skill tools.
+        assert!(
+            names.iter().any(|n| n == "shell"),
+            "target built-in must still be present, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "delegate"),
+            "delegate must still be stripped (no recursion), got {names:?}"
+        );
+        // The returned workspace is the TARGET's config workspace - the caller threads it
+        // into build_enriched_system_prompt so the skill PROMPT content is built from the
+        // same workspace as the skill TOOLS above (not the caller's). Guards against the
+        // tools-from-B / prompt-from-A split.
+        assert_eq!(
+            independent.workspace_dir,
+            config.agent_workspace_dir("target"),
+            "independent delegate prompt must be built from the target's workspace"
+        );
+        assert_eq!(
+            independent.workspace_dir, target_ws,
+            "target workspace must resolve to the configured target-workspace path"
+        );
+    }
+
+    // Finding: an independent delegate to a non-native, strict-tool-parsing target must
+    // suppress the deferred-MCP prompt section exactly as a fresh target turn does
+    // (apply_text_tool_prompt_policy clears it), instead of advertising `tool_search`
+    // stubs the target cannot use. compose_independent_system_prompt centralizes that.
+    #[test]
+    fn independent_prompt_respects_text_tool_policy_for_deferred_section() {
+        let base = || Some("BASE PROMPT".to_string());
+        let deferred = "== DEFERRED MCP: call tool_search ==".to_string();
+
+        // Native provider: deferred section is appended verbatim.
+        let native = DelegateTool::compose_independent_system_prompt(
+            base(),
+            deferred.clone(),
+            true, // native_tools
+            true, // strict_tool_parsing (ignored when native)
+        )
+        .unwrap();
+        assert!(
+            native.contains("BASE PROMPT") && native.contains("DEFERRED MCP"),
+            "native target must keep the deferred section, got: {native:?}"
+        );
+
+        // Non-native but NOT strict: text tool protocol is exposed, deferred kept.
+        let lenient = DelegateTool::compose_independent_system_prompt(
+            base(),
+            deferred.clone(),
+            false, // non-native
+            false, // not strict
+        )
+        .unwrap();
+        assert!(
+            lenient.contains("DEFERRED MCP"),
+            "non-native non-strict target must keep the deferred section, got: {lenient:?}"
+        );
+
+        // Non-native AND strict: the fresh-turn policy CLEARS the deferred section, so the
+        // delegate prompt must be the base only - no tool_search advertisement.
+        let strict = DelegateTool::compose_independent_system_prompt(
+            base(),
+            deferred.clone(),
+            false, // non-native
+            true,  // strict
+        )
+        .unwrap();
+        assert_eq!(
+            strict, "BASE PROMPT",
+            "non-native strict target must NOT get the deferred section, got: {strict:?}"
+        );
+        assert!(
+            !strict.contains("DEFERRED MCP") && !strict.contains("tool_search"),
+            "strict delegate prompt must not advertise deferred MCP, got: {strict:?}"
+        );
+
+        // Empty deferred section is a no-op regardless of policy.
+        assert_eq!(
+            DelegateTool::compose_independent_system_prompt(base(), String::new(), false, false),
+            base()
+        );
+        // No base prompt + non-empty deferred (native) becomes the deferred section alone.
+        assert_eq!(
+            DelegateTool::compose_independent_system_prompt(
+                None,
+                "ONLY DEFERRED".to_string(),
+                true,
+                false
+            ),
+            Some("ONLY DEFERRED".to_string())
         );
     }
 

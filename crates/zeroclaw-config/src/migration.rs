@@ -8,6 +8,22 @@ use crate::schema::v2::V2Config;
 /// The schema version this binary writes and expects on disk.
 pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
+/// Attribution surface for config load/migration emissions. Config loading
+/// runs before any entry-point attribution span exists, so the migration
+/// entry points open their own System-role span; every `record!` inside
+/// then carries `zc_role = system` and the queryable `system_alias = config`
+/// field instead of landing un-attributed.
+pub(crate) struct ConfigLoadAttribution;
+
+impl zeroclaw_api::attribution::Attributable for ConfigLoadAttribution {
+    fn role(&self) -> zeroclaw_api::attribution::Role {
+        zeroclaw_api::attribution::Role::System
+    }
+    fn alias(&self) -> &str {
+        "config"
+    }
+}
+
 /// Top-level TOML keys that legacy schema versions had but V3 either
 /// removed or restructured. Suppresses "unknown key" warnings on V1/V2
 /// configs flowing through `migrate_to_current`: every key here is
@@ -273,6 +289,7 @@ fn encrypt_in_place(value: &mut toml::Value, store: &crate::secrets::SecretStore
 /// Used by repair tooling (`zeroclaw config migrate`, `model_routing_config`)
 /// that needs the precise failure. Daemon load uses the resilient path.
 pub fn migrate_to_current(input: &str) -> Result<Config> {
+    let _attribution = ::zeroclaw_log::attribution_span!(&ConfigLoadAttribution).entered();
     let final_value = migrate_value(input)?;
     final_value
         .try_into()
@@ -684,6 +701,7 @@ fn channel_alias_is_invalid(chan_type: &str, alias_value: &toml::Value) -> bool 
 /// On rename failure the temp file is removed and the backup is restored
 /// over the original so the operator never observes a partial write.
 pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
+    let _attribution = ::zeroclaw_log::attribution_span!(&ConfigLoadAttribution).entered();
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config at {}", path.display().to_string()))?;
     let migrated = match migrate_file(&raw)? {
