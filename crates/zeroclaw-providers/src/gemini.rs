@@ -568,9 +568,11 @@ async fn refresh_gemini_cli_token_async(
 /// Typed builder for [`GeminiModelProvider`].
 ///
 /// Only `alias` is required; every credential input is optional and layered
-/// by the same priority the old `new` / `new_with_auth` split enforced:
-/// explicit API key → managed OAuth (when [`Self::managed_auth`] is set) →
-/// CLI OAuth tokens from `~/.gemini/oauth_creds.json`.
+/// at [`Self::build`] time in this order:
+///   1. Explicit API key from [`Self::api_key`]
+///   2. Managed OAuth via [`Self::managed_auth`] (when wired and the
+///      profile exists)
+///   3. CLI OAuth tokens from `~/.gemini/oauth_creds.json`
 #[must_use]
 pub struct GeminiBuilder {
     alias: String,

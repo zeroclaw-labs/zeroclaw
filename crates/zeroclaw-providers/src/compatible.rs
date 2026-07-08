@@ -219,24 +219,55 @@ fn models_dev_to_model_info(ids: Vec<String>) -> Vec<zeroclaw_api::model_provide
 
 /// Typed builder for [`OpenAiCompatibleModelProvider`].
 ///
-/// The five required fields (`alias`, `name`, `base_url`, `credential`,
-/// `auth_style`) are passed to [`OpenAiCompatibleModelProvider::builder`];
-/// everything else has a sensible default and can be tuned via chainable
-/// methods on the builder or (for post-construction tweaks driven by config)
-/// via the same `with_*` methods on the built provider.
+/// `alias` (the config key this provider was constructed under) is the
+/// only argument passed to [`OpenAiCompatibleModelProvider::builder`].
+/// Every other field — including the semantically-required
+/// `display_name` / `base_url` / `auth_style` — is set via a labelled
+/// chain method so call sites read as prose instead of a comma-counted
+/// tuple. `build()` panics if any of `display_name`, `base_url`, or
+/// `auth_style` were omitted; there are no sensible defaults for those.
 #[must_use]
 pub struct OpenAiCompatibleBuilder {
     alias: String,
-    name: String,
-    base_url: String,
+    name: Option<String>,
+    base_url: Option<String>,
     credential: Option<String>,
-    auth_style: AuthStyle,
+    auth_style: Option<AuthStyle>,
     supports_vision: bool,
     user_agent: Option<String>,
     merge_system_into_user: bool,
 }
 
 impl OpenAiCompatibleBuilder {
+    /// Human-readable display name (e.g. `"Groq"`, `"MiniMax"`). Surfaced
+    /// in logs, `Attributable` output, and the onboarding UI. Required.
+    pub fn display_name(mut self, name: &str) -> Self {
+        self.name = Some(name.to_string());
+        self
+    }
+
+    /// Base URL for the provider's `/chat/completions` endpoint. Trailing
+    /// slashes are stripped so callers need not care whether config
+    /// supplied them. Required.
+    pub fn base_url(mut self, base_url: &str) -> Self {
+        self.base_url = Some(base_url.trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Explicit API credential. `None` (the default) leaves this provider
+    /// unauthenticated, which is how local LLM servers (Ollama,
+    /// llama.cpp) are constructed.
+    pub fn credential(mut self, credential: Option<&str>) -> Self {
+        self.credential = credential.map(ToString::to_string);
+        self
+    }
+
+    /// How this provider expects the API key to be sent. Required.
+    pub fn auth_style(mut self, style: AuthStyle) -> Self {
+        self.auth_style = Some(style);
+        self
+    }
+
     /// Enable OpenAI-style multimodal (image) inputs on this provider.
     pub fn vision(mut self, supports_vision: bool) -> Self {
         self.supports_vision = supports_vision;
@@ -268,16 +299,30 @@ impl OpenAiCompatibleBuilder {
     /// Finalize the builder into a ready provider. Post-construction tweaks
     /// (timeout, max_tokens, extra headers, TLS CA, catalog keys, …) use the
     /// `with_*` methods on the returned [`OpenAiCompatibleModelProvider`].
+    ///
+    /// # Panics
+    /// Panics if [`Self::display_name`], [`Self::base_url`], or
+    /// [`Self::auth_style`] was not called — those three fields carry no
+    /// sensible default and every real call site sets them.
     pub fn build(self) -> OpenAiCompatibleModelProvider {
+        let name = self
+            .name
+            .expect("OpenAiCompatibleBuilder: display_name() is required");
+        let base_url = self
+            .base_url
+            .expect("OpenAiCompatibleBuilder: base_url() is required");
+        let auth_style = self
+            .auth_style
+            .expect("OpenAiCompatibleBuilder: auth_style() is required");
         OpenAiCompatibleModelProvider {
             alias: self.alias,
-            name: self.name,
-            base_url: self.base_url,
+            name,
+            base_url,
             credential: self.credential,
             auth_service: None,
             auth_model_provider: None,
             auth_profile_override: None,
-            auth_header: self.auth_style,
+            auth_header: auth_style,
             supports_vision: self.supports_vision,
             user_agent: self.user_agent,
             native_tool_calling: !self.merge_system_into_user,
@@ -301,24 +346,18 @@ impl OpenAiCompatibleBuilder {
 impl OpenAiCompatibleModelProvider {
     /// Entry point for constructing an OpenAI-compatible provider.
     ///
-    /// The five required fields land here; everything else is either a
-    /// chainable option on the returned [`OpenAiCompatibleBuilder`] or a
-    /// `with_*` method on the built provider (post-construction tweaks
-    /// driven by config live in the latter so callers can chain them
-    /// conditionally on the finished value).
-    pub fn builder(
-        alias: &str,
-        name: &str,
-        base_url: &str,
-        credential: Option<&str>,
-        auth_style: AuthStyle,
-    ) -> OpenAiCompatibleBuilder {
+    /// Only `alias` is taken as a positional argument; every other field
+    /// is set via labelled chain methods on the returned
+    /// [`OpenAiCompatibleBuilder`] so call sites remain readable. See
+    /// [`OpenAiCompatibleBuilder::build`] for the fields that must be
+    /// set before calling `build()`.
+    pub fn builder(alias: &str) -> OpenAiCompatibleBuilder {
         OpenAiCompatibleBuilder {
             alias: alias.to_string(),
-            name: name.to_string(),
-            base_url: base_url.trim_end_matches('/').to_string(),
-            credential: credential.map(ToString::to_string),
-            auth_style,
+            name: None,
+            base_url: None,
+            credential: None,
+            auth_style: None,
             supports_vision: false,
             user_agent: None,
             merge_system_into_user: false,
@@ -404,7 +443,10 @@ impl OpenAiCompatibleModelProvider {
     }
 
     /// Merge all system messages into the first user message before sending.
-    /// Unlike `new_merge_system_into_user`, this preserves native tool calling.
+    /// Unlike [`OpenAiCompatibleBuilder::merge_system_into_user`], this
+    /// preserves native tool calling — use it when the upstream rejects
+    /// `role: system` but still accepts OpenAI-style `tools` payloads
+    /// (e.g. Bedrock's Anthropic pass-through).
     pub fn with_merge_system_into_user(mut self) -> Self {
         self.merge_system_into_user = true;
         self
@@ -3482,7 +3524,12 @@ mod tests {
         url: &str,
         key: Option<&str>,
     ) -> OpenAiCompatibleModelProvider {
-        OpenAiCompatibleModelProvider::builder("test", name, url, key, AuthStyle::Bearer).build()
+        OpenAiCompatibleModelProvider::builder("test")
+            .display_name(name)
+            .base_url(url)
+            .credential(key)
+            .auth_style(AuthStyle::Bearer)
+            .build()
     }
 
     #[test]
@@ -3884,27 +3931,23 @@ mod tests {
 
     #[test]
     fn x_api_key_auth_style() {
-        let p = OpenAiCompatibleModelProvider::builder(
-            "test",
-            "moonshot",
-            "https://api.moonshot.cn",
-            Some("ms-key"),
-            AuthStyle::XApiKey,
-        )
-        .build();
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("moonshot")
+            .base_url("https://api.moonshot.cn")
+            .credential(Some("ms-key"))
+            .auth_style(AuthStyle::XApiKey)
+            .build();
         assert!(matches!(p.auth_header, AuthStyle::XApiKey));
     }
 
     #[test]
     fn custom_auth_style() {
-        let p = OpenAiCompatibleModelProvider::builder(
-            "test",
-            "custom",
-            "https://api.example.com",
-            Some("key"),
-            AuthStyle::Custom("X-Custom-Key".into()),
-        )
-        .build();
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("custom")
+            .base_url("https://api.example.com")
+            .credential(Some("key"))
+            .auth_style(AuthStyle::Custom("X-Custom-Key".into()))
+            .build();
         assert!(matches!(p.auth_header, AuthStyle::Custom(_)));
     }
 
@@ -3972,14 +4015,12 @@ mod tests {
 
     #[test]
     fn zhipu_jwt_auth_style_applies_correctly() {
-        let p = OpenAiCompatibleModelProvider::builder(
-            "test",
-            "Z.AI",
-            "https://api.z.ai/api/coding/paas/v4",
-            Some("testid.testsecret"),
-            AuthStyle::ZhipuJwt,
-        )
-        .build();
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("Z.AI")
+            .base_url("https://api.z.ai/api/coding/paas/v4")
+            .credential(Some("testid.testsecret"))
+            .auth_style(AuthStyle::ZhipuJwt)
+            .build();
         assert!(matches!(p.auth_header, AuthStyle::ZhipuJwt));
     }
 
@@ -4771,15 +4812,13 @@ mod tests {
 
     #[test]
     fn capabilities_reports_vision_for_qwen_compatible_provider() {
-        let p = OpenAiCompatibleModelProvider::builder(
-            "test",
-            "Qwen",
-            "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            Some("k"),
-            AuthStyle::Bearer,
-        )
-        .vision(true)
-        .build();
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("Qwen")
+            .base_url("https://dashscope.aliyuncs.com/compatible-mode/v1")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .vision(true)
+            .build();
         let caps = <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
@@ -4787,15 +4826,13 @@ mod tests {
 
     #[test]
     fn minimax_provider_supports_native_tool_calling_with_system_merge() {
-        let p = OpenAiCompatibleModelProvider::builder(
-            "test",
-            "MiniMax",
-            "https://api.minimax.chat/v1",
-            Some("k"),
-            AuthStyle::Bearer,
-        )
-        .build()
-        .with_merge_system_into_user();
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("MiniMax")
+            .base_url("https://api.minimax.chat/v1")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .build()
+            .with_merge_system_into_user();
         let caps = <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p);
         assert!(
             caps.native_tool_calling,
@@ -4820,15 +4857,13 @@ mod tests {
             ChatMessage::assistant("Here are the results about cats"),
             ChatMessage::user("thanks"),
         ];
-        let p = OpenAiCompatibleModelProvider::builder(
-            "test",
-            "MiniMax",
-            "https://api.minimax.chat/v1",
-            Some("k"),
-            AuthStyle::Bearer,
-        )
-        .merge_system_into_user()
-        .build();
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("MiniMax")
+            .base_url("https://api.minimax.chat/v1")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .merge_system_into_user()
+            .build();
         let stripped = p.strip_native_tool_messages(&messages);
         // tool message dropped; the pre-tool narration and the reply that
         // follows the tool result are now coalesced into a single assistant
@@ -4869,15 +4904,13 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"tc1","content":"ok"}"#),
             ChatMessage::assistant("Done"),
         ];
-        let p = OpenAiCompatibleModelProvider::builder(
-            "test",
-            "MiniMax",
-            "https://api.minimax.chat/v1",
-            Some("k"),
-            AuthStyle::Bearer,
-        )
-        .merge_system_into_user()
-        .build();
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("MiniMax")
+            .base_url("https://api.minimax.chat/v1")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .merge_system_into_user()
+            .build();
         let stripped = p.strip_native_tool_messages(&messages);
         // assistant with empty content + tool_calls → dropped; tool → dropped
         assert_eq!(stripped.len(), 3);
@@ -4895,15 +4928,13 @@ mod tests {
             ChatMessage::assistant("hi there"),
             ChatMessage::user("bye"),
         ];
-        let p = OpenAiCompatibleModelProvider::builder(
-            "test",
-            "MiniMax",
-            "https://api.minimax.chat/v1",
-            Some("k"),
-            AuthStyle::Bearer,
-        )
-        .merge_system_into_user()
-        .build();
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("MiniMax")
+            .base_url("https://api.minimax.chat/v1")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .merge_system_into_user()
+            .build();
         let stripped = p.strip_native_tool_messages(&messages);
         assert_eq!(stripped.len(), 4);
         for (orig, result) in messages.iter().zip(stripped.iter()) {
@@ -4928,14 +4959,12 @@ mod tests {
             ),
             ChatMessage::assistant("Here are the results about cats"),
         ];
-        let p = OpenAiCompatibleModelProvider::builder(
-            "test",
-            "NativeToolProvider",
-            "https://api.example.com/v1",
-            Some("k"),
-            AuthStyle::Bearer,
-        )
-        .build();
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("NativeToolProvider")
+            .base_url("https://api.example.com/v1")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .build();
         assert!(
             <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p).native_tool_calling,
             "model_provider must have native_tool_calling enabled for this test"
@@ -4950,15 +4979,13 @@ mod tests {
 
     #[test]
     fn user_agent_constructor_keeps_native_tool_calling_enabled() {
-        let p = OpenAiCompatibleModelProvider::builder(
-            "test",
-            "TestProvider",
-            "https://example.com",
-            Some("k"),
-            AuthStyle::Bearer,
-        )
-        .user_agent("zeroclaw-test/1.0")
-        .build();
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("TestProvider")
+            .base_url("https://example.com")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .user_agent("zeroclaw-test/1.0")
+            .build();
         let caps = <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(!caps.vision);
@@ -4967,16 +4994,14 @@ mod tests {
 
     #[test]
     fn user_agent_and_vision_constructor_preserves_capability_flags() {
-        let p = OpenAiCompatibleModelProvider::builder(
-            "test",
-            "VisionModelProvider",
-            "https://example.com",
-            Some("k"),
-            AuthStyle::Bearer,
-        )
-        .user_agent("zeroclaw-test/vision")
-        .vision(true)
-        .build();
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("VisionModelProvider")
+            .base_url("https://example.com")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .user_agent("zeroclaw-test/vision")
+            .vision(true)
+            .build();
         let caps = <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
@@ -6269,16 +6294,14 @@ mod tests {
     fn extra_headers_combined_with_user_agent() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Title".to_string(), "zeroclaw".to_string());
-        let p = OpenAiCompatibleModelProvider::builder(
-            "test",
-            "test",
-            "https://example.com",
-            None,
-            AuthStyle::Bearer,
-        )
-        .user_agent("CustomAgent/1.0")
-        .build()
-        .with_extra_headers(headers);
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .user_agent("CustomAgent/1.0")
+            .build()
+            .with_extra_headers(headers);
         assert_eq!(p.user_agent.as_deref(), Some("CustomAgent/1.0"));
         assert_eq!(p.extra_headers.len(), 1);
         // Should not panic
@@ -6425,15 +6448,13 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"t1","content":"Found 10 results"}"#),
             ChatMessage::assistant("Here are the results about cats"),
         ];
-        let p = OpenAiCompatibleModelProvider::builder(
-            "test",
-            "MiniMax",
-            "https://api.minimax.chat/v1",
-            Some("k"),
-            AuthStyle::Bearer,
-        )
-        .merge_system_into_user()
-        .build();
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("MiniMax")
+            .base_url("https://api.minimax.chat/v1")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .merge_system_into_user()
+            .build();
         let stripped = p.strip_native_tool_messages(&messages);
         let roles: Vec<&str> = stripped.iter().map(|m| m.role.as_str()).collect();
         assert!(
@@ -6471,15 +6492,13 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"t1","content":"cargo output"}"#),
             ChatMessage::user("go on"),
         ];
-        let p = OpenAiCompatibleModelProvider::builder(
-            "test",
-            "Anthropic-compatible",
-            "https://example.test/v1",
-            Some("k"),
-            AuthStyle::Bearer,
-        )
-        .merge_system_into_user()
-        .build();
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("Anthropic-compatible")
+            .base_url("https://example.test/v1")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .merge_system_into_user()
+            .build();
         let stripped = p.strip_native_tool_messages(&messages);
         let roles: Vec<&str> = stripped.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles, vec!["user"]);
@@ -6505,15 +6524,13 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"t1","content":"cargo output"}"#),
             ChatMessage::user("go on"),
         ];
-        let p = OpenAiCompatibleModelProvider::builder(
-            "test",
-            "Anthropic-compatible",
-            "https://example.test/v1",
-            Some("k"),
-            AuthStyle::Bearer,
-        )
-        .merge_system_into_user()
-        .build();
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("Anthropic-compatible")
+            .base_url("https://example.test/v1")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .merge_system_into_user()
+            .build();
         let stripped = p.strip_native_tool_messages(&messages);
         let roles: Vec<&str> = stripped.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles, vec!["user"]);
@@ -6534,15 +6551,13 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"t1","content":"Found"}"#),
             ChatMessage::assistant("Here are the results"),
         ];
-        let p = OpenAiCompatibleModelProvider::builder(
-            "test",
-            "MiniMax",
-            "https://api.minimax.chat/v1",
-            Some("k"),
-            AuthStyle::Bearer,
-        )
-        .merge_system_into_user()
-        .build();
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("MiniMax")
+            .base_url("https://api.minimax.chat/v1")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .merge_system_into_user()
+            .build();
         let stripped = p.strip_native_tool_messages(&messages);
         assert_eq!(
             stripped.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
@@ -6595,14 +6610,12 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let provider = OpenAiCompatibleModelProvider::builder(
-            "test",
-            "test",
-            &format!("http://{addr}"),
-            Some("k"),
-            AuthStyle::Bearer,
-        )
-        .build();
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .build();
 
         let mut stream = provider.stream_chat(
             crate::traits::ChatRequest {

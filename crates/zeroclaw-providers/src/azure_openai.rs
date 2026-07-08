@@ -188,21 +188,36 @@ impl NativeResponseMessage {
 
 /// Typed builder for [`AzureOpenAiModelProvider`].
 ///
-/// The three required identifiers (alias, resource name, deployment
-/// name) go through [`AzureOpenAiModelProvider::builder`]; the credential,
-/// API version override, and reasoning effort are all chainable options
-/// with sensible defaults.
+/// `alias` is the only positional argument. `resource_name` and
+/// `deployment_name` — the two halves of Azure's deployment URL — are
+/// set via labelled chain methods and are both required at
+/// [`Self::build`] time. Credential, API-version override, and
+/// reasoning effort have sensible defaults.
 #[must_use]
 pub struct AzureOpenAiBuilder {
     alias: String,
-    resource_name: String,
-    deployment_name: String,
+    resource_name: Option<String>,
+    deployment_name: Option<String>,
     credential: Option<String>,
     api_version: Option<String>,
     reasoning_effort: Option<String>,
 }
 
 impl AzureOpenAiBuilder {
+    /// The `<resource>` half of Azure's deployment URL
+    /// `https://<resource>.openai.azure.com/…`. Required.
+    pub fn resource_name(mut self, resource: &str) -> Self {
+        self.resource_name = Some(resource.to_string());
+        self
+    }
+
+    /// The `<deployment>` half of Azure's deployment URL
+    /// `…/openai/deployments/<deployment>`. Required.
+    pub fn deployment_name(mut self, deployment: &str) -> Self {
+        self.deployment_name = Some(deployment.to_string());
+        self
+    }
+
     /// Explicit API key. Empty / whitespace-only values are treated as
     /// "no credential" (matching the trimming behaviour of the original
     /// positional constructor).
@@ -227,19 +242,29 @@ impl AzureOpenAiBuilder {
         self
     }
 
+    /// # Panics
+    /// Panics if [`Self::resource_name`] or [`Self::deployment_name`]
+    /// was not called — Azure needs both to construct the deployment
+    /// URL and there is no sensible default for either.
     pub fn build(self) -> AzureOpenAiModelProvider {
+        let resource_name = self
+            .resource_name
+            .expect("AzureOpenAiBuilder: resource_name() is required");
+        let deployment_name = self
+            .deployment_name
+            .expect("AzureOpenAiBuilder: deployment_name() is required");
         let version = self
             .api_version
             .unwrap_or_else(|| DEFAULT_API_VERSION.to_string());
         let base_url = format!(
             "https://{}.openai.azure.com/openai/deployments/{}",
-            self.resource_name, self.deployment_name
+            resource_name, deployment_name
         );
         AzureOpenAiModelProvider {
             alias: self.alias,
             credential: self.credential,
-            resource_name: self.resource_name,
-            deployment_name: self.deployment_name,
+            resource_name,
+            deployment_name,
             api_version: version,
             base_url,
             reasoning_effort: self.reasoning_effort,
@@ -248,18 +273,14 @@ impl AzureOpenAiBuilder {
 }
 
 impl AzureOpenAiModelProvider {
-    /// Entry point. Only the three deployment identifiers are required;
-    /// tune credential / api-version / reasoning via
-    /// [`AzureOpenAiBuilder`] chain methods.
-    pub fn builder(
-        alias: &str,
-        resource_name: &str,
-        deployment_name: &str,
-    ) -> AzureOpenAiBuilder {
+    /// Entry point. Only `alias` is taken positionally; every other
+    /// field (including the two required deployment identifiers) is set
+    /// via a labelled chain method on the returned [`AzureOpenAiBuilder`].
+    pub fn builder(alias: &str) -> AzureOpenAiBuilder {
         AzureOpenAiBuilder {
             alias: alias.to_string(),
-            resource_name: resource_name.to_string(),
-            deployment_name: deployment_name.to_string(),
+            resource_name: None,
+            deployment_name: None,
             credential: None,
             api_version: None,
             reasoning_effort: None,
@@ -695,7 +716,9 @@ mod tests {
 
     #[test]
     fn url_construction_default_version() {
-        let p = AzureOpenAiModelProvider::builder("test", "my-resource", "gpt-4o")
+        let p = AzureOpenAiModelProvider::builder("test")
+            .resource_name("my-resource")
+            .deployment_name("gpt-4o")
             .credential(Some("test-key"))
             .build();
         assert_eq!(
@@ -706,7 +729,9 @@ mod tests {
 
     #[test]
     fn url_construction_custom_version() {
-        let p = AzureOpenAiModelProvider::builder("test", "my-resource", "gpt-4o")
+        let p = AzureOpenAiModelProvider::builder("test")
+            .resource_name("my-resource")
+            .deployment_name("gpt-4o")
             .credential(Some("test-key"))
             .api_version(Some("2024-06-01"))
             .build();
@@ -718,7 +743,9 @@ mod tests {
 
     #[test]
     fn url_construction_preserves_resource_and_deployment() {
-        let p = AzureOpenAiModelProvider::builder("test", "contoso-ai", "my-gpt35-deployment")
+        let p = AzureOpenAiModelProvider::builder("test")
+            .resource_name("contoso-ai")
+            .deployment_name("my-gpt35-deployment")
             .credential(Some("key"))
             .build();
         let url = p.chat_completions_url();
@@ -732,7 +759,9 @@ mod tests {
         // This test verifies the model_provider stores the credential correctly
         // and that the auth header name is "api-key" (verified via the
         // implementation in chat_with_system which uses .header("api-key", ...)).
-        let p = AzureOpenAiModelProvider::builder("test", "resource", "deployment")
+        let p = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment")
             .credential(Some("my-azure-key"))
             .build();
         assert_eq!(p.credential.as_deref(), Some("my-azure-key"));
@@ -740,7 +769,9 @@ mod tests {
 
     #[test]
     fn creates_with_credential() {
-        let p = AzureOpenAiModelProvider::builder("test", "resource", "deployment")
+        let p = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment")
             .credential(Some("azure-test-credential"))
             .build();
         assert_eq!(p.credential.as_deref(), Some("azure-test-credential"));
@@ -751,13 +782,17 @@ mod tests {
 
     #[test]
     fn creates_without_credential() {
-        let p = AzureOpenAiModelProvider::builder("test", "resource", "deployment").build();
+        let p = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment").build();
         assert!(p.credential.is_none());
     }
 
     #[test]
     fn blank_credential_is_treated_as_missing() {
-        let p = AzureOpenAiModelProvider::builder("test", "resource", "deployment")
+        let p = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment")
             .credential(Some("   \t  "))
             .build();
         assert!(p.credential.is_none());
@@ -765,7 +800,9 @@ mod tests {
 
     #[test]
     fn credential_is_trimmed_before_storage() {
-        let p = AzureOpenAiModelProvider::builder("test", "resource", "deployment")
+        let p = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment")
             .credential(Some("  azure-test-credential \n"))
             .build();
         assert_eq!(p.credential.as_deref(), Some("azure-test-credential"));
@@ -773,7 +810,9 @@ mod tests {
 
     #[tokio::test]
     async fn chat_fails_without_key() {
-        let p = AzureOpenAiModelProvider::builder("test", "resource", "deployment").build();
+        let p = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment").build();
         let result = p.chat_with_system(None, "hello", "gpt-4o", Some(0.7)).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key not set"));
@@ -781,7 +820,9 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_system_fails_without_key() {
-        let p = AzureOpenAiModelProvider::builder("test", "resource", "deployment").build();
+        let p = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment").build();
         let result = p
             .chat_with_system(Some("You are ZeroClaw"), "test", "gpt-4o", Some(0.5))
             .await;
@@ -888,7 +929,9 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_tools_fails_without_key() {
-        let p = AzureOpenAiModelProvider::builder("test", "resource", "deployment").build();
+        let p = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment").build();
         let messages = vec![ChatMessage::user("hello".to_string())];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -925,7 +968,9 @@ mod tests {
 
     #[test]
     fn capabilities_reports_native_tools_and_vision() {
-        let p = AzureOpenAiModelProvider::builder("test", "resource", "deployment")
+        let p = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment")
             .credential(Some("key"))
             .build();
         let caps = <AzureOpenAiModelProvider as ModelProvider>::capabilities(&p);
@@ -935,7 +980,9 @@ mod tests {
 
     #[test]
     fn supports_native_tools_returns_true() {
-        let p = AzureOpenAiModelProvider::builder("test", "resource", "deployment")
+        let p = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment")
             .credential(Some("key"))
             .build();
         assert!(p.supports_native_tools());
@@ -943,7 +990,9 @@ mod tests {
 
     #[test]
     fn supports_vision_returns_true() {
-        let p = AzureOpenAiModelProvider::builder("test", "resource", "deployment")
+        let p = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment")
             .credential(Some("key"))
             .build();
         assert!(p.supports_vision());
@@ -951,14 +1000,18 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_is_noop() {
-        let p = AzureOpenAiModelProvider::builder("test", "resource", "deployment").build();
+        let p = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment").build();
         let result = p.warmup().await;
         assert!(result.is_ok());
     }
 
     #[test]
     fn custom_api_version_stored() {
-        let p = AzureOpenAiModelProvider::builder("test", "resource", "deployment")
+        let p = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment")
             .credential(Some("key"))
             .api_version(Some("2025-01-01"))
             .build();
