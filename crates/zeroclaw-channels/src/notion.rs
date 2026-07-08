@@ -482,6 +482,8 @@ impl Channel for NotionChannel {
                                 interruption_scope_id: None,
                                 attachments: vec![],
                                 subject: None,
+
+                                ..Default::default()
                             })
                             .await
                             .is_err()

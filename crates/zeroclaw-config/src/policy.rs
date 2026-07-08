@@ -183,7 +183,7 @@ impl Default for PerSenderTracker {
 ///   `AccessMode::Read` grants.
 /// - `allowed_roots_write_only`: write but NOT read. Populated from
 ///   `AccessMode::Write` grants. The bot can append/overwrite under
-///   the path but `file_read` / `pdf_read` / `glob_search` /
+///   the path but `file_read` / `glob_search` /
 ///   `content_search` reject it.
 ///
 /// Read-side tools call [`SecurityPolicy::is_resolved_path_readable`],
@@ -203,6 +203,13 @@ pub struct SecurityPolicy {
     /// Whether and to which agents this profile may delegate.
     pub delegation_policy: crate::autonomy::DelegationPolicy,
     pub workspace_dir: PathBuf,
+    /// Absolute path to the active `config.toml`. Used to protect the
+    /// runtime config from agent self-modification regardless of how
+    /// deeply the per-agent workspace is nested under the install root
+    /// (the config lives at the install root, not at
+    /// `workspace_dir.parent()`). `None` falls back to the legacy
+    /// `workspace_dir.parent()` location.
+    pub config_path: Option<PathBuf>,
     pub workspace_only: bool,
     pub allowed_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
@@ -219,8 +226,8 @@ pub struct SecurityPolicy {
     /// Directories the agent can write but NOT read under. Populated
     /// from cross-agent `AccessMode::Write` grants at policy
     /// construction time. Empty when no write-only cross-agent access
-    /// is configured. Read-side tools (`file_read`, `pdf_read`,
-    /// `glob_search`, `content_search`) ignore this list; write-side
+    /// is configured. Read-side tools (`file_read`, `glob_search`,
+    /// `content_search`) ignore this list; write-side
     /// tools (`file_write`, `file_edit`, `git_operations`) honor it.
     pub allowed_roots_write_only: Vec<PathBuf>,
     pub max_actions_per_hour: u32,
@@ -229,7 +236,6 @@ pub struct SecurityPolicy {
     pub block_high_risk_commands: bool,
     pub shell_env_passthrough: Vec<String>,
     pub shell_timeout_secs: u64,
-    pub shell_max_memory_mb: u64,
     /// Tool name allowlist. `None` is unrestricted (default for agents
     /// without an explicit `risk_profile.allowed_tools` setting).
     /// `Some(vec![])` denies every tool. `Some(list)` admits only the
@@ -464,8 +470,6 @@ pub enum EscalationViolation {
     /// ceiling. The shell budget is a runaway-process guard; raising
     /// it on the child side defeats the parent's intent.
     ShellTimeoutExceeded { child: u64, parent: u64 },
-    /// Child override raises or disables the parent's shell memory ceiling.
-    ShellMemoryLimitExceeded { child: u64, parent: u64 },
     /// Child flips `block_high_risk_commands` from `true` (parent) to
     /// `false`, opening the high-risk command surface the parent
     /// closed.
@@ -522,10 +526,6 @@ impl std::fmt::Display for EscalationViolation {
                 f,
                 "subagent shell_timeout_secs={child} exceeds parent's {parent}"
             ),
-            Self::ShellMemoryLimitExceeded { child, parent } => write!(
-                f,
-                "subagent shell_max_memory_mb={child} exceeds parent's {parent}"
-            ),
             Self::BlockHighRiskCommandsDisabledByChild => write!(
                 f,
                 "subagent attempts to set block_high_risk_commands=false but the parent enforces it"
@@ -547,6 +547,7 @@ impl Default for SecurityPolicy {
             risk_profile_name: String::new(),
             delegation_policy: crate::autonomy::DelegationPolicy::default(),
             workspace_dir: PathBuf::from("."),
+            config_path: None,
             workspace_only: true,
             allowed_commands: default_allowed_commands(),
             forbidden_paths: default_forbidden_paths(),
@@ -559,7 +560,6 @@ impl Default for SecurityPolicy {
             block_high_risk_commands: true,
             shell_env_passthrough: vec![],
             shell_timeout_secs: 60,
-            shell_max_memory_mb: 512,
             allowed_tools: None,
             excluded_tools: None,
             auto_approve: vec![],
@@ -1925,7 +1925,7 @@ impl SecurityPolicy {
 
     /// Validate that a resolved path is readable by the current
     /// security policy. Used by read-side tools (`file_read`,
-    /// `pdf_read`, `glob_search`, `content_search`) that should honor
+    /// `glob_search`, `content_search`) that should honor
     /// the read-write `allowed_roots` AND the read-only
     /// `allowed_roots_read_only` lists, plus the universal POSIX
     /// device files (`/dev/null`, `/dev/zero`, `/dev/random`,
@@ -2058,33 +2058,44 @@ impl SecurityPolicy {
         false
     }
 
-    fn runtime_config_dir(&self) -> Option<PathBuf> {
-        let parent = self.workspace_dir.parent()?;
-        Some(
-            parent
-                .canonicalize()
-                .unwrap_or_else(|_| parent.to_path_buf()),
-        )
+    /// Directories whose `config.toml`-family files are protected from
+    /// agent self-modification. Includes the real config directory (the
+    /// parent of `config_path`, i.e. the install root) and, for
+    /// backward compatibility with the legacy flat layout, the parent of
+    /// `workspace_dir`. The two differ once per-agent workspaces nest
+    /// under `<install>/agents/<alias>/workspace/`: the config lives at
+    /// the install root, which is no longer `workspace_dir.parent()`.
+    fn runtime_config_dirs(&self) -> Vec<PathBuf> {
+        let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(parent) = self.config_path.as_deref().and_then(Path::parent) {
+            dirs.push(canon(parent));
+        }
+        if let Some(parent) = self.workspace_dir.parent() {
+            let dir = canon(parent);
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+        dirs
     }
 
     pub fn is_runtime_config_path(&self, resolved: &Path) -> bool {
-        let Some(config_dir) = self.runtime_config_dir() else {
-            return false;
-        };
-        if !resolved.starts_with(&config_dir) {
-            return false;
-        }
-        if resolved.parent() != Some(config_dir.as_path()) {
-            return false;
-        }
-
         let Some(file_name) = resolved.file_name().and_then(|value| value.to_str()) else {
             return false;
         };
-
-        file_name == "config.toml"
+        let is_config_name = file_name == "config.toml"
             || file_name == "config.toml.bak"
-            || file_name.starts_with(".config.toml.tmp-")
+            || file_name.starts_with(".config.toml.tmp-");
+        if !is_config_name {
+            return false;
+        }
+        let Some(parent) = resolved.parent() else {
+            return false;
+        };
+        self.runtime_config_dirs()
+            .iter()
+            .any(|dir| parent == dir.as_path())
     }
 
     pub fn runtime_config_violation_message(&self, resolved: &Path) -> String {
@@ -2228,7 +2239,7 @@ impl SecurityPolicy {
     /// Check whether the given raw path falls under
     /// `allowed_roots` (rw), `allowed_roots_read_only`, OR
     /// `allowed_roots_write_only`. Read-side tools (`file_read`,
-    /// `pdf_read`, `glob_search`, `content_search`) call
+    /// `glob_search`, `content_search`) call
     /// [`Self::is_resolved_path_readable`] for the resolved-path form,
     /// which intentionally excludes the write-only tier. This raw-path
     /// helper is the union of all three, used where read+write tools
@@ -2357,16 +2368,6 @@ impl SecurityPolicy {
                 parent: parent.shell_timeout_secs,
             });
         }
-        let child_disables_parent_limit =
-            parent.shell_max_memory_mb > 0 && self.shell_max_memory_mb == 0;
-        let child_raises_parent_limit =
-            parent.shell_max_memory_mb > 0 && self.shell_max_memory_mb > parent.shell_max_memory_mb;
-        if child_disables_parent_limit || child_raises_parent_limit {
-            return Err(EscalationViolation::ShellMemoryLimitExceeded {
-                child: self.shell_max_memory_mb,
-                parent: parent.shell_max_memory_mb,
-            });
-        }
         if parent.block_high_risk_commands && !self.block_high_risk_commands {
             return Err(EscalationViolation::BlockHighRiskCommandsDisabledByChild);
         }
@@ -2378,9 +2379,10 @@ impl SecurityPolicy {
     }
 
     /// Legacy entry point: build a `SecurityPolicy` from a risk profile
-    /// without a configured runtime profile. Budget caps use
-    /// `RuntimeProfileConfig::default()` so legacy call sites still get the
-    /// default runtime guardrails.
+    /// without a runtime profile. Budget caps default to zero (interpreted
+    /// as "no enforcement"). Tests and pre-multi-agent callsites use this;
+    /// production code should call `from_profiles` or `for_agent` so the
+    /// runtime profile's budget caps actually take effect.
     pub fn from_risk_profile(
         risk_profile: &crate::schema::RiskProfileConfig,
         workspace_dir: &Path,
@@ -2392,10 +2394,9 @@ impl SecurityPolicy {
     ///
     /// Authorization fields (autonomy level, allowlists, sandbox) come from
     /// the risk profile. Budget caps (`max_actions_per_hour`,
-    /// `max_cost_per_day_cents`, `shell_timeout_secs`,
-    /// `shell_max_memory_mb`) come from the runtime profile but are enforced
-    /// with parent-subset discipline on SubAgent spawn (see
-    /// `ensure_no_escalation_beyond`).
+    /// `max_cost_per_day_cents`, `shell_timeout_secs`) come from the
+    /// runtime profile but are enforced with parent-subset discipline on
+    /// SubAgent spawn (see `ensure_no_escalation_beyond`).
     pub fn from_profiles(
         risk_profile: &crate::schema::RiskProfileConfig,
         runtime_profile: Option<&crate::schema::RuntimeProfileConfig>,
@@ -2419,6 +2420,9 @@ impl SecurityPolicy {
             risk_profile_name: String::new(),
             delegation_policy: risk_profile.delegation_policy.clone(),
             workspace_dir: workspace_dir.to_path_buf(),
+            // Set by `for_agent` once the install root is known; the
+            // profile-only constructor has no config path.
+            config_path: None,
             workspace_only: effective_workspace_only,
             allowed_commands: risk_profile.allowed_commands.clone(),
             forbidden_paths: risk_profile.forbidden_paths.clone(),
@@ -2452,7 +2456,6 @@ impl SecurityPolicy {
             block_high_risk_commands: risk_profile.block_high_risk_commands,
             shell_env_passthrough: risk_profile.shell_env_passthrough.clone(),
             shell_timeout_secs: runtime.shell_timeout_secs,
-            shell_max_memory_mb: runtime.shell_max_memory_mb,
             allowed_tools: if risk_profile.allowed_tools.is_empty() {
                 None
             } else {
@@ -2476,8 +2479,9 @@ impl SecurityPolicy {
     /// a `SecurityPolicy`. Bails when the agent isn't configured or when its
     /// `risk_profile` field doesn't name a configured profile — there is no
     /// global fallback, every security context is per-agent. Missing
-    /// `runtime_profile` falls back to `RuntimeProfileConfig::default()`,
-    /// matching the default runtime guardrails used by `from_profiles`.
+    /// `runtime_profile` falls back to zero budgets (treated as "inherit /
+    /// no enforcement"), matching the previous default when the budget
+    /// fields lived on the risk profile.
     pub fn for_agent(config: &crate::schema::Config, agent_alias: &str) -> anyhow::Result<Self> {
         let risk_profile = config.risk_profile_for_agent(agent_alias).ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -2510,6 +2514,12 @@ impl SecurityPolicy {
         if let Some(agent_cfg) = config.agents.get(agent_alias) {
             policy.risk_profile_name = agent_cfg.risk_profile.trim().to_string();
         }
+        // Protect the active runtime config from agent self-modification.
+        // The per-agent workspace nests several levels under the install
+        // root, so `workspace_dir.parent()` alone no longer points at the
+        // directory holding `config.toml`. Record the real config path so
+        // `is_runtime_config_path` guards it directly.
+        policy.config_path = Some(config.config_path.clone());
 
         // Shared skills directory: every agent reads from
         // `<install>/shared/skills/` so the `read_skills` tool resolves
@@ -2835,6 +2845,7 @@ mod tests {
             always_ask: vec!["shell".into()],
             allowed_roots: vec!["/tmp/extra".into()],
             delegation_policy: crate::autonomy::DelegationPolicy::default(),
+            approval_route: None,
             allowed_tools: vec!["shell".into(), "memory_recall".into()],
             excluded_tools: vec!["spawn_subagent".into()],
             sandbox_enabled: Some(true),
@@ -2949,7 +2960,6 @@ mod tests {
             max_actions_per_hour: 99,
             max_cost_per_day_cents: 1234,
             shell_timeout_secs: 300,
-            shell_max_memory_mb: 256,
             ..RuntimeProfileConfig::default()
         };
 
@@ -2958,7 +2968,6 @@ mod tests {
         assert_eq!(policy.max_actions_per_hour, 99);
         assert_eq!(policy.max_cost_per_day_cents, 1234);
         assert_eq!(policy.shell_timeout_secs, 300);
-        assert_eq!(policy.shell_max_memory_mb, 256);
     }
 
     #[test]
@@ -2975,7 +2984,6 @@ mod tests {
         assert_eq!(policy.max_actions_per_hour, 20);
         assert_eq!(policy.max_cost_per_day_cents, 500);
         assert_eq!(policy.shell_timeout_secs, 60);
-        assert_eq!(policy.shell_max_memory_mb, 512);
     }
 
     fn unix_forbidden_path_policy() -> SecurityPolicy {
@@ -5390,59 +5398,6 @@ mod tests {
     }
 
     #[test]
-    fn ensure_no_escalation_rejects_higher_shell_memory_limit() {
-        let parent = SecurityPolicy {
-            shell_max_memory_mb: 256,
-            ..parent_policy_for_escalation_tests()
-        };
-        let child = SecurityPolicy {
-            shell_max_memory_mb: 512,
-            ..parent.clone()
-        };
-        let err = child
-            .ensure_no_escalation_beyond(&parent)
-            .expect_err("higher shell_max_memory_mb must be rejected");
-        assert!(matches!(
-            err,
-            EscalationViolation::ShellMemoryLimitExceeded { child, parent }
-            if child == 512 && parent == 256
-        ));
-    }
-
-    #[test]
-    fn ensure_no_escalation_rejects_disabled_shell_memory_limit_under_finite_parent() {
-        let parent = SecurityPolicy {
-            shell_max_memory_mb: 256,
-            ..parent_policy_for_escalation_tests()
-        };
-        let child = SecurityPolicy {
-            shell_max_memory_mb: 0,
-            ..parent.clone()
-        };
-        let err = child
-            .ensure_no_escalation_beyond(&parent)
-            .expect_err("disabled shell_max_memory_mb must be rejected under finite parent");
-        assert!(matches!(
-            err,
-            EscalationViolation::ShellMemoryLimitExceeded { child, parent }
-            if child == 0 && parent == 256
-        ));
-    }
-
-    #[test]
-    fn ensure_no_escalation_accepts_shell_memory_limit_when_parent_is_unlimited() {
-        let parent = SecurityPolicy {
-            shell_max_memory_mb: 0,
-            ..parent_policy_for_escalation_tests()
-        };
-        let child = SecurityPolicy {
-            shell_max_memory_mb: 512,
-            ..parent.clone()
-        };
-        assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
-    }
-
-    #[test]
     fn ensure_no_escalation_rejects_disabled_block_high_risk_commands() {
         let parent = SecurityPolicy {
             block_high_risk_commands: true,
@@ -5523,6 +5478,46 @@ mod tests {
 
         assert!(!policy.is_runtime_config_path(&workspace.join("notes.txt")));
         assert!(!policy.is_runtime_config_path(&nested_dir.join("config.toml")));
+    }
+
+    #[test]
+    fn is_runtime_config_path_protects_install_root_for_nested_agent_layout() {
+        // Real per-agent layout: `<install>/agents/<alias>/workspace`, with
+        // the active config.toml at the install root, two levels above
+        // `workspace_dir.parent()`. Regression guard: the old check only
+        // looked at `workspace_dir.parent()`, leaving the install-root
+        // config.toml unprotected for nested agent workspaces.
+        let install_root = PathBuf::from("/tmp/zeroclaw-install-nested");
+        let workspace = install_root
+            .join("agents")
+            .join("agent-alpha")
+            .join("workspace");
+        let config_path = install_root.join("config.toml");
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            config_path: Some(config_path.clone()),
+            ..SecurityPolicy::default()
+        };
+
+        // The real config at the install root is now protected.
+        assert!(policy.is_runtime_config_path(&config_path));
+        assert!(policy.is_runtime_config_path(&install_root.join("config.toml.bak")));
+        assert!(policy.is_runtime_config_path(&install_root.join(".config.toml.tmp-42")));
+
+        // Legacy fallback (config_path = None) only guards
+        // `workspace.parent()`, so it misses the nested install-root
+        // config. This is exactly the gap the config_path field closes.
+        let legacy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        assert!(!legacy.is_runtime_config_path(&config_path));
+
+        // A config.toml inside the agent workspace is still not a runtime
+        // config path under either policy.
+        assert!(!policy.is_runtime_config_path(&workspace.join("config.toml")));
+        assert!(!legacy.is_runtime_config_path(&workspace.join("config.toml")));
     }
 
     // ── prompt_summary ──────────────────────────────────────

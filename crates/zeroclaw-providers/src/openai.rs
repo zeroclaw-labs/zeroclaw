@@ -304,10 +304,7 @@ impl OpenAiModelProvider {
                             },
                         })
                         .collect::<Vec<_>>();
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
+                    let content = crate::request_payload::non_empty_string_field(&value, "content");
                     let reasoning_content = value
                         .get("reasoning_content")
                         .and_then(serde_json::Value::as_str)
@@ -489,7 +486,15 @@ impl ModelProvider for OpenAiModelProvider {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
             temperature: adjusted_temperature,
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            // Omit tool_choice when the tool list is empty — vLLM 0.19+ and
+            // spec-compliant validators reject tool_choice without a non-empty
+            // tools field (HTTP 400). `Self::convert_tools` is a plain
+            // `tools.map(...)`, so an empty input slice yields `Some(vec![])`
+            // (not `None`) — guard on `tools` being `Some` *and* the resulting
+            // list being non-empty, not merely on `is_some()`.
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools,
             max_tokens: self.max_tokens,
         };
@@ -588,7 +593,10 @@ impl ModelProvider for OpenAiModelProvider {
             model: model.to_string(),
             messages: Self::convert_messages(messages),
             temperature: adjusted_temperature,
-            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
+            // See above: omit tool_choice when the tool list is empty.
+            tool_choice: native_tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools: native_tools,
             max_tokens: self.max_tokens,
         };
@@ -693,6 +701,10 @@ struct ResponsesApiRequest {
 #[derive(Debug, Serialize)]
 struct ResponsesApiReasoning {
     effort: String,
+}
+
+fn has_responses_tools(tools: Option<&[ResponsesToolSpec]>) -> bool {
+    tools.is_some_and(|tools| !tools.is_empty())
 }
 
 /// Non-streaming response body from `/v1/responses`.
@@ -869,7 +881,12 @@ pub(crate) async fn run_responses_sse(
         let _ = tx.send(Ok(StreamEvent::TextDelta(chunk))).await;
     }
 
-    let _ = tx.send(Ok(StreamEvent::Final)).await;
+    crate::stream_guard::finish_sse_stream(
+        tx,
+        state.saw_completion,
+        "response.completed or [DONE]",
+    )
+    .await;
 }
 
 pub struct OpenAiResponsesModelProvider {
@@ -920,7 +937,7 @@ impl OpenAiResponsesModelProvider {
         temperature: Option<f64>,
         stream: bool,
     ) -> ResponsesApiRequest {
-        let has_tools = tools.is_some();
+        let has_tools = has_responses_tools(tools.as_deref());
         let reasoning = self
             .reasoning_effort
             .as_deref()
@@ -1111,7 +1128,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             };
             let tools = convert_tools(tools_owned.as_deref());
             let tools_count = tools.as_ref().map_or(0, Vec::len);
-            let has_tools = tools.is_some();
+            let has_tools = has_responses_tools(tools.as_deref());
             let reasoning = reasoning_effort
                 .as_deref()
                 .map(|effort| ResponsesApiReasoning {
@@ -1988,6 +2005,44 @@ mod tests {
                     .and_then(serde_json::Value::as_null)
                     .is_some(),
             "no tools → parallel_tool_calls must be omitted (skipped via skip_serializing_if)"
+        );
+    }
+
+    #[test]
+    fn responses_request_omits_tool_choice_and_parallel_when_tools_empty() {
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            Some(Vec::new()),
+            "gpt-5",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert!(
+            json.get("tool_choice").is_none()
+                || json
+                    .get("tool_choice")
+                    .and_then(serde_json::Value::as_null)
+                    .is_some(),
+            "empty tools list → tool_choice must be omitted (vLLM rejects tool_choice without non-empty tools)"
+        );
+        assert!(
+            json.get("parallel_tool_calls").is_none()
+                || json
+                    .get("parallel_tool_calls")
+                    .and_then(serde_json::Value::as_null)
+                    .is_some(),
+            "empty tools list → parallel_tool_calls must be omitted with tool_choice"
+        );
+        let wire_tools = json
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .expect("tools must be a JSON array on the wire body");
+        assert!(
+            wire_tools.is_empty(),
+            "empty tools should remain an empty tools array; only tool_choice and parallel_tool_calls are suppressed"
         );
     }
 }

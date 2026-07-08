@@ -1076,6 +1076,35 @@ fn apply_model_provider(
                     return None;
                 }
             }
+            // Auto-populate context_window from provider's /models endpoint if supported.
+            // Silently ignores failures (falls back to config default).
+            // Only runs on multi-threaded Tokio runtime (actual CLI), not single-threaded test runtime.
+            let provider_config = zeroclaw_config::schema::ModelProviderConfig {
+                model: Some(choice.model.clone()),
+                uri: config.get_prop(&format!("{prefix}.uri")).ok(),
+                api_key: choice
+                    .fields
+                    .get("api_key")
+                    .and_then(|v| if v.is_empty() { None } else { Some(v.clone()) }),
+                ..Default::default()
+            };
+            if tokio::runtime::Handle::try_current()
+                .map(|h| {
+                    matches!(
+                        h.runtime_flavor(),
+                        tokio::runtime::RuntimeFlavor::MultiThread
+                    )
+                })
+                .unwrap_or(false)
+                && let Some(ctx) = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        zeroclaw_providers::fetch_context_window(&provider_type, &provider_config),
+                    )
+                })
+            {
+                let _ = config
+                    .set_prop_persistent(&format!("{prefix}.context_window"), &ctx.to_string());
+            }
             Some(format!("{}.{}", provider_type, choice.alias))
         }
     }

@@ -1,6 +1,8 @@
 # Operations: Overview
 
-How to run ZeroClaw in production. The surface is intentionally small: one binary, one config file, one SQLite workspace. Most "operations" is "systemd and journald".
+How to run ZeroClaw in production. The surface is intentionally small: one
+binary, one config file, and one install root with a handful of runtime stores.
+Most "operations" is "systemd and journald".
 
 This section covers:
 
@@ -16,7 +18,11 @@ A typical always-on ZeroClaw install is:
 
 {{#include ../_snippets/deployment-shape.md}}
 
-Everything except the binary can move. The data dir defaults to `~/.zeroclaw/data/` (the legacy `~/.zeroclaw/workspace/` name is still accepted); config paths resolve per environment (Homebrew vs. bootstrap vs. XDG), and log destinations are platform-native by default.
+Everything except the binary can move. The data dir defaults to
+`~/.zeroclaw/data/` (the legacy `~/.zeroclaw/workspace/` name is still
+accepted); config paths resolve per environment (Homebrew vs. bootstrap vs.
+XDG), and log destinations are platform-native by default. For the full store
+map, see [Runtime state and persistence](../architecture/runtime-state-and-persistence.md).
 
 ## What to monitor
 
