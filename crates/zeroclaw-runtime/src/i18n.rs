@@ -411,6 +411,12 @@ mod tests {
                 ["ops", "risk_profile"].as_slice(),
             ),
             (
+                "cli-status-web-ui-found",
+                &[("path", "/srv/zeroclaw/web/dist")][..],
+                ["Web UI", "/srv/zeroclaw/web/dist"].as_slice(),
+            ),
+            ("cli-status-web-ui-missing", &[][..], ["Web UI"].as_slice()),
+            (
                 "cli-status-channel-configured",
                 &[("status", "configured")][..],
                 ["✅ configured"].as_slice(),

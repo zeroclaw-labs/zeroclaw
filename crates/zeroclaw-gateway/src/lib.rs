@@ -411,6 +411,36 @@ fn dirs_data_local() -> Option<std::path::PathBuf> {
     directories::BaseDirs::new().map(|d| d.data_local_dir().to_path_buf())
 }
 
+pub fn resolve_web_dist_dir(config: &Config) -> Option<std::path::PathBuf> {
+    match config
+        .gateway
+        .web_dist_dir
+        .as_ref()
+        .map(std::path::PathBuf::from)
+    {
+        Some(explicit) if explicit.join("index.html").is_file() => Some(explicit),
+        Some(_) | None => auto_detect_web_dist_dir(),
+    }
+}
+
+fn auto_detect_web_dist_dir() -> Option<std::path::PathBuf> {
+    let mut candidates = vec![
+        std::path::PathBuf::from("web/dist"),
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("web/dist")))
+            .unwrap_or_default(),
+        std::path::PathBuf::from("/zeroclaw-data/web/dist"),
+        std::path::PathBuf::from("/usr/share/zeroclawlabs/web/dist"),
+    ];
+    if let Some(data_dir) = dirs_data_local() {
+        candidates.push(data_dir.join("zeroclaw/web/dist"));
+    }
+    candidates
+        .into_iter()
+        .find(|p| !p.as_os_str().is_empty() && p.join("index.html").is_file())
+}
+
 fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
     if let Some(xff) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
         for candidate in xff.split(',') {
@@ -1386,56 +1416,24 @@ pub async fn run_gateway(
         }
     }
 
-    // Resolve web_dist_dir: explicit config (when valid) → auto-detect.
-    // Treat the configured path as advisory — if it doesn't contain
-    // index.html on this machine (stale/leaked path from another host,
-    // typo, missing build), fall back to auto-detect rather than hard-
-    // failing every dashboard request. We log the demotion so the
-    // operator can spot a misconfigured path.
-    let auto_detect_web_dist = || -> Option<std::path::PathBuf> {
-        let mut candidates = vec![
-            // Relative to CWD (development: running from repo root)
-            std::path::PathBuf::from("web/dist"),
-            // Relative to binary (installed alongside binary)
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("web/dist")))
-                .unwrap_or_default(),
-            // Docker / packaged layout
-            std::path::PathBuf::from("/zeroclaw-data/web/dist"),
-            // AUR / system package
-            std::path::PathBuf::from("/usr/share/zeroclawlabs/web/dist"),
-        ];
-        // XDG data home (prebuilt binary installer)
-        if let Some(data_dir) = dirs_data_local() {
-            candidates.push(data_dir.join("zeroclaw/web/dist"));
-        }
-        candidates
-            .into_iter()
-            .find(|p| !p.as_os_str().is_empty() && p.join("index.html").is_file())
-    };
-
-    let web_dist_dir: Option<std::path::PathBuf> = match config
+    let web_dist_dir = resolve_web_dist_dir(&config);
+    if let Some(stale) = config
         .gateway
         .web_dist_dir
         .as_ref()
         .map(std::path::PathBuf::from)
+        && !stale.join("index.html").is_file()
     {
-        Some(explicit) if explicit.join("index.html").is_file() => Some(explicit),
-        Some(stale) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"configured": stale.display().to_string()})),
-                "gateway.web_dist_dir points at a path that doesn't contain index.html on \
-                 this machine; falling back to auto-detect. Update or remove the setting in \
-                 config.toml to silence this warning."
-            );
-            auto_detect_web_dist()
-        }
-        None => auto_detect_web_dist(),
-    };
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"configured": stale.display().to_string()})),
+            "gateway.web_dist_dir points at a path that doesn't contain index.html on \
+             this machine; falling back to auto-detect. Update or remove the setting in \
+             config.toml to silence this warning."
+        );
+    }
 
     if let Some(ref dir) = web_dist_dir {
         ::zeroclaw_log::record!(
@@ -4595,6 +4593,30 @@ mod tests {
         assert_eq!(
             format_paircode_recovery_curl("127.0.0.1", 42617, "/gw"),
             "curl -s -X POST http://127.0.0.1:42617/gw/admin/paircode/new"
+        );
+    }
+
+    #[test]
+    fn resolve_web_dist_dir_accepts_configured_dist() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let dist_dir = temp.path().join("dist");
+        std::fs::create_dir_all(&dist_dir).expect("create dist dir");
+        std::fs::write(dist_dir.join("index.html"), "").expect("write index.html");
+        let mut config = Config::default();
+        config.gateway.web_dist_dir = Some(dist_dir.display().to_string());
+
+        assert_eq!(resolve_web_dist_dir(&config), Some(dist_dir));
+    }
+
+    #[test]
+    fn resolve_web_dist_dir_rejects_configured_path_without_index() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let mut config = Config::default();
+        config.gateway.web_dist_dir = Some(temp.path().display().to_string());
+
+        assert_ne!(
+            resolve_web_dist_dir(&config),
+            Some(temp.path().to_path_buf())
         );
     }
 

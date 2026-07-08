@@ -640,6 +640,8 @@ cli-status-agents = 🛡️  Agents :        {$v}
 cli-status-agent-risk-profile = {$alias}={$level}
 cli-status-agent-no-risk-profile-summary = {$alias}=<aucun risk_profile>
 cli-status-runtime = ⚙️  Runtime :       {$v}
+cli-status-web-ui-found = 🌐 Web UI :        TROUVÉ ({$path})
+cli-status-web-ui-missing = 🌐 Web UI :        MANQUANT
 cli-status-heartbeat = 💓 Battement de cœur :      {$v}
 cli-status-heartbeat-every-minutes = toutes les {$minutes}min
 cli-status-memory = 🧠 Mémoire :         {$backend} (sauvegarde auto : {$auto_save})

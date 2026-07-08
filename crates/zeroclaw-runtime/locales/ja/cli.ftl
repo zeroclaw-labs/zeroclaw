@@ -637,6 +637,8 @@ cli-status-agents = 🛡️  エージェント:        {$v}
 cli-status-agent-risk-profile = {$alias}={$level}
 cli-status-agent-no-risk-profile-summary = {$alias}=<risk_profile なし>
 cli-status-runtime = ⚙️  ランタイム:       {$v}
+cli-status-web-ui-found = 🌐 Web UI:        検出 ({$path})
+cli-status-web-ui-missing = 🌐 Web UI:        未検出
 cli-status-heartbeat = 💓 ハートビート:      {$v}
 cli-status-heartbeat-every-minutes = {$minutes}分ごと
 cli-status-memory = 🧠 メモリ:         {$backend} (自動保存: {$auto_save})
