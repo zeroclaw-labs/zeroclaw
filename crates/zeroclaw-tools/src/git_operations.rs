@@ -981,10 +981,15 @@ impl Tool for GitOperationsTool {
             }
 
             if !found_git {
+                let path_display = working_dir.display().to_string();
+                let error_msg = crate::i18n::get_required_tool_string_with_args(
+                    "tool-git-operations-error-not-in-repo",
+                    &[("path", &path_display)],
+                );
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some("Not in a git repository".into()),
+                    error: Some(error_msg),
                 });
             }
         }
@@ -1764,5 +1769,56 @@ mod tests {
         let out = String::from_utf8_lossy(&status.stdout);
         assert!(out.contains("A  a.txt"), "a.txt not staged: {out:?}");
         assert!(out.contains("A  b.txt"), "b.txt not staged: {out:?}");
+    }
+
+    /// Regression: calling execute() from a non-repository path must
+    /// return an error message that includes the resolved working
+    /// directory path and recovery guidance keywords.
+    ///
+    /// Before the fix, the error was a bare "Not in a git repository"
+    /// with no path context or actionable hint. The fix routes the
+    /// message through a Fluent key with a `{ $path }` placeholder,
+    /// producing a message like:
+    ///   "Not in a Git repository at '/tmp/xyz'. Choose a path inside
+    ///    a Git worktree, pass 'path' for a repository subdirectory,
+    ///    or initialize a repository before running git_operations."
+    ///
+    /// This test exercises the fixed branch by calling execute() with
+    /// a working directory that is not inside any Git repository and
+    /// asserting that the error message contains both the path and
+    /// recovery keywords.
+    #[tokio::test]
+    async fn non_repository_error_includes_path_context_and_recovery_hint() {
+        let tmp = TempDir::new().unwrap();
+        // Do NOT git-init the temp dir — we want a non-repository path.
+        let tool = test_tool(tmp.path());
+
+        let result = tool.execute(json!({"operation": "status"})).await.unwrap();
+
+        assert!(
+            !result.success,
+            "git_operations should fail when not in a repository"
+        );
+
+        let error = result.error.as_deref().unwrap_or("");
+        let path_display = tmp.path().display().to_string();
+
+        // The error message must include the resolved working directory
+        // path so the user can see where the tool was looking.
+        assert!(
+            error.contains(&path_display),
+            "error should contain the working directory path '{path_display}', got: {error}"
+        );
+
+        // The error message must include recovery guidance keywords
+        // that tell the user how to resolve the issue.
+        assert!(
+            error.contains("worktree") || error.contains("work tree") || error.contains("path"),
+            "error should contain a recovery keyword (worktree/work tree/path), got: {error}"
+        );
+        assert!(
+            error.contains("initialize") || error.contains("init"),
+            "error should mention initializing a repository, got: {error}"
+        );
     }
 }

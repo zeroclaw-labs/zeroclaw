@@ -10,13 +10,26 @@
 //!
 //! The struct is the single source of truth: [`SkillFrontmatter::prop_fields`]
 //! enumerates the same field set that drives the dashboard form, CLI flags
-//! on `zeroclaw skills add`, and the TUI form. Adding a field here = all
-//! three surfaces gain it via `prop_fields`.
+//! on `zeroclaw skills add`, and the TUI form. Adding a flat scalar field here
+//! = all three surfaces gain it via `prop_fields`.
+//!
+//! The one exception is `slash_options`: a nested `slash_options:` YAML list
+//! (typed Discord slash-command parameters). It is the reason this file keeps
+//! a flat *scalar* schema while still expressing structured options — the
+//! nesting is parsed/serialized by the shared helper in [`super::document`],
+//! not the flat parser, and it is deliberately excluded from `prop_fields`
+//! (the flat form can't render a nested list; the dashboard gets a bespoke
+//! editor for it).
 
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::traits::{PropFieldInfo, PropKind};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+use super::SkillSlashOption;
+
+// `Eq` is intentionally NOT derived: `slash_options` carries `SkillSlashOption`,
+// whose `min`/`max` bounds are `f64` (no total ordering). `PartialEq` is all the
+// surfaces (tests, change detection) need.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SkillFrontmatter {
     pub name: String,
     pub description: String,
@@ -35,6 +48,16 @@ pub struct SkillFrontmatter {
     /// longer silently strips its tags.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Typed slash-command options a `slash`-tagged skill exposes (Discord
+    /// dropdowns / ranges / autocomplete). The one genuinely *nested* field —
+    /// a `slash_options:` YAML list of maps, each with an optional `choices`
+    /// sub-list. It is parsed/serialized by the shared nested helper in
+    /// [`super::document`] (the flat scalar parser leaves it untouched) and is
+    /// deliberately excluded from [`SkillFrontmatter::prop_fields`] because the
+    /// flat dashboard/CLI/TUI form can't express nesting; the dashboard gets a
+    /// bespoke editor for it instead. See [`SkillSlashOption`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slash_options: Vec<SkillSlashOption>,
 }
 
 impl SkillFrontmatter {
@@ -128,14 +151,23 @@ mod tests {
 
     #[test]
     fn prop_fields_matches_struct() {
-        // Drift check: when a field is added to SkillFrontmatter, prop_fields
-        // must be updated to match. The expected count tracks every field.
+        // Drift check: when a FLAT scalar field is added to SkillFrontmatter,
+        // prop_fields must be updated to match. The struct has 8 fields, but
+        // `slash_options` is INTENTIONALLY excluded from prop_fields — it is a
+        // nested list the flat dashboard/CLI/TUI form can't render, so it gets
+        // a bespoke editor instead. Hence 7 flat fields surfaced here.
         let fields = SkillFrontmatter::prop_fields();
         assert_eq!(
             fields.len(),
             7,
             "SkillFrontmatter::prop_fields drifted from struct definition; \
-             update both when adding/removing fields"
+             update both when adding/removing FLAT fields (slash_options is \
+             nested and deliberately excluded)"
+        );
+        // slash_options must never sneak into the flat form.
+        assert!(
+            !fields.iter().any(|f| f.name == "slash_options"),
+            "slash_options is nested and must stay out of the flat prop_fields form"
         );
     }
 

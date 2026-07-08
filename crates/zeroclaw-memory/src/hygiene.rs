@@ -1,3 +1,4 @@
+use crate::budget;
 use crate::policy::PolicyEnforcer;
 use anyhow::Result;
 use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
@@ -67,7 +68,7 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
         config.core_retention_days,
     );
 
-    let report = HygieneReport {
+    let mut report = HygieneReport {
         archived_memory_files: archive_daily_memory_files(
             workspace_dir,
             config.archive_after_days,
@@ -84,6 +85,9 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
         pruned_daily_rows: prune_category_rows(workspace_dir, daily_retention, "daily", false)?,
         pruned_core_rows: prune_category_rows(workspace_dir, core_retention, "core", true)?,
     };
+    let budget_report = compact_budget_rows(workspace_dir, config)?;
+    report.pruned_daily_rows += budget_report.daily_rows;
+    report.pruned_core_rows += budget_report.core_rows;
 
     // Prune audit entries if audit is enabled.
     if config.audit_enabled
@@ -239,6 +243,10 @@ fn archive_session_files(workspace_dir: &Path, archive_after_days: u32) -> Resul
             continue;
         };
 
+        if !is_legacy_session_artifact(filename) {
+            continue;
+        }
+
         let is_old = if let Some(date) = date_prefix(filename) {
             date < cutoff_date
         } else {
@@ -252,6 +260,12 @@ fn archive_session_files(workspace_dir: &Path, archive_after_days: u32) -> Resul
     }
 
     Ok(moved)
+}
+
+fn is_legacy_session_artifact(filename: &str) -> bool {
+    date_prefix(filename).is_some()
+        || filename.ends_with(".jsonl")
+        || filename.ends_with(".jsonl.migrated")
 }
 
 fn purge_memory_archives(workspace_dir: &Path, purge_after_days: u32) -> Result<u64> {
@@ -322,6 +336,10 @@ fn purge_session_archives(workspace_dir: &Path, purge_after_days: u32) -> Result
             continue;
         };
 
+        if !is_legacy_session_artifact(filename) {
+            continue;
+        }
+
         let is_old = if let Some(date) = date_prefix(filename) {
             date < cutoff_date
         } else {
@@ -369,12 +387,37 @@ fn prune_category_rows(
         "updated_at"
     };
     let sql = format!(
-        "DELETE FROM memories WHERE category = ?1 AND {} < ?2",
-        timestamp_col
+        "DELETE FROM memories WHERE category = ?1 AND {timestamp_col} < ?2 AND pinned = 0",
     );
     let affected = conn.execute(&sql, params![category, cutoff])?;
 
     Ok(u64::try_from(affected).unwrap_or(0))
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BudgetRows {
+    core_rows: u64,
+    daily_rows: u64,
+}
+
+fn compact_budget_rows(workspace_dir: &Path, config: &MemoryConfig) -> Result<BudgetRows> {
+    if config.core_max_rows == 0 && config.core_max_bytes == 0 && config.daily_max_rows == 0 {
+        return Ok(BudgetRows::default());
+    }
+
+    let db_path = workspace_dir.join("memory").join("brain.db");
+    if !db_path.exists() {
+        return Ok(BudgetRows::default());
+    }
+
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+    let core = budget::compact_category_to_budget(&conn, "core", config)?;
+    let daily = budget::compact_category_to_budget(&conn, "daily", config)?;
+    Ok(BudgetRows {
+        core_rows: core.evicted_by_count + core.evicted_by_bytes,
+        daily_rows: daily.evicted_by_count + daily.evicted_by_bytes,
+    })
 }
 
 fn prune_audit_entries(workspace_dir: &Path, retention_days: u32) -> Result<()> {
@@ -487,10 +530,19 @@ mod tests {
     use super::*;
     use crate::sqlite::SqliteMemory;
     use crate::traits::{Memory, MemoryCategory};
+    use filetime::{FileTime, set_file_mtime};
     use tempfile::TempDir;
 
     fn default_cfg() -> MemoryConfig {
         MemoryConfig::default()
+    }
+
+    fn set_old_mtime(path: &Path, days_old: i64) {
+        let old = FileTime::from_system_time(
+            (SystemTime::now() - StdDuration::from_secs(days_old as u64 * 24 * 60 * 60))
+                .max(SystemTime::UNIX_EPOCH),
+        );
+        set_file_mtime(path, old).unwrap();
     }
 
     #[test]
@@ -547,6 +599,92 @@ mod tests {
                 .exists(),
             "archived session file should exist"
         );
+    }
+
+    #[test]
+    fn keeps_sqlite_session_artifacts_out_of_archives() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let sessions_dir = workspace.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let protected = ["sessions.db", "sessions.db-wal", "sessions.db-shm"];
+        for filename in protected {
+            let path = sessions_dir.join(filename);
+            fs::write(&path, "sqlite artifact").unwrap();
+            set_old_mtime(&path, 10);
+        }
+
+        run_if_due(&default_cfg(), workspace).unwrap();
+
+        for filename in protected {
+            assert!(
+                sessions_dir.join(filename).exists(),
+                "{filename} should remain in the hot sessions directory"
+            );
+            assert!(
+                !sessions_dir.join("archive").join(filename).exists(),
+                "{filename} must not be moved into the session archive"
+            );
+        }
+    }
+
+    #[test]
+    fn archives_old_legacy_jsonl_session_files() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let sessions_dir = workspace.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let legacy_file = sessions_dir.join("legacy_session.jsonl");
+        fs::write(&legacy_file, "legacy session").unwrap();
+        set_old_mtime(&legacy_file, 10);
+
+        run_if_due(&default_cfg(), workspace).unwrap();
+
+        assert!(
+            !legacy_file.exists(),
+            "old legacy JSONL session file should be archived"
+        );
+        assert!(
+            sessions_dir
+                .join("archive")
+                .join("legacy_session.jsonl")
+                .exists(),
+            "archived legacy JSONL session file should exist"
+        );
+    }
+
+    #[test]
+    fn purges_old_legacy_session_archives_but_keeps_sqlite_artifacts() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let archive_dir = workspace.join("sessions").join("archive");
+        fs::create_dir_all(&archive_dir).unwrap();
+
+        let protected = ["sessions.db", "sessions.db-wal", "sessions.db-shm"];
+        for filename in protected {
+            let path = archive_dir.join(filename);
+            fs::write(&path, "sqlite artifact").unwrap();
+            set_old_mtime(&path, 40);
+        }
+
+        let legacy_file = archive_dir.join("legacy_session.jsonl");
+        fs::write(&legacy_file, "legacy session").unwrap();
+        set_old_mtime(&legacy_file, 40);
+
+        run_if_due(&default_cfg(), workspace).unwrap();
+
+        assert!(
+            !legacy_file.exists(),
+            "old archived legacy session file should be purged"
+        );
+        for filename in protected {
+            assert!(
+                archive_dir.join(filename).exists(),
+                "{filename} should remain in the session archive"
+            );
+        }
     }
 
     #[test]

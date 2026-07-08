@@ -120,3 +120,78 @@ pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trace_response_text_variant_defaults_tokens_to_zero() {
+        let r: TraceResponse = serde_json::from_str(r#"{"type":"text","content":"hi"}"#).unwrap();
+        match r {
+            TraceResponse::Text {
+                content,
+                input_tokens,
+                output_tokens,
+            } => {
+                assert_eq!(content, "hi");
+                assert_eq!(input_tokens, 0);
+                assert_eq!(output_tokens, 0);
+            }
+            _ => panic!("expected Text variant"),
+        }
+    }
+
+    #[test]
+    fn trace_response_tool_calls_variant_parses() {
+        let j = r#"{"type":"tool_calls","tool_calls":[{"id":"1","name":"search","arguments":{"q":"x"}}],"input_tokens":5}"#;
+        let r: TraceResponse = serde_json::from_str(j).unwrap();
+        match r {
+            TraceResponse::ToolCalls {
+                tool_calls,
+                input_tokens,
+                output_tokens,
+            } => {
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].id, "1");
+                assert_eq!(tool_calls[0].name, "search");
+                assert_eq!(input_tokens, 5);
+                assert_eq!(output_tokens, 0);
+            }
+            _ => panic!("expected ToolCalls variant"),
+        }
+    }
+
+    #[test]
+    fn llm_trace_uses_default_expects_when_omitted() {
+        let t: LlmTrace = serde_json::from_str(r#"{"model_name":"m","turns":[]}"#).unwrap();
+        assert_eq!(t.model_name, "m");
+        assert!(t.turns.is_empty());
+        assert!(t.expects.response_contains.is_empty());
+        assert!(t.expects.max_tool_calls.is_none());
+    }
+
+    #[test]
+    fn from_file_reads_and_parses_trace() {
+        let path = std::env::temp_dir().join("zeroclaw_eval_case_from_file_test.json");
+        std::fs::write(&path, r#"{"model_name":"demo","turns":[]}"#).unwrap();
+        let t = LlmTrace::from_file(&path).unwrap();
+        assert_eq!(t.model_name, "demo");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_suite_filters_json_and_sorts_by_path() {
+        let dir = std::env::temp_dir().join("zeroclaw_eval_case_suite_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("b.json"), r#"{"model_name":"b","turns":[]}"#).unwrap();
+        std::fs::write(dir.join("a.json"), r#"{"model_name":"a","turns":[]}"#).unwrap();
+        std::fs::write(dir.join("note.txt"), "ignored").unwrap();
+        let suite = load_suite(&dir).unwrap();
+        assert_eq!(suite.len(), 2); // the .txt file is ignored
+        assert_eq!(suite[0].1.model_name, "a"); // sorted by path
+        assert_eq!(suite[1].1.model_name, "b");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

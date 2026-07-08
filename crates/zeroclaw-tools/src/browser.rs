@@ -61,6 +61,7 @@ impl Default for ComputerUseConfig {
 pub struct BrowserTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
+    allowed_private_hosts: Vec<String>,
     session_name: Option<String>,
     backend: String,
     headed: Option<bool>,
@@ -216,6 +217,7 @@ impl BrowserTool {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            Vec::new(),
         )
     }
 
@@ -230,12 +232,17 @@ impl BrowserTool {
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
         computer_use: ComputerUseConfig,
+        allowed_private_hosts: Vec<String>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             security,
             allowed_domains: domain_guard::normalize_allowed_domains(
                 allowed_domains,
                 "browser.allowed_domains",
+            )?,
+            allowed_private_hosts: domain_guard::normalize_allowed_domains(
+                allowed_private_hosts,
+                "browser.allowed_private_hosts",
             )?,
             session_name,
             backend,
@@ -449,17 +456,62 @@ impl BrowserTool {
             anyhow::bail!("Only http:// and https:// URLs are allowed");
         }
 
-        if self.allowed_domains.is_empty() {
+        // Parse with `reqwest::Url` (re-exported `url` crate, the Rust de-facto
+        // standard URL parser) instead of hand-rolling authority/host
+        // extraction. Reviewer caught two parser-mismatch bypasses against the
+        // prior hand-rolled `extract_host`:
+        //
+        //   1. `http://example.com@127.0.0.1/` — userinfo `example.com@…`
+        //      classified as host, browser navigates to loopback.
+        //   2. `http://127.0.0.1?x` / `http://127.0.0.1#x` — no `/` before the
+        //      query/fragment, so `127.0.0.1?x` classified as host, not
+        //      private, browser still navigates to loopback.
+        //
+        // Both classes vanish once we use the same parser the browser backend
+        // ultimately resolves against. This also aligns the `browser` SSRF
+        // gate with `http_request.rs`, `domain_guard.rs`, and the existing
+        // `reqwest::Url::parse` calls already in this file.
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| anyhow::Error::msg(format!("Invalid URL format: {e}")))?;
+
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            anyhow::bail!("URL userinfo is not allowed");
+        }
+
+        if self.allowed_domains.is_empty() && self.allowed_private_hosts.is_empty() {
             anyhow::bail!(
                 "Browser tool enabled but no allowed_domains configured. \
                 Add [browser].allowed_domains in config.toml"
             );
         }
 
-        let host = extract_host(url)?;
+        let host_str = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::Error::msg("URL must include a host"))?;
 
-        if domain_guard::is_private_or_local_host(&host) {
+        // Re-add IPv6 brackets so the host string fed to `is_private_or_local_host`
+        // and `host_matches_allowlist` matches the shape used elsewhere in this
+        // crate (`[::1]`, `[fe80::1]`). `Url::host_str` strips the brackets for
+        // IPv6 literals. We detect IPv6 by parsing the bracket-less form as an
+        // `IpAddr` — avoids depending on `url::Host` (only `url::Url` is
+        // re-exported via `reqwest`).
+        let is_ipv6 = host_str.parse::<std::net::Ipv6Addr>().is_ok();
+        let host = if is_ipv6 {
+            format!("[{host_str}]")
+        } else {
+            host_str.to_lowercase()
+        };
+
+        let private_host = domain_guard::is_private_or_local_host(&host);
+        let private_host_allowed = private_host
+            && domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts);
+
+        if private_host && !private_host_allowed {
             anyhow::bail!("Blocked local/private host: {host}");
+        }
+
+        if private_host_allowed {
+            return Ok(());
         }
 
         if !domain_guard::host_matches_allowlist(&host, &self.allowed_domains) {
@@ -1651,10 +1703,10 @@ mod native_backend {
     fn selector_for_find(by: &str, value: &str) -> String {
         let escaped = css_attr_escape(value);
         match by {
-            "role" => format!(r#"[role=\"{escaped}\"]"#),
+            "role" => format!("[role=\"{escaped}\"]"),
             "label" => format!("label={value}"),
-            "placeholder" => format!(r#"[placeholder=\"{escaped}\"]"#),
-            "testid" => format!(r#"[data-testid=\"{escaped}\"]"#),
+            "placeholder" => format!("[placeholder=\"{escaped}\"]"),
+            "testid" => format!("[data-testid=\"{escaped}\"]"),
             _ => format!("text={value}"),
         }
     }
@@ -1742,7 +1794,7 @@ mod native_backend {
 
         if trimmed.starts_with('@') {
             let escaped = css_attr_escape(trimmed);
-            return SelectorKind::Css(format!(r#"[data-zc-ref=\"{escaped}\"]"#));
+            return SelectorKind::Css(format!("[data-zc-ref=\"{escaped}\"]"));
         }
 
         SelectorKind::Css(trimmed.to_string())
@@ -1812,7 +1864,7 @@ mod native_backend {
             .unwrap_or_else(|| "null".to_string());
 
         format!(
-            r#"(() => {{
+            r#"return (() => {{
   const interactiveOnly = {interactive_only};
   const compact = {compact};
   const maxDepth = {depth_literal};
@@ -1875,6 +1927,66 @@ mod native_backend {
   }};
 }})();"#
         )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn snapshot_script_starts_with_return() {
+            let script = snapshot_script(true, false, None);
+            assert!(
+                script.starts_with("return (() => {"),
+                "snapshot_script must start with 'return (() => {{' for WebDriver ExecuteScript; got: {:?}",
+                &script[..60]
+            );
+        }
+
+        #[test]
+        fn selector_for_find_role_emits_normal_css_attribute() {
+            let sel = selector_for_find("role", "button");
+            assert_eq!(sel, r#"[role="button"]"#);
+        }
+
+        #[test]
+        fn selector_for_find_placeholder_emits_normal_css_attribute() {
+            let sel = selector_for_find("placeholder", "Search");
+            assert_eq!(sel, r#"[placeholder="Search"]"#);
+        }
+
+        #[test]
+        fn selector_for_find_testid_emits_normal_css_attribute() {
+            let sel = selector_for_find("testid", "submit-btn");
+            assert_eq!(sel, r#"[data-testid="submit-btn"]"#);
+        }
+
+        #[test]
+        fn parse_selector_at_ref_emits_normal_css_attribute() {
+            let sel = parse_selector("@elem");
+            let SelectorKind::Css(css) = sel else {
+                panic!("expected Css selector, got XPath");
+            };
+            assert_eq!(css, r#"[data-zc-ref="@elem"]"#);
+        }
+
+        #[test]
+        fn css_attr_escape_escapes_backslashes() {
+            let escaped = css_attr_escape(r#"path\to\file"#);
+            assert_eq!(escaped, r#"path\\to\\file"#);
+        }
+
+        #[test]
+        fn css_attr_escape_escapes_double_quotes() {
+            let escaped = css_attr_escape(r#"he said "hello""#);
+            assert_eq!(escaped, r#"he said \"hello\""#);
+        }
+
+        #[test]
+        fn css_attr_escape_handles_both() {
+            let escaped = css_attr_escape(r#"a\"b"#);
+            assert_eq!(escaped, r#"a\\\"b"#);
+        }
     }
 }
 
@@ -2219,33 +2331,6 @@ fn endpoint_reachable(endpoint: &reqwest::Url, timeout: Duration) -> bool {
     std::net::TcpStream::connect_timeout(&addr, timeout).is_ok()
 }
 
-fn extract_host(url_str: &str) -> anyhow::Result<String> {
-    // Simple host extraction without url crate
-    let url = url_str.trim();
-    let without_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .or_else(|| url.strip_prefix("file://"))
-        .unwrap_or(url);
-
-    // Extract host — handle bracketed IPv6 addresses like [::1]:8080
-    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
-
-    let host = if authority.starts_with('[') {
-        // IPv6: take everything up to and including the closing ']'
-        authority.find(']').map_or(authority, |i| &authority[..=i])
-    } else {
-        // IPv4 or hostname: take everything before the port separator
-        authority.split(':').next().unwrap_or(authority)
-    };
-
-    if host.is_empty() {
-        anyhow::bail!("Invalid URL: no host");
-    }
-
-    Ok(host.to_lowercase())
-}
-
 /// Detect whether the current process is running inside a service environment
 /// (e.g. systemd, OpenRC, or launchd) where the browser sandbox and
 /// environment setup may be restricted.
@@ -2287,31 +2372,6 @@ fn ensure_browser_env(cmd: &mut Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn extract_host_works() {
-        assert_eq!(
-            extract_host("https://example.com/path").unwrap(),
-            "example.com"
-        );
-        assert_eq!(
-            extract_host("https://Sub.Example.COM:8080/").unwrap(),
-            "sub.example.com"
-        );
-    }
-
-    #[test]
-    fn extract_host_handles_ipv6() {
-        // IPv6 with brackets (required for URLs with ports)
-        assert_eq!(extract_host("https://[::1]/path").unwrap(), "[::1]");
-        // IPv6 with brackets and port
-        assert_eq!(
-            extract_host("https://[2001:db8::1]:8080/path").unwrap(),
-            "[2001:db8::1]"
-        );
-        // IPv6 with brackets, trailing slash
-        assert_eq!(extract_host("https://[fe80::1]/").unwrap(), "[fe80::1]");
-    }
 
     #[test]
     fn validate_url_blocks_ipv6_ssrf() {
@@ -2390,6 +2450,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            Vec::new(),
         )
         .unwrap();
         let cmd = tool.agent_browser_command();
@@ -2417,6 +2478,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            Vec::new(),
         )
         .unwrap();
         let cmd = tool.agent_browser_command();
@@ -2444,6 +2506,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            Vec::new(),
         )
         .unwrap();
         assert_eq!(tool.configured_backend().unwrap(), BrowserBackendKind::Auto);
@@ -2462,6 +2525,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            Vec::new(),
         )
         .unwrap();
         assert_eq!(
@@ -2486,6 +2550,7 @@ mod tests {
                 endpoint: "http://computer-use.example.com/v1/actions".into(),
                 ..ComputerUseConfig::default()
             },
+            Vec::new(),
         )
         .unwrap();
 
@@ -2509,6 +2574,7 @@ mod tests {
                 allow_remote_endpoint: true,
                 ..ComputerUseConfig::default()
             },
+            Vec::new(),
         )
         .unwrap();
 
@@ -2532,6 +2598,7 @@ mod tests {
                 max_coordinate_y: Some(100),
                 ..ComputerUseConfig::default()
             },
+            Vec::new(),
         )
         .unwrap();
 
@@ -2740,5 +2807,190 @@ mod tests {
         } else {
             assert_eq!(cmd, "agent-browser");
         }
+    }
+
+    // ── allowed_private_hosts opt-in tests ──────────────────────
+
+    fn private_host_tool(
+        allowed_domains: Vec<&str>,
+        allowed_private_hosts: Vec<&str>,
+    ) -> BrowserTool {
+        let security = Arc::new(SecurityPolicy::default());
+        BrowserTool::new_with_backend(
+            security,
+            allowed_domains.into_iter().map(String::from).collect(),
+            None,
+            "agent_browser".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            allowed_private_hosts
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_permits_localhost() {
+        let tool = private_host_tool(vec![], vec!["*"]);
+        assert!(tool.validate_url("http://localhost:8080").is_ok());
+        assert!(tool.validate_url("https://localhost:8443").is_ok());
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_permits_rfc1918() {
+        let tool = private_host_tool(vec![], vec!["*"]);
+        assert!(tool.validate_url("http://192.168.1.5").is_ok());
+        assert!(tool.validate_url("http://10.0.0.1").is_ok());
+        assert!(tool.validate_url("http://172.16.0.1").is_ok());
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_does_not_loosen_file_scheme() {
+        // file:// is always blocked, regardless of allowed_private_hosts.
+        let tool = private_host_tool(vec!["*"], vec!["*"]);
+        let err = tool
+            .validate_url("file:///etc/passwd")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("file://"));
+    }
+
+    #[test]
+    fn allowed_private_hosts_entry_permits_listed_host() {
+        let tool = private_host_tool(vec![], vec!["10.0.0.1"]);
+        assert!(tool.validate_url("http://10.0.0.1").is_ok());
+    }
+
+    #[test]
+    fn allowed_private_hosts_does_not_permit_unlisted_host() {
+        let tool = private_host_tool(vec![], vec!["10.0.0.1"]);
+        let err = tool
+            .validate_url("http://10.0.0.2")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn empty_private_allowlist_still_rejects_private() {
+        let tool = private_host_tool(vec!["*"], vec![]);
+        let err = tool
+            .validate_url("https://localhost")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_satisfies_allowlist_requirement() {
+        // allowed_domains empty + allowed_private_hosts=["*"] should not surface
+        // the "no allowed_domains configured" error for private hosts.
+        let tool = private_host_tool(vec![], vec!["*"]);
+        assert!(tool.validate_url("http://localhost").is_ok());
+    }
+
+    #[test]
+    fn specific_private_host_alone_satisfies_allowlist_requirement() {
+        let tool = private_host_tool(vec![], vec!["192.168.1.5"]);
+        assert!(tool.validate_url("http://192.168.1.5").is_ok());
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_does_not_widen_public_allowlist() {
+        // Public hosts are still subject to allowed_domains when private hosts
+        // are wide-open — the bypass is scoped to private/local hosts only.
+        let tool = private_host_tool(vec!["example.com"], vec!["*"]);
+        let err = tool
+            .validate_url("https://other.com")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowed_domains"));
+    }
+
+    // ── userinfo SSRF regression tests ──────────────────────────
+    //
+    // `extract_host` is a hand-rolled prefix-strip and does NOT parse `@`
+    // userinfo. Without an explicit reject, a URL like
+    // `http://example.com@127.0.0.1/` is classified by its `example.com@…`
+    // host string (which satisfies the default `["*"]` public allowlist)
+    // while the browser backend actually navigates to `127.0.0.1`. Pin both
+    // the public-wildcard case and the private-wildcard case so neither
+    // allowlist surface can be used to smuggle a private destination.
+
+    #[test]
+    fn userinfo_url_targeting_private_host_rejected_under_wildcard_public_allowlist() {
+        // Default-shipped posture: allowed_domains = ["*"], no private
+        // allowlist. `extract_host` would otherwise treat
+        // `example.com@127.0.0.1` as the host and accept it.
+        let tool = private_host_tool(vec!["*"], vec![]);
+        let err = tool
+            .validate_url("http://example.com@127.0.0.1/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("userinfo"), "got: {err}");
+    }
+
+    #[test]
+    fn userinfo_url_targeting_private_host_rejected_under_wildcard_private_allowlist() {
+        // Even with the private bypass wide open, userinfo is rejected before
+        // host classification — so this is a parser-mismatch defense, not a
+        // policy decision the operator can opt around.
+        let tool = private_host_tool(vec!["*"], vec!["*"]);
+        let err = tool
+            .validate_url("http://example.com@127.0.0.1/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("userinfo"), "got: {err}");
+    }
+
+    #[test]
+    fn userinfo_url_with_password_rejected() {
+        // `user:pass@host` form — same parser hole, same fix.
+        let tool = private_host_tool(vec!["*"], vec![]);
+        let err = tool
+            .validate_url("https://user:pass@10.0.0.1/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("userinfo"), "got: {err}");
+    }
+
+    // Regression: a URL with no slash before the query or fragment — e.g.
+    // `http://127.0.0.1?x` — must still classify the host as `127.0.0.1`,
+    // not `127.0.0.1?x`. The pre-fix hand-rolled `extract_host` only split
+    // the authority on `/`, so under the default `allowed_domains = ["*"]`
+    // posture this string slipped past the SSRF gate while the browser
+    // backend still navigated to loopback. Both `?` and `#` are now handled
+    // correctly because `validate_url` parses with `reqwest::Url` (the `url`
+    // crate), the same parser the browser backend resolves against.
+
+    #[test]
+    fn query_only_url_targeting_private_host_rejected_under_wildcard_public_allowlist() {
+        let tool = private_host_tool(vec!["*"], vec![]);
+        let err = tool
+            .validate_url("http://127.0.0.1?x")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("local/private host"),
+            "expected private-host block, got: {err}",
+        );
+    }
+
+    #[test]
+    fn fragment_only_url_targeting_private_host_rejected_under_wildcard_public_allowlist() {
+        let tool = private_host_tool(vec!["*"], vec![]);
+        let err = tool
+            .validate_url("http://127.0.0.1#x")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("local/private host"),
+            "expected private-host block, got: {err}",
+        );
     }
 }

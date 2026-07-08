@@ -281,10 +281,7 @@ impl AzureOpenAiModelProvider {
                             },
                         })
                         .collect::<Vec<_>>();
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
+                    let content = crate::request_payload::non_empty_string_field(&value, "content");
                     let reasoning_content = value
                         .get("reasoning_content")
                         .and_then(serde_json::Value::as_str)
@@ -492,7 +489,12 @@ impl ModelProvider for AzureOpenAiModelProvider {
         let native_request = NativeChatRequest {
             messages: Self::convert_messages(request.messages),
             temperature,
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            // Omit tool_choice when the tool list is empty — Azure (and
+            // spec-compliant validators) reject tool_choice without a
+            // non-empty tools field (HTTP 400).
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools,
             reasoning_effort: self.reasoning_effort_for_model(model),
             max_completion_tokens: None,
@@ -570,7 +572,10 @@ impl ModelProvider for AzureOpenAiModelProvider {
         let native_request = NativeChatRequest {
             messages: Self::convert_messages(messages),
             temperature,
-            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
+            // See above: omit tool_choice when the tool list is empty.
+            tool_choice: native_tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools: native_tools,
             reasoning_effort: self.reasoning_effort_for_model(model),
             max_completion_tokens: None,

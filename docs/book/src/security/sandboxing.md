@@ -47,6 +47,19 @@ The sandbox passes through only the env vars listed in `[risk_profiles.<alias>].
 
 Per-tool wall-time timeouts live on the tool's own config block (`[shell_tool].timeout_secs`, etc.). Docker-specific limits (memory, CPU) live on `[runtime.docker]` when the agent's runtime kind is set to `docker`:
 
+### Shell binary
+
+By default, the native runtime invokes commands via `/bin/sh`. Set `[runtime].shell` to use a different shell:
+
+```toml
+[runtime]
+shell = "bash"      # resolves through PATH, or use an absolute path
+```
+
+The shell is called as `<shell> -c "<command>"`, so any POSIX-compatible shell works. The value must be either a bare command name found on `PATH` (e.g. `"bash"`) or an absolute path to an executable (e.g. `"/bin/bash"`); relative paths with separators (e.g. `"./sh"`, `"bin/sh"`) are rejected. It is validated when the runtime starts, so an empty, missing, non-executable, or malformed shell fails fast with a clear error instead of breaking the first command. Defaults to `"sh"` when unset.
+
+Only applies to the native runtime kind. Docker uses its container's shell, and Windows (always `cmd.exe`) and Android (always `/system/bin/sh`) ignore the setting and do not validate it.
+
 ## Per-backend notes
 
 ### Landlock

@@ -906,6 +906,9 @@ mod tests {
             superseded_by: None,
             agent_alias: None,
             agent_id: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
         }
     }
 
@@ -928,6 +931,9 @@ mod tests {
             superseded_by: None,
             agent_alias: None,
             agent_id: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
         }
     }
 
