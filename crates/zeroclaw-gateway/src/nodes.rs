@@ -246,6 +246,15 @@ pub(crate) fn check_node_auth(
         ));
     }
     if let Some(ref expected_token) = nodes_config.auth_token {
+        // Fail-closed: a whitespace-only / empty configured token must not
+        // authenticate missing or arbitrary tokens (trimming both sides
+        // would produce `constant_time_eq("", "")` = true and bypass auth).
+        if expected_token.trim().is_empty() {
+            return Some((
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable — nodes.auth_token must not be empty or whitespace-only",
+            ));
+        }
         let token = extract_node_ws_token(headers, query_token).unwrap_or("");
         // SECURITY: route through `constant_time_eq` (not `==`) to prevent
         // a remote timing attack that could leak `nodes.auth_token` one
@@ -484,6 +493,56 @@ mod tests {
             ..NodesConfig::default()
         };
         let result = check_node_auth(&cfg, &make_pairing(false), &empty_headers(), None);
+        assert_eq!(
+            result.map(|(s, _)| s),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// nodes.auth_token set to whitespace-only, no token provided → 503
+    /// (fail-closed: empty-trimmed config must not match missing token).
+    #[test]
+    fn nodes_auth_token_whitespace_only_rejects_missing_token() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("   ".into()),
+            ..NodesConfig::default()
+        };
+        let result = check_node_auth(&cfg, &make_pairing(false), &empty_headers(), None);
+        assert_eq!(
+            result.map(|(s, _)| s),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// nodes.auth_token set to whitespace-only, caller presents a token → 503
+    /// (fail-closed: empty-trimmed config must not authenticate any token).
+    #[test]
+    fn nodes_auth_token_whitespace_only_rejects_any_token() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("   ".into()),
+            ..NodesConfig::default()
+        };
+        let headers = bearer_headers("anything");
+        let result = check_node_auth(&cfg, &make_pairing(false), &headers, None);
+        assert_eq!(
+            result.map(|(s, _)| s),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// nodes.auth_token set to whitespace-only, caller presents matching
+    /// whitespace token → 503 (same fail-closed path).
+    #[test]
+    fn nodes_auth_token_whitespace_only_rejects_matching_whitespace_token() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("   ".into()),
+            ..NodesConfig::default()
+        };
+        let headers = bearer_headers("   ");
+        let result = check_node_auth(&cfg, &make_pairing(false), &headers, None);
         assert_eq!(
             result.map(|(s, _)| s),
             Some(StatusCode::SERVICE_UNAVAILABLE)
