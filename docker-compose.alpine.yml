@@ -1,0 +1,56 @@
+# ZeroClaw Docker Compose — Alpine variant
+#
+# Quick start:
+#   1. Set your API key: export ZEROCLAW_providers__models__openrouter__default__api_key=sk-or-...
+#      (V0.8 env-var grammar: ZEROCLAW_<dotted.toml.path.with.double.underscores>=value)
+#   2. Run: docker compose -f docker-compose.alpine.yml up -d
+#   3. Access gateway at http://localhost:42617
+#
+# Build for local platform (fastest):
+#   docker compose -f docker-compose.alpine.yml up --build
+#
+# Multi-arch build (x86_64 + aarch64, rustc runs native, no QEMU):
+#   docker buildx build -f Dockerfile.alpine \
+#     --platform linux/amd64,linux/arm64 -t zeroclaw:alpine --load .
+
+services:
+  zeroclaw:
+    build:
+      context: .
+      dockerfile: Dockerfile.alpine
+    image: zeroclaw:alpine
+    container_name: zeroclaw-alpine
+    restart: unless-stopped
+
+    environment:
+      # V0.8 env-var grammar. Provide credentials here, or bind-mount your own
+      # config.toml over /zeroclaw-data/.zeroclaw/config.toml. The default
+      # baked config (Ollama at host.docker.internal:11434) needs no key.
+      - ZEROCLAW_providers__models__openrouter__default__api_key=${OPENROUTER_API_KEY:-}
+      - ZEROCLAW_ALLOW_PUBLIC_BIND=true
+      - ZEROCLAW_gateway__port=${ZEROCLAW_GATEWAY_PORT:-42617}
+
+    volumes:
+      - zeroclaw-data-alpine:/zeroclaw-data
+
+    ports:
+      - "${HOST_PORT:-42617}:${ZEROCLAW_GATEWAY_PORT:-42617}"
+
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 32M
+
+    healthcheck:
+      test: ["CMD", "zeroclaw", "status", "--format=exit-code"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  zeroclaw-data-alpine:

@@ -14,6 +14,45 @@ Multi-arch: `linux/amd64`, `linux/arm64`.
 
 > **Note on shell access:** The default `latest` image is intentionally distroless and does not include `sh`, `ash`, or `bash`. Use the `debian` tag if you need a shell inside the container (for example, to run `docker exec` for debugging).
 
+## Alpine image (local build)
+
+A third variant, `Dockerfile.alpine`, builds a small **statically-linked musl** image from source. It is not published to `ghcr.io` — build it locally when you want:
+
+- a smaller image footprint than the Debian/glibc variants,
+- a fully static binary (no glibc dependency), well-suited to Proxmox LXC/VM guests and other minimal kernels,
+- the same multi-arch coverage (`linux/amd64`, `linux/arm64`) as the official images.
+
+The builder cross-compiles both musl targets via `cargo-zigbuild` with rustc pinned to the native build platform, so `docker buildx --platform linux/amd64,linux/arm64` runs the compiler natively (no QEMU emulation) and can produce either arch from either an Apple Silicon or an x86-64 host. It carries the same shell tools (`bash`, `git`, `curl`) and the dashboard as the Debian image, installed at the same `/usr/share/zeroclawlabs/web/dist` path.
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+# Local platform only (fastest smoke test):
+docker build -f Dockerfile.alpine -t zeroclaw:alpine .
+
+# Multi-arch (both amd64 + arm64, rustc runs native on each build platform):
+docker buildx build -f Dockerfile.alpine \
+  --platform linux/amd64,linux/arm64 -t zeroclaw:alpine --load .
+```
+
+</div>
+
+Or with the bundled Compose file (single-platform build):
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+docker compose -f docker-compose.alpine.yml up --build
+```
+
+</div>
+
+The alpine image uses the same baked config, `/zeroclaw-data` data mount, and V0.8 env-var grammar as the official images — see [Config inside containers](#config-inside-containers) and the Compose section below.
+
 ## Minimum run
 
 <div class="os-tabs-src">
