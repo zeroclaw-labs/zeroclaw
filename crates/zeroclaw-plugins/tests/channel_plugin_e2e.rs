@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::webhook::{RawWebhook, WebhookReject};
 use zeroclaw_plugins::PluginPermission;
 use zeroclaw_plugins::component::PluginLimits;
 use zeroclaw_plugins::error::PluginError;
@@ -262,4 +263,83 @@ async fn unauthorized_poll_sender_is_not_forwarded() {
         .await
         .expect_err("aborting the listener should cancel the polling loop");
     assert!(err.is_cancelled());
+}
+
+#[tokio::test]
+async fn webhook_ingress_delivers_inbound() {
+    let wasm = fixture();
+
+    // The fixture serves webhook path "fixture" and authenticates the
+    // `x-fixture-secret` header against its configured value.
+    let channel = Arc::new(
+        WasmChannel::from_wasm_mirror(
+            "fixture",
+            "default",
+            &wasm,
+            &[PluginPermission::ConfigRead],
+            "test-secret",
+            test_limits(),
+            allow_all(),
+        )
+        .await
+        .expect("fixture instantiates"),
+    );
+    assert_eq!(channel.webhook_path().await.as_deref(), Some("fixture"));
+
+    // Register the sink drain end + start the listener (which drains webhooks
+    // on a second task), then feed raw webhooks as the gateway would.
+    let (sink_tx, sink_rx) = tokio::sync::mpsc::channel::<RawWebhook>(4);
+    channel.set_webhook_rx(sink_rx);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let listener_channel = Arc::clone(&channel);
+    let listener =
+        ::zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+
+    // Valid signature → the body is decoded into an inbound message and the
+    // reply resolves Ok.
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    sink_tx
+        .send(RawWebhook {
+            headers: vec![("x-fixture-secret".to_string(), "test-secret".to_string())],
+            body: b"hello from webhook".to_vec(),
+            reply: reply_tx,
+        })
+        .await
+        .expect("sink accepts");
+    assert!(
+        matches!(reply_rx.await, Ok(Ok(()))),
+        "valid webhook → reply Ok"
+    );
+
+    // Both the fixture's one-shot config echo (poll) and the webhook message
+    // arrive on `tx`; order is not guaranteed, so assert the webhook body is
+    // among the delivered messages.
+    let mut delivered = Vec::new();
+    for _ in 0..2 {
+        if let Ok(Some(m)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            delivered.push(m.content);
+        }
+    }
+    assert!(
+        delivered.iter().any(|c| c == "hello from webhook"),
+        "webhook body delivered as inbound: {delivered:?}"
+    );
+
+    // Wrong signature → the plugin rejects it: reply Err(Unauthorized).
+    let (reply_tx2, reply_rx2) = tokio::sync::oneshot::channel();
+    sink_tx
+        .send(RawWebhook {
+            headers: vec![("x-fixture-secret".to_string(), "wrong".to_string())],
+            body: b"nope".to_vec(),
+            reply: reply_tx2,
+        })
+        .await
+        .expect("sink accepts");
+    assert!(
+        matches!(reply_rx2.await, Ok(Err(WebhookReject::Unauthorized(_)))),
+        "bad signature → Unauthorized"
+    );
+
+    listener.abort();
+    let _ = listener.await;
 }

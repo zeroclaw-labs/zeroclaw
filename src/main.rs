@@ -4217,6 +4217,11 @@ async fn main() -> Result<()> {
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
 
+                // Shared path→sink registry so the gateway can route inbound
+                // webhooks to the plugin channels this iteration builds. Rebuilt
+                // each daemon iteration alongside the channel set.
+                let plugin_webhooks = Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new());
+
                 // SOP loading is gated on `[sop] sops_dir`: unset disables all
                 // SOP runtime behavior, matching the documented rollback path.
                 let (sop_engine, sop_audit) = if current_config.sop.sops_dir.is_some() {
@@ -4248,10 +4253,12 @@ async fn main() -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let wh = plugin_webhooks.clone();
                     move |host, port, config, tx, reload_controls, tui_registry| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let plugin_webhooks = wh.clone();
                         Box::pin(async move {
                             Box::pin(zeroclaw_gateway::run_gateway(
                                 &host,
@@ -4263,6 +4270,7 @@ async fn main() -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
+                                plugin_webhooks,
                             ))
                             .await
                         })
@@ -4272,10 +4280,12 @@ async fn main() -> Result<()> {
                 registry.register_channels(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let wh = plugin_webhooks.clone();
                     move |config, cancel| {
                         let canvas_store = canvas_store_for_channels.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let plugin_webhooks = wh.clone();
                         Box::pin(async move {
                             Box::pin(zeroclaw_channels::orchestrator::start_channels(
                                 config,
@@ -4283,6 +4293,7 @@ async fn main() -> Result<()> {
                                 cancel,
                                 sop_engine,
                                 sop_audit,
+                                Some(plugin_webhooks),
                             ))
                             .await
                         })
@@ -5003,7 +5014,7 @@ async fn main() -> Result<()> {
                     config.sop.maintenance_interval_secs,
                 );
                 let result = Box::pin(channels::start_channels(
-                    config, None, cancel, sop_engine, sop_audit,
+                    config, None, cancel, sop_engine, sop_audit, None,
                 ))
                 .await;
                 if let Some(handle) = sop_maintenance {
@@ -7873,7 +7884,16 @@ async fn run_gateway_if_enabled(
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None,
+        host,
+        port,
+        config,
+        tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
     ))
     .await;
     match result {

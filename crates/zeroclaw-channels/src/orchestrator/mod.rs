@@ -9916,6 +9916,7 @@ pub async fn start_channels(
     cancel: tokio_util::sync::CancellationToken,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    plugin_webhooks: Option<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
 ) -> Result<()> {
     // Wrap into the canonical shared handle so channels and persistence
     // paths share one source of truth. The local `config` shadowing
@@ -10624,6 +10625,7 @@ pub async fn start_channels(
             for (alias, channel) in zeroclaw_runtime::plugin_channels::build_channel_plugins(
                 &config_arc,
                 &native_channel_keys,
+                plugin_webhooks.as_deref(),
             )
             .await
             {

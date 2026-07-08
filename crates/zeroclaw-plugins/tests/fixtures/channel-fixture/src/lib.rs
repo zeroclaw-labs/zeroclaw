@@ -115,7 +115,9 @@ mod component {
         }
 
         fn get_channel_capabilities() -> ChannelCapabilities {
-            ChannelCapabilities::HEALTH_CHECK | ChannelCapabilities::SELF_HANDLE
+            ChannelCapabilities::HEALTH_CHECK
+                | ChannelCapabilities::SELF_HANDLE
+                | ChannelCapabilities::WEBHOOK_INGRESS
         }
 
         fn health_check() -> bool {
@@ -211,6 +213,41 @@ mod component {
 
         fn supports_free_form_ask() -> bool {
             true
+        }
+
+        fn webhook_path() -> Option<String> {
+            Some("fixture".to_string())
+        }
+
+        fn parse_webhook(
+            headers: Vec<(String, String)>,
+            body: Vec<u8>,
+        ) -> Result<Vec<InboundMessage>, String> {
+            // Auth: the caller must present this fixture's configured secret in
+            // `x-fixture-secret`; otherwise reject (the host replies 401 and
+            // enqueues nothing). Stands in for a real platform HMAC check.
+            let secret = CONFIG.with(|c| c.borrow().clone());
+            let presented = headers
+                .iter()
+                .find(|(k, _)| k == "x-fixture-secret")
+                .map(|(_, v)| v.as_str());
+            if presented != Some(secret.as_str()) {
+                return Err("bad signature".to_string());
+            }
+            let content = String::from_utf8(body).map_err(|_| "non-utf8 body".to_string())?;
+            Ok(vec![InboundMessage {
+                id: "webhook-1".to_string(),
+                sender: "webhook".to_string(),
+                reply_target: "webhook".to_string(),
+                content,
+                channel: PLUGIN_NAME.to_string(),
+                channel_alias: None,
+                timestamp: 0,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: Vec::new(),
+                subject: None,
+            }])
         }
     }
 

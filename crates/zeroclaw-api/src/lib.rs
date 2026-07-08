@@ -34,6 +34,7 @@ pub mod schema;
 pub mod session_keys;
 pub mod tool;
 pub mod vad;
+pub mod webhook;
 
 tokio::task_local! {
     /// Current thread/sender ID for per-sender rate limiting.

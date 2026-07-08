@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 use wasmtime::Store;
 use wasmtime::component::Linker;
 use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
@@ -28,6 +29,7 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 use zeroclaw_api::media::MediaAttachment;
+use zeroclaw_api::webhook::{RawWebhook, WebhookReject};
 
 /// Host-supplied sender authorization for normalized inbound messages.
 ///
@@ -51,6 +53,9 @@ pub struct WasmChannel {
     /// Applied at the final host boundary before any inbound transport can
     /// forward a normalized message to the agent.
     authorizer: SenderAuthorizer,
+    /// Sink-drain end for host-fed webhooks (set by the orchestrator when this
+    /// channel declares a `webhook-path`). Taken once by `listen`.
+    webhook_rx: std::sync::Mutex<Option<mpsc::Receiver<RawWebhook>>>,
 }
 
 /// Whether the listen loop's last `poll-message` did not trap. A channel whose
@@ -193,7 +198,47 @@ impl WasmChannel {
             cached_multi_message_delay_ms,
             poll_healthy: Arc::new(AtomicBool::new(true)),
             authorizer,
+            webhook_rx: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Whether this plugin advertises `webhook-ingress` (serves inbound via a
+    /// host webhook route rather than self-polling).
+    pub fn has_webhook_ingress(&self) -> bool {
+        self.capabilities
+            .contains(ChannelCapabilities::WEBHOOK_INGRESS)
+    }
+
+    /// The URL path segment this channel serves webhooks on, or `None` for a
+    /// poll-only channel. Calls the plugin's `webhook-path` export (only when it
+    /// advertised the capability).
+    pub async fn webhook_path(&self) -> Option<String> {
+        if !self.has_webhook_ingress() {
+            return None;
+        }
+        let result: Result<Option<String>> = call_plugin!(
+            self,
+            async move |store: &mut Store<PluginState>, bindings: &mut ChannelPlugin| {
+                wt(
+                    bindings
+                        .zeroclaw_plugin_channel()
+                        .call_webhook_path(store)
+                        .await,
+                    "channel.webhook-path failed",
+                )
+            }
+        );
+        result.ok().flatten()
+    }
+
+    /// Hand this channel the drain end of its webhook sink, before it is boxed
+    /// into an `Arc<dyn Channel>`; `listen` takes it once.
+    pub fn set_webhook_rx(&self, rx: mpsc::Receiver<RawWebhook>) {
+        let mut webhook_rx = self
+            .webhook_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *webhook_rx = Some(rx);
     }
 
     /// Instantiate a novel channel plugin from its `[[plugins.entries]]` config.
@@ -425,6 +470,62 @@ impl Channel for WasmChannel {
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
         let channel_ref = self.channel_ref.clone();
         let authorizer = Arc::clone(&self.authorizer);
+
+        let mut webhook_rx = self
+            .webhook_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut webhook_rx) = webhook_rx.take() {
+            let webhook_state = Arc::clone(&self.state);
+            let webhook_channel_ref = channel_ref.clone();
+            let webhook_tx = tx.clone();
+            let webhook_authorizer = Arc::clone(&authorizer);
+            zeroclaw_spawn::spawn!(async move {
+                while let Some(RawWebhook {
+                    headers,
+                    body,
+                    reply,
+                }) = webhook_rx.recv().await
+                {
+                    let decoded = {
+                        let mut guard = webhook_state.lock().await;
+                        let (ref mut store, ref mut bindings) = *guard;
+                        crate::component::refuel(store);
+                        bindings
+                            .zeroclaw_plugin_channel()
+                            .call_parse_webhook(store, &headers, &body)
+                            .await
+                    };
+                    match decoded {
+                        Ok(Ok(messages)) => {
+                            for message in messages {
+                                if forward_if_authorized(
+                                    &webhook_tx,
+                                    &webhook_authorizer,
+                                    &webhook_channel_ref,
+                                    from_wit_inbound(message, &webhook_channel_ref),
+                                )
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            let _ = reply.send(Ok(()));
+                        }
+                        Ok(Err(reason)) => {
+                            let _ = reply.send(Err(WebhookReject::Unauthorized(reason)));
+                        }
+                        Err(error) => {
+                            let _ =
+                                reply.send(Err(WebhookReject::BadRequest(format!("{error:#}"))));
+                        }
+                    }
+                }
+            });
+        }
+
         const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
         const MAX_BACKOFF: Duration = Duration::from_millis(500);
         let mut backoff = INITIAL_BACKOFF;

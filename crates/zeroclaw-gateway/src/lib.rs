@@ -597,6 +597,8 @@ pub async fn run_gateway(
     // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    // Path→sink registry for routing inbound plugin webhooks (daemon-owned).
+    plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
@@ -1691,6 +1693,11 @@ pub async fn run_gateway(
         .route("/pair", post(handle_pair))
         .route("/pair/code", get(handle_pair_code))
         .route("/webhook", post(handle_webhook))
+        // Inbound webhooks for plugin channels: a plugin claims `<segment>` via
+        // its `webhook-path` export; the registry carries the sink. Disjoint
+        // from every native channel route by the `/plugin/` prefix.
+        .route("/plugin/{path}", post(handle_plugin_webhook))
+        .layer(axum::Extension(plugin_webhooks.clone()))
         .merge(optional_channel_routes())
         // ── Claude Code runner hooks ──
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
@@ -2718,6 +2725,65 @@ pub struct WebhookQuery {
     /// can reuse their query string verbatim.
     #[serde(default, alias = "agentAlias", alias = "agent_alias")]
     pub agent: Option<String>,
+}
+
+/// POST /plugin/{path} — hand a raw inbound webhook to the plugin channel that
+/// claimed `path`. The plugin verifies authenticity and decodes the payload in
+/// its own `parse-webhook` export; the reply drives the status code. The turn is
+/// never run inline: the message goes through the plugin's bounded inbound queue
+/// (429 when full) and the normal dispatch loop.
+async fn handle_plugin_webhook(
+    axum::Extension(registry): axum::Extension<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
+    axum::extract::Path(path): axum::extract::Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use zeroclaw_api::webhook::{RawWebhook, WebhookReject};
+
+    let Some(sink) = registry.get(&path) else {
+        return (StatusCode::NOT_FOUND, "no plugin serves this webhook path").into_response();
+    };
+
+    // Lower-cased header names → values; non-UTF-8 header values are dropped.
+    let header_pairs: Vec<(String, String)> = headers
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|val| (k.as_str().to_ascii_lowercase(), val.to_string()))
+        })
+        .collect();
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let raw = RawWebhook {
+        headers: header_pairs,
+        body: body.to_vec(),
+        reply: reply_tx,
+    };
+    if sink.try_send(raw).is_err() {
+        // Bounded queue full or the channel is gone — shed load rather than
+        // block the HTTP worker.
+        return (StatusCode::TOO_MANY_REQUESTS, "plugin webhook queue full").into_response();
+    }
+
+    match tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
+        Ok(Ok(Ok(()))) => StatusCode::OK.into_response(),
+        Ok(Ok(Err(WebhookReject::Unauthorized(m)))) => {
+            (StatusCode::UNAUTHORIZED, m).into_response()
+        }
+        Ok(Ok(Err(WebhookReject::BadRequest(m)))) => (StatusCode::BAD_REQUEST, m).into_response(),
+        // The plugin dropped the reply (e.g. its channel task ended).
+        Ok(Err(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "plugin channel unavailable",
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "plugin webhook decode timed out",
+        )
+            .into_response(),
+    }
 }
 
 /// POST /webhook — main webhook endpoint
@@ -5146,7 +5212,19 @@ mod tests {
         // the spawn: a still-running task at the deadline means boot
         // got far enough to start serving.
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
+            )
+            .await
         });
 
         match tokio::time::timeout(
@@ -5210,7 +5288,19 @@ mod tests {
         config.agents.insert("fake123".to_string(), agent);
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
+            )
+            .await
         });
 
         match tokio::time::timeout(
@@ -5251,7 +5341,19 @@ mod tests {
         );
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
+            )
+            .await
         });
 
         match tokio::time::timeout(
@@ -5310,6 +5412,7 @@ mod tests {
                 None,
                 None,
                 None,
+                Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
             )
             .await
         });
