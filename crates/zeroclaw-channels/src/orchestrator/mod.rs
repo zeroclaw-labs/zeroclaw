@@ -10644,6 +10644,36 @@ pub async fn start_channels(
                      `channel-filesystem`; skipping Filesystem."
                 );
             }
+            // WASM channel plugins — registered and supervised exactly like
+            // native channels, but a compiled-in channel of the same id wins
+            // (native-wins), mirroring the tool-plugin and skill-tool shadow
+            // policy. The building lives in `zeroclaw-runtime` (this crate has no
+            // `zeroclaw-plugins` dependency); the dedup set is computed here where
+            // the native channel ids are known. Downstream — the supervised
+            // listener and the `channels_by_name` registry — consume these
+            // appended entries unchanged.
+            let native_channel_ids: std::collections::HashSet<String> = configured_channels
+                .iter()
+                .map(|cc| cc.channel.name().to_string())
+                .collect();
+            for (id, channel) in
+                zeroclaw_runtime::plugin_channels::build_channel_plugins(&config).await
+            {
+                if native_channel_ids.contains(&id) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!("Plugin channel '{id}' shadows a compiled-in channel, skipping")
+                    );
+                    continue;
+                }
+                configured_channels.push(ConfiguredChannel {
+                    display_name: "Plugin",
+                    alias: Some(id),
+                    channel,
+                });
+            }
             let channels: Vec<Arc<dyn Channel>> = configured_channels
                 .iter()
                 .map(|cc| Arc::clone(&cc.channel))
