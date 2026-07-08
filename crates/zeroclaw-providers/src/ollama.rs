@@ -216,9 +216,14 @@ pub struct OllamaBuilder {
 }
 
 impl OllamaBuilder {
-    /// Override the Ollama server base URL. Empty / whitespace-only values
-    /// fall back to the default; trailing `/` and `/api/...` paths are
-    /// normalized identically to the pre-builder behaviour.
+    /// Override the Ollama server base URL. `None` (the default) uses
+    /// the module-level `BASE_URL` constant (`http://localhost:11434`);
+    /// `Some("")` / whitespace-only input is preserved as an empty
+    /// base URL (matching the pre-builder behaviour — useful for tests
+    /// that inject a mock server via a full endpoint URL and want the
+    /// provider's `base_url` field to stay literally empty). Trailing
+    /// `/` and `/api[...]` suffixes are normalized identically to the
+    /// pre-builder ctor.
     pub fn base_url(mut self, base_url: Option<&str>) -> Self {
         self.base_url = base_url.map(str::to_string);
         self

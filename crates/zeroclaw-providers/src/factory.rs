@@ -1202,15 +1202,22 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
         _api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let mut p = if let Some(api_key) = key {
-            crate::bedrock::BedrockModelProvider::new(alias).with_bearer_token(api_key)
+        let builder = crate::bedrock::BedrockModelProvider::builder(alias);
+        // Explicit-key path stays no-probe — do not run BEDROCK_API_KEY /
+        // AwsCredentials::from_env / from_credential_process (which can
+        // spawn a shell command) when the operator has already resolved
+        // a Bedrock API key from config.
+        let builder = if let Some(api_key) = key {
+            builder.bearer_token(api_key)
         } else {
-            crate::bedrock::BedrockModelProvider::new(alias)
+            builder
         };
-        if let Some(mt) = opts.provider_max_tokens {
-            p = p.with_max_tokens(mt);
-        }
-        Ok(Box::new(p))
+        let builder = if let Some(mt) = opts.provider_max_tokens {
+            builder.max_tokens(mt)
+        } else {
+            builder
+        };
+        Ok(Box::new(builder.build()))
     }
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
