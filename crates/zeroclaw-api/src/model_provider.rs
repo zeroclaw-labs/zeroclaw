@@ -98,6 +98,28 @@ impl ChatMessage {
                 .and_then(|previous| messages.get(previous))
                 .is_some_and(Self::is_pruned_tool_exchange_summary)
     }
+
+    pub fn is_system(&self) -> bool {
+        self.role == "system"
+    }
+
+    pub fn is_user(&self) -> bool {
+        self.role == "user"
+    }
+
+    pub fn sanitize_leading_turn_order(messages: &mut Vec<Self>) {
+        let first_non_system = messages
+            .iter()
+            .position(|m| !m.is_system())
+            .unwrap_or(messages.len());
+        let mut drop_to = first_non_system;
+        while drop_to < messages.len() && !messages[drop_to].is_user() {
+            drop_to += 1;
+        }
+        if drop_to > first_non_system {
+            messages.drain(first_non_system..drop_to);
+        }
+    }
 }
 
 /// A tool call requested by the LLM.
@@ -876,4 +898,65 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
     }
 
     instructions
+}
+
+#[cfg(test)]
+mod turn_order_tests {
+    use super::ChatMessage;
+
+    #[test]
+    fn drops_leading_assistant_tool_call_before_first_user() {
+        let mut msgs = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant("[tool_call] fire"),
+            ChatMessage::tool("result"),
+            ChatMessage::user("actual user"),
+        ];
+        ChatMessage::sanitize_leading_turn_order(&mut msgs);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[1].role, "user");
+        assert_eq!(msgs[1].content, "actual user");
+    }
+
+    #[test]
+    fn drops_leading_orphan_tool_turn() {
+        let mut msgs = vec![ChatMessage::tool("orphan result"), ChatMessage::user("hi")];
+        ChatMessage::sanitize_leading_turn_order(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+    }
+
+    #[test]
+    fn preserves_already_valid_history() {
+        let mut msgs = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("q"),
+            ChatMessage::assistant("[tool_call] x"),
+            ChatMessage::tool("r"),
+            ChatMessage::assistant("done"),
+        ];
+        let before = msgs.clone();
+        ChatMessage::sanitize_leading_turn_order(&mut msgs);
+        assert_eq!(msgs.len(), before.len());
+        assert_eq!(msgs[1].role, "user");
+    }
+
+    #[test]
+    fn no_user_turn_drops_all_non_system() {
+        let mut msgs = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant("[tool_call] x"),
+            ChatMessage::tool("r"),
+        ];
+        ChatMessage::sanitize_leading_turn_order(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "system");
+    }
+
+    #[test]
+    fn empty_history_is_noop() {
+        let mut msgs: Vec<ChatMessage> = vec![];
+        ChatMessage::sanitize_leading_turn_order(&mut msgs);
+        assert!(msgs.is_empty());
+    }
 }

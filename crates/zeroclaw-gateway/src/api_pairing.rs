@@ -856,12 +856,22 @@ mod tests {
         state.pairing = Arc::new(PairingGuard::new(true, &[]));
         // No device_registry at all → registry branch is skipped,
         // so the persistence branch is the only failing step.
-        // Point the config path at a non-existent file inside a
-        // directory whose parent doesn't exist so `save_dirty`
-        // cannot write.
+        //
+        // Force `save_dirty` → `write_config_atomically` → `create_dir_all`
+        // to fail deterministically by pointing `config_path` at a file
+        // whose parent segment is itself an ordinary file. `create_dir_all`
+        // then hits ENOTDIR at the kernel level, which root cannot bypass
+        // — unlike the previous `/no/such/dir/config.toml` path, where a
+        // uid-0 CI runner is allowed to create `/no/`, `/no/such/`,
+        // `/no/such/dir/` from `/` and the save silently succeeds, letting
+        // the whole rollback path go untested (and leaking a 200 + token
+        // if it ever regresses).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"").expect("seed blocker file");
         {
             let mut cfg = state.config.write();
-            cfg.config_path = PathBuf::from("/no/such/dir/config.toml");
+            cfg.config_path = blocker.join("config.toml");
         }
 
         let code = state
