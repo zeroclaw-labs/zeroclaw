@@ -21,11 +21,11 @@ const INPUT_CLS = 'w-full rounded border border-pc-border bg-pc-surface px-2 py-
 /// Shared, cached load of the tool catalog (built-in agent tools + CLI tools).
 /// `loadCatalog` is process-cached, so every mounted editor resolves instantly
 /// after the first fetch.
-function useToolCatalog(): CatalogEntry[] | null {
+function useToolCatalog(agent?: string | null): CatalogEntry[] | null {
   const [catalog, setCatalog] = useState<CatalogEntry[] | null>(null);
   useEffect(() => {
     let live = true;
-    loadCatalog()
+    loadCatalog(agent ?? undefined)
       .then((entries) => {
         if (live) setCatalog(entries);
       })
@@ -35,7 +35,7 @@ function useToolCatalog(): CatalogEntry[] | null {
     return () => {
       live = false;
     };
-  }, []);
+  }, [agent]);
   return catalog;
 }
 
@@ -406,16 +406,20 @@ function SchemaArgsEditor({
 export function PlannedCallsEditor({
   calls,
   captured,
+  agent,
   onChange,
 }: {
   calls: PlannedToolCall[];
   /// Captured calls for the same step from a watched run, used to pin
   /// sample outputs onto planned calls at the same index.
   captured?: StepToolCall[];
+  /// Effective agent for the owning step (step-level override or the SOP's
+  /// agent), so the tool catalog scopes to that agent's real tool set.
+  agent?: string | null;
   onChange: (next: PlannedToolCall[]) => void;
 }) {
   const [openIdx, setOpenIdx] = useState<number | null>(null);
-  const catalog = useToolCatalog();
+  const catalog = useToolCatalog(agent);
   const setCall = (i: number, patch: Partial<PlannedToolCall>) => {
     onChange(calls.map((c, j) => (j === i ? { ...c, ...patch } : c)));
   };

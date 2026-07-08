@@ -17,7 +17,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Search, X, Wrench, Terminal } from 'lucide-react';
-import type { ToolSpec, CliTool } from '@/types/api';
+import type { ToolSpec, CliTool, OptionDomain } from '@/types/api';
 import { getTools, getCliTools } from '@/lib/api';
 import { t } from '@/lib/i18n';
 
@@ -43,6 +43,10 @@ export interface CatalogEntry {
   group: 'agent' | 'cli';
   /** JSON Schema for the tool's args (agent tools only; CLI tools omit it). */
   parameters?: unknown;
+  /** Declared structured-output schema, when the tool declares one. */
+  output?: unknown;
+  /** Parameter name → runtime option domain, for domain-typed params. */
+  param_domains?: Record<string, OptionDomain>;
 }
 
 // Process-wide cache so re-mounting the picker (e.g. reopening the Cron
@@ -77,6 +81,8 @@ export function loadCatalog(agent?: string): Promise<CatalogEntry[]> {
         description: tnt.description,
         group: 'agent' as const,
         parameters: tnt.parameters,
+        output: tnt.output,
+        param_domains: tnt.param_domains,
       }));
       const cli: CatalogEntry[] = cliTools.map((c: CliTool) => ({
         name: c.name,

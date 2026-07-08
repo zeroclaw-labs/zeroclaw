@@ -891,7 +891,7 @@ mod tests {
         ToolSpec {
             name: name.to_string(),
             description: String::new(),
-            parameters: params,
+            parameters: std::sync::Arc::new(params),
             output,
             param_domains: Default::default(),
         }

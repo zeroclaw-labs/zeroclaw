@@ -420,6 +420,8 @@ mod tests {
             name: "shell".to_string(),
             description: "Run commands".to_string(),
             parameters: std::sync::Arc::new(schema.clone()),
+            output: None,
+            param_domains: std::collections::BTreeMap::new(),
         };
         let arc_params = serde_json::to_string(&spec.parameters).expect("arc serializes");
         let plain_params = serde_json::to_string(&schema).expect("plain value serializes");

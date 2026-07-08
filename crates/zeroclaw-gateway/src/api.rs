@@ -348,11 +348,18 @@ pub async fn handle_api_tools(
     let tools: Vec<serde_json::Value> = registry
         .iter()
         .map(|spec| {
-            serde_json::json!({
+            let mut tool = serde_json::json!({
                 "name": spec.name,
                 "description": spec.description,
                 "parameters": spec.parameters,
-            })
+            });
+            if let Some(output) = &spec.output {
+                tool["output"] = output.clone();
+            }
+            if !spec.param_domains.is_empty() {
+                tool["param_domains"] = serde_json::json!(spec.param_domains);
+            }
+            tool
         })
         .collect();
 

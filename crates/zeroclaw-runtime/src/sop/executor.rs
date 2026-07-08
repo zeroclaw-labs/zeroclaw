@@ -369,6 +369,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn record_step_tool_call_scrubs_authorization_and_cookie_output_data() {
+        let sink = new_step_call_sink();
+        scope_step_call_sink(sink.clone(), async {
+            record_step_tool_call(
+                "http_request",
+                &json!({"url": "https://example.com/login"}),
+                true,
+                "200 OK".into(),
+                Some(json!({"body": {
+                    "authorization": "Bearer sk-live-abcdef0123456789",
+                    "cookie": "session=deadbeefcafebabe0123",
+                    "set-cookie": "sid=9f8e7d6c5b4a3210feed"
+                }})),
+                None,
+                7,
+            );
+        })
+        .await;
+
+        let calls = drain_step_calls(&sink);
+        assert_eq!(calls.len(), 1);
+        let body = calls[0]
+            .output_data
+            .as_ref()
+            .and_then(|d| d.get("body"))
+            .expect("output_data body present");
+        for (key, leaked) in [
+            ("authorization", "sk-live-abcdef0123456789"),
+            ("cookie", "deadbeefcafebabe0123"),
+            ("set-cookie", "9f8e7d6c5b4a3210feed"),
+        ] {
+            let value = body
+                .get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("{key} present"));
+            assert!(
+                value.contains("[REDACTED]"),
+                "output_data {key} was not scrubbed: {value}"
+            );
+            assert!(!value.contains(leaked), "output_data {key} leaked secret");
+        }
+    }
+
+    #[tokio::test]
     async fn nested_step_call_scopes_do_not_leak_into_outer_sink() {
         let outer = new_step_call_sink();
         let inner = new_step_call_sink();

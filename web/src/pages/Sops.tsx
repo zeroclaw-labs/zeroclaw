@@ -644,6 +644,7 @@ function StepEditor({
         <PlannedCallsEditor
           calls={step.calls ?? []}
           captured={capturedCalls}
+          agent={step.agent ?? parentAgent}
           onChange={(next) => onChange({ calls: next })}
         />
       </div>

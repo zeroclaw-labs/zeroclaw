@@ -6,7 +6,7 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\./+=]{8,}))"#).unwrap()
+    Regex::new(r#"(?i)(authorization|token|api[_-]?key|password|secret|user[_-]?key|bearer|credential|set[_-]?cookie|cookie)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\./+=]{8,}))"#).unwrap()
 });
 
 /// Scrub credentials from text bound for a human-facing surface (log records,
@@ -58,7 +58,7 @@ pub fn scrub_credentials(input: &str) -> String {
 }
 
 static SENSITIVE_KEY_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)"#).unwrap()
+    Regex::new(r#"(?i)(authorization|token|api[_-]?key|password|secret|user[_-]?key|bearer|credential|set[_-]?cookie|cookie)"#).unwrap()
 });
 
 /// Structured-aware credential scrub for a JSON value bound for a human-facing
@@ -125,6 +125,29 @@ mod tests {
         assert!(!token.contains("abcdef0123456789"));
         assert_eq!(out["body"]["status"], "ok");
         assert_eq!(out["count"], 3);
+    }
+
+    #[test]
+    fn scrub_credentials_value_redacts_authorization_and_cookie_keys() {
+        let input = serde_json::json!({
+            "body": {
+                "authorization": "Bearer sk-live-abcdef0123456789",
+                "cookie": "session=deadbeefcafebabe0123",
+                "set-cookie": "sid=9f8e7d6c5b4a3210feed",
+                "status": "ok"
+            }
+        });
+        let out = scrub_credentials_value(input);
+        let authorization = out["body"]["authorization"].as_str().unwrap();
+        assert!(authorization.contains("[REDACTED]"));
+        assert!(!authorization.contains("sk-live-abcdef0123456789"));
+        let cookie = out["body"]["cookie"].as_str().unwrap();
+        assert!(cookie.contains("[REDACTED]"));
+        assert!(!cookie.contains("deadbeefcafebabe0123"));
+        let set_cookie = out["body"]["set-cookie"].as_str().unwrap();
+        assert!(set_cookie.contains("[REDACTED]"));
+        assert!(!set_cookie.contains("9f8e7d6c5b4a3210feed"));
+        assert_eq!(out["body"]["status"], "ok");
     }
 
     #[test]
