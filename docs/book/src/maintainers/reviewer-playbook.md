@@ -54,7 +54,7 @@ If any intake check fails, leave one actionable checklist comment and stop. Don'
 - Rollback path is concrete; "revert" is not concrete.
 - Compatibility and migration impact is clear.
 - No personal or sensitive data leaked into diff artifacts; tests use neutral, project-scoped placeholders.
-- Naming and architecture boundaries follow project contracts (`AGENTS.md`, [Extension examples](../developing/extension-examples.md)).
+- Naming and architecture boundaries follow project contracts (`AGENTS.md`, [Architecture overview](../architecture/overview.md#core-traits)).
 
 ### Deep-review checklist (high-risk only)
 
@@ -92,6 +92,7 @@ Issue `risk:*` labels describe likely fix blast radius from the report. PR `risk
 | `status:blocked` | Valid work is waiting on an external dependency, maintainer decision, or linked prerequisite. Record the blocker; this is stale protection only while that blocker remains unresolved. |
 | `status:in-progress` | An open PR is actively targeting the issue. Re-check live PR state before relying on it during stale passes. |
 | `status:no-stale` | Accepted or otherwise long-lived work should stay open and is not already protected by another stale exclusion. Record the reason and routing evidence using the contributor-visible sources in the [Project board contract](./pr-workflow.md#issue-routing-evidence). Active release trackers and active RFC or design trackers may use the tracker itself as the visible reason and routing surface while they remain active. |
+| `type:tracker` | Active parent coordination issue for a release, roadmap, RFC/design thread, implementation batch, cleanup, or audit. Use only when the live label exists; do not substitute `roadmap` or `type:roadmap`. This is a finder/routing marker, not stale protection by itself. |
 | `good first issue` | XS/S, self-contained, documented work with clear acceptance criteria, relevant code or docs links, a named mentor or contact, and low onboarding risk. |
 | `help wanted` | Actionable, unblocked work maintainers want external help on and can review. Do not use it as a generic valid/unowned marker. |
 
@@ -127,8 +128,14 @@ When review demand exceeds capacity:
 
 1. Keep active bug and security PRs (`size:XS` or `size:S`) at the top of the queue.
 2. Ask overlapping PRs to consolidate; close older ones with a superseded or replaced rationale after the author acknowledges. See [Superseding PRs](./superseding.md) for the attribution rules.
-3. Mark dormant PRs as `stale-candidate` before stale closure window starts.
-4. Require rebase + fresh validation evidence before reopening anything that's been stale-closed.
+3. Use the PR stale ramp below. PR backlog pruning uses `needs-author-action` and `stale-candidate`; issue stale sweeps use `status:stale` under the RFC stale policy.
+
+| State | When to use | Required public note | Follow-up |
+|---|---|---|---|
+| `needs-author-action` | The next PR step is on the author: rebase, conflict fix, scope split, review answer, requested code change, or refreshed validation. | A review or comment names the concrete action. | Continue normal review when the author responds. This is not a closure warning by itself. |
+| `stale-candidate` | A prior author-action request has sat unanswered and the PR now blocks useful review, or the branch is clearly stale, dirty, or obsolete against current `master`. Do not stale-escalate work that is parked under a visible maintainer plan, explicit dependency, active owner, or recorded revisit date. | A comment names the requested action and a follow-up date, normally 7-10 days out unless a maintainer chooses a longer window. It should distinguish a stale branch from a still-valid bug or feature request. | At the follow-up date, re-check live state. If the author responded or the branch became reviewable, remove or keep off `stale-candidate`. If there is still no response and no maintainer takeover or replacement path, close with a backlog-hygiene rationale and a clear reopening or replacement path. |
+
+If the underlying bug or feature is still valid, preserve it in an issue, tracker row, replacement PR, or takeover plan instead of implying that the idea was rejected. Require rebase + fresh validation evidence before reopening anything that's been stale-closed.
 
 ## Automation override
 

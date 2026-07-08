@@ -1,0 +1,1 @@
+> **Not yet wired.** This trigger type is defined and matched, and its syntax validates, but no live event source currently routes events into the SOP dispatcher for it. A SOP with this trigger loads without error but only starts via a live source ([MQTT](./mqtt.md), [Filesystem](./filesystem.md), [AMQP](./amqp.md)) or [`sop_execute`](./manual.md).

@@ -153,6 +153,13 @@ OAuth-backed Qwen accounts use the same slot with `auth_mode = "oauth"`.
 
 ### MiniMax: slot `minimax`
 
+```toml
+[providers.models.minimax.intl]
+model    = "MiniMax-M3"                       # or MiniMax-M2.7, MiniMax-M2.7-highspeed
+api_key  = "..."
+endpoint = "intl"                            # variants: cn, intl
+```
+
 ### Z.AI: slot `zai`
 
 For Z.AI's Anthropic-compatible API, use `[providers.models.anthropic.zai]` with `uri = "https://api.z.ai/api/anthropic"` instead.

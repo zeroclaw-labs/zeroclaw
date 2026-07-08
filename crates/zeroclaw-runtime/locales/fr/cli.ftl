@@ -128,6 +128,7 @@ cli-models-set-about = Définir le modèle par défaut dans la configuration
 cli-models-status-about = Afficher la configuration actuelle du modèle et l'état du cache
 cli-doctor-models-about = Sonder les catalogues de modèles à travers les fournisseurs et signaler la disponibilité
 cli-doctor-traces-about = Interroger les événements de trace d'exécution (diagnostics d'outils et réponses de modèle)
+cli-doctor-update-context-windows-about = Mettre à jour context_window dans config.toml depuis les endpoints /models du fournisseur
 cli-hardware-discover-about = Énumérer les dispositifs USB et afficher les cartes connues
 cli-hardware-introspect-about = Inspecter un appareil par son numéro de série ou son chemin de dispositif
 cli-hardware-info-about = Obtenir les informations de puce via USB en utilisant probe-rs via ST-Link
@@ -290,6 +291,13 @@ cli-skills-install-suggestion =
 
     Capacité correspondante : {$matched}
     Étape suivante : Exécutez `{$install_command}` pour l'installer.
+
+cli-plugin-install-suggestion =
+    Il semble que cette requête nécessite le plugin `{$name}`, mais il n'est pas installé.
+
+    Capacité correspondante : {$matched}
+    Étape suivante : Exécutez `{$install_command}` pour l'installer.
+
 cli-completions-long-about =
     Génère les scripts de complétion de shell pour `zeroclaw`.
 
@@ -389,6 +397,9 @@ cli-skills-create-hint = {"  "}Créez-en une : mkdir -p ~/.zeroclaw/workspace/sk
 cli-skills-install-hint = {"  "}Ou installez : zeroclaw skills install <source>
 cli-skills-installed-header = Compétences installées ({$count}) :
 cli-skills-tags = Étiquettes :  {$tags}
+cli-skills-skipped-header = Ignorées ({$count}) :
+cli-skills-skipped-reason = {"    "}Raison : {$reason}
+cli-skills-skipped-scripts-hint = {"    "}Définissez `skills.allow_scripts = true` dans votre configuration zeroclaw pour l'activer.
 cli-sop-none = Aucun SOP trouvé.
 cli-sop-create-hint = {"  "}Créez-en un : mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}puis ajoutez SOP.toml et SOP.md
@@ -779,3 +790,17 @@ cli-bundle-warn-archive = avertissement : échec de l'archivage du répertoire d
 cli-bundle-deleted = skill_bundles.{$alias} supprimé (retiré de {$count} agent(s))
 cli-bundle-warn-move = avertissement : échec du déplacement du répertoire de bundle : {$error}
 cli-bundle-renamed = skill_bundles.{$from} → skill_bundles.{$to} renommé
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
+cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
+cli-agent-context-bar-unknown = ctx: inconnu / {$max}
+cli-doctor-ctxwin-already-set = {$provider_ref}: a déjà context_window = {$ctx}
+cli-doctor-ctxwin-no-model = {$provider_ref}: aucun modèle configuré, ignoré
+cli-doctor-ctxwin-would-set = {$provider_ref}: définirait context_window = {$ctx} (simulation)
+cli-doctor-ctxwin-set = {$provider_ref}: context_window défini = {$ctx}
+cli-doctor-ctxwin-not-found = {$provider_ref}: entrée introuvable pour mise à jour
+cli-doctor-ctxwin-fetch-failed = {$provider_ref}: n'expose pas la fenêtre de contexte ou l'obtention a échoué
+cli-doctor-ctxwin-saved = {$updated} mise(s) à jour enregistrée(s) dans config.toml
+cli-doctor-ctxwin-dry-run = Simulation terminée — aucun changement. Relancez sans --dry-run pour appliquer.
+cli-doctor-ctxwin-none = Aucune mise à jour nécessaire.
+cli-doctor-ctxwin-write-failed = {$provider_ref}: échec de l'écriture de context_window: {$error}

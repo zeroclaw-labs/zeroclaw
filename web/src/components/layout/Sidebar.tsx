@@ -285,7 +285,7 @@ function RailLogo() {
           style={{ background: 'linear-gradient(135deg, rgba(var(--pc-accent-rgb), 0.15), rgba(var(--pc-accent-rgb), 0.05))' }}
         />
         <img
-          src={`${basePath}/_app/zeroclaw-trans.png`}
+          src={`${basePath}/_app/logo.png`}
           alt={t('sidebar.logo_alt')}
           className="relative h-8 w-8 rounded-xl object-cover"
           onError={(e) => {
@@ -310,7 +310,7 @@ function DrawerLogo() {
           style={{ background: 'linear-gradient(135deg, rgba(var(--pc-accent-rgb), 0.15), rgba(var(--pc-accent-rgb), 0.05))' }}
         />
         <img
-          src={`${basePath}/_app/zeroclaw-trans.png`}
+          src={`${basePath}/_app/logo.png`}
           alt={t('sidebar.logo_alt')}
           className="relative h-9 w-9 rounded-xl object-cover"
           onError={(e) => {
