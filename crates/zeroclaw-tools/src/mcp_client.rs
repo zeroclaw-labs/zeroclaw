@@ -917,6 +917,7 @@ mod tests {
     async fn connect_nonexistent_command_fails_cleanly() {
         // A command that doesn't exist should fail at spawn, not panic.
         let config = McpServerConfig {
+            pinned_resources: Vec::new(),
             name: "nonexistent".to_string(),
             command: "/usr/bin/this_binary_does_not_exist_zeroclaw_test".to_string(),
             args: vec![],
@@ -937,6 +938,7 @@ mod tests {
     async fn connect_all_nonfatal_on_single_failure() {
         // If one server config is bad, connect_all should succeed (with 0 servers).
         let configs = vec![McpServerConfig {
+            pinned_resources: Vec::new(),
             name: "bad".to_string(),
             command: "/usr/bin/does_not_exist_zc_test".to_string(),
             args: vec![],
@@ -957,6 +959,7 @@ mod tests {
     #[test]
     fn http_transport_requires_url() {
         let config = McpServerConfig {
+            pinned_resources: Vec::new(),
             name: "test".into(),
             transport: McpTransport::Http,
             ..Default::default()
@@ -1311,6 +1314,7 @@ done
         std::fs::set_permissions(&server_path, perms).expect("chmod");
 
         let config = McpServerConfig {
+            pinned_resources: Vec::new(),
             name: "echo".to_string(),
             command: server_path.display().to_string(),
             args: vec![pid_path.display().to_string()],

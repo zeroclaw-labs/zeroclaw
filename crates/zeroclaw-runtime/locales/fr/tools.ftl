@@ -60,7 +60,7 @@ tool-file-download-error-write-body = Échec lors de l'écriture des octets tél
 tool-file-download-error-flush = Échec du vidage du fichier téléchargé : { $err }
 tool-file-download-error-move = Échec du déplacement du fichier téléchargé à sa place : { $err }
 tool-file-download-success = { $written } octets téléchargés vers { $dest_path } ({ $status })
-tool-file-read = Lire le contenu du fichier avec les numéros de ligne. Prise en charge de la lecture partielle via offset et limite. Extrait le texte des PDF ; les autres fichiers binaires sont lus avec une conversion UTF-8 lossless.
+tool-file-read = Lire le contenu du fichier avec les numéros de ligne. Prise en charge de la lecture partielle via offset et limite. Les fichiers binaires et images sont rejetés (utilisez l'outil image_info pour les images). Définissez encoding="base64" pour renvoyer les octets bruts encodés en base64 (pour les fichiers binaires tels que .pdf/.xlsx/.docx) ; offset/limit sont ignorés dans ce mode.
 tool-file-write = Écrire le contenu dans un fichier de l'espace de travail
 tool-git-operations = Effectue des opérations Git structurées (état, diff, journal, branche, engagement, ajouter, checkout, stash). Fournit une sortie JSON analysée et s'intègre à la politique de sécurité pour les contrôles d'autonomie.
 tool-git-operations-error-not-in-repo = Pas dans un dépôt Git à '{ $path }'. Choisissez un chemin dans un arbre de travail Git, passez 'path' pour un sous-répertoire du dépôt, ou initialisez un dépôt avant d'exécuter git_operations.
@@ -81,7 +81,6 @@ tool-memory-store = Stocker un fait, une préférence ou une note dans la mémoi
 tool-microsoft365 = Intégration Microsoft 365 : gérez les e-mails Outlook, les messages Teams, les événements du calendrier, les fichiers OneDrive et la recherche SharePoint via l'API Microsoft Graph
 tool-model-routing-config = Gérer les paramètres par défaut du modèle, les routes de fournisseur/modèle basées sur des scénarios, les règles de classification et les profils de sous-agents délégués.
 tool-notion = Interagir avec Notion : interroger des bases de données, lire/créer/mettre à jour des pages et rechercher dans l'espace de travail.
-tool-pdf-read = Extrait le texte brut d'un fichier PDF dans l'espace de travail. Retourne tout le texte lisible. Les PDF uniquement imagés ou chiffrés retournent un résultat vide. Nécessite la fonctionnalité de compilation 'rag-pdf'.
 tool-project-intel = Intelligence de livraison de projet : générer des rapports d'état, détecter les risques, rédiger des mises à jour pour les clients, résumer les sprints et estimer l'effort. Outil d'analyse en lecture seule.
 tool-proxy-config = Gérer les paramètres du proxy ZeroClaw (portée : environment | zeroclaw | services), y compris l'application des variables d'environnement de l'environnement d'exécution et du processus.
 tool-pushover = Envoyer une notification Pushover à votre appareil. Nécessite PUSHOVER_TOKEN et PUSHOVER_USER_KEY dans le fichier .env.

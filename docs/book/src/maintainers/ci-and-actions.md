@@ -26,6 +26,10 @@ Composite job with multiple matrix legs:
 
 Runs `cargo deny check advisories` daily at 09:00 UTC against the dependency tree. Opens an issue on findings. No action unless a vulnerability is reported.
 
+### Daily npm Audit (`daily-npm-audit.yml`)
+
+Runs `npm audit --audit-level=high` daily at 09:23 UTC against `web/package-lock.json`. Opens one deduplicated `security` + `dependencies` issue when high-severity npm advisories affect the committed web lockfile.
+
 ### PR Path Labeler (`pr-path-labeler.yml`)
 
 Auto-applies path and scope labels based on changed files. It runs on PR open, reopen, and every pushed update to the PR branch. Because `sync-labels: true` is enabled, labels defined in `.github/labeler.yml` are recalculated from the current PR file set.
@@ -44,7 +48,7 @@ Triggered on tag push (and `workflow_dispatch`); builds and publishes versioned 
 
 ### Docker Image PR Check (`docker-image-pr.yml`)
 
-Runs only when Docker image or release-Docker context files change. It prepares a smoke `docker-ctx` with the same helper used by the stable release workflow, then builds the default and Debian compatibility images without pushing either image. This catches image dependency and `COPY` path breakage before release without giving PR runs registry write permission or running on every PR.
+Runs only when Docker image or release-Docker context files change. It prepares a smoke `docker-ctx` with the same helper used by the stable release workflow, then builds the default prebuilt image and the Debian compatibility prebuilt image from `Dockerfile.ci` without pushing either image. This catches image dependency and `COPY` path breakage before release without giving PR runs registry write permission or running on every PR.
 
 ### Discord Release (`discord-release.yml`)
 

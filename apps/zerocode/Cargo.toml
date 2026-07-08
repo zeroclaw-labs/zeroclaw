@@ -45,6 +45,7 @@ shellexpand = "3.1"
 directories = { workspace = true }
 fluent = "0.16"
 unic-langid = "0.9"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

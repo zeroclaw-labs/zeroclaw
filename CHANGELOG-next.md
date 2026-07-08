@@ -114,6 +114,7 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 - Registry-driven pane help, themed code-fence syntax highlighting, per-fence copy, and unified split-pane config navigation (#8282).
 - Daemon version mismatch detection (#8192).
 - MCP initialized for Chat TUI sessions (#8199).
+- Deferred MCP tools are now advertised in the Chat TUI system prompt so the agent knows `tool_search` exists and can discover MCP tools (#8193).
 - Active config directory surfaced in the Config header (#7999).
 - Approval overlay background filled (#7823).
 - Queue-paused hint skipped when the backlog is empty (#7857).
@@ -145,6 +146,7 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 
 | Area | Fix |
 |---|---|
+| daemon | Back off exponentially when a supervised component exits immediately, and trim glibc arenas between restarts, to stop the WSL2 restart-storm OOM (#5542) |
 | config | Gate Android shell import on non-Windows (#8189) |
 | tools | Normalize Windows workspace-prefixed paths (#8114) |
 | tools | Resolve external coding tool `working_directory` from project root (#7967) |

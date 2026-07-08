@@ -64,7 +64,8 @@ examples, then regenerates every spec-driven install surface via
 sets, and `dev/ci/docker-tags.toml`. Those surfaces derive their version and
 feature lists from the canonical install spec (`Cargo.toml` plus
 `[package.metadata.zeroclaw]`), so the bump keeps them in step automatically;
-never hand-edit a generated region.
+never hand-edit a generated region. This script also refreshes the Nix git
+dependency hashes (`nix/hashes.json`) via `scripts/dev/refresh-nix-hashes.sh`.
 
 Then refresh the docs translation catalogues and pin them to the matching tag:
 
@@ -93,9 +94,10 @@ Commit everything together:
 chore: bump version to vX.Y.Z
 ```
 
-Open a PR. Label it `chore`, `size:XS`. Get one maintainer review. Merge when
-CI is green. The **Installer Drift** gate in CI fails the PR if a generated
-surface is out of sync with the spec, so a missed regeneration cannot land. The
+Open a PR. Label it `type:ci`, `size:XS`, and any path labels the PR labeler
+adds. Get one maintainer review. Merge when CI is green. The **Installer Drift**
+gate in CI fails the PR if a generated surface is out of sync with the spec, so
+a missed regeneration cannot land. The
 **Validate Translations Pin** gate resolves the submodule at the pinned commit
 and validates catalogue format and msgid parity, so a bad pin cannot land
 either. See [Docs & Translations](../maintainers/docs-and-translations.md) for
