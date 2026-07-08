@@ -109,11 +109,13 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "clawdtalk",
     "reddit",
     "bluesky",
+    "git",
     "voice_call",
     "voice_wake",
     "voice_duplex",
     "mqtt",
     "amqp",
+    "filesystem",
 ];
 
 impl V2Config {
@@ -139,7 +141,7 @@ impl V2Config {
         // Authorization fields (allowlists, sandbox, approval gates,
         // env passthrough) land on the risk profile. Budget caps
         // (`max_actions_per_hour`, `max_cost_per_day_cents`,
-        // `shell_timeout_secs`, `shell_max_memory_mb`) and recursion/timeout fields
+        // `shell_timeout_secs`) and recursion/timeout fields
         // (`max_delegation_depth`, `delegation_timeout_secs`,
         // `agentic_timeout_secs`) land on the runtime profile because
         // they are operational tuning enforced with subagent
@@ -2654,7 +2656,6 @@ fn split_autonomy_into_profile_buckets(
         "max_actions_per_hour",
         "max_cost_per_day_cents",
         "shell_timeout_secs",
-        "shell_max_memory_mb",
         "max_delegation_depth",
         "delegation_timeout_secs",
         "agentic_timeout_secs",

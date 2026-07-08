@@ -498,8 +498,9 @@ fn delete_agent(
 /// `heartbeat.agent` is cleared only when reached (an *enabled* heartbeat
 /// pointing at `alias` is a HARD ref, refused before this runs). `retain` is
 /// index-shift-safe. The loop over `cfg.agents.values_mut()` still includes the
-/// to-be-deleted agent, so a self-reference (e.g. `bot.delegates = ["bot"]`) is
-/// actively stripped by the `retain` here before the entry itself is removed.
+/// to-be-deleted agent, so a self-reference (e.g.
+/// `bot.delegates = [{ agent = "bot", mode = "bounded" }]`) is actively
+/// stripped by the `retain` here before the entry itself is removed.
 fn scrub_agent_refs(cfg: &mut Config, alias: &str) {
     if cfg.heartbeat.agent.trim() == alias {
         cfg.heartbeat.agent.clear();
@@ -514,7 +515,7 @@ fn scrub_agent_refs(cfg: &mut Config, alias: &str) {
         cfg.acp.default_agent = None;
     }
     for agent in cfg.agents.values_mut() {
-        agent.delegates.retain(|d| d.trim() != alias); // trimmed (validate trims)
+        agent.delegates.retain(|d| d.agent().trim() != alias); // trimmed (validate trims)
         agent.workspace.access.retain(|k, _| k.as_str() != alias); // raw
         agent
             .workspace
@@ -849,8 +850,9 @@ fn entry_path(kind: &AliasKind, alias: &str) -> String {
 /// read_memory_from / peer_groups.agents raw — matching on the same comparison
 /// and writing the new value verbatim. `heartbeat.agent` is rewritten whether or
 /// not heartbeat is enabled (the pointer follows the rename either way). Includes
-/// the renamed agent itself, so a self-reference (`bot.delegates=["bot"]` under a
-/// bot→bot2 rename) is rewritten here too. Returns the entry/section dirty paths
+/// the renamed agent itself, so a self-reference
+/// (`bot.delegates=[{ agent = "bot", mode = "bounded" }]` under a bot→bot2
+/// rename) is rewritten here too. Returns the entry/section dirty paths
 /// it touched (`heartbeat.agent`, `acp.default_agent`, `agents.<name>`,
 /// `peer_groups.<g>`) so the surface can persist exactly what changed.
 fn rewrite_agent_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String> {
@@ -872,8 +874,8 @@ fn rewrite_agent_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String> {
     for (name, agent) in cfg.agents.iter_mut() {
         let mut touched = false;
         for d in agent.delegates.iter_mut() {
-            if d.trim() == old {
-                *d = new.to_string(); // trimmed (validate trims delegates)
+            if d.agent().trim() == old {
+                d.agent = new.to_string(); // trimmed (validate trims delegates)
                 touched = true;
             }
         }
@@ -1422,13 +1424,13 @@ fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
         ));
     }
     for (name, agent) in sorted_agents(cfg) {
-        // delegates[] — validate() trims (schema.rs:17331).
+        // delegates[].agent — validate() trims.
         for (i, d) in agent.delegates.iter().enumerate() {
-            if d.trim() == alias {
+            if d.agent().trim() == alias {
                 sites.push(RefSite::soft(
-                    format!("agents.{name}.delegates[{i}]"),
+                    format!("agents.{name}.delegates[{i}].agent"),
                     ScrubAction::DropFromVec { index: i },
-                    d.as_str(),
+                    d.agent(),
                 ));
             }
         }
@@ -1503,7 +1505,9 @@ fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
 mod tests {
     use super::*;
     use crate::multi_agent::{AccessMode, AgentAlias, PeerGroupConfig};
-    use crate::schema::{AliasedAgentConfig, Config, EmbeddingRouteConfig, ModelRouteConfig};
+    use crate::schema::{
+        AliasedAgentConfig, Config, DelegateTargetConfig, EmbeddingRouteConfig, ModelRouteConfig,
+    };
 
     /// Empty config with the alias-keyed containers cleared so Config::default()
     /// can't inject spurious references into assertions.
@@ -1649,7 +1653,7 @@ mod tests {
         cfg.heartbeat.agent = "bot".to_string();
         cfg.acp.default_agent = Some("bot".to_string());
         let mut referrer = AliasedAgentConfig {
-            delegates: vec!["bot".to_string()],
+            delegates: vec![DelegateTargetConfig::bounded("bot")],
             ..Default::default()
         };
         // workspace allowlists
@@ -1765,7 +1769,7 @@ mod tests {
         cfg.agents.insert(
             "lead".to_string(),
             AliasedAgentConfig {
-                delegates: vec![" bot ".to_string()],
+                delegates: vec![DelegateTargetConfig::bounded(" bot ")],
                 ..Default::default()
             },
         );
@@ -1782,7 +1786,7 @@ mod tests {
         let paths: Vec<_> = sites.iter().map(|s| s.path.as_str()).collect();
         assert!(paths.contains(&"heartbeat.agent"));
         assert!(paths.contains(&"acp.default_agent"));
-        assert!(paths.contains(&"agents.lead.delegates[0]"));
+        assert!(paths.contains(&"agents.lead.delegates[0].agent"));
         assert!(
             !paths.iter().any(|p| p.contains("read_memory_from")),
             "padded read_memory_from is raw-matched, must NOT match (mirror validate)"
@@ -2274,7 +2278,7 @@ mod tests {
         cfg.heartbeat.agent = "bot".to_string();
         cfg.acp.default_agent = Some("bot".to_string());
         let mut lead = AliasedAgentConfig {
-            delegates: vec!["bot".to_string()],
+            delegates: vec![DelegateTargetConfig::bounded("bot")],
             ..Default::default()
         };
         lead.workspace
@@ -2320,7 +2324,7 @@ mod tests {
         cfg.heartbeat.agent = "  bot  ".to_string();
         cfg.acp.default_agent = Some(" bot ".to_string());
         let mut lead = AliasedAgentConfig {
-            delegates: vec![" bot ".to_string()],
+            delegates: vec![DelegateTargetConfig::bounded(" bot ")],
             ..Default::default()
         };
         lead.workspace
@@ -2382,7 +2386,7 @@ mod tests {
         // then confirms nothing dangles).
         let mut cfg = empty_config();
         let mut bot = AliasedAgentConfig {
-            delegates: vec!["bot".to_string()],
+            delegates: vec![DelegateTargetConfig::bounded("bot")],
             ..Default::default()
         };
         bot.workspace.read_memory_from.push(AgentAlias::new("bot"));
@@ -2613,7 +2617,7 @@ mod tests {
         cfg.acp.default_agent = Some("bot".to_string());
         // The renamed agent itself self-delegates (must be rewritten too).
         let mut bot = AliasedAgentConfig {
-            delegates: vec!["bot".to_string()],
+            delegates: vec![DelegateTargetConfig::bounded("bot")],
             ..Default::default()
         };
         bot.workspace
@@ -2622,7 +2626,7 @@ mod tests {
         cfg.agents.insert("bot".to_string(), bot);
         // A referrer agent pointing at bot every which way.
         let mut lead = AliasedAgentConfig {
-            delegates: vec!["bot".to_string()],
+            delegates: vec![DelegateTargetConfig::bounded("bot")],
             ..Default::default()
         };
         lead.workspace
@@ -2643,14 +2647,20 @@ mod tests {
         // every ref now names bot2
         assert_eq!(cfg.heartbeat.agent, "bot2");
         assert_eq!(cfg.acp.default_agent.as_deref(), Some("bot2"));
-        assert_eq!(cfg.agents["bot2"].delegates, vec!["bot2".to_string()]);
+        assert_eq!(
+            cfg.agents["bot2"].delegates,
+            vec![DelegateTargetConfig::bounded("bot2")]
+        );
         assert!(
             cfg.agents["bot2"]
                 .workspace
                 .access
                 .contains_key(&AgentAlias::new("bot2"))
         );
-        assert_eq!(cfg.agents["lead"].delegates, vec!["bot2".to_string()]);
+        assert_eq!(
+            cfg.agents["lead"].delegates,
+            vec![DelegateTargetConfig::bounded("bot2")]
+        );
         assert!(
             cfg.agents["lead"]
                 .workspace
@@ -2957,7 +2967,10 @@ mod tests {
     #[test]
     fn dirty_entry_for_truncates_ref_paths_to_persistable_entries() {
         // agent / peer-group referrer sites → the entry root (whole subtree).
-        assert_eq!(dirty_entry_for("agents.lead.delegates[0]"), "agents.lead");
+        assert_eq!(
+            dirty_entry_for("agents.lead.delegates[0].agent"),
+            "agents.lead"
+        );
         assert_eq!(
             dirty_entry_for("agents.lead.workspace.access.bot"),
             "agents.lead"
@@ -2996,7 +3009,7 @@ mod tests {
         cfg.agents.insert(
             "lead".to_string(),
             AliasedAgentConfig {
-                delegates: vec!["bot".to_string()],
+                delegates: vec![DelegateTargetConfig::bounded("bot")],
                 ..Default::default()
             },
         );

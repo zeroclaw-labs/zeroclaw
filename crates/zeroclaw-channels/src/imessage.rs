@@ -347,6 +347,8 @@ end tell"#
                             interruption_scope_id: None,
                             attachments: vec![],
                             subject: None,
+
+                            ..Default::default()
                         };
 
                         if tx.send(msg).await.is_err() {

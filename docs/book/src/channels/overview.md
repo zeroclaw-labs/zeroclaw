@@ -50,6 +50,14 @@ One-to-many or public-feed integrations.
 
 See [Social channels](./social.md).
 
+### Developer platforms
+
+| Channel | Feature flag | Protocol / service |
+|---|---|---|
+| Git | `channel-git` | Git forge behind a provider seam (GitHub, Gitea, Forgejo); REST polling of issues, PRs, CI runs & releases with per-event routing |
+
+See [Git](./git.md).
+
 ### Email
 
 | Channel | Feature flag | Notes |
@@ -80,6 +88,18 @@ See [Voice & telephony](./voice.md).
 | ACP (Agent Client Protocol) | `channel-acp-server` | JSON-RPC 2.0 over stdio: editor/IDE sessions |
 
 See [Webhooks](./webhook.md) and [ACP](./acp.md).
+
+### Event sources
+
+Input-only transports that feed events into the agent loop or the SOP engine. They have no outbound reply; each one is also a [SOP fan-in](../sop/fan-in/overview.md).
+
+| Channel | Feature flag | Shape |
+|---|---|---|
+| MQTT | `channel-mqtt` | Broker messages → agent or SOP |
+| AMQP | `channel-amqp` | Broker deliveries → agent or SOP |
+| Filesystem | `channel-filesystem` | Path changes → agent or SOP |
+
+See [MQTT](./mqtt.md), [AMQP](./amqp.md), and [Filesystem](./filesystem.md).
 
 ## Configuration
 

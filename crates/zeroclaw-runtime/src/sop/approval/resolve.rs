@@ -79,7 +79,7 @@ pub fn resolve_gate(
             // approval. Keeps the live counters in lockstep with the ledger-sourced
             // `rebuild_from_persistence`.
             engine.record_approval_metric(run_id, principal.is_system());
-            ResolveOutcome::Resumed(action)
+            ResolveOutcome::Resumed(Box::new(action))
         }
         ApprovalDecision::Deny { reason } => {
             let why = reason.unwrap_or_else(|| format!("denied by {}", principal.actor_label()));
@@ -133,6 +133,9 @@ mod tests {
         fn load_run(&self, run_id: &str) -> Result<Option<PersistedRun>, StoreError> {
             self.inner.load_run(run_id)
         }
+        fn last_terminal_completed_at(&self, sop_name: &str) -> Result<Option<String>, StoreError> {
+            self.inner.last_terminal_completed_at(sop_name)
+        }
         fn try_claim_run(
             &self,
             run_id: &str,
@@ -142,6 +145,16 @@ mod tests {
         ) -> Result<Option<ClaimToken>, StoreError> {
             self.inner
                 .try_claim_run(run_id, sop_name, per_sop_cap, global_cap)
+        }
+        fn renew_claim_for_restore(
+            &self,
+            run_id: &str,
+            sop_name: &str,
+        ) -> Result<ClaimToken, StoreError> {
+            self.inner.renew_claim_for_restore(run_id, sop_name)
+        }
+        fn claim_counts(&self, sop_name: &str) -> Result<(usize, usize), StoreError> {
+            self.inner.claim_counts(sop_name)
         }
         fn heartbeat_claim(&self, token: &ClaimToken) -> Result<(), StoreError> {
             self.inner.heartbeat_claim(token)
@@ -199,6 +212,7 @@ mod tests {
                     requires_confirmation: true,
                     kind: SopStepKind::Execute,
                     schema: None,
+                    ..SopStep::default()
                 },
                 SopStep {
                     number: 2,
@@ -208,6 +222,7 @@ mod tests {
                     requires_confirmation: false,
                     kind: SopStepKind::Execute,
                     schema: None,
+                    ..SopStep::default()
                 },
             ],
             cooldown_secs: 0,

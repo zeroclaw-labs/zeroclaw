@@ -87,6 +87,7 @@ pub fn build_spec() -> serde_json::Value {
             "DriftResponse":    schema_value::<DriftResponse>(),
             "ReloadStatusResponse": schema_value::<ReloadStatusResponse>(),
             "Config":           schema_value::<zeroclaw_config::schema::Config>(),
+            "SlashOptionKindsResult": schema_value::<crate::api_skills::SlashOptionKindsResult>(),
         },
         "securitySchemes": {
             "bearerAuth": {
@@ -193,6 +194,19 @@ pub fn build_spec() -> serde_json::Value {
                     "200": {
                         "description": "List of properties.",
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ListResponse" } } }
+                    }
+                }
+            }
+        },
+        "/api/skills/slash-option-kinds": {
+            "get": {
+                "tags": ["skills"],
+                "summary": "Typed slash-option kind registry",
+                "description": "Returns the canonical set of typed slash-command option kinds and each kind's constraint capabilities (choices / numeric bounds / length bounds), built by walking the backend kind enum. Surfaces read this instead of restating the kind list.",
+                "responses": {
+                    "200": {
+                        "description": "The slash-option kind registry.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlashOptionKindsResult" } } }
                     }
                 }
             }
@@ -483,6 +497,7 @@ mod tests {
         assert!(paths.get("/api/config/migrate").is_some());
         assert!(paths.get("/api/config/drift").is_some());
         assert!(paths.get("/api/config/reload-status").is_some());
+        assert!(paths.get("/api/skills/slash-option-kinds").is_some());
         #[cfg(feature = "a2a")]
         assert!(paths.get("/a2a/{alias}").is_some());
     }

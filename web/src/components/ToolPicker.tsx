@@ -169,6 +169,24 @@ export default function ToolPicker({
     onChange(value.filter((n) => n !== name));
   };
 
+  // Bulk toggle for a group's currently-displayed entries. If every displayed
+  // entry is already selected, deselect them all; otherwise add the missing
+  // ones. Operates on the filtered list so it honors an active search, and
+  // matches the count shown in the group header.
+  const toggleAll = (entries: CatalogEntry[]) => {
+    if (disabled || entries.length === 0) return;
+    const names = entries.map((e) => e.name);
+    const allSelected = names.every((n) => selectedSet.has(n));
+    if (allSelected) {
+      const drop = new Set(names);
+      onChange(value.filter((n) => !drop.has(n)));
+    } else {
+      const next = [...value];
+      for (const n of names) if (!next.includes(n)) next.push(n);
+      onChange(next);
+    }
+  };
+
   // Search filter over name + description (case-insensitive).
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -189,6 +207,11 @@ export default function ToolPicker({
     () => filtered.filter((e) => e.group === 'cli'),
     [filtered],
   );
+
+  const agentAllSelected =
+    agentEntries.length > 0 && agentEntries.every((e) => selectedSet.has(e.name));
+  const cliAllSelected =
+    cliEntries.length > 0 && cliEntries.every((e) => selectedSet.has(e.name));
 
   // Selected names that aren't in the catalog (unknown / removed tools).
   // Surface them as chips so nothing is silently dropped on save.
@@ -309,6 +332,52 @@ export default function ToolPicker({
           className="w-full h-9 pl-9 pr-3 text-sm rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 disabled:opacity-50 disabled:cursor-not-allowed"
         />
       </div>
+
+      {/* Per-group bulk-select toolbar. Rendered OUTSIDE the role="listbox"
+          below so the controls are valid ARIA (a listbox may only contain
+          option/group descendants) and reachable in the natural Tab order with
+          native button Enter/Space activation. Each button acts on its group's
+          currently-displayed (filtered) entries and flips Select all/Deselect
+          all to match. Hidden when the picker is disabled or the group is empty. */}
+      {!loading && error === null && !disabled &&
+        (agentEntries.length > 0 || cliEntries.length > 0) && (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-0.5">
+            {agentEntries.length > 0 && (
+              <button
+                type="button"
+                onClick={() => toggleAll(agentEntries)}
+                aria-label={`${
+                  agentAllSelected
+                    ? t('tool_picker.deselect_all_aria_prefix')
+                    : t('tool_picker.select_all_aria_prefix')
+                }${t('tool_picker.group_agent')}`}
+                className="text-[10px] font-medium text-pc-accent hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]/40 rounded cursor-pointer"
+              >
+                {agentAllSelected
+                  ? t('tool_picker.deselect_all')
+                  : t('tool_picker.select_all')}{' '}
+                {t('tool_picker.group_agent')}
+              </button>
+            )}
+            {cliEntries.length > 0 && (
+              <button
+                type="button"
+                onClick={() => toggleAll(cliEntries)}
+                aria-label={`${
+                  cliAllSelected
+                    ? t('tool_picker.deselect_all_aria_prefix')
+                    : t('tool_picker.select_all_aria_prefix')
+                }${t('tool_picker.group_cli')}`}
+                className="text-[10px] font-medium text-pc-accent hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]/40 rounded cursor-pointer"
+              >
+                {cliAllSelected
+                  ? t('tool_picker.deselect_all')
+                  : t('tool_picker.select_all')}{' '}
+                {t('tool_picker.group_cli')}
+              </button>
+            )}
+          </div>
+        )}
 
       {/* Catalog list */}
       {loading ? (

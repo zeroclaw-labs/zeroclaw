@@ -74,7 +74,7 @@ These are three distinct concerns. Conflating them, putting everything in one bo
 |---|---|---|
 | Work pipeline (backlog → release) | **GitHub Projects v2** | Custom fields, multiple views, Kanban + roadmap, built-in automation, milestone tracking |
 | Community discussion and idea incubation | **GitHub Discussions** | Community-visible, no PR required, separates early conversation from committed work, promotes concrete outcomes into the owning tracked surface |
-| Governance and decision authority | **RFC process + Team Tiers + CODEOWNERS** | Already partially established via `docs/proposals/`; needs formalization and close loop |
+| Governance and decision authority | **RFC process + Team Tiers + CODEOWNERS** | Established through RFC issues, foundation docs, and CODEOWNERS; needs formalization and close loop |
 
 The key principle: **the Project board contains only work the team has committed to thinking about.** Early community discussion, ideas, Q&A, and showcases can live in Discussions when the lane is maintained. Work that has been evaluated, accepted, and scoped lives in the Project. This distinction is what keeps the board useful.
 
@@ -387,7 +387,7 @@ Create `.github/CODEOWNERS`:
 ```
 # CODEOWNERS — Automatic review routing by risk tier
 # See AGENTS.md for risk tier definitions.
-# See docs/proposals/project-governance.md for team tier definitions.
+# See the governance foundation doc and RFC issue template for team tier definitions.
 
 # ── High Risk: requires Core Team approval ──────────────────────────────────
 
@@ -407,8 +407,8 @@ deny.toml                       @zeroclaw-labs/zeroclaw-core
 
 # ── Architecture documents: requires Core Team review ───────────────────────
 
-docs/proposals/**               @zeroclaw-labs/zeroclaw-core
-docs/architecture/decisions/**  @zeroclaw-labs/zeroclaw-core
+docs/book/src/foundations/**    @zeroclaw-labs/zeroclaw-core
+docs/book/src/architecture/decisions/**  @zeroclaw-labs/zeroclaw-core
 AGENTS.md                       @zeroclaw-labs/zeroclaw-core
 
 # ── Default: any Contributor or Core Team member can review ─────────────────
@@ -528,18 +528,14 @@ The RFC process was established in the documentation RFC and the architecture RF
 ### 8.1 The Full RFC Lifecycle
 
 ```
-1. AUTHOR writes proposal → docs/proposals/<slug>.md
+1. AUTHOR opens an RFC issue using the RFC issue template
+   with the proposal and any supporting PR or document links
            ↓
-2. AUTHOR opens PR with the proposal document
-           ↓
-3. AUTHOR opens RFC issue using the RFC issue template
-   linking to the PR
-           ↓
-4. DISCUSSION PERIOD — minimum 7 days
+2. DISCUSSION PERIOD — minimum 7 days
    Anyone can comment. Core Team members engage substantively.
-   Discussions happen on the issue, not the PR.
+   Discussions happen on the issue.
            ↓
-5. CORE TEAM VOTE on the issue
+3. CORE TEAM VOTE on the issue
    Format: comment with one of:
      ✅ APPROVE — with brief rationale
      ❌ REJECT — with specific objections
@@ -549,7 +545,7 @@ The RFC process was established in the documentation RFC and the architecture RF
    │  RFC is accepted                                          │
    │  PR is merged                                            │
    │  Issue labeled rfc:accepted                              │
-   │  Author writes ADR(s) in docs/architecture/decisions/    │
+   │  Author writes ADR(s) under docs/book/src/architecture/decisions/ │
    │  ADR issue(s) linked back to RFC issue                   │
    │  RFC issue closed                                        │
    └──────────────────────────────────────────────────────────┘
@@ -567,7 +563,7 @@ The RFC process was established in the documentation RFC and the architecture RF
    │  Issue labeled rfc:revision-requested                    │
    │  Author revises proposal document                        │
    │  Author re-requests review via issue comment             │
-   │  Process returns to step 4                               │
+   │  Process returns to step 2                               │
    └──────────────────────────────────────────────────────────┘
 ```
 
@@ -587,15 +583,16 @@ Every accepted RFC must produce at least one ADR before the corresponding implem
 
 RFCs are proposals. ADRs are decisions. Both are necessary. Neither replaces the other.
 
-### 8.4 Existing RFCs in This Repository
+### 8.4 Foundational RFCs
 
-The following RFCs have been filed as of this writing and should be converted to formal RFC issues immediately:
+The early proposal documents have since been represented as RFC issues
+and foundation documents:
 
-| RFC Document | Issue to create | Priority |
+| RFC issue | Current durable surface | Priority |
 |---|---|---|
-| `docs/proposals/microkernel-architecture.md` | Microkernel Architecture RFC (v0.7.0+) | High |
-| `docs/proposals/documentation-standards.md` | Documentation Standards and i18n RFC | High |
-| `docs/proposals/project-governance.md` | Team Organization and Governance RFC | Medium |
+| [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574) | [FND-001: Intentional architecture](./fnd-001-intentional-architecture.md) | High |
+| [#5576](https://github.com/zeroclaw-labs/zeroclaw/issues/5576) | [FND-002: Documentation standards](./fnd-002-documentation-standards.md) | High |
+| [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577) | [FND-003: Governance](./fnd-003-governance.md) | Medium |
 
 ---
 

@@ -27,7 +27,7 @@ doas pkg install -y rust git
 
 | Package | Why |
 |---|---|
-| `rust` | Provides `cargo` and `rustc` to build the binary. ZeroClaw's workspace MSRV is Rust 1.87; the FreeBSD `rust` port tracks a newer stable, so `pkg install rust` satisfies it. |
+| `rust` | Provides `cargo` and `rustc` to build the binary. ZeroClaw's workspace MSRV is Rust 1.96.1; the FreeBSD `rust` port tracks a newer stable, so `pkg install rust` satisfies it. |
 | `git` | Cloning the repo, and required at runtime if you use any git-backed tools. |
 
 > **`doas`, not `sudo`.** FreeBSD ships `doas` as the base privilege-escalation tool; `sudo` is an optional port. The examples here use `doas`. A minimal `/usr/local/etc/doas.conf` granting the `wheel` group passwordless escalation is:
