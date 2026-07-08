@@ -200,6 +200,61 @@ where
 }
 // ─── Implementation ───────────────────────────────────────────────────────────
 
+/// Typed builder for [`OllamaModelProvider`].
+///
+/// Only `alias` is required. `base_url` defaults to the module-level
+/// `BASE_URL` constant (bare `http://localhost:11434`), `api_key` is
+/// treated as absent when empty/whitespace, and `reasoning_enabled`
+/// stays `None` (thinking-mode determined by the served model) unless
+/// explicitly toggled.
+#[must_use]
+pub struct OllamaBuilder {
+    alias: String,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    reasoning_enabled: Option<bool>,
+}
+
+impl OllamaBuilder {
+    /// Override the Ollama server base URL. Empty / whitespace-only values
+    /// fall back to the default; trailing `/` and `/api/...` paths are
+    /// normalized identically to the pre-builder behaviour.
+    pub fn base_url(mut self, base_url: Option<&str>) -> Self {
+        self.base_url = base_url.map(str::to_string);
+        self
+    }
+
+    /// Explicit API key. Whitespace-only inputs are treated as absent
+    /// (mirrors the trimming the pre-builder ctor applied in-line).
+    pub fn api_key(mut self, api_key: Option<&str>) -> Self {
+        self.api_key = api_key.and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
+        self
+    }
+
+    /// Override reasoning-mode routing. `None` (the default) lets the
+    /// runtime probe the served model; `Some(true)` / `Some(false)`
+    /// pins the behaviour.
+    pub fn reasoning_enabled(mut self, reasoning_enabled: Option<bool>) -> Self {
+        self.reasoning_enabled = reasoning_enabled;
+        self
+    }
+
+    pub fn build(self) -> OllamaModelProvider {
+        OllamaModelProvider {
+            alias: self.alias,
+            base_url: OllamaModelProvider::normalize_base_url(
+                self.base_url.as_deref().unwrap_or(BASE_URL),
+            ),
+            api_key: self.api_key,
+            reasoning_enabled: self.reasoning_enabled,
+            tuning: OllamaTuning::default(),
+        }
+    }
+}
+
 impl OllamaModelProvider {
     fn normalize_base_url(raw_url: &str) -> String {
         let trimmed = raw_url.trim().trim_end_matches('/');
@@ -215,29 +270,15 @@ impl OllamaModelProvider {
             .to_string()
     }
 
-    pub fn new(alias: &str, base_url: Option<&str>, api_key: Option<&str>) -> Self {
-        Self::new_with_reasoning(alias, base_url, api_key, None)
-    }
-
-    pub fn new_with_reasoning(
-        alias: &str,
-        base_url: Option<&str>,
-        api_key: Option<&str>,
-        reasoning_enabled: Option<bool>,
-    ) -> Self {
-        let api_key = api_key.and_then(|value| {
-            let trimmed = value.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        });
-
-        Self {
+    pub fn builder(alias: &str) -> OllamaBuilder {
+        OllamaBuilder {
             alias: alias.to_string(),
-            base_url: Self::normalize_base_url(base_url.unwrap_or(BASE_URL)),
-            api_key,
-            reasoning_enabled,
-            tuning: OllamaTuning::default(),
+            base_url: None,
+            api_key: None,
+            reasoning_enabled: None,
         }
     }
+
     /// Override the per-deployment tuning knobs (`num_ctx`, `num_predict`,
     /// `temperature_override`) on this provider. Returns `self` for
     /// chained construction.
@@ -1112,43 +1153,43 @@ mod tests {
 
     #[test]
     fn default_url() {
-        let p = OllamaModelProvider::new("test", None, None);
+        let p = OllamaModelProvider::builder("test").build();
         assert_eq!(p.base_url, "http://localhost:11434");
     }
 
     #[test]
     fn custom_url_trailing_slash() {
-        let p = OllamaModelProvider::new("test", Some("http://192.168.1.100:11434/"), None);
+        let p = OllamaModelProvider::builder("test").base_url(Some("http://192.168.1.100:11434/")).build();
         assert_eq!(p.base_url, "http://192.168.1.100:11434");
     }
 
     #[test]
     fn custom_url_no_trailing_slash() {
-        let p = OllamaModelProvider::new("test", Some("http://myserver:11434"), None);
+        let p = OllamaModelProvider::builder("test").base_url(Some("http://myserver:11434")).build();
         assert_eq!(p.base_url, "http://myserver:11434");
     }
 
     #[test]
     fn custom_url_strips_api_suffix() {
-        let p = OllamaModelProvider::new("test", Some("https://ollama.com/api/"), None);
+        let p = OllamaModelProvider::builder("test").base_url(Some("https://ollama.com/api/")).build();
         assert_eq!(p.base_url, "https://ollama.com");
     }
 
     #[test]
     fn custom_url_strips_api_chat_suffix() {
-        let p = OllamaModelProvider::new("test", Some("http://172.30.30.50:11434/api/chat"), None);
+        let p = OllamaModelProvider::builder("test").base_url(Some("http://172.30.30.50:11434/api/chat")).build();
         assert_eq!(p.base_url, "http://172.30.30.50:11434");
     }
 
     #[test]
     fn empty_url_uses_empty() {
-        let p = OllamaModelProvider::new("test", Some(""), None);
+        let p = OllamaModelProvider::builder("test").base_url(Some("")).build();
         assert_eq!(p.base_url, "");
     }
 
     #[test]
     fn cloud_suffix_strips_model_name() {
-        let p = OllamaModelProvider::new("test", Some("https://ollama.com"), Some("ollama-key"));
+        let p = OllamaModelProvider::builder("test").base_url(Some("https://ollama.com")).api_key(Some("ollama-key")).build();
         let (model, should_auth) = p.resolve_request_details("qwen3:cloud").unwrap();
         assert_eq!(model, "qwen3");
         assert!(should_auth);
@@ -1156,7 +1197,7 @@ mod tests {
 
     #[test]
     fn cloud_suffix_with_local_endpoint_errors() {
-        let p = OllamaModelProvider::new("test", None, Some("ollama-key"));
+        let p = OllamaModelProvider::builder("test").api_key(Some("ollama-key")).build();
         let error = p
             .resolve_request_details("qwen3:cloud")
             .expect_err("cloud suffix should fail on local endpoint");
@@ -1169,7 +1210,7 @@ mod tests {
 
     #[test]
     fn cloud_suffix_with_unspecified_local_endpoint_errors() {
-        let p = OllamaModelProvider::new("test", Some("http://0.0.0.0:11434"), Some("ollama-key"));
+        let p = OllamaModelProvider::builder("test").base_url(Some("http://0.0.0.0:11434")).api_key(Some("ollama-key")).build();
         let error = p
             .resolve_request_details("qwen3:cloud")
             .expect_err("cloud suffix should fail on unspecified local endpoint");
@@ -1182,7 +1223,7 @@ mod tests {
 
     #[test]
     fn cloud_suffix_without_api_key_errors() {
-        let p = OllamaModelProvider::new("test", Some("https://ollama.com"), None);
+        let p = OllamaModelProvider::builder("test").base_url(Some("https://ollama.com")).build();
         let error = p
             .resolve_request_details("qwen3:cloud")
             .expect_err("cloud suffix should require API key");
@@ -1195,7 +1236,7 @@ mod tests {
 
     #[test]
     fn cloud_suffix_preserved_for_private_remote_without_api_key() {
-        let p = OllamaModelProvider::new("test", Some("http://192.168.1.100:11434"), None);
+        let p = OllamaModelProvider::builder("test").base_url(Some("http://192.168.1.100:11434")).build();
         let (model, should_auth) = p.resolve_request_details("qwen3:cloud").unwrap();
         assert_eq!(model, "qwen3:cloud");
         assert!(!should_auth);
@@ -1203,11 +1244,10 @@ mod tests {
 
     #[test]
     fn cloud_suffix_preserved_for_private_remote_with_api_key() {
-        let p = OllamaModelProvider::new(
-            "test",
-            Some("https://private-ollama.example.com"),
-            Some("ollama-key"),
-        );
+        let p = OllamaModelProvider::builder("test")
+            .base_url(Some("https://private-ollama.example.com"))
+            .api_key(Some("ollama-key"))
+            .build();
         let (model, should_auth) = p.resolve_request_details("qwen3:cloud").unwrap();
         assert_eq!(model, "qwen3:cloud");
         assert!(should_auth);
@@ -1215,7 +1255,7 @@ mod tests {
 
     #[test]
     fn remote_endpoint_auth_enabled_when_key_present() {
-        let p = OllamaModelProvider::new("test", Some("https://ollama.com"), Some("ollama-key"));
+        let p = OllamaModelProvider::builder("test").base_url(Some("https://ollama.com")).api_key(Some("ollama-key")).build();
         let (_model, should_auth) = p.resolve_request_details("qwen3").unwrap();
         assert!(should_auth);
     }
@@ -1223,7 +1263,7 @@ mod tests {
     #[test]
     fn remote_endpoint_with_api_suffix_still_allows_cloud_models() {
         let p =
-            OllamaModelProvider::new("test", Some("https://ollama.com/api"), Some("ollama-key"));
+            OllamaModelProvider::builder("test").base_url(Some("https://ollama.com/api")).api_key(Some("ollama-key")).build();
         let (model, should_auth) = p.resolve_request_details("qwen3:cloud").unwrap();
         assert_eq!(model, "qwen3");
         assert!(should_auth);
@@ -1231,7 +1271,7 @@ mod tests {
 
     #[test]
     fn local_endpoint_auth_disabled_even_with_key() {
-        let p = OllamaModelProvider::new("test", None, Some("ollama-key"));
+        let p = OllamaModelProvider::builder("test").api_key(Some("ollama-key")).build();
         let (_model, should_auth) = p.resolve_request_details("llama3").unwrap();
         assert!(!should_auth);
     }
@@ -1274,7 +1314,7 @@ mod tests {
                 .expect("test server should run");
         });
 
-        let provider = OllamaModelProvider::new("test", Some(&format!("http://{addr}")), None);
+        let provider = OllamaModelProvider::builder("test").base_url(Some(&format!("http://{addr}"))).build();
         let messages = vec![
             ChatMessage::system("You are helpful."),
             ChatMessage::user("read a file"),
@@ -1349,7 +1389,7 @@ mod tests {
 
     #[test]
     fn request_omits_think_when_reasoning_not_configured() {
-        let model_provider = OllamaModelProvider::new("test", None, None);
+        let model_provider = OllamaModelProvider::builder("test").build();
         let request = model_provider.build_chat_request(
             vec![Message {
                 role: "user".to_string(),
@@ -1372,8 +1412,9 @@ mod tests {
 
     #[test]
     fn request_includes_think_when_reasoning_configured() {
-        let model_provider =
-            OllamaModelProvider::new_with_reasoning("test", None, None, Some(false));
+        let model_provider = OllamaModelProvider::builder("test")
+            .reasoning_enabled(Some(false))
+            .build();
         let request = model_provider.build_chat_request(
             vec![Message {
                 role: "user".to_string(),
@@ -1396,7 +1437,7 @@ mod tests {
 
     #[test]
     fn request_includes_default_num_ctx_and_num_predict() {
-        let provider = OllamaModelProvider::new("test", None, None);
+        let provider = OllamaModelProvider::builder("test").build();
         let request = provider.build_chat_request(
             vec![Message {
                 role: "user".to_string(),
@@ -1423,7 +1464,7 @@ mod tests {
         // every Ollama /api/chat request must carry an `options` object
         // with `num_ctx` and `num_predict`, and a `temperature` matching
         // the value passed. None must omit the temperature key entirely.
-        let provider = OllamaModelProvider::new("test", None, None);
+        let provider = OllamaModelProvider::builder("test").build();
         let request = provider.build_chat_request_with_think(
             vec![Message {
                 role: "user".to_string(),
@@ -1464,7 +1505,7 @@ mod tests {
 
     #[test]
     fn request_includes_overridden_tuning() {
-        let provider = OllamaModelProvider::new("test", None, None).with_tuning(OllamaTuning {
+        let provider = OllamaModelProvider::builder("test").build().with_tuning(OllamaTuning {
             num_ctx: 4096,
             num_predict: 1024,
             temperature_override: None,
@@ -1490,7 +1531,7 @@ mod tests {
 
     #[test]
     fn temperature_override_replaces_per_call_temperature() {
-        let provider = OllamaModelProvider::new("test", None, None).with_tuning(OllamaTuning {
+        let provider = OllamaModelProvider::builder("test").build().with_tuning(OllamaTuning {
             num_ctx: 8192,
             num_predict: 2048,
             temperature_override: Some(0.1),
@@ -1515,7 +1556,7 @@ mod tests {
 
     #[test]
     fn temperature_override_unset_passes_per_call_temperature() {
-        let provider = OllamaModelProvider::new("test", None, None);
+        let provider = OllamaModelProvider::builder("test").build();
         let request = provider.build_chat_request(
             vec![Message {
                 role: "user".to_string(),
@@ -1539,7 +1580,9 @@ mod tests {
         // The think=true → retry-without-think path in `send_request` uses the
         // same `build_chat_request_with_think` builder for both attempts; verify
         // the builder produces identical option fields when only `think` differs.
-        let provider = OllamaModelProvider::new_with_reasoning("test", None, None, Some(true))
+        let provider = OllamaModelProvider::builder("test")
+            .reasoning_enabled(Some(true))
+            .build()
             .with_tuning(OllamaTuning {
                 num_ctx: 16384,
                 num_predict: 4096,
@@ -1656,7 +1699,7 @@ mod tests {
 
     #[test]
     fn extract_tool_name_handles_nested_tool_call() {
-        let model_provider = OllamaModelProvider::new("test", None, None);
+        let model_provider = OllamaModelProvider::builder("test").build();
         let tc = OllamaToolCall {
             id: Some("call_123".into()),
             function: OllamaFunction {
@@ -1674,7 +1717,7 @@ mod tests {
 
     #[test]
     fn extract_tool_name_handles_prefixed_name() {
-        let model_provider = OllamaModelProvider::new("test", None, None);
+        let model_provider = OllamaModelProvider::builder("test").build();
         let tc = OllamaToolCall {
             id: Some("call_123".into()),
             function: OllamaFunction {
@@ -1689,7 +1732,7 @@ mod tests {
 
     #[test]
     fn extract_tool_name_handles_normal_call() {
-        let model_provider = OllamaModelProvider::new("test", None, None);
+        let model_provider = OllamaModelProvider::builder("test").build();
         let tc = OllamaToolCall {
             id: Some("call_123".into()),
             function: OllamaFunction {
@@ -1704,7 +1747,7 @@ mod tests {
 
     #[test]
     fn format_tool_calls_produces_valid_json() {
-        let model_provider = OllamaModelProvider::new("test", None, None);
+        let model_provider = OllamaModelProvider::builder("test").build();
         let tool_calls = vec![OllamaToolCall {
             id: Some("call_abc".into()),
             function: OllamaFunction {
@@ -1728,7 +1771,7 @@ mod tests {
 
     #[test]
     fn convert_messages_parses_native_assistant_tool_calls() {
-        let model_provider = OllamaModelProvider::new("test", None, None);
+        let model_provider = OllamaModelProvider::builder("test").build();
         let messages = vec![ChatMessage {
             role: "assistant".into(),
             content: r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{\"command\":\"ls\"}"}]}"#.into(),
@@ -1751,7 +1794,7 @@ mod tests {
 
     #[test]
     fn convert_messages_maps_tool_result_call_id_to_tool_name() {
-        let model_provider = OllamaModelProvider::new("test", None, None);
+        let model_provider = OllamaModelProvider::builder("test").build();
         let messages = vec![
             ChatMessage {
                 role: "assistant".into(),
@@ -1774,7 +1817,7 @@ mod tests {
 
     #[test]
     fn convert_messages_extracts_images_from_user_marker() {
-        let model_provider = OllamaModelProvider::new("test", None, None);
+        let model_provider = OllamaModelProvider::builder("test").build();
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "Inspect this screenshot [IMAGE:data:image/png;base64,abcd==]".into(),
@@ -1796,7 +1839,7 @@ mod tests {
 
     #[test]
     fn capabilities_disable_native_tools_and_enable_vision() {
-        let model_provider = OllamaModelProvider::new("test", None, None);
+        let model_provider = OllamaModelProvider::builder("test").build();
         let caps = <OllamaModelProvider as ModelProvider>::capabilities(&model_provider);
         assert!(
             !caps.native_tool_calling,

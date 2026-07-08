@@ -3516,7 +3516,7 @@ mod tests {
         assert_eq!(tuning.num_predict, 4096);
         assert_eq!(tuning.temperature_override, Some(0.5));
 
-        let provider = ollama::OllamaModelProvider::new("test", None, None).with_tuning(tuning);
+        let provider = ollama::OllamaModelProvider::builder("test").build().with_tuning(tuning);
         assert_eq!(provider.tuning(), tuning);
     }
 
