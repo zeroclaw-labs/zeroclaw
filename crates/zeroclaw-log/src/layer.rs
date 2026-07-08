@@ -608,6 +608,21 @@ mod e2e_tests {
         }
     }
 
+    /// Synthetic `Role::System` fixture standing in for config
+    /// load/migration attribution.
+    struct FakeSystemSurface {
+        alias: String,
+    }
+
+    impl Attributable for FakeSystemSurface {
+        fn role(&self) -> Role {
+            Role::System
+        }
+        fn alias(&self) -> &str {
+            &self.alias
+        }
+    }
+
     static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[allow(clippy::await_holding_lock)]
@@ -693,6 +708,74 @@ mod e2e_tests {
         );
 
         // Clean up so subsequent parallel tests aren't affected.
+        crate::clear_broadcast_hook();
+    }
+
+    /// A `Role::System` span carries a queryable alias. Regression for
+    /// zeroclaw-labs/zeroclaw#8636 follow-up: the config load/migration
+    /// attribution span must land `system_alias` in `LogEvent.zeroclaw`,
+    /// not merely set `zc_role = system` with the alias dropped.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn system_role_span_populates_system_alias() {
+        let _subscriber_guard = TEST_LOCK.lock();
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+
+        try_install_capture_subscriber();
+        let mut rx = subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let thing = FakeSystemSurface {
+            alias: "config".into(),
+        };
+
+        {
+            use zeroclaw_log::Instrument;
+            async {
+                zeroclaw_log::record!(
+                    INFO,
+                    Event::new(module_path!(), Action::Note).with_outcome(EventOutcome::Success),
+                    "system-role attribution e2e test"
+                );
+            }
+            .instrument(zeroclaw_log::attribution_span!(&thing))
+            .await;
+        }
+
+        let mut found = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !found && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("system-role attribution e2e test"))
+                        .unwrap_or(false)
+                    {
+                        let zc = value.get("zeroclaw").expect("zeroclaw block present");
+                        assert_eq!(
+                            zc.get("system_alias").and_then(|v| v.as_str()),
+                            Some("config"),
+                            "expected system_alias, got: {zc:?}"
+                        );
+                        assert_eq!(zc.get("zc_role").and_then(|v| v.as_str()), Some("system"),);
+                        found = true;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        assert!(
+            found,
+            "did not find the test event with system_alias attribution",
+        );
+
         crate::clear_broadcast_hook();
     }
 

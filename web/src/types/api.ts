@@ -16,16 +16,16 @@ export interface StatusResponse {
   paired: boolean;
   channels: Record<string, boolean>;
   health: HealthSnapshot;
-  /** Self-process resource snapshot. Present on Linux; on unsupported
-   * platforms `rss_bytes = 0` and `cpu_percent = null`. */
+  /** Self-process resource snapshot. Populated on Linux, macOS, Windows,
+   * and FreeBSD via the `sysinfo` crate; on unsupported hosts
+   * `rss_bytes = 0` and `cpu_percent = null`. */
   process?: ProcessStats;
 }
 
 export interface ProcessStats {
   rss_bytes: number;
-  /** Total system RAM in bytes (`/proc/meminfo`'s `MemTotal`). `0` on
-   * unsupported platforms; render the RAM tile as `rss / total * 100%`
-   * when this is non-zero. */
+  /** Total system RAM in bytes. `0` on unsupported platforms; render the
+   * RAM tile as `rss / total * 100%` when this is non-zero. */
   system_ram_total_bytes: number;
   /** Average CPU% across logical cores (0..100 * num_cpus). `null` on the
    * first sample after boot (no baseline) or on unsupported platforms. */
