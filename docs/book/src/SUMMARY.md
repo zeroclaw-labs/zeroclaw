@@ -126,7 +126,6 @@
     - [MQTT](./sop/fan-in/mqtt.md)
     - [Filesystem](./sop/fan-in/filesystem.md)
     - [AMQP](./sop/fan-in/amqp.md)
-    - [Channel](./sop/fan-in/channel.md)
     - [Git](./sop/fan-in/git.md)
     - [Manual](./sop/fan-in/manual.md)
     - [Webhook](./sop/fan-in/webhook.md)
