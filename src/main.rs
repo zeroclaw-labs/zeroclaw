@@ -5773,6 +5773,26 @@ async fn main() -> Result<()> {
                     } else {
                         raw_path.to_string()
                     };
+                    // Mirror `PATCH /api/config`'s alias auto-materialization
+                    // (`handle_patch` in crates/zeroclaw-gateway/src/api_config.rs):
+                    // `add`/`replace` against a leaf under a not-yet-existing map-keyed
+                    // alias (e.g. a brand-new `channels.telegram.<alias>.<field>`)
+                    // creates the alias first. `remove`/`test`/`comment` intentionally
+                    // do not materialize — nothing to remove/test on an alias that
+                    // doesn't exist yet.
+                    if matches!(op_name, "add" | "replace") && config.ensure_map_key_for_path(&path)
+                    {
+                        let err = ConfigApiError::new(
+                            ConfigApiCode::ValidationFailed,
+                            "alias `default` is reserved and cannot be created",
+                        )
+                        .with_path(&path)
+                        .with_op_index(idx);
+                        let human = format!(
+                            "op[{idx}] `{op_name}` on `{path}`: alias `default` is reserved and cannot be created"
+                        );
+                        config_patch_fail_json_or_human(json, err, human)?;
+                    }
                     let comment = match object.get("comment") {
                         Some(value) => match value.as_str() {
                             Some(comment) => Some(comment),
@@ -5816,11 +5836,17 @@ async fn main() -> Result<()> {
                                 ))
                             })?;
                             let value_str = json_value_to_setprop_string(value, &config, &path)?;
-                            config
-                                .set_prop_persistent(&path, &value_str)
-                                .with_context(|| {
-                                    format!("op[{idx}] `{op_name}` on `{path}` failed")
-                                })?;
+                            match config.set_prop_persistent(&path, &value_str) {
+                                Ok(()) => {}
+                                Err(err) => {
+                                    let api_err = config_patch_map_prop_error(err, &path, idx);
+                                    let human = format!(
+                                        "op[{idx}] `{op_name}` on `{path}` failed: {}",
+                                        api_err.message
+                                    );
+                                    config_patch_fail_json_or_human(json, api_err, human)?;
+                                }
+                            }
                             if is_secret {
                                 serde_json::json!({
                                     "op": op_name,
@@ -5836,9 +5862,17 @@ async fn main() -> Result<()> {
                             }
                         }
                         "remove" => {
-                            config.set_prop_persistent(&path, "").with_context(|| {
-                                format!("op[{idx}] `remove` on `{path}` failed")
-                            })?;
+                            match config.set_prop_persistent(&path, "") {
+                                Ok(()) => {}
+                                Err(err) => {
+                                    let api_err = config_patch_map_prop_error(err, &path, idx);
+                                    let human = format!(
+                                        "op[{idx}] `remove` on `{path}` failed: {}",
+                                        api_err.message
+                                    );
+                                    config_patch_fail_json_or_human(json, api_err, human)?;
+                                }
+                            }
                             if is_secret {
                                 serde_json::json!({
                                     "op": "remove",
@@ -5946,9 +5980,14 @@ async fn main() -> Result<()> {
                     results.push(result_entry);
                 }
 
-                config
-                    .validate()
-                    .context("validation failed after applying patch \u{2014} no changes saved")?;
+                if let Err(err) = config.validate() {
+                    let api_err = ConfigApiError::from_validation(err);
+                    let human = format!(
+                        "validation failed after applying patch \u{2014} no changes saved: {}",
+                        api_err.message
+                    );
+                    config_patch_fail_json_or_human(json, api_err, human)?;
+                }
                 Box::pin(config.save_dirty()).await?;
 
                 if json {
