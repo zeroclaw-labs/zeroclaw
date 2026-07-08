@@ -1557,7 +1557,7 @@ impl RpcDispatcher {
             0
         };
 
-        // Capture attribution fields and max_context_tokens for the turn span.
+        // Capture live attribution fields and max_context_tokens for the turn span.
         let (agent_alias, model_provider, model, max_ctx) = {
             let alias = self
                 .ctx
@@ -1565,16 +1565,16 @@ impl RpcDispatcher {
                 .get_agent_alias(sid)
                 .await
                 .unwrap_or_default();
-            let cfg = self.ctx.config.read().clone();
-            let mp = cfg
-                .agent(&alias)
-                .map(|a| a.model_provider.to_string())
-                .unwrap_or_default();
-            let m = cfg
-                .model_provider_for_agent(&alias)
-                .and_then(|p| p.model.clone())
-                .unwrap_or_default();
-            let max_ctx = Some(cfg.effective_model_context_window(&alias) as u64);
+            let (mp, m) = if let Some(agent) = self.ctx.sessions.get_agent(sid).await {
+                let (_, model_provider, model) = agent.lock().await.attribution_fields();
+                (model_provider, model)
+            } else {
+                (String::new(), String::new())
+            };
+            let max_ctx = {
+                let cfg = self.ctx.config.read();
+                Some(cfg.effective_model_context_window(&alias) as u64)
+            };
             (alias, mp, m, max_ctx)
         };
 
@@ -1884,6 +1884,7 @@ impl RpcDispatcher {
 
     async fn handle_session_configure(&self, params: &Value) -> RpcResult {
         let req: SessionConfigureParams = parse_params(params)?;
+        validate_session_configure_overrides(&req.overrides)?;
 
         let merged = self
             .ctx
@@ -1892,11 +1893,11 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
-        // A model_provider override needs a live provider-box rebuild, which
-        // requires Config — held here, not in the session store. Resolve the
-        // model from the prospective merged override or the configured entry,
-        // build the box, and only then commit the override to the session.
-        let built_model_provider = if let Some(ref model_provider_ref) = merged.model_provider {
+        // Model/model_provider overrides need a live provider-box rebuild,
+        // which requires Config — held here, not in the session store. Resolve
+        // the provider from the prospective merged override or configured
+        // agent, build the box, and only then commit the override.
+        let built_model_provider = if merged.model_provider.is_some() || merged.model.is_some() {
             let agent_alias = self
                 .ctx
                 .sessions
@@ -1914,6 +1915,10 @@ impl RpcDispatcher {
                             format!("Agent `{agent_alias}` is not configured"),
                         )
                     })?;
+                let model_provider_ref = merged
+                    .model_provider
+                    .as_deref()
+                    .unwrap_or_else(|| agent_cfg.model_provider.as_str());
                 let (model_provider, model_provider_name, model_name) =
                     crate::agent::agent::build_session_model_provider(
                         &config,
@@ -1959,10 +1964,6 @@ impl RpcDispatcher {
                 .await
                 .then_some(())
                 .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        } else if let Some(ref model_name) = merged.model
-            && let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await
-        {
-            agent.lock().await.set_model_name(model_name.clone());
         }
 
         to_result(SessionConfigureResult {
@@ -3979,6 +3980,24 @@ impl RpcDispatcher {
 
 fn parse_params<T: DeserializeOwned>(params: &Value) -> Result<T, JsonRpcError> {
     serde_json::from_value(params.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))
+}
+
+fn validate_session_configure_overrides(overrides: &SessionOverrides) -> Result<(), JsonRpcError> {
+    if overrides
+        .model
+        .as_deref()
+        .is_some_and(|model| model.trim().is_empty())
+    {
+        return Err(rpc_err(INVALID_PARAMS, "model must not be blank"));
+    }
+    if overrides
+        .model_provider
+        .as_deref()
+        .is_some_and(|provider| provider.trim().is_empty())
+    {
+        return Err(rpc_err(INVALID_PARAMS, "model_provider must not be blank"));
+    }
+    Ok(())
 }
 
 fn to_result<T: Serialize>(val: T) -> RpcResult {
@@ -6926,6 +6945,75 @@ mod tests {
             "old-model",
             "failed provider switch must leave the live agent unchanged"
         );
+    }
+
+    #[tokio::test]
+    async fn session_configure_blank_model_fields_do_not_commit_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        for model in ["", "   "] {
+            let res = dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": session_id,
+                    "overrides": {
+                        "model": model
+                    }
+                }))
+                .await;
+            let err = res.expect_err("blank model must be rejected");
+            assert_eq!(err.code, INVALID_PARAMS);
+
+            let overrides = dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .expect("session still exists");
+            assert_eq!(
+                overrides.model, None,
+                "failed model switch must not leave a stale override behind"
+            );
+            assert_eq!(
+                model_name_for_session(&dispatcher, &session_id).await,
+                "old-model",
+                "failed model switch must leave the live agent unchanged"
+            );
+        }
+
+        for model_provider in ["", "   "] {
+            let res = dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": session_id,
+                    "overrides": {
+                        "model_provider": model_provider
+                    }
+                }))
+                .await;
+            let err = res.expect_err("blank model_provider must be rejected");
+            assert_eq!(err.code, INVALID_PARAMS);
+
+            let overrides = dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .expect("session still exists");
+            assert_eq!(
+                overrides.model_provider, None,
+                "failed provider switch must not leave a stale override behind"
+            );
+            assert_eq!(
+                model_name_for_session(&dispatcher, &session_id).await,
+                "old-model",
+                "failed provider switch must leave the live agent unchanged"
+            );
+        }
     }
 
     #[tokio::test]
