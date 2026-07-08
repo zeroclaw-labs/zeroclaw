@@ -17,6 +17,13 @@ pub use chord::Chord;
 
 use crossterm::event::KeyEvent;
 
+pub fn help_bypasses_text_input(event: &KeyEvent) -> bool {
+    GlobalAction::Help
+        .resolved()
+        .iter()
+        .any(|chord| !chord.modifiers.is_empty() && chord.matches(event))
+}
+
 /// Uniform interface over every `keyactions!`-generated enum so generic
 /// code (the keybind surface) can walk variants, names, labels, and
 /// resolved chords without knowing the concrete enum.
@@ -76,6 +83,16 @@ mod tests {
     fn global_quit_chord_resolves() {
         let ev = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(GlobalAction::from_chord(&ev), Some(GlobalAction::Quit));
+    }
+
+    #[test]
+    fn global_help_resolves_from_question_mark_and_f1() {
+        let q = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        assert_eq!(GlobalAction::from_chord(&q), Some(GlobalAction::Help));
+        let f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE);
+        assert_eq!(GlobalAction::from_chord(&f1), Some(GlobalAction::Help));
+        let ctrl_f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::CONTROL);
+        assert_eq!(GlobalAction::from_chord(&ctrl_f1), Some(GlobalAction::Help));
     }
 
     #[test]

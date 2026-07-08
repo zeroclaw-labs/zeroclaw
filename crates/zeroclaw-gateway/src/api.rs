@@ -1881,6 +1881,15 @@ mod tests {
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
+
+        // Override the trait default (which returns an "unsupported" Err) so
+        // tests that trigger the delete_agent cascade don't have their
+        // `warnings` array polluted with a memory-backend error that has
+        // nothing to do with what they're actually asserting. Mirrors the
+        // behavior of a real backend on a delete-of-a-never-stored agent.
+        async fn purge_agent(&self, _agent_alias: &str) -> anyhow::Result<usize> {
+            Ok(0)
+        }
     }
     impl ::zeroclaw_api::attribution::Attributable for MockMemory {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {

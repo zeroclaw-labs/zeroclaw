@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use zeroclaw_config::schema::Config;
-use zeroclaw_memory::{MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN};
 
 mod registry;
 pub use registry::{DaemonRegistry, GatewayReloadControls};
@@ -1248,6 +1247,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 false,
                 None,
                 None,
+                zeroclaw_api::ingress::TurnOrigin::Daemon,
                 crate::agent::loop_::AgentRunOverrides::default(),
             ));
             let phase1_result = if config.heartbeat.task_timeout_secs > 0 {
@@ -1352,42 +1352,13 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             let task_start = std::time::Instant::now();
             let task_prompt = format!("[Heartbeat Task | {}] {}", task.priority, task.text);
 
-            // Recall relevant memories so heartbeat tasks have context awareness.
-            // Exclude `Conversation` memories to prevent chat context from
-            // leaking into scheduled executions.
-            let memory_context = if let Some(ref mem) = heartbeat_memory {
-                match mem.recall(&task.text, 5, None, None, None).await {
-                    Ok(entries) if !entries.is_empty() => {
-                        let ctx: String = entries
-                            .iter()
-                            .filter(|e| {
-                                !matches!(
-                                    e.category,
-                                    zeroclaw_memory::traits::MemoryCategory::Conversation
-                                )
-                            })
-                            .map(|e| format!("- {}: {}", e.key, e.content))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        if ctx.is_empty() {
-                            None
-                        } else {
-                            Some(format!(
-                                "{MEMORY_CONTEXT_OPEN}\n{ctx}\n{MEMORY_CONTEXT_CLOSE}\n\n"
-                            ))
-                        }
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            let prompt = match (&session_context, &memory_context) {
-                (Some(sc), Some(mc)) => format!("{mc}\n{sc}\n\n{task_prompt}"),
-                (Some(sc), None) => format!("{sc}\n\n{task_prompt}"),
-                (None, Some(mc)) => format!("{mc}\n\n{task_prompt}"),
-                (None, None) => task_prompt,
+            // Memory context is injected once in the engine, keyed on the
+            // Daemon origin (agent::memory_inject): Conversation entries are
+            // excluded for scheduled origins. `heartbeat_memory` stays for
+            // the post-run auto-save consolidation below.
+            let prompt = match &session_context {
+                Some(sc) => format!("{sc}\n\n{task_prompt}"),
+                None => task_prompt,
             };
             let temp: Option<f64> = config
                 .model_provider_for_agent(&agent_alias)
@@ -1403,6 +1374,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 false,
                 None,
                 None,
+                zeroclaw_api::ingress::TurnOrigin::Daemon,
                 crate::agent::loop_::AgentRunOverrides::default(),
             ));
             let phase2_result = if config.heartbeat.task_timeout_secs > 0 {
