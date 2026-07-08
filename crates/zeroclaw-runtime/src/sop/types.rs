@@ -360,8 +360,11 @@ pub struct SopStep {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pos: Option<StepPos>,
     /// Agent alias that runs this step. Overrides the SOP's parent agent when
-    /// set; unset inherits the parent. The named agent's own session, tools,
-    /// and model execute the step body.
+    /// set; unset inherits the parent. Authored, persisted, and resolved into
+    /// the executing action via `effective_agent` (step override then parent).
+    /// Spawning a distinct per-step agent's own session at execution time is
+    /// staged follow-on work; today the resolved alias is stamped on the action
+    /// and the active agent loop executes the step body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     /// Capability identifier used when `kind = "capability"`.
