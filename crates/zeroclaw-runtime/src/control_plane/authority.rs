@@ -17,6 +17,14 @@ use super::task_registry::TaskRecord;
 ///
 /// Never reclaims a task a live same-boot daemon is actively heart-beating.
 pub fn is_authoritative(rec: &TaskRecord, current_boot_id: &str) -> bool {
+    is_authoritative_with_pid_liveness(rec, current_boot_id, pid_is_alive)
+}
+
+fn is_authoritative_with_pid_liveness(
+    rec: &TaskRecord,
+    current_boot_id: &str,
+    pid_is_alive: impl Fn(u32) -> bool,
+) -> bool {
     // Fail-closed: an UNSTAMPED record (empty owner_boot_id) is never reclaimed by the
     // boot-mismatch path — otherwise a live task mid-create (record written before the
     // boot id is stamped) would be reaped by its own daemon. It is only reclaimable if
@@ -98,13 +106,19 @@ mod tests {
         // owned by a LIVE pid must NOT be reaped via the boot-mismatch path — fail closed.
         let me = std::process::id();
         assert!(!is_authoritative(&rec(me, ""), "boot-NEW"));
-        // Linux can prove this fake pid is dead via `/proc/<pid>`, so an empty
-        // boot_id with a dead owner remains reclaimable there.
-        #[cfg(target_os = "linux")]
-        assert!(is_authoritative(&rec(999_999, ""), "boot-NEW"));
-        // Other platforms deliberately fail closed for nonzero pids because
-        // `pid_is_alive` cannot prove liveness with the current implementation.
-        #[cfg(not(target_os = "linux"))]
-        assert!(!is_authoritative(&rec(999_999, ""), "boot-NEW"));
+    }
+
+    #[test]
+    fn unstamped_boot_id_reclaims_only_when_pid_liveness_says_dead() {
+        assert!(!is_authoritative_with_pid_liveness(
+            &rec(42, ""),
+            "boot-NEW",
+            |_| true,
+        ));
+        assert!(is_authoritative_with_pid_liveness(
+            &rec(42, ""),
+            "boot-NEW",
+            |_| false,
+        ));
     }
 }

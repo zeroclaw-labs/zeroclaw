@@ -21,6 +21,87 @@ works without further configuration.
 stream (dashboard SSE) and the typed `Observer` bridge still receive
 events; only the JSONL writer is gated.
 
+### Archive rotation (`log_persistence = "rotating"`)
+
+`rotating` persists every event like `full`, but ZeroClaw manages the active
+file: it is rotated to a timestamped archive on a size and/or daily boundary,
+and old archives are pruned by count and age. This differs from `rolling`,
+which trims old entries out of the active file; rotated events are preserved in
+archive files for later diagnostics.
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `log_persistence_max_bytes` | `0` | Rotate once an append leaves the active file at or above this many bytes. `0` disables size rotation. |
+| `log_persistence_rotate_daily` | `true` | Before the first event of a new UTC day, archive a file whose last write fell on an earlier day. |
+| `log_persistence_retention_max_files` | `7` | Keep at most this many archives; after a rotation the oldest beyond the cap are deleted. `0` keeps all. |
+| `log_persistence_retention_max_age_days` | `0` | Delete archives older than this many days after a rotation. `0` disables age-based cleanup. |
+
+Archives sit next to the active file and keep its extension, with a sortable
+UTC stamp inserted before that extension. For example, `runtime-trace.jsonl`
+rotates to `runtime-trace.20260624-031500.jsonl`. The dashboard and the
+`/api/logs` endpoint read the active file only, so archives are an on-disk
+record for offline inspection rather than a live query surface.
+
+Daily rotation keys off the UTC calendar, so its boundary may not line up with
+local midnight in other time zones. These keys are ignored unless
+`log_persistence = "rotating"`, and the `none`, `rolling`, and `full` modes are
+unchanged.
+
+### GenAI span attributes (`observability-otel`)
+
+`llm.response` spans carry the OTel GenAI message-content attributes
+`gen_ai.input.messages`, `gen_ai.output.messages`, and `gen_ai.system_instructions`
+(JSON-string encoded), which populate the Input/Output/System panes in Langfuse/Tempo.
+
+> **Privacy & cost.** Captured content is sanitized best-effort: inline image data is
+> elided and known credential shapes (key=value, bearer, and `sk-`/`ghp_`/`xoxb-`-style
+> prefixes) are redacted. This does NOT guarantee removal of all secrets or PII. Prefer
+> an access-controlled trace backend if conversations may be sensitive. Capture cost is
+> O(prompt size) **per agent-loop iteration** (the growing history is re-scanned each
+> round), and full text grows per-span payload proportionally. On per-byte backends,
+> apply exporter-side truncation rather than dropping the attributes.
+
+### OTel Content Capture
+
+OTel content capture is independent of log-based capture (`log_tool_io`, `log_llm_request_payload`). It controls what content is emitted as OpenTelemetry span attributes.
+
+#### GenAI Content
+
+Controls `gen_ai.system_instructions`, `gen_ai.input.messages`, and `gen_ai.output.messages` on OTel spans.
+
+```toml
+[observability]
+otel_genai_content = "off"            # off | redacted | full
+otel_genai_content_max_chars = 1000  # per-field truncation limit
+```
+
+- `off` (default): No content attributes, only metadata.
+- `redacted`: Content is leak-scanned and truncated at `max_chars` per field.
+- `full`: Content is leak-scanned but not truncated.
+
+#### Tool I/O
+
+Controls `gen_ai.tool.arguments`, `input.value`, `gen_ai.tool.result`, and `output.value` on OTel spans.
+
+```toml
+[observability]
+otel_tool_io = "off"                  # off | redacted | full
+otel_tool_io_max_chars = 1000        # per-field truncation limit
+```
+
+- `off` (default): No content attributes, only tool name + outcome.
+- `redacted`: Content is leak-scanned and truncated at `max_chars` per field.
+- `full`: Content is leak-scanned but not truncated.
+
+#### Behavior Notes
+
+- Setting `*_max_chars = 0` is equivalent to `off` for that policy.
+- Content is always scrubbed (credential patterns + secret patterns) before truncation.
+- Truncation preserves JSON structure for tool arguments (leaf strings truncated).
+- Truncated fields get a `…[truncated {n} of {total} chars]` marker. The marker is metadata and does not count against `max_chars`: the kept content is exactly `max_chars` characters, with the marker appended on top.
+- Default `off` is a privacy-first change from previous behavior (feature-gated but always-on when enabled).
+- The content policy is bound to the observer/config instance, not to the process. There is no process-global OTel content policy: each `OtelObserver` derives an immutable content config from `ObservabilityConfig` at construction and consults it at the OTel export boundary. Multiple observers in the same process keep independent policies: a later observer cannot override or silence an earlier one's privacy setting (no last-writer-wins, no cross-observer drift).
+
 ### LLM request payload capture (`log_llm_request_payload`)
 
 `log_llm_request_payload` controls whether the `llm_request` event records the
@@ -244,7 +325,8 @@ volume governor for genuine errors.
 - `crates/zeroclaw-log/src/layer.rs`: the `tracing-subscriber` Layer
   that captures every `tracing::*` call and feeds the pipeline.
 - `crates/zeroclaw-log/src/macro.rs`: `record!`, `scope!`, `spawn!`.
-- `crates/zeroclaw-log/src/writer.rs`: append + rolling trim.
+- `crates/zeroclaw-log/src/writer.rs`: append, rolling trim, and archive
+  rotation.
 - `crates/zeroclaw-log/src/reader.rs`: `/api/logs` reader.
 - `crates/zeroclaw-log/src/config.rs`: `StoragePolicy`, `ToolIoPolicy`,
   `ResolvedPolicy`.

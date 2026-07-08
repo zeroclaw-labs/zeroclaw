@@ -63,9 +63,9 @@ pub(crate) async fn announce_llm_request(
         model_provider: active_model_provider_name.to_string(),
         model: active_model.to_string(),
         messages_count: history.len(),
-        channel: None,
-        agent_alias: None,
-        turn_id: None,
+        channel: Some(ctx.channel_name.to_string()),
+        agent_alias: ctx.agent_alias.map(|s| s.to_string()),
+        turn_id: Some(ctx.turn_id.to_string()),
     });
     {
         let _provider_guard = ::zeroclaw_log::attribution_span!(active_model_provider).entered();
@@ -374,13 +374,17 @@ mod payload_capture_tests {
             pacing,
             strict_tool_parsing: false,
             channel: None,
+            agent_alias: None,
             turn_id: "trace-req-test",
         }
     }
 
-    /// Read the next broadcast `llm_request` record within a 2s deadline,
-    /// recovering from `Lagged` errors caused by parallel workspace tests
-    /// firing into the same global broadcast hook.
+    /// Read the next broadcast `llm_request` record for THIS test's turn
+    /// (`trace-req-test`) within a 2s deadline, recovering from `Lagged`
+    /// errors and skipping records emitted by other loop-driving tests: the
+    /// capture subscriber is process-global, so any concurrently-running
+    /// `run_tool_call_loop` test also emits `llm_request` records into the
+    /// same broadcast hook.
     async fn next_llm_request(
         rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
     ) -> serde_json::Value {
@@ -390,7 +394,13 @@ mod payload_capture_tests {
             let step = remaining.min(std::time::Duration::from_millis(50));
             match tokio::time::timeout(step, rx.recv()).await {
                 Ok(Ok(value)) => {
-                    if value.get("message").and_then(|v| v.as_str()) == Some("llm_request") {
+                    let ours = value
+                        .get("attributes")
+                        .and_then(|a| a.get("trace_id"))
+                        .and_then(|v| v.as_str())
+                        == Some("trace-req-test");
+                    if ours && value.get("message").and_then(|v| v.as_str()) == Some("llm_request")
+                    {
                         return value;
                     }
                 }
