@@ -107,6 +107,9 @@ pub mod error_codes {
     pub const AUTH_REQUIRED: i32 = -32010;
     pub const VERSION_MISMATCH: i32 = -32011;
 
+    // SOP authoring
+    pub const SOP_ALREADY_EXISTS: i32 = -32020;
+    pub const SOP_NOT_FOUND: i32 = -32021;
     // Filesystem RPC errors (internal numeric codes; wire uses string codes e.g. "fs.not_found")
     pub const FS_NOT_FOUND: i32 = 4001;
     pub const FS_PERMISSION_DENIED: i32 = 4002;

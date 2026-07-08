@@ -57,9 +57,75 @@ pub fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
+static SENSITIVE_KEY_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)"#).unwrap()
+});
+
+/// Structured-aware credential scrub for a JSON value bound for a human-facing
+/// surface. Object entries whose key names a credential have their string value
+/// redacted in place, preserving the key; every other string leaf still runs
+/// through the text [`scrub_credentials`] so inline `token=...` patterns inside
+/// unrelated fields are caught too. Serialize-then-scrub would corrupt key names
+/// that merely contain a sensitive word (e.g. `access_token`), so this walks the
+/// value instead. Same rendering-boundary contract as [`scrub_credentials`].
+pub fn scrub_credentials_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let scrubbed = map
+                .into_iter()
+                .map(|(key, val)| {
+                    if SENSITIVE_KEY_REGEX.is_match(&key) {
+                        (key, redact_credential_leaf(val))
+                    } else {
+                        (key, scrub_credentials_value(val))
+                    }
+                })
+                .collect();
+            serde_json::Value::Object(scrubbed)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(scrub_credentials_value).collect())
+        }
+        serde_json::Value::String(s) => serde_json::Value::String(scrub_credentials(&s)),
+        other => other,
+    }
+}
+
+/// Redact a value sitting under a credential-named key. String values keep a
+/// short prefix for context; non-strings recurse so nested secret objects are
+/// still walked.
+fn redact_credential_leaf(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => {
+            let prefix = s
+                .char_indices()
+                .nth(4)
+                .map(|(byte_idx, _)| &s[..byte_idx])
+                .filter(|_| s.chars().count() > 4)
+                .unwrap_or("");
+            serde_json::Value::String(format!("{prefix}*[REDACTED]"))
+        }
+        nested => scrub_credentials_value(nested),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::scrub_credentials;
+    use super::{scrub_credentials, scrub_credentials_value};
+
+    #[test]
+    fn scrub_credentials_value_redacts_nested_secret_and_keeps_key() {
+        let input = serde_json::json!({
+            "body": {"access_token": "sk-live-abcdef0123456789", "status": "ok"},
+            "count": 3
+        });
+        let out = scrub_credentials_value(input);
+        let token = out["body"]["access_token"].as_str().unwrap();
+        assert!(token.contains("[REDACTED]"));
+        assert!(!token.contains("abcdef0123456789"));
+        assert_eq!(out["body"]["status"], "ok");
+        assert_eq!(out["count"], 3);
+    }
 
     #[test]
     fn scrub_credentials_redacts_unquoted_base64_credential_values() {

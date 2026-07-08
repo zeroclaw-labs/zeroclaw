@@ -46,6 +46,7 @@ web/dist/*
 # by /target above.)
 web/src/lib/api-generated.ts
 web/src/lib/api-descriptions.ts
+web/src/lib/api-enums.ts
 *.db
 *.db-journal
 *.db-wal
@@ -119,6 +120,7 @@ apps/tauri/gen/schemas/
 # Generated TypeScript client (rebuild via cargo web gen-api)
 web/src/lib/api-generated.ts
 web/src/lib/api-descriptions.ts
+web/src/lib/api-enums.ts
 
 # Generated OpenAPI spec (transient handoff for openapi-typescript)
 target/openapi.json

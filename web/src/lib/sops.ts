@@ -1,6 +1,7 @@
 import { apiFetch } from './api';
 import type { components } from './api-generated';
 import { fieldHelp } from './api-descriptions';
+import { enumMembers } from './api-enums';
 
 type Schemas = components['schemas'];
 
@@ -9,6 +10,10 @@ type Schemas = components['schemas'];
 export function sopFieldHelp(schema: string, field: string): string | undefined {
   return fieldHelp(schema, field);
 }
+
+export const sopPriorities = enumMembers('SopPriority') as readonly SopPriority[];
+export const sopExecutionModes = enumMembers('SopExecutionMode') as readonly SopExecutionMode[];
+export const sopStepKinds = enumMembers('SopStepKind') as readonly SopStepKind[];
 
 export type Sop = Schemas['Sop'];
 export type SopStep = Schemas['SopStep'];
@@ -319,6 +324,17 @@ export function runStatusTone(status: SopRunStatus | undefined): RunStateTone {
       return 'warning';
     default:
       return 'neutral';
+  }
+}
+
+export function isTerminalRunStatus(status: SopRunStatus | undefined): boolean {
+  switch (status) {
+    case 'completed':
+    case 'failed':
+    case 'cancelled':
+      return true;
+    default:
+      return false;
   }
 }
 

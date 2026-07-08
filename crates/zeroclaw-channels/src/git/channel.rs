@@ -37,6 +37,27 @@ const MIN_POLL_INTERVAL_SECS: u64 = 15;
 /// abuse limits punish rapid content mutation.
 const DRAFT_EDIT_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Resolve the GitHub App private key PEM, preferring the inline `private_key`
+/// and falling back to reading `private_key_path` from disk. Backward-compatible
+/// with configs that predate the inline field.
+fn resolve_github_private_key(cfg: &GitConfig) -> anyhow::Result<Option<String>> {
+    if cfg.private_key.is_some() {
+        return Ok(cfg.private_key.clone());
+    }
+    let Some(path) = cfg
+        .private_key_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    else {
+        return Ok(None);
+    };
+    match std::fs::read_to_string(path) {
+        Ok(pem) => Ok(Some(pem)),
+        Err(e) => anyhow::bail!("git channel: reading private_key_path `{path}` failed: {e}"),
+    }
+}
+
 /// Build the configured forge provider, or a clear error for an unknown
 /// `provider` value. The only forge-aware seam in the channel.
 fn build_provider(cfg: &GitConfig) -> anyhow::Result<Box<dyn GitProvider>> {
@@ -46,7 +67,7 @@ fn build_provider(cfg: &GitConfig) -> anyhow::Result<Box<dyn GitProvider>> {
             {
                 Ok(Box::new(super::providers::github::GithubProvider::new(
                     cfg.app_id,
-                    cfg.private_key.clone(),
+                    resolve_github_private_key(cfg)?,
                     cfg.installation_id,
                     cfg.proxy_url.clone(),
                 )))
@@ -675,6 +696,43 @@ mod tests {
         let ch = channel(vec![]);
         assert_eq!(ch.name(), "git");
         assert_eq!(ch.alias(), "git_test_alias");
+    }
+
+    #[test]
+    fn resolve_key_prefers_inline_then_path() {
+        let inline = GitConfig {
+            private_key: Some("INLINE-PEM".to_string()),
+            private_key_path: Some("/does/not/matter".to_string()),
+            ..GitConfig::default()
+        };
+        assert_eq!(
+            resolve_github_private_key(&inline).unwrap().as_deref(),
+            Some("INLINE-PEM")
+        );
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("git_key_{}.pem", std::process::id()));
+        std::fs::write(&path, "PATH-PEM").unwrap();
+        let from_path = GitConfig {
+            private_key: None,
+            private_key_path: Some(path.to_string_lossy().into_owned()),
+            ..GitConfig::default()
+        };
+        assert_eq!(
+            resolve_github_private_key(&from_path).unwrap().as_deref(),
+            Some("PATH-PEM")
+        );
+        let _ = std::fs::remove_file(&path);
+
+        let neither = GitConfig::default();
+        assert!(resolve_github_private_key(&neither).unwrap().is_none());
+
+        let missing = GitConfig {
+            private_key: None,
+            private_key_path: Some("/no/such/key.pem".to_string()),
+            ..GitConfig::default()
+        };
+        assert!(resolve_github_private_key(&missing).is_err());
     }
 
     #[test]

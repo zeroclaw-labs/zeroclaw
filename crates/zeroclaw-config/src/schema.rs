@@ -16039,6 +16039,12 @@ pub struct GitConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private_key: Option<String>,
+    /// Filesystem path to the RS256 private key `.pem` file, read at startup
+    /// when `private_key` (inline PEM) is unset. Backward-compatible fallback
+    /// for configs that predate the inline-PEM field. GitHub provider only.
+    #[tab(Connection)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key_path: Option<String>,
     /// Installation ID to act as. When unset, the app's installations are
     /// listed on first use and a sole installation is auto-selected;
     /// startup fails if the app has zero or multiple installations.
@@ -16125,6 +16131,7 @@ impl std::fmt::Debug for GitConfig {
             .field("provider", &self.provider)
             .field("app_id", &self.app_id)
             .field("private_key", &self.private_key.as_ref().map(|_| "***"))
+            .field("private_key_path", &self.private_key_path)
             .field("installation_id", &self.installation_id)
             .field("api_base_url", &self.api_base_url)
             .field(
@@ -16162,6 +16169,7 @@ impl Default for GitConfig {
             provider: default_git_provider(),
             app_id: 0,
             private_key: None,
+            private_key_path: None,
             installation_id: None,
             api_base_url: None,
             access_token: String::new(),

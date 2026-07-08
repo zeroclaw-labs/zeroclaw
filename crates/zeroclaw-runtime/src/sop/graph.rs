@@ -370,6 +370,17 @@ impl SopGraphExt for SopGraph {
                 }
             }
 
+            if !step.routing.switch.is_empty() && step.routing.next.is_some() {
+                diagnostics.push(GraphDiagnostic {
+                    severity: GraphSeverity::Warning,
+                    step: step.number,
+                    message:
+                        "step has switch rules and a routing.next target; next is ignored because \
+                         switch resolution takes precedence"
+                            .to_string(),
+                });
+            }
+
             for rule in &step.routing.switch {
                 match rule.goto {
                     Some(target) if valid_steps.contains(&target) => {

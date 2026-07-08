@@ -703,11 +703,12 @@ export default function SopCanvas({
             completeLink(node.step);
             return;
           }
+          onSelectStep(node.step);
+          if (readOnly) return;
           const local = toLocal(e.clientX, e.clientY);
           setDrag({ step: node.step, dx: local.x - p.x, dy: local.y - p.y });
-          onSelectStep(node.step);
         }}
-        className="cursor-grab"
+        className={readOnly ? 'cursor-pointer' : 'cursor-grab'}
       >
         <rect
           width={NODE_W}

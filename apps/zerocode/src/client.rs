@@ -2018,6 +2018,23 @@ pub enum SopStepKind {
     #[default]
     Execute,
     Checkpoint,
+    Capability,
+}
+
+impl SopStepKind {
+    pub const ALL: [SopStepKind; 3] = [
+        SopStepKind::Execute,
+        SopStepKind::Checkpoint,
+        SopStepKind::Capability,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SopStepKind::Execute => "execute",
+            SopStepKind::Checkpoint => "checkpoint",
+            SopStepKind::Capability => "capability",
+        }
+    }
 }
 
 // SOP graph wire types. zerocode is an RPC-only surface: it deserializes these

@@ -17,7 +17,7 @@ use super::engine::SopEngine;
 use super::types::{SopRun, SopRunAction, SopStepResult, StepToolCall};
 
 use crate::agent::history::truncate_tool_result;
-use crate::agent::turn::redact::scrub_credentials;
+use crate::agent::turn::redact::{scrub_credentials, scrub_credentials_value};
 
 const MAX_STEP_TOOL_CALLS: usize = 256;
 const MAX_STEP_TOOL_OUTPUT_CHARS: usize = 4096;
@@ -88,6 +88,7 @@ pub(crate) fn record_step_tool_call(
             let args = serde_json::from_str(&scrubbed_args).unwrap_or(serde_json::Value::Null);
             let output =
                 truncate_tool_result(&scrub_credentials(&output), MAX_STEP_TOOL_OUTPUT_CHARS);
+            let output_data = output_data.map(scrub_credentials_value);
             calls.push(StepToolCall {
                 index,
                 tool: tool.to_string(),
@@ -334,6 +335,37 @@ mod tests {
         assert_eq!(calls[1].duration_ms, 3);
         // Drain empties the sink.
         assert!(drain_step_calls(&sink).is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_step_tool_call_scrubs_output_data_secrets() {
+        let sink = new_step_call_sink();
+        scope_step_call_sink(sink.clone(), async {
+            record_step_tool_call(
+                "http_request",
+                &json!({"url": "https://example.com/token"}),
+                true,
+                "200 OK".into(),
+                Some(json!({"body": {"access_token": "sk-live-abcdef0123456789"}})),
+                None,
+                7,
+            );
+        })
+        .await;
+
+        let calls = drain_step_calls(&sink);
+        assert_eq!(calls.len(), 1);
+        let data = calls[0].output_data.as_ref().expect("output_data present");
+        let token = data
+            .get("body")
+            .and_then(|b| b.get("access_token"))
+            .and_then(|t| t.as_str())
+            .expect("access_token present");
+        assert!(
+            token.contains("[REDACTED]"),
+            "output_data secret was not scrubbed: {token}"
+        );
+        assert!(!token.contains("abcdef0123456789"));
     }
 
     #[tokio::test]

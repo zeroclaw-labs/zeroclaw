@@ -424,16 +424,14 @@ pub async fn handle_sop_create(
         return e.into_response();
     }
     let (dir, _mode) = sops_dir_and_mode(&state);
-    match zeroclaw_runtime::sop::create_sop(&dir, &sop) {
+    match zeroclaw_runtime::sop::create_sop_typed(&dir, &sop) {
         Ok(()) => Json(serde_json::json!({ "created": sop.name })).into_response(),
         Err(e) => {
-            let msg = e.to_string();
-            let code = if msg.contains("already exists") {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::BAD_REQUEST
+            let code = match e {
+                zeroclaw_runtime::sop::SopAuthorError::AlreadyExists(_) => StatusCode::CONFLICT,
+                _ => StatusCode::BAD_REQUEST,
             };
-            (code, Json(serde_json::json!({ "error": msg }))).into_response()
+            (code, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
         }
     }
 }
@@ -480,13 +478,15 @@ pub async fn handle_sop_delete(
         return e.into_response();
     }
     let (dir, _mode) = sops_dir_and_mode(&state);
-    match zeroclaw_runtime::sop::delete_sop(&dir, &name) {
+    match zeroclaw_runtime::sop::delete_sop_typed(&dir, &name) {
         Ok(()) => Json(serde_json::json!({ "deleted": name })).into_response(),
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => {
+            let code = match e {
+                zeroclaw_runtime::sop::SopAuthorError::NotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (code, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+        }
     }
 }
 

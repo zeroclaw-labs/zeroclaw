@@ -4185,15 +4185,26 @@ impl RpcDispatcher {
         let req: SopSaveRequest = parse_params(params)?;
         let sop = Self::parse_sop(&req.sop)?;
         let (dir, _mode) = self.sops_dir_and_mode();
-        crate::sop::create_sop(&dir, &sop).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        crate::sop::create_sop_typed(&dir, &sop).map_err(|e| {
+            let code = match e {
+                crate::sop::SopAuthorError::AlreadyExists(_) => SOP_ALREADY_EXISTS,
+                _ => INVALID_PARAMS,
+            };
+            rpc_err(code, e.to_string())
+        })?;
         to_result(serde_json::json!({ "created": sop.name }))
     }
 
     fn handle_sops_delete(&self, params: &Value) -> RpcResult {
         let req: SopSelectRequest = parse_params(params)?;
         let (dir, _mode) = self.sops_dir_and_mode();
-        crate::sop::delete_sop(&dir, &req.name)
-            .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        crate::sop::delete_sop_typed(&dir, &req.name).map_err(|e| {
+            let code = match e {
+                crate::sop::SopAuthorError::NotFound(_) => SOP_NOT_FOUND,
+                _ => INTERNAL_ERROR,
+            };
+            rpc_err(code, e.to_string())
+        })?;
         to_result(serde_json::json!({ "deleted": req.name }))
     }
 

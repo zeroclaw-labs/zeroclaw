@@ -8,6 +8,14 @@ use super::payloads::{
 };
 use crate::git::types::{GitChannelError, IssueRef, RepoRef};
 
+/// Pin a raw forge-call path under the configured Gitea API base. Same origin
+/// guarantee as the GitHub client: the path is only ever appended after
+/// `base/`, so no absolute URL, `//host`, or `..` in the path can redirect the
+/// request to a different origin.
+fn forge_url(base: &str, path: &str) -> String {
+    format!("{}/{}", base, path.trim_start_matches('/'))
+}
+
 pub struct GiteaApi {
     base: String,
     proxy_url: Option<String>,
@@ -276,7 +284,7 @@ impl GiteaApi {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<(u16, serde_json::Value), GitChannelError> {
-        let url = format!("{}/{}", self.base, path.trim_start_matches('/'));
+        let url = forge_url(&self.base, path);
         let mut req = self.request(method, url, token);
         if let Some(payload) = body {
             req = req.json(payload);
@@ -290,5 +298,26 @@ impl GiteaApi {
             serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
         };
         Ok((status, value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::forge_url;
+
+    #[test]
+    fn forge_url_pins_raw_path_to_configured_base() {
+        let base = "https://git.example.org/api/v1";
+        assert_eq!(
+            forge_url(base, "repos/o/r/issues/1"),
+            "https://git.example.org/api/v1/repos/o/r/issues/1"
+        );
+        assert_eq!(
+            forge_url(base, "/repos/o/r/issues/1"),
+            "https://git.example.org/api/v1/repos/o/r/issues/1"
+        );
+        assert!(forge_url(base, "https://evil.test/x").starts_with("https://git.example.org/"));
+        assert!(forge_url(base, "//evil.test/x").starts_with("https://git.example.org/"));
+        assert!(forge_url(base, "../../../evil.test").starts_with("https://git.example.org/"));
     }
 }

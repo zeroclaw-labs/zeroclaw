@@ -1170,10 +1170,9 @@ impl SopPane {
             StepField::Body => step.body.push(c),
             StepField::Tools => push_csv_char(&mut step.suggested_tools, c),
             StepField::Kind => {
-                step.kind = match step.kind {
-                    SopStepKind::Execute => SopStepKind::Checkpoint,
-                    SopStepKind::Checkpoint => SopStepKind::Execute,
-                };
+                if let Some(picked) = cycle_pick(&SopStepKind::ALL, &step.kind, true) {
+                    step.kind = picked;
+                }
             }
             StepField::DependsOn => push_num_csv_char(&mut step.routing.depends_on, c),
             StepField::Next => push_opt_u32_char(&mut step.routing.next, c),
@@ -1761,10 +1760,7 @@ impl SopPane {
                     (" ", "")
                 }
             };
-            let kind = match step.kind {
-                SopStepKind::Execute => "execute",
-                SopStepKind::Checkpoint => "checkpoint",
-            };
+            let kind = step.kind.as_str();
             lines.push(format!("── step {} ──", i + 1));
             let (m, cur) = marker(StepField::Title);
             lines.push(format!("{m} title: {}{cur}", step.title));
@@ -1792,6 +1788,17 @@ impl SopPane {
                 "{m} when: {}{cur}",
                 step.routing.when.clone().unwrap_or_default()
             ));
+            if on_step && ed.field == StepField::When && !self.trigger_registry.operators.is_empty()
+            {
+                let ops = self
+                    .trigger_registry
+                    .operators
+                    .iter()
+                    .map(|op| op.token.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                lines.push(format!("     ops: {ops}"));
+            }
             let (m, _) = marker(StepField::OnFailure);
             lines.push(format!(
                 "{m} on_failure: {}",

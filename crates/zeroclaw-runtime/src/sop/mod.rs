@@ -214,6 +214,43 @@ pub fn create_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
     save_sop(sops_dir, sop)
 }
 
+/// Typed classification of an authoring failure so transports map it to the
+/// right status/RPC code without matching on stringified message substrings.
+#[derive(Debug)]
+pub enum SopAuthorError {
+    AlreadyExists(String),
+    NotFound(String),
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for SopAuthorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SopAuthorError::AlreadyExists(name) => write!(f, "SOP '{name}' already exists"),
+            SopAuthorError::NotFound(name) => write!(f, "SOP '{name}' not found"),
+            SopAuthorError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for SopAuthorError {}
+
+pub fn create_sop_typed(sops_dir: &Path, sop: &Sop) -> std::result::Result<(), SopAuthorError> {
+    let dir = resolve_sop_dir(sops_dir, &sop.name).map_err(SopAuthorError::Other)?;
+    if dir.exists() {
+        return Err(SopAuthorError::AlreadyExists(sop.name.clone()));
+    }
+    save_sop(sops_dir, sop).map_err(SopAuthorError::Other)
+}
+
+pub fn delete_sop_typed(sops_dir: &Path, name: &str) -> std::result::Result<(), SopAuthorError> {
+    let dir = resolve_sop_dir(sops_dir, name).map_err(SopAuthorError::Other)?;
+    if !dir.exists() {
+        return Err(SopAuthorError::NotFound(name.to_string()));
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| SopAuthorError::Other(e.into()))
+}
+
 /// Project the live run state for `run_id` onto `sop`'s graph. Errors if
 /// the run is unknown or the engine lock is poisoned.
 pub fn run_overlay_for(

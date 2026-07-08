@@ -784,7 +784,9 @@ pub struct DeterministicSavings {
 /// What the engine instructs the caller to do next after a state transition.
 #[derive(Debug, Clone)]
 pub enum SopRunAction {
-    /// Inject this step into the agent for execution.
+    /// Inject this step into the agent for execution. `step.agent` is the
+    /// resolved effective agent (step override then parent), not the raw
+    /// persisted override; consumers must not re-resolve it.
     ExecuteStep {
         run_id: String,
         step: SopStep,

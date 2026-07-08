@@ -1098,6 +1098,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'sops.step_kind': 'Step kind',
     'sops.kind_execute': 'execute',
     'sops.kind_checkpoint': 'checkpoint',
+    'sops.kind_capability': 'capability',
     'sops.routing_depends_on': 'depends on (fan-in)',
     'sops.routing_next': 'next step',
     'sops.routing_when': 'when (condition)',

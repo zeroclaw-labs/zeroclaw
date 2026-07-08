@@ -27,6 +27,10 @@ import {
   runStateTone,
   parseCondition,
   buildCondition,
+  sopPriorities,
+  sopExecutionModes,
+  sopStepKinds,
+  isTerminalRunStatus,
   type RunStateTone,
   type WireRole,
   type SopSummary,
@@ -336,7 +340,7 @@ function SelectField({
   label: string;
   value: string;
   onChange: (next: string) => void;
-  options?: string[];
+  options?: readonly string[];
   disabled?: boolean;
   children?: ReactNode;
   help?: string | null;
@@ -423,8 +427,11 @@ function StepEditor({
           aria-label={t('sops.step_kind')}
           title={sopFieldHelp('SopStep', 'kind') ?? undefined}
         >
-          <option value="execute">{t('sops.kind_execute')}</option>
-          <option value="checkpoint">{t('sops.kind_checkpoint')}</option>
+          {sopStepKinds.map((kind) => (
+            <option key={kind} value={kind}>
+              {t(`sops.kind_${kind}`)}
+            </option>
+          ))}
         </select>
         <button
           type="button"
@@ -1275,7 +1282,7 @@ function DraftSidebar({
           label={t('sops.field_priority')}
           value={draft.priority}
           onChange={(v) => onField({ priority: v as Sop['priority'] })}
-          options={['critical', 'high', 'normal', 'low']}
+          options={sopPriorities}
           help={sopFieldHelp('Sop', 'priority')}
         />
       </div>
@@ -1283,7 +1290,7 @@ function DraftSidebar({
         label={t('sops.field_execution_mode')}
         value={draft.execution_mode}
         onChange={(v) => onField({ execution_mode: v as Sop['execution_mode'] })}
-        options={['auto', 'supervised', 'step_by_step', 'priority_based', 'deterministic']}
+        options={sopExecutionModes}
         help={sopFieldHelp('Sop', 'execution_mode')}
       />
       <SelectField
@@ -1732,12 +1739,20 @@ export default function Sops() {
       return;
     }
     let active = true;
+    let id = 0;
+    const stop = () => {
+      if (id) {
+        window.clearInterval(id);
+        id = 0;
+      }
+    };
     const poll = () => {
       getRunOverlay(selected, runId)
         .then((o) => {
           if (!active) return;
           setOverlay(o);
           setOverlayError(null);
+          if (isTerminalRunStatus(o.status)) stop();
         })
         .catch((e: unknown) => {
           if (!active) return;
@@ -1746,10 +1761,10 @@ export default function Sops() {
         });
     };
     poll();
-    const id = window.setInterval(poll, 2000);
+    id = window.setInterval(poll, 2000);
     return () => {
       active = false;
-      window.clearInterval(id);
+      stop();
     };
   }, [selected, runId]);
 
