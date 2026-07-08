@@ -836,6 +836,17 @@ impl AnthropicModelProvider {
         )
     }
 
+    /// Streaming client: connect-timeout only, no total request timeout, so a
+    /// long streaming generation is bounded by the SSE idle guard rather than a
+    /// wall-clock cap that would truncate legitimate long output. The
+    /// non-streaming `http_client` keeps its 120s total timeout.
+    fn streaming_client(&self) -> Client {
+        zeroclaw_config::schema::build_runtime_proxy_streaming_client(
+            "model_provider.anthropic",
+            10,
+        )
+    }
+
     /// Build a streaming request body from a `NativeChatRequest`.
     fn build_streaming_request(request: &NativeChatRequest) -> anyhow::Result<serde_json::Value> {
         let mut body = serde_json::to_value(request)
@@ -1476,7 +1487,7 @@ impl ModelProvider for AnthropicModelProvider {
             // across the async boundary.
             let body = serde_json::to_value(&native_request)
                 .expect("NativeChatRequest should serialize to JSON");
-            let client = self.http_client();
+            let client = self.streaming_client();
             let url = format!("{}/v1/messages", self.base_url);
             let is_oauth = Self::is_setup_token(&credential);
 
@@ -1585,7 +1596,7 @@ impl ModelProvider for AnthropicModelProvider {
                     .boxed();
             }
         };
-        let client = self.http_client();
+        let client = self.streaming_client();
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
 
@@ -1988,6 +1999,13 @@ data: {\"type\":\"message_stop\"}\n\n";
         let p = AnthropicModelProvider::new("test", Some("  anthropic-test-credential  "));
         assert!(p.credential.is_some());
         assert_eq!(p.credential.as_deref(), Some("anthropic-test-credential"));
+    }
+
+    #[test]
+    fn streaming_client_builds_without_a_total_timeout() {
+        let p = AnthropicModelProvider::new("test", Some("test-key"));
+        let _streaming = p.streaming_client();
+        let _blocking = p.http_client();
     }
 
     #[test]
