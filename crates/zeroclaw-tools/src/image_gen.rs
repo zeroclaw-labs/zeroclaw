@@ -2,6 +2,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::json;
 use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
@@ -232,13 +233,19 @@ impl ImageGenTool {
     /// catch this.
     ///
     /// Mirrors the async-DNS pattern at `http_request.rs:622-185` and
-    /// `web_fetch.rs:702-723`. The redirect policy closure (which is sync
-    /// and cannot await DNS) remains on the literal-host check; that gap
-    /// is documented as a known follow-up.
+    /// `web_fetch.rs:702-723`. Returns the validated host and socket
+    /// addresses so the caller can pin the reqwest connection via
+    /// `resolve_to_addrs`, eliminating the time-of-check/time-of-use
+    /// window between DNS validation and the actual TCP connect.
     ///
     /// For IP-literal hosts the literal-host check at `validate_image_url`
-    /// has already classified the IP, so this method is a no-op.
-    async fn validate_resolved_ips_for_image_url(&self, url: &str) -> anyhow::Result<()> {
+    /// has already classified the IP, so this method resolves nothing
+    /// and returns the parsed host with an empty addr list (the caller
+    /// skips `resolve_to_addrs` for IP literals).
+    async fn validate_resolved_ips_for_image_url(
+        &self,
+        url: &str,
+    ) -> anyhow::Result<(String, Vec<SocketAddr>)> {
         let parsed = reqwest::Url::parse(url)
             .map_err(|e| anyhow::Error::msg(format!("Invalid image URL format: {e}")))?;
         let host = parsed
@@ -247,8 +254,10 @@ impl ImageGenTool {
             .to_string();
 
         // IP literals: the literal-host check already classified the host.
+        // No DNS needed — return the host string and an empty addr list so
+        // the caller can skip `resolve_to_addrs` (reqwest connects directly).
         if host.parse::<IpAddr>().is_ok() {
-            return Ok(());
+            return Ok((host, Vec::new()));
         }
 
         let port = parsed.port_or_known_default().unwrap_or(443);
@@ -271,7 +280,9 @@ impl ImageGenTool {
             .collect::<Vec<_>>();
 
         let ips: Vec<IpAddr> = addrs.iter().map(|sa| sa.ip()).collect();
-        check_resolved_ips_for_image_gen(&host, &self.allowed_private_hosts, &ips)
+        check_resolved_ips_for_image_gen(&host, &self.allowed_private_hosts, &ips)?;
+
+        Ok((host, addrs))
     }
 
     /// Build a reusable HTTP client with reasonable timeouts.
@@ -439,7 +450,12 @@ impl ImageGenTool {
         // where `internal.corp` resolves to `10.0.0.5` — the literal-host
         // check at `validate_image_url` cannot catch this. Mirrors
         // `http_request.rs:622-185` async-DNS pattern.
-        self.validate_resolved_ips_for_image_url(&validated_image_url)
+        //
+        // Returns the host name and validated socket addresses so the
+        // download client can pin the connection (eliminating the TOCTOU
+        // window between DNS validation and the TCP connect).
+        let (image_host, resolved_addrs) = self
+            .validate_resolved_ips_for_image_url(&validated_image_url)
             .await?;
 
         // ── Build image-download client with per-redirect SSRF gate ─
@@ -464,12 +480,20 @@ impl ImageGenTool {
             attempt.follow()
         });
 
-        let download_client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .connect_timeout(std::time::Duration::from_secs(10))
-            .redirect(redirect_policy)
-            .build()
-            .unwrap_or_default();
+            .redirect(redirect_policy);
+
+        // Pin the validated resolved addresses so reqwest cannot perform
+        // a separate DNS lookup during connect — closes the TOCTOU window
+        // between validation and the actual TCP handshake. For IP-literal
+        // hosts (empty resolved_addrs), skip pinning (reqwest connects
+        // directly to the literal address anyway).
+        if !resolved_addrs.is_empty() {
+            builder = builder.resolve_to_addrs(&image_host, &resolved_addrs);
+        }
+        let download_client = builder.build().unwrap_or_default();
 
         // ── Download image ─────────────────────────────────────────
         let img_resp = download_client
