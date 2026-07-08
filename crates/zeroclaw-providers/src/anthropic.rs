@@ -1,10 +1,9 @@
-#[cfg(test)]
-use crate::traits::PRUNED_CONTEXT_SEPARATOR;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     ModelProvider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
     StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
+use anyhow::Context;
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::stream::{self, StreamExt};
@@ -69,7 +68,7 @@ struct ContentBlock {
 }
 
 #[derive(Debug, Serialize)]
-struct NativeChatRequest<'a> {
+struct NativeChatRequest {
     model: String,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,7 +77,7 @@ struct NativeChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<NativeToolSpec<'a>>>,
+    tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,10 +155,10 @@ enum NativeContentOut {
 }
 
 #[derive(Debug, Serialize)]
-struct NativeToolSpec<'a> {
-    name: &'a str,
-    description: &'a str,
-    input_schema: &'a serde_json::Value,
+struct NativeToolSpec {
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
 }
@@ -353,17 +352,19 @@ impl AnthropicModelProvider {
         }
     }
 
-    fn convert_tools<'a>(tools: Option<&'a [ToolSpec]>) -> Option<Vec<NativeToolSpec<'a>>> {
+    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
         let items = tools?;
         if items.is_empty() {
             return None;
         }
-        let mut native_tools: Vec<NativeToolSpec<'a>> = items
+        let mut native_tools: Vec<NativeToolSpec> = items
             .iter()
             .map(|tool| NativeToolSpec {
-                name: &tool.name,
-                description: &tool.description,
-                input_schema: &tool.parameters,
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                input_schema: zeroclaw_api::schema::SchemaCleanr::clean_for_anthropic(
+                    tool.parameters.clone(),
+                ),
                 cache_control: None,
             })
             .collect();
@@ -458,26 +459,12 @@ impl AnthropicModelProvider {
         })
     }
 
-    fn should_skip_internal_pruning_marker(messages: &[ChatMessage], index: usize) -> bool {
-        let Some(msg) = messages.get(index) else {
-            return false;
-        };
-        if msg.is_pruned_tool_exchange_summary() {
-            return true;
-        }
-        msg.is_pruned_context_separator()
-            && index
-                .checked_sub(1)
-                .and_then(|previous| messages.get(previous))
-                .is_some_and(ChatMessage::is_pruned_tool_exchange_summary)
-    }
-
     fn convert_messages(messages: &[ChatMessage]) -> (Option<SystemPrompt>, Vec<NativeMessage>) {
         let mut system_text = None;
         let mut native_messages = Vec::new();
 
         for (index, msg) in messages.iter().enumerate() {
-            if Self::should_skip_internal_pruning_marker(messages, index) {
+            if ChatMessage::should_skip_internal_pruning_marker(messages, index) {
                 continue;
             }
             match msg.role.as_str() {
@@ -857,11 +844,11 @@ impl AnthropicModelProvider {
     }
 
     /// Build a streaming request body from a `NativeChatRequest`.
-    fn build_streaming_request(request: &NativeChatRequest<'_>) -> serde_json::Value {
-        let mut body =
-            serde_json::to_value(request).expect("NativeChatRequest should serialize to JSON");
+    fn build_streaming_request(request: &NativeChatRequest) -> anyhow::Result<serde_json::Value> {
+        let mut body = serde_json::to_value(request)
+            .context("Failed to serialize NativeChatRequest to JSON")?;
         body["stream"] = serde_json::Value::Bool(true);
-        body
+        Ok(body)
     }
 
     /// Parse Anthropic SSE lines from `response` and send `StreamEvent`s to `tx`.
@@ -906,9 +893,28 @@ impl AnthropicModelProvider {
         let mut cached_input_tokens: Option<u64> = None;
         let mut cache_creation_input_tokens: Option<u64> = None;
 
-        while let Ok(Some(line)) =
-            match tokio::time::timeout(SSE_IDLE_TIMEOUT, lines.next_line()).await {
-                Ok(read) => read,
+        let mut saw_stop_reason = false;
+
+        loop {
+            let line = match tokio::time::timeout(SSE_IDLE_TIMEOUT, lines.next_line()).await {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) => break,
+                Ok(Err(err)) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{err}"),
+                            })),
+                        "stream: SSE read error — aborting stream"
+                    );
+                    let _ = tx
+                        .send(Err(StreamError::Http(format!("SSE read error: {err}"))))
+                        .await;
+                    return;
+                }
                 Err(_) => {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -927,8 +933,7 @@ impl AnthropicModelProvider {
                         .await;
                     return;
                 }
-            }
-        {
+            };
             let line = line.trim().to_string();
             if !line.starts_with("data: ") {
                 continue;
@@ -1058,6 +1063,9 @@ impl AnthropicModelProvider {
                         .and_then(|d| d.get("stop_reason"))
                         .and_then(|s| s.as_str())
                         .unwrap_or("none");
+                    if stop_reason != "none" {
+                        saw_stop_reason = true;
+                    }
                     // Anthropic's running-total: each `message_delta`
                     // supersedes the previous one, so we always overwrite.
                     let observed_output = event
@@ -1134,18 +1142,7 @@ impl AnthropicModelProvider {
             }
         }
 
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                .with_category(::zeroclaw_log::EventCategory::Provider)
-                .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                .with_attrs(::serde_json::json!({
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                })),
-            "stream: SSE parser reached end of stream, emitting Final"
-        );
-        let _ = tx.send(Ok(StreamEvent::Final)).await;
+        crate::stream_guard::finish_sse_stream(tx, saw_stop_reason, "message_stop").await;
     }
 }
 
@@ -1271,6 +1268,7 @@ impl ModelProvider for AnthropicModelProvider {
             .ok()
             .flatten();
         let native_tools = Self::convert_tools(request.tools);
+        let tools_count = native_tools.as_ref().map_or(0, Vec::len);
         let tool_choice = if native_tools.is_some() {
             tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
         } else {
@@ -1287,13 +1285,24 @@ impl ModelProvider for AnthropicModelProvider {
         let (effective_temperature, thinking_config, effective_max_tokens) =
             self.resolve_thinking(request.thinking, temperature, model);
 
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({"max_tokens": effective_max_tokens, "model": model})
-            ),
-            "non-streaming API request"
-        );
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "anthropic",
+                        "alias": &self.alias,
+                        "request_api": "messages",
+                        "model": model,
+                        "stream": false,
+                        "max_tokens": effective_max_tokens,
+                        "tools_count": tools_count,
+                        "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
+                        "thinking_enabled": thinking_config.is_some(),
+                    })),
+                "anthropic provider request prepared"
+            );
+        }
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: effective_max_tokens,
@@ -1454,6 +1463,7 @@ impl ModelProvider for AnthropicModelProvider {
             .ok()
             .flatten();
         let native_tools = Self::convert_tools(request.tools);
+        let tools_count = native_tools.as_ref().map_or(0, Vec::len);
         let tool_choice = if native_tools.is_some() {
             tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
         } else {
@@ -1482,7 +1492,15 @@ impl ModelProvider for AnthropicModelProvider {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"model": model})),
+                    .with_attrs(::serde_json::json!({
+                        "provider": "anthropic",
+                        "alias": &self.alias,
+                        "request_api": "messages",
+                        "model": model,
+                        "stream": false,
+                        "tools_count": tools_count,
+                        "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
+                    })),
                 "native thinking enabled; using non-streaming fallback to preserve signed thinking blocks"
             );
             let native_request = NativeChatRequest {
@@ -1497,9 +1515,7 @@ impl ModelProvider for AnthropicModelProvider {
                 thinking: thinking_config,
             };
             // Serialize eagerly so the request body is owned and `'static`
-            // across the async boundary — `NativeToolSpec<'a>` borrows from
-            // `request.tools`, which prevents moving `native_request` into
-            // the spawned future otherwise.
+            // across the async boundary.
             let body = serde_json::to_value(&native_request)
                 .expect("NativeChatRequest should serialize to JSON");
             let client = self.http_client();
@@ -1574,13 +1590,24 @@ impl ModelProvider for AnthropicModelProvider {
             .boxed();
         }
 
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({"max_tokens": effective_max_tokens, "model": model})
-            ),
-            "stream_chat request"
-        );
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "anthropic",
+                        "alias": &self.alias,
+                        "request_api": "messages",
+                        "model": model,
+                        "stream": true,
+                        "max_tokens": effective_max_tokens,
+                        "tools_count": tools_count,
+                        "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
+                        "thinking_enabled": false,
+                    })),
+                "anthropic streaming provider request prepared"
+            );
+        }
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: effective_max_tokens,
@@ -1593,7 +1620,13 @@ impl ModelProvider for AnthropicModelProvider {
             thinking: thinking_config,
         };
 
-        let body = Self::build_streaming_request(&native_request);
+        let body = match Self::build_streaming_request(&native_request) {
+            Ok(body) => body,
+            Err(e) => {
+                return stream::once(async move { Err(StreamError::ModelProvider(e.to_string())) })
+                    .boxed();
+            }
+        };
         let client = self.http_client();
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
@@ -1894,6 +1927,44 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
         assert!(
             probe.is_finished(),
             "guard drop must abort the parser task immediately, not wait out the idle timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_before_message_stop_surfaces_error_not_final() {
+        // Live repro (trace aaf558a6): the SSE socket closed mid-response
+        // after tool-result submission; the parser fell through to Final and
+        // the turn ended as an empty "final response" with no explanation.
+        // EOF without message_stop (or a stop_reason) is a truncated
+        // response and must surface a retryable error.
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":10}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut saw_final = false;
+        let mut last_err = None;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match ev {
+                Ok(StreamEvent::Final) => saw_final = true,
+                Err(e) => last_err = Some(e),
+                Ok(_) => {}
+            }
+        }
+        assert!(!saw_final, "truncated stream must not emit Final");
+        let err = last_err.expect("truncated stream must emit a StreamError");
+        assert!(
+            matches!(err, StreamError::Http(ref m) if m.contains("truncated")),
+            "expected truncation error, got: {err:?}"
         );
     }
 
@@ -2352,9 +2423,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn native_tool_spec_without_cache_control() {
         let schema = serde_json::json!({"type": "object"});
         let tool = NativeToolSpec {
-            name: "get_weather",
-            description: "Get weather info",
-            input_schema: &schema,
+            name: "get_weather".to_string(),
+            description: "Get weather info".to_string(),
+            input_schema: schema,
             cache_control: None,
         };
         let json = serde_json::to_string(&tool).unwrap();
@@ -2366,9 +2437,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn native_tool_spec_with_cache_control() {
         let schema = serde_json::json!({"type": "object"});
         let tool = NativeToolSpec {
-            name: "get_weather",
-            description: "Get weather info",
-            input_schema: &schema,
+            name: "get_weather".to_string(),
+            description: "Get weather info".to_string(),
+            input_schema: schema,
             cache_control: Some(CacheControl::ephemeral()),
         };
         let json = serde_json::to_string(&tool).unwrap();
@@ -2541,6 +2612,87 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         assert_eq!(native_tools.len(), 1);
         assert!(native_tools[0].cache_control.is_some());
+    }
+
+    #[test]
+    fn convert_tools_cleans_ref_from_input_schema() {
+        let tools = vec![ToolSpec {
+            name: "query".to_string(),
+            description: "Search with a ref".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "$ref": "#/$defs/FilterSpec"
+                    }
+                },
+                "$defs": {
+                    "FilterSpec": {
+                        "type": "object",
+                        "properties": {
+                            "field": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+        }];
+
+        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
+        let schema = &native_tools[0].input_schema;
+
+        let filter = &schema["properties"]["filter"];
+        assert!(filter.get("$ref").is_none(), "$ref was not cleaned");
+        assert_eq!(filter["type"], "object");
+        assert_eq!(filter["properties"]["field"]["type"], "string");
+        assert!(schema.get("$defs").is_none(), "$defs was not stripped");
+    }
+
+    #[test]
+    fn convert_tools_cleans_definitions_from_input_schema() {
+        let tools = vec![ToolSpec {
+            name: "query".to_string(),
+            description: "Search with a definitions ref".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "$ref": "#/definitions/FilterSpec"
+                    }
+                },
+                "definitions": {
+                    "FilterSpec": {
+                        "type": "object",
+                        "properties": {
+                            "field": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+        }];
+
+        let native_tools = AnthropicModelProvider::convert_tools(Some(&tools)).unwrap();
+        let schema = &native_tools[0].input_schema;
+
+        let filter = &schema["properties"]["filter"];
+        assert!(filter.get("$ref").is_none(), "$ref was not cleaned");
+        assert_eq!(filter["type"], "object");
+        assert!(
+            schema.get("definitions").is_none(),
+            "definitions was not stripped"
+        );
+    }
+
+    #[test]
+    fn convert_tools_empty_tools_returns_none() {
+        let tools: Vec<ToolSpec> = vec![];
+        let result = AnthropicModelProvider::convert_tools(Some(&tools));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn convert_tools_none_returns_none() {
+        let result: Option<Vec<NativeToolSpec>> = AnthropicModelProvider::convert_tools(None);
+        assert!(result.is_none());
     }
 
     #[test]
@@ -3239,156 +3391,5 @@ data: {\"type\":\"message_stop\"}\n\n";
                 window[0].role
             );
         }
-    }
-
-    #[test]
-    fn convert_messages_does_not_surface_context_separator_as_user_instruction() {
-        let messages = vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: "You are helpful.".to_string(),
-            },
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: ChatMessage::pruned_tool_exchange_summary(1),
-            },
-            ChatMessage::pruned_context_separator(),
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: serde_json::json!({
-                    "content": "",
-                    "tool_calls": [
-                        {"id": "live_1", "name": "file_read", "arguments": "{}"}
-                    ]
-                })
-                .to_string(),
-            },
-            ChatMessage {
-                role: "tool".to_string(),
-                content: serde_json::json!({
-                    "tool_call_id": "live_1",
-                    "content": "recent file content"
-                })
-                .to_string(),
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: "Continue from the current state.".to_string(),
-            },
-        ];
-
-        let (_system, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
-        let roles = native_msgs
-            .iter()
-            .map(|message| message.role.as_str())
-            .collect::<Vec<_>>();
-        let flattened_text = native_msgs
-            .iter()
-            .flat_map(|message| message.content.iter())
-            .filter_map(|block| match block {
-                NativeContentOut::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        assert!(
-            roles.windows(2).all(|pair| pair[0] != pair[1]),
-            "converted request should preserve Anthropic role alternation: {roles:?}"
-        );
-        assert!(
-            !flattened_text.contains(&PRUNED_CONTEXT_SEPARATOR),
-            "synthetic role separator should not be delivered to Anthropic as user text: \
-             {flattened_text:?}"
-        );
-        assert!(
-            native_msgs.iter().any(|message| {
-                message.content.iter().any(
-                    |block| matches!(block, NativeContentOut::ToolUse { id, .. } if id == "live_1"),
-                )
-            }),
-            "live tool_use must survive pruning-marker filtering"
-        );
-        assert!(
-            native_msgs.iter().any(|message| {
-                message.content.iter().any(|block| {
-                    matches!(
-                        block,
-                        NativeContentOut::ToolResult {
-                            tool_use_id,
-                            content,
-                            ..
-                        } if tool_use_id == "live_1" && content == "recent file content"
-                    )
-                })
-            }),
-            "matching live tool_result must survive pruning-marker filtering"
-        );
-    }
-
-    #[test]
-    fn convert_messages_keeps_real_context_separator_between_assistants() {
-        let messages = vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: "You are helpful.".to_string(),
-            },
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: "protected assistant one".to_string(),
-            },
-            ChatMessage::pruned_context_separator(),
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: serde_json::json!({
-                    "content": "",
-                    "tool_calls": [
-                        {"id": "live_2", "name": "file_read", "arguments": "{}"}
-                    ]
-                })
-                .to_string(),
-            },
-            ChatMessage {
-                role: "tool".to_string(),
-                content: serde_json::json!({
-                    "tool_call_id": "live_2",
-                    "content": "recent file content"
-                })
-                .to_string(),
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: "Continue from the current state.".to_string(),
-            },
-        ];
-
-        let (_system, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
-        let roles = native_msgs
-            .iter()
-            .map(|message| message.role.as_str())
-            .collect::<Vec<_>>();
-
-        assert!(
-            roles.windows(2).all(|pair| pair[0] != pair[1]),
-            "context separator should keep Anthropic roles alternating: {roles:?}"
-        );
-        assert!(
-            native_msgs.iter().any(|message| {
-                message.content.iter().any(
-                    |block| matches!(block, NativeContentOut::ToolUse { id, .. } if id == "live_2"),
-                )
-            }),
-            "live tool_use must survive real context separator conversion"
-        );
-        assert!(
-            native_msgs.iter().any(|message| {
-                message.content.iter().any(|block| {
-                    matches!(
-                        block,
-                        NativeContentOut::ToolResult { tool_use_id, .. } if tool_use_id == "live_2"
-                    )
-                })
-            }),
-            "matching live tool_result must survive real context separator conversion"
-        );
     }
 }

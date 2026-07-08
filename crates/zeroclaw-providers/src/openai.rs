@@ -304,10 +304,7 @@ impl OpenAiModelProvider {
                             },
                         })
                         .collect::<Vec<_>>();
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
+                    let content = crate::request_payload::non_empty_string_field(&value, "content");
                     let reasoning_content = value
                         .get("reasoning_content")
                         .and_then(serde_json::Value::as_str)
@@ -484,14 +481,39 @@ impl ModelProvider for OpenAiModelProvider {
             temperature.map(|t| Self::adjust_temperature_for_model(model, t));
 
         let tools = Self::convert_tools(request.tools);
+        let tools_count = tools.as_ref().map_or(0, Vec::len);
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
             temperature: adjusted_temperature,
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            // Omit tool_choice when the tool list is empty — vLLM 0.19+ and
+            // spec-compliant validators reject tool_choice without a non-empty
+            // tools field (HTTP 400). `Self::convert_tools` is a plain
+            // `tools.map(...)`, so an empty input slice yields `Some(vec![])`
+            // (not `None`) — guard on `tools` being `Some` *and* the resulting
+            // list being non-empty, not merely on `is_some()`.
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools,
             max_tokens: self.max_tokens,
         };
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "openai",
+                        "alias": &self.alias,
+                        "request_api": "chat_completions",
+                        "model": model,
+                        "stream": false,
+                        "tools_count": tools_count,
+                        "tool_choice": native_request.tool_choice.as_deref(),
+                    })),
+                "openai provider request prepared"
+            );
+        }
 
         let response = self
             .http_client()
@@ -571,7 +593,10 @@ impl ModelProvider for OpenAiModelProvider {
             model: model.to_string(),
             messages: Self::convert_messages(messages),
             temperature: adjusted_temperature,
-            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
+            // See above: omit tool_choice when the tool list is empty.
+            tool_choice: native_tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools: native_tools,
             max_tokens: self.max_tokens,
         };
@@ -676,6 +701,10 @@ struct ResponsesApiRequest {
 #[derive(Debug, Serialize)]
 struct ResponsesApiReasoning {
     effort: String,
+}
+
+fn has_responses_tools(tools: Option<&[ResponsesToolSpec]>) -> bool {
+    tools.is_some_and(|tools| !tools.is_empty())
 }
 
 /// Non-streaming response body from `/v1/responses`.
@@ -852,7 +881,12 @@ pub(crate) async fn run_responses_sse(
         let _ = tx.send(Ok(StreamEvent::TextDelta(chunk))).await;
     }
 
-    let _ = tx.send(Ok(StreamEvent::Final)).await;
+    crate::stream_guard::finish_sse_stream(
+        tx,
+        state.saw_completion,
+        "response.completed or [DONE]",
+    )
+    .await;
 }
 
 pub struct OpenAiResponsesModelProvider {
@@ -903,7 +937,7 @@ impl OpenAiResponsesModelProvider {
         temperature: Option<f64>,
         stream: bool,
     ) -> ResponsesApiRequest {
-        let has_tools = tools.is_some();
+        let has_tools = has_responses_tools(tools.as_deref());
         let reasoning = self
             .reasoning_effort
             .as_deref()
@@ -1018,7 +1052,25 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             Some(instructions)
         };
         let tools = convert_tools(request.tools);
+        let tools_count = tools.as_ref().map_or(0, Vec::len);
         let req = self.build_request(instructions, input, tools, model, temperature, false);
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "openai",
+                        "alias": &self.alias,
+                        "request_api": "responses",
+                        "model": model,
+                        "stream": false,
+                        "tools_count": tools_count,
+                        "tool_choice": req.tool_choice.as_deref(),
+                        "parallel_tool_calls": req.parallel_tool_calls,
+                    })),
+                "openai responses provider request prepared"
+            );
+        }
         let response = Client::new()
             .post(&self.responses_url)
             .header("Authorization", format!("Bearer {credential}"))
@@ -1064,6 +1116,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let reasoning_effort = self.reasoning_effort.clone();
         let max_tokens = self.max_tokens;
         let client = self.streaming_client();
+        let alias = ::zeroclaw_log::debug_enabled().then(|| self.alias.clone());
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
         let handle = ::zeroclaw_spawn::spawn!(async move {
@@ -1074,7 +1127,8 @@ impl ModelProvider for OpenAiResponsesModelProvider {
                 Some(instructions)
             };
             let tools = convert_tools(tools_owned.as_deref());
-            let has_tools = tools.is_some();
+            let tools_count = tools.as_ref().map_or(0, Vec::len);
+            let has_tools = has_responses_tools(tools.as_deref());
             let reasoning = reasoning_effort
                 .as_deref()
                 .map(|effort| ResponsesApiReasoning {
@@ -1092,6 +1146,23 @@ impl ModelProvider for OpenAiResponsesModelProvider {
                 max_output_tokens: max_tokens,
                 reasoning,
             };
+            if let Some(alias) = alias.as_deref() {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                        .with_attrs(::serde_json::json!({
+                            "provider": "openai",
+                            "alias": alias,
+                            "request_api": "responses",
+                            "model": &req.model,
+                            "stream": true,
+                            "tools_count": tools_count,
+                            "tool_choice": req.tool_choice.as_deref(),
+                            "parallel_tool_calls": req.parallel_tool_calls,
+                        })),
+                    "openai responses streaming provider request prepared"
+                );
+            }
 
             let request_builder = client
                 .post(&responses_url)
@@ -1635,6 +1706,343 @@ mod tests {
         assert_eq!(
             OpenAiModelProvider::adjust_temperature_for_model("gpt-4o", 1.0),
             1.0
+        );
+    }
+
+    // ----------------------------------------------------------
+    // Responses-wire option propagation (#7690)
+    //
+    // Pinned regression: non-default options configured on
+    // `OpenAiResponsesModelProvider` (via the `with_*` builders) must
+    // survive into `ResponsesApiRequest` at the wire boundary. Without
+    // these tests, a future refactor could silently drop
+    // `max_tokens` / `reasoning_effort` / `responses_url` / tools /
+    // instructions / temperature while existing smoke tests still pass.
+    //
+    // Test seam: `build_request` is private but reachable via `super::*`
+    // from this `#[cfg(test)] mod tests`. We construct the provider with
+    // the non-default option, call `build_request` with minimal
+    // required arguments, serialize to JSON, and assert each option is
+    // present in the wire body (or, for URL, in the field
+    // `responses_url`).
+    //
+    // No live network dependency. No provider credentials required.
+    // ----------------------------------------------------------
+    //
+    // Supported options (asserted below with `propagates_*_when_set`
+    // tests, and pinned for `None` propagation with `omits_*_when_unset`
+    // tests):
+    //
+    // | Provider builder        | Wire field on `ResponsesApiRequest` | Notes                                  |
+    // |-------------------------|--------------------------------------|----------------------------------------|
+    // | `with_max_tokens`       | `max_output_tokens`                  | Omits when `None`                      |
+    // | `with_reasoning_effort` | `reasoning.effort`                   | Omits when `None`                      |
+    // | (model arg)             | `model`                              | Always present                         |
+    // | (instructions arg)      | `instructions`                       | Omits when `None`                      |
+    // | (temperature arg)       | `temperature`                        | Force-1.0 for o1/o3/gpt-5-*; else pass |
+    // | (stream arg)            | `stream`                             | Always present (bool)                  |
+    // | (tools arg)             | `tools`                              | Omits when `None`                      |
+    // | (tool_choice arg)       | `tool_choice`                        | Omits when `None` AND tools absent     |
+    // | (parallel arg)          | `parallel_tool_calls`                | Omits when `None` AND tools absent     |
+    //
+    // Intentionally NOT propagated by the responses wire (these would
+    // be silently dropped — listed here as known-unsupported for this
+    // code path so future maintainers do not "fix" them by quietly
+    // adding fields the OpenAI Responses API does not accept):
+    //
+    // - `top_p` — Responses API has no `top_p`; callers who need it
+    //   must use the legacy `OpenAiModelProvider` (chat-completions
+    //   path).
+    // - `frequency_penalty` / `presence_penalty` — Responses API
+    //   rejects both. Same fallback path as `top_p`.
+    // - `stop` / `seed` — not exposed by
+    //   `OpenAiResponsesModelProvider`'s `with_*` builders; add to this
+    //   list if/when a `with_seed` builder is introduced.
+    // - `logprobs` — Responses API uses `top_logprobs` instead; not
+    //   propagated. Same fallback path as `top_p`.
+    //
+    // Runtime options not yet wired into the responses provider
+    // (`OpenAiResponsesModelProvider` carries no fields for these;
+    // `build_responses_provider_if_requested` in factory.rs drops them
+    // on the floor rather than forwarding to the responses path).
+    // Listed here so the gap is visible from the test mod rather than
+    // only discoverable by reading the factory:
+    //
+    // - `provider_timeout_secs` — `OpenAiResponsesModelProvider` has no
+    //   `timeout_secs` field; non-streaming responses calls use
+    //   `Client::new()` with no client-builder timeout override, and
+    //   the streaming responses path likewise. `apply_compat_options`
+    //   forwards this to OpenAI-compatible providers only. Callers who
+    //   need a custom timeout on the responses path must extend
+    //   `OpenAiResponsesModelProvider` with a `timeout_secs` field,
+    //   mirror it through the non-streaming client builder, and add
+    //   the corresponding `with_timeout_secs` builder + wire-shape
+    //   test here.
+    // - `extra_headers` — `OpenAiResponsesModelProvider`'s
+    //   `build_request` only sets `Authorization` (plus `Accept` for
+    //   SSE); there is no header-merge step. `apply_compat_options`
+    //   forwards this to OpenAI-compatible providers only. Same
+    //   follow-up shape as `provider_timeout_secs`.
+    // - `api_path` — already routed correctly: the `api_url` argument
+    //   to `OpenAiResponsesModelProvider::new` lands in the
+    //   `responses_url` field, and the request-time URL is read from
+    //   there (covered by the `responses_url_appends_responses_to_custom_base`
+    //   test and the pre-existing propagation tests above). The
+    //   `opts.api_path` runtime option is therefore not separately
+    //   needed — the factory maps `api_url` (from the provider
+    //   config) into `OpenAiResponsesModelProvider::new`, which
+    //   composes the final URL with the `/responses` suffix.
+    //
+    // Issue #7690 acceptance criterion #1 explicitly listed timeout,
+    // headers, and API path as targets. This commit scopes down to
+    // option-propagation test pinning only; the timeout / headers
+    // implementation work is intentionally deferred to a follow-up
+    // PR that wires the missing fields through both the provider and
+    // the factory.
+    // ----------------------------------------------------------
+
+    #[test]
+    fn responses_request_propagates_max_tokens_when_set() {
+        let provider =
+            OpenAiResponsesModelProvider::new("openai", None, None).with_max_tokens(Some(2048));
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            None,
+            "gpt-5",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert_eq!(
+            json.get("max_output_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(2048),
+            "max_tokens configured on the provider must survive into max_output_tokens on the wire body"
+        );
+    }
+
+    #[test]
+    fn responses_request_omits_max_tokens_when_unset() {
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        assert!(
+            provider.max_tokens.is_none(),
+            "fresh provider must default max_tokens to None"
+        );
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            None,
+            "gpt-5",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert!(
+            json.get("max_output_tokens").is_none()
+                || json
+                    .get("max_output_tokens")
+                    .and_then(serde_json::Value::as_null)
+                    .is_some(),
+            "unset max_tokens must not surface as a wire-bound integer (skipped via skip_serializing_if)"
+        );
+    }
+
+    #[test]
+    fn responses_request_propagates_reasoning_effort_when_set() {
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None)
+            .with_reasoning_effort(Some("high".to_string()));
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            None,
+            "o3",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        let reasoning = json
+            .get("reasoning")
+            .expect("reasoning_effort must populate the `reasoning` object");
+        assert_eq!(
+            reasoning.get("effort").and_then(serde_json::Value::as_str),
+            Some("high"),
+            "with_reasoning_effort(Some(\"high\")) must surface as reasoning.effort = \"high\" on the wire body"
+        );
+    }
+
+    #[test]
+    fn responses_request_omits_reasoning_when_unset() {
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        assert!(
+            provider.reasoning_effort.is_none(),
+            "fresh provider must default reasoning_effort to None"
+        );
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            None,
+            "gpt-5",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert!(
+            json.get("reasoning").is_none()
+                || json
+                    .get("reasoning")
+                    .and_then(serde_json::Value::as_null)
+                    .is_some(),
+            "unset reasoning_effort must not surface as a wire-bound object (skipped via skip_serializing_if)"
+        );
+    }
+
+    #[test]
+    fn responses_request_propagates_instructions_and_temperature_and_model() {
+        let provider =
+            OpenAiResponsesModelProvider::new("openai", Some("https://api.example.test/v1"), None);
+        let req = provider.build_request(
+            Some("You are a careful assistant.".to_string()),
+            vec![serde_json::json!({"role": "user", "content": "summarize"})],
+            None,
+            "gpt-5-mini",
+            Some(0.3),
+            true,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert_eq!(
+            json.get("model").and_then(serde_json::Value::as_str),
+            Some("gpt-5-mini"),
+            "model argument must reach the wire body verbatim"
+        );
+        assert_eq!(
+            json.get("instructions").and_then(serde_json::Value::as_str),
+            Some("You are a careful assistant."),
+            "non-None instructions argument must reach the wire body"
+        );
+        assert_eq!(
+            json.get("temperature").and_then(serde_json::Value::as_f64),
+            Some(0.3),
+            "temperature argument must reach the wire body as f64"
+        );
+        assert_eq!(
+            json.get("stream").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "stream argument must reach the wire body as bool"
+        );
+    }
+
+    #[test]
+    fn responses_request_propagates_tool_choice_and_parallel_when_tools_present() {
+        let provider =
+            OpenAiResponsesModelProvider::new("openai", None, None).with_max_tokens(Some(1024));
+        let tools = Some(vec![ResponsesToolSpec {
+            kind: "function".to_string(),
+            name: "lookup_weather".to_string(),
+            description: "Look up the weather for a city.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            }),
+            strict: true,
+        }]);
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "weather?"})],
+            tools,
+            "gpt-5",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert_eq!(
+            json.get("tool_choice").and_then(serde_json::Value::as_str),
+            Some("auto"),
+            "with tools present, wire body must carry tool_choice = \"auto\""
+        );
+        assert_eq!(
+            json.get("parallel_tool_calls")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "with tools present, wire body must carry parallel_tool_calls = true"
+        );
+        let wire_tools = json
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .expect("tools must be a JSON array on the wire body");
+        assert_eq!(
+            wire_tools.len(),
+            1,
+            "exactly one tool spec must reach the wire body"
+        );
+    }
+
+    #[test]
+    fn responses_request_omits_tool_choice_and_parallel_when_tools_absent() {
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            None,
+            "gpt-5",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert!(
+            json.get("tool_choice").is_none()
+                || json
+                    .get("tool_choice")
+                    .and_then(serde_json::Value::as_null)
+                    .is_some(),
+            "no tools → tool_choice must be omitted (skipped via skip_serializing_if)"
+        );
+        assert!(
+            json.get("parallel_tool_calls").is_none()
+                || json
+                    .get("parallel_tool_calls")
+                    .and_then(serde_json::Value::as_null)
+                    .is_some(),
+            "no tools → parallel_tool_calls must be omitted (skipped via skip_serializing_if)"
+        );
+    }
+
+    #[test]
+    fn responses_request_omits_tool_choice_and_parallel_when_tools_empty() {
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            Some(Vec::new()),
+            "gpt-5",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert!(
+            json.get("tool_choice").is_none()
+                || json
+                    .get("tool_choice")
+                    .and_then(serde_json::Value::as_null)
+                    .is_some(),
+            "empty tools list → tool_choice must be omitted (vLLM rejects tool_choice without non-empty tools)"
+        );
+        assert!(
+            json.get("parallel_tool_calls").is_none()
+                || json
+                    .get("parallel_tool_calls")
+                    .and_then(serde_json::Value::as_null)
+                    .is_some(),
+            "empty tools list → parallel_tool_calls must be omitted with tool_choice"
+        );
+        let wire_tools = json
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .expect("tools must be a JSON array on the wire body");
+        assert!(
+            wire_tools.is_empty(),
+            "empty tools should remain an empty tools array; only tool_choice and parallel_tool_calls are suppressed"
         );
     }
 }

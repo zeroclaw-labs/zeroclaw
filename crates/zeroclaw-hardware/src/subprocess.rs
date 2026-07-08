@@ -432,23 +432,12 @@ mod tests {
         // `echo` prints its argument + newline and exits 0.
         let result_json = r#"{"success":true,"output":"ok","error":null}"#;
 
-        // Build a manifest pointing at `echo`.
+        // Build a manifest pointing at a tiny protocol helper.
         let m = make_manifest("echo_tool", vec![]);
 
-        // Construct an `echo` invocation as the binary with the JSON pre-set.
-        // We use `sh -c 'echo <json>'` because the SubprocessTool feeds the
-        // manifest binary with args on stdin — echo just ignores stdin.
-        let script = format!("echo '{}'", result_json);
-        let binary = PathBuf::from("sh");
-        // Override binary to `sh` and pass `-c` + script via a wrapper.
-        // Simpler: write a temp script.
         let dir = tempfile::tempdir().unwrap();
-        let script_path = dir.path().join("tool.sh");
-        std::fs::write(
-            &script_path,
-            format!("#!/bin/sh\ncat > /dev/null\necho '{}'\n", result_json),
-        )
-        .unwrap();
+        let script_path = protocol_helper_path(dir.path());
+        std::fs::write(&script_path, protocol_helper_script(result_json)).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -464,9 +453,26 @@ mod tests {
         assert!(result.success, "expected success=true, got: {:?}", result);
         assert_eq!(result.output, "ok");
         assert!(result.error.is_none());
+    }
 
-        let _ = script;
-        let _ = binary;
+    #[cfg(windows)]
+    fn protocol_helper_path(dir: &std::path::Path) -> PathBuf {
+        dir.join("tool.cmd")
+    }
+
+    #[cfg(not(windows))]
+    fn protocol_helper_path(dir: &std::path::Path) -> PathBuf {
+        dir.join("tool.sh")
+    }
+
+    #[cfg(windows)]
+    fn protocol_helper_script(result_json: &str) -> String {
+        format!("@echo off\r\nset /p _zc_args=\r\necho {result_json}\r\n")
+    }
+
+    #[cfg(not(windows))]
+    fn protocol_helper_script(result_json: &str) -> String {
+        format!("#!/bin/sh\ncat > /dev/null\necho '{}'\n", result_json)
     }
 
     /// A binary that hangs forever should be killed and return a timeout error.

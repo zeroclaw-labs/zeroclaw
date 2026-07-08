@@ -5,6 +5,7 @@
 //! one table so adding one is data, not control flow.
 
 pub mod container;
+pub mod container_base;
 pub mod docker_tags;
 pub mod flake;
 pub mod install_sh;
@@ -83,7 +84,8 @@ fn registry() -> Vec<Surface> {
 /// heavyweight), build-time overridable via --build-arg.
 fn render_docker_arg(root: &Path, current: &str) -> anyhow::Result<String> {
     let body = container::render_features_arg(root, &Sel::Dist)?;
-    container::splice(current, "docker-features-arg", &body)
+    let spliced = container::splice(current, "docker-features-arg", &body)?;
+    container_base::splice_zones(root, &spliced)
 }
 
 /// Containerfile surface: standard image ships Dist (all channels, no
@@ -103,6 +105,22 @@ fn workspace_root() -> PathBuf {
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+pub fn features(selection_id: &str) -> anyhow::Result<()> {
+    let menu = Sel::menu();
+    let selection = menu
+        .iter()
+        .find(|s| s.id() == selection_id)
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "unknown selection `{selection_id}` (known: {})",
+                menu.iter().map(|s| s.id()).collect::<Vec<_>>().join(", ")
+            ))
+        })?;
+    let list = spec::resolve_feature_list(&workspace_root(), selection)?;
+    println!("{}", list.join(","));
+    Ok(())
 }
 
 pub fn run(targets: &[String], check: bool) -> anyhow::Result<()> {
@@ -128,6 +146,10 @@ pub fn run(targets: &[String], check: bool) -> anyhow::Result<()> {
 
     let root = workspace_root();
     let mut drift = false;
+
+    if !check {
+        container_base::refresh_source(&root)?;
+    }
 
     for s in selected {
         let path = root.join(s.file);
