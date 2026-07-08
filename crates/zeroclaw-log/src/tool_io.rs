@@ -205,4 +205,37 @@ mod tests {
         assert_eq!(cap.text, "hello world");
         assert!(!cap.truncated);
     }
+
+    #[test]
+    fn redacted_keeps_input_at_or_under_cap() {
+        let p = make_policy("redacted", 8, vec![]);
+        // Under cap.
+        let c = capture_tool_input(&p, "shell", "hello").unwrap();
+        assert_eq!(c.text, "hello");
+        assert_eq!(c.original_bytes, 5);
+        assert!(!c.truncated);
+        // Exactly at cap is kept (the check is ).
+        let c = capture_tool_input(&p, "shell", "12345678").unwrap();
+        assert_eq!(c.text, "12345678");
+        assert!(!c.truncated);
+    }
+
+    #[test]
+    fn redacted_truncation_respects_utf8_char_boundaries() {
+        // 'é' is 2 bytes (U+00E9). With cap=3, "éé" (4 bytes) must truncate to
+        // the first whole char rather than splitting one mid-byte.
+        let p = make_policy("redacted", 3, vec![]);
+        let c = capture_tool_input(&p, "shell", "éé").unwrap();
+        assert_eq!(c.text, "é");
+        assert!(c.truncated);
+        assert_eq!(c.original_bytes, 4);
+        // Kept text stays within the byte cap and remains valid UTF-8.
+        assert!(c.text.len() <= 3);
+    }
+
+    #[test]
+    fn capture_tool_output_uses_the_same_policy_path() {
+        let p = make_policy("off", 8192, vec![]);
+        assert!(capture_tool_output(&p, "shell", "x").is_none());
+    }
 }

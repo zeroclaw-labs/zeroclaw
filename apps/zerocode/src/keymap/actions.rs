@@ -123,7 +123,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 keyactions! {
     pub enum GlobalAction ("global") {
         Quit         [Chord::ctrl('c')]                                 => "quit",
-        Help         [Chord::char('?')]                                 => "help",
+        Help         [Chord::char('?'), Chord::key(KeyCode::F(1)), Chord::with(KeyCode::F(1), KeyModifiers::CONTROL)]      => "help",
         PaneNavLeft  [Chord::with(KeyCode::Left, KeyModifiers::ALT), Chord::with(KeyCode::Char('b'), KeyModifiers::ALT)]  => "prev pane",
         PaneNavRight [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "next pane",
         ReloadDaemon [Chord::ctrl('r')]                                 => "reload daemon",
@@ -289,6 +289,7 @@ keyactions! {
         CursorEnd          [Chord::key(KeyCode::End), Chord::ctrl('e')] => "line end",
         OpenFileBrowser    [Chord::ctrl('a')] => "browse files",
         Backspace          [Chord::key(KeyCode::Backspace)] => "backspace",
+        DeletePreviousWord [Chord::ctrl('w')] => "delete previous word",
         ClearInput         [Chord::ctrl('u')] => "clear input",
         SelectAll          [] => "select all",
         Paste              [Chord::ctrl('v')] => "paste",
@@ -308,6 +309,7 @@ keyactions! {
         Cancel  [Chord::key(KeyCode::Esc), Chord::char('n'), Chord::char('N')] => "cancel",
         Up      [Chord::key(KeyCode::Up)] => "prev",
         Down    [Chord::key(KeyCode::Down)] => "next",
+        Toggle  [Chord::char(' ')] => "toggle selection",
     }
 }
 
