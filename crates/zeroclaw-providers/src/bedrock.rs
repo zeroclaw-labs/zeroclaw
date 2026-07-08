@@ -1976,7 +1976,7 @@ mod tests {
     #[test]
     fn creates_without_credentials() {
         // ModelProvider should construct even without env vars.
-        let _provider = BedrockModelProvider::new("test");
+        let _provider = BedrockModelProvider::builder("test").build();
     }
 
     #[tokio::test]
@@ -2074,7 +2074,7 @@ mod tests {
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
         let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", None);
 
-        let model_provider = BedrockModelProvider::new("test");
+        let model_provider = BedrockModelProvider::builder("test").build();
         assert!(matches!(
             model_provider.auth,
             Some(BedrockAuth::BearerToken(ref t)) if t == "env-bearer-token"
@@ -2088,7 +2088,7 @@ mod tests {
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", Some("AKIAEXAMPLE"));
         let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", Some("secret"));
 
-        let model_provider = BedrockModelProvider::new("test");
+        let model_provider = BedrockModelProvider::builder("test").build();
         // Bearer token should take priority over SigV4 credentials.
         assert!(matches!(
             model_provider.auth,
