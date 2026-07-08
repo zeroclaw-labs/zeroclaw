@@ -327,7 +327,7 @@ mod tests {
         assert!(schema["properties"].as_object().unwrap().is_empty());
     }
 
-    // ── SSRF guards (audit-zeroclaw-2026-07-03.md follow-up finding) ──
+    // ── SSRF guards ──
     //
     // The URL template is operator-trust (skill author), but `{{arg_name}}`
     // is LLM-supplied at runtime. A template like `http://{{user}}@{{host}}`

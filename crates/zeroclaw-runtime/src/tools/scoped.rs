@@ -128,9 +128,20 @@ pub struct ScopedAssembled {
     pub poll_handle: Option<PerToolChannelHandle>,
     pub escalate_handle: Option<PerToolChannelHandle>,
     pub channel_room_handle: Option<PerToolChannelHandle>,
-    /// The deferred-MCP tool-search prompt section (empty when deferred loading is off
-    /// or no MCP tools are granted). The caller injects this into its system prompt.
+    /// The deferred-MCP tool-search listing on its own (deferred mode only): the
+    /// `## Deferred Tools` section that names the policy-admitted `<server>__<tool>`
+    /// stubs and instructs the model to call `tool_search`. Empty when deferred loading
+    /// is off, no stubs are admitted, or `tool_search` itself is in `excluded_tools`
+    /// (the registry and prompt surfaces move together). Callers that inject one
+    /// combined MCP prompt block (`run`, `process_message`) append [`Self::pinned_section`] onto this via
+    /// `append_pinned_mcp_section`; `from_config` threads it into the Agent's separate
+    /// `mcp_deferred_section` slot alongside `pinned_section`.
     pub deferred_section: String,
+    /// The pinned-MCP-resources system-prompt section on its own. Empty when no pinned
+    /// resources are granted. Kept separate from [`Self::deferred_section`] so callers
+    /// with two distinct prompt slots (`from_config`'s Agent) inject each without
+    /// duplication; single-block callers append it onto `deferred_section`.
+    pub pinned_section: String,
     /// Live handle to the activated deferred-MCP set (present only when a deferred
     /// `tool_search` tool was registered).
     pub activated_handle: Option<Arc<std::sync::Mutex<ActivatedToolSet>>>,
@@ -212,6 +223,10 @@ impl ScopedToolRegistry {
         //    each tool. Skipped only when this path does not connect MCP (ACP) or MCP
         //    is disabled - in both cases nothing is granted.
         let mut deferred_section = String::new();
+        // Pinned MCP resources are surfaced on their own field. Single-block callers
+        // (`run`, `process_message`) append this onto their `deferred_section` copy;
+        // `from_config` injects it into the Agent's distinct pinned-section slot.
+        let mut pinned_section = String::new();
         let mut activated_handle: Option<Arc<std::sync::Mutex<ActivatedToolSet>>> = None;
         let mut mcp_elevation_arcs: Vec<Arc<dyn Tool>> = Vec::new();
 
@@ -252,7 +267,7 @@ impl ScopedToolRegistry {
                             mcp_policy.as_ref(),
                         );
                     }
-                    let pinned_section = tools::mcp_context::build_pinned_resources_section(
+                    pinned_section = tools::mcp_context::build_pinned_resources_section(
                         &registry,
                         &agent_mcp_servers,
                         mcp_policy.as_ref(),
@@ -355,12 +370,6 @@ impl ScopedToolRegistry {
                             );
                         }
                     }
-                    // Pinned MCP resources ride the same prompt section in both
-                    // modes - parity with run/process_message.
-                    crate::agent::loop_::append_pinned_mcp_section(
-                        &mut deferred_section,
-                        &pinned_section,
-                    );
                 }
                 Err(err) => {
                     // Non-fatal (the assembly proceeds without MCP), but an ERROR
@@ -396,6 +405,27 @@ impl ScopedToolRegistry {
             runtime,
         );
 
+        // 6. Final denylist sweep. The documented contract is that `excluded_tools`
+        //    ALWAYS subtracts (docs/book/src/tools/mcp.md, tools/overview.md,
+        //    agents/delegation.md). The step-2 built-in filter and the step-4 MCP
+        //    policy already drop excluded EAGER tools, but two tools are registered
+        //    AFTER the built-in filter and so escaped it: the deferred-MCP `tool_search`
+        //    wrapper (pushed in step 4) and skill wrappers (step 5). Enforce the
+        //    denylist once more here so no explicitly-excluded tool name survives on
+        //    any construction path. `allowed_tools` is deliberately NOT re-applied:
+        //    scoped elevation wrappers must survive an allowlist that dropped their
+        //    raw target (only the exact excluded name is removed).
+        if let Some(excluded) = security.excluded_tools.as_deref() {
+            tools_registry.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
+            // The registry and prompt surfaces must move together: if `tool_search`
+            // itself is excluded, the deferred-MCP prompt section - which always
+            // instructs the model to call `tool_search` - must not survive either,
+            // or the model is told to call a tool the policy just removed.
+            if excluded.iter().any(|ex| ex == "tool_search") {
+                deferred_section.clear();
+            }
+        }
+
         ScopedAssembled {
             registry: ScopedToolRegistry(tools_registry),
             delegate_handle,
@@ -405,6 +435,7 @@ impl ScopedToolRegistry {
             escalate_handle,
             channel_room_handle,
             deferred_section,
+            pinned_section,
             activated_handle,
         }
     }

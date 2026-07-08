@@ -1,6 +1,6 @@
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    TOOL_LOOP_SESSION_KEY, ToolLoop, run_tool_call_loop,
+    TOOL_LOOP_SESSION_KEY, ToolLoop, apply_text_tool_prompt_policy, run_tool_call_loop,
 };
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
@@ -9,7 +9,7 @@ use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,6 +59,50 @@ pub enum BackgroundTaskStatus {
     Completed,
     Failed,
     Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundResultState {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Lost,
+    TimedOut,
+}
+
+impl BackgroundResultState {
+    fn from_file_status(status: &BackgroundTaskStatus) -> Self {
+        match status {
+            BackgroundTaskStatus::Running => Self::Running,
+            BackgroundTaskStatus::Completed => Self::Completed,
+            BackgroundTaskStatus::Failed => Self::Failed,
+            BackgroundTaskStatus::Cancelled => Self::Cancelled,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Lost => "lost",
+            Self::TimedOut => "timed_out",
+        }
+    }
+
+    fn is_success(self) -> bool {
+        self == Self::Completed
+    }
+
+    fn is_pending(self) -> bool {
+        self == Self::Running
+    }
+
+    fn is_failure(self) -> bool {
+        !matches!(self, Self::Running | Self::Completed)
+    }
 }
 
 /// Tool that delegates a subtask to a named agent with a different
@@ -132,10 +176,86 @@ enum DelegateAdmission {
     Prevalidated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelegateAction {
+    Delegate,
+    CheckResult,
+    ListResults,
+    CancelTask,
+    AwaitSessions,
+}
+
+impl DelegateAction {
+    const ALL: [Self; 5] = [
+        Self::Delegate,
+        Self::CheckResult,
+        Self::ListResults,
+        Self::CancelTask,
+        Self::AwaitSessions,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Delegate => "delegate",
+            Self::CheckResult => "check_result",
+            Self::ListResults => "list_results",
+            Self::CancelTask => "cancel_task",
+            Self::AwaitSessions => "await_sessions",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|action| action.as_str() == value)
+    }
+
+    fn schema_values() -> Vec<&'static str> {
+        Self::ALL.into_iter().map(Self::as_str).collect()
+    }
+
+    fn usage() -> String {
+        Self::schema_values().join("/")
+    }
+}
+
+/// The independent-delegate registry plus the deferred-MCP side-channels the
+/// sub-agent turn needs. Independent delegation assembles the target's full
+/// runtime registry (built-ins + granted MCP + skills), and deferred MCP mode
+/// surfaces its tools through a prompt section (`deferred_section`) and a live
+/// activated set (`activated_handle`) that the sub-agent loop must inject and
+/// thread - exactly as a fresh target turn (`Agent::from_config`) does.
+struct IndependentTargetTools {
+    tools: Vec<Box<dyn Tool>>,
+    /// The deferred-MCP + pinned-resources system-prompt section (empty unless
+    /// the target has granted MCP bundles under deferred loading).
+    deferred_section: String,
+    /// Live handle to the deferred-MCP activated set (Some only when a deferred
+    /// `tool_search` tool was registered), threaded into the sub-agent turn loop.
+    activated_handle: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    /// The TARGET agent's workspace dir (`config.agent_workspace_dir(target)`),
+    /// resolved once here so the sub-agent's skill *prompt* content is built from
+    /// the same workspace its skill *tools* were loaded from - matching a fresh
+    /// target turn (`loop_.rs` uses `config.agent_workspace_dir(agent_alias)` for
+    /// both). Without this the prompt would describe the *caller's* skills while
+    /// the tools come from the target's.
+    workspace_dir: PathBuf,
+    /// The TARGET agent's skills, loaded via the canonical per-agent loader
+    /// (`load_skills_for_agent_from_config`, which unions the workspace,
+    /// open-skills, plugin, and `skill_bundles` sources). Threaded into the
+    /// sub-agent prompt so the SkillsSection describes exactly the skill tools
+    /// that were assembled; `build_enriched_system_prompt`'s local bundle resolver
+    /// only sees `skill_bundles`, so without this override the prompt could omit
+    /// skills the delegate can actually call.
+    skills: Vec<crate::skills::Skill>,
+}
+
 impl DelegateTool {
     /// Canonical tool name. Referenced by `REENTRANT_AGENT_TOOLS` so a
     /// rename cannot desync the two.
     pub const NAME: &'static str = "delegate";
+    const MAX_AWAIT_SESSIONS_TIMEOUT: Duration = Duration::from_secs(120);
+    const MAX_AWAIT_SESSION_TASK_IDS: usize = 128;
     const INDEPENDENT_ALWAYS_ASK_DOC_REF: &'static str =
         "ZeroClaw docs, \"Delegation & SubAgents\" > \"What's not supported\"";
 
@@ -658,15 +778,18 @@ impl DelegateTool {
     /// Bounded agentic delegation starts from the caller's already-filtered
     /// `parent_tools`. Independent delegation is intentionally different: it is
     /// equivalent to starting a fresh target-agent turn, so the registry comes
-    /// from `all_tools_with_runtime()` using the target risk profile, target
-    /// workspace, target memory, and target provider credentials. The only
-    /// cross-cutting restriction retained here is stripping `delegate` itself,
-    /// because recursive agentic delegation is still not supported.
+    /// from the target risk profile, target workspace, target memory, and target
+    /// provider credentials, assembled through the same `ScopedToolRegistry::assemble`
+    /// seam a real target turn uses - including the target's granted MCP-bundle
+    /// tools and callable skill tools. The only cross-cutting restriction retained
+    /// here is stripping `delegate` itself, because recursive agentic delegation is
+    /// still not supported. Returns the registry plus the deferred-MCP prompt section
+    /// and activated-set handle the caller threads into the sub-agent turn.
     async fn independent_agentic_tools_for_target(
         &self,
         agent_name: &str,
         target_policy: Arc<SecurityPolicy>,
-    ) -> anyhow::Result<Vec<Box<dyn Tool>>> {
+    ) -> anyhow::Result<IndependentTargetTools> {
         let config = self
             .root_config
             .as_ref()
@@ -729,37 +852,63 @@ impl DelegateTool {
             None,
         );
 
-        // Route the independent-target registry through the one gated `assemble`
-        // seam. Tool-set-neutral on this path: assemble's built-in filter runs
-        // against the TARGET's SecurityPolicy (target tools, not the caller's),
-        // caller_allowed is None (no per-run allowlist here), and MCP / peripherals
-        // / skill-tools / memory-strip are all off, exactly what this builder did by
-        // hand. `emit_assembly_logs: true` because this is an execution surface (the
-        // target then runs a turn), so operators get the same "which tools were
-        // admitted / did policy drop tools" audit breadcrumbs the other execution
-        // paths emit. The `delegate` tool is stripped afterward because
-        // `all_tools_with_runtime` unconditionally injects it and an independent
-        // delegate must not be able to recurse into further delegation.
+        // Load the TARGET agent's skills - the same "fresh turn" loader run() and
+        // from_config use (`_from_config` resolves the target's workspace + skill_bundles
+        // from the alias) - so an independent delegate exposes the target's callable skill
+        // tools, not an empty set. Resolve the target workspace explicitly too, so the
+        // caller can build the sub-agent's skill *prompt* from the SAME workspace these
+        // skill *tools* came from (the loader resolves `config.agent_workspace_dir(target)`
+        // internally). NB: this is the target's config workspace, not `target_policy
+        // .workspace_dir` (which policy_for_target rebinds to the caller's cwd when caller
+        // and target share a risk profile) - matching loop_.rs, which uses
+        // `config.agent_workspace_dir(agent_alias)` for both skills and prompt.
+        let target_workspace = config.agent_workspace_dir(agent_name);
+        let skills = crate::skills::load_skills_for_agent_from_config(config, agent_name);
+
+        // Route the independent-target registry through the one gated seam - the same
+        // `assemble` seam run(), process_message, and the gateway use. Independent
+        // delegation is "like opening a fresh chat with the target"
+        // (docs/book/src/agents/delegation.md), so it assembles the TARGET's FULL runtime
+        // registry: assemble step 2 filters with the TARGET's SecurityPolicy (the #8239
+        // invariant - target tools, not the caller's), `connect_mcp: true` connects the
+        // target's granted MCP bundles (omission is not a grant), and the target's skills
+        // register as tools. caller_allowed is None (no per-run allowlist here).
+        // `connect_peripherals` stays FALSE deliberately: a delegate sub-loop must not open
+        // the serial hardware the live daemon holds exclusively. `emit_assembly_logs: true`
+        // because this is an execution surface. The `delegate` tool is stripped afterward
+        // because `all_tools_with_runtime` injects it and an independent delegate must not
+        // recurse into further delegation.
         let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
                 config,
                 agent_alias: agent_name,
                 security: &target_policy,
                 built: all_tools_result,
-                skills: &[],
+                skills: &skills,
                 runtime,
                 caller_allowed: None,
-                connect_mcp: false,
+                connect_mcp: true,
                 connect_peripherals: false,
                 exclude_memory: false,
                 emit_assembly_logs: true,
             },
         )
         .await;
-        let mut tools = assembled.registry.into_inner();
-
+        let crate::tools::scoped::ScopedAssembled {
+            registry,
+            deferred_section,
+            activated_handle,
+            ..
+        } = assembled;
+        let mut tools = registry.into_inner();
         tools.retain(|tool| tool.name() != Self::NAME);
-        Ok(tools)
+        Ok(IndependentTargetTools {
+            tools,
+            deferred_section,
+            activated_handle,
+            workspace_dir: target_workspace,
+            skills,
+        })
     }
 
     /// Resolve `model_provider` ("type.alias") → (provider_type, credential, model, temperature).
@@ -988,9 +1137,8 @@ impl Tool for DelegateTool {
         "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model \
          (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single \
          prompt by default; with agentic=true it can iterate with a filtered tool-call loop. \
-         Supports background execution (returns a task_id immediately) and parallel execution \
-         (runs multiple agents concurrently). Use action='check_result' with a task_id to \
-         retrieve background results."
+         Supports background execution (returns a task_id immediately), batched background waits \
+         (await_sessions), and parallel execution (runs multiple agents concurrently)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1019,11 +1167,12 @@ impl Tool for DelegateTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["delegate", "check_result", "list_results", "cancel_task"],
+                    "enum": DelegateAction::schema_values(),
                     "description": "Action to perform. Default: 'delegate'. Use 'check_result' to \
-                                    retrieve a background task result, 'list_results' to list all \
-                                    background tasks, 'cancel_task' to cancel a running background task.",
-                    "default": "delegate"
+                                    retrieve a background task result, 'await_sessions' to wait for \
+                                    multiple background results, 'list_results' to list all background \
+                                    tasks, 'cancel_task' to cancel a running background task.",
+                    "default": DelegateAction::Delegate.as_str()
                 },
                 "agent": {
                     "type": "string",
@@ -1064,6 +1213,19 @@ impl Tool for DelegateTool {
                     "type": "string",
                     "description": "Task ID for check_result/cancel_task actions (returned by \
                                     background delegation)."
+                },
+                "task_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "maxItems": Self::MAX_AWAIT_SESSION_TASK_IDS,
+                    "description": "Task IDs for await_sessions."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": Self::MAX_AWAIT_SESSIONS_TIMEOUT.as_millis(),
+                    "description": "Maximum milliseconds for await_sessions to wait before returning partial results. Capped at 120000."
                 }
             },
             "required": []
@@ -1071,25 +1233,27 @@ impl Tool for DelegateTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let action = args
+        let action_value = args
             .get("action")
             .and_then(|v| v.as_str())
-            .unwrap_or("delegate");
+            .unwrap_or_else(|| DelegateAction::Delegate.as_str());
+        let Some(action) = DelegateAction::parse(action_value) else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Unknown action '{action_value}'. Use {}.",
+                    DelegateAction::usage()
+                )),
+            });
+        };
 
         match action {
-            "check_result" => return self.handle_check_result(&args).await,
-            "list_results" => return self.handle_list_results().await,
-            "cancel_task" => return self.handle_cancel_task(&args).await,
-            "delegate" => {} // fall through to delegation logic
-            other => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "Unknown action '{other}'. Use delegate/check_result/list_results/cancel_task."
-                    )),
-                });
-            }
+            DelegateAction::CheckResult => return self.handle_check_result(&args).await,
+            DelegateAction::ListResults => return self.handle_list_results().await,
+            DelegateAction::CancelTask => return self.handle_cancel_task(&args).await,
+            DelegateAction::AwaitSessions => return self.handle_await_sessions(&args).await,
+            DelegateAction::Delegate => {}
         }
 
         // --- Parallel mode ---
@@ -1305,6 +1469,7 @@ impl DelegateTool {
             &[],
             &self.workspace_dir,
             false,
+            None,
         );
         let system_prompt_ref = enriched_system_prompt.as_deref();
 
@@ -1919,6 +2084,96 @@ impl DelegateTool {
         }
     }
 
+    async fn read_background_result(
+        &self,
+        task_id: &str,
+    ) -> anyhow::Result<Option<BackgroundDelegateResult>> {
+        let result_path = self.results_dir().join(format!("{task_id}.json"));
+        let content = match tokio::fs::read_to_string(&result_path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let result = serde_json::from_str(&content)?;
+        Ok(Some(result))
+    }
+
+    async fn background_result_view(
+        task_id: &str,
+        result: BackgroundDelegateResult,
+    ) -> anyhow::Result<(BackgroundResultState, serde_json::Value)> {
+        if let Some(label) = Self::reconciled_loss_label(task_id, &result.status).await {
+            let state = match label {
+                "lost" => BackgroundResultState::Lost,
+                "timed_out" => BackgroundResultState::TimedOut,
+                _ => BackgroundResultState::from_file_status(&result.status),
+            };
+            return Ok((
+                state,
+                json!({
+                    "task_id": task_id,
+                    "agent": result.agent,
+                    "status": label,
+                    "started_at": result.started_at,
+                    "note": "the owning daemon exited or the task exceeded its max runtime; \
+                             reconciled by the supervision reaper",
+                }),
+            ));
+        }
+        let state = BackgroundResultState::from_file_status(&result.status);
+        Ok((state, serde_json::to_value(result)?))
+    }
+
+    fn task_ids_from_args(args: &serde_json::Value) -> anyhow::Result<Vec<String>> {
+        let values = args
+            .get("task_ids")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| anyhow::Error::msg("Missing 'task_ids' parameter for await_sessions"))?;
+        if values.len() > Self::MAX_AWAIT_SESSION_TASK_IDS {
+            return Err(anyhow::Error::msg(format!(
+                "'task_ids' must contain no more than {} task ids",
+                Self::MAX_AWAIT_SESSION_TASK_IDS
+            )));
+        }
+        let mut task_ids = Vec::with_capacity(values.len());
+        let mut seen = HashSet::with_capacity(values.len());
+        for value in values {
+            let Some(task_id) = value.as_str() else {
+                return Err(anyhow::Error::msg("'task_ids' must contain only strings"));
+            };
+            Self::validate_task_id(task_id).map_err(anyhow::Error::msg)?;
+            if !seen.insert(task_id) {
+                return Err(anyhow::Error::msg(format!(
+                    "Duplicate task_id '{task_id}' in task_ids"
+                )));
+            }
+            task_ids.push(task_id.to_string());
+        }
+        if task_ids.is_empty() {
+            return Err(anyhow::Error::msg(
+                "'task_ids' must contain at least one task id",
+            ));
+        }
+        Ok(task_ids)
+    }
+
+    fn await_timeout(args: &serde_json::Value) -> anyhow::Result<Duration> {
+        let Some(value) = args.get("timeout_ms") else {
+            return Ok(Duration::from_millis(30_000));
+        };
+        let Some(timeout_ms) = value.as_u64() else {
+            return Err(anyhow::Error::msg("'timeout_ms' must be an integer"));
+        };
+        let timeout = Duration::from_millis(timeout_ms);
+        if timeout > Self::MAX_AWAIT_SESSIONS_TIMEOUT {
+            return Err(anyhow::Error::msg(format!(
+                "'timeout_ms' must be no more than {}",
+                Self::MAX_AWAIT_SESSIONS_TIMEOUT.as_millis()
+            )));
+        }
+        Ok(timeout)
+    }
+
     /// Retrieve the result of a background delegate task by task_id.
     async fn handle_check_result(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         let task_id = args
@@ -1944,45 +2199,109 @@ impl DelegateTool {
             });
         }
 
-        let result_path = self.results_dir().join(format!("{task_id}.json"));
-        if !result_path.exists() {
+        let Some(result) = self.read_background_result(task_id).await? else {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("No result found for task_id '{task_id}'")),
             });
-        }
-
-        let content = tokio::fs::read_to_string(&result_path).await?;
-        let result: BackgroundDelegateResult = serde_json::from_str(&content)?;
-
-        // Overlay the control-plane's reconciled view: a crashed/timed-out task whose
-        // flat file still says `Running` is surfaced as lost/timed_out, so the agent
-        // stops polling a task that will never complete.
-        if let Some(label) = Self::reconciled_loss_label(task_id, &result.status).await {
-            return Ok(ToolResult {
-                success: false,
-                output: serde_json::to_string_pretty(&json!({
-                    "task_id": task_id,
-                    "agent": result.agent,
-                    "status": label,
-                    "started_at": result.started_at,
-                    "note": "the owning daemon exited or the task exceeded its max runtime; \
-                             reconciled by the supervision reaper",
-                }))?,
-                error: Some(format!("background task is {label} and will not complete")),
-            });
-        }
+        };
+        let error = result.error.clone();
+        let (state, value) = Self::background_result_view(task_id, result).await?;
+        let success = state.is_success();
 
         Ok(ToolResult {
-            success: result.status == BackgroundTaskStatus::Completed,
-            output: serde_json::to_string_pretty(&result)?,
-            error: if result.status == BackgroundTaskStatus::Completed {
+            success,
+            output: serde_json::to_string_pretty(&value)?,
+            error: if success {
                 None
+            } else if let Some(error) = error {
+                Some(error)
+            } else if state.is_failure() {
+                Some(format!(
+                    "background task is {} and will not complete",
+                    state.as_str()
+                ))
             } else {
-                result.error
+                None
             },
         })
+    }
+
+    async fn handle_await_sessions(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let task_ids = match Self::task_ids_from_args(args) {
+            Ok(task_ids) => task_ids,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error.to_string()),
+                });
+            }
+        };
+        let timeout = match Self::await_timeout(args) {
+            Ok(timeout) => timeout,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error.to_string()),
+                });
+            }
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let mut results = Vec::new();
+            let mut pending = Vec::new();
+            let mut missing = Vec::new();
+            let mut failed = Vec::new();
+
+            for task_id in &task_ids {
+                let Some(result) = self.read_background_result(task_id).await? else {
+                    missing.push(task_id.clone());
+                    continue;
+                };
+                let (state, value) = Self::background_result_view(task_id, result).await?;
+                if state.is_pending() {
+                    pending.push(task_id.clone());
+                } else if state.is_failure() {
+                    failed.push(task_id.clone());
+                }
+                results.push(value);
+            }
+
+            let waiting = !pending.is_empty() || !missing.is_empty();
+            let timed_out = waiting && tokio::time::Instant::now() >= deadline;
+            if !waiting || timed_out {
+                let completed = results
+                    .iter()
+                    .filter(|result| result.get("status") == Some(&json!("completed")))
+                    .count();
+                let success = missing.is_empty() && pending.is_empty() && failed.is_empty();
+                let error = if success {
+                    None
+                } else if timed_out {
+                    Some("one or more background tasks are still pending or missing".into())
+                } else {
+                    Some("one or more background tasks failed or were cancelled".into())
+                };
+                return Ok(ToolResult {
+                    success,
+                    output: serde_json::to_string_pretty(&json!({
+                        "status": if timed_out { "timeout" } else { "complete" },
+                        "completed": completed,
+                        "pending": pending,
+                        "missing": missing,
+                        "failed": failed,
+                        "results": results,
+                    }))?,
+                    error,
+                });
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// List all background delegate task results.
@@ -2155,6 +2474,44 @@ impl DelegateTool {
         self.cancellation_token.cancel();
     }
 
+    /// Compose an independent sub-agent's system prompt from the base (tools /
+    /// skills / identity) prompt and the target's deferred-MCP section.
+    ///
+    /// This mirrors a fresh target turn: the deferred-tools section is first run
+    /// through the turn engine's `apply_text_tool_prompt_policy`, which *clears*
+    /// it for a non-native, strict-tool-parsing target (such a target cannot use
+    /// the text `tool_search` protocol, so a fresh turn never advertises it). Only
+    /// then is a non-empty section appended. Reusing the shared policy helper keeps
+    /// the delegate path from drifting from the engine. The throwaway tool-descs
+    /// vec is intentionally unused - `build_enriched_system_prompt` already applied
+    /// the policy to the tool descriptions; here we only want its effect on the
+    /// deferred section.
+    fn compose_independent_system_prompt(
+        base: Option<String>,
+        mut deferred_section: String,
+        native_tools: bool,
+        strict_tool_parsing: bool,
+    ) -> Option<String> {
+        let mut ignored_tool_descs: Vec<(&str, &str)> = Vec::new();
+        apply_text_tool_prompt_policy(
+            native_tools,
+            strict_tool_parsing,
+            &mut ignored_tool_descs,
+            &mut deferred_section,
+        );
+        if deferred_section.is_empty() {
+            return base;
+        }
+        match base {
+            Some(mut p) => {
+                p.push_str("\n\n");
+                p.push_str(&deferred_section);
+                Some(p)
+            }
+            None => Some(deferred_section),
+        }
+    }
+
     /// Build an enriched system prompt for a sub-agent by composing structured
     /// operational sections (tools, skills, workspace, datetime, shell policy)
     /// with the per-agent identity files loaded from the target's own
@@ -2169,21 +2526,37 @@ impl DelegateTool {
         sub_tools: &[Box<dyn Tool>],
         workspace_dir: &Path,
         sends_native_tool_specs: bool,
+        skills_override: Option<&[crate::skills::Skill]>,
     ) -> Option<String> {
-        // Resolve skill bundle directories. With one or more configured
-        // bundles, load + concat skills from each. With none, fall back to
-        // the workspace default.
-        let bundle_dirs = self.resolve_skill_bundle_dirs(&agent_config.skill_bundles);
-        let skills: Vec<_> = if bundle_dirs.is_empty() {
-            let default_dir = crate::skills::skills_dir(workspace_dir);
-            crate::skills::load_skills_from_directory(&default_dir, false).0
-        } else {
-            bundle_dirs
-                .into_iter()
-                .flat_map(|dir| {
-                    crate::skills::load_skills_from_directory(&workspace_dir.join(dir), false).0
-                })
-                .collect()
+        // Skills for the prompt. An independent delegate passes the canonical
+        // per-agent skill set (`skills_override`) - the SAME set its skill tools
+        // were assembled from - so the SkillsSection describes exactly the exposed
+        // tools. Bounded delegation (override None) falls back to local bundle
+        // resolution: with configured bundles, load + concat from each; otherwise
+        // the workspace default. (The local resolver only sees `skill_bundles`,
+        // which is why independent delegation overrides it.)
+        let resolved_skills: Vec<crate::skills::Skill>;
+        let skills: &[crate::skills::Skill] = match skills_override {
+            Some(s) => s,
+            None => {
+                let bundle_dirs = self.resolve_skill_bundle_dirs(&agent_config.skill_bundles);
+                resolved_skills = if bundle_dirs.is_empty() {
+                    let default_dir = crate::skills::skills_dir(workspace_dir);
+                    crate::skills::load_skills_from_directory(&default_dir, false).0
+                } else {
+                    bundle_dirs
+                        .into_iter()
+                        .flat_map(|dir| {
+                            crate::skills::load_skills_from_directory(
+                                &workspace_dir.join(dir),
+                                false,
+                            )
+                            .0
+                        })
+                        .collect()
+                };
+                &resolved_skills
+            }
         };
 
         // Determine shell policy instructions when the `shell` tool is in the
@@ -2214,7 +2587,7 @@ impl DelegateTool {
             agent_workspace_dir: workspace_dir,
             model_name,
             tools: prompt_tools,
-            skills: &skills,
+            skills,
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
@@ -2336,13 +2709,34 @@ impl DelegateTool {
             DelegateAdmission::Prevalidated => Arc::clone(&self.security),
         };
         let target_mode = self.mode_for_target(agent_name);
+        // Deferred-MCP side-channels for an INDEPENDENT target: its sub-agent turn must
+        // inject the deferred-tools prompt section and thread the activated set, exactly as
+        // a fresh target turn does. Bounded delegation leaves these empty (it starts from
+        // the parent's already-built registry, not the target's assembled one).
+        let mut sub_deferred_section = String::new();
+        let mut sub_activated: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>> = None;
+        // For an INDEPENDENT target, build the sub-agent's system prompt (skills, identity)
+        // from the TARGET's workspace, not the caller's - so skill *prompt* content matches
+        // the skill *tools* assembled above. `None` for bounded delegation, which keeps the
+        // caller's `self.workspace_dir`.
+        let mut sub_workspace: Option<PathBuf> = None;
+        // The target's canonical skills (Some for independent), so the prompt's SkillsSection
+        // describes exactly the assembled skill tools rather than the local bundle resolver's
+        // narrower view. None for bounded delegation (local resolution).
+        let mut sub_skills: Option<Vec<crate::skills::Skill>> = None;
         let sub_tools: Vec<Box<dyn Tool>> = match target_mode {
             DelegateExecutionMode::Independent => {
                 match self
                     .independent_agentic_tools_for_target(agent_name, Arc::clone(&target_policy))
                     .await
                 {
-                    Ok(tools) => tools,
+                    Ok(independent) => {
+                        sub_deferred_section = independent.deferred_section;
+                        sub_activated = independent.activated_handle;
+                        sub_workspace = Some(independent.workspace_dir);
+                        sub_skills = Some(independent.skills);
+                        independent.tools
+                    }
                     Err(e) => {
                         return Ok(ToolResult {
                             success: false,
@@ -2405,13 +2799,28 @@ impl DelegateTool {
         prompt_agent_config.resolved = loop_runtime.clone();
 
         // Build enriched system prompt with tools, skills, workspace, datetime context.
+        // Independent delegation builds it from the TARGET's workspace (`sub_workspace`), so
+        // the skill prompt content matches the target's skill tools; bounded delegation
+        // keeps the caller's `self.workspace_dir`.
+        let prompt_workspace = sub_workspace.as_deref().unwrap_or(&self.workspace_dir);
         let enriched_system_prompt = self.build_enriched_system_prompt(
             agent_name,
             &prompt_agent_config,
             model,
             &sub_tools,
-            &self.workspace_dir,
+            prompt_workspace,
             model_provider.supports_native_tools(),
+            sub_skills.as_deref(),
+        );
+        // Independent delegates surface the target's deferred MCP tools the way a fresh
+        // target turn does. See `compose_independent_system_prompt`: it applies the turn
+        // engine's text-tool prompt policy to the deferred section (so a non-native strict
+        // target suppresses it, exactly as a fresh turn would) and then appends it.
+        let enriched_system_prompt = Self::compose_independent_system_prompt(
+            enriched_system_prompt,
+            sub_deferred_section,
+            model_provider.supports_native_tools(),
+            loop_runtime.strict_tool_parsing,
         );
 
         let mut history = Vec::new();
@@ -2454,7 +2863,10 @@ impl DelegateTool {
                         approval: None,
                         multimodal_config: &self.multimodal_config,
                         hooks: None,
-                        activated_tools: None,
+                        // Thread the target's deferred-MCP activated set so `tool_search`
+                        // can activate the target's deferred tools mid-turn (Some only for
+                        // an independent target with granted deferred-MCP bundles).
+                        activated_tools: sub_activated.as_ref(),
                         model_switch_callback: None,
                         // delegate subagents don't support approval
                         receipt_generator,
@@ -2826,6 +3238,38 @@ mod tests {
 
             sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    fn background_result(
+        task_id: &str,
+        status: BackgroundTaskStatus,
+        output: Option<&str>,
+        error: Option<&str>,
+    ) -> BackgroundDelegateResult {
+        let finished_at = if status == BackgroundTaskStatus::Running {
+            None
+        } else {
+            Some("2026-06-29T12:00:01Z".to_string())
+        };
+        BackgroundDelegateResult {
+            task_id: task_id.to_string(),
+            agent: "researcher".to_string(),
+            status,
+            output: output.map(str::to_string),
+            error: error.map(str::to_string),
+            started_at: "2026-06-29T12:00:00Z".to_string(),
+            finished_at,
+        }
+    }
+
+    fn write_background_result(workspace: &Path, result: &BackgroundDelegateResult) {
+        let results_dir = workspace.join("delegate_results");
+        std::fs::create_dir_all(&results_dir).unwrap();
+        std::fs::write(
+            results_dir.join(format!("{}.json", result.task_id)),
+            serde_json::to_vec_pretty(result).unwrap(),
+        )
+        .unwrap();
     }
 
     #[derive(Default)]
@@ -4547,6 +4991,7 @@ mod tests {
                 &prompt_tools,
                 Path::new("/tmp"),
                 false,
+                None,
             )
             .expect("prompt should render");
         assert!(
@@ -5265,7 +5710,15 @@ mod tests {
             .with_workspace_dir(workspace.clone());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                None,
+            )
             .unwrap();
 
         assert!(prompt.contains("## Tools"), "should contain tools section");
@@ -5336,7 +5789,15 @@ mod tests {
             .with_workspace_dir(workspace.to_path_buf());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                None,
+            )
             .unwrap();
 
         assert!(
@@ -5386,7 +5847,15 @@ mod tests {
             .with_workspace_dir(workspace.to_path_buf());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                None,
+            )
             .unwrap();
 
         assert!(
@@ -5458,7 +5927,15 @@ mod tests {
             .with_workspace_dir(workspace.clone());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                None,
+            )
             .unwrap();
 
         assert!(
@@ -5491,7 +5968,15 @@ mod tests {
             .with_workspace_dir(workspace.clone());
 
         let prompt = tool
-            .build_enriched_system_prompt("alpha", &config, "test-model", &tools, &workspace, false)
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                None,
+            )
             .unwrap();
 
         assert!(
@@ -5602,6 +6087,334 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap().contains("No result found"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_schema_exposes_action_and_inputs() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let schema = tool.parameters_schema();
+        let action_enum = schema
+            .pointer("/properties/action/enum")
+            .and_then(|value| value.as_array())
+            .expect("action enum exists");
+        assert!(action_enum.iter().any(|value| value == "await_sessions"));
+        assert_eq!(
+            schema.pointer("/properties/task_ids/maxItems"),
+            Some(&json!(DelegateTool::MAX_AWAIT_SESSION_TASK_IDS))
+        );
+        assert_eq!(
+            schema.pointer("/properties/timeout_ms/maximum"),
+            Some(&json!(120000))
+        );
+    }
+
+    #[tokio::test]
+    async fn await_sessions_returns_completed_results() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_done_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let first = uuid::Uuid::new_v4().to_string();
+        let second = uuid::Uuid::new_v4().to_string();
+        write_background_result(
+            &workspace,
+            &background_result(
+                &first,
+                BackgroundTaskStatus::Completed,
+                Some("first output"),
+                None,
+            ),
+        );
+        write_background_result(
+            &workspace,
+            &background_result(
+                &second,
+                BackgroundTaskStatus::Completed,
+                Some("second output"),
+                None,
+            ),
+        );
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [first, second],
+                "timeout_ms": 0
+            }))
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+
+        assert!(result.success, "got error: {:?}", result.error);
+        assert_eq!(output["status"], "complete");
+        assert_eq!(output["completed"], 2);
+        assert_eq!(output["results"].as_array().unwrap().len(), 2);
+        assert!(result.error.is_none());
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_reports_failed_results() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_failed_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        write_background_result(
+            &workspace,
+            &background_result(
+                &task_id,
+                BackgroundTaskStatus::Failed,
+                None,
+                Some("model failed"),
+            ),
+        );
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [task_id],
+                "timeout_ms": 0
+            }))
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+
+        assert!(!result.success);
+        assert_eq!(output["status"], "complete");
+        assert_eq!(output["failed"].as_array().unwrap().len(), 1);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("failed")
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_times_out_with_pending_results() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_pending_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let done = uuid::Uuid::new_v4().to_string();
+        let pending = uuid::Uuid::new_v4().to_string();
+        write_background_result(
+            &workspace,
+            &background_result(&done, BackgroundTaskStatus::Completed, Some("done"), None),
+        );
+        write_background_result(
+            &workspace,
+            &background_result(&pending, BackgroundTaskStatus::Running, None, None),
+        );
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [done, pending],
+                "timeout_ms": 0
+            }))
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+
+        assert!(!result.success);
+        assert_eq!(output["status"], "timeout");
+        assert_eq!(output["completed"], 1);
+        assert_eq!(output["pending"].as_array().unwrap().len(), 1);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("pending")
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_reports_missing_tasks() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_missing_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let missing = uuid::Uuid::new_v4().to_string();
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [missing],
+                "timeout_ms": 0
+            }))
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+
+        assert!(!result.success);
+        assert_eq!(output["status"], "timeout");
+        assert_eq!(output["missing"].as_array().unwrap().len(), 1);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("missing")
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_rejects_duplicate_task_ids() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_duplicate_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [task_id, task_id],
+                "timeout_ms": 0
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        assert!(result.error.unwrap().contains("Duplicate task_id"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_rejects_invalid_task_ids() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_invalid_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": ["../../../etc/shadow"],
+                "timeout_ms": 0
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        assert!(result.error.unwrap().contains("Invalid task_id"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_rejects_too_many_task_ids() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_many_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let task_ids: Vec<String> = (0..=DelegateTool::MAX_AWAIT_SESSION_TASK_IDS)
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect();
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": task_ids,
+                "timeout_ms": 0
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        assert!(result.error.unwrap().contains("no more than"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_rejects_invalid_timeout_ms() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_bad_timeout_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [task_id],
+                "timeout_ms": "later"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains("'timeout_ms' must be an integer")
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_rejects_timeout_ms_over_cap() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_timeout_cap_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [task_id],
+                "timeout_ms": 120001
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        assert!(result.error.unwrap().contains("no more than 120000"));
 
         let _ = std::fs::remove_dir_all(workspace);
     }
@@ -6881,7 +7694,8 @@ mod tests {
         let tools = tool
             .independent_agentic_tools_for_target("target", target_policy)
             .await
-            .expect("target-owned registry builds");
+            .expect("target-owned registry builds")
+            .tools;
         let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
 
         assert!(
@@ -6895,6 +7709,218 @@ mod tests {
         assert!(
             !tool_names.contains(&"echo_tool"),
             "independent target must not inherit parent-only tools"
+        );
+    }
+
+    /// An independent delegate now receives the TARGET agent's callable SKILL tools,
+    /// not just its built-ins -- matching a fresh target turn. A skill declared in the
+    /// target's workspace surfaces as `{skill}__{tool}`. This fails on the old
+    /// `skills: &[]` wiring (the built-in-only registry).
+    #[tokio::test]
+    async fn independent_delegate_receives_target_skill_tools() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        // A skill with one shell tool, in the TARGET agent's workspace.
+        let target_ws = tmp.path().join("target-workspace");
+        let skill_dir = target_ws.join("skills").join("pdfify");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            r#"[skill]
+name = "pdfify"
+description = "test skill for independent-delegate skill wiring"
+version = "0.1.0"
+
+[[tools]]
+name = "run"
+description = "run pdfify"
+kind = "shell"
+command = "echo hi"
+"#,
+        )
+        .unwrap();
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec!["echo_tool".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["shell".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Independent,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(target_ws.clone()),
+                    ..Default::default()
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(DelegateTestRuntime))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        let target_policy = tool
+            .policy_for_target("target")
+            .expect("independent target policy resolves");
+
+        let independent = tool
+            .independent_agentic_tools_for_target("target", target_policy)
+            .await
+            .expect("target-owned registry builds");
+        let names: Vec<String> = independent
+            .tools
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+
+        // The target skill tool reaches the delegate even though the target's allowed_tools
+        // is ["shell"]: skill tools are granted via skill config (skill_bundles/workspace),
+        // NOT the built-in allowlist, and builtin-kind skill tools are scoped-elevation
+        // wrappers meant to stay callable off the allowlist. Only excluded_tools subtracts a
+        // skill tool (see the seam fix in `register_skill_tools`), so this is correct
+        // documented behavior, not an allowlist bypass.
+        assert!(
+            names.iter().any(|n| n == "pdfify__run"),
+            "independent delegate must expose the target's skill tools (fails with skills:&[]); got {names:?}"
+        );
+        // The #8239 invariants still hold alongside the new skill tools.
+        assert!(
+            names.iter().any(|n| n == "shell"),
+            "target built-in must still be present, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "delegate"),
+            "delegate must still be stripped (no recursion), got {names:?}"
+        );
+        // The returned workspace is the TARGET's config workspace - the caller threads it
+        // into build_enriched_system_prompt so the skill PROMPT content is built from the
+        // same workspace as the skill TOOLS above (not the caller's). Guards against the
+        // tools-from-B / prompt-from-A split.
+        assert_eq!(
+            independent.workspace_dir,
+            config.agent_workspace_dir("target"),
+            "independent delegate prompt must be built from the target's workspace"
+        );
+        assert_eq!(
+            independent.workspace_dir, target_ws,
+            "target workspace must resolve to the configured target-workspace path"
+        );
+    }
+
+    // Finding: an independent delegate to a non-native, strict-tool-parsing target must
+    // suppress the deferred-MCP prompt section exactly as a fresh target turn does
+    // (apply_text_tool_prompt_policy clears it), instead of advertising `tool_search`
+    // stubs the target cannot use. compose_independent_system_prompt centralizes that.
+    #[test]
+    fn independent_prompt_respects_text_tool_policy_for_deferred_section() {
+        let base = || Some("BASE PROMPT".to_string());
+        let deferred = "== DEFERRED MCP: call tool_search ==".to_string();
+
+        // Native provider: deferred section is appended verbatim.
+        let native = DelegateTool::compose_independent_system_prompt(
+            base(),
+            deferred.clone(),
+            true, // native_tools
+            true, // strict_tool_parsing (ignored when native)
+        )
+        .unwrap();
+        assert!(
+            native.contains("BASE PROMPT") && native.contains("DEFERRED MCP"),
+            "native target must keep the deferred section, got: {native:?}"
+        );
+
+        // Non-native but NOT strict: text tool protocol is exposed, deferred kept.
+        let lenient = DelegateTool::compose_independent_system_prompt(
+            base(),
+            deferred.clone(),
+            false, // non-native
+            false, // not strict
+        )
+        .unwrap();
+        assert!(
+            lenient.contains("DEFERRED MCP"),
+            "non-native non-strict target must keep the deferred section, got: {lenient:?}"
+        );
+
+        // Non-native AND strict: the fresh-turn policy CLEARS the deferred section, so the
+        // delegate prompt must be the base only - no tool_search advertisement.
+        let strict = DelegateTool::compose_independent_system_prompt(
+            base(),
+            deferred.clone(),
+            false, // non-native
+            true,  // strict
+        )
+        .unwrap();
+        assert_eq!(
+            strict, "BASE PROMPT",
+            "non-native strict target must NOT get the deferred section, got: {strict:?}"
+        );
+        assert!(
+            !strict.contains("DEFERRED MCP") && !strict.contains("tool_search"),
+            "strict delegate prompt must not advertise deferred MCP, got: {strict:?}"
+        );
+
+        // Empty deferred section is a no-op regardless of policy.
+        assert_eq!(
+            DelegateTool::compose_independent_system_prompt(base(), String::new(), false, false),
+            base()
+        );
+        // No base prompt + non-empty deferred (native) becomes the deferred section alone.
+        assert_eq!(
+            DelegateTool::compose_independent_system_prompt(
+                None,
+                "ONLY DEFERRED".to_string(),
+                true,
+                false
+            ),
+            Some("ONLY DEFERRED".to_string())
         );
     }
 
