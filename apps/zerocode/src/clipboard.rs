@@ -22,7 +22,9 @@ const IMAGE_READ_RETRY_DELAY: Duration = Duration::from_millis(80);
 ///
 /// Returns `Some((bytes, mime_type))` on success, `None` when the clipboard
 /// genuinely holds no image or no clipboard tool is available. An owner that
-/// advertises only text targets is not recoverable here and lands in `None`.
+/// advertises only text targets is not recoverable here and lands in `None`
+/// on the first probe, so a text-only clipboard does not pay the retry
+/// budget before the caller falls through to text paste.
 pub(crate) fn read_clipboard_image() -> Option<(Vec<u8>, String)> {
     let tool = which_clipboard_tool()?;
 
@@ -31,7 +33,16 @@ pub(crate) fn read_clipboard_image() -> Option<(Vec<u8>, String)> {
         // attempts when another client re-grabs the selection. For tools that
         // cannot enumerate (pngpaste, PowerShell) this resolves to image/png,
         // which those tools always emit.
-        for target in image_targets_for_tool(&tool) {
+        let targets = image_targets_for_tool(&tool);
+        if targets.is_empty() && tool_can_enumerate(&tool) {
+            // Enumerable owner is advertising no image target at all. Not a
+            // servable-target race — a plain text-only clipboard. Return
+            // immediately so the caller falls through to text paste without
+            // burning the full IMAGE_READ_ATTEMPTS * IMAGE_READ_RETRY_DELAY
+            // window (~720ms) on every ordinary text paste.
+            return None;
+        }
+        for target in targets {
             if let Some(bytes) = run_clipboard_tool(&tool, &target)
                 && !bytes.is_empty()
             {
@@ -43,6 +54,13 @@ pub(crate) fn read_clipboard_image() -> Option<(Vec<u8>, String)> {
         }
     }
     None
+}
+
+/// Whether a clipboard tool can enumerate advertised targets. Used to
+/// distinguish "no image advertised" (fast fall-through) from "cannot see the
+/// offer" (must retry the read).
+fn tool_can_enumerate(tool: &ClipboardTool) -> bool {
+    matches!(tool, ClipboardTool::Xclip | ClipboardTool::WlPaste)
 }
 
 /// Returns `true` when the system clipboard currently advertises a servable
@@ -460,6 +478,14 @@ mod tests {
             image_targets_for_tool(&ClipboardTool::PowerShellImage),
             vec!["image/png".to_string()]
         );
+    }
+
+    #[test]
+    fn tool_can_enumerate_matches_probing_tools() {
+        assert!(tool_can_enumerate(&ClipboardTool::Xclip));
+        assert!(tool_can_enumerate(&ClipboardTool::WlPaste));
+        assert!(!tool_can_enumerate(&ClipboardTool::PngPaste));
+        assert!(!tool_can_enumerate(&ClipboardTool::PowerShellImage));
     }
 
     #[test]
