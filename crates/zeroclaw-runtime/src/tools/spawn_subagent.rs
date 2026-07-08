@@ -214,6 +214,12 @@ impl Tool for SpawnSubagentTool {
             security: Some(subagent_ctx.policy.clone()),
             memory: None,
             is_subagent: true,
+            // Sub-turn origin already skips memory injection; explicit for
+            // the same future-proofing reason as `is_subagent` above.
+            suppress_memory_inject: true,
+            // Subagents keep a live memory backend and the memory tools; only
+            // the injected context preamble is suppressed above.
+            memory_free: false,
         };
         let parent_alias = subagent_ctx.parent_alias.clone();
 
@@ -261,6 +267,7 @@ impl Tool for SpawnSubagentTool {
                 false,
                 Some(session_path),
                 None,
+                zeroclaw_api::ingress::TurnOrigin::SubTurn,
                 run_overrides,
             )
         ))

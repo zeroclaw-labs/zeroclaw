@@ -1687,6 +1687,38 @@ pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
     )
 }
 
+/// The skill-tool `kind`s that register as callable tool specs (invocable via
+/// function calling), as opposed to prompt-only descriptions. Shared by the
+/// registry converter (`skills_to_tools_with_context_and_runtime`, which gates
+/// its per-kind dispatch on it) and the prompt renderer, so the two cannot
+/// drift. `builtin` and `mcp` are elevation wrappers.
+fn is_registered_skill_tool_kind(kind: &str) -> bool {
+    matches!(kind, "shell" | "script" | "http" | "builtin" | "mcp")
+}
+
+/// Whether a skill tool should be advertised as callable in the system prompt,
+/// from what is statically knowable in the manifest.
+///
+/// `shell`/`script`/`http` always register. `builtin`/`mcp` are elevation
+/// wrappers that register only when they name a `target` to elevate to
+/// (`resolve_elevated_tool` returns `None` without one) - so a manifest that
+/// omits `target` must NOT be advertised as callable, or the model is told to
+/// invoke a `skill__tool` the converter skipped. Runtime resolvability of that
+/// target (e.g. a disconnected MCP server) is not knowable at prompt-build time;
+/// that residual is the same best-effort the prompt has always carried for
+/// `builtin`. Previously the renderer classified by kind alone and omitted `mcp`
+/// entirely, so `mcp` tools rendered as non-callable while the registry exposed
+/// them, and target-less `builtin`/`mcp` tools rendered callable while it did not.
+fn skill_tool_is_prompt_callable(tool: &SkillTool) -> bool {
+    if !is_registered_skill_tool_kind(tool.kind.as_str()) {
+        return false;
+    }
+    match tool.kind.as_str() {
+        "builtin" | "mcp" => tool.target.as_deref().is_some_and(|t| !t.trim().is_empty()),
+        _ => true,
+    }
+}
+
 /// Build the "Available Skills" system prompt section with configurable verbosity.
 pub fn skills_to_prompt_with_mode(
     skills: &[Skill],
@@ -1745,18 +1777,21 @@ pub fn skills_to_prompt_with_mode(
         }
 
         if !skill.tools.is_empty() {
-            // Tools with known kinds (shell, script, http) are registered as
-            // callable tool specs and can be invoked directly via function calling.
-            // We note them here for context but mark them as callable.
+            // Callable (registered as a callable tool spec, invocable directly via
+            // function calling) vs prompt-only is decided by
+            // `skill_tool_is_prompt_callable`, which mirrors what the registry
+            // converter actually registers: shell/script/http always, builtin/mcp
+            // only when they name a target to elevate to. This keeps the prompt
+            // from advertising `skill__tool` names the converter skipped.
             let registered: Vec<_> = skill
                 .tools
                 .iter()
-                .filter(|t| matches!(t.kind.as_str(), "shell" | "script" | "http" | "builtin"))
+                .filter(|t| skill_tool_is_prompt_callable(t))
                 .collect();
             let unregistered: Vec<_> = skill
                 .tools
                 .iter()
-                .filter(|t| !matches!(t.kind.as_str(), "shell" | "script" | "http" | "builtin"))
+                .filter(|t| !skill_tool_is_prompt_callable(t))
                 .collect();
 
             if !registered.is_empty() {
@@ -1893,6 +1928,18 @@ pub fn skills_to_tools_with_context_and_runtime(
     let mut tools: Vec<Box<dyn zeroclaw_api::tool::Tool>> = Vec::new();
     for skill in skills {
         for tool in &skill.tools {
+            if !is_registered_skill_tool_kind(tool.kind.as_str()) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "Unknown skill tool kind '{}' for {}.{}, skipping",
+                        tool.kind, skill.name, tool.name
+                    )
+                );
+                continue;
+            }
             match tool.kind.as_str() {
                 "shell" | "script" => {
                     let inner = crate::skills::skill_tool::SkillShellTool::new_with_runtime(
@@ -1926,17 +1973,9 @@ pub fn skills_to_tools_with_context_and_runtime(
                         tools.push(t);
                     }
                 }
-                other => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        &format!(
-                            "Unknown skill tool kind '{}' for {}.{}, skipping",
-                            other, skill.name, tool.name
-                        )
-                    );
-                }
+                // `is_registered_skill_tool_kind` above admits only the kinds
+                // dispatched here, so any other kind was already skipped.
+                other => unreachable!("registered skill kind '{other}' not dispatched"),
             }
         }
     }
@@ -4231,6 +4270,143 @@ mod prompt_callable_name_tests {
         assert!(
             !prompt.contains("pr-review-toolkit:code-reviewer__run.lint"),
             "prompt advertised the raw, unsanitized composed name:\n{prompt}",
+        );
+    }
+
+    fn tool_with_target(name: &str, kind: &str, target: &str) -> SkillTool {
+        SkillTool {
+            target: Some(target.to_string()),
+            ..tool(name, kind)
+        }
+    }
+
+    #[test]
+    fn prompt_callable_predicate_matches_registration_preconditions() {
+        // shell/script/http always register -> always prompt-callable.
+        assert!(skill_tool_is_prompt_callable(&tool("run", "shell")));
+        assert!(skill_tool_is_prompt_callable(&tool("run", "script")));
+        assert!(skill_tool_is_prompt_callable(&tool("fetch", "http")));
+        // builtin/mcp are elevation wrappers: callable only WITH a target.
+        assert!(skill_tool_is_prompt_callable(&tool_with_target(
+            "gen",
+            "mcp",
+            "images__generate"
+        )));
+        assert!(skill_tool_is_prompt_callable(&tool_with_target(
+            "sh", "builtin", "shell"
+        )));
+        // ... and NOT callable without one (the converter's resolve_elevated_tool
+        // would return None, so advertising them callable lies to the model).
+        assert!(!skill_tool_is_prompt_callable(&tool("gen", "mcp")));
+        assert!(!skill_tool_is_prompt_callable(&tool("sh", "builtin")));
+        // A whitespace-only target is as good as absent.
+        assert!(!skill_tool_is_prompt_callable(&tool_with_target(
+            "gen", "mcp", "   "
+        )));
+        // unknown kinds are never callable.
+        assert!(!skill_tool_is_prompt_callable(&tool("x", "weird")));
+    }
+
+    #[test]
+    fn converter_skips_targetless_elevation_matching_the_prompt_predicate() {
+        // The end-to-end invariant the renderer relies on: the registry converter
+        // registers exactly the tools `skill_tool_is_prompt_callable` marks callable
+        // (for what is statically decidable). A target-less builtin/mcp elevation
+        // tool is skipped by the converter, so it must not be advertised callable.
+        let security = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+        let skill = Skill {
+            name: "ops".to_string(),
+            description: "d".to_string(),
+            description_localizations: Default::default(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![
+                tool("run", "shell"),  // always registers
+                tool("orphan", "mcp"), // no target -> skipped
+                tool("sh", "builtin"), // no target -> skipped
+            ],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            location: None,
+        };
+
+        let registered: Vec<String> =
+            crate::skills::skills_to_tools(std::slice::from_ref(&skill), security)
+                .iter()
+                .map(|t| t.name().to_string())
+                .collect();
+
+        // shell registers; the target-less elevation tools do not - matching the
+        // prompt predicate for each.
+        for t in &skill.tools {
+            let composed = crate::tools::skill_tool::composed_tool_name(&skill.name, &t.name);
+            let in_registry = registered.iter().any(|n| n == &composed);
+            assert_eq!(
+                in_registry,
+                skill_tool_is_prompt_callable(t),
+                "prompt-callable and registry-registered must agree for {} ({}): registry={in_registry}",
+                t.name,
+                t.kind,
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_lists_mcp_with_target_as_callable_and_targetless_as_not() {
+        let skill = Skill {
+            name: "imagegen".to_string(),
+            description: "d".to_string(),
+            description_localizations: Default::default(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![
+                tool_with_target("generate", "mcp", "images__generate"),
+                tool("orphan", "mcp"), // no target -> not registered
+            ],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            location: None,
+        };
+
+        let prompt = skills_to_prompt_with_mode(
+            std::slice::from_ref(&skill),
+            Path::new("/tmp"),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        );
+
+        // The callable block comes first, the unregistered <tools> block after.
+        let callable_idx = prompt
+            .find("<callable_tools")
+            .expect("callable_tools block");
+        let tools_at = prompt
+            .find("<tools>")
+            .expect("unregistered <tools> block present for the target-less mcp tool");
+        assert!(
+            callable_idx < tools_at,
+            "callable block precedes unregistered block"
+        );
+
+        // The targeted mcp tool is advertised as callable (composed name, under
+        // <callable_tools>, before the unregistered block).
+        let callable = crate::tools::skill_tool::composed_tool_name(&skill.name, "generate");
+        let callable_at = prompt
+            .find(&format!("<name>{callable}</name>"))
+            .expect("targeted mcp skill tool must be present as a callable name");
+        assert!(
+            callable_at > callable_idx && callable_at < tools_at,
+            "targeted mcp skill tool must render under <callable_tools>:\n{prompt}"
+        );
+
+        // The target-less mcp tool renders under the unregistered <tools> block
+        // (raw name, after the callable block) - the converter would skip it.
+        let orphan_at = prompt
+            .find("<name>orphan</name>")
+            .expect("target-less mcp skill tool must be present under <tools>");
+        assert!(
+            orphan_at > tools_at,
+            "target-less mcp skill tool must render as unregistered, not callable:\n{prompt}"
         );
     }
 }
