@@ -158,7 +158,10 @@ enum NativeContentOut {
 struct NativeToolSpec {
     name: String,
     description: String,
-    input_schema: serde_json::Value,
+    /// `Arc`-shared with the tool registry's stored schema when no cleaning
+    /// is required — serialized transparently, deep-cloned only for schemas
+    /// the Anthropic cleaner actually rewrites (#8642).
+    input_schema: std::sync::Arc<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
 }
@@ -362,8 +365,9 @@ impl AnthropicModelProvider {
             .map(|tool| NativeToolSpec {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
-                input_schema: zeroclaw_api::schema::SchemaCleanr::clean_for_anthropic(
-                    tool.parameters.clone(),
+                input_schema: zeroclaw_api::schema::SchemaCleanr::clean_shared(
+                    &tool.parameters,
+                    zeroclaw_api::schema::CleaningStrategy::Anthropic,
                 ),
                 cache_control: None,
             })
@@ -2423,7 +2427,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let tool = NativeToolSpec {
             name: "get_weather".to_string(),
             description: "Get weather info".to_string(),
-            input_schema: schema,
+            input_schema: schema.into(),
             cache_control: None,
         };
         let json = serde_json::to_string(&tool).unwrap();
@@ -2437,7 +2441,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let tool = NativeToolSpec {
             name: "get_weather".to_string(),
             description: "Get weather info".to_string(),
-            input_schema: schema,
+            input_schema: schema.into(),
             cache_control: Some(CacheControl::ephemeral()),
         };
         let json = serde_json::to_string(&tool).unwrap();

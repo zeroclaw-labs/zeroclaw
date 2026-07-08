@@ -365,6 +365,21 @@ pub fn register_skill_tools_with_context_and_runtime(
     }
 
     let before = tools_registry.len();
+    // Keep the policy after `security` is moved into skill-tool construction: skill tools
+    // must honor the `excluded_tools` denylist, like every other tool. The built-in filter
+    // (`apply_policy_tool_filter`) runs before skill registration, so without this check a
+    // skill-defined tool bypasses the policy entirely - the same class of gap #6959 fixed
+    // for eager built-ins, never applied to skill tools, so `excluded_tools` silently
+    // failed to subtract a skill tool. This is the single skill-registration chokepoint
+    // (assemble, from_config, the channel orchestrator, and direct callers all funnel
+    // here), so gating once here closes it on every construction path.
+    //
+    // Denylist only, NOT the `allowed_tools` allowlist: skill tools are granted explicitly
+    // via skill config, and `builtin`-kind skill tools are scoped-elevation wrappers meant
+    // to stay callable when the raw tool is off the allowlist (see
+    // `SecurityPolicy::is_tool_excluded`). Applying the allowlist would defeat that; the
+    // denylist still removes any skill tool named in `excluded_tools`.
+    let policy = Arc::clone(&security);
     let skill_tools = crate::skills::skills_to_tools_with_context_and_runtime(
         skills,
         security,
@@ -383,6 +398,15 @@ pub fn register_skill_tools_with_context_and_runtime(
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                 &format!(
                     "Skill tool '{}' shadows built-in tool, skipping",
+                    tool.name()
+                )
+            );
+        } else if policy.is_tool_excluded(tool.name()) {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "Skill tool '{}' denied by excluded_tools, skipping",
                     tool.name()
                 )
             );
@@ -780,7 +804,7 @@ pub fn all_tools_with_runtime(
     }
 
     if matches!(
-        root_config.skills.prompt_injection_mode,
+        root_config.effective_skills_prompt_mode(agent_alias),
         zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
     ) {
         // ReadSkillTool now holds full config to support all skill sources:
@@ -2652,6 +2676,129 @@ mod tests {
         assert!(
             !subagent.iter().any(|n| n == ModelSwitchTool::NAME),
             "subagent must not be able to switch the inherited model"
+        );
+    }
+
+    #[test]
+    fn all_tools_registers_read_skill_for_compact_agent_override_over_global_full() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        // Global stays Full; a runtime profile flips this agent to Compact and
+        // the agent selects it via `runtime_profile`.
+        cfg.skills.prompt_injection_mode = zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+        cfg.runtime_profiles.insert(
+            "compact_profile".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                prompt_injection_mode: Some(
+                    zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
+                ),
+                ..Default::default()
+            },
+        );
+        cfg.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: "compact_profile".into(),
+                ..Default::default()
+            },
+        );
+
+        let tools = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            names.contains(&"read_skill"),
+            "compact runtime-profile override should register read_skill even when global is full"
+        );
+    }
+
+    #[test]
+    fn all_tools_omits_read_skill_for_full_agent_override_over_global_compact() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        // Global is Compact; a runtime profile pins this agent to Full and the
+        // agent selects it via `runtime_profile`.
+        cfg.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
+        cfg.runtime_profiles.insert(
+            "full_profile".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                prompt_injection_mode: Some(
+                    zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+                ),
+                ..Default::default()
+            },
+        );
+        cfg.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: "full_profile".into(),
+                ..Default::default()
+            },
+        );
+
+        let tools = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            !names.contains(&"read_skill"),
+            "full runtime-profile override should omit read_skill even when global is compact"
         );
     }
 }

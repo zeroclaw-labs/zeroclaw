@@ -437,6 +437,39 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         preflight_history_maintenance(history);
 
         if iteration == 0 && context_token_budget > 0 {
+            // The system prompt + inlined tool definitions form an irreducible
+            // floor whole-turn trimming can never drop. When that floor alone
+            // meets or exceeds the budget, trimming conversation history can
+            // never bring the request under budget — surface the actionable
+            // root cause once per turn (this block is gated on iteration == 0)
+            // so the misconfiguration is not silent (#5808). Whole-turn
+            // trimming below still runs and is harmless (it keeps the most
+            // recent turn); the model call / reactive recovery proceeds.
+            let system_floor = crate::agent::history::estimate_system_floor_tokens(history);
+            if system_floor >= context_token_budget {
+                let __zc_floor_span = ::zeroclaw_log::info_span!(
+                    target: "zeroclaw_log_internal_scope",
+                    "zeroclaw_scope",
+                    model = %model,
+                    model_provider = %provider_name,
+                );
+                let _zc_floor_guard = __zc_floor_span.entered();
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "system_floor": system_floor,
+                            "budget": context_token_budget,
+                            "error_key": "context_floor_exceeds_budget",
+                        })),
+                    crate::agent::history::context_floor_remediation(
+                        system_floor,
+                        context_token_budget,
+                    )
+                );
+            }
             let taken = std::mem::take(history);
             let result =
                 crate::agent::history_trim::trim_to_recent_turns(taken, context_token_budget);
@@ -679,6 +712,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     iteration,
                     event_tx.as_ref(),
                     observer,
+                    context_token_budget,
                 )
                 .await;
                 if recovered {

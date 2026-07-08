@@ -203,6 +203,15 @@ pub struct RpcInboundRequest {
     pub params: Value,
 }
 
+/// Buffer capacity for the server-initiated inbound-request broadcast.
+///
+/// These frames are response-bearing (today: `elicitation/create`): a dropped
+/// one parks the daemon's tool call until the session timeout. The buffer is
+/// sized generously so a busy TUI draw loop does not lag the receiver and lose
+/// an elicitation. The Chat pane additionally surfaces a `Lagged` overflow so
+/// the rare drop is diagnosable rather than a silent hang.
+pub const INBOUND_REQUEST_CHANNEL_CAPACITY: usize = 1024;
+
 // ── Typed session updates ────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -534,7 +543,8 @@ impl RpcClient {
         let rpc = Arc::new(RpcOutbound::new(writer_tx));
         let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
         let notif_tx_for_reader = notif_tx.clone();
-        let (inbound_tx, _) = broadcast::channel::<RpcInboundRequest>(64);
+        let (inbound_tx, _) =
+            broadcast::channel::<RpcInboundRequest>(INBOUND_REQUEST_CHANNEL_CAPACITY);
         let inbound_tx_for_reader = inbound_tx.clone();
 
         let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
@@ -679,7 +689,8 @@ impl RpcClient {
         let rpc = Arc::new(jsonrpc::RpcOutbound::new(writer_tx));
         let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
         let notif_tx_for_reader = notif_tx.clone();
-        let (inbound_tx, _) = broadcast::channel::<RpcInboundRequest>(64);
+        let (inbound_tx, _) =
+            broadcast::channel::<RpcInboundRequest>(INBOUND_REQUEST_CHANNEL_CAPACITY);
         let inbound_tx_for_reader = inbound_tx.clone();
 
         let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));

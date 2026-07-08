@@ -1,3 +1,4 @@
+mod config_patch_cli;
 mod config_persistence;
 mod config_schema;
 mod dockerignore_test;

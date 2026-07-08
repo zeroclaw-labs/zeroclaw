@@ -137,7 +137,8 @@ tokio-socks = "0.5"
 #
 # Commit history:
 # - 9734fb2: MSRV fix for `if let` guard (wacore/src/history_sync.rs:93)
-#            stable only on Rust 1.94+; ZeroClaw CI pins 1.93.0.
+#            stable only on Rust 1.94+; ZeroClaw MSRV is 1.96.1 so this is
+#            well within the supported baseline.
 #            Fixes the post-2026-04-24 WhatsApp Web protocol break (#6246).
 # - cbcdd2a: PR #636 fix for LID namespace conversion. Fixes ACK 400
 #            "server requires all participants to share the same JID
