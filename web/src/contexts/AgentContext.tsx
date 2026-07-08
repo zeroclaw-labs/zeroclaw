@@ -69,6 +69,9 @@ interface AgentContextValue {
    */
   pendingApproval: PendingApproval | null;
   respondToApproval: (decision: ApprovalDecision) => void;
+  // Context window tracking (from "done" WS frames). See #7311.
+  contextMaxTokens: number | null;
+  contextInputTokens: number | null;
 }
 
 const AgentContext = createContext<AgentContextValue | null>(null);
@@ -120,6 +123,9 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const [modelLoading, setModelLoading] = useState(false);
   const [modelInfoVersion, setModelInfoVersion] = useState(0);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
+  // Context window tracking (from "done" WS frames). See #7311.
+  const [contextMaxTokens, setContextMaxTokens] = useState<number | null>(null);
+  const [contextInputTokens, setContextInputTokens] = useState<number | null>(null);
 
   const wsRef = useRef<WebSocketClient | null>(null);
   const pendingContentRef = useRef('');
@@ -251,6 +257,19 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
               timestamp: new Date(),
             },
           ]);
+        }
+        // Extract context window info from "done" frame (sent by gateway). See #7311.
+        if (msg.type === 'done') {
+          if (typeof msg.max_context_tokens === 'number') {
+            setContextMaxTokens(msg.max_context_tokens);
+          }
+          // Prefer last_input_tokens (accurate per-turn prompt size) over
+          // accumulated input_tokens for context-bar rendering.
+          if (typeof msg.last_input_tokens === 'number') {
+            setContextInputTokens(msg.last_input_tokens);
+          } else if (typeof msg.input_tokens === 'number') {
+            setContextInputTokens(msg.input_tokens);
+          }
         }
         pendingContentRef.current = '';
         pendingThinkingRef.current = '';
@@ -814,6 +833,9 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     },
     pendingApproval,
     respondToApproval,
+    // Context window tracking (from "done" WS frames). See #7311.
+    contextMaxTokens,
+    contextInputTokens,
   };
 
   return <AgentContext.Provider value={value}>{children}</AgentContext.Provider>;

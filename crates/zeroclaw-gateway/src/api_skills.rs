@@ -12,20 +12,28 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use zeroclaw_runtime::rpc::types::{
     AgentSkillEntry, AgentSkillsResult, DroppedSkillEntry, ShadowedSkillEntry, SkillBundleEntry,
     SkillListEntry, SkillsBundlesResult, SkillsListResult, SkillsReadResult,
 };
 use zeroclaw_runtime::skills::{
     DroppedSkill, EffectiveSkill, RemoveMode, ScaffoldOptions, ServiceError, SkillDropReason,
-    SkillFrontmatter, SkillOrigin, SkillsService,
+    SkillFrontmatter, SkillOrigin, SkillsService, SlashOptionKindDescriptor,
 };
 
 use super::AppState;
 use super::api::require_auth;
 
 // ── HTTP-specific request shapes (not shared) ───────────────────────
+
+/// Response for `GET /api/skills/slash-option-kinds`: the canonical registry,
+/// built by walking `SlashOptionKind::ALL`.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct SlashOptionKindsResult {
+    pub kinds: Vec<SlashOptionKindDescriptor>,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SkillCreateBody {
@@ -57,6 +65,22 @@ pub struct DeleteQuery {
 }
 
 // ── Handlers ────────────────────────────────────────────────────────
+
+/// `GET /api/skills/slash-option-kinds` — the canonical typed-slash-option kind
+/// registry (kind list + per-kind constraint capabilities), built by walking
+/// `SlashOptionKind::ALL`. Surfaces read this instead of restating the kind set.
+pub async fn handle_slash_option_kinds(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    Json(SlashOptionKindsResult {
+        kinds: zeroclaw_runtime::skills::slash_option_kinds(),
+    })
+    .into_response()
+}
 
 /// `GET /api/skills/bundles`
 pub async fn handle_list_bundles(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -175,16 +199,20 @@ fn agent_skill_entry(s: EffectiveSkill) -> AgentSkillEntry {
 /// [`SkillDropReason`] enum into a `(reason_kind, reason)` string pair the
 /// dashboard can group on without knowing the Rust enum. (#7963)
 fn dropped_skill_entry(d: DroppedSkill) -> DroppedSkillEntry {
-    let (reason_kind, reason) = match d.reason {
-        SkillDropReason::AuditFindings(s) => ("audit_findings", s),
-        SkillDropReason::AuditError(s) => ("audit_error", s),
-        SkillDropReason::ManifestParseError(s) => ("manifest_parse_error", s),
+    let (reason_kind, reason, scripts_blocked) = match d.reason {
+        SkillDropReason::AuditFindings {
+            summary,
+            scripts_blocked,
+        } => ("audit_findings", summary, scripts_blocked),
+        SkillDropReason::AuditError(s) => ("audit_error", s, false),
+        SkillDropReason::ManifestParseError(s) => ("manifest_parse_error", s, false),
     };
     DroppedSkillEntry {
         name: d.name,
         origin: d.origin_hint,
         reason_kind: reason_kind.to_string(),
         reason,
+        scripts_blocked,
         directory: d.location.map(|p| p.display().to_string()),
     }
 }
@@ -383,8 +411,20 @@ mod tests {
             location: Some(PathBuf::from("/x/n")),
         };
         assert_eq!(
-            dropped_skill_entry(mk(SkillDropReason::AuditFindings("a".into()))).reason_kind,
+            dropped_skill_entry(mk(SkillDropReason::AuditFindings {
+                summary: "a".into(),
+                scripts_blocked: true,
+            }))
+            .reason_kind,
             "audit_findings"
+        );
+        assert!(
+            dropped_skill_entry(mk(SkillDropReason::AuditFindings {
+                summary: "a".into(),
+                scripts_blocked: true,
+            }))
+            .scripts_blocked,
+            "scripts_blocked flag must pass through to the wire entry"
         );
         assert_eq!(
             dropped_skill_entry(mk(SkillDropReason::AuditError("b".into()))).reason_kind,

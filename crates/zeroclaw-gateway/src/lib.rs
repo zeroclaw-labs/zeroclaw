@@ -146,9 +146,6 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 use zeroclaw_providers::{self, ModelProvider};
-use zeroclaw_runtime::agent::loop_::{
-    eager_mcp_tool_allowed, mcp_tool_access_policy, register_eager_mcp_tool_if_allowed,
-};
 use zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy;
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::i18n;
@@ -156,6 +153,7 @@ use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
 use zeroclaw_runtime::tools;
 use zeroclaw_runtime::tools::CanvasStore;
+use zeroclaw_runtime::tools::scoped;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -463,135 +461,6 @@ fn default_agent_alias(config: &Config) -> Option<String> {
         .filter(|(_, a)| a.enabled)
         .map(|(alias, _)| alias.clone())
         .min()
-}
-
-/// Connect the MCP servers granted to `agent_alias` by its `mcp_bundles` and
-/// append the resulting tools to `gw_tools`, gated by the agent's tool-access
-/// policy. Shared by the dashboard-agent seed and the per-agent
-/// `/api/tools` registry builder so both surfaces scope MCP identically
-/// (omission is not a grant; deny wins). A no-op when MCP is disabled or the
-/// agent's bundles grant no servers, and non-fatal on connect failure so the
-/// gateway still boots.
-async fn append_scoped_mcp_tools(
-    config: &Config,
-    agent_alias: &str,
-    security: &Arc<SecurityPolicy>,
-    gw_tools: &mut Vec<Box<dyn tools::Tool>>,
-    gw_delegate: Option<&tools::DelegateParentToolsHandle>,
-) {
-    let agent_mcp_servers = if config.mcp.enabled {
-        config.mcp_servers_for_agent(agent_alias)
-    } else {
-        Vec::new()
-    };
-    if agent_mcp_servers.is_empty() {
-        return;
-    }
-    use ::zeroclaw_log::Instrument;
-    let mcp_policy = mcp_tool_access_policy(security, None);
-    let mcp_model_provider = config
-        .agents
-        .get(agent_alias)
-        .map(|a| a.model_provider.as_str().to_string())
-        .unwrap_or_default();
-    let mcp_model = config
-        .model_provider_for_agent(agent_alias)
-        .and_then(|p| p.model.clone())
-        .unwrap_or_default();
-    let attribution_span =
-        ::zeroclaw_log::attribution_span!(&zeroclaw_runtime::agent::AgentAttribution(agent_alias));
-    ::zeroclaw_log::scope!(
-        model_provider: mcp_model_provider,
-        model: mcp_model,
-        =>
-        async {
-            match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
-                Ok(registry) => {
-                    let registry = std::sync::Arc::new(registry);
-                    if config.mcp.deferred_loading {
-                        let deferred_set = tools::DeferredMcpToolSet::from_registry(
-                            std::sync::Arc::clone(&registry),
-                        )
-                        .await;
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
-                            &format!(
-                                "Gateway MCP deferred_loading: {} tool stub(s) from {} server(s)",
-                                deferred_set.len(),
-                                registry.server_count()
-                            )
-                        );
-                        let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                            tools::ActivatedToolSet::new(),
-                        ));
-                        let mut tool_search =
-                            tools::ToolSearchTool::new(deferred_set, activated);
-                        if let Some(policy) = mcp_policy {
-                            tool_search = tool_search.with_access_policy(policy);
-                        }
-                        gw_tools.push(Box::new(tool_search));
-                    } else {
-                        let names = registry.tool_names();
-                        let mut registered = 0usize;
-                        let mut skipped = 0usize;
-                        for name in names {
-                            if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
-                                skipped += 1;
-                                continue;
-                            }
-                            if let Some(def) = registry.get_tool_def(&name).await {
-                                let wrapper: std::sync::Arc<dyn tools::Tool> =
-                                    std::sync::Arc::new(tools::McpToolWrapper::new(
-                                        name,
-                                        def,
-                                        std::sync::Arc::clone(&registry),
-                                    ));
-                                if register_eager_mcp_tool_if_allowed(
-                                    wrapper,
-                                    gw_tools,
-                                    gw_delegate,
-                                    mcp_policy.as_ref(),
-                                ) {
-                                    registered += 1;
-                                }
-                            }
-                        }
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"skipped": skipped})),
-                            &format!(
-                                "Gateway MCP: {} tool(s) registered from {} server(s)",
-                                registered,
-                                registry.server_count()
-                            )
-                        );
-                    }
-                }
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(
-                            module_path!(),
-                            ::zeroclaw_log::Action::Fail
-                        )
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "Gateway MCP registry failed to initialize"
-                    );
-                }
-            }
-        }
-    )
-    .instrument(attribution_span)
-    .await;
 }
 
 /// Shared state for all axum handlers
@@ -1011,20 +880,47 @@ pub async fn run_gateway(
                 None,
                 sop_engine.clone(),
                 sop_audit.clone(),
+                None,
             );
+            // Mint the registry through the gated seam: the built-in
+            // allow/deny filter and MCP scope+gate (omission is not a grant)
+            // run inside `assemble`, shared with every other path routed
+            // through it. The gateway previously applied only the MCP step,
+            // so its /api/tools listings showed unfiltered built-ins the
+            // agent's policy denies.
+            let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+                config: &config,
+                agent_alias,
+                security: &security,
+                built: all_tools_result,
+                // The gateway registers no skills today; unifying the two
+                // skill loaders through this seam is the Epic F follow-up.
+                skills: &[],
+                runtime: Arc::clone(&runtime),
+                caller_allowed: None,
+                connect_mcp: true,
+                // Listing-only registry: loading peripherals physically opens
+                // hardware (exclusive serial holds) that the live turn paths
+                // need. Never connect them for a registry no turn runs against.
+                connect_peripherals: false,
+                emit_assembly_logs: false,
+                exclude_memory: false,
+                list_deferred_mcp_specs: true,
+            })
+            .await;
             // Wire channel-driven tool handles so the dashboard agent can
             // deliver messages to configured channels (same pattern as
             // orchestrator::start_channels).
-            // reaction_handle_gw is PerToolChannelHandle (not Option);
+            // reaction_handle is PerToolChannelHandle (not Option);
             // register_channels_for_tools expects &Option for all handles.
-            let reaction_handle_gw_opt = Some(all_tools_result.reaction_handle.clone());
+            let reaction_handle_gw_opt = Some(assembled.reaction_handle.clone());
             let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
                 &config,
-                &all_tools_result.ask_user_handle,
-                &all_tools_result.channel_room_handle,
+                &assembled.ask_user_handle,
+                &assembled.channel_room_handle,
                 &reaction_handle_gw_opt,
-                &all_tools_result.poll_handle,
-                &all_tools_result.escalate_handle,
+                &assembled.poll_handle,
+                &assembled.escalate_handle,
             );
             if !channel_names.is_empty() {
                 ::zeroclaw_log::record!(
@@ -1037,22 +933,11 @@ pub async fn run_gateway(
                     ),
                 );
             }
-            let mut gw_tools = all_tools_result.tools;
-            let gw_delegate = all_tools_result.delegate_handle;
-            // MCP tools, scoped to this agent's `mcp_bundles` and gated by its
-            // tool policy (parity with the orchestrator + runtime paths;
-            // omission is not a grant). Factored into `append_scoped_mcp_tools`
-            // so the per-agent registry below scopes MCP identically; a gateway
-            // with no resolved agent gets no MCP servers.
-            append_scoped_mcp_tools(
-                &config,
-                agent_alias,
-                &security,
-                &mut gw_tools,
-                gw_delegate.as_ref(),
-            )
-            .await;
-            (gw_tools, gw_delegate)
+            // Listing-only registry: no turn runs against it, so the
+            // deferred-MCP prompt section and activation handle returned by
+            // `assemble` have no consumer here (live gateway chat resolves
+            // its tools inside process_message).
+            (assembled.registry.into_inner(), assembled.delegate_handle)
         }
         (Some(_), None) => {
             // Agent existed but its config failed to resolve. Warned
@@ -1145,18 +1030,33 @@ pub async fn run_gateway(
             None,
             sop_engine.clone(),
             sop_audit.clone(),
+            None,
         );
-        let mut agent_tools = agent_tools_result.tools;
-        let agent_delegate = agent_tools_result.delegate_handle;
-        append_scoped_mcp_tools(
-            &config,
-            &alias,
-            &security,
-            &mut agent_tools,
-            agent_delegate.as_ref(),
-        )
+        // Same gated seam as the dashboard seed above, so this listing shows
+        // the agent's policy-filtered set (filter + MCP). The tools are only
+        // enumerated for their specs, never invoked, so the returned channel
+        // handles, deferred section, and activation handle are unused.
+        let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+            config: &config,
+            agent_alias: &alias,
+            security: &security,
+            built: agent_tools_result,
+            // Same divergence note as the dashboard seed: no skills on the
+            // gateway until Epic F unifies the loaders.
+            skills: &[],
+            runtime: Arc::clone(&runtime),
+            caller_allowed: None,
+            connect_mcp: true,
+            // Same as the seed: never open hardware for a listing (and
+            // `config.peripherals` is global - N per-agent opens of the same
+            // boards would fail against the first holder anyway).
+            connect_peripherals: false,
+            emit_assembly_logs: false,
+            exclude_memory: false,
+            list_deferred_mcp_specs: true,
+        })
         .await;
-        let specs: Vec<ToolSpec> = agent_tools.iter().map(|t| t.spec()).collect();
+        let specs: Vec<ToolSpec> = assembled.registry.iter().map(|t| t.spec()).collect();
         tools_registry_by_agent.insert(alias, Arc::new(specs));
     }
     let tools_registry_by_agent: Arc<HashMap<String, Arc<Vec<ToolSpec>>>> =
@@ -1164,6 +1064,12 @@ pub async fn run_gateway(
 
     // Cost tracker — process-global singleton so channels share the same instance
     let cost_tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir);
+
+    // Live model-pricing refresher (once per process; idempotent, no-op unless a
+    // provider sets `live_pricing = true`). Each call re-binds the refresher's
+    // config handle, so reloads that re-instantiate the config Arc are honored
+    // without a restart; shares the global price snapshot the cost path reads.
+    zeroclaw_providers::pricing::spawn_refresher(config_state.clone());
 
     // SSE broadcast channel for real-time events.
     // Use an externally provided sender (e.g. from the daemon) so that other
@@ -1561,7 +1467,14 @@ pub async fn run_gateway(
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
     }
-    println!("  🌐 Web Dashboard: http://{display_addr}{pfx}/");
+    if web_dist_dir.is_some() {
+        println!("  🌐 Web Dashboard: http://{display_addr}{pfx}/");
+    } else {
+        println!(
+            "  ⚠️  Web Dashboard: not available — reinstall with the supported installer \
+             (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to build it"
+        );
+    }
     if let Some(code) = pairing.pairing_code() {
         println!();
         println!("  🔐 PAIRING REQUIRED — use this one-time code:");
@@ -1811,6 +1724,10 @@ pub async fn run_gateway(
             post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
         )
         .route("/api/config/rename-map-key", post(api_config::handle_rename_map_key))
+        .route(
+            "/api/config/model-providers/{type}/{alias}/refresh-context-window",
+            post(api_config::handle_refresh_context_window),
+        )
         .route("/api/config/delete-plan", get(api_config::handle_delete_plan))
         .route("/api/config/catalog", get(api_sections::handle_catalog))
         .route(
@@ -1888,6 +1805,10 @@ pub async fn run_gateway(
             get(api_skills::handle_agent_skills),
         )
         .route("/api/skills/bundles", get(api_skills::handle_list_bundles))
+        .route(
+            "/api/skills/slash-option-kinds",
+            get(api_skills::handle_slash_option_kinds),
+        )
         .route(
             "/api/skills/bundles/{alias}/skills",
             get(api_skills::handle_list_skills).post(api_skills::handle_create_skill),
@@ -1970,7 +1891,9 @@ pub async fn run_gateway(
         );
 
     #[cfg(feature = "a2a")]
-    let inner = inner.merge(a2a::a2a_routes());
+    let inner = inner.merge(a2a::a2a_routes_with_endpoint(Some(
+        a2a::AdvertisedGatewayEndpoint::new(host, actual_port),
+    )));
 
     // ── WebAuthn hardware key authentication API (requires webauthn feature) ──
     #[cfg(feature = "webauthn")]
@@ -2335,6 +2258,18 @@ async fn handle_pair(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 "new client paired successfully"
             );
+            // `try_pair` is not just validation: by the time we land
+            // here, the pairing code is consumed and the token's
+            // SHA-256 hash is already in `PairingGuard::paired_tokens`.
+            // Every step below MUST succeed atomically — if any of them
+            // fails, we MUST roll back via `revoke_token_hash` and
+            // return 500 WITHOUT the token in the body. The previous
+            // version of this code returned the plaintext token in the
+            // 500 body, so the caller received a bearer that
+            // authenticated until restart even though there was no
+            // device row and no persisted token record. That preserves
+            // the management gap this whole PR is trying to close.
+            let token_hash = PairingGuard::token_hash(&token);
             // Register the device so a token paired via the legacy `/pair`
             // route is listable and revocable from the management UI, exactly
             // like `/api/pair` (`submit_pairing_enhanced`). Without this the
@@ -2342,8 +2277,8 @@ async fn handle_pair(
             // see nor revoke it. The token itself is owned by `PairingGuard`
             // and persisted below; this row is metadata keyed by its hash.
             if let Some(ref registry) = state.device_registry {
-                registry.register(
-                    PairingGuard::token_hash(&token),
+                if let Err(e) = registry.register(
+                    token_hash.clone(),
                     api_pairing::DeviceInfo {
                         id: uuid::Uuid::new_v4().to_string(),
                         name: None,
@@ -2353,7 +2288,32 @@ async fn handle_pair(
                         ip_address: Some(rate_key.clone()),
                         capabilities: None,
                     },
-                );
+                ) {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                        "device registry insert failed after successful legacy /pair; rolling back in-process token"
+                    );
+                    // Compensating action: drop the just-accepted
+                    // hash so the failed pairing leaves no
+                    // authenticate-able state. The pairing code is
+                    // already consumed (one-shot), so the operator
+                    // must call `initiate_pairing` to issue a new
+                    // code. The orphaned registry row, if any, sits
+                    // until the operator removes it via the
+                    // management UI; the next `revoke_all` /
+                    // `reconcile` cycle cleans it up.
+                    state.pairing.revoke_token_hash(&token_hash);
+                    let body = serde_json::json!({
+                        "paired": false,
+                        "persisted": false,
+                        "error": format!("Device registry error: {e}"),
+                        "message": "Pairing failed; the in-process token was not retained.",
+                    });
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(body));
+                }
             }
             if let Err(err) =
                 Box::pin(persist_pairing_tokens(state.config.clone(), &state.pairing)).await
@@ -2363,15 +2323,22 @@ async fn handle_pair(
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                    "pairing succeeded but token persistence failed"
+                    "pairing token persistence failed; rolling back in-process token"
                 );
+                // Same compensating action: persistence failed, so a
+                // restart would resurrect the in-memory token. Drop
+                // it now and do NOT return the plaintext token in the
+                // body — the previous behavior leaked a usable
+                // bearer on a 200, which is the very gap this PR
+                // closes.
+                state.pairing.revoke_token_hash(&token_hash);
                 let body = serde_json::json!({
-                    "paired": true,
+                    "paired": false,
                     "persisted": false,
-                    "token": token,
-                    "message": "Paired for this process, but failed to persist token to config.toml. Check config path and write permissions.",
+                    "error": format!("Token persistence error: {err}"),
+                    "message": "Pairing failed; the in-process token was not retained.",
                 });
-                return (StatusCode::OK, Json(body));
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(body));
             }
 
             let body = serde_json::json!({
@@ -2582,7 +2549,13 @@ pub(crate) async fn run_gateway_chat_with_tools(
             turn_usage.clone(),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
-                zeroclaw_runtime::agent::process_message(config, &agent_alias, message, session_id),
+                zeroclaw_runtime::agent::process_message(
+                    config,
+                    &agent_alias,
+                    message,
+                    session_id,
+                    zeroclaw_api::ingress::TurnOrigin::Interactive,
+                ),
             ),
         ))
         .await?;
@@ -4374,6 +4347,9 @@ mod tests {
     use zeroclaw_api::channel::ChannelMessage;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use zeroclaw_providers::ModelProvider;
+    use zeroclaw_runtime::agent::loop_::{
+        mcp_tool_access_policy, register_eager_mcp_tool_if_allowed,
+    };
 
     #[test]
     fn default_agent_alias_picks_smallest_enabled_and_is_deterministic() {
@@ -4434,82 +4410,6 @@ mod tests {
                 error: None,
             })
         }
-    }
-
-    /// Regression test for #7733 at the gateway MCP wiring site.
-    /// `append_scoped_mcp_tools` must early-return without mutating
-    /// `gw_tools` when the agent has no `mcp_bundles` grant, even if
-    /// `[[mcp.servers]]` is non-empty.
-    ///
-    /// Note: this is a behavior-pinning test, not a mutation-discriminating
-    /// one. The configured stdio server (`/usr/bin/mcp-fs`) is unlikely
-    /// to exist on the test host, so a hypothetical regression that
-    /// reverted to `&config.mcp.servers` would also produce zero
-    /// registered tools (the stdio connect fails non-fatally). The
-    /// stronger guard against that regression is
-    /// `crates/zeroclaw-channels/tests/orchestrator_mcp_scope.rs` plus
-    /// the resolver-level pins in `zeroclaw-config`. This test still
-    /// adds value by exercising the `append_scoped_mcp_tools` call
-    /// surface and ensuring it does not hang or panic for an unscoped
-    /// agent.
-    #[tokio::test]
-    async fn append_scoped_mcp_tools_is_a_noop_for_agent_without_bundles() {
-        use std::sync::Arc;
-        use zeroclaw_config::schema::{
-            AliasedAgentConfig, McpServerConfig, McpTransport, RiskProfileConfig,
-        };
-
-        let mut config = Config::default();
-        config.mcp.enabled = true;
-        config.mcp.servers = vec![McpServerConfig {
-            name: "fs".into(),
-            transport: McpTransport::Stdio,
-            command: "/usr/bin/mcp-fs".into(),
-            ..Default::default()
-        }];
-        // Critically: NO mcp_bundles configured and NO agent grants.
-        config
-            .risk_profiles
-            .insert("test-profile".into(), RiskProfileConfig::default());
-        config.agents.insert(
-            "unscoped".into(),
-            AliasedAgentConfig {
-                enabled: true,
-                model_provider: "openai.test-provider".into(),
-                risk_profile: "test-profile".into(),
-                mcp_bundles: Vec::new(),
-                ..Default::default()
-            },
-        );
-
-        let security: Arc<SecurityPolicy> = Arc::new(SecurityPolicy {
-            workspace_dir: std::env::temp_dir(),
-            ..SecurityPolicy::default()
-        });
-
-        let mut gw_tools: Vec<Box<dyn tools::Tool>> = Vec::new();
-        let initial_len = gw_tools.len();
-
-        // Bound the call with a short timeout: if the no-bundle branch
-        // ever stops being an early-return and tries to spawn an stdio
-        // MCP child, we'd rather see a timeout failure here than a
-        // hanging CI job.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            super::append_scoped_mcp_tools(&config, "unscoped", &security, &mut gw_tools, None),
-        )
-        .await
-        .expect("append_scoped_mcp_tools must not hang for an unscoped agent");
-
-        assert_eq!(
-            gw_tools.len(),
-            initial_len,
-            "append_scoped_mcp_tools must not push any tool when the \
-             agent has no mcp_bundles grant; gw_tools went from {} \
-             to {}",
-            initial_len,
-            gw_tools.len()
-        );
     }
 
     /// Gateway parity with the channel path: the gateway now scopes MCP servers
@@ -4810,18 +4710,23 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        state.device_registry.as_ref().unwrap().register(
-            PairingGuard::token_hash(&token),
-            api_pairing::DeviceInfo {
-                id: device_id.to_string(),
-                name: None,
-                device_type: None,
-                paired_at: chrono::Utc::now(),
-                last_seen: chrono::Utc::now(),
-                ip_address: None,
-                capabilities: None,
-            },
-        );
+        state
+            .device_registry
+            .as_ref()
+            .unwrap()
+            .register(
+                PairingGuard::token_hash(&token),
+                api_pairing::DeviceInfo {
+                    id: device_id.to_string(),
+                    name: None,
+                    device_type: None,
+                    paired_at: chrono::Utc::now(),
+                    last_seen: chrono::Utc::now(),
+                    ip_address: None,
+                    capabilities: None,
+                },
+            )
+            .expect("test device registry insert");
         token
     }
 
@@ -4890,7 +4795,13 @@ mod tests {
             "rotate=all must persist an empty token set"
         );
         assert!(
-            state.device_registry.as_ref().unwrap().list().is_empty(),
+            state
+                .device_registry
+                .as_ref()
+                .unwrap()
+                .list()
+                .expect("test device registry list")
+                .is_empty(),
             "rotate=all must clear the device registry"
         );
     }
@@ -8299,6 +8210,150 @@ mod tests {
         ))
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Regression tests for atomic /pair path (review feedback on #8466).
+    //
+    // `handle_pair` (`/pair`) and `submit_pairing_enhanced` (`/api/pair`)
+    // share the same atomicity invariant: once `try_pair` accepts the
+    // code, every subsequent step (device registry write, token
+    // persistence) MUST succeed atomically. If any step fails, the
+    // handler must roll back the in-process token via
+    // `revoke_token_hash` and return 5xx WITHOUT the plaintext bearer
+    // in the body. Otherwise the calling client receives a usable
+    // bearer token that authenticates until restart even though there
+    // is no device row and no persisted token record — exactly the
+    // management gap the PR is closing.
+    //
+    // The api_pairing.rs side of this guarantee is exercised by
+    // `submit_pairing_enhanced_rolls_back_*`. These two tests cover the
+    // legacy `/pair` path that previously leaked the bearer in its
+    // 500 body.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Build an `AppState` whose device registry points at a non-existent
+    /// path so every SQLite write fails. Mirrors `unwriteable_registry_state`
+    /// in `api_pairing::tests` so the regression set stays side-by-side.
+    fn unwriteable_registry_pair_state(tmp: &tempfile::TempDir) -> AppState {
+        let mut state = admin_paircode_state(tmp, true, false);
+        // No registry from `admin_paircode_state`; inject the broken one.
+        state.device_registry = Some(Arc::new(api_pairing::DeviceRegistry::with_db_path(
+            std::path::PathBuf::from("/this/path/does/not/exist/devices.db"),
+        )));
+        state
+    }
+
+    async fn legacy_pair_response_json(
+        result: impl IntoResponse,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = result.into_response();
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("legacy /pair response body")
+            .to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, body)
+    }
+
+    /// If `registry.register(...)` fails after `try_pair` already
+    /// accepted the code, `handle_pair` must roll back the in-process
+    /// token (no accepted credential left behind) and must NOT return
+    /// the plaintext bearer in the 500 body — the previous behavior
+    /// did, so the calling client received a usable token that
+    /// authenticated until restart.
+    #[tokio::test]
+    async fn legacy_pair_rolls_back_in_process_token_when_registry_register_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = unwriteable_registry_pair_state(&tmp);
+
+        let code = state
+            .pairing
+            .generate_new_pairing_code()
+            .expect("pairing code must be issuable when require_pairing=true");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Pairing-Code", HeaderValue::from_str(&code).unwrap());
+
+        let (status, body) = legacy_pair_response_json(
+            handle_pair(State(state.clone()), test_connect_info(), headers).await,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "legacy /pair registry.register failure must surface as 500"
+        );
+        assert_eq!(body["paired"], serde_json::Value::Bool(false));
+        assert!(
+            body.get("token").is_none(),
+            "legacy /pair 5xx body MUST NOT contain the plaintext bearer token; got: {body}"
+        );
+        assert!(
+            state.pairing.tokens().is_empty(),
+            "PairingGuard::paired_tokens must be empty after a failed /pair \
+             registry.register (compensating `revoke_token_hash`); instead have {:?}",
+            state.pairing.tokens()
+        );
+    }
+
+    /// If token persistence to `config.toml` fails after `try_pair`
+    /// already accepted the code, `handle_pair` must roll back the
+    /// in-process token and return 500 WITHOUT the bearer in the body.
+    /// The previous behavior leaked a usable bearer on a 200, which is
+    /// exactly the gap this whole PR closes.
+    #[tokio::test]
+    async fn legacy_pair_rolls_back_in_process_token_when_persist_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        // No registry → registry branch is skipped, so persistence is the
+        // only failing step.
+        //
+        // Force `save_dirty` → `write_config_atomically` → `create_dir_all`
+        // to fail deterministically by planting an ordinary file at the
+        // parent segment of `config_path`. `create_dir_all` then hits
+        // ENOTDIR at the kernel level, which root cannot bypass — unlike
+        // the previous `/no/such/dir/config.toml` path, where a uid-0 CI
+        // runner is allowed to create `/no/…` from `/` and the save
+        // silently succeeds, letting the whole rollback path go untested
+        // (and leaking a 200 + token if it ever regresses).
+        let blocker = tmp.path().join("legacy-pair-blocker");
+        std::fs::write(&blocker, b"").expect("seed blocker file");
+        state.config.write().config_path = blocker.join("config.toml");
+
+        let code = state
+            .pairing
+            .generate_new_pairing_code()
+            .expect("pairing code must be issuable when require_pairing=true");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Pairing-Code", HeaderValue::from_str(&code).unwrap());
+
+        let (status, body) = legacy_pair_response_json(
+            handle_pair(State(state.clone()), test_connect_info(), headers).await,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "legacy /pair persistence failure MUST surface as 500 (legacy leaked 200 + token)"
+        );
+        assert_eq!(body["paired"], serde_json::Value::Bool(false));
+        assert!(
+            body.get("token").is_none(),
+            "legacy /pair 5xx body MUST NOT contain the plaintext bearer token; got: {body}"
+        );
+        assert!(
+            state.pairing.tokens().is_empty(),
+            "PairingGuard::paired_tokens must be empty after a failed /pair \
+             persist; have {:?}",
+            state.pairing.tokens()
+        );
     }
 }
 

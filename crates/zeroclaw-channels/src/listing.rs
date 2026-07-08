@@ -154,6 +154,11 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-bluesky"),
     },
     ChannelCompileSpec {
+        schema_name: Some("Git"),
+        type_keys: &["git"],
+        compiled: cfg!(feature = "channel-git"),
+    },
+    ChannelCompileSpec {
         schema_name: Some("X/Twitter"),
         type_keys: &["twitter"],
         compiled: cfg!(feature = "channel-twitter"),
@@ -187,6 +192,11 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         schema_name: Some("AMQP"),
         type_keys: &["amqp"],
         compiled: cfg!(feature = "channel-amqp"),
+    },
+    ChannelCompileSpec {
+        schema_name: Some("Filesystem"),
+        type_keys: &["filesystem"],
+        compiled: cfg!(feature = "channel-filesystem"),
     },
     ChannelCompileSpec {
         schema_name: Some("Webhook"),

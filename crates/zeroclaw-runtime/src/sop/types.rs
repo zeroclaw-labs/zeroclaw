@@ -64,35 +64,117 @@ impl fmt::Display for SopExecutionMode {
     }
 }
 
+// ── Filesystem event kind ───────────────────────────────────────
+
+/// A normalized filesystem change kind reported by the watcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum FilesystemEventKind {
+    Created,
+    Modified,
+    Deleted,
+    Renamed,
+}
+
+impl fmt::Display for FilesystemEventKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Created => write!(f, "created"),
+            Self::Modified => write!(f, "modified"),
+            Self::Deleted => write!(f, "deleted"),
+            Self::Renamed => write!(f, "renamed"),
+        }
+    }
+}
+
+impl std::str::FromStr for FilesystemEventKind {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        serde_json::from_value(serde_json::Value::String(s.to_ascii_lowercase())).map_err(|_| ())
+    }
+}
+
 // ── Trigger ─────────────────────────────────────────────────────
 
 /// What event can activate an SOP.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SopTrigger {
+    /// MQTT message arrival. Live: delivered by the MQTT listener.
     Mqtt {
+        /// Topic filter. `+` matches one level, `#` matches the remaining levels.
         topic: String,
+        /// Optional expression evaluated against the message payload; the run
+        /// starts only when it holds.
         #[serde(default)]
         condition: Option<String>,
     },
+    /// Inbound HTTP request. Defined and matched, but no live route feeds it.
     Webhook {
+        /// Request path matched exactly against the event path.
         path: String,
     },
+    /// Time-based firing. Defined and matched, but no scheduler feeds it.
     Cron {
+        /// Cron expression evaluated over the run window.
         expression: String,
     },
+    /// Hardware signal. Defined and matched, but no peripheral listener feeds it.
     Peripheral {
+        /// Board identifier the signal originates from.
         board: String,
+        /// Signal name on the board; matched as `board/signal`.
         signal: String,
+        /// Optional expression evaluated against the signal payload.
         #[serde(default)]
         condition: Option<String>,
     },
+    /// Filesystem change. Live: delivered by the filesystem watcher.
+    Filesystem {
+        /// Path glob (`*`, `**`, `?`); a bare directory matches anything under it.
+        path: String,
+        /// Change kinds to match; empty matches every kind.
+        #[serde(default)]
+        events: Vec<FilesystemEventKind>,
+        /// Optional expression evaluated against the change payload.
+        #[serde(default)]
+        condition: Option<String>,
+    },
+    /// Calendar event state. Defined and matched, but no poller feeds it live.
     Calendar {
+        /// Calendar source identifier the event originates from.
         calendar_source: String,
+        /// Calendar IDs to scope to; empty matches all of the source's calendars.
         #[serde(default)]
         calendar_ids: Vec<String>,
     },
+    /// A channel-sourced fan-in event, produced by a channel that routes forge
+    /// or platform events into SOP ingress (the Git forge channel is the first
+    /// producer). Live: emitted by the channel's event router and consumed by
+    /// the orchestrator's channel-SOP dispatch.
+    Channel {
+        /// Exact channel-SOP topic to match, for example
+        /// `git.<alias>:pull_request.opened`.
+        topic: String,
+        /// Optional expression evaluated against the event payload; when set,
+        /// the SOP only fires if it evaluates truthy.
+        #[serde(default)]
+        condition: Option<String>,
+    },
+    /// Agent-initiated run via the `sop_execute` tool. Not an external fan-in.
     Manual,
+    /// AMQP delivery. Live: delivered by the AMQP consumer in a SOP dispatch mode.
+    Amqp {
+        /// Routing-key filter (topic-exchange semantics): `.`-delimited words,
+        /// `*` matches one word, `#` matches zero or more words.
+        routing_key: String,
+        /// Optional expression evaluated against the delivery body.
+        #[serde(default)]
+        condition: Option<String>,
+    },
 }
 
 impl fmt::Display for SopTrigger {
@@ -102,10 +184,13 @@ impl fmt::Display for SopTrigger {
             Self::Webhook { path } => write!(f, "webhook:{path}"),
             Self::Cron { expression } => write!(f, "cron:{expression}"),
             Self::Peripheral { board, signal, .. } => write!(f, "peripheral:{board}/{signal}"),
+            Self::Filesystem { path, .. } => write!(f, "filesystem:{path}"),
             Self::Calendar {
                 calendar_source, ..
             } => write!(f, "calendar:{calendar_source}"),
+            Self::Channel { topic, .. } => write!(f, "channel:{topic}"),
             Self::Manual => write!(f, "manual"),
+            Self::Amqp { routing_key, .. } => write!(f, "amqp:{routing_key}"),
         }
     }
 }
@@ -121,6 +206,8 @@ pub enum SopStepKind {
     Execute,
     /// Checkpoint step — pauses execution and waits for human approval.
     Checkpoint,
+    /// Deterministic capability step - executed by the SOP capability registry.
+    Capability,
 }
 
 impl fmt::Display for SopStepKind {
@@ -128,6 +215,7 @@ impl fmt::Display for SopStepKind {
         match self {
             Self::Execute => write!(f, "execute"),
             Self::Checkpoint => write!(f, "checkpoint"),
+            Self::Capability => write!(f, "capability"),
         }
     }
 }
@@ -153,8 +241,11 @@ pub struct StepSchema {
 /// A single step in an SOP procedure, parsed from SOP.md.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SopStep {
+    #[serde(default)]
     pub number: u32,
+    #[serde(default)]
     pub title: String,
+    #[serde(default)]
     pub body: String,
     #[serde(default)]
     pub suggested_tools: Vec<String>,
@@ -178,6 +269,12 @@ pub struct SopStep {
     /// Optional per-step execution mode override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<SopExecutionMode>,
+    /// Capability identifier used when `kind = "capability"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    /// Capability arguments, serialized as `with` in TOML/JSON definitions.
+    #[serde(default, rename = "with", skip_serializing_if = "Option::is_none")]
+    pub capability_input: Option<serde_json::Value>,
 }
 
 impl Default for SopStep {
@@ -194,11 +291,27 @@ impl Default for SopStep {
             routing: StepRouting::default(),
             on_failure: StepFailure::default(),
             mode: None,
+            capability: None,
+            capability_input: None,
         }
     }
 }
 
 impl SopStep {
+    pub fn capability_id(&self) -> Option<&str> {
+        self.capability.as_deref()
+    }
+
+    pub fn capability_call_input(&self, piped_input: serde_json::Value) -> serde_json::Value {
+        let Some(mut configured) = self.capability_input.clone() else {
+            return piped_input;
+        };
+        if let Some(object) = configured.as_object_mut() {
+            object.entry("input").or_insert(piped_input);
+        }
+        configured
+    }
+
     pub fn effective_tool_scope(&self) -> Option<StepToolScope> {
         let mut scope = self.scope.clone();
         if !self.suggested_tools.is_empty() {
@@ -251,6 +364,8 @@ pub struct SopManifest {
     pub sop: SopMeta,
     #[serde(default)]
     pub triggers: Vec<SopTrigger>,
+    #[serde(default)]
+    pub steps: Vec<SopStep>,
 }
 
 /// The `[sop]` table in SOP.toml.
@@ -287,8 +402,11 @@ pub enum SopTriggerSource {
     Webhook,
     Cron,
     Peripheral,
+    Filesystem,
     Calendar,
+    Channel,
     Manual,
+    Amqp,
 }
 
 impl fmt::Display for SopTriggerSource {
@@ -298,8 +416,11 @@ impl fmt::Display for SopTriggerSource {
             Self::Webhook => write!(f, "webhook"),
             Self::Cron => write!(f, "cron"),
             Self::Peripheral => write!(f, "peripheral"),
+            Self::Filesystem => write!(f, "filesystem"),
             Self::Calendar => write!(f, "calendar"),
+            Self::Channel => write!(f, "channel"),
             Self::Manual => write!(f, "manual"),
+            Self::Amqp => write!(f, "amqp"),
         }
     }
 }
@@ -598,6 +719,82 @@ condition = "$.value > 85"
     }
 
     #[test]
+    fn trigger_filesystem_toml_roundtrip() {
+        let toml_str = r#"
+type = "filesystem"
+path = "/var/inbox/**/*.json"
+events = ["created", "modified"]
+condition = "$.extension == \"json\""
+"#;
+        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
+        match trigger {
+            SopTrigger::Filesystem {
+                path,
+                events,
+                condition,
+            } => {
+                assert_eq!(path, "/var/inbox/**/*.json");
+                assert_eq!(
+                    events,
+                    vec![FilesystemEventKind::Created, FilesystemEventKind::Modified]
+                );
+                assert_eq!(condition.as_deref(), Some(r#"$.extension == "json""#));
+            }
+            other => panic!("expected Filesystem trigger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trigger_filesystem_defaults_events_empty() {
+        let toml_str = r#"
+type = "filesystem"
+path = "/var/inbox"
+"#;
+        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
+        assert!(
+            matches!(trigger, SopTrigger::Filesystem { ref events, ref condition, .. } if events.is_empty() && condition.is_none())
+        );
+    }
+
+    #[test]
+    fn trigger_channel_toml() {
+        let toml_str = r#"
+type = "channel"
+topic = "git.main:pull_request.opened"
+condition = "$.repo == \"octo/repo\""
+"#;
+        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
+        assert!(
+            matches!(trigger, SopTrigger::Channel { ref topic, .. } if topic == "git.main:pull_request.opened")
+        );
+    }
+
+    #[test]
+    fn filesystem_event_kind_display_and_serde() {
+        assert_eq!(FilesystemEventKind::Created.to_string(), "created");
+        assert_eq!(FilesystemEventKind::Renamed.to_string(), "renamed");
+        let json = serde_json::to_string(&FilesystemEventKind::Deleted).unwrap();
+        assert_eq!(json, "\"deleted\"");
+        let parsed: FilesystemEventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, FilesystemEventKind::Deleted);
+    }
+
+    #[test]
+    fn trigger_filesystem_display() {
+        let trigger = SopTrigger::Filesystem {
+            path: "/var/inbox/*.json".into(),
+            events: vec![FilesystemEventKind::Created],
+            condition: None,
+        };
+        assert_eq!(trigger.to_string(), "filesystem:/var/inbox/*.json");
+    }
+
+    #[test]
+    fn trigger_source_filesystem_display() {
+        assert_eq!(SopTriggerSource::Filesystem.to_string(), "filesystem");
+    }
+
+    #[test]
     fn run_status_display() {
         assert_eq!(
             SopRunStatus::WaitingApproval.to_string(),
@@ -609,6 +806,7 @@ condition = "$.value > 85"
     fn step_kind_display() {
         assert_eq!(SopStepKind::Execute.to_string(), "execute");
         assert_eq!(SopStepKind::Checkpoint.to_string(), "checkpoint");
+        assert_eq!(SopStepKind::Capability.to_string(), "capability");
     }
 
     #[test]
@@ -668,6 +866,8 @@ condition = "$.value > 85"
                 .unwrap();
         assert!(step.suggested_tools.is_empty());
         assert!(!step.requires_confirmation);
+        assert!(step.capability.is_none());
+        assert!(step.capability_input.is_none());
     }
 
     #[test]
@@ -684,6 +884,8 @@ condition = "$.value > 85"
         assert!(value.get("routing").is_none());
         assert!(value.get("on_failure").is_none());
         assert!(value.get("mode").is_none());
+        assert!(value.get("capability").is_none());
+        assert!(value.get("with").is_none());
     }
 
     #[test]
@@ -710,6 +912,7 @@ path = "/sop/test"
     #[test]
     fn trigger_source_display() {
         assert_eq!(SopTriggerSource::Mqtt.to_string(), "mqtt");
+        assert_eq!(SopTriggerSource::Channel.to_string(), "channel");
         assert_eq!(SopTriggerSource::Manual.to_string(), "manual");
     }
 
