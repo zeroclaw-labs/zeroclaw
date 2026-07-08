@@ -2485,7 +2485,7 @@ fn map_key_for_prop_path<'a>(section_path: &str, prop_path: &'a str) -> Option<&
 fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<bool> {
     let Some((section_path, key)) = Config::map_key_sections()
         .into_iter()
-        .filter(|section| section.path.starts_with("providers."))
+        .filter(|section| section.path.starts_with("providers.") || section.path.starts_with("channels."))
         .filter(|section| section.kind == zeroclaw_config::traits::MapKeyKind::Map)
         .filter_map(|section| {
             let key = map_key_for_prop_path(section.path, prop_path)?;
@@ -8732,7 +8732,37 @@ mod tests {
 
         assert!(
             !created,
-            "auto-materialization must stay scoped to typed provider aliases"
+            "auto-materialization must stay scoped to typed provider and channel aliases"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn config_set_materializes_missing_channel_alias() {
+        let mut config = Config::default();
+        let path = "channels.telegram.default.bot_token";
+
+        assert!(
+            !config.channels.telegram.contains_key("default"),
+            "fresh config should not already contain the default channel alias"
+        );
+
+        let created = ensure_map_key_for_prop_path(&mut config, path)
+            .expect("known channel path should be materialized");
+
+        assert!(created, "missing channel alias should be created");
+        config
+            .set_prop_persistent(path, "test-token")
+            .expect("materialized channel path should be writable");
+        assert_eq!(
+            config
+                .channels
+                .telegram
+                .get("default")
+                .unwrap()
+                .bot_token
+                .as_deref(),
+            Some("test-token")
         );
     }
 

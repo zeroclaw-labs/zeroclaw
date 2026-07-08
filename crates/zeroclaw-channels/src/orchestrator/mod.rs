@@ -6391,7 +6391,7 @@ pub async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<(
     if !updated.channels.telegram.contains_key("default") {
         anyhow::bail!(
             "Telegram channel is not configured. Run \
-             `zeroclaw config set channels.telegram.default.bot_token=<token>` \
+             `zeroclaw config set channels.telegram.default.bot_token <token>` \
              (or add a different alias than `default`); see \
              docs/book/src/channels/overview.md for the full field list."
         );
