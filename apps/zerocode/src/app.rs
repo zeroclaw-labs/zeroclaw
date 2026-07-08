@@ -569,7 +569,12 @@ pub async fn run(
                     continue;
                 }
 
-                if global == Some(GlobalAction::Quit) {
+                let pane_wants_quit_chord = match mode {
+                    Mode::Chat => chat_pane.wants_quit_chord(),
+                    Mode::Acp => acp_pane.wants_quit_chord(),
+                    _ => false,
+                };
+                if global == Some(GlobalAction::Quit) && !pane_wants_quit_chord {
                     // First Ctrl+C: clear input bar text, clear transient
                     // state (browse mode, overlay, …) and arm the confirm modal.
                     match mode {
@@ -644,8 +649,10 @@ pub async fn run(
                     continue;
                 }
 
-                // `?` opens help unless pane is in text-input mode.
-                if global == Some(GlobalAction::Help) && !in_text_input {
+                let help_bypasses_text_input = crate::keymap::help_bypasses_text_input(&key);
+                if global == Some(GlobalAction::Help)
+                    && (!in_text_input || help_bypasses_text_input)
+                {
                     show_help = true;
                     continue;
                 }
@@ -897,7 +904,7 @@ fn draw_status_bar(
     // The ctx bar is held back until the context-accounting feature is
     // ready to show; there is no user-facing switch — the gate flips
     // when the work lands.
-    const SHOW_CTX_BAR: bool = false;
+    const SHOW_CTX_BAR: bool = true;
     // If browse mode is active, split off a fixed-width badge first.
     let left_area = if browse_mode {
         let badge_w = "  BROWSE  ".len() as u16 + 1;

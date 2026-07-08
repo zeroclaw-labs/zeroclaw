@@ -18,6 +18,7 @@
 //! GitHub.
 
 use super::personality::EDITABLE_PERSONALITY_FILES;
+use std::path::Path;
 
 const IDENTITY: &str = include_str!("IDENTITY.md");
 const SOUL: &str = include_str!("SOUL.md");
@@ -101,6 +102,41 @@ pub fn render_preset_default(ctx: &TemplateContext) -> Vec<(&'static str, String
         .copied()
         .filter_map(|f| render(f, ctx).map(|content| (f, content)))
         .collect()
+}
+
+/// Materialize the default personality preset into `workspace_dir`.
+///
+/// Each file produced by [`render_preset_default`] is written **only when it is
+/// absent or blank** (whitespace-only). Files that already hold real content are
+/// never overwritten, so user edits and prior customization survive.
+///
+/// Blank files are (re)seeded on purpose: the runtime treats an empty
+/// personality file as missing (see
+/// [`crate::agent::personality::load_personality_files`]), so a stray 0-byte
+/// file would otherwise leave the agent with no identity *and* could never be
+/// healed by an existence-only guard. Treating empty as missing here closes
+/// that trap.
+///
+/// Returns the filenames written on this call (empty when everything was
+/// already populated).
+pub async fn ensure_personality_preset(
+    workspace_dir: &Path,
+    ctx: &TemplateContext,
+) -> std::io::Result<Vec<&'static str>> {
+    let mut written = Vec::new();
+    for (filename, content) in render_preset_default(ctx) {
+        let path = workspace_dir.join(filename);
+        let needs_seed = match tokio::fs::read_to_string(&path).await {
+            Ok(existing) => existing.trim().is_empty(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Err(err) => return Err(err),
+        };
+        if needs_seed {
+            tokio::fs::write(&path, &content).await?;
+            written.push(filename);
+        }
+    }
+    Ok(written)
 }
 
 #[cfg(test)]
@@ -199,5 +235,73 @@ mod tests {
     fn unknown_filename_returns_none() {
         let ctx = TemplateContext::default();
         assert!(render("OTHER.md", &ctx).is_none());
+    }
+
+    #[tokio::test]
+    async fn ensure_preset_seeds_every_editable_file_with_substitution() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = TemplateContext {
+            agent: "Nova".to_string(),
+            ..TemplateContext::default()
+        };
+        let written = ensure_personality_preset(dir.path(), &ctx).await.unwrap();
+
+        // The full editable set lands on disk, populated (not empty).
+        for f in EDITABLE_PERSONALITY_FILES {
+            assert!(written.contains(f), "preset should seed {f}");
+            let body = tokio::fs::read_to_string(dir.path().join(f)).await.unwrap();
+            assert!(!body.trim().is_empty(), "{f} must be populated, not blank");
+        }
+        // Substitution actually ran — no raw placeholders left behind.
+        let soul = tokio::fs::read_to_string(dir.path().join("SOUL.md"))
+            .await
+            .unwrap();
+        assert!(soul.contains("You are **Nova**"));
+        assert!(!soul.contains("{agent}"));
+    }
+
+    #[tokio::test]
+    async fn ensure_preset_preserves_existing_user_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = "# My own SOUL\nHand-written.\n";
+        tokio::fs::write(dir.path().join("SOUL.md"), custom)
+            .await
+            .unwrap();
+
+        let written = ensure_personality_preset(dir.path(), &TemplateContext::default())
+            .await
+            .unwrap();
+
+        assert!(
+            !written.contains(&"SOUL.md"),
+            "files with real content must never be overwritten"
+        );
+        let soul = tokio::fs::read_to_string(dir.path().join("SOUL.md"))
+            .await
+            .unwrap();
+        assert_eq!(soul, custom);
+    }
+
+    #[tokio::test]
+    async fn ensure_preset_reseeds_blank_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // A stray 0-byte / whitespace-only file is what the existence-only
+        // guard could never heal; the preset must reseed it.
+        tokio::fs::write(dir.path().join("AGENTS.md"), "   \n\t\n")
+            .await
+            .unwrap();
+
+        let written = ensure_personality_preset(dir.path(), &TemplateContext::default())
+            .await
+            .unwrap();
+
+        assert!(
+            written.contains(&"AGENTS.md"),
+            "blank file must be reseeded, not skipped"
+        );
+        let agents = tokio::fs::read_to_string(dir.path().join("AGENTS.md"))
+            .await
+            .unwrap();
+        assert!(!agents.trim().is_empty());
     }
 }

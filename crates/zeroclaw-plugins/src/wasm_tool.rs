@@ -1,6 +1,7 @@
 //! Bridge between WASM plugins and the Tool trait.
 
 use crate::PluginPermission;
+use crate::component::PluginLimits;
 use crate::runtime;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -20,6 +21,7 @@ pub struct WasmTool {
     wasm_path: PathBuf,
     permissions: Vec<PluginPermission>,
     config: HashMap<String, String>,
+    limits: PluginLimits,
 }
 
 impl WasmTool {
@@ -30,6 +32,7 @@ impl WasmTool {
         wasm_path: PathBuf,
         permissions: Vec<PluginPermission>,
         config: HashMap<String, String>,
+        limits: PluginLimits,
     ) -> Self {
         Self {
             name,
@@ -38,6 +41,7 @@ impl WasmTool {
             wasm_path,
             permissions,
             config,
+            limits,
         }
     }
 
@@ -49,12 +53,13 @@ impl WasmTool {
         fallback_name: String,
         fallback_description: String,
         config: HashMap<String, String>,
+        limits: PluginLimits,
     ) -> Self {
         let probe = {
             let wasm_path = wasm_path.clone();
             let permissions = permissions.clone();
             block_probe(async move {
-                let mut plugin = runtime::create_plugin(&wasm_path, &permissions).await?;
+                let mut plugin = runtime::create_plugin(&wasm_path, &permissions, limits).await?;
                 runtime::call_tool_metadata(&mut plugin).await
             })
         };
@@ -85,6 +90,7 @@ impl WasmTool {
             wasm_path,
             permissions,
             config,
+            limits,
         }
     }
 }
@@ -142,7 +148,8 @@ impl Tool for WasmTool {
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let args_json = serde_json::to_vec(&args)?;
-        let mut plugin = runtime::create_plugin(&self.wasm_path, &self.permissions).await?;
+        let mut plugin =
+            runtime::create_plugin(&self.wasm_path, &self.permissions, self.limits).await?;
         runtime::call_execute(&mut plugin, &args_json, &self.config, &self.permissions).await
     }
 }
@@ -161,6 +168,12 @@ mod tests {
             PathBuf::from("/tmp/plugin.wasm"),
             Vec::new(),
             HashMap::new(),
+            PluginLimits {
+                call_fuel: 0,
+                max_memory_bytes: 256 * 1024 * 1024,
+                max_table_elements: 100_000,
+                max_instances: 64,
+            },
         );
         assert_eq!(tool.name(), "my_tool");
         assert_eq!(tool.description(), "does things");

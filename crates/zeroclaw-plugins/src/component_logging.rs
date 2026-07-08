@@ -113,3 +113,28 @@ macro_rules! impl_host {
 impl_host!(tool);
 impl_host!(channel);
 impl_host!(memory);
+
+impl bindings::channel::zeroclaw::plugin::inbound::Host for PluginState {
+    async fn inbound_poll(
+        &mut self,
+    ) -> Option<bindings::channel::zeroclaw::plugin::inbound::HostInboundMessage> {
+        self.inbound().poll().map(|m| {
+            bindings::channel::zeroclaw::plugin::inbound::HostInboundMessage {
+                id: m.id,
+                sender: m.sender,
+                reply_target: m.reply_target,
+                content: m.content,
+                channel: m.channel,
+                channel_alias: m.channel_alias,
+                timestamp: m.timestamp,
+                thread_ts: m.thread_ts,
+                interruption_scope_id: m.interruption_scope_id,
+                subject: m.subject,
+            }
+        })
+    }
+
+    async fn inbound_pending(&mut self) -> u32 {
+        self.inbound().pending()
+    }
+}

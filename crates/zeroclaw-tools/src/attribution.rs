@@ -58,7 +58,6 @@ use crate::microsoft365::Microsoft365Tool;
 use crate::model_routing_config::ModelRoutingConfigTool;
 use crate::notion_tool::NotionTool;
 use crate::opencode_cli::OpenCodeCliTool;
-use crate::pdf_read::PdfReadTool;
 use crate::pipeline::PipelineTool;
 use crate::poll::PollTool;
 use crate::project_intel::ProjectIntelTool;
@@ -67,6 +66,7 @@ use crate::pushover::PushoverTool;
 use crate::reaction::ReactionTool;
 use crate::report_template_tool::ReportTemplateTool;
 use crate::screenshot::ScreenshotTool;
+use crate::send_via::SendViaTool;
 use crate::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
@@ -124,7 +124,6 @@ tool_attribution!(Microsoft365Tool, ToolKind::Plugin);
 tool_attribution!(ModelRoutingConfigTool, ToolKind::Plugin);
 tool_attribution!(NotionTool, ToolKind::Plugin);
 tool_attribution!(OpenCodeCliTool, ToolKind::Plugin);
-tool_attribution!(PdfReadTool, ToolKind::Plugin);
 tool_attribution!(PipelineTool, ToolKind::Plugin);
 tool_attribution!(PollTool, ToolKind::Wait);
 tool_attribution!(ProjectIntelTool, ToolKind::Plugin);
@@ -133,6 +132,7 @@ tool_attribution!(PushoverTool, ToolKind::Plugin);
 tool_attribution!(ReactionTool, ToolKind::Plugin);
 tool_attribution!(ReportTemplateTool, ToolKind::Plugin);
 tool_attribution!(ScreenshotTool, ToolKind::Plugin);
+tool_attribution!(SendViaTool, ToolKind::Plugin);
 tool_attribution!(SessionDeleteTool, ToolKind::Plugin);
 tool_attribution!(SessionResetTool, ToolKind::Plugin);
 tool_attribution!(SessionsCurrentTool, ToolKind::Plugin);
