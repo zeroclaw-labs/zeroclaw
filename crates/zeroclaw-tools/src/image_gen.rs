@@ -1,11 +1,14 @@
 use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::json;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
+
+use crate::helpers::domain_guard;
 
 /// Resolve the output filename stem (no extension) for a generated image.
 ///
@@ -57,6 +60,12 @@ pub struct ImageGenTool {
     workspace_dir: PathBuf,
     default_model: String,
     api_key_env: String,
+    /// Normalized host allowlist (entries from `ImageGenConfig::allowed_private_hosts`).
+    /// Empty by default. A bare `"*"` blanket-tolerates any private/local host;
+    /// otherwise each entry is a host or suffix checked against the image-download
+    /// host. Mirrors the same field on `[file_download]`, `[http_request]`,
+    /// `[web_fetch]`, and the browser tools.
+    allowed_private_hosts: Vec<String>,
     /// Whether the saved image persists on the host filesystem. `false` on an
     /// ephemeral runtime (Docker tmpfs / no volume mount), where the PNG is
     /// written inside the container but invisible on the host and discarded at
@@ -78,6 +87,7 @@ impl ImageGenTool {
             workspace_dir,
             default_model,
             api_key_env,
+            allowed_private_hosts: Vec::new(),
             persistent_writes: true,
         }
     }
@@ -97,8 +107,116 @@ impl ImageGenTool {
             workspace_dir,
             default_model,
             api_key_env,
+            allowed_private_hosts: Vec::new(),
             persistent_writes,
         }
+    }
+
+    /// Construct with the full config (including `allowed_private_hosts`).
+    /// The host allowlist is normalized via `domain_guard::normalize_allowed_domains`
+    /// at construction time so per-request validation is a constant-time
+    /// allowlist match (no per-call parsing).
+    pub fn new_with_config(
+        security: Arc<SecurityPolicy>,
+        workspace_dir: PathBuf,
+        default_model: String,
+        api_key_env: String,
+        persistent_writes: bool,
+        allowed_private_hosts: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        let normalized = domain_guard::normalize_allowed_domains(
+            allowed_private_hosts,
+            "image_gen.allowed_private_hosts",
+        )?;
+        Ok(Self {
+            security,
+            workspace_dir,
+            default_model,
+            api_key_env,
+            allowed_private_hosts: normalized,
+            persistent_writes,
+        })
+    }
+
+    /// Validate the URL of an image to be downloaded from a (server-supplied)
+    /// fal.ai response. Mirrors `http_request::validate_url_policy` but for
+    /// the image-download stage: no `allowed_domains` (we trust fal.ai's
+    /// hostname choice), only a private-host gate lifted by
+    /// `allowed_private_hosts`. Always rejects cloud-metadata IP literals
+    /// even if `allowed_private_hosts` would otherwise lift the gate — that
+    /// matches the matrix-textbrower-browser-file_download pattern (see
+    /// `domain_guard::validate_resolved_ips_exclude_metadata`).
+    fn validate_image_url(&self, raw_url: &str) -> anyhow::Result<String> {
+        let url = raw_url.trim();
+        if url.is_empty() {
+            anyhow::bail!("image URL cannot be empty");
+        }
+        if url.chars().any(char::is_whitespace) {
+            anyhow::bail!("image URL cannot contain whitespace");
+        }
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            anyhow::bail!("Only http:// and https:// image URLs are allowed");
+        }
+
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| anyhow::Error::msg(format!("Invalid image URL format: {e}")))?;
+
+        // Reject userinfo-bearing URLs at parse time — the same shape used
+        // by the http_request SSRF gate (`http_request.rs` extract_host).
+        // A `user:pass@host` form is never legitimate for an image CDN.
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            anyhow::bail!("image URL userinfo is not allowed");
+        }
+
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::Error::msg("image URL has no host"))?
+            .to_string();
+
+        // Cloud-metadata IP literals (169.254.169.254, fd00:ec2::254, etc.)
+        // are rejected unconditionally — never a legitimate image source.
+        if host
+            .parse::<IpAddr>()
+            .is_ok_and(domain_guard::is_cloud_metadata_ip)
+        {
+            anyhow::bail!("Blocked cloud metadata host: {host}");
+        }
+
+        let host_is_private_or_local = domain_guard::is_private_or_local_host(&host);
+        let private_match = if host_is_private_or_local {
+            domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts)
+        } else {
+            false
+        };
+
+        if host_is_private_or_local && !private_match {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"tool": "image_gen", "host": host})),
+                "image_gen: rejecting private/local image host"
+            );
+            anyhow::bail!(
+                "Blocked local/private image host: {host}. \
+                 To allow, add it (or \"*\") to image_gen.allowed_private_hosts in config.toml"
+            );
+        }
+
+        // Warn loudly when an explicit carve-out lifts the SSRF gate — same
+        // signal as web_fetch's redirect-path warn, so operators can detect
+        // accidental "trusted internal CDN" misconfigurations in audit.
+        if host_is_private_or_local && private_match {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"tool": "image_gen", "host": host})),
+                "image_gen: allowing private/local image host via allowed_private_hosts"
+            );
+        }
+
+        Ok(url.to_string())
     }
 
     /// Build a reusable HTTP client with reasonable timeouts.
@@ -250,9 +368,48 @@ impl ImageGenTool {
                 anyhow::Error::msg("No image URL in fal.ai response")
             })?;
 
+        // ── Validate image URL against the SSRF gate ──────────────
+        // The image URL is server-supplied by fal.ai (and therefore not
+        // trustable in the same way as the operator-configured fal.run
+        // endpoint above). Validate the host string before any bytes hit
+        // the network. The redirect policy on the download client below
+        // re-validates each redirect target with the same gate — closes
+        // the redirect-to-internal gap that `Policy::default()` would
+        // leave open.
+        let validated_image_url = self.validate_image_url(image_url)?;
+
+        // ── Build image-download client with per-redirect SSRF gate ─
+        // Mirrors `web_fetch.rs:407-426`. The closure captures a clone of
+        // `self.allowed_private_hosts` so the per-redirect check uses the
+        // exact operator-configured allowlist (no re-parse, no IO).
+        let allowed_private_hosts = self.allowed_private_hosts.clone();
+        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error(std::io::Error::other(
+                    "Too many image-URL redirects (max 10)",
+                ));
+            }
+            if let Err(err) =
+                validate_redirect_image_url(attempt.url().as_str(), &allowed_private_hosts)
+            {
+                return attempt.error(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("Blocked image-URL redirect target: {err}"),
+                ));
+            }
+            attempt.follow()
+        });
+
+        let download_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .redirect(redirect_policy)
+            .build()
+            .unwrap_or_default();
+
         // ── Download image ─────────────────────────────────────────
-        let img_resp = client
-            .get(image_url)
+        let img_resp = download_client
+            .get(&validated_image_url)
             .send()
             .await
             .context("Failed to download generated image")?;
@@ -300,6 +457,57 @@ impl ImageGenTool {
             error: None,
         })
     }
+}
+
+/// Free-function companion to `ImageGenTool::validate_image_url`, used by the
+/// reqwest redirect policy closure (which can't borrow `self`). Performs the
+/// same gate — http(s)-only, no userinfo, no private/local host unless covered
+/// by `allowed_private_hosts`, cloud-metadata IP literals always rejected.
+fn validate_redirect_image_url(
+    raw_url: &str,
+    allowed_private_hosts: &[String],
+) -> anyhow::Result<()> {
+    let url = raw_url.trim();
+    if url.is_empty() {
+        anyhow::bail!("redirect image URL cannot be empty");
+    }
+    if url.chars().any(char::is_whitespace) {
+        anyhow::bail!("redirect image URL cannot contain whitespace");
+    }
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        anyhow::bail!("Only http:// and https:// redirect URLs are allowed");
+    }
+
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| anyhow::Error::msg(format!("Invalid redirect image URL format: {e}")))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("redirect image URL userinfo is not allowed");
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::Error::msg("redirect image URL has no host"))?
+        .to_string();
+
+    if host
+        .parse::<IpAddr>()
+        .is_ok_and(domain_guard::is_cloud_metadata_ip)
+    {
+        anyhow::bail!("Blocked redirect to cloud metadata host: {host}");
+    }
+
+    let host_is_private_or_local = domain_guard::is_private_or_local_host(&host);
+    let private_match = host_is_private_or_local
+        && domain_guard::host_matches_allowlist(&host, allowed_private_hosts);
+
+    if host_is_private_or_local && !private_match {
+        anyhow::bail!(
+            "Blocked redirect to local/private host: {host}. \
+             To allow, add it (or \"*\") to image_gen.allowed_private_hosts in config.toml"
+        );
+    }
+
+    Ok(())
 }
 
 #[async_trait]
@@ -628,5 +836,164 @@ mod tests {
         assert_eq!(result.unwrap(), "test_value_123");
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZC_IMAGE_GEN_TEST_KEY") };
+    }
+
+    // ── SSRF gate tests for the image-download stage ──────────────
+    //
+    // These exercise `ImageGenTool::validate_image_url` and the free-function
+    // companion `validate_redirect_image_url` directly. Hermetic — no
+    // network, no reqwest, no `fal.run` POST. A regression that drops the
+    // SSRF gate (or relaxes the private-host check) would surface here.
+
+    fn test_tool_with_private_hosts(allowed_private_hosts: Vec<&str>) -> ImageGenTool {
+        ImageGenTool::new_with_config(
+            test_security(),
+            std::env::temp_dir(),
+            "fal-ai/flux/schnell".into(),
+            "FAL_API_KEY".into(),
+            true,
+            allowed_private_hosts
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        )
+        .expect("test tool construction should succeed")
+    }
+
+    #[test]
+    fn validate_image_url_rejects_empty() {
+        let tool = test_tool_with_private_hosts(vec![]);
+        let err = tool.validate_image_url("").unwrap_err().to_string();
+        assert!(err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_image_url_rejects_whitespace() {
+        let tool = test_tool_with_private_hosts(vec![]);
+        let err = tool
+            .validate_image_url("http://example .com/x.png")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("whitespace"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_image_url_rejects_non_http_scheme() {
+        let tool = test_tool_with_private_hosts(vec![]);
+        let err = tool
+            .validate_image_url("ftp://example.com/x.png")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("http://"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_image_url_rejects_userinfo() {
+        let tool = test_tool_with_private_hosts(vec![]);
+        let err = tool
+            .validate_image_url("https://attacker:pwn@cdn.example.com/x.png")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("userinfo"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_image_url_rejects_localhost() {
+        let tool = test_tool_with_private_hosts(vec![]);
+        let err = tool
+            .validate_image_url("http://localhost/x.png")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_image_url_rejects_private_ipv4() {
+        let tool = test_tool_with_private_hosts(vec![]);
+        let err = tool
+            .validate_image_url("http://10.0.0.5/x.png")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_image_url_rejects_cloud_metadata_ipv4() {
+        // Even with `allowed_private_hosts = ["*"]`, cloud-metadata IPs
+        // must still be rejected — the gate is unconditional for the
+        // metadata service.
+        let wildcard = test_tool_with_private_hosts(vec!["*"]);
+        let err = wildcard
+            .validate_image_url("http://169.254.169.254/latest/meta-data/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("metadata"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_image_url_accepts_public_https() {
+        let tool = test_tool_with_private_hosts(vec![]);
+        let url = tool
+            .validate_image_url("https://cdn.fal.ai/files/abc123.png")
+            .expect("public HTTPS host must be accepted");
+        assert_eq!(url, "https://cdn.fal.ai/files/abc123.png");
+    }
+
+    #[test]
+    fn validate_image_url_accepts_allowed_private_host_explicit() {
+        // Operator opted-in to a specific internal CDN via the allowlist.
+        let tool = test_tool_with_private_hosts(vec!["cdn.internal.example"]);
+        let url = tool
+            .validate_image_url("https://cdn.internal.example/x.png")
+            .expect("explicit allowed_private_hosts entry must lift the block");
+        assert_eq!(url, "https://cdn.internal.example/x.png");
+    }
+
+    #[test]
+    fn validate_image_url_accepts_allowed_private_host_wildcard() {
+        // `*` blanket-tolerates any private/local host (dev/CI use case).
+        let tool = test_tool_with_private_hosts(vec!["*"]);
+        let url = tool
+            .validate_image_url("http://localhost:8080/x.png")
+            .expect("wildcard allowed_private_hosts must lift the block");
+        assert_eq!(url, "http://localhost:8080/x.png");
+    }
+
+    // ── Redirect-gate tests ───────────────────────────────────────
+    //
+    // The reqwest `Policy::custom` closure that re-validates each redirect
+    // target uses `validate_redirect_image_url` (free function) — these tests
+    // pin the redirect-path contract directly.
+
+    #[test]
+    fn validate_redirect_image_url_rejects_localhost() {
+        let allowed = vec!["cdn.internal.example".to_string()];
+        let err = validate_redirect_image_url("http://localhost/x.png", &allowed)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_redirect_image_url_rejects_cloud_metadata() {
+        let allowed = vec!["*".to_string()];
+        let err = validate_redirect_image_url("http://169.254.169.254/latest/meta-data/", &allowed)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("metadata"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_redirect_image_url_accepts_public_https() {
+        let allowed: Vec<String> = vec![];
+        validate_redirect_image_url("https://cdn.fal.ai/files/abc.png", &allowed)
+            .expect("public HTTPS host must be accepted by redirect gate");
+    }
+
+    #[test]
+    fn validate_redirect_image_url_accepts_allowed_private_host() {
+        let allowed = vec!["cdn.internal.example".to_string()];
+        validate_redirect_image_url("https://cdn.internal.example/x.png", &allowed)
+            .expect("allowed_private_hosts must lift the redirect gate");
     }
 }
