@@ -223,7 +223,8 @@ async fn parity_l1_engine_honors_excluded_tools() {
         steering: None,
         new_messages_out: None,
         image_cache: None,
-        ingress: IngressContext::internal(),
+        ingress: IngressContext::sub_turn(),
+        memory: None,
         agent_alias: None,
         turn_id: &turn_id,
     })
