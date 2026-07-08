@@ -80,6 +80,7 @@ impl DiagItem {
 pub fn diagnose(config: &Config) -> Vec<DiagResult> {
     let mut items: Vec<DiagItem> = Vec::new();
 
+    check_degraded_sections(config, &mut items);
     check_config_semantics(config, &mut items);
     check_workspace(config, &mut items);
     check_daemon_state(config, &mut items);
@@ -918,6 +919,36 @@ pub fn run_traces(
 }
 
 // ── Config semantic validation ───────────────────────────────────
+
+/// Surface config sections the resilient loader dropped at load time
+/// (`Config::degraded_sections` / `Config::degraded_security`, populated by
+/// `migrate_to_current_salvaged` in `zeroclaw-config`) so `doctor` names the
+/// actual malformed section instead of downstream checks reporting confusing
+/// secondary symptoms (e.g. "no channels configured").
+fn check_degraded_sections(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "config";
+    for path in &config.degraded_security {
+        items.push(DiagItem::error(
+            cat,
+            format!(
+                "SECURITY-CRITICAL config section `{path}` is invalid and was reset to its \
+                 default so the daemon can boot; the running posture may be WEAKER than \
+                 intended. Run `zeroclaw config migrate` to see the parse error, then repair \
+                 the file."
+            ),
+        ));
+    }
+    for path in &config.degraded_sections {
+        items.push(DiagItem::warn(
+            cat,
+            format!(
+                "config section `{path}` is malformed and was reset to defaults; values in \
+                 that section are NOT in effect. Run `zeroclaw config migrate` to see the \
+                 parse error, then repair the file."
+            ),
+        ));
+    }
+}
 
 fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "config";
@@ -1774,6 +1805,52 @@ mod tests {
         let ch_item = items.iter().find(|i| i.message.contains("channel"));
         assert!(ch_item.is_some());
         assert_eq!(ch_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn degraded_sections_reported_as_warning() {
+        let mut config = Config::default();
+        config.degraded_sections = vec!["channels.telegram.default".to_string()];
+        let mut items = Vec::new();
+        check_degraded_sections(&config, &mut items);
+        let item = items
+            .iter()
+            .find(|i| i.message.contains("channels.telegram.default"));
+        assert!(
+            item.is_some(),
+            "expected a diagnostic naming the degraded section, got messages: {:?}",
+            items.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+        assert_eq!(item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn degraded_security_reported_as_error() {
+        let mut config = Config::default();
+        config.degraded_security = vec!["security".to_string()];
+        let mut items = Vec::new();
+        check_degraded_sections(&config, &mut items);
+        let item = items
+            .iter()
+            .find(|i| i.message.contains("SECURITY-CRITICAL"));
+        assert!(
+            item.is_some(),
+            "expected a SECURITY-CRITICAL diagnostic, got messages: {:?}",
+            items.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+        assert_eq!(item.unwrap().severity, Severity::Error);
+    }
+
+    #[test]
+    fn clean_config_reports_no_degraded_sections() {
+        let config = Config::default();
+        let mut items = Vec::new();
+        check_degraded_sections(&config, &mut items);
+        assert!(
+            items.is_empty(),
+            "a config with no degraded sections must not produce degraded-section diagnostics, got messages: {:?}",
+            items.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]

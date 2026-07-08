@@ -1086,6 +1086,56 @@ from_address = "a@example.com"
     }
 
     #[test]
+    fn broken_telegram_alias_is_dropped_and_recorded() {
+        // Telegram alias missing the required `bot_token` must not abort the
+        // load; the dropped alias path must be recorded verbatim so `doctor`
+        // can name the exact malformed section (see zeroclaw-runtime's
+        // check_degraded_sections).
+        let raw = r#"
+schema_version = 3
+
+[channels.telegram.default]
+enabled = true
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            !load.config.channels.telegram.contains_key("default"),
+            "invalid alias must be pruned, got {:?}",
+            load.config.channels.telegram.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            load.dropped,
+            vec!["channels.telegram.default"],
+            "dropped list must pin the exact malformed section path, got {:?}",
+            load.dropped
+        );
+    }
+
+    #[test]
+    fn complete_telegram_alias_survives() {
+        // Regression companion to broken_telegram_alias_is_dropped_and_recorded:
+        // a complete [channels.telegram.default] (bot_token present) must
+        // survive intact and must not appear in `dropped`.
+        let raw = r#"
+schema_version = 3
+
+[channels.telegram.default]
+enabled = true
+bot_token = "t"
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            load.config.channels.telegram.contains_key("default"),
+            "a complete alias must survive salvage"
+        );
+        assert!(
+            load.dropped.is_empty(),
+            "a complete alias must not be reported as dropped, got {:?}",
+            load.dropped
+        );
+    }
+
+    #[test]
     fn valid_provider_aliases_survive_broken_sibling() {
         // Repro for the zerocode "all providers vanish after restart" report:
         // one malformed provider alias must not take the whole [providers]
