@@ -1,5 +1,18 @@
 use crate::approval::ApprovalManager;
 
+/// Format token count with thousands separators.
+fn format_tokens(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
 /// CLI channel factory, injected by the binary. Returns a `Box<dyn Channel>` for interactive mode.
 pub static CLI_CHANNEL_FN: std::sync::OnceLock<
     Box<dyn Fn() -> Box<dyn zeroclaw_api::channel::Channel> + Send + Sync>,
@@ -139,11 +152,9 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::channel::Channel;
-use zeroclaw_api::ingress::IngressContext;
+use zeroclaw_api::ingress::{IngressContext, TurnOrigin};
 use zeroclaw_config::schema::Config;
-use zeroclaw_memory::{
-    self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, MemoryCategory, decay,
-};
+use zeroclaw_memory::{self, Memory, MemoryCategory};
 #[cfg(test)]
 use zeroclaw_providers::ChatRequest;
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ToolCall};
@@ -285,9 +296,15 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 ///    `agent::run`-level `allowed_tools` parameter).
 ///
 /// A tool survives only when BOTH gates admit its name. `None` on
-/// either gate is unrestricted for that gate alone. Built-in tools,
-/// MCP tools, and skill tools all flow through the same filter; the
-/// helper does not know or care about category.
+/// either gate is unrestricted for that gate alone. The helper itself is
+/// category-agnostic - it filters whatever names are in `tools`. In
+/// production, however, the categories are gated at different layers:
+/// built-in tools flow through this filter, MCP tools through their
+/// `ToolAccessPolicy`, and skill tools through the `is_tool_excluded`
+/// denylist gate applied at skill registration (`register_skill_tools*`) -
+/// skill tools are deliberately NOT subject to the `allowed_tools`
+/// allowlist (they are granted via skill config; see
+/// `SecurityPolicy::is_tool_excluded`).
 pub fn apply_policy_tool_filter(
     tools: &mut Vec<Box<dyn Tool>>,
     policy: Option<&zeroclaw_config::policy::SecurityPolicy>,
@@ -386,8 +403,6 @@ pub fn filter_tool_specs_for_turn(
     groups: &[zeroclaw_config::schema::ToolFilterGroup],
     user_message: &str,
 ) -> Vec<crate::tools::ToolSpec> {
-    use zeroclaw_config::schema::ToolFilterGroupMode;
-
     if groups.is_empty() {
         return tool_specs;
     }
@@ -398,25 +413,37 @@ pub fn filter_tool_specs_for_turn(
         .into_iter()
         .filter(|spec| {
             // Built-in tools always pass through.
-            if !spec.name.starts_with("mcp_") {
-                return true;
-            }
-            // MCP tool: include if any active group matches.
-            groups.iter().any(|group| {
-                let pattern_matches = group.tools.iter().any(|pat| glob_match(pat, &spec.name));
-                if !pattern_matches {
-                    return false;
-                }
-                match group.mode {
-                    ToolFilterGroupMode::Always => true,
-                    ToolFilterGroupMode::Dynamic => group
-                        .keywords
-                        .iter()
-                        .any(|kw| msg_lower.contains(&kw.to_ascii_lowercase())),
-                }
-            })
+            !spec.name.starts_with("mcp_")
+                || mcp_tool_included_for_turn(&spec.name, groups, &msg_lower)
         })
         .collect()
+}
+
+/// Name-only core of [`filter_tool_specs_for_turn`]: whether an MCP tool is
+/// included by at least one active group. Operating on names alone lets
+/// per-turn exclusion computation skip building `ToolSpec`s entirely — specs
+/// carry the full parameter schema, which is exactly the per-turn clone
+/// churn #8642 removes. `msg_lower` must already be lowercased.
+fn mcp_tool_included_for_turn(
+    name: &str,
+    groups: &[zeroclaw_config::schema::ToolFilterGroup],
+    msg_lower: &str,
+) -> bool {
+    use zeroclaw_config::schema::ToolFilterGroupMode;
+
+    groups.iter().any(|group| {
+        let pattern_matches = group.tools.iter().any(|pat| glob_match(pat, name));
+        if !pattern_matches {
+            return false;
+        }
+        match group.mode {
+            ToolFilterGroupMode::Always => true,
+            ToolFilterGroupMode::Dynamic => group
+                .keywords
+                .iter()
+                .any(|kw| msg_lower.contains(&kw.to_ascii_lowercase())),
+        }
+    })
 }
 
 /// Filters a tool spec list by an optional capability allowlist.
@@ -484,16 +511,16 @@ fn compute_excluded_mcp_tools(
     if groups.is_empty() {
         return Vec::new();
     }
-    let filtered_specs = filter_tool_specs_for_turn(
-        tools_registry.iter().map(|t| t.spec()).collect(),
-        groups,
-        user_message,
-    );
-    let included: HashSet<&str> = filtered_specs.iter().map(|s| s.name.as_str()).collect();
+    // Name-only: exclusion needs tool names, never schemas, so avoid
+    // building (and formerly deep-cloning) every spec per turn (#8642).
+    let msg_lower = user_message.to_ascii_lowercase();
     tools_registry
         .iter()
-        .filter(|t| t.name().starts_with("mcp_") && !included.contains(t.name()))
-        .map(|t| t.name().to_string())
+        .map(|t| t.name())
+        .filter(|name| {
+            name.starts_with("mcp_") && !mcp_tool_included_for_turn(name, groups, &msg_lower)
+        })
+        .map(str::to_string)
         .collect()
 }
 
@@ -507,13 +534,23 @@ pub fn native_tool_specs_present_for_turn(
         return Ok(false);
     }
 
-    let iteration_tool_specs = super::turn::build_iteration_tool_specs(
-        model_provider,
-        tools_registry,
-        excluded_tools,
-        activated_tools,
-    )?;
-    Ok(!iteration_tool_specs.tool_specs.is_empty())
+    // Name-only presence check mirroring `build_iteration_tool_specs`'s
+    // filtering, without assembling any specs (#8642): tools are present if
+    // the registry or the activated deferred set has a non-excluded name.
+    let is_excluded = |name: &str| excluded_tools.iter().any(|ex| ex == name);
+    if tools_registry.iter().any(|tool| !is_excluded(tool.name())) {
+        return Ok(true);
+    }
+    let Some(at) = activated_tools else {
+        return Ok(false);
+    };
+    let activated = match at.lock() {
+        Ok(guard) => guard,
+        // Same recovery as build_iteration_tool_specs: a poisoned lock is
+        // still safe for a read-only name scan.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    Ok(activated.tool_names().iter().any(|name| !is_excluded(name)))
 }
 
 /// Elide inlined base64 image data URIs from message content before export.
@@ -727,116 +764,6 @@ fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4())
 }
 
-/// Build context preamble by searching memory for relevant entries.
-/// Entries with a hybrid score below `min_relevance_score` are dropped to
-/// prevent unrelated memories from bleeding into the conversation.
-/// Core memories are exempt from time decay (evergreen).
-///
-/// `exclude_conversation` skips `MemoryCategory::Conversation` entries
-/// regardless of their key shape. Set to `true` for autonomous/scheduled
-/// runs (cron, daemon heartbeat) so chat memory cannot leak into prompts
-/// the user did not initiate. / #5456.
-async fn build_context(
-    mem: &dyn Memory,
-    observer: &dyn Observer,
-    user_msg: &str,
-    min_relevance_score: f64,
-    session_id: Option<&str>,
-    exclude_conversation: bool,
-) -> String {
-    let mut context = String::new();
-    let backend = mem.name().to_string();
-
-    // Pull relevant memories for this message. The original code used
-    // `if let Ok(...)` to silently swallow recall errors; we keep that
-    // behavior but refactor to an explicit match so the failure path can
-    // still emit a `MemoryRecall` observer event.
-    let start = std::time::Instant::now();
-    let recall_result = mem.recall(user_msg, 5, session_id, None, None).await;
-    let duration = start.elapsed();
-    let query_summary = make_query_summary(user_msg);
-
-    match recall_result {
-        Ok(mut entries) => {
-            observer.record_event(&ObserverEvent::MemoryRecall {
-                query_summary,
-                duration,
-                num_entries: entries.len(),
-                backend,
-                success: true,
-            });
-
-            // Apply time decay: older non-Core memories score lower
-            decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
-
-            let relevant: Vec<_> = entries
-                .iter()
-                .filter(|e| match e.score {
-                    Some(score) => score >= min_relevance_score,
-                    None => true,
-                })
-                .collect();
-
-            if !relevant.is_empty() {
-                let mut included = false;
-                for entry in &relevant {
-                    // Scheduled (cron / heartbeat) runs must not see chat-origin
-                    // memories. The autosave-key checks below catch the agent's
-                    // own autosaves but miss Conversation entries written by
-                    // channel handlers (Discord, gateway, WhatsApp, …) under
-                    // their own keys. / #5456.
-                    if exclude_conversation
-                        && matches!(entry.category, MemoryCategory::Conversation)
-                    {
-                        continue;
-                    }
-                    if zeroclaw_memory::is_assistant_autosave_key(&entry.key) {
-                        continue;
-                    }
-                    // Skip raw per-turn user messages: re-injecting them causes each
-                    // recalled entry to embed all prior generations, growing exponentially.
-                    // Consolidated knowledge is already promoted to Core/Daily entries.
-                    if zeroclaw_memory::is_user_autosave_key(&entry.key) {
-                        continue;
-                    }
-                    if zeroclaw_memory::should_skip_autosave_content(&entry.content) {
-                        continue;
-                    }
-                    // Skip entries containing tool_result blocks — they can leak
-                    // stale tool output from previous heartbeat ticks into new
-                    // sessions, presenting the LLM with orphan tool_result data.
-                    if entry.content.contains("<tool_result") {
-                        continue;
-                    }
-                    if !included {
-                        context.push_str(MEMORY_CONTEXT_OPEN);
-                        context.push('\n');
-                        included = true;
-                    }
-                    let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
-                }
-                if included {
-                    context.push_str(MEMORY_CONTEXT_CLOSE);
-                    context.push_str("\n\n");
-                }
-            }
-        }
-        Err(_) => {
-            observer.record_event(&ObserverEvent::MemoryRecall {
-                query_summary,
-                duration,
-                num_entries: 0,
-                backend,
-                success: false,
-            });
-            // Preserve original swallow behavior — recall errors are not
-            // propagated; an empty context string is returned.
-        }
-    }
-
-    context
-}
-
 /// Build hardware datasheet context from RAG when peripherals are enabled.
 /// Includes pin-alias lookup (e.g. "red_led" → 13) when query matches, plus retrieved chunks.
 fn build_hardware_context(
@@ -917,6 +844,8 @@ pub async fn agent_turn(
     max_tool_result_chars: usize,
     context_token_budget: usize,
     channel: Option<&dyn Channel>,
+    origin: TurnOrigin,
+    memory: Option<crate::agent::memory_inject::TurnMemory<'_>>,
 ) -> Result<String> {
     let turn_id = uuid::Uuid::new_v4().to_string();
     run_tool_call_loop(ToolLoop {
@@ -962,9 +891,11 @@ pub async fn agent_turn(
         steering: None,
         new_messages_out: None,
         image_cache: None,
-        // Phase 1: stamp Internal/Trusted. Real per-transport
-        // stamping is PR C (RFC #6971 §4).
-        ingress: IngressContext::internal(),
+        // Origin and the per-turn memory half are threaded from the entry
+        // point; source/transport/trust stay phase-1 placeholders. Real
+        // per-transport stamping is PR C (RFC #6971 §4).
+        memory,
+        ingress: IngressContext::from_origin(origin),
         agent_alias: None,
         turn_id: &turn_id,
     })
@@ -1093,6 +1024,17 @@ pub struct AgentRunOverrides {
     /// underway. Default `false` keeps top-level / cron-launched /
     /// CLI-launched agents at depth 0.
     pub is_subagent: bool,
+    /// Spawn-site opt-out of the engine's memory-context injection (e.g. a
+    /// cron job configured with `uses_memory = false`). Default `false`.
+    pub suppress_memory_inject: bool,
+    /// Spawn-site request for a fully memory-free run: the loop binds a
+    /// `NoneMemory` backend (no recall, no store, no governance) and drops the
+    /// persistent memory tools from the registry, so the model can neither read
+    /// nor write memory for this run. Set by cron jobs with
+    /// `uses_memory = false`; `suppress_memory_inject` alone only stops the
+    /// context preamble and would still hand the model a live backend and
+    /// working memory tools. Default `false`.
+    pub memory_free: bool,
 }
 
 /// Build the dotted provider ref (`"openai.qwertfoozp"`) from the agent's
@@ -1177,6 +1119,7 @@ pub async fn run(
     interactive: bool,
     session_state_file: Option<PathBuf>,
     allowed_tools: Option<Vec<String>>,
+    origin: TurnOrigin,
     overrides: AgentRunOverrides,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
@@ -1222,9 +1165,10 @@ pub async fn run(
         // Profile values (when set) override the agent's inline fields.
         // See `Config::resolved_agent_config` for precedence rules.
         let eff_max_history_messages = agent.resolved.max_history_messages;
-        let eff_max_context_tokens = agent.resolved.max_context_tokens;
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
+        let eff_model_context_window = agent.resolved.model_context_window;
+        let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -1253,6 +1197,8 @@ pub async fn run(
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let is_subagent_caller = overrides.is_subagent;
+        let suppress_memory_inject = overrides.suppress_memory_inject;
+        let memory_free = overrides.memory_free;
         let security = match overrides.security {
             Some(sec) => sec,
             None => Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?),
@@ -1271,15 +1217,24 @@ pub async fn run(
         // `read_memory_from` allowlist. When the caller supplies a
         // pre-built memory handle (SubAgent narrowing path), use that
         // instead so the validator's allowlist subset reaches the loop.
-        let mem: Arc<dyn Memory> = match overrides.memory {
-            Some(m) => m,
-            None => {
-                zeroclaw_memory::create_memory_for_agent(
-                    &config,
-                    agent_alias,
-                    agent_model_provider.and_then(|e| e.api_key.as_deref()),
-                )
-                .await?
+        let mem: Arc<dyn Memory> = if memory_free {
+            // A memory-free run (cron `uses_memory = false`) binds an explicit
+            // no-op backend so recall, store, and governance are inert even
+            // though the loop wiring is unchanged. The persistent memory tools
+            // are also dropped below (`exclude_memory`), so the model has no
+            // path back into a real store for this run.
+            Arc::new(zeroclaw_memory::NoneMemory::new("none"))
+        } else {
+            match overrides.memory {
+                Some(m) => m,
+                None => {
+                    zeroclaw_memory::create_memory_for_agent(
+                        &config,
+                        agent_alias,
+                        agent_model_provider.and_then(|e| e.api_key.as_deref()),
+                    )
+                    .await?
+                }
             }
         };
         ::zeroclaw_log::record!(
@@ -1359,7 +1314,8 @@ pub async fn run(
             poll_handle,
             escalate_handle,
             channel_room_handle,
-            deferred_section,
+            mut deferred_section,
+            pinned_section,
             activated_handle,
         } = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
             config: &config,
@@ -1371,11 +1327,18 @@ pub async fn run(
             caller_allowed: allowed_tools.as_deref(),
             connect_mcp: true,
             connect_peripherals: true,
-            exclude_memory: false,
+            // A memory-free run drops the persistent memory tools so the model
+            // cannot read or write memory even though the registry is otherwise
+            // built identically.
+            exclude_memory: memory_free,
+            list_deferred_mcp_specs: false,
             emit_assembly_logs: true,
         })
         .await;
         let tools_registry = registry.into_inner();
+        // run injects one combined MCP prompt block: fold the pinned-resources section
+        // onto the deferred tool-search listing (the seam now surfaces them separately).
+        append_pinned_mcp_section(&mut deferred_section, &pinned_section);
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
@@ -1500,13 +1463,12 @@ pub async fn run(
             .collect();
 
         // ── Initialize locale-aware tool descriptions ──────────────────
-        let i18n_locale = config
+        let _i18n_locale = config
             .locale
             .as_deref()
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
             .unwrap_or_else(crate::i18n::detect_locale);
-        crate::i18n::init(&i18n_locale);
 
         let mut tool_descs: Vec<(&str, &str)> = vec![
             (
@@ -1535,7 +1497,7 @@ pub async fn run(
             ),
         ];
         if matches!(
-            config.skills.prompt_injection_mode,
+            eff_prompt_injection_mode,
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
         ) {
             tool_descs.push((
@@ -1656,7 +1618,7 @@ pub async fn run(
             &prompt_excluded_tools,
             activated_handle.as_ref(),
             agent.resolved.strict_tool_parsing,
-            config.skills.prompt_injection_mode,
+            eff_prompt_injection_mode,
             eff_compact_context,
             eff_max_system_prompt_chars,
             true,
@@ -1751,7 +1713,7 @@ pub async fn run(
                 &excluded_tools,
                 activated_handle.as_ref(),
                 agent.resolved.strict_tool_parsing,
-                config.skills.prompt_injection_mode,
+                eff_prompt_injection_mode,
                 eff_compact_context,
                 eff_max_system_prompt_chars,
                 true,
@@ -1803,23 +1765,10 @@ pub async fn run(
                 });
             }
 
-            // Inject memory + hardware RAG context into user message.
-            // Exclude Conversation-category memories when:
-            //   - non-interactive (cron, daemon heartbeat): chat history must
-            //     not leak into autonomous executions / #5456, OR
-            //   - no session scope is available (memory_session_id is None):
-            //     without a session filter, Conversation entries from other
-            //     channels (Matrix, Discord, …) would bleed into this session.
-            let exclude_conv = !interactive || memory_session_id.is_none();
-            let mem_context = build_context(
-                mem.as_ref(),
-                &*observer,
-                &effective_msg,
-                config.memory.min_relevance_score,
-                memory_session_id.as_deref(),
-                exclude_conv,
-            )
-            .await;
+            // Memory context is injected once in the engine, keyed on the
+            // ingress origin (agent::memory_inject). Hardware RAG context
+            // stays site-built; the engine prepends the memory block above
+            // it, preserving the legacy mem -> hw -> [now] msg order.
             let rag_limit = if eff_compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
@@ -1827,7 +1776,7 @@ pub async fn run(
                     build_hardware_context(r, &*observer, &effective_msg, &board_names, rag_limit)
                 })
                 .unwrap_or_default();
-            let context = format!("{mem_context}{hw_context}");
+            let context = hw_context;
             let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
             let enriched = if context.is_empty() {
                 format!("[{now}] {effective_msg}")
@@ -1867,7 +1816,7 @@ pub async fn run(
                         &excluded_tools,
                         activated_handle.as_ref(),
                         agent.resolved.strict_tool_parsing,
-                        config.skills.prompt_injection_mode,
+                        eff_prompt_injection_mode,
                         eff_compact_context,
                         eff_max_system_prompt_chars,
                         true,
@@ -1925,9 +1874,20 @@ pub async fn run(
                                 steering: None,
                                 new_messages_out: None,
                                 image_cache: None,
-                                // Phase 1: stamp Internal/Trusted. Real per-transport
-                                // stamping is PR C (RFC #6971 §4).
-                                ingress: IngressContext::internal(),
+                                // Origin is threaded from the entry point;
+                                // source/transport/trust stay phase-1
+                                // placeholders (real stamping is RFC #6971 §4).
+                                memory: Some(crate::agent::memory_inject::TurnMemory {
+                                    handle: mem.as_ref(),
+                                    query: effective_msg.clone(),
+                                    sessions: vec![memory_session_id.clone()],
+                                    suppress: suppress_memory_inject,
+                                    cfg: crate::agent::memory_inject::MemoryInjectConfig {
+                                        min_relevance_score: config.memory.min_relevance_score,
+                                        ..Default::default()
+                                    },
+                                }),
+                                ingress: IngressContext::from_origin(origin),
                                 agent_alias: Some(agent_alias),
                                 turn_id: &turn_id,
                             }),
@@ -2007,7 +1967,35 @@ pub async fn run(
                         config.data_dir.clone(),
                         config.skills.skill_creation.clone(),
                     );
-                    match creator.create_from_execution(&msg, &tool_calls, None).await {
+                    // Opt-in reflection synthesizes a `SKILL.md` from a bounded
+                    // slice of the execution; it falls back to `SKILL.toml`
+                    // internally when the provider call or its output is
+                    // unusable. Default path stays the deterministic generator.
+                    let creation_result = if config.skills.skill_creation.reflection_enabled {
+                        // The reflection path makes one post-turn provider call.
+                        // Scope it under TOOL_LOOP_COST_TRACKING_CONTEXT with the
+                        // same `cost_tracking_context` as the parent turn (whose
+                        // scope has already exited here) so the call is budget-
+                        // enforced and its usage is recorded against the same cost
+                        // tracker as the main loop and the skill-review fork below.
+                        TOOL_LOOP_COST_TRACKING_CONTEXT
+                            .scope(
+                                cost_tracking_context.clone(),
+                                creator.create_from_execution_reflected(
+                                    &msg,
+                                    &tool_calls,
+                                    &response,
+                                    None,
+                                    &provider_name,
+                                    model_provider.as_ref(),
+                                    &model_name,
+                                ),
+                            )
+                            .await
+                    } else {
+                        creator.create_from_execution(&msg, &tool_calls, None).await
+                    };
+                    match creation_result {
                         Ok(Some(slug)) => {
                             ::zeroclaw_log::record!(
                                 INFO,
@@ -2301,19 +2289,10 @@ pub async fn run(
                     });
                 }
 
-                // Inject memory + hardware RAG context into user message.
-                // Keep Conversation memories only when a session scope is
-                // available; without one, cross-channel entries (Matrix,
-                // Discord, …) would bleed into this interactive session.
-                let mem_context = build_context(
-                    mem.as_ref(),
-                    &*observer,
-                    &effective_input,
-                    config.memory.min_relevance_score,
-                    memory_session_id.as_deref(),
-                    memory_session_id.is_none(),
-                )
-                .await;
+                // Memory context is injected once in the engine, keyed on
+                // the ingress origin (agent::memory_inject). Hardware RAG
+                // stays site-built; the engine prepends the memory block
+                // above it.
                 let rag_limit = if eff_compact_context { 2 } else { 5 };
                 let hw_context = hardware_rag
                     .as_ref()
@@ -2327,7 +2306,7 @@ pub async fn run(
                         )
                     })
                     .unwrap_or_default();
-                let context = format!("{mem_context}{hw_context}");
+                let context = hw_context;
                 let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
                 let enriched = if context.is_empty() {
                     format!("[{now}] {effective_input}")
@@ -2394,7 +2373,7 @@ pub async fn run(
                             &excluded_tools,
                             activated_handle.as_ref(),
                             agent.resolved.strict_tool_parsing,
-                            config.skills.prompt_injection_mode,
+                            eff_prompt_injection_mode,
                             eff_compact_context,
                             eff_max_system_prompt_chars,
                             true,
@@ -2458,9 +2437,20 @@ pub async fn run(
                                     steering: None,
                                     new_messages_out: None,
                                     image_cache: None,
-                                    // Phase 1: stamp Internal/Trusted. Real per-transport
-                                    // stamping is PR C (RFC #6971 §4).
-                                    ingress: IngressContext::internal(),
+                                    // Origin is threaded from the entry point;
+                                    // source/transport/trust stay phase-1
+                                    // placeholders (real stamping is RFC #6971 §4).
+                                    memory: Some(crate::agent::memory_inject::TurnMemory {
+                                        handle: mem.as_ref(),
+                                        query: effective_input.clone(),
+                                        sessions: vec![memory_session_id.clone()],
+                                        suppress: suppress_memory_inject,
+                                        cfg: crate::agent::memory_inject::MemoryInjectConfig {
+                                            min_relevance_score: config.memory.min_relevance_score,
+                                            ..Default::default()
+                                        },
+                                    }),
+                                    ingress: IngressContext::from_origin(origin),
                                     agent_alias: Some(agent_alias),
                                     turn_id: &turn_id,
                                 }),
@@ -2542,9 +2532,26 @@ pub async fn run(
                                     "Context overflow in interactive loop, attempting recovery"
                                 );
                                 let taken = std::mem::take(&mut history);
+                                // Context overflow recovery: trim to 90% of the model's true
+                                // input capacity, not the runtime trimming budget. After an
+                                // overflow we must fit the provider's real tokenizer, so the
+                                // model window — not the operator's lower max_context_tokens
+                                // — is the correct target. The 10% headroom absorbs (a) the
+                                // under-count from estimate_history_tokens (~4 chars/token;
+                                // history.rs:285), which is what trim_to_recent_turns measures
+                                // against, and (b) room for the assistant reply plus the next
+                                // user turn, so the retried request lands inside the window
+                                // instead of re-overflowing at the same boundary. This CLI
+                                // outer-recovery site is a defense-in-depth fallback behind
+                                // the in-loop recovery at turn/context_recovery.rs:85 (which
+                                // uses its own tokens_now*2/3 heuristic); the two are
+                                // intentionally different — the in-loop path drops
+                                // aggressively before retry, this outer path lands the retry
+                                // inside the window with margin. See the note2.md 🟡 warning.
+                                let recovery_budget = eff_model_context_window * 9 / 10;
                                 let result = crate::agent::history_trim::trim_to_recent_turns(
                                     taken,
-                                    eff_max_context_tokens,
+                                    recovery_budget,
                                 );
                                 if result.trimmed {
                                     let mut trimmed = result.history;
@@ -2582,6 +2589,17 @@ pub async fn run(
                                     continue;
                                 }
                                 history = result.history;
+                                // When the system prompt + inlined tool
+                                // definitions alone meet or exceed the budget,
+                                // the single remaining turn can never fit;
+                                // surface the actionable root cause + remedy
+                                // rather than a generic "cannot trim" warning
+                                // (#5808).
+                                let system_floor =
+                                    crate::agent::history::estimate_system_floor_tokens(&history);
+                                let context_token_budget =
+                                    agent.resolved.effective_context_budget();
+                                let floor_exceeds_budget = system_floor >= context_token_budget;
                                 {
                                     let __zc_trim_span = ::zeroclaw_log::info_span!(
                                         target: "zeroclaw_log_internal_scope",
@@ -2590,16 +2608,48 @@ pub async fn run(
                                         model_provider = %provider_name,
                                     );
                                     let _zc_trim_guard = __zc_trim_span.entered();
-                                    ::zeroclaw_log::record!(
-                                        WARN,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Fail
+                                    if floor_exceeds_budget {
+                                        ::zeroclaw_log::record!(
+                                            WARN,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Fail
+                                            )
+                                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                            .with_attrs(::serde_json::json!({
+                                                "system_floor": system_floor,
+                                                "budget": context_token_budget,
+                                                "error_key": "context_floor_exceeds_budget",
+                                            })),
+                                            crate::agent::history::context_floor_remediation(
+                                                system_floor,
+                                                context_token_budget,
+                                            )
+                                        );
+                                    } else {
+                                        ::zeroclaw_log::record!(
+                                            WARN,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Fail
+                                            )
+                                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                            "Context overflow but only one turn remains; cannot trim further"
+                                        );
+                                    }
+                                }
+
+                                if floor_exceeds_budget {
+                                    eprintln!(
+                                        "\nError: {e}\n{}\n",
+                                        crate::agent::history::context_floor_remediation(
+                                            system_floor,
+                                            context_token_budget,
                                         )
-                                        .with_category(::zeroclaw_log::EventCategory::Agent)
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                                        "Context overflow but only one turn remains; cannot trim further"
                                     );
+                                    break String::new();
                                 }
                             }
 
@@ -2626,6 +2676,51 @@ pub async fn run(
                     eprintln!("\nError sending CLI response: {e}\n");
                 }
                 observer.record_event(&ObserverEvent::TurnComplete);
+
+                // Display context usage for this turn.
+                if let Some(ref ctx) = cost_tracking_context {
+                    let usage = ctx.snapshot_turn_usage();
+                    // Use last_input_tokens (absolute provider-reported prompt size)
+                    // instead of accumulated input_tokens. last_input_tokens is the
+                    // accurate "context window fill" measure because the LLM's
+                    // usage.input_tokens already includes the full prompt
+                    // (history + tools + system). Accumulating across rounds
+                    // double-counts the shared history.
+                    let effective_input_tokens = usage.last_input_tokens;
+                    if effective_input_tokens > 0 || usage.output_tokens > 0 {
+                        let max_ctx = eff_model_context_window as u64;
+                        let pct = if max_ctx > 0 {
+                            (effective_input_tokens as f64 / max_ctx as f64 * 100.0).min(100.0)
+                        } else {
+                            0.0
+                        };
+                        let bar_width: usize = 16;
+                        let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
+                        let empty = bar_width.saturating_sub(filled);
+                        let bar = format!(
+                            "[{}{}]",
+                            "\u{2588}".repeat(filled),
+                            "\u{2591}".repeat(empty)
+                        );
+                        let msg = if effective_input_tokens > 0 {
+                            crate::i18n::get_required_cli_string_with_args(
+                                "cli-agent-context-bar",
+                                &[
+                                    ("used", format_tokens(effective_input_tokens).as_str()),
+                                    ("max", format_tokens(max_ctx).as_str()),
+                                    ("bar", &bar),
+                                    ("pct", format!("{:.0}", pct).as_str()),
+                                ],
+                            )
+                        } else {
+                            crate::i18n::get_required_cli_string_with_args(
+                                "cli-agent-context-bar-unknown",
+                                &[("max", format_tokens(max_ctx).as_str())],
+                            )
+                        };
+                        eprintln!("\x1b[2m{}\x1b[0m", msg);
+                    }
+                }
 
                 // Hard cap as a safety net.
                 trim_history(&mut history, eff_max_history_messages);
@@ -2687,6 +2782,7 @@ pub async fn process_message(
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
+    origin: TurnOrigin,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
     let agent = resolved_agent_for_turn(&config, agent_alias)?;
@@ -2737,6 +2833,7 @@ pub async fn process_message(
         // See `Config::resolved_agent_config` for precedence rules.
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
+        let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
 
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
@@ -2835,6 +2932,7 @@ pub async fn process_message(
             escalate_handle,
             channel_room_handle,
             mut deferred_section,
+            pinned_section,
             activated_handle: activated_handle_pm,
         } = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
             config: &config,
@@ -2847,10 +2945,14 @@ pub async fn process_message(
             connect_mcp: true,
             connect_peripherals: true,
             exclude_memory: false,
+            list_deferred_mcp_specs: false,
             emit_assembly_logs: true,
         })
         .await;
         let tools_registry = registry.into_inner();
+        // process_message injects one combined MCP prompt block: fold pinned resources
+        // onto the deferred tool-search listing (the seam surfaces them separately).
+        append_pinned_mcp_section(&mut deferred_section, &pinned_section);
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
@@ -2917,13 +3019,12 @@ pub async fn process_message(
             .collect();
 
         // ── Initialize locale-aware tool descriptions ──────────────────
-        let i18n_locale = config
+        let _i18n_locale = config
             .locale
             .as_deref()
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
             .unwrap_or_else(crate::i18n::detect_locale);
-        crate::i18n::init(&i18n_locale);
 
         let mut tool_descs: Vec<(&str, &str)> = vec![
             ("shell", "Execute terminal commands."),
@@ -2940,7 +3041,7 @@ pub async fn process_message(
             ("image_info", "Read image metadata."),
         ];
         if matches!(
-            config.skills.prompt_injection_mode,
+            eff_prompt_injection_mode,
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
         ) {
             tool_descs.push((
@@ -3055,7 +3156,7 @@ pub async fn process_message(
                 bootstrap_max_chars,
                 Some(&risk_profile),
                 native_tool_specs_present,
-                config.skills.prompt_injection_mode,
+                eff_prompt_injection_mode,
                 eff_compact_context,
                 eff_max_system_prompt_chars,
                 false,
@@ -3123,18 +3224,10 @@ pub async fn process_message(
             return Ok(suggestion);
         }
 
-        // process_message is the channel entrypoint (Discord, Telegram, gateway,
-        // etc.) — recall is scoped to the channel's session_id, so retrieving the
-        // user's own Conversation history within their session is intended.
-        let mem_context = build_context(
-            mem.as_ref(),
-            &*observer,
-            effective_msg_ref,
-            config.memory.min_relevance_score,
-            session_id,
-            false,
-        )
-        .await;
+        // Memory context is injected once in the engine, keyed on the ingress
+        // origin (agent::memory_inject); recall is scoped to this entry's
+        // session_id. Hardware RAG stays site-built; the engine prepends the
+        // memory block above it.
         let rag_limit = if eff_compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
@@ -3142,7 +3235,7 @@ pub async fn process_message(
                 build_hardware_context(r, &*observer, effective_msg_ref, &board_names, rag_limit)
             })
             .unwrap_or_default();
-        let context = format!("{mem_context}{hw_context}");
+        let context = hw_context;
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
         let enriched = if context.is_empty() {
             format!("[{now}] {effective_message}")
@@ -3213,6 +3306,17 @@ pub async fn process_message(
                     // profile sets `approval_route` and channels are live, else
                     // `None` (today's channel-less auto-deny). See above.
                     routed_approval_channel_ref,
+                    origin,
+                    Some(crate::agent::memory_inject::TurnMemory {
+                        handle: mem.as_ref(),
+                        query: effective_message.clone(),
+                        sessions: vec![session_id.map(str::to_string)],
+                        suppress: false,
+                        cfg: crate::agent::memory_inject::MemoryInjectConfig {
+                            min_relevance_score: config.memory.min_relevance_score,
+                            ..Default::default()
+                        },
+                    }),
                 ),
             )
             .await
@@ -3226,10 +3330,9 @@ pub async fn process_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_text_tool_prompt_policy, build_context, estimate_history_tokens,
-        load_interactive_session_history, make_query_summary,
-        maybe_inject_channel_delivery_defaults, save_interactive_session_history,
-        seed_channel_handles, truncate_tool_result,
+        apply_text_tool_prompt_policy, estimate_history_tokens, load_interactive_session_history,
+        make_query_summary, maybe_inject_channel_delivery_defaults,
+        save_interactive_session_history, seed_channel_handles, truncate_tool_result,
     };
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::{ToolDispatchContext, execute_one_tool};
@@ -4972,7 +5075,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -5045,7 +5149,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -5135,7 +5240,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -5220,7 +5326,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -5296,7 +5403,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -5372,7 +5480,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -5448,7 +5557,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -5460,7 +5570,7 @@ mod tests {
 
     /// Behavior-identical guard (RFC #6971 phase 1): the always-on ingress
     /// policy layer must not change a turn's output. A plain turn with the
-    /// `IngressContext::internal()` envelope, and the same turn with a fully
+    /// `IngressContext::sub_turn()` envelope, and the same turn with a fully
     /// external/untrusted channel envelope, both disposition to `Loop` under
     /// the default policy and must produce the identical final answer the
     /// engine produced before the layer existed.
@@ -5513,6 +5623,7 @@ mod tests {
                 steering: None,
                 new_messages_out: None,
                 image_cache: None,
+                memory: None,
                 ingress: ctx,
                 agent_alias: None,
                 turn_id: &turn_id,
@@ -5521,7 +5632,7 @@ mod tests {
             .expect("default-Loop ingress must run the turn exactly as today")
         }
 
-        let internal = run_with(IngressContext::internal()).await;
+        let internal = run_with(IngressContext::sub_turn()).await;
         let external = run_with(IngressContext {
             message_id: Some("ghc_9001".to_string()),
             source_class: zeroclaw_api::ingress::SourceClass::External,
@@ -5531,6 +5642,7 @@ mod tests {
                 alias: "gh".to_string(),
             },
             trust: zeroclaw_api::ingress::TrustClass::Untrusted,
+            origin: zeroclaw_api::ingress::TurnOrigin::Channel,
         })
         .await;
 
@@ -5539,6 +5651,225 @@ mod tests {
             internal, external,
             "default-Loop policy must produce identical output regardless of envelope"
         );
+    }
+
+    /// Memory backend whose `recall` returns one Core entry. Used to exercise
+    /// the engine's unified memory-context injection wiring.
+    struct StaticRecallMemory;
+
+    #[async_trait]
+    impl zeroclaw_memory::Memory for StaticRecallMemory {
+        fn name(&self) -> &str {
+            "static-recall"
+        }
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+            Ok(vec![zeroclaw_memory::MemoryEntry {
+                id: "1".into(),
+                key: "remembered".into(),
+                content: "the server is prod-3".into(),
+                category: MemoryCategory::Core,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                session_id: None,
+                score: None,
+                namespace: "default".into(),
+                importance: None,
+                superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
+                agent_alias: None,
+                agent_id: None,
+            }])
+        }
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<zeroclaw_memory::MemoryEntry>> {
+            Ok(None)
+        }
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+            Ok(vec![])
+        }
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(1)
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StaticRecallMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "StaticRecallMemory"
+        }
+    }
+
+    /// The unified memory-context injection wiring contract at the engine:
+    /// with a `TurnMemory` on the `ToolLoop`, a user-facing origin injects
+    /// the preamble into the trailing user message before the provider sees
+    /// it and emits exactly one `MemoryRecall` event; a `SubTurn` origin
+    /// injects nothing and emits nothing; a failing backend leaves the turn
+    /// intact and reports `success: false`.
+    #[tokio::test]
+    async fn run_tool_call_loop_memory_injection_keys_on_origin() {
+        async fn run_case(
+            mem: &dyn zeroclaw_memory::Memory,
+            origin: zeroclaw_api::ingress::TurnOrigin,
+        ) -> (String, Vec<(Option<String>, bool)>) {
+            let model_provider = ScriptedModelProvider::from_text_responses(vec!["done"]);
+            let mut history = vec![ChatMessage::user("what server?".to_string())];
+            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let observer = RecallCountingObserver::default();
+            let turn_id = uuid::Uuid::new_v4().to_string();
+
+            run_tool_call_loop(ToolLoop {
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &model_provider,
+                        provider_name: "scripted",
+                        model: "scripted-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    max_tool_iterations: 3,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    context_token_budget: 0,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                },
+                history: &mut history,
+                channel_name: "cli",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                memory: Some(crate::agent::memory_inject::TurnMemory {
+                    handle: mem,
+                    query: "what server?".to_string(),
+                    sessions: vec![Some("session-1".to_string())],
+                    suppress: false,
+                    cfg: crate::agent::memory_inject::MemoryInjectConfig::default(),
+                }),
+                ingress: IngressContext::from_origin(origin),
+                agent_alias: None,
+                turn_id: &turn_id,
+            })
+            .await
+            .expect("turn should complete");
+
+            let user_msg = history
+                .iter()
+                .find(|m| m.role == "user")
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+            let recalls = observer
+                .recalls
+                .lock()
+                .iter()
+                .map(|r| (r.query_summary.clone(), r.success))
+                .collect();
+            (user_msg, recalls)
+        }
+
+        // User-facing origin: preamble injected, one successful recall event.
+        let (msg, recalls) = run_case(
+            &StaticRecallMemory,
+            zeroclaw_api::ingress::TurnOrigin::Interactive,
+        )
+        .await;
+        assert!(msg.starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN));
+        assert!(msg.contains("- remembered: the server is prod-3"));
+        assert!(msg.ends_with("what server?"));
+        assert_eq!(recalls.len(), 1);
+        assert!(recalls[0].1, "recall event must report success");
+
+        // SubTurn origin: no injection, no recall, no event.
+        let (msg, recalls) = run_case(
+            &StaticRecallMemory,
+            zeroclaw_api::ingress::TurnOrigin::SubTurn,
+        )
+        .await;
+        assert_eq!(msg, "what server?");
+        assert!(recalls.is_empty(), "sub-turns must not recall memory");
+
+        // Failing backend: turn proceeds bare, one failure event.
+        let (msg, recalls) = run_case(
+            &FailingRecallMemory,
+            zeroclaw_api::ingress::TurnOrigin::Interactive,
+        )
+        .await;
+        assert_eq!(msg, "what server?");
+        assert_eq!(recalls.len(), 1);
+        assert!(!recalls[0].1, "recall event must report failure");
     }
 
     /// When `vision_model_provider` is set but `vision_model` is not, the default
@@ -5607,7 +5938,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -5682,7 +6014,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -5756,7 +6089,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -5914,7 +6248,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -6046,7 +6381,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: Some("test-agent"),
             turn_id: &turn_id,
         })
@@ -6200,7 +6536,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: Some("test-agent"),
             turn_id: &turn_id,
         })
@@ -6319,7 +6656,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -6491,7 +6829,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -6596,7 +6935,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -6685,7 +7025,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -6766,7 +7107,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -6855,7 +7197,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -6947,7 +7290,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -7044,7 +7388,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -7136,7 +7481,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -7230,7 +7576,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -7329,7 +7676,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -7420,7 +7768,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -7516,7 +7865,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -7611,7 +7961,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -7692,7 +8043,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -7777,7 +8129,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -7857,7 +8210,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -7935,7 +8289,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -8016,7 +8371,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -8094,7 +8450,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -8171,7 +8528,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -8240,7 +8598,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -8310,7 +8669,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -8380,7 +8740,8 @@ mod tests {
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -8452,7 +8813,8 @@ This is an example, not an invocation."#;
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -8529,7 +8891,8 @@ This is an example, not an invocation."#;
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -8618,7 +8981,8 @@ This is an example, not an invocation."#;
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -8690,7 +9054,8 @@ Done."#;
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -8765,7 +9130,8 @@ Done."#;
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -8838,7 +9204,8 @@ Done."#;
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -8912,7 +9279,8 @@ This is an example, not an invocation."#;
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -9043,7 +9411,8 @@ This is an example, not an invocation."#;
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -9125,7 +9494,8 @@ This is an example, not an invocation."#;
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -9211,7 +9581,8 @@ This is an example, not an invocation."#;
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -9320,7 +9691,8 @@ This is an example, not an invocation."#;
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -9434,7 +9806,8 @@ This is an example, not an invocation."#;
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -9522,7 +9895,8 @@ This is an example, not an invocation."#;
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -9619,7 +9993,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            ingress: zeroclaw_api::ingress::IngressContext::internal(),
+            memory: None,
+            ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -9697,7 +10072,7 @@ This is an example, not an invocation."#;
             Some(&[crate::tools::ToolSpec {
                 name: "count_tool".to_string(),
                 description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
+                parameters: serde_json::json!({"type": "object"}).into(),
             }]),
             "mock-model",
             Some(0.0),
@@ -9783,7 +10158,7 @@ This is an example, not an invocation."#;
             Some(&[crate::tools::ToolSpec {
                 name: "count_tool".to_string(),
                 description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
+                parameters: serde_json::json!({"type": "object"}).into(),
             }]),
             "mock-model",
             Some(0.0),
@@ -9860,7 +10235,7 @@ This is an example, not an invocation."#;
             Some(&[crate::tools::ToolSpec {
                 name: "count_tool".to_string(),
                 description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
+                parameters: serde_json::json!({"type": "object"}).into(),
             }]),
             "mock-model",
             Some(0.0),
@@ -9900,7 +10275,7 @@ This is an example, not an invocation."#;
             Some(&[crate::tools::ToolSpec {
                 name: "count_tool".to_string(),
                 description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
+                parameters: serde_json::json!({"type": "object"}).into(),
             }]),
             "mock-model",
             Some(0.0),
@@ -10239,7 +10614,7 @@ This is an example, not an invocation."#;
             Some(&[crate::tools::ToolSpec {
                 name: "count_tool".to_string(),
                 description: "Count values".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
+                parameters: serde_json::json!({"type": "object"}).into(),
             }]),
             "mock-model",
             Some(0.0),
@@ -10500,7 +10875,8 @@ This is an example, not an invocation."#;
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -10599,7 +10975,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -10699,7 +11076,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -10799,7 +11177,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -10845,7 +11224,7 @@ This is an example, not an invocation."#;
         let tools = [crate::tools::ToolSpec {
             name: "count_tool".to_string(),
             description: "Count values".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
+            parameters: serde_json::json!({"type": "object"}).into(),
         }];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
@@ -10956,7 +11335,8 @@ This is an example, not an invocation."#;
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -11047,6 +11427,8 @@ This is an example, not an invocation."#;
                 0,     // max_tool_result_chars: disabled for test
                 0,     // context_token_budget: disabled for test
                 None,  // channel
+                TurnOrigin::SubTurn,
+                None,
             )
             .await
             .expect("wrapper path should execute activated tools");
@@ -11115,6 +11497,8 @@ This is an example, not an invocation."#;
                 0,     // max_tool_result_chars: disabled for test
                 0,     // context_token_budget: disabled for test
                 None,  // channel
+                TurnOrigin::SubTurn,
+                None,
             )
             .await
             .expect("strict wrapper path should preserve fallback-looking text");
@@ -11244,6 +11628,8 @@ This is an example, not an invocation."#;
                 100, // max_tool_result_chars: truncate at 100 chars
                 0,   // context_token_budget: disabled
                 None,
+                TurnOrigin::SubTurn,
+                None,
             )
             .await
             .expect("agent_turn should complete");
@@ -11321,6 +11707,8 @@ This is an example, not an invocation."#;
                 false,
                 0, // max_tool_result_chars: disabled (no truncation)
                 0, // context_token_budget: disabled
+                None,
+                TurnOrigin::SubTurn,
                 None,
             )
             .await
@@ -11497,112 +11885,6 @@ This is an example, not an invocation."#;
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 
-    #[tokio::test]
-    async fn build_context_ignores_legacy_assistant_autosave_entries() {
-        let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-        mem.store(
-            "assistant_resp_poisoned",
-            "User suffered a fabricated event",
-            MemoryCategory::Daily,
-            None,
-        )
-        .await
-        .unwrap();
-        mem.store(
-            "user_preference",
-            "User asked for concise status updates",
-            MemoryCategory::Conversation,
-            None,
-        )
-        .await
-        .unwrap();
-
-        let context = build_context(&mem, &NoopObserver, "status updates", 0.0, None, false).await;
-        assert!(context.contains("user_preference"));
-        assert!(!context.contains("assistant_resp_poisoned"));
-        assert!(!context.contains("fabricated event"));
-    }
-
-    #[tokio::test]
-    async fn build_context_ignores_user_autosave_entries() {
-        let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-        mem.store(
-            "user_msg",
-            "Original user message with full conversation history",
-            MemoryCategory::Conversation,
-            None,
-        )
-        .await
-        .unwrap();
-        mem.store(
-            "user_msg_a1b2c3d4",
-            "Follow-up user message embedding prior context verbatim",
-            MemoryCategory::Conversation,
-            None,
-        )
-        .await
-        .unwrap();
-        mem.store(
-            "user_preference",
-            "User prefers concise answers",
-            MemoryCategory::Conversation,
-            None,
-        )
-        .await
-        .unwrap();
-
-        let context = build_context(&mem, &NoopObserver, "answers", 0.0, None, false).await;
-        assert!(context.contains("user_preference"));
-        assert!(!context.contains("user_msg"));
-        assert!(!context.contains("embedding prior context"));
-    }
-
-    /// Regression: cron / heartbeat runs must not surface chat-origin
-    /// `Conversation` memories — the leak path the #5456 prefix filter
-    /// missed because `agent::run` performs a second, unfiltered recall
-    /// inside `build_context`.
-    #[tokio::test]
-    async fn build_context_excludes_conversation_when_flag_set() {
-        let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-        // A Conversation entry written by a chat channel with a non-autosave
-        // key (autosave keys are already skipped by the existing filters).
-        mem.store(
-            "discord:guild:chan:msg-42",
-            "Reminder for Alice: the API key is in 1Password vault Foo.",
-            MemoryCategory::Conversation,
-            Some("discord:guild:chan"),
-        )
-        .await
-        .unwrap();
-        // A non-Conversation memory that should still surface so we know the
-        // function still does its job — only Conversation should be dropped.
-        mem.store(
-            "team_oncall",
-            "Primary on-call rotates every Monday at 09:00 UTC.",
-            MemoryCategory::Core,
-            None,
-        )
-        .await
-        .unwrap();
-
-        let context = build_context(&mem, &NoopObserver, "Alice on-call", 0.0, None, true).await;
-        assert!(
-            !context.contains("Alice"),
-            "Conversation memory leaked into scheduled context: {context}"
-        );
-        assert!(
-            !context.contains("API key"),
-            "Conversation memory leaked into scheduled context: {context}"
-        );
-        assert!(
-            context.contains("team_oncall"),
-            "Non-Conversation memory should still surface: {context}"
-        );
-    }
-
     #[test]
     fn make_query_summary_redacts_credentials_and_caps_length() {
         // Empty input → None (so observers can distinguish "no query
@@ -11642,14 +11924,13 @@ This is an example, not an invocation."#;
     /// Captured `MemoryRecall` event used by the wiring-contract tests below.
     struct CapturedRecall {
         query_summary: Option<String>,
-        backend: String,
         success: bool,
     }
 
     /// Counting observer that records every `MemoryRecall` event so the test
-    /// can assert that the runtime hot path emits the variant once per
-    /// `build_context` call. Locks in the wiring contract that motivated the
-    /// memory-OTel work.
+    /// can assert that the runtime hot path emits the variant once per engine
+    /// memory-context render (`agent::memory_inject::render_memory_context`).
+    /// Locks in the wiring contract that motivated the memory-OTel work.
     #[derive(Default)]
     struct RecallCountingObserver {
         recalls: parking_lot::Mutex<Vec<CapturedRecall>>,
@@ -11659,14 +11940,12 @@ This is an example, not an invocation."#;
         fn record_event(&self, event: &crate::observability::ObserverEvent) {
             if let crate::observability::ObserverEvent::MemoryRecall {
                 query_summary,
-                backend,
                 success,
                 ..
             } = event
             {
                 self.recalls.lock().push(CapturedRecall {
                     query_summary: query_summary.clone(),
-                    backend: backend.clone(),
                     success: *success,
                 });
             }
@@ -11683,31 +11962,9 @@ This is an example, not an invocation."#;
         }
     }
 
-    #[tokio::test]
-    async fn build_context_emits_memory_recall_event() {
-        let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-        let observer = RecallCountingObserver::default();
-
-        let _ = build_context(&mem, &observer, "any query", 0.0, None, false).await;
-
-        let recalls = observer.recalls.lock();
-        assert_eq!(
-            recalls.len(),
-            1,
-            "build_context must emit exactly one MemoryRecall event per call"
-        );
-        assert_eq!(recalls[0].query_summary.as_deref(), Some("any query"));
-        assert_eq!(recalls[0].backend, "sqlite");
-        assert!(
-            recalls[0].success,
-            "successful recall must report success = true"
-        );
-    }
-
     /// Memory backend whose `recall` always returns `Err`. Used to exercise
-    /// the failure arm of `build_context`'s explicit match — the runtime
-    /// swallows the error and returns an empty context, but observers must
+    /// the recall-failure arm of the engine's memory-context render; the
+    /// runtime swallows the error and injects nothing, but observers must
     /// still see a `MemoryRecall { success: false }` event.
     struct FailingRecallMemory;
 
@@ -11790,31 +12047,6 @@ This is an example, not an invocation."#;
         fn alias(&self) -> &str {
             "FailingRecallMemory"
         }
-    }
-
-    #[tokio::test]
-    async fn build_context_emits_memory_recall_event_on_failure() {
-        let mem = FailingRecallMemory;
-        let observer = RecallCountingObserver::default();
-
-        let context = build_context(&mem, &observer, "any query", 0.0, None, false).await;
-        assert!(
-            context.is_empty(),
-            "recall failure must still produce empty context (swallow behavior)"
-        );
-
-        let recalls = observer.recalls.lock();
-        assert_eq!(
-            recalls.len(),
-            1,
-            "build_context must emit exactly one MemoryRecall event even on Err"
-        );
-        assert_eq!(recalls[0].query_summary.as_deref(), Some("any query"));
-        assert_eq!(recalls[0].backend, "failing-recall");
-        assert!(
-            !recalls[0].success,
-            "failed recall must report success = false"
-        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -12884,7 +13116,7 @@ Let me check the result."#;
         crate::tools::ToolSpec {
             name: name.to_string(),
             description: String::new(),
-            parameters: serde_json::json!({}),
+            parameters: serde_json::json!({}).into(),
         }
     }
 
@@ -12997,6 +13229,63 @@ Let me check the result."#;
         assert_eq!(tokens, 23);
     }
 
+    /// Regression for the 🟡 note2.md warning: the CLI outer-recovery trim
+    /// at loop_.rs:~2557 must target *below* the model window, not the full
+    /// window. Trimming to the raw `eff_model_context_window` leaves zero
+    /// headroom: the request that just failed already exceeded the
+    /// provider's real tokenizer, and `trim_to_recent_turns` measures via
+    /// `estimate_history_tokens` (~4 chars/token; history.rs:285), which
+    /// under-counts. The retry would re-overflow at the same boundary.
+    ///
+    /// The fix trims to `eff_model_context_window * 9 / 10` (10% headroom:
+    /// absorbs the heuristic's under-count plus room for the assistant
+    /// reply + next user turn). This test pins that property by feeding a
+    /// history whose estimate *equals* the window — full-window trimming
+    /// would no-op and the retry would fail; the 90% budget forces a trim.
+    #[test]
+    fn cli_outer_recovery_trims_below_model_window_with_headroom() {
+        use crate::agent::history_trim::trim_to_recent_turns;
+
+        let model_context_window: usize = 32_000;
+        let recovery_budget = model_context_window * 9 / 10; // 28_800
+
+        // Build a history whose estimate_history_tokens *exceeds* the
+        // window so a full-window budget would not trim and the retry
+        // would re-overflow, but the 90% budget must trim. 4000 chars per
+        // message ≈ 1004 estimated tokens; 32 user turns + 32 assistant
+        // replies + 1 system ≈ 65 messages × ~1004 = ~65_260 tokens.
+        let big = "x".repeat(4000);
+        let mut history = vec![ChatMessage::system("sys")];
+        for i in 0..32 {
+            history.push(ChatMessage::user(format!("turn {i} {big}").as_str()));
+            history.push(ChatMessage::assistant(format!("reply {i} {big}").as_str()));
+        }
+        let tokens_before = super::estimate_history_tokens(&history);
+        assert!(
+            tokens_before > model_context_window,
+            "fixture must overflow the window: got {tokens_before}"
+        );
+
+        let result = trim_to_recent_turns(history, recovery_budget);
+        assert!(
+            result.trimmed,
+            "recovery must trim when the estimate exceeds the 90% budget"
+        );
+        assert!(
+            result.tokens_after <= recovery_budget,
+            "tokens_after ({}) must be <= recovery_budget ({})",
+            result.tokens_after,
+            recovery_budget
+        );
+        // Headroom must leave us strictly below the model's true window,
+        // so the retried request has room for the reply + next user turn.
+        assert!(
+            result.tokens_after < model_context_window,
+            "headroom must leave us strictly below the model window: got {}",
+            result.tokens_after
+        );
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_surfaces_tool_failure_reason_in_on_delta() {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -13061,7 +13350,8 @@ Let me check the result."#;
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -13235,7 +13525,8 @@ Let me check the result."#;
                     image_cache: None,
                     // Phase 1: stamp Internal/Trusted. Real per-transport
                     // stamping is PR C (RFC #6971 §4).
-                    ingress: IngressContext::internal(),
+                    memory: None,
+                    ingress: IngressContext::sub_turn(),
                     agent_alias: None,
                     turn_id: &turn_id,
                 }),
@@ -13308,7 +13599,8 @@ Let me check the result."#;
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -13420,7 +13712,8 @@ Let me check the result."#;
                     image_cache: None,
                     // Phase 1: stamp Internal/Trusted. Real per-transport
                     // stamping is PR C (RFC #6971 §4).
-                    ingress: IngressContext::internal(),
+                    memory: None,
+                    ingress: IngressContext::sub_turn(),
                     agent_alias: None,
                     turn_id: &turn_id,
                 }),
@@ -13498,7 +13791,8 @@ Let me check the result."#;
             image_cache: None,
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
         })
@@ -13581,7 +13875,8 @@ Let me check the result."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: "test-turn-id",
         })
@@ -13805,6 +14100,88 @@ Let me check the result."#;
             after, before,
             "budget-exceeded fork must not make a recorded provider call"
         );
+    }
+
+    #[tokio::test]
+    async fn reflected_skill_creation_records_cost_usage_under_parent_scope() {
+        use super::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        use crate::cost::CostTracker;
+        use crate::skills::creator::{SkillCreator, ToolCallRecord};
+
+        // Reflection's single post-turn provider call returns a valid SKILL.md
+        // with usage. It must go through `chat` (the scripted provider bails on
+        // `chat_with_system`), and record its usage under the parent scope.
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some(
+                    "---\nname: model-picked\ndescription: Build and test the project.\n---\n\n# X\n\nBody.\n"
+                        .to_string(),
+                ),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(800),
+                    output_tokens: Some(120),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let creator = SkillCreator::new(
+            dir.path().to_path_buf(),
+            zeroclaw_config::schema::SkillCreationConfig {
+                enabled: true,
+                reflection_enabled: true,
+                ..zeroclaw_config::schema::SkillCreationConfig::default()
+            },
+        );
+        let tool_calls = vec![
+            ToolCallRecord {
+                name: "shell".to_string(),
+                args: serde_json::json!({ "cmd": "build" }),
+            },
+            ToolCallRecord {
+                name: "shell".to_string(),
+                args: serde_json::json!({ "cmd": "test" }),
+            },
+        ];
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let cost_config = zeroclaw_config::schema::CostConfig {
+            enabled: true,
+            ..zeroclaw_config::schema::CostConfig::default()
+        };
+        let tracker = Arc::new(CostTracker::new(cost_config, workspace.path()).unwrap());
+        let ctx =
+            ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(review_test_pricing()));
+
+        let slug = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                creator.create_from_execution_reflected(
+                    "Build and test the project",
+                    &tool_calls,
+                    "All tests passed.",
+                    None,
+                    "mock-provider",
+                    &model_provider,
+                    "mock-model",
+                ),
+            )
+            .await
+            .unwrap()
+            .expect("a skill should be created from the reflected SKILL.md");
+        assert_eq!(slug, "build-and-test-the-project");
+
+        let summary = tracker.get_summary().unwrap();
+        assert_eq!(
+            summary.request_count, 1,
+            "reflection must record its provider call under the parent cost scope"
+        );
+        assert_eq!(summary.total_tokens, 920);
+        assert!(summary.session_cost_usd > 0.0);
     }
 
     // ── apply_policy_tool_filter coverage ─────────────────────
@@ -14375,12 +14752,18 @@ Let me check the result."#;
             false,
             None,
             None,
+            TurnOrigin::SubTurn,
             super::AgentRunOverrides::default(),
         )
         .await;
-        let _ =
-            super::process_message(config, "entrypoint-profile-agent", "hello", Some("session"))
-                .await;
+        let _ = super::process_message(
+            config,
+            "entrypoint-profile-agent",
+            "hello",
+            Some("session"),
+            TurnOrigin::SubTurn,
+        )
+        .await;
 
         {
             let mut hook = RESOLVED_AGENT_FOR_TURN_TEST_HOOK
@@ -14476,6 +14859,7 @@ Let me check the result."#;
                 connect_mcp: false,   // exercise the filter without MCP fixtures
                 connect_peripherals: false,
                 exclude_memory: false,
+                list_deferred_mcp_specs: false,
                 emit_assembly_logs: false,
             },
         )
@@ -14690,7 +15074,8 @@ Let me check the result."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            ingress: IngressContext::internal(),
+            memory: None,
+            ingress: IngressContext::sub_turn(),
             agent_alias: Some("test-agent"),
             turn_id: &turn_id,
         })

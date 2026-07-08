@@ -1071,7 +1071,7 @@ capabilities = ["tool"]
         assert_eq!(
             host.list_plugins().len(),
             1,
-            "permissive mode must load an unsigned plugin (signed-but-invalid is rejected by enforce_signature_policy, covered in signature.rs)"
+            "permissive mode must load an unsigned plugin (untrusted and invalid signatures also load with a warning in permissive mode, covered in signature.rs)"
         );
     }
 

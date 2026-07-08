@@ -127,6 +127,7 @@ cli-models-set-about = 在配置中设置默认模型
 cli-models-status-about = 显示当前模型配置和缓存状态
 cli-doctor-models-about = 探测各提供商的模型目录并报告可用性
 cli-doctor-traces-about = 查询运行时跟踪事件（工具诊断和模型回复）
+cli-doctor-update-context-windows-about = 从提供商的 /models 端点更新 config.toml 中的 context_window
 cli-hardware-discover-about = 枚举 USB 设备并显示已知开发板
 cli-hardware-introspect-about = 通过序列号或设备路径检视设备
 cli-hardware-info-about = 通过 ST-Link 使用 probe-rs 经 USB 获取芯片信息
@@ -360,6 +361,9 @@ channel-discord-delivery-failure-note-one = （注意：我无法传送 {$count}
 channel-discord-delivery-failure-note-many = （注意：我无法传送 {$count} 个文件。）
 channel-whatsapp-web-delivery-failure-note-one = （注意：我无法传送 {$count} 个 WhatsApp 媒体附件。）
 channel-whatsapp-web-delivery-failure-note-many = （注意：我无法传送 {$count} 个 WhatsApp 媒体附件。）
+channel-line-bind-success = ✅ 已配对！现在可以聊天了。
+channel-line-bind-invalid-code = ❌ 代码无效。请重试。
+channel-line-bind-rate-limited = ⏳ 尝试次数过多。请在 { $secs }s 后重试。
 onboard-openai-auth-note =
     OpenAI 身份验证：
     • API 密钥 — 通过 platform.openai.com 的标准 API 访问（sk-...）
@@ -373,10 +377,17 @@ onboard-openai-codex-followup =
 cli-web-dist-dir-reason-tilde = 以不会被展开的 `~` 开头
 cli-web-dist-dir-reason-dollar = 包含不会被展开的 `$`
 cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason}；gateway.web_dist_dir 按原样读取，请自行展开该值（例如使用绝对路径）
+cli-doctor-codex-auth-profile-no-slot = OpenAI Codex 凭据已登录，但没有模型提供方槽位使用它们。请在 OpenAI 提供方槽位上设置 `requires_openai_auth = true`，并将 agent 的 `model_provider` 指向它，或运行 `zeroclaw quickstart`。
+cli-doctor-codex-auth-slot-no-profile = OpenAI 槽位 {$slots} 已设置 `requires_openai_auth = true`，但没有 OpenAI Codex 凭据登录。请运行 `zeroclaw auth login --provider openai-codex`。
+cli-doctor-codex-auth-ok = OpenAI Codex 凭据已登录，并由模型提供方槽位引用。
+cli-doctor-systemd-linger-enabled = systemd 用户 linger 已启用
+cli-doctor-systemd-linger-disabled = systemd 用户 linger 已禁用；用户服务可能会在注销后停止。启用命令：loginctl enable-linger {$user}
+cli-doctor-systemd-linger-unknown = 无法使用 loginctl 检查 systemd 用户 linger
 cli-self-test-web-dist-dir-name = web_dist_dir
 cli-self-test-web-dist-dir-pass-unset = 未设置（使用自动检测）
 cli-self-test-web-dist-dir-pass-literal = {$path}（字面路径）
 cli-self-test-web-dist-dir-fail-expansion = 警告：{$path} — {$reason}；gateway.web_dist_dir 按原样读取，请自行展开该值（例如使用绝对路径）
+cli-service-systemd-linger-disabled-warning = systemd 用户 linger 已禁用。ZeroClaw 的用户服务可能会在注销后停止。启用命令：loginctl enable-linger {$user}
 cli-peripherals-none = 未配置外设。
 cli-peripherals-add-hint = 使用以下命令添加: zeroclaw peripheral add <board> <path>
 cli-peripherals-add-example = {"  "}示例: zeroclaw peripheral add nucleo-f401re <serial-path>
@@ -392,7 +403,17 @@ cli-skills-create-hint = {"  "}创建一个: mkdir -p ~/.zeroclaw/workspace/skil
 cli-skills-install-hint = {"  "}或安装: zeroclaw skills install <source>
 cli-skills-installed-header = 已安装的技能 ({$count}):
 cli-skills-tags = 标签:  {$tags}
+cli-skills-skipped-header = 已跳过 ({$count}):
+cli-skills-skipped-reason = {"    "}原因: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}在 zeroclaw 配置中设置 `skills.allow_scripts = true` 以启用它。
 cli-sop-none = 未找到 SOP。
+cli-sop-pending-none = 没有等待审批的 SOP 运行。
+cli-sop-pending-header = 等待审批的 SOP 运行：
+cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] 步骤 {$step}/{$total}
+cli-sop-ws-invalid-approval = sop approval_response 需要 run_id，以及 approve 或 deny 决策
+cli-sop-ws-resolve-failed = SOP 解析失败：{$error}
+cli-sop-ws-engine-lock-poisoned = SOP 引擎锁已中毒
+cli-sop-ws-subsystem-disabled = SOP 子系统未启用
 cli-sop-create-hint = {"  "}创建一个: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}然后添加 SOP.toml 和 SOP.md
 cli-sop-loaded-header = 已加载的 SOP ({$count}):
@@ -656,6 +677,10 @@ cli-plugin-no-description = （无描述）
 cli-plugin-install-resolving = 正在从插件注册表解析 '{$source}'...
 cli-plugin-installed-from = 已从 {$source} 安装插件
 cli-plugin-installed-name-version = 已安装插件 {$name} v{$version}
+cli-plugin-config-entry-seeded = 已为 '{$name}' 创建 [[plugins.entries]]。使用 `zeroclaw config set plugins.entries.{$name}.config.<key>` 设置插件配置值。
+cli-plugin-config-entry-seed-skipped = 警告：已跳过为 '{$name}' 创建配置条目：磁盘上的 [plugins] 部分格式不正确。请修复它，添加带有 `name = "{$name}"` 的 [[plugins.entries]] 块，然后使用 `zeroclaw config set plugins.entries.{$name}.config.<key>` 设置值。
+cli-plugin-config-entry-seed-unaddressable = 警告：已跳过为 '{$name}' 创建配置条目：包含 '.' 的插件名称无法通过点分配置路径寻址（`config set` 会按 '.' 分割）。请手动向配置文件添加带有 `name = "{$name}"` 的 [[plugins.entries]] 块。
+cli-config-section-degraded = 警告：{$path} 中的配置部分 `{$section}` 格式不正确，本次运行已重置为默认值。该部分中的值不会生效。请运行 `zeroclaw config migrate` 查看解析错误，然后修复文件。
 cli-plugin-removed = 已移除插件“{$name}”。
 cli-plugin-not-found = 未找到插件“{$name}”。
 cli-plugin-legacy-detected = 注意：位于旧位置（{$path}）的插件未被代理加载。请运行 `zeroclaw plugin migrate` 将其移动到 {$target}。
@@ -740,6 +765,7 @@ turn-cancelled-client-rpc = [已通过客户端取消回合]
 turn-stream-interrupted = [流已中断]
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
+history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 turn-ingress-dropped = 此请求未被处理：{ $reason }
 turn-tool-interrupted-before-result = [在此工具产生结果前被用户中断]
 channel-runtime-malformed-tool-output = 我生成了内部工具调用格式错误，无法完成此请求。请重试。
@@ -789,3 +815,20 @@ cli-bundle-warn-archive = 警告：bundle 目录归档失败：{$error}
 cli-bundle-deleted = 已删除 skill_bundles.{$alias}（已从 {$count} 个 agent 中移除）
 cli-bundle-warn-move = 警告：bundle 目录移动失败：{$error}
 cli-bundle-renamed = 已重命名 skill_bundles.{$from} → skill_bundles.{$to}
+
+cli-daemon-gateway-already-running = ZeroClaw gateway 已在 {$host}:{$port} 运行。daemon 会管理自己的 gateway，不会在同一地址启动第二个 gateway。请停止该 gateway（或使用 `zeroclaw config set gateway.port <port>` 将 daemon 指向空闲端口），然后重新运行 daemon。
+cli-daemon-gateway-port-occupied = Gateway 地址 {$host}:{$port} 已被另一个进程占用。请释放该端口或将 daemon 指向空闲端口（`zeroclaw config set gateway.port <port>`），然后重新运行 daemon。
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
+cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
+cli-agent-context-bar-unknown = ctx: 未知 / {$max}
+cli-doctor-ctxwin-already-set = {$provider_ref}: 已有 context_window = {$ctx}
+cli-doctor-ctxwin-no-model = {$provider_ref}: 未配置模型，跳过
+cli-doctor-ctxwin-would-set = {$provider_ref}: 将设置 context_window = {$ctx} (试运行)
+cli-doctor-ctxwin-set = {$provider_ref}: 已设置 context_window = {$ctx}
+cli-doctor-ctxwin-not-found = {$provider_ref}: 找不到要更新的条目
+cli-doctor-ctxwin-fetch-failed = {$provider_ref}: 提供商未暴露上下文窗口或获取失败
+cli-doctor-ctxwin-saved = 已保存 {$updated} 项更新到 config.toml
+cli-doctor-ctxwin-dry-run = 试运行完成 — 未写入更改。去掉 --dry-run 以应用。
+cli-doctor-ctxwin-none = 无需更新。
+cli-doctor-ctxwin-write-failed = {$provider_ref}: 写入 context_window 失败: {$error}

@@ -46,6 +46,16 @@ pub(crate) fn require_auth(
     }
 
     let token = extract_bearer_token(headers).unwrap_or("");
+    // Defense-in-depth: reject empty tokens explicitly so a future
+    // refactor of is_authenticated cannot accidentally treat "" as valid.
+    if token.is_empty() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            })),
+        ));
+    }
     if state.pairing.is_authenticated(token) {
         Ok(())
     } else {
@@ -2013,6 +2023,15 @@ mod tests {
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
+
+        // Override the trait default (which returns an "unsupported" Err) so
+        // tests that trigger the delete_agent cascade don't have their
+        // `warnings` array polluted with a memory-backend error that has
+        // nothing to do with what they're actually asserting. Mirrors the
+        // behavior of a real backend on a delete-of-a-never-stored agent.
+        async fn purge_agent(&self, _agent_alias: &str) -> anyhow::Result<usize> {
+            Ok(0)
+        }
     }
     impl ::zeroclaw_api::attribution::Attributable for MockMemory {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -2287,7 +2306,7 @@ mod tests {
         let spec = |name: &str| ToolSpec {
             name: name.to_string(),
             description: format!("{name} desc"),
-            parameters: serde_json::json!({}),
+            parameters: serde_json::json!({}).into(),
         };
         state.tools_registry = Arc::new(vec![spec("default_tool")]);
         let mut by_agent: std::collections::HashMap<String, Arc<Vec<ToolSpec>>> =
@@ -2668,6 +2687,24 @@ mod tests {
                 .iter()
                 .any(|item| item.contains("Bind this channel"))
         );
+    }
+
+    #[test]
+    fn require_auth_rejects_empty_bearer_token() {
+        let config = zeroclaw_config::schema::Config::default();
+        let mut state = test_state(config);
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer ".parse().unwrap(), // empty token after prefix
+        );
+
+        let result = require_auth(&state, &headers);
+        assert!(result.is_err(), "empty bearer token must be rejected");
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

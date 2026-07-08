@@ -38,6 +38,8 @@ pub use crate::discord::DiscordChannel;
 pub use crate::email_channel::EmailChannel;
 #[cfg(feature = "channel-filesystem")]
 pub use crate::filesystem::FilesystemChannel;
+#[cfg(feature = "channel-git")]
+pub use crate::git::GitChannel;
 #[cfg(feature = "channel-email")]
 pub use crate::gmail_push::GmailPushChannel;
 #[cfg(feature = "channel-imessage")]
@@ -124,7 +126,9 @@ use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
 use zeroclaw_config::schema::Config;
-use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
+#[cfg(test)]
+use zeroclaw_memory::MEMORY_CONTEXT_OPEN;
+use zeroclaw_memory::{self, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
@@ -261,9 +265,6 @@ const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
-const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
-const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
-const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
 /// Proactive context-window budget in estimated characters (~4 chars/token).
@@ -1201,23 +1202,18 @@ fn build_channel_turn_context_preamble(
     preamble
 }
 
-/// Compose the outgoing user-turn content from the volatile preamble, the
-/// per-turn memory recall block, and the raw (timestamped) user content.
+/// Compose the outgoing user-turn content from the volatile preamble and
+/// the raw (timestamped) user content. The per-turn memory block is no
+/// longer composed here: the turn engine injects it above the whole user
+/// turn (agent::memory_inject), so the wire order is memory -> preamble ->
+/// raw content, matching the CLI shape.
 ///
-/// Order on the wire: preamble → memory_context → raw user content, joined
-/// by blank lines. When `preamble` is empty (CLI-style / no `reply_target`)
-/// and `memory_context` is empty, returns the raw content unchanged.
-fn compose_outgoing_user_turn_with_context(
-    preamble: &str,
-    memory_context: &str,
-    raw_user_content: &str,
-) -> String {
-    let mut parts: Vec<&str> = Vec::with_capacity(3);
+/// When `preamble` is empty (CLI-style / no `reply_target`), returns the
+/// raw content unchanged.
+fn compose_outgoing_user_turn_with_context(preamble: &str, raw_user_content: &str) -> String {
+    let mut parts: Vec<&str> = Vec::with_capacity(2);
     if !preamble.is_empty() {
         parts.push(preamble);
-    }
-    if !memory_context.is_empty() {
-        parts.push(memory_context);
     }
     parts.push(raw_user_content);
     parts.join("\n\n")
@@ -2082,7 +2078,8 @@ fn refreshed_new_session_system_prompt(ctx: &ChannelRuntimeContext) -> String {
             ctx.agent_alias.as_ref(),
         ),
         ctx.workspace_dir.as_ref(),
-        ctx.prompt_config.skills.prompt_injection_mode,
+        ctx.prompt_config
+            .effective_skills_prompt_mode(ctx.agent_alias.as_str()),
     );
     replace_available_skills_section(ctx.system_prompt.as_str(), &refreshed_skills)
 }
@@ -2251,45 +2248,6 @@ fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
     }
 
     zeroclaw_providers::reliable::is_non_retryable(error)
-}
-
-fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
-    if zeroclaw_memory::is_assistant_autosave_key(key) {
-        return true;
-    }
-
-    // Skip raw per-turn user messages: re-injecting them causes each
-    // recalled entry to embed all prior generations, growing exponentially.
-    // Consolidated knowledge is already promoted to Core/Daily entries.
-    if zeroclaw_memory::is_user_autosave_key(key) {
-        return true;
-    }
-
-    if zeroclaw_memory::should_skip_autosave_content(content) {
-        return true;
-    }
-
-    if key.trim().to_ascii_lowercase().ends_with("_history") {
-        return true;
-    }
-
-    // Skip entries containing image markers to prevent duplication.
-    // When auto_save stores a photo message to memory, a subsequent
-    // memory recall on the same turn would surface the marker again,
-    // causing two identical image blocks in the model_provider request.
-    if content.contains("[IMAGE:") {
-        return true;
-    }
-
-    // Skip entries containing tool_result blocks. After a daemon restart
-    // these can be recalled from SQLite and injected as memory context,
-    // presenting the LLM with a `<tool_result>` without a preceding
-    // `<tool_call>` and triggering hallucinated output.
-    if content.contains("<tool_result") {
-        return true;
-    }
-
-    content.chars().count() > MEMORY_CONTEXT_MAX_CHARS
 }
 
 fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
@@ -2964,114 +2922,6 @@ async fn handle_runtime_command_if_needed(
     }
 
     true
-}
-
-async fn build_memory_context(
-    mem: &dyn Memory,
-    user_msg: &str,
-    min_relevance_score: f64,
-    session_id: Option<&str>,
-) -> String {
-    build_memory_context_for_sessions(mem, user_msg, min_relevance_score, &[session_id]).await
-}
-
-async fn build_memory_context_for_sessions(
-    mem: &dyn Memory,
-    user_msg: &str,
-    min_relevance_score: f64,
-    session_ids: &[Option<&str>],
-) -> String {
-    let mut entries = Vec::new();
-    let mut seen_keys = HashSet::new();
-
-    match session_ids {
-        [] => {}
-        [session_id] => {
-            let recalled = mem.recall(user_msg, 5, *session_id, None, None).await;
-            append_recalled_memory_entries(&mut entries, &mut seen_keys, recalled);
-        }
-        [first_session_id, second_session_id] => {
-            let (first_entries, second_entries) = tokio::join!(
-                mem.recall(user_msg, 5, *first_session_id, None, None),
-                mem.recall(user_msg, 5, *second_session_id, None, None)
-            );
-            append_recalled_memory_entries(&mut entries, &mut seen_keys, first_entries);
-            append_recalled_memory_entries(&mut entries, &mut seen_keys, second_entries);
-        }
-        _ => {
-            for session_id in session_ids {
-                let recalled = mem.recall(user_msg, 5, *session_id, None, None).await;
-                append_recalled_memory_entries(&mut entries, &mut seen_keys, recalled);
-            }
-        }
-    }
-
-    format_memory_context(&entries, min_relevance_score)
-}
-
-fn append_recalled_memory_entries(
-    entries: &mut Vec<zeroclaw_memory::MemoryEntry>,
-    seen_keys: &mut HashSet<String>,
-    recalled: Result<Vec<zeroclaw_memory::MemoryEntry>>,
-) {
-    if let Ok(recalled) = recalled {
-        for entry in recalled {
-            if seen_keys.insert(entry.key.clone()) {
-                entries.push(entry);
-            }
-        }
-    }
-}
-
-fn format_memory_context(
-    entries: &[zeroclaw_memory::MemoryEntry],
-    min_relevance_score: f64,
-) -> String {
-    let mut context = String::new();
-
-    let mut included = 0usize;
-    let mut used_chars = 0usize;
-
-    for entry in entries.iter().filter(|e| match e.score {
-        Some(score) => score >= min_relevance_score,
-        None => true, // keep entries without a score (e.g. non-vector backends)
-    }) {
-        if included >= MEMORY_CONTEXT_MAX_ENTRIES {
-            break;
-        }
-
-        if should_skip_memory_context_entry(&entry.key, &entry.content) {
-            continue;
-        }
-
-        let content = if entry.content.chars().count() > MEMORY_CONTEXT_ENTRY_MAX_CHARS {
-            truncate_with_ellipsis(&entry.content, MEMORY_CONTEXT_ENTRY_MAX_CHARS)
-        } else {
-            entry.content.clone()
-        };
-
-        let line = format!("- {}: {}\n", entry.key, content);
-        let line_chars = line.chars().count();
-        if used_chars + line_chars > MEMORY_CONTEXT_MAX_CHARS {
-            break;
-        }
-
-        if included == 0 {
-            context.push_str(MEMORY_CONTEXT_OPEN);
-            context.push('\n');
-        }
-
-        context.push_str(&line);
-        used_chars += line_chars;
-        included += 1;
-    }
-
-    if included > 0 {
-        context.push_str(MEMORY_CONTEXT_CLOSE);
-        context.push_str("\n\n");
-    }
-
-    context
 }
 
 fn is_group_reply_target(reply_target: &str) -> bool {
@@ -4724,48 +4574,19 @@ async fn process_channel_message_body(
     // within the context budget (#3460).
     collapse_inline_image_payloads(&mut prior_turns);
 
-    // ── Dual-scope memory recall ──────────────────────────────────
-    // Always recall before each LLM call (not just first turn).
-    // For group chats: merge sender-scope + group-scope memories.
-    // For DMs: recall from the current conversation scope plus sender scope.
+    // ── Dual-scope memory recall (engine-injected) ───────────────
+    // Memory context is injected once in the turn engine, keyed on the
+    // ingress origin (agent::memory_inject). This site only assembles the
+    // session scopes: sender scope(s) always; the group/history scope is
+    // added for group chats so both are recalled (key-deduped, one block).
     let is_group_chat = is_group_reply_target(&msg.reply_target);
-
-    let mem_recall_start = Instant::now();
-    let sender_session_ids = sender_memory_session_ids(&msg, &history_key);
-    let sender_session_id_refs: Vec<Option<&str>> = sender_session_ids
-        .iter()
-        .map(|s| Some(s.as_str()))
+    let mut memory_sessions: Vec<Option<String>> = sender_memory_session_ids(&msg, &history_key)
+        .into_iter()
+        .map(Some)
         .collect();
-    let sender_memory_fut = build_memory_context_for_sessions(
-        ctx.memory.as_ref(),
-        &msg.content,
-        ctx.min_relevance_score,
-        sender_session_id_refs.as_slice(),
-    );
-
-    let (sender_memory, group_memory) = if is_group_chat {
-        let group_memory_fut = build_memory_context(
-            ctx.memory.as_ref(),
-            &msg.content,
-            ctx.min_relevance_score,
-            Some(&history_key),
-        );
-        tokio::join!(sender_memory_fut, group_memory_fut)
-    } else {
-        (sender_memory_fut.await, String::new())
-    };
-    #[allow(clippy::cast_possible_truncation)]
-    let mem_recall_ms = mem_recall_start.elapsed().as_millis() as u64;
-    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"mem_recall_ms": mem_recall_ms, "sender_empty": sender_memory.is_empty(), "group_empty": group_memory.is_empty()})), "memory recall completed");
-
-    // Merge sender and group memory context blocks.
-    let memory_context = if group_memory.is_empty() {
-        sender_memory
-    } else if sender_memory.is_empty() {
-        group_memory
-    } else {
-        format!("{sender_memory}\n{group_memory}")
-    };
+    if is_group_chat {
+        memory_sessions.push(Some(history_key.clone()));
+    }
 
     // Build the byte-stable system prompt for the cached prefix.
     // Note: memory recall is NOT injected here (it used to be, but the
@@ -4850,8 +4671,7 @@ async fn process_channel_message_body(
         && last_turn.role == "user"
     {
         let raw_content = last_turn.content.clone();
-        last_turn.content =
-            compose_outgoing_user_turn_with_context(&preamble, &memory_context, &raw_content);
+        last_turn.content = compose_outgoing_user_turn_with_context(&preamble, &raw_content);
     }
 
     // ── Reply-intent precheck ────────────────────────────────────────
@@ -4859,37 +4679,111 @@ async fn process_channel_message_body(
         .as_ref()
         .map(|c| c.is_direct_message(&msg))
         .unwrap_or(false);
-    let classifier_intent = if should_bypass_reply_intent_precheck(&msg, direct_message) {
-        AssistantChannelOutcome::Reply(String::new())
-    } else {
-        let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (
-            Arc<dyn ModelProvider>,
-            String,
-            Option<f64>,
-        ) = resolve_classifier_route(
-            ctx.as_ref(),
-            &ctx.agent_cfg.classifier_provider,
-            &runtime_defaults,
-        )
-        .await
-        .unwrap_or_else(|| {
-            (
-                Arc::clone(&active_model_provider),
-                route.model.clone(),
-                None,
-            )
-        });
+    let precheck = &ctx.agent_cfg.precheck;
+    let classifier_intent = ::zeroclaw_log::scope!(
+        category: "channel",
+        model_provider: route.model_provider.as_str(),
+        model: route.model.as_str(),
+        => async {
+            if should_bypass_reply_intent_precheck(&msg, direct_message) {
+                AssistantChannelOutcome::Reply(String::new())
+            } else if !precheck.enabled {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip).with_attrs(
+                        ::serde_json::json!({
+                            "phase": "precheck",
+                            "reason": "disabled",
+                        })
+                    ),
+                    "reply-intent precheck skipped"
+                );
+                AssistantChannelOutcome::Reply(String::new())
+            } else {
+                let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (
+                    Arc<dyn ModelProvider>,
+                    String,
+                    Option<f64>,
+                ) = resolve_classifier_route(
+                    ctx.as_ref(),
+                    &ctx.agent_cfg.classifier_provider,
+                    &runtime_defaults,
+                )
+                .await
+                .unwrap_or_else(|| {
+                    (
+                        Arc::clone(&active_model_provider),
+                        route.model.clone(),
+                        None,
+                    )
+                });
 
-        classify_channel_reply_intent(
-            classifier_provider_arc.as_ref(),
-            history[0].content.as_str(),
-            &history,
-            classifier_model_owned.as_str(),
-            classifier_temperature.or(runtime_defaults.defaults.temperature),
-        )
-        .await
-        .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
-    };
+                let started = Instant::now();
+                let precheck_future = classify_channel_reply_intent(
+                    classifier_provider_arc.as_ref(),
+                    history[0].content.as_str(),
+                    &history,
+                    classifier_model_owned.as_str(),
+                    classifier_temperature.or(runtime_defaults.defaults.temperature),
+                );
+                match tokio::time::timeout(Duration::from_secs(precheck.timeout_secs), precheck_future)
+                    .await
+                {
+                    Ok(Ok(outcome)) => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_duration(
+                                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "classifier_model": classifier_model_owned.as_str(),
+                                    "phase": "precheck",
+                                })),
+                            "reply-intent precheck completed"
+                        );
+                        outcome
+                    }
+                    Ok(Err(e)) => {
+                        let safe_err = zeroclaw_providers::sanitize_api_error(&e.to_string());
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_duration(
+                                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "classifier_model": classifier_model_owned.as_str(),
+                                    "error": safe_err,
+                                    "phase": "precheck",
+                                })),
+                            "reply-intent precheck failed open"
+                        );
+                        AssistantChannelOutcome::Reply(String::new())
+                    }
+                    Err(_) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_duration(
+                                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "classifier_model": classifier_model_owned.as_str(),
+                                    "phase": "precheck",
+                                    "timeout_secs": precheck.timeout_secs,
+                                })),
+                            "reply-intent precheck timed out; failing open"
+                        );
+                        AssistantChannelOutcome::Reply(String::new())
+                    }
+                }
+            }
+        }
+    )
+    .await;
 
     // ACP sessions are direct user requests — there is no broadcast,
     // no peer context, no spam concern. The no-reply classifier is a
@@ -5266,9 +5160,19 @@ async fn process_channel_message_body(
                 steering: None,
                 new_messages_out: None,
                 image_cache: None,
-                // Phase 1: stamp Internal/Trusted. Real per-transport
-                // stamping is PR C (RFC #6971 §4).
-                ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                // Channel-orchestrator dispatch; source/transport/trust stay
+                // placeholders, not yet stamped at the edge.
+                memory: Some(zeroclaw_runtime::agent::memory_inject::TurnMemory {
+                    handle: ctx.memory.as_ref(),
+                    query: msg.content.clone(),
+                    sessions: memory_sessions.clone(),
+                    suppress: false,
+                    cfg: zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
+                        min_relevance_score: ctx.min_relevance_score,
+                        ..Default::default()
+                    },
+                }),
+                ingress: zeroclaw_api::ingress::IngressContext::channel(),
                 agent_alias: Some(ctx.agent_alias.as_str()),
                 turn_id: &turn_id,
             });
@@ -6113,6 +6017,8 @@ struct AgentRouter {
     by_agent: Arc<HashMap<String, Arc<ChannelRuntimeContext>>>,
     owner_by_channel_key: Arc<HashMap<String, String>>,
     single_ctx: Option<Arc<ChannelRuntimeContext>>,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
 
 impl AgentRouter {
@@ -6122,17 +6028,23 @@ impl AgentRouter {
             by_agent: Arc::new(HashMap::new()),
             owner_by_channel_key: Arc::new(HashMap::new()),
             single_ctx: Some(ctx),
+            sop_engine: None,
+            sop_audit: None,
         }
     }
 
     fn multi(
         by_agent: HashMap<String, Arc<ChannelRuntimeContext>>,
         owner_by_channel_key: HashMap<String, String>,
+        sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+        sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     ) -> Self {
         Self {
             by_agent: Arc::new(by_agent),
             owner_by_channel_key: Arc::new(owner_by_channel_key),
             single_ctx: None,
+            sop_engine,
+            sop_audit,
         }
     }
 
@@ -6160,6 +6072,82 @@ impl AgentRouter {
     }
 }
 
+async fn dispatch_channel_sop_event(
+    router: &AgentRouter,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    // Route on the internal marker the git/forge producer sets, NOT on the
+    // user-facing `subject`. The email channel is the one inbound channel that
+    // fills `subject` from user-controlled data, so keying on `subject` would
+    // let an allowlisted (or From-spoofed) sender hijack SOP ingress. This
+    // marker is set only by the git producer and never round-trips through any
+    // wire format, so it cannot be forged by an inbound message.
+    let Some(topic) = msg
+        .internal_sop_event
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return false;
+    };
+
+    let Some(engine) = router.sop_engine.as_ref() else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "channel": msg.channel.as_str(),
+                    "channel_alias": msg.channel_alias.as_deref(),
+                    "topic": topic,
+                })
+            ),
+            "dropping channel SOP event: SOP engine is not available"
+        );
+        return true;
+    };
+    let Some(audit) = router.sop_audit.as_ref() else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "channel": msg.channel.as_str(),
+                    "channel_alias": msg.channel_alias.as_deref(),
+                    "topic": topic,
+                })
+            ),
+            "dropping channel SOP event: SOP audit logger is not available"
+        );
+        return true;
+    };
+
+    let event = zeroclaw_runtime::sop::types::SopEvent {
+        source: zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
+        topic: Some(topic.to_string()),
+        payload: Some(msg.content.clone()),
+        timestamp: zeroclaw_runtime::sop::engine::now_iso8601(),
+    };
+    let target_sop = channel_sop_target(msg);
+    let results = if let Some(sop_name) = target_sop.as_deref() {
+        zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to(engine, audit, event, sop_name).await
+    } else {
+        zeroclaw_runtime::sop::dispatch::dispatch_sop_event(engine, audit, event).await
+    };
+    zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
+    true
+}
+
+fn channel_sop_target(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&msg.content)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("sop")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+        })
+}
+
 async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
     router: AgentRouter,
@@ -6178,6 +6166,9 @@ async fn run_message_dispatch_loop(
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"channel_alias": msg.channel_alias, "sender": msg.sender})), "dropping inbound message: no agent owns this channel");
             continue;
         };
+        if dispatch_channel_sop_event(&router, &msg).await {
+            continue;
+        }
         // Fast path: /stop cancels the in-flight task for this sender scope without
         // spawning a worker or registering a new task. Handled here — before semaphore
         // acquisition — so the target task is still in the store and is never replaced.
@@ -7149,6 +7140,25 @@ fn build_channel_by_id(
         "twitter" => {
             anyhow::bail!("X/Twitter channel requires the `channel-twitter` feature");
         }
+        #[cfg(feature = "channel-git")]
+        "git" => {
+            let g = config
+                .channels
+                .git
+                .get("default")
+                .context("Git channel is not configured")?;
+            let alias = "default".to_string();
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("git", &alias))
+            };
+            Ok(Arc::new(GitChannel::new(g.clone(), alias, peer_resolver)?))
+        }
+        #[cfg(not(feature = "channel-git"))]
+        "git" => {
+            anyhow::bail!("Git channel requires the `channel-git` feature");
+        }
         #[cfg(feature = "channel-mochat")]
         "mochat" => {
             let mc = config
@@ -7205,8 +7215,21 @@ fn build_channel_by_id(
                     let alias = alias.clone();
                     Arc::new(move || cfg_arc.read().channel_external_peers("line", &alias))
                 };
+                let sender_name_resolver: Arc<dyn Fn() -> Option<String> + Send + Sync> = {
+                    let cfg_arc = config_arc.clone();
+                    let alias = alias.clone();
+                    Arc::new(move || {
+                        cfg_arc
+                            .read()
+                            .channels
+                            .line
+                            .get(&alias)
+                            .and_then(|ln| ln.sender_name.clone())
+                            .filter(|s| !s.is_empty())
+                    })
+                };
                 Ok(Arc::new(
-                    LineChannel::from_config(ln, alias, peer_resolver)
+                    LineChannel::from_config(ln, alias, peer_resolver, sender_name_resolver)
                         .with_persistence(config_arc.clone()),
                 ))
             }
@@ -7234,7 +7257,7 @@ fn build_channel_by_id(
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, imessage, line, voice-call"
+            email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
         ),
     }
 }
@@ -8524,11 +8547,24 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("line", &alias))
         };
+        let sender_name_resolver: Arc<dyn Fn() -> Option<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                cfg_arc
+                    .read()
+                    .channels
+                    .line
+                    .get(&alias)
+                    .and_then(|ln| ln.sender_name.clone())
+                    .filter(|s| !s.is_empty())
+            })
+        };
         channels.push(ConfiguredChannel {
             display_name: "LINE",
             alias: Some(alias.clone()),
             channel: Arc::new(
-                LineChannel::from_config(ln, alias.clone(), peer_resolver)
+                LineChannel::from_config(ln, alias.clone(), peer_resolver, sender_name_resolver)
                     .with_persistence(config_arc.clone())
                     .with_transcription(config.transcription.clone()),
             ),
@@ -8657,6 +8693,51 @@ fn collect_configured_channels(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "X/Twitter channel is configured but this build was compiled without \
              `channel-twitter`; skipping X/Twitter."
+        );
+    }
+
+    #[cfg(feature = "channel-git")]
+    for (alias, g) in &config.channels.git {
+        if !active_channel_aliases.contains(&format!("git.{alias}")) {
+            continue;
+        }
+        if !g.enabled {
+            continue;
+        }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || cfg_arc.read().channel_external_peers("git", &alias))
+        };
+        match GitChannel::new(g.clone(), alias.clone(), peer_resolver) {
+            Ok(channel) => channels.push(ConfiguredChannel {
+                display_name: "Git",
+                alias: Some(alias.clone()),
+                channel: Arc::new(channel),
+            }),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "alias": alias,
+                            "error": e.to_string(),
+                        })),
+                    "Git channel alias misconfigured; skipping"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(feature = "channel-git"))]
+    if !config.channels.git.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Git channel is configured but this build was compiled without \
+             `channel-git`; skipping Git."
         );
     }
 
@@ -9312,6 +9393,14 @@ pub async fn start_channels(
         return Ok(());
     }
 
+    // Start the live model-pricing refresher (once per process; idempotent and
+    // a no-op unless some provider sets `live_pricing = true`). Each call
+    // re-binds the refresher's config handle, so reload iterations that
+    // re-instantiate the config Arc (or toggle `live_pricing`) are honored
+    // without a restart. Fills cost rates for models the operator hasn't
+    // priced in `[cost.rates]`.
+    zeroclaw_providers::pricing::spawn_refresher(config_arc.clone());
+
     // Every `[channels.<type>.<alias>]` block is owned by exactly one agent
     // (declared via `agents.<alias>.channels = [...]`). One
     // `ChannelRuntimeContext` per enabled agent; `AgentRouter::multi` resolves
@@ -9745,7 +9834,7 @@ pub async fn start_channels(
         ];
 
         if matches!(
-            config.skills.prompt_injection_mode,
+            config.effective_skills_prompt_mode(agent_alias),
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
         ) {
             tool_descs.push((
@@ -9828,7 +9917,7 @@ pub async fn start_channels(
             bootstrap_max_chars,
             Some(&risk_profile),
             native_tools,
-            config.skills.prompt_injection_mode,
+            config.effective_skills_prompt_mode(agent_alias),
             agent.resolved.compact_context,
             agent.resolved.max_system_prompt_chars,
             true,
@@ -10273,7 +10362,7 @@ pub async fn start_channels(
         }
     }
 
-    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key);
+    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
 
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
@@ -11329,7 +11418,7 @@ temperature = 0.3
         let mut owners: HashMap<String, String> = HashMap::new();
         owners.insert("discord.clamps".to_string(), "clamps".to_string());
         owners.insert("discord.glados".to_string(), "glados".to_string());
-        let router = AgentRouter::multi(by_agent, owners);
+        let router = AgentRouter::multi(by_agent, owners, None, None);
 
         let msg_clamps = channel_message("discord", Some("clamps"));
         let msg_glados = channel_message("discord", Some("glados"));
@@ -11352,7 +11441,7 @@ temperature = 0.3
         by_agent.insert("agent_a".to_string(), Arc::clone(&agent_a_ctx));
         let mut owners: HashMap<String, String> = HashMap::new();
         owners.insert("discord.bot_a".to_string(), "agent_a".to_string());
-        let router = AgentRouter::multi(by_agent, owners);
+        let router = AgentRouter::multi(by_agent, owners, None, None);
 
         let cli_msg = channel_message("cli", None);
         assert!(router.resolve(&cli_msg).is_none(), "cli has no owner");
@@ -11365,7 +11454,7 @@ temperature = 0.3
         by_agent.insert("ops".to_string(), Arc::clone(&notion_agent_ctx));
         let mut owners: HashMap<String, String> = HashMap::new();
         owners.insert("notion".to_string(), "ops".to_string());
-        let router = AgentRouter::multi(by_agent, owners);
+        let router = AgentRouter::multi(by_agent, owners, None, None);
 
         let msg = channel_message("notion", None);
         let resolved = router.resolve(&msg).expect("notion resolves");
@@ -11391,7 +11480,7 @@ temperature = 0.3
         let legacy_ctx = router_test_ctx();
         let mut by_agent: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
         by_agent.insert("legacy".to_string(), Arc::clone(&legacy_ctx));
-        let router = AgentRouter::multi(by_agent, owners);
+        let router = AgentRouter::multi(by_agent, owners, None, None);
 
         let msg = channel_message("mattermost", Some("default"));
         let resolved = router.resolve(&msg).expect("fallback owner resolves");
@@ -11698,62 +11787,6 @@ temperature = 0.3
         let other_err =
             anyhow::Error::msg("OpenAI Codex API error (502 Bad Gateway): error code: 502");
         assert!(!is_context_window_overflow_error(&other_err));
-    }
-
-    #[test]
-    fn memory_context_skip_rules_exclude_history_blobs() {
-        assert!(should_skip_memory_context_entry(
-            "telegram_123_history",
-            r#"[{"role":"user"}]"#
-        ));
-        assert!(should_skip_memory_context_entry(
-            "assistant_resp_legacy",
-            "fabricated memory"
-        ));
-        assert!(!should_skip_memory_context_entry("telegram_123_45", "hi"));
-
-        // Entries containing image markers must be skipped to prevent
-        // auto-saved photo messages from duplicating image blocks.
-        assert!(should_skip_memory_context_entry(
-            "telegram_user_msg_99",
-            "[IMAGE:/tmp/workspace/photo_1_2.jpg]"
-        ));
-        assert!(should_skip_memory_context_entry(
-            "telegram_user_msg_100",
-            "[IMAGE:/tmp/workspace/photo_1_2.jpg]\n\nCheck this screenshot"
-        ));
-        // Plain text without image markers should not be skipped.
-        assert!(!should_skip_memory_context_entry(
-            "telegram_user_msg_101",
-            "Please describe the image"
-        ));
-
-        // Entries containing tool_result blocks must be skipped.
-        assert!(should_skip_memory_context_entry(
-            "telegram_user_msg_200",
-            r#"[Tool results]
-<tool_result name="shell">Mon Feb 20</tool_result>"#
-        ));
-        assert!(!should_skip_memory_context_entry(
-            "telegram_user_msg_201",
-            "plain text without tool results"
-        ));
-
-        // Per-turn user auto-save keys must be skipped to prevent exponential
-        // context bloat from re-injected conversation history.
-        assert!(should_skip_memory_context_entry(
-            "user_msg",
-            "original user message text"
-        ));
-        assert!(should_skip_memory_context_entry(
-            "user_msg_a1b2c3d4e5f6",
-            "follow-up message embedding prior context"
-        ));
-        // Channel-scoped keys (e.g. telegram_*) must NOT be affected.
-        assert!(!should_skip_memory_context_entry(
-            "telegram_user_msg_101",
-            "Please describe the image"
-        ));
     }
 
     fn channel_runtime_context_for_defaults_test(
@@ -13945,6 +13978,7 @@ BTC is currently around $65,000 based on latest tool output."#
         precheck_calls: AtomicUsize,
         main_calls: AtomicUsize,
         models: std::sync::Mutex<Vec<String>>,
+        precheck_delay: Option<Duration>,
     }
 
     #[async_trait::async_trait]
@@ -13963,6 +13997,9 @@ BTC is currently around $65,000 based on latest tool output."#
 
             if message.starts_with("Decide whether the assistant should send any visible reply") {
                 self.precheck_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(delay) = self.precheck_delay {
+                    tokio::time::sleep(delay).await;
+                }
                 return Ok("NO_REPLY[INFO]: background chatter".to_string());
             }
 
@@ -15627,6 +15664,196 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             sent_messages.is_empty(),
             "provider returns NO_REPLY from precheck, so no visible reply should be sent"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn process_channel_message_precheck_log_uses_span_attribution_not_attrs() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(PrecheckProbeModelProvider::default());
+        let provider: Arc<dyn ModelProvider> = provider_impl;
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "custom.primary",
+            None,
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-precheck-log".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-precheck-log".to_string(),
+                content: "background chatter".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 5,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut precheck_event = None;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|m| m == "reply-intent precheck completed")
+                    {
+                        precheck_event = Some(value);
+                        break;
+                    }
+                }
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+
+        let value = precheck_event.expect("reply-intent precheck log should be emitted");
+        assert_eq!(
+            value["zeroclaw"]["agent_alias"], "test-agent",
+            "precheck record must inherit agent_alias from the channel turn span, got: {value}"
+        );
+        assert_eq!(
+            value["zeroclaw"]["model"], "test-model",
+            "precheck record must preserve primary model attribution, got: {value}"
+        );
+        assert_eq!(
+            value["attributes"]["classifier_model"], "test-model",
+            "classifier model must use a non-attribution attr key, got: {value}"
+        );
+        assert!(
+            value["attributes"].get("agent").is_none(),
+            "agent alias belongs in zeroclaw.agent_alias, not attributes.agent: {value}"
+        );
+        assert!(
+            value["attributes"].get("model").is_none(),
+            "classifier model must not shadow zeroclaw.model via attributes.model: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_skips_reply_intent_classifier_when_agent_precheck_disabled() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(PrecheckProbeModelProvider::default());
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let agent_cfg = zeroclaw_config::schema::AliasedAgentConfig {
+            precheck: zeroclaw_config::scattered_types::ChannelPrecheckConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            agent_cfg,
+            "test-provider",
+            None,
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-precheck-disabled".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-precheck-disabled".to_string(),
+                content: "background chatter".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(provider_impl.precheck_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider_impl.main_calls.load(Ordering::SeqCst), 1);
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.as_slice(),
+            ["chat-precheck-disabled:visible reply"]
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_precheck_timeout_fails_open_to_reply() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(PrecheckProbeModelProvider {
+            precheck_delay: Some(Duration::from_secs(2)),
+            ..Default::default()
+        });
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let agent_cfg = zeroclaw_config::schema::AliasedAgentConfig {
+            precheck: zeroclaw_config::scattered_types::ChannelPrecheckConfig {
+                timeout_secs: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            agent_cfg,
+            "test-provider",
+            None,
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-precheck-timeout".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-precheck-timeout".to_string(),
+                content: "background chatter".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(provider_impl.precheck_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_impl.main_calls.load(Ordering::SeqCst), 1);
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.as_slice(),
+            ["chat-precheck-timeout:visible reply"]
         );
     }
 
@@ -18950,17 +19177,26 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 
-    #[tokio::test]
-    async fn build_memory_context_includes_recalled_entries() {
-        let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-        mem.store("age_fact", "Age is 45", MemoryCategory::Conversation, None)
-            .await
-            .unwrap();
-
-        let context = build_memory_context(&mem, "age", 0.0, None).await;
-        assert!(context.contains(MEMORY_CONTEXT_OPEN));
-        assert!(context.contains("Age is 45"));
+    /// Test shim: the old per-orchestrator renderer call shape, routed
+    /// through the unified engine pipeline (agent::memory_inject).
+    async fn render_for_sessions(
+        mem: &dyn zeroclaw_memory::Memory,
+        user_msg: &str,
+        min_relevance_score: f64,
+        session_ids: &[Option<&str>],
+    ) -> String {
+        zeroclaw_runtime::agent::memory_inject::render_memory_context(
+            mem,
+            &zeroclaw_runtime::observability::NoopObserver,
+            user_msg,
+            session_ids,
+            &zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
+                min_relevance_score,
+                ..Default::default()
+            },
+            false,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -18996,8 +19232,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let session_ids = sender_memory_session_ids(&msg, &history_key);
         let session_id_refs: Vec<Option<&str>> =
             session_ids.iter().map(|s| Some(s.as_str())).collect();
-        let context =
-            build_memory_context_for_sessions(&mem, "quartz", 0.0, &session_id_refs).await;
+        let context = render_for_sessions(&mem, "quartz", 0.0, &session_id_refs).await;
 
         assert!(
             context.contains("Project codename is quartz"),
@@ -19060,12 +19295,11 @@ BTC is currently around $65,000 based on latest tool output."#
             .map(|s| Some(s.as_str()))
             .collect();
         let sender_context =
-            build_memory_context_for_sessions(&mem, "quartz", 0.0, &group_b_sender_session_id_refs)
-                .await;
+            render_for_sessions(&mem, "quartz", 0.0, &group_b_sender_session_id_refs).await;
         let group_context =
-            build_memory_context(&mem, "quartz", 0.0, Some(&group_b_history_key)).await;
+            render_for_sessions(&mem, "quartz", 0.0, &[Some(&group_b_history_key)]).await;
         let source_group_context =
-            build_memory_context(&mem, "quartz", 0.0, Some(&group_a_history_key)).await;
+            render_for_sessions(&mem, "quartz", 0.0, &[Some(&group_a_history_key)]).await;
 
         assert!(
             sender_context.is_empty(),
@@ -19121,52 +19355,10 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         let session_id_refs: Vec<Option<&str>> =
             session_ids.iter().map(|s| Some(s.as_str())).collect();
-        let context =
-            build_memory_context_for_sessions(&mem, "coffee", 0.0, &session_id_refs).await;
+        let context = render_for_sessions(&mem, "coffee", 0.0, &session_id_refs).await;
         assert!(
             context.contains("Alice favors filtered coffee"),
             "sender recall must find migrated row stored under sanitized sender, got: {context}"
-        );
-    }
-
-    /// Auto-saved photo messages must not surface through memory context,
-    /// otherwise the image marker gets duplicated in the model_provider request.
-    #[tokio::test]
-    async fn build_memory_context_excludes_image_marker_entries() {
-        let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-
-        // Simulate auto-save of a photo message containing an [IMAGE:] marker.
-        mem.store(
-            "telegram_user_msg_photo",
-            "[IMAGE:/tmp/workspace/photo_1_2.jpg]\n\nDescribe this screenshot",
-            MemoryCategory::Conversation,
-            None,
-        )
-        .await
-        .unwrap();
-        // Also store a plain text entry that shares a word with the query
-        // so the FTS recall returns both entries.
-        mem.store(
-            "screenshot_preference",
-            "User prefers screenshot descriptions to be concise",
-            MemoryCategory::Conversation,
-            None,
-        )
-        .await
-        .unwrap();
-
-        let context = build_memory_context(&mem, "screenshot", 0.0, None).await;
-
-        // The image-marker entry must be excluded to prevent duplication.
-        assert!(
-            !context.contains("[IMAGE:"),
-            "memory context must not contain image markers, got: {context}"
-        );
-        // Plain text entries should still be included.
-        assert!(
-            context.contains("screenshot descriptions"),
-            "plain text entry should remain in context, got: {context}"
         );
     }
 
@@ -20351,6 +20543,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     mime_type: Some("image/png".to_string()),
                 }],
                 subject: None,
+                internal_sop_event: None,
             },
             CancellationToken::new(),
         )
@@ -21985,6 +22178,7 @@ This is an example JSON object for profile settings."#;
                     mime_type: Some("image/png".to_string()),
                 }],
                 subject: None,
+                internal_sop_event: None,
             },
             CancellationToken::new(),
         )
@@ -24285,25 +24479,17 @@ Done."#;
     }
 
     #[test]
-    fn compose_outgoing_user_turn_with_context_orders_preamble_memory_content() {
-        // Order on the wire: preamble → memory_context → raw user content,
-        // joined by blank lines. Empty preamble and empty memory leave the
-        // raw content untouched (CLI-style path).
+    fn compose_outgoing_user_turn_with_context_orders_preamble_content() {
+        // Order on the wire: preamble -> raw user content, joined by blank
+        // lines (the memory block is engine-injected ABOVE the whole turn).
+        // Empty preamble leaves the raw content untouched (CLI-style path).
         assert_eq!(
-            compose_outgoing_user_turn_with_context("", "", "hello"),
+            compose_outgoing_user_turn_with_context("", "hello"),
             "hello"
         );
         assert_eq!(
-            compose_outgoing_user_turn_with_context("[turn-context] x\n\n", "", "hello"),
+            compose_outgoing_user_turn_with_context("[turn-context] x\n\n", "hello"),
             "[turn-context] x\n\n\n\nhello"
-        );
-        assert_eq!(
-            compose_outgoing_user_turn_with_context("", "[memory] y", "hello"),
-            "[memory] y\n\nhello"
-        );
-        assert_eq!(
-            compose_outgoing_user_turn_with_context("[turn-context] x\n\n", "[memory] y", "hello"),
-            "[turn-context] x\n\n\n\n[memory] y\n\nhello"
         );
     }
 
@@ -24555,6 +24741,60 @@ Done."#;
         let sm = SendMessage::reply_to(&msg, "Here is the answer");
         assert_eq!(sm.in_reply_to.as_deref(), Some("<abc123@mail.example>"));
         assert!(sm.subject.is_none());
+    }
+
+    /// Router with no SOP engine wired. `dispatch_channel_sop_event` decides
+    /// whether a message is a channel SOP event before it ever touches the
+    /// engine, so this is enough to exercise the source/dispatch boundary.
+    fn router_without_sop_engine() -> AgentRouter {
+        AgentRouter {
+            by_agent: Arc::new(HashMap::new()),
+            owner_by_channel_key: Arc::new(HashMap::new()),
+            single_ctx: None,
+            sop_engine: None,
+            sop_audit: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_channel_sop_event_ignores_user_controlled_subject() {
+        // An email-shaped message: the reserved prefix sits in the
+        // user-controlled `subject`, but the internal git-only marker is
+        // absent. It MUST NOT route to SOP.
+        let msg = ChannelMessage {
+            channel: "email".to_string(),
+            sender: "attacker@example.com".to_string(),
+            subject: Some("zeroclaw:sop-event:git.main:pull_request.opened".to_string()),
+            content: r#"{"sop":"triage"}"#.to_string(),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "attacker@example.com", "", "", "email", 0)
+        };
+        let router = router_without_sop_engine();
+        assert!(
+            !dispatch_channel_sop_event(&router, &msg).await,
+            "a forged subject must not select SOP ingress"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_channel_sop_event_routes_git_produced_marker() {
+        // A genuine git-produced message: the internal marker carries the
+        // topic. It IS recognized as a SOP event (returns true; the missing
+        // engine is handled inside, but the routing decision fired).
+        let msg = ChannelMessage {
+            channel: "git".to_string(),
+            channel_alias: Some("main".to_string()),
+            sender: "test_user".to_string(),
+            subject: Some("zeroclaw:sop-event:git.main:pull_request.opened".to_string()),
+            content: r#"{"sop":"triage"}"#.to_string(),
+            internal_sop_event: Some("git.main:pull_request.opened".to_string()),
+            ..ChannelMessage::new("1", "test_user", "octo/repo#12", "", "git", 0)
+        };
+        let router = router_without_sop_engine();
+        assert!(
+            dispatch_channel_sop_event(&router, &msg).await,
+            "a git-produced internal marker must select SOP ingress"
+        );
     }
 }
 
