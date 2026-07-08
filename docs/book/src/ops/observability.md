@@ -61,6 +61,47 @@ unchanged.
 > round), and full text grows per-span payload proportionally. On per-byte backends,
 > apply exporter-side truncation rather than dropping the attributes.
 
+### OTel Content Capture
+
+OTel content capture is independent of log-based capture (`log_tool_io`, `log_llm_request_payload`). It controls what content is emitted as OpenTelemetry span attributes.
+
+#### GenAI Content
+
+Controls `gen_ai.system_instructions`, `gen_ai.input.messages`, and `gen_ai.output.messages` on OTel spans.
+
+```toml
+[observability]
+otel_genai_content = "off"            # off | redacted | full
+otel_genai_content_max_chars = 1000  # per-field truncation limit
+```
+
+- `off` (default): No content attributes, only metadata.
+- `redacted`: Content is leak-scanned and truncated at `max_chars` per field.
+- `full`: Content is leak-scanned but not truncated.
+
+#### Tool I/O
+
+Controls `gen_ai.tool.arguments`, `input.value`, `gen_ai.tool.result`, and `output.value` on OTel spans.
+
+```toml
+[observability]
+otel_tool_io = "off"                  # off | redacted | full
+otel_tool_io_max_chars = 1000        # per-field truncation limit
+```
+
+- `off` (default): No content attributes, only tool name + outcome.
+- `redacted`: Content is leak-scanned and truncated at `max_chars` per field.
+- `full`: Content is leak-scanned but not truncated.
+
+#### Behavior Notes
+
+- Setting `*_max_chars = 0` is equivalent to `off` for that policy.
+- Content is always scrubbed (credential patterns + secret patterns) before truncation.
+- Truncation preserves JSON structure for tool arguments (leaf strings truncated).
+- Truncated fields get a `…[truncated {n} of {total} chars]` marker. The marker is metadata and does not count against `max_chars`: the kept content is exactly `max_chars` characters, with the marker appended on top.
+- Default `off` is a privacy-first change from previous behavior (feature-gated but always-on when enabled).
+- The content policy is bound to the observer/config instance, not to the process. There is no process-global OTel content policy: each `OtelObserver` derives an immutable content config from `ObservabilityConfig` at construction and consults it at the OTel export boundary. Multiple observers in the same process keep independent policies: a later observer cannot override or silence an earlier one's privacy setting (no last-writer-wins, no cross-observer drift).
+
 ### LLM request payload capture (`log_llm_request_payload`)
 
 `log_llm_request_payload` controls whether the `llm_request` event records the

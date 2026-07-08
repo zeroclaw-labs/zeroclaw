@@ -32,6 +32,23 @@ pub enum OptKind {
 }
 
 impl OptKind {
+    /// The Discord wire projection of a canonical [`SlashOptionKind`]. Exhaustive
+    /// so a new canonical variant forces a wire mapping here rather than silently
+    /// dropping.
+    pub fn from_kind(kind: zeroclaw_runtime::skills::SlashOptionKind) -> Self {
+        use zeroclaw_runtime::skills::SlashOptionKind as K;
+        match kind {
+            K::String => Self::String,
+            K::Integer => Self::Integer,
+            K::Number => Self::Number,
+            K::Boolean => Self::Boolean,
+            K::User => Self::User,
+            K::Channel => Self::Channel,
+            K::Role => Self::Role,
+            K::Mentionable => Self::Mentionable,
+        }
+    }
+
     /// Parse a skill-manifest `type` string. Unknown values return `None` (the
     /// channel drops the option with a WARN rather than registering a bad type).
     pub fn from_manifest(kind: &str) -> Option<Self> {
@@ -512,5 +529,30 @@ mod tests {
         assert!(extract_focused_option(&unfocused).is_none());
         // Missing command name → None.
         assert!(extract_focused_option(&json!({ "data": {} })).is_none());
+    }
+
+    #[test]
+    fn from_kind_projects_every_canonical_variant_to_matching_wire_type() {
+        use zeroclaw_runtime::skills::SlashOptionKind as K;
+        // Walk the canonical registry: each variant projects to a wire OptKind
+        // whose manifest name round-trips back to the same canonical token, and
+        // whose capability flags agree with the canonical enum. Exhaustive by
+        // construction (walks `K::ALL`), so a new canonical variant that lacks a
+        // wire projection fails to compile in `from_kind` before it reaches here.
+        for kind in K::ALL {
+            let projected = OptKind::from_kind(kind);
+            assert_eq!(
+                OptKind::from_manifest(kind.manifest_name()),
+                Some(projected),
+                "manifest token {:?} must parse back to the projected wire kind",
+                kind.manifest_name(),
+            );
+            assert_eq!(
+                projected.is_scalar(),
+                kind.supports_choices(),
+                "choice capability disagreement for {:?}",
+                kind.manifest_name(),
+            );
+        }
     }
 }

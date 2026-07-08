@@ -40,7 +40,77 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use dialoguer::{Password, Select};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
-use std::io::{ErrorKind, Write};
+use std::io::{BufRead, ErrorKind, Read, Write};
+
+/// Per-line byte cap for stdin reads in interactive CLI modes (the simple_chat
+/// REPL fallback at line 3637 and the Windows-only "press Enter to exit"
+/// prompt at line 401). Matches `zeroclaw_runtime::agent::loop_::
+/// MAX_INTERACTIVE_INPUT_BYTES` (1 MiB) by convention. The cap is duplicated
+/// here — at module level rather than re-declared in each call site — so the
+/// value is visible in one place for both call sites and can be adjusted in
+/// a single edit. Defense against a piped-in flood
+/// (e.g. `head -c 10G /dev/zero | zeroclaw chat`) that would otherwise grow
+/// the per-line `String` until the process OOMs.
+const STDIN_LINE_CAP: usize = 1024 * 1024;
+
+/// Result of [`read_capped_line`].
+#[cfg(not(feature = "agent-runtime"))]
+#[derive(Debug)]
+enum CappedLine {
+    /// A full line under the cap, with the trailing `\n` stripped.
+    Line(String),
+    /// The physical line exceeded `cap`. The remainder has been drained
+    /// and must not be used as a prompt.
+    Truncated,
+    /// EOF with no bytes read.
+    Eof,
+}
+
+/// Read a single line from `reader` bounded at `cap` bytes. Returns
+/// the line with the trailing `\n` stripped or [`CappedLine::Truncated`]
+/// when the cap was hit. When truncated, the rest of the physical line
+/// is drained using a fixed-size scratch buffer so the next call starts
+/// at the next line and no unbounded allocation occurs.
+#[cfg(not(feature = "agent-runtime"))]
+fn read_capped_line<R: std::io::BufRead>(reader: R, cap: usize) -> std::io::Result<CappedLine> {
+    let mut raw = Vec::new();
+    let mut limited = reader.take((cap + 1) as u64);
+    std::io::BufRead::read_until(&mut limited, b'\n', &mut raw)?;
+    let truncated = raw.len() > cap;
+    if truncated {
+        let mut inner = limited.into_inner();
+        discard_until_newline(&mut inner)?;
+        return Ok(CappedLine::Truncated);
+    } else if raw.last() == Some(&b'\n') {
+        raw.pop();
+    }
+    if raw.is_empty() {
+        return Ok(CappedLine::Eof);
+    }
+    Ok(CappedLine::Line(String::from_utf8_lossy(&raw).into_owned()))
+}
+
+/// Discard bytes from `reader` until the next `\n` or EOF, using only
+/// `BufRead::fill_buf` / `consume`. This avoids the unbounded allocation
+/// that `read_until(..., &mut Vec::new())` would incur on an oversized
+/// physical line, and it stops exactly at the newline so the next line
+/// is not consumed.
+#[cfg(not(feature = "agent-runtime"))]
+fn discard_until_newline<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<()> {
+    loop {
+        let buf = reader.fill_buf()?;
+        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            reader.consume(pos + 1);
+            return Ok(());
+        }
+        let len = buf.len();
+        if len == 0 {
+            return Ok(());
+        }
+        reader.consume(len);
+    }
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
@@ -225,8 +295,24 @@ fn pause_after_no_command_help() {
     println!();
     print!("{}", t("cli-press-enter", "Press Enter to exit..."));
     let _ = std::io::stdout().flush();
+    // Cap the read so a piped-in flood (e.g. `dir | zeroclaw` with no
+    // command) cannot blow up RSS in this trivial one-Enter prompt.
+    // See module-level `STDIN_LINE_CAP` for rationale.
     let mut line = String::new();
-    let _ = std::io::stdin().read_line(&mut line);
+    // `Stdin::lock()` returns a `StdinLock<'_>` which is unconditionally
+    // `BufRead` across all target platforms and rustc feature gates; the
+    // unlocked `Stdin` is only `BufRead` on some platforms / under some
+    // feature combinations, so wrap the read in `lock()` to keep the
+    // `no-default-features` build (and 32-bit / Windows) green. The lock
+    // is dropped at the end of this scope, restoring the original
+    // behavior of stdin.
+    let _ = std::io::stdin()
+        .lock()
+        .take((STDIN_LINE_CAP + 1) as u64)
+        .read_line(&mut line);
+    if line.len() > STDIN_LINE_CAP {
+        line.truncate(STDIN_LINE_CAP);
+    }
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -2626,6 +2712,81 @@ fn plugin_host_with_configured_security(
     )
 }
 
+/// Seed an empty `[[plugins.entries]]` block named after a freshly installed
+/// plugin. `config set plugins.entries.<name>.config.<key>` routes through
+/// natural-key path resolution, which only matches entries already present in
+/// live config; without a seeded entry the operator's only recourse is
+/// hand-editing the file. Idempotent: reinstalling a plugin whose entry
+/// already exists leaves the operator's config values untouched.
+#[cfg(feature = "plugins-wasm")]
+async fn seed_plugin_config_entry(
+    config: &mut crate::config::schema::Config,
+    plugin_name: &str,
+) -> Result<()> {
+    // A degraded [plugins] block means the on-disk section is malformed and
+    // the in-memory view is defaults. save_dirty cannot write through the
+    // broken shape (verified: it silently no-ops), so seeding would print a
+    // success message while persisting nothing. The whole-config sentinel
+    // (unparseable TOML) is worse: save_dirty hard-fails parsing the file
+    // and would turn a successful install into a command error. Refuse
+    // honestly in both cases.
+    let whole_config_degraded = config
+        .degraded_security
+        .iter()
+        .any(|s| s == crate::config::migration::WHOLE_CONFIG_SENTINEL);
+    if whole_config_degraded || config.degraded_sections.iter().any(|s| s == "plugins") {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-plugin-config-entry-seed-skipped",
+                &[("name", plugin_name)],
+                "warning: skipped seeding the plugin config entry: the \
+                 [plugins] section on disk is malformed. Repair it, add \
+                 `[[plugins.entries]]` with the plugin name, then set values \
+                 with `zeroclaw config set plugins.entries.<name>.config.<key>`."
+            )
+        );
+        return Ok(());
+    }
+    // Dotted-path routing splits on `.`, so a plugin name containing a dot
+    // (or an empty name) can never be addressed by
+    // `config set plugins.entries.<name>...`, and the per-entry dirty path
+    // `plugins.entries.<name>` cannot round-trip through the natural-key
+    // writer either: save_dirty silently no-ops while the success message
+    // claims otherwise (verified). Skip honestly.
+    if plugin_name.is_empty() || plugin_name.contains('.') {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-plugin-config-entry-seed-unaddressable",
+                &[("name", plugin_name)],
+                "warning: skipped seeding the plugin config entry: the plugin \
+                 name cannot be addressed by a dotted config path. Add a \
+                 `[[plugins.entries]]` block to the config file by hand."
+            )
+        );
+        return Ok(());
+    }
+    let created = config
+        .create_map_key("plugins.entries", plugin_name)
+        .map_err(anyhow::Error::msg)?;
+    if !created {
+        return Ok(());
+    }
+    config.mark_dirty(&format!("plugins.entries.{plugin_name}"));
+    Box::pin(config.save_dirty()).await?;
+    println!(
+        "{}",
+        ta(
+            "cli-plugin-config-entry-seeded",
+            &[("name", plugin_name)],
+            "Seeded config entry. Set plugin config values with \
+             `zeroclaw config set plugins.entries.<name>.config.<key>`."
+        )
+    );
+    Ok(())
+}
+
 #[derive(Subcommand, Debug)]
 enum ConfigCommands {
     /// Dump the full configuration JSON Schema to stdout. With `--path`, returns
@@ -2681,7 +2842,7 @@ enum ConfigCommands {
     },
     /// Migrate the on-disk config to the current schema version (preserves comments)
     Migrate {
-        /// Emit a structured JSON envelope ({migrated, backup_path?, schema_version}) instead of plain text.
+        /// Emit a structured JSON envelope ({migrated, backup_path?, schema_version, valid?, error?}) instead of plain text.
         #[arg(long)]
         json: bool,
     },
@@ -2915,6 +3076,16 @@ enum DoctorCommands {
         /// Maximum number of events to display
         #[arg(long, default_value = "20")]
         limit: usize,
+    },
+    /// Update context_window in config.toml from provider /models endpoints
+    UpdateContextWindows {
+        /// Update a specific model_provider only (default: all known model_providers)
+        #[arg(long)]
+        model_provider: Option<String>,
+
+        /// Show what would be updated without writing to config
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -3157,9 +3328,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    #[cfg(feature = "agent-runtime")]
-    crate::i18n::init(&crate::i18n::detect_locale());
-
     let cmd = apply_i18n_to_command(Cli::command());
 
     if std::env::args_os().len() <= 1 {
@@ -3175,6 +3343,9 @@ async fn main() -> Result<()> {
         // SAFETY: called early in main before any threads are spawned.
         unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir) };
     }
+
+    #[cfg(feature = "agent-runtime")]
+    crate::i18n::init(&crate::i18n::detect_locale());
 
     // Completions must remain stdout-only and should not load config or initialize logging.
     // This avoids warnings/log lines corrupting sourced completion scripts.
@@ -3310,6 +3481,32 @@ async fn main() -> Result<()> {
 
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
+    // Malformed sections the resilient loader dropped to defaults are logged
+    // to the trace file, but the terminal is muted unless --verbose. Echo
+    // them to stderr unconditionally: an operator whose `[plugins]` (or any
+    // other block) silently reset to defaults must see it on every command,
+    // not only when spelunking logs. Security-critical drops additionally
+    // hard-gate serving in gate_security_posture.
+    for section in config
+        .degraded_sections
+        .iter()
+        .chain(config.degraded_security.iter())
+    {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-config-section-degraded",
+                &[
+                    ("section", section),
+                    ("path", &config.config_path.display().to_string()),
+                ],
+                "warning: config section is malformed and was reset to defaults \
+                 for this run. Values in that section are NOT in effect. Run \
+                 `zeroclaw config migrate` to see the parse error, then repair \
+                 the file."
+            )
+        );
+    }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
     #[cfg(feature = "agent-runtime")]
@@ -3415,15 +3612,41 @@ async fn main() -> Result<()> {
                         println!("{response}");
                     }
                     None => {
-                        // Interactive mode
-                        let stdin = std::io::stdin();
-                        let mut line = String::new();
+                        // Interactive mode. Cap the per-line read so a
+                        // piped-in flood (e.g. `head -c 10G /dev/zero |
+                        // zeroclaw chat`) cannot OOM the process — same
+                        // audit-flagged vector the agent-runtime path
+                        // covers in `loop_::read_capped_line`. See
+                        // module-level `STDIN_LINE_CAP` for the cap
+                        // rationale.
+                        // `Stdin::lock()` is taken once per line so that a
+                        // fresh `Take(cap + 1)` is applied to each physical
+                        // line; a cumulative Take across the whole REPL loop
+                        // would mean that after STDIN_LINE_CAP + 1 total
+                        // bytes all later reads returned EOF (Audacity88
+                        // review #8463).
                         loop {
                             eprint!("> ");
-                            line.clear();
-                            if stdin.read_line(&mut line)? == 0 {
-                                break;
-                            }
+                            let line = {
+                                let stdin = std::io::stdin().lock();
+                                match read_capped_line(stdin, STDIN_LINE_CAP) {
+                                    Ok(CappedLine::Eof) => break,
+                                    Ok(CappedLine::Line(s)) => s,
+                                    Ok(CappedLine::Truncated) => {
+                                        // i18n-exempt: no-runtime fallback lacks the Fluent catalogue.
+                                        eprintln!(
+                                            "\nWarning: input line exceeds {} bytes and was discarded.",
+                                            STDIN_LINE_CAP
+                                        );
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        // i18n-exempt: no-runtime fallback lacks the Fluent catalogue.
+                                        eprintln!("\nError reading input: {e}\n");
+                                        break;
+                                    }
+                                }
+                            };
                             let response =
                                 zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
                                     .simple_chat(line.trim(), model_name, Some(final_temperature))
@@ -3539,6 +3762,7 @@ async fn main() -> Result<()> {
                 true,
                 session_state_file,
                 None,
+                zeroclaw_api::ingress::TurnOrigin::Interactive,
                 zeroclaw_runtime::agent::loop_::AgentRunOverrides::default(),
             ))
             .await
@@ -3699,11 +3923,11 @@ async fn main() -> Result<()> {
                                 t("cli-pairing-enabled", "🔐 Gateway pairing is enabled.")
                             );
                             println!();
-                            if let Some(message) = message.as_deref() {
-                                if rotating {
-                                    println!("  ✅ {message}");
-                                    println!();
-                                }
+                            if let Some(message) = message.as_deref()
+                                && rotating
+                            {
+                                println!("  ✅ {message}");
+                                println!();
                             }
                             println!("  ┌──────────────┐");
                             println!("  │  {code}  │");
@@ -4086,6 +4310,11 @@ async fn main() -> Result<()> {
                             "🔄 Daemon reload — re-reading config from disk"
                         );
                         current_config = Box::pin(Config::load_or_init()).await?;
+                        #[cfg(feature = "agent-runtime")]
+                        observability::runtime_trace::init_from_config(
+                            &current_config.observability,
+                            &current_config.data_dir,
+                        );
                         // Stop the stale nag and re-gate against the fresh
                         // config: a repaired posture silences the warning, a
                         // newly-degraded one (still allowed) restarts it. A
@@ -4656,6 +4885,19 @@ async fn main() -> Result<()> {
                 contains.as_deref(),
                 limit,
             ),
+            Some(DoctorCommands::UpdateContextWindows {
+                model_provider,
+                dry_run,
+            }) => {
+                Box::pin(doctor::update_context_windows(
+                    &mut config,
+                    model_provider.as_deref(),
+                    dry_run,
+                    None,
+                ))
+                .await?;
+                Ok(())
+            }
             None => doctor::run(&config).await,
         },
 
@@ -4828,12 +5070,12 @@ async fn main() -> Result<()> {
                 }
 
                 // 2. Same directory as the current executable
-                if found.is_none() {
-                    if let Ok(exe) = std::env::current_exe() {
-                        let sibling = exe.with_file_name("zeroclaw-desktop");
-                        if sibling.is_file() {
-                            found = Some(sibling);
-                        }
+                if found.is_none()
+                    && let Ok(exe) = std::env::current_exe()
+                {
+                    let sibling = exe.with_file_name("zeroclaw-desktop");
+                    if sibling.is_file() {
+                        found = Some(sibling);
                     }
                 }
 
@@ -4841,38 +5083,37 @@ async fn main() -> Result<()> {
                 //    Uses directories::UserDirs so HOME (Unix) and USERPROFILE (Windows)
                 //    are both resolved correctly. On Windows the binary is .exe — try
                 //    both names since which::which (step 4) only catches PATH entries.
-                if found.is_none() {
-                    if let Some(home) =
+                if found.is_none()
+                    && let Some(home) =
                         directories::UserDirs::new().map(|u| u.home_dir().to_path_buf())
-                    {
-                        let bin_names: &[&str] = if cfg!(windows) {
-                            &["zeroclaw-desktop.exe", "zeroclaw-desktop"]
-                        } else {
-                            &["zeroclaw-desktop"]
-                        };
-                        // .cargo/bin works the same on Windows; .local/bin is XDG (Unix only).
-                        let dirs: &[&str] = if cfg!(windows) {
-                            &[".cargo/bin"]
-                        } else {
-                            &[".cargo/bin", ".local/bin"]
-                        };
-                        'outer: for dir in dirs {
-                            for name in bin_names {
-                                let candidate = home.join(dir).join(name);
-                                if candidate.is_file() {
-                                    found = Some(candidate);
-                                    break 'outer;
-                                }
+                {
+                    let bin_names: &[&str] = if cfg!(windows) {
+                        &["zeroclaw-desktop.exe", "zeroclaw-desktop"]
+                    } else {
+                        &["zeroclaw-desktop"]
+                    };
+                    // .cargo/bin works the same on Windows; .local/bin is XDG (Unix only).
+                    let dirs: &[&str] = if cfg!(windows) {
+                        &[".cargo/bin"]
+                    } else {
+                        &[".cargo/bin", ".local/bin"]
+                    };
+                    'outer: for dir in dirs {
+                        for name in bin_names {
+                            let candidate = home.join(dir).join(name);
+                            if candidate.is_file() {
+                                found = Some(candidate);
+                                break 'outer;
                             }
                         }
                     }
                 }
 
                 // 4. Fallback to PATH lookup
-                if found.is_none() {
-                    if let Ok(path) = which::which("zeroclaw-desktop") {
-                        found = Some(path);
-                    }
+                if found.is_none()
+                    && let Ok(path) = which::which("zeroclaw-desktop")
+                {
+                    found = Some(path);
                 }
 
                 found
@@ -5053,10 +5294,10 @@ async fn main() -> Result<()> {
                     if secrets && !entry.is_secret {
                         continue;
                     }
-                    if let Some(ref f) = filter {
-                        if !entry.name.starts_with(f.as_str()) {
-                            continue;
-                        }
+                    if let Some(ref f) = filter
+                        && !entry.name.starts_with(f.as_str())
+                    {
+                        continue;
                     }
                     if entry.category != current_category {
                         if !current_category.is_empty() {
@@ -5380,12 +5621,30 @@ async fn main() -> Result<()> {
                         }
                     }
                     None => {
+                        // Schema-current files can still carry a section that
+                        // fails typed deserialization (the resilient loader
+                        // resets it to defaults and the CLI points here for
+                        // the precise error). Run the strict path so this
+                        // command actually shows it instead of a dead-end
+                        // "already current".
+                        let strict_error = std::fs::read_to_string(&config.config_path)
+                            .ok()
+                            .and_then(|raw| {
+                                crate::config::migration::migrate_to_current(&raw)
+                                    .err()
+                                    .map(|e| format!("{e:#}"))
+                            });
                         if json {
                             let envelope = serde_json::json!({
                                 "migrated": false,
                                 "schema_version": crate::config::migration::CURRENT_SCHEMA_VERSION,
+                                "valid": strict_error.is_none(),
+                                "error": strict_error,
                             });
                             println!("{}", serde_json::to_string_pretty(&envelope)?);
+                            if strict_error.is_some() {
+                                std::process::exit(1);
+                            }
                         } else {
                             println!(
                                 "{}",
@@ -5394,6 +5653,14 @@ async fn main() -> Result<()> {
                                     "Config already at current schema version."
                                 )
                             );
+                            if let Some(error) = strict_error {
+                                anyhow::bail!(
+                                    "config at {} does not deserialize strictly; the resilient \
+                                     loader is substituting defaults for the failing section. \
+                                     Parse error: {error}",
+                                    config.config_path.display()
+                                );
+                            }
                         }
                     }
                 }
@@ -5511,6 +5778,26 @@ async fn main() -> Result<()> {
                     } else {
                         raw_path.to_string()
                     };
+                    // Mirror `PATCH /api/config`'s alias auto-materialization
+                    // (`handle_patch` in crates/zeroclaw-gateway/src/api_config.rs):
+                    // `add`/`replace` against a leaf under a not-yet-existing map-keyed
+                    // alias (e.g. a brand-new `channels.telegram.<alias>.<field>`)
+                    // creates the alias first. `remove`/`test`/`comment` intentionally
+                    // do not materialize — nothing to remove/test on an alias that
+                    // doesn't exist yet.
+                    if matches!(op_name, "add" | "replace") && config.ensure_map_key_for_path(&path)
+                    {
+                        let err = ConfigApiError::new(
+                            ConfigApiCode::ValidationFailed,
+                            "alias `default` is reserved and cannot be created",
+                        )
+                        .with_path(&path)
+                        .with_op_index(idx);
+                        let human = format!(
+                            "op[{idx}] `{op_name}` on `{path}`: alias `default` is reserved and cannot be created"
+                        );
+                        config_patch_fail_json_or_human(json, err, human)?;
+                    }
                     let comment = match object.get("comment") {
                         Some(value) => match value.as_str() {
                             Some(comment) => Some(comment),
@@ -5554,11 +5841,17 @@ async fn main() -> Result<()> {
                                 ))
                             })?;
                             let value_str = json_value_to_setprop_string(value, &config, &path)?;
-                            config
-                                .set_prop_persistent(&path, &value_str)
-                                .with_context(|| {
-                                    format!("op[{idx}] `{op_name}` on `{path}` failed")
-                                })?;
+                            match config.set_prop_persistent(&path, &value_str) {
+                                Ok(()) => {}
+                                Err(err) => {
+                                    let api_err = config_patch_map_prop_error(err, &path, idx);
+                                    let human = format!(
+                                        "op[{idx}] `{op_name}` on `{path}` failed: {}",
+                                        api_err.message
+                                    );
+                                    config_patch_fail_json_or_human(json, api_err, human)?;
+                                }
+                            }
                             if is_secret {
                                 serde_json::json!({
                                     "op": op_name,
@@ -5574,9 +5867,17 @@ async fn main() -> Result<()> {
                             }
                         }
                         "remove" => {
-                            config.set_prop_persistent(&path, "").with_context(|| {
-                                format!("op[{idx}] `remove` on `{path}` failed")
-                            })?;
+                            match config.set_prop_persistent(&path, "") {
+                                Ok(()) => {}
+                                Err(err) => {
+                                    let api_err = config_patch_map_prop_error(err, &path, idx);
+                                    let human = format!(
+                                        "op[{idx}] `remove` on `{path}` failed: {}",
+                                        api_err.message
+                                    );
+                                    config_patch_fail_json_or_human(json, api_err, human)?;
+                                }
+                            }
                             if is_secret {
                                 serde_json::json!({
                                     "op": "remove",
@@ -5684,9 +5985,14 @@ async fn main() -> Result<()> {
                     results.push(result_entry);
                 }
 
-                config
-                    .validate()
-                    .context("validation failed after applying patch \u{2014} no changes saved")?;
+                if let Err(err) = config.validate() {
+                    let api_err = ConfigApiError::from_validation(err);
+                    let human = format!(
+                        "validation failed after applying patch \u{2014} no changes saved: {}",
+                        api_err.message
+                    );
+                    config_patch_fail_json_or_human(json, api_err, human)?;
+                }
                 Box::pin(config.save_dirty()).await?;
 
                 if json {
@@ -5813,6 +6119,11 @@ async fn main() -> Result<()> {
             PluginCommands::Search { query, registry } => {
                 let registry_url = plugin_registry::registry_url(registry.as_deref());
                 let index = plugin_registry::fetch_registry_index(&registry_url).await?;
+                zeroclaw::plugins::registry::write_cached_registry_index(
+                    &config.data_dir,
+                    &registry_url,
+                    &index,
+                )?;
                 let matches = plugin_registry::search_entries(&index, &query);
                 if matches.is_empty() {
                     println!(
@@ -5865,7 +6176,7 @@ async fn main() -> Result<()> {
                 }
                 let mut host = plugin_host_with_configured_security(&config)?;
                 if plugin_registry::is_local_plugin_source(&source) {
-                    host.install(&source)?;
+                    let name = host.install(&source)?;
                     println!(
                         "{}",
                         ta(
@@ -5874,6 +6185,7 @@ async fn main() -> Result<()> {
                             "Plugin installed"
                         )
                     );
+                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
                 } else {
                     let registry_url = plugin_registry::registry_url(registry.as_deref());
                     println!(
@@ -5884,10 +6196,14 @@ async fn main() -> Result<()> {
                             "Resolving plugin from registry..."
                         )
                     );
-                    let downloaded =
-                        plugin_registry::download_registry_plugin(&registry_url, &source).await?;
+                    let downloaded = plugin_registry::download_registry_plugin(
+                        &registry_url,
+                        &source,
+                        Some(&config.data_dir),
+                    )
+                    .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
-                    host.install(&plugin_dir)?;
+                    let name = host.install(&plugin_dir)?;
                     println!(
                         "{}",
                         ta(
@@ -5899,6 +6215,7 @@ async fn main() -> Result<()> {
                             "Plugin installed"
                         )
                     );
+                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
                 }
                 Ok(())
             }

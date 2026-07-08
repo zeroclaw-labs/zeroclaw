@@ -15,10 +15,10 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::time::{self, Duration};
+use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl};
 use zeroclaw_log::Instrument;
-use zeroclaw_memory::{MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN};
 
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
@@ -286,7 +286,11 @@ pub async fn run_manual_job(
     }
 }
 
-pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
+pub async fn run(
+    config: Config,
+    event_tx: EventBroadcast,
+    cancel: CancellationToken,
+) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -379,27 +383,44 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
     }
 
     loop {
-        interval.tick().await;
-        // Keep scheduler liveness fresh even when there are no due jobs.
-        crate::health::mark_component_ok(SCHEDULER_COMPONENT);
+        // `select!` between the interval tick and the cancellation
+        // token so the daemon's shutdown path (`channels_cancel.cancel()`
+        // at daemon/mod.rs:584) reaches the scheduler without waiting
+        // for the next tick — and so the loop returns `Ok(())` cleanly
+        // before the supervisor's `.abort()` fallback would fire.
+        tokio::select! {
+            _ = interval.tick() => {
+                // Keep scheduler liveness fresh even when there are no due jobs.
+                crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
-        let jobs = match due_jobs(&config, Utc::now()) {
-            Ok(jobs) => jobs,
-            Err(e) => {
-                crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "Scheduler query failed"
-                );
-                continue;
+                let jobs = match due_jobs(&config, Utc::now()) {
+                    Ok(jobs) => jobs,
+                    Err(e) => {
+                        crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "Scheduler query failed"
+                        );
+                        continue;
+                    }
+                };
+
+                let jobs = claim_due_jobs(&config, jobs);
+                process_due_jobs(&config, jobs, SCHEDULER_COMPONENT, &event_tx).await;
             }
-        };
-
-        let jobs = claim_due_jobs(&config, jobs);
-        process_due_jobs(&config, jobs, SCHEDULER_COMPONENT, &event_tx).await;
+            _ = cancel.cancelled() => {
+                crate::health::mark_component_ok(SCHEDULER_COMPONENT);
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "Cron scheduler shutting down via cancellation token"
+                );
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -815,50 +836,12 @@ async fn run_agent_job(
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
 
-    // Recall relevant memories so cron jobs have context awareness.
-    // Skipped when `job.uses_memory` is false (e.g. stateless digest jobs).
-    // Exclude `Conversation` memories to prevent chat context from
-    // leaking into scheduled executions. Routes through
-    // the cron-owning agent's per-agent memory wrapper so the
-    // recall is scoped to that agent's bound + allowlisted rows.
-    let memory_context = if !job.uses_memory {
-        String::new()
-    } else {
-        match zeroclaw_memory::create_memory_for_agent(
-            config,
-            agent_alias,
-            config
-                .model_provider_for_agent(agent_alias)
-                .and_then(|e| e.api_key.as_deref()),
-        )
-        .await
-        {
-            Ok(mem) => match mem.recall(&prompt, 5, None, None, None).await {
-                Ok(entries) if !entries.is_empty() => {
-                    let ctx: String = entries
-                        .iter()
-                        .filter(|e| {
-                            !matches!(
-                                e.category,
-                                zeroclaw_memory::traits::MemoryCategory::Conversation
-                            )
-                        })
-                        .map(|e| format!("- {}: {}", e.key, e.content))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if ctx.is_empty() {
-                        String::new()
-                    } else {
-                        format!("{MEMORY_CONTEXT_OPEN}\n{ctx}\n{MEMORY_CONTEXT_CLOSE}\n\n")
-                    }
-                }
-                _ => String::new(),
-            },
-            Err(_) => String::new(),
-        }
-    };
-
-    let prefixed_prompt = format!("{memory_context}[cron:{} {name}] {prompt}", job.id);
+    // Memory context is injected once in the engine, keyed on the Cron
+    // origin (agent::memory_inject): Conversation entries are excluded for
+    // scheduled origins, and `uses_memory = false` suppresses injection via
+    // `AgentRunOverrides.suppress_memory_inject` below. `run()` builds the
+    // same agent-scoped memory (`create_memory_for_agent`) this site used.
+    let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
     let mut cron_config = config.clone();
@@ -895,6 +878,14 @@ async fn run_agent_job(
         security: Some(Arc::new(run_security)),
         memory: None,
         is_subagent: false,
+        // `uses_memory = false` fully opts the job out of the engine's
+        // memory-context injection (stateless digest jobs)...
+        suppress_memory_inject: !job.uses_memory,
+        // ...and makes the run memory-free end to end: the loop binds a
+        // `NoneMemory` backend and drops the persistent memory tools, so a
+        // `uses_memory = false` job can neither recall/store through a real
+        // backend nor reach one via advertised memory tools (issue #8695).
+        memory_free: !job.uses_memory,
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
@@ -912,6 +903,7 @@ async fn run_agent_job(
                     false,
                     Some(session_path.clone()),
                     job.allowed_tools.clone(),
+                    zeroclaw_api::ingress::TurnOrigin::Cron,
                     run_overrides,
                 )
                 .instrument(subagent_span),
