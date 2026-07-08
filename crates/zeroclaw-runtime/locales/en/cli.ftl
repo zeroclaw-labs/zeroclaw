@@ -27,6 +27,8 @@ cli-config-about = Manage ZeroClaw configuration
 cli-update-about = Check for and apply ZeroClaw updates
 cli-self-test-about = Run diagnostic self-tests
 cli-completions-about = Generate shell completion scripts
+cli-desktop-about = Launch the ZeroClaw companion desktop app
+
 cli-config-schema-about = Dump the full configuration JSON Schema to stdout
 cli-config-list-about = List all config properties with current values
 cli-config-get-about = Get a config property value
@@ -141,6 +143,7 @@ cli-models-status-about = Show current model configuration and cache status
 
 cli-doctor-models-about = Probe model catalogs across providers and report availability
 cli-doctor-traces-about = Query runtime trace events (tool diagnostics and model replies)
+cli-doctor-update-context-windows-about = Update context_window in config.toml from provider /models endpoints
 
 cli-hardware-discover-about = Enumerate USB devices and show known boards
 cli-hardware-introspect-about = Introspect a device by its serial or device path
@@ -318,6 +321,12 @@ cli-skills-install-suggestion =
     Matched capability: {$matched}
     Next: Run `{$install_command}` to install it.
 
+cli-plugin-install-suggestion =
+    It looks like this request needs the `{$name}` plugin, but it is not installed.
+
+    Matched capability: {$matched}
+    Next: Run `{$install_command}` to install it.
+
 cli-completions-long-about =
     Generate shell completion scripts for `zeroclaw`.
 
@@ -327,6 +336,17 @@ cli-completions-long-about =
       source <(zeroclaw completions bash)
       zeroclaw completions zsh > ~/.zfunc/_zeroclaw
       zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish
+
+cli-desktop-long-about =
+    Launch the ZeroClaw companion desktop app.
+
+    The companion app is a lightweight menu bar / system tray application that connects to the same gateway as the CLI. It provides quick access to the dashboard, status monitoring, and device pairing.
+
+    Use --install to download the pre-built companion app for your platform.
+
+    Examples:
+      zeroclaw desktop              # launch the companion app
+      zeroclaw desktop --install    # download and install it
 
 # Channel-side reply emitted when chat dispatch refuses because the
 # gateway has no model configured. Used by the gateway crate channel
@@ -381,6 +401,9 @@ channel-discord-delivery-failure-note-one = (note: I couldn't deliver {$count} f
 channel-discord-delivery-failure-note-many = (note: I couldn't deliver {$count} files.)
 channel-whatsapp-web-delivery-failure-note-one = (note: I could not deliver {$count} WhatsApp media attachment.)
 channel-whatsapp-web-delivery-failure-note-many = (note: I could not deliver {$count} WhatsApp media attachments.)
+channel-line-bind-success = ✅ Paired! You can now chat.
+channel-line-bind-invalid-code = ❌ Invalid code. Please try again.
+channel-line-bind-rate-limited = ⏳ Too many attempts. Retry in { $secs }s.
 
 # Onboarding — OpenAI auth picker
 onboard-openai-auth-note =
@@ -402,6 +425,15 @@ onboard-openai-codex-followup =
 cli-web-dist-dir-reason-tilde = starts with `~` which is not expanded
 cli-web-dist-dir-reason-dollar = contains `$` which is not expanded
 cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason}; gateway.web_dist_dir is read verbatim, so expand the value yourself (e.g. an absolute path)
+# Diagnostics emitted by `zeroclaw doctor` cross-checking OpenAI Codex
+# (OAuth/subscription) credentials against OpenAI provider slots that opt in
+# via `requires_openai_auth = true`. A signed-in credential with no slot — or a
+# slot with no credential — otherwise stays silent until the first model call,
+# where it surfaces as a confusing auth error. Companion runtime check in
+# `crates/zeroclaw-runtime/src/doctor/mod.rs`.
+cli-doctor-codex-auth-profile-no-slot = OpenAI Codex credentials are signed in but no model provider slot uses them. Set `requires_openai_auth = true` on an OpenAI provider slot and point an agent's `model_provider` at it, or run `zeroclaw quickstart`.
+cli-doctor-codex-auth-slot-no-profile = OpenAI slot(s) {$slots} set `requires_openai_auth = true` but no OpenAI Codex credentials are signed in. Run `zeroclaw auth login --provider openai-codex`.
+cli-doctor-codex-auth-ok = OpenAI Codex credentials are signed in and referenced by a model provider slot.
 cli-doctor-systemd-linger-enabled = systemd user lingering enabled
 cli-doctor-systemd-linger-disabled = systemd user lingering disabled; user service may stop after logout. Enable with: loginctl enable-linger {$user}
 cli-doctor-systemd-linger-unknown = systemd user lingering could not be checked with loginctl
@@ -431,6 +463,9 @@ cli-skills-create-hint = {"  "}Create one: mkdir -p ~/.zeroclaw/workspace/skills
 cli-skills-install-hint = {"  "}Or install: zeroclaw skills install <source>
 cli-skills-installed-header = Installed skills ({$count}):
 cli-skills-tags = Tags:  {$tags}
+cli-skills-skipped-header = Skipped ({$count}):
+cli-skills-skipped-reason = {"    "}Reason: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}Set `skills.allow_scripts = true` in your zeroclaw config to enable it.
 
 # ── sop (zeroclaw sop) ──
 cli-sop-none = No SOPs found.
@@ -654,6 +689,11 @@ cli-status-service-stopped = 🔴 Service:       stopped
 cli-status-channels = Channels:
 cli-status-cli-always = {"  "}CLI:      ✅ always
 cli-status-peripherals = Peripherals:
+cli-desktop-download = Download the ZeroClaw companion app:
+cli-desktop-homebrew = Or install via Homebrew (coming soon):
+cli-desktop-linux-pkg = {"  "}Download the .deb or .AppImage for your architecture.
+cli-desktop-launching = Launching ZeroClaw companion app...
+
 # ── status fields ──
 cli-status-version = Version:     {$v}
 cli-status-workspace = Workspace:   {$v}
@@ -695,6 +735,9 @@ cli-status-word-not-configured = not configured
 cli-status-channel-not-compiled = 🚫 configured, not compiled
 
 # ── desktop / config / plugins / estop / auth ──
+cli-desktop-not-installed = ZeroClaw companion app is not installed.
+cli-desktop-blurb1 = The companion app is a lightweight menu bar app that
+cli-desktop-blurb2 = connects to the same gateway as the CLI.
 cli-config-all-configured = All sections already configured.
 cli-config-schema-current = Config already at current schema version.
 cli-config-applied-ops = Applied {$count} operation(s):
@@ -707,6 +750,10 @@ cli-plugin-no-description = (no description)
 cli-plugin-install-resolving = Resolving '{$source}' from plugin registry...
 cli-plugin-installed-from = Plugin installed from {$source}
 cli-plugin-installed-name-version = Installed plugin {$name} v{$version}
+cli-plugin-config-entry-seeded = Seeded [[plugins.entries]] for '{$name}'. Set plugin config values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-seed-skipped = warning: skipped seeding the config entry for '{$name}': the [plugins] section on disk is malformed. Repair it, add a [[plugins.entries]] block with `name = "{$name}"`, then set values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-seed-unaddressable = warning: skipped seeding the config entry for '{$name}': plugin names containing '.' cannot be addressed by dotted config paths (`config set` splits on '.'). Add a [[plugins.entries]] block with `name = "{$name}"` to the config file by hand.
+cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-plugin-removed = Plugin '{$name}' removed.
 cli-plugin-not-found = Plugin '{$name}' not found.
 cli-plugin-legacy-detected = Note: plugins in a legacy location ({$path}) are not loaded by the agent — run `zeroclaw plugin migrate` to move them into {$target}.
@@ -723,6 +770,7 @@ cli-warn-crypto-provider = Warning: Failed to install default crypto provider: {
 cli-error-label = {"   "}Error: {$err}
 cli-warn-cost-usage = {"  "}⚠ Could not load cost usage: {$err}
 cli-warn-cost-tracker = {"  "}⚠ Could not init cost tracker: {$err}
+cli-desktop-download-at = {"  "}Download it at: {$url}
 cli-config-legend = Legend: 💉 env-overridden  🔒 secret
 cli-config-secret-set = {$path} is set (encrypted secret — value not displayed)
 cli-config-secret-unset = {$path} is not set (encrypted secret)
@@ -814,6 +862,10 @@ turn-stream-interrupted = [stream interrupted]
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 # Reason carried on every history_trimmed event (WS, SSE, ACP).
 history-trim-reason-budget = context token budget exceeded
+# Remediation surfaced when the system prompt + inlined tool definitions alone
+# meet or exceed the context budget, so no amount of conversation trimming can
+# fit the request (#5808).
+history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 # Refusal returned when the ingress policy layer (RFC #6971) drops an inbound
 # turn before it reaches the model. Unreachable under the default `Loop` policy
 # (phase 1); becomes live when non-`Loop` policy is configured (phase 3).
@@ -881,3 +933,18 @@ cli-bundle-renamed = renamed skill_bundles.{$from} → skill_bundles.{$to}
 # a supervisor retry loop. The two variants differ only by who holds the port.
 cli-daemon-gateway-already-running = A ZeroClaw gateway is already running on {$host}:{$port}. The daemon supervises its own gateway and will not start a second one on the same address. Stop that gateway (or point the daemon at a free port with `zeroclaw config set gateway.port <port>`), then run the daemon again.
 cli-daemon-gateway-port-occupied = Gateway address {$host}:{$port} is already in use by another process. Free the port or point the daemon at a free port (`zeroclaw config set gateway.port <port>`), then run the daemon again.
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
+cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
+cli-agent-context-bar-unknown = ctx: unknown / {$max}
+cli-doctor-ctxwin-already-set = {$provider_ref}: already has context_window = {$ctx}
+cli-doctor-ctxwin-no-model = {$provider_ref}: no model configured, skipping
+cli-doctor-ctxwin-would-set = {$provider_ref}: would set context_window = {$ctx} (dry run)
+cli-doctor-ctxwin-set = {$provider_ref}: set context_window = {$ctx}
+cli-doctor-ctxwin-not-found = {$provider_ref}: could not find entry to update
+cli-doctor-ctxwin-fetch-failed = {$provider_ref}: provider does not expose context window or fetch failed
+cli-doctor-ctxwin-saved = Saved {$updated} updates to config.toml
+cli-doctor-ctxwin-dry-run = Dry run complete — no changes written. Run without --dry-run to apply.
+cli-doctor-ctxwin-none = No updates needed.
+cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window: {$error}
+

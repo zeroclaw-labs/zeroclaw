@@ -753,6 +753,7 @@ impl Channel for NextcloudTalkChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        _suppress_voice: bool,
     ) -> anyhow::Result<()> {
         let display_text = Self::truncate_to_nc_limit(text);
 

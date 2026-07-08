@@ -322,7 +322,10 @@ pub struct Agent {
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
     tool_dispatcher: Box<dyn ToolDispatcher>,
-    memory_strategy: Arc<dyn zeroclaw_api::memory_traits::MemoryStrategy>,
+    /// Stable half of the engine's memory-context injection policy
+    /// (recall limit, relevance floor, budgets). Threaded into `ToolLoop`
+    /// as `TurnMemory.cfg` on every turn.
+    memory_inject_cfg: crate::agent::memory_inject::MemoryInjectConfig,
     config: zeroclaw_config::schema::AliasedAgentConfig,
     multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     model_name: String,
@@ -358,6 +361,19 @@ pub struct Agent {
     /// When MCP deferred loading is enabled, tools are activated via `tool_search`
     /// and stored here for lookup during tool execution.
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    /// Pre-rendered MCP pinned-resource system-prompt section, read once at
+    /// construction from each server's `pinned_resources` and provenance-wrapped
+    /// (`trust="untrusted-external"`). Empty when no pins are configured or all
+    /// were skipped. Appended to the system prompt in `build_system_prompt`.
+    mcp_pinned_section: String,
+    /// Pre-rendered deferred-MCP-tools system-prompt section, built once at
+    /// construction when `mcp.deferred_loading` is enabled. It enumerates the
+    /// policy-admitted `<server>__<tool>` stubs and instructs the model to call
+    /// `tool_search` to activate them. Empty when deferred loading is off or no
+    /// stubs are admitted. Appended to the system prompt in
+    /// `build_system_prompt` so TUI Chat sessions surface the same deferred MCP
+    /// affordance the gateway and channel/webhook paths already expose (#8193).
+    mcp_deferred_section: String,
     /// Hook runner for tool-call auditing and lifecycle side effects.
     /// See issue #5462.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
@@ -477,7 +493,7 @@ pub struct AgentBuilder {
     observer: Option<Arc<dyn Observer>>,
     prompt_builder: Option<SystemPromptBuilder>,
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
-    memory_strategy: Option<Arc<dyn zeroclaw_api::memory_traits::MemoryStrategy>>,
+    memory_inject_cfg: Option<crate::agent::memory_inject::MemoryInjectConfig>,
     config: Option<zeroclaw_config::schema::AliasedAgentConfig>,
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
@@ -499,6 +515,8 @@ pub struct AgentBuilder {
     autonomy_level: Option<crate::security::AutonomyLevel>,
     approval_route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    mcp_pinned_section: Option<String>,
+    mcp_deferred_section: Option<String>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     approval_manager: Option<Arc<ApprovalManager>>,
     agent_alias: Option<String>,
@@ -523,7 +541,7 @@ impl AgentBuilder {
             observer: None,
             prompt_builder: None,
             tool_dispatcher: None,
-            memory_strategy: None,
+            memory_inject_cfg: None,
             config: None,
             multimodal_config: None,
             model_name: None,
@@ -545,6 +563,8 @@ impl AgentBuilder {
             autonomy_level: None,
             approval_route: None,
             activated_tools: None,
+            mcp_pinned_section: None,
+            mcp_deferred_section: None,
             hook_runner: None,
             approval_manager: None,
             agent_alias: None,
@@ -585,11 +605,14 @@ impl AgentBuilder {
         self
     }
 
-    pub fn memory_strategy(
+    /// Stable half of the engine's memory-context injection policy. When
+    /// unset, defaults preserve the legacy loader shape (recall limit 5,
+    /// the schema-default relevance floor).
+    pub fn memory_inject_cfg(
         mut self,
-        memory_strategy: Arc<dyn zeroclaw_api::memory_traits::MemoryStrategy>,
+        cfg: crate::agent::memory_inject::MemoryInjectConfig,
     ) -> Self {
-        self.memory_strategy = Some(memory_strategy);
+        self.memory_inject_cfg = Some(cfg);
         self
     }
 
@@ -719,6 +742,16 @@ impl AgentBuilder {
         self
     }
 
+    pub fn mcp_pinned_section(mut self, section: Option<String>) -> Self {
+        self.mcp_pinned_section = section;
+        self
+    }
+
+    pub fn mcp_deferred_section(mut self, section: Option<String>) -> Self {
+        self.mcp_deferred_section = section;
+        self
+    }
+
     pub fn hook_runner(mut self, runner: Option<Arc<crate::hooks::HookRunner>>) -> Self {
         self.hook_runner = runner;
         self
@@ -782,11 +815,6 @@ impl AgentBuilder {
             tools.retain(|t| !zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&t.name()));
         }
 
-        let workspace_dir = self
-            .workspace_dir
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-
         let memory: Arc<dyn Memory> = if exclude_memory {
             Arc::new(zeroclaw_memory::NoneMemory::new("none"))
         } else {
@@ -801,14 +829,6 @@ impl AgentBuilder {
                 anyhow::Error::msg("memory is required")
             })?
         };
-        // No-memory sessions must not retain a caller-provided strategy that
-        // still closes over persistent memory.
-        let memory_strategy = if exclude_memory {
-            None
-        } else {
-            self.memory_strategy
-        };
-
         Ok(Agent {
             model_provider: self.model_provider.ok_or_else(|| {
                 ::zeroclaw_log::record!(
@@ -845,14 +865,12 @@ impl AgentBuilder {
                 );
                 anyhow::Error::msg("tool_dispatcher is required")
             })?,
-            memory_strategy: memory_strategy.unwrap_or_else(|| {
-                Arc::new(
-                    crate::agent::memory_strategy::DefaultMemoryStrategy::with_config(
-                        memory.clone(),
-                        zeroclaw_config::schema::MemoryConfig::default(),
-                        workspace_dir.clone(),
-                    ),
-                )
+            memory_inject_cfg: self.memory_inject_cfg.unwrap_or_else(|| {
+                crate::agent::memory_inject::MemoryInjectConfig {
+                    min_relevance_score: zeroclaw_config::schema::MemoryConfig::default()
+                        .min_relevance_score,
+                    ..Default::default()
+                }
             }),
             config: self.config.unwrap_or_default(),
             multimodal_config: self.multimodal_config.unwrap_or_default(),
@@ -896,6 +914,8 @@ impl AgentBuilder {
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
+            mcp_pinned_section: self.mcp_pinned_section.unwrap_or_default(),
+            mcp_deferred_section: self.mcp_deferred_section.unwrap_or_default(),
             hook_runner: self.hook_runner,
             approval_manager: self.approval_manager,
             agent_alias: self.agent_alias.unwrap_or_default(),
@@ -1012,12 +1032,49 @@ impl Agent {
         transcript
     }
 
+    /// Whether this turn will have a per-turn memory preamble injected that
+    /// the response-cache key does not capture.
+    ///
+    /// Memory injection (`agent::memory_inject`) runs inside the turn engine
+    /// and prepends a `[Memory context]` block to the last user message
+    /// AFTER the response-cache key has been computed from the bare
+    /// transcript. That block varies with memory state, so a cache keyed on
+    /// the transcript alone could serve a stale, memory-conditioned answer
+    /// for the same user text. When injection is active, the response cache
+    /// must be bypassed (both read and write) rather than key on a prompt
+    /// the model never actually saw.
+    ///
+    /// `NoneMemory` recalls nothing, so its turns never vary and stay
+    /// cacheable. For a real backend, mirror the engine's own decision
+    /// (`turn/mod.rs`): the direct and streamed `Agent::turn` paths both run
+    /// under the `AgentDirect` ingress origin with no spawn suppression, so
+    /// the policy is `Inject` whenever a session-scoped or unscoped recall
+    /// could contribute entries.
+    fn memory_injection_active(&self) -> bool {
+        if self.memory.name() == "none" {
+            return false;
+        }
+        matches!(
+            crate::agent::memory_inject::resolve_inject_policy(
+                zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                self.memory_session_id.is_some(),
+                false,
+            ),
+            crate::agent::memory_inject::InjectPolicy::Inject { .. }
+        )
+    }
+
     fn response_cache_key_for_messages(
         &self,
         messages: &[ChatMessage],
         effective_model: &str,
     ) -> Option<String> {
-        if self.temperature != Some(0.0) || self.response_cache.is_none() {
+        // Bypass the cache when a per-turn memory preamble the key cannot see
+        // will be injected downstream (see `memory_injection_active`).
+        if self.temperature != Some(0.0)
+            || self.response_cache.is_none()
+            || self.memory_injection_active()
+        {
             return None;
         }
 
@@ -1052,16 +1109,8 @@ impl Agent {
         user_message: &str,
         new_msgs: &mut Vec<ConversationMessage>,
     ) {
-        let context = self
-            .memory_strategy
-            .load_context(
-                &*self.observer,
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
-            .await
-            .unwrap_or_default();
-
+        // Memory context is injected once in the engine, keyed on the
+        // ingress origin (agent::memory_inject).
         if self.auto_save {
             let store_start = std::time::Instant::now();
             let store_result = self
@@ -1082,11 +1131,7 @@ impl Agent {
         }
 
         let now = self.current_turn_datetime().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = if context.is_empty() {
-            format!("[{now}] {user_message}")
-        } else {
-            format!("{context}[{now}] {user_message}")
-        };
+        let enriched = format!("[{now}] {user_message}");
 
         let user_msg = ConversationMessage::Chat(ChatMessage::user(enriched));
         new_msgs.push(user_msg.clone());
@@ -1099,6 +1144,23 @@ impl Agent {
 
     pub fn set_temperature(&mut self, temperature: Option<f64>) {
         self.temperature = temperature;
+    }
+
+    /// Refresh this agent's memory embedder after a provider-profile
+    /// `config/set`/`config/delete`, so a live session's per-agent memory stops
+    /// embedding against a stale endpoint/key without a daemon restart (#8359).
+    /// Forwards through any memory wrappers (e.g. `AgentScopedMemory`) to the
+    /// embedding backend; a no-op for backends that do not embed. `&self` —
+    /// the swap is interior to the memory handle.
+    pub fn refresh_memory_embedder(
+        &self,
+        model_provider: &str,
+        api_key: Option<&str>,
+        model: &str,
+        dimensions: usize,
+    ) {
+        self.memory
+            .refresh_embedder(model_provider, api_key, model, dimensions);
     }
 
     #[cfg(test)]
@@ -1140,6 +1202,29 @@ impl Agent {
     #[cfg(test)]
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.iter().map(|t| t.name()).collect()
+    }
+
+    /// Render the current system prompt. Test-only — lets regression tests
+    /// assert on prompt-injected sections (e.g. the deferred-MCP-tools section
+    /// that advertises `tool_search`) without driving a full turn (#8193).
+    #[cfg(test)]
+    pub fn system_prompt_for_test(&self) -> Result<String> {
+        self.build_system_prompt()
+    }
+
+    /// Execute a registered tool by name against this agent's tool registry.
+    /// Test-only — lets regression tests assert real tool *behavior* (e.g. that
+    /// `tool_search` actually resolves granted deferred MCP tools, not merely
+    /// that it is registered or advertised) without driving a full model turn
+    /// (#8193). Returns `None` when no tool with `name` is registered.
+    #[cfg(test)]
+    pub async fn execute_tool_for_test(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Option<anyhow::Result<zeroclaw_api::tool::ToolResult>> {
+        let tool = crate::agent::tool_execution::find_tool(&self.tools, name)?;
+        Some(tool.execute(args).await)
     }
 
     /// Hydrate the agent with prior chat messages (e.g. from a session backend).
@@ -1336,12 +1421,20 @@ impl Agent {
         if let Err(e) = tokio::fs::create_dir_all(&agent_workspace).await {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "workspace": agent_workspace.display().to_string(), "e": e.to_string()})), "Failed to create per-agent workspace dir (continuing): ");
         }
-        // Seed the agent's bootstrap files (AGENTS.md / SOUL.md /
-        // IDENTITY.md / USER.md / TOOLS.md / BOOTSTRAP.md) on first
-        // run. Idempotent — never overwrites existing files; only
-        // fills in the gaps so a freshly-created agent has a basic
-        // identity to load.
-        if let Err(e) = zeroclaw_config::schema::ensure_bootstrap_files(&agent_workspace).await {
+        // Seed the agent's personality files (SOUL.md / IDENTITY.md /
+        // USER.md / AGENTS.md / TOOLS.md / HEARTBEAT.md / MEMORY.md) from
+        // the default preset on first run. Idempotent — only missing or
+        // blank files are written, so existing user edits are preserved.
+        // Without this a freshly-created agent loads with empty operating
+        // files, which silently breaks tool use for prompt-guided models
+        // that rely on AGENTS.md/TOOLS.md instead of native tool schemas.
+        if let Err(e) = crate::agent::personality::seed_default_personality(
+            config,
+            agent_alias,
+            &agent_workspace,
+        )
+        .await
+        {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "workspace": agent_workspace.display().to_string(), "e": e.to_string()})), "Failed to ensure per-agent bootstrap files (continuing with whatever exists): ");
         }
         let security = Arc::new({
@@ -1438,175 +1531,52 @@ impl Agent {
             tui_env,
             sop_engine,
             sop_audit,
+            None,
         );
-        let mut tools = all_tools_result.tools;
-        let delegate_handle = all_tools_result.delegate_handle;
-        let ask_user_handle = all_tools_result.ask_user_handle;
-        let channel_room_handle = all_tools_result.channel_room_handle;
-        let reaction_handle = all_tools_result.reaction_handle;
-        let poll_handle = all_tools_result.poll_handle;
-        let escalate_handle = all_tools_result.escalate_handle;
-
-        // ── Built-in SecurityPolicy tool gate (parity with agent::run) ──
-        // Apply the agent's allowlist (`allowed_tools`) AND denylist
-        // (`excluded_tools`) to the built-in registry *before* MCP tools and
-        // skill tools are added. `from_config` (ws.rs / daemon) bypasses the
-        // channel orchestrator and previously enforced only the risk-profile
-        // denylist (further below) on this path — never the allowlist — so an
-        // agent allowlisted to e.g. `file_read` still kept raw `shell` /
-        // `file_write`. Filtering here, before skill registration, is also
-        // what lets a scoped elevation wrapper survive: the raw target is
-        // removed while the distinct prefixed `{skill}__{tool}` wrapper is
-        // appended later. MCP tools are initialized after this built-in
-        // filter, then MCP registration and deferred discovery apply the same
-        // SecurityPolicy explicitly so denied MCP tools do not surface.
-        let before_policy_filter = tools.len();
-        crate::agent::loop_::apply_policy_tool_filter(&mut tools, Some(security.as_ref()), None);
-        if tools.len() != before_policy_filter {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({
-                        "before": before_policy_filter,
-                        "retained": tools.len(),
-                        "policy_allowed": security.allowed_tools.as_ref().map(|v| v.len()),
-                        "policy_excluded": security.excluded_tools.as_ref().map(|v| v.len()),
-                    })),
-                "Applied SecurityPolicy built-in tool filter (from_config path)"
-            );
-        }
-
-        // ── Wire MCP tools (non-fatal) ─────────────────────────────
-        // Replicates the same MCP initialization logic used in the CLI
-        // and webhook paths (loop_.rs) so that the WebSocket/daemon UI
-        // path also has access to MCP tools.
-        let mut activated_tools: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>> = None;
-        // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
-        let mut mcp_elevation_arcs: Vec<Arc<dyn tools::Tool>> = Vec::new();
-        // Secure by default: only the MCP servers granted by this agent's
-        // `mcp_bundles` (omission is not a grant). Regression-covered by
-        // `crates/zeroclaw-runtime/src/rpc/dispatch.rs::tests::`
-        // `chat_session_new_omits_mcp_tools_when_agent_has_no_bundles_{deferred,eager}`
-        // - those tests reach this code path via `session/new` -> `Agent::from_config_with_tui_env`.
-        // If you change the call below, update those tests.
-        let agent_mcp_servers = if initialize_mcp && config.mcp.enabled {
-            config.mcp_servers_for_agent(agent_alias)
-        } else {
-            Vec::new()
-        };
-        if !agent_mcp_servers.is_empty() {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                &format!(
-                    "Initializing MCP client - {} server(s) granted via mcp_bundles",
-                    agent_mcp_servers.len()
-                )
-            );
-            match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
-                Ok(registry) => {
-                    let registry = std::sync::Arc::new(registry);
-                    mcp_elevation_arcs = tools::collect_mcp_elevation_arcs(&registry).await;
-                    let mcp_policy =
-                        crate::agent::loop_::mcp_tool_access_policy(security.as_ref(), None);
-                    for tool in tools::build_mcp_capability_tools(&registry, mcp_policy.as_ref()) {
-                        crate::agent::loop_::register_eager_mcp_tool_if_allowed(
-                            tool,
-                            &mut tools,
-                            delegate_handle.as_ref(),
-                            mcp_policy.as_ref(),
-                        );
-                    }
-                    if config.mcp.deferred_loading {
-                        let deferred_set = tools::DeferredMcpToolSet::from_registry(
-                            std::sync::Arc::clone(&registry),
-                        )
-                        .await;
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
-                            &format!(
-                                "MCP deferred: {} tool stub(s) from {} server(s)",
-                                deferred_set.len(),
-                                registry.server_count()
-                            )
-                        );
-                        let allowed_stub_count = crate::agent::loop_::mcp_allowed_tool_count(
-                            deferred_set
-                                .stubs
-                                .iter()
-                                .map(|stub| stub.prefixed_name.as_str()),
-                            mcp_policy.as_ref(),
-                        );
-                        if allowed_stub_count > 0 {
-                            let activated =
-                                Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
-                            activated_tools = Some(Arc::clone(&activated));
-                            let mut tool_search =
-                                tools::ToolSearchTool::new(deferred_set, activated);
-                            if let Some(policy) = mcp_policy {
-                                tool_search = tool_search.with_access_policy(policy);
-                            }
-                            tools.push(Box::new(tool_search));
-                        }
-                    } else {
-                        let names = registry.tool_names();
-                        let mut registered = 0usize;
-                        let mut skipped = 0usize;
-                        for name in names {
-                            if !crate::agent::loop_::eager_mcp_tool_allowed(
-                                &name,
-                                mcp_policy.as_ref(),
-                            ) {
-                                skipped += 1;
-                                continue;
-                            }
-                            if let Some(def) = registry.get_tool_def(&name).await {
-                                let wrapper: std::sync::Arc<dyn tools::Tool> =
-                                    std::sync::Arc::new(tools::McpToolWrapper::new(
-                                        name,
-                                        def,
-                                        std::sync::Arc::clone(&registry),
-                                    ));
-                                if crate::agent::loop_::register_eager_mcp_tool_if_allowed(
-                                    wrapper,
-                                    &mut tools,
-                                    delegate_handle.as_ref(),
-                                    mcp_policy.as_ref(),
-                                ) {
-                                    registered += 1;
-                                }
-                            }
-                        }
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
-                            &format!(
-                                "MCP: {} tool(s) registered from {} server(s), {} skipped by policy",
-                                registered,
-                                registry.server_count(),
-                                skipped
-                            )
-                        );
-                    }
-                }
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "MCP registry failed to initialize"
-                    );
-                }
-            }
-        }
+        // Skills are loaded here and handed to `assemble`, which owns skill
+        // registration and resolves builtin/MCP elevation against the pre-filter
+        // arcs internally. Bundle-aware via `[agents.<alias>].skill_bundles`.
+        let skills = crate::skills::load_skills_for_agent_from_config(config, agent_alias);
+        // Route the per-agent tool registry through the one gated seam - the same
+        // `assemble` seam `run()` uses. This replaces the hand-rolled built-in filter,
+        // MCP scoping, and skill registration from_config previously duplicated.
+        // connect_mcp mirrors the old `initialize_mcp && config.mcp.enabled` gate;
+        // connect_peripherals is false because from_config never loaded peripheral
+        // tools (routing them in would be a widening and would open serial hardware).
+        let crate::tools::scoped::ScopedAssembled {
+            registry,
+            delegate_handle: _,
+            ask_user_handle,
+            reaction_handle,
+            poll_handle,
+            escalate_handle,
+            channel_room_handle,
+            // The Agent injects two distinct MCP prompt slots: `mcp_deferred_section`
+            // (the deferred tool-search listing) and `mcp_pinned_section`
+            // (pinned resources). `assemble` surfaces the two atomically, so from_config
+            // threads each into its own slot below - no duplication, and the deferred
+            // advertisement the regression suite asserts is preserved.
+            deferred_section,
+            pinned_section,
+            activated_handle,
+        } = crate::tools::scoped::ScopedToolRegistry::assemble(
+            crate::tools::scoped::ScopedAssembly {
+                config,
+                agent_alias,
+                security: &security,
+                built: all_tools_result,
+                skills: &skills,
+                runtime,
+                caller_allowed: None,
+                connect_mcp: initialize_mcp,
+                connect_peripherals: false,
+                exclude_memory,
+                list_deferred_mcp_specs: false,
+                emit_assembly_logs: true,
+            },
+        )
+        .await;
+        let tools = registry.into_inner();
 
         let model_name = match agent_model_provider
             .and_then(|e| e.model.as_deref())
@@ -1662,36 +1632,6 @@ impl Agent {
             None
         };
 
-        // Filter out tools excluded by this agent's risk profile. The
-        // channel orchestrator applies this for channel-driven runs, but
-        // Agent::from_config (used by ws.rs) doesn't go through that path.
-        let excluded = &risk_profile.excluded_tools;
-        if !excluded.is_empty() {
-            tools.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
-        }
-
-        // Load skills and register them as callable tools so WebSocket/daemon
-        // sessions can execute them (not just describe them in the prompt).
-        // Bundle-aware so `[agents.<alias>].skill_bundles` aliases resolve
-        // through to `[skill_bundles.<alias>].directory` (defaulting to
-        // `<install>/shared/skills/<alias>/`).
-        let skills = crate::skills::load_skills_for_agent_from_config(config, agent_alias);
-        // Resolution registry = built-in arcs + resolution-only MCP wrappers, so
-        // skill elevation (kind = "builtin" / "mcp") can resolve either target.
-        let skill_resolution_registry: Vec<Arc<dyn tools::Tool>> = all_tools_result
-            .unfiltered_tool_arcs
-            .iter()
-            .cloned()
-            .chain(mcp_elevation_arcs.iter().cloned())
-            .collect();
-        tools::register_skill_tools_with_context_and_runtime(
-            &mut tools,
-            &skills,
-            security.clone(),
-            &skill_resolution_registry,
-            runtime,
-        );
-
         let approval_manager = if approval_backchannel {
             ApprovalManager::for_non_interactive_backchannel(risk_profile)
         } else {
@@ -1705,14 +1645,11 @@ impl Agent {
             .observer(observer)
             .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)
-            .memory_strategy(Arc::new(
-                crate::agent::memory_strategy::DefaultMemoryStrategy::with_config_and_limit(
-                    memory.clone(),
-                    config.memory.clone(),
-                    security.workspace_dir.clone(),
-                    config.effective_memory_recall_limit(agent_alias),
-                ),
-            ))
+            .memory_inject_cfg(crate::agent::memory_inject::MemoryInjectConfig {
+                limit: config.effective_memory_recall_limit(agent_alias),
+                min_relevance_score: config.memory.min_relevance_score,
+                ..Default::default()
+            })
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(
                 config
@@ -1731,13 +1668,15 @@ impl Agent {
             .route_model_by_hint(route_model_by_hint)
             .identity_config(agent_cfg.identity.clone())
             .skills(skills)
-            .skills_prompt_mode(config.skills.prompt_injection_mode)
+            .skills_prompt_mode(config.effective_skills_prompt_mode(agent_alias))
             .auto_save(config.memory.auto_save)
             .exclude_memory(exclude_memory)
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(risk_profile.level)
             .approval_route(risk_profile.approval_route.clone())
-            .activated_tools(activated_tools)
+            .activated_tools(activated_handle)
+            .mcp_deferred_section(Some(deferred_section))
+            .mcp_pinned_section(Some(pinned_section))
             .hook_runner(if config.hooks.enabled {
                 Some(Arc::new(crate::hooks::HookRunner::from_config(
                     &config.hooks,
@@ -1938,15 +1877,22 @@ impl Agent {
     }
 
     fn build_system_prompt(&self) -> Result<String> {
-        let expose_text_tool_protocol = !self.config.resolved.strict_tool_parsing
-            || self.tool_dispatcher.should_send_tool_specs();
+        self.build_system_prompt_with_dispatcher(self.tool_dispatcher.as_ref())
+    }
+
+    fn build_system_prompt_with_dispatcher(
+        &self,
+        dispatcher: &dyn ToolDispatcher,
+    ) -> Result<String> {
+        let expose_text_tool_protocol =
+            !self.config.resolved.strict_tool_parsing || dispatcher.should_send_tool_specs();
         let no_tools: Vec<Box<dyn Tool>> = Vec::new();
         let prompt_tools = if expose_text_tool_protocol {
             &self.tools
         } else {
             &no_tools
         };
-        let instructions = self.tool_dispatcher.prompt_instructions(prompt_tools);
+        let instructions = dispatcher.prompt_instructions(prompt_tools);
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
             agent_workspace_dir: &self.agent_workspace_dir,
@@ -1956,7 +1902,7 @@ impl Agent {
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
-            sends_native_tool_specs: self.tool_dispatcher.should_send_tool_specs()
+            sends_native_tool_specs: dispatcher.should_send_tool_specs()
                 && !prompt_tools.is_empty(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
@@ -1966,10 +1912,39 @@ impl Agent {
         if receipts.enabled && receipts.inject_system_prompt {
             prompt.push_str(crate::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
         }
+        if !self.mcp_deferred_section.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&self.mcp_deferred_section);
+        }
+        if !self.mcp_pinned_section.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&self.mcp_pinned_section);
+        }
         Ok(prompt)
     }
 
-    // Superseded by the loop's prepare/approve/execute pipeline (#7415).
+    /// Rebuild the stored system prompt using the dispatcher that matches the
+    /// active provider for this turn.
+    ///
+    /// `Agent::from_config` freezes the tool dispatcher and builds the prompt
+    /// once against the base provider. A multimodal/vision turn can route to a
+    /// different active provider, so we rebuild `history[0]` here before the
+    /// turn proceeds. This is the Agent-level complement to the per-iteration
+    /// anchor refresh in `turn/mod.rs` (#8054 Surface 3).
+    fn rebuild_system_prompt_for_dispatcher(
+        &mut self,
+        dispatcher: &dyn ToolDispatcher,
+    ) -> Result<()> {
+        let new_prompt = self.build_system_prompt_with_dispatcher(dispatcher)?;
+        let Some(ConversationMessage::Chat(first)) = self.history.first_mut() else {
+            return Ok(());
+        };
+        if first.role != "system" {
+            return Ok(());
+        }
+        first.content = new_prompt;
+        Ok(())
+    }
 
     fn classify_model(&self, user_message: &str) -> String {
         if let Some(decision) =
@@ -2150,16 +2125,8 @@ impl Agent {
                 )));
         }
 
-        let context = self
-            .memory_strategy
-            .load_context(
-                &*self.observer,
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
-            .await
-            .unwrap_or_default();
-
+        // Memory context is injected once in the engine, keyed on the
+        // ingress origin (agent::memory_inject).
         if self.auto_save {
             let store_start = std::time::Instant::now();
             let store_result = self
@@ -2186,11 +2153,7 @@ impl Agent {
         let date_str =
             format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
 
-        let enriched = if context.is_empty() {
-            format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
-        } else {
-            format!("[CURRENT DATE & TIME: {date_str}]\n\n{context}\n\n{user_message}")
-        };
+        let enriched = format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}");
 
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
@@ -2228,7 +2191,31 @@ impl Agent {
         // otherwise distinct conversations can collide when their final
         // prompt matches. Keyed on the raw provider transcript — multimodal
         // preparation is a per-iteration loop concern now.
-        let provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+        //
+        // ── Per-turn active-provider resolution and prompt refresh (#8054 Surface 2) ──
+        // The agent was built against the base provider, but a multimodal turn
+        // may route to a vision provider with different native-tool support.
+        // Rebuild the stored system prompt with the active provider's
+        // dispatcher and use that dispatcher when preparing the provider-visible
+        // transcript.
+        let active_dispatcher = {
+            let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let (vision_provider_box, _degrade_strip_images) =
+                crate::agent::turn::resolve_vision_provider(
+                    self.model_provider.as_ref(),
+                    &base_provider_messages,
+                    &self.multimodal_config,
+                    &self.model_provider_name,
+                )?;
+            let active_provider: &dyn ModelProvider = vision_provider_box
+                .as_deref()
+                .unwrap_or(self.model_provider.as_ref());
+            tool_dispatcher_for_provider(&self.config, active_provider)
+        };
+
+        self.rebuild_system_prompt_for_dispatcher(active_dispatcher.as_ref())?;
+
+        let provider_messages = active_dispatcher.to_provider_messages(&self.history);
         let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
 
         if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
@@ -2328,9 +2315,16 @@ impl Agent {
                         steering: None,
                         new_messages_out: Some(&mut loop_new_messages),
                         image_cache: Some(&mut self.image_cache),
-                        // Phase 1: stamp Internal/Trusted. Real per-transport
-                        // stamping is PR C (RFC #6971 §4).
-                        ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                        // Direct embedded Agent::turn call; source/transport/
+                        // trust stay placeholders, not yet stamped at the edge.
+                        memory: Some(crate::agent::memory_inject::TurnMemory {
+                            handle: self.memory.as_ref(),
+                            query: user_message.to_string(),
+                            sessions: vec![self.memory_session_id.clone()],
+                            suppress: false,
+                            cfg: self.memory_inject_cfg,
+                        }),
+                        ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
                         agent_alias: agent_alias_for_loop.as_deref(),
                         turn_id: &turn_id,
                     }),
@@ -2623,7 +2617,41 @@ impl Agent {
         // provider-visible transcript (matches `Agent::turn`; the old code
         // re-checked every iteration, but only a transcript identical to a
         // previously cached single-exchange turn can ever hit).
-        let provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+        //
+        // ── Per-turn active-provider resolution and prompt refresh (#8054 Surface 2) ──
+        // The agent was built against the base provider, but a multimodal turn
+        // may route to a vision provider with different native-tool support.
+        // Rebuild the stored system prompt if the active provider's tool mode
+        // differs from the prompt's current claim, and use the active provider's
+        // dispatcher when preparing the provider-visible transcript.
+        let active_dispatcher = {
+            let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let (vision_provider_box, _degrade_strip_images) =
+                crate::agent::turn::resolve_vision_provider(
+                    self.model_provider.as_ref(),
+                    &base_provider_messages,
+                    &self.multimodal_config,
+                    &self.model_provider_name,
+                )
+                .map_err(|error| StreamedTurnError {
+                    error,
+                    committed_response: String::new(),
+                    new_messages: new_msgs.clone(),
+                })?;
+            let active_provider: &dyn ModelProvider = vision_provider_box
+                .as_deref()
+                .unwrap_or(self.model_provider.as_ref());
+            tool_dispatcher_for_provider(&self.config, active_provider)
+        };
+
+        self.rebuild_system_prompt_for_dispatcher(active_dispatcher.as_ref())
+            .map_err(|error| StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: new_msgs.clone(),
+            })?;
+
+        let provider_messages = active_dispatcher.to_provider_messages(&self.history);
         let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
 
         if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
@@ -2778,9 +2806,16 @@ impl Agent {
                             steering: None,
                             new_messages_out: Some(&mut round_added),
                             image_cache: Some(&mut self.image_cache),
-                            // Phase 1: stamp Internal/Trusted. Real per-transport
-                            // stamping is PR C (RFC #6971 §4).
-                            ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                            // Direct embedded Agent::turn call; source/transport/
+                            // trust stay placeholders, not yet stamped at the edge.
+                            memory: Some(crate::agent::memory_inject::TurnMemory {
+                                handle: self.memory.as_ref(),
+                                query: user_message.to_string(),
+                                sessions: vec![self.memory_session_id.clone()],
+                                suppress: false,
+                                cfg: self.memory_inject_cfg,
+                            }),
+                            ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
                             agent_alias: agent_alias_for_loop.as_deref(),
                             turn_id: &turn_id,
                         }),
@@ -3002,6 +3037,12 @@ pub async fn run(
 #[cfg(test)]
 #[path = "safety_net.rs"]
 mod safety_net;
+
+// Agent-policy parity harness: the cross-path matrix + L1/L2 locks,
+// sibling of the safety net so it reuses the same fixtures.
+#[cfg(test)]
+#[path = "parity.rs"]
+mod parity;
 
 #[cfg(test)]
 mod tests {
@@ -3833,6 +3874,370 @@ mod tests {
         assert!(xml_prompt.contains("## Tools"));
         assert!(xml_prompt.contains("echo"));
         assert!(xml_prompt.contains("## Tool Use Protocol"));
+    }
+
+    mod surface2_tests {
+        use super::*;
+        use crate::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher};
+
+        /// Marker text produced by the section-based prompt builder when tools
+        /// are advertised as XML/text instructions rather than native tool specs.
+        const XML_TOOLS_MARKER: &str = "## Tools";
+        type CapturedTranscripts = Arc<Mutex<Vec<Vec<ChatMessage>>>>;
+
+        /// Test provider that captures the provider-visible transcript and
+        /// reports a configurable native-tool capability.
+        struct CapturingModelProvider {
+            responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
+            supports_native: bool,
+            captured_messages: CapturedTranscripts,
+        }
+
+        #[async_trait]
+        impl ModelProvider for CapturingModelProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<String> {
+                Ok("ok".into())
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                self.captured_messages
+                    .lock()
+                    .push(request.messages.to_vec());
+                let mut guard = self.responses.lock();
+                if guard.is_empty() {
+                    return Ok(zeroclaw_providers::ChatResponse {
+                        text: Some("done".into()),
+                        tool_calls: vec![],
+                        usage: None,
+                        reasoning_content: None,
+                    });
+                }
+                Ok(guard.remove(0))
+            }
+
+            fn supports_native_tools(&self) -> bool {
+                self.supports_native
+            }
+        }
+
+        impl ::zeroclaw_api::attribution::Attributable for CapturingModelProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "CapturingModelProvider"
+            }
+        }
+
+        fn capturing_provider(
+            supports_native: bool,
+        ) -> (Box<dyn ModelProvider>, CapturedTranscripts) {
+            let captured: CapturedTranscripts = Arc::new(Mutex::new(Vec::new()));
+            (
+                Box::new(CapturingModelProvider {
+                    responses: Mutex::new(vec![]),
+                    supports_native,
+                    captured_messages: Arc::clone(&captured),
+                }),
+                captured,
+            )
+        }
+
+        fn test_agent_with_provider(
+            provider: Box<dyn ModelProvider>,
+            tools: Vec<Box<dyn Tool>>,
+        ) -> Agent {
+            test_agent_with_provider_and_multimodal(provider, tools, None, None)
+        }
+
+        fn test_agent_with_provider_and_multimodal(
+            provider: Box<dyn ModelProvider>,
+            tools: Vec<Box<dyn Tool>>,
+            tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
+            multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
+        ) -> Agent {
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let workspace = tempfile::TempDir::new().expect("temp dir");
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                    .expect("memory creation should succeed"),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            let mut builder = Agent::builder()
+                .model_provider(provider)
+                .tools(tools)
+                .memory(mem)
+                .observer(observer)
+                .workspace_dir(workspace.path().to_path_buf());
+            if let Some(dispatcher) = tool_dispatcher {
+                builder = builder.tool_dispatcher(dispatcher);
+            } else {
+                builder = builder.tool_dispatcher(Box::new(NativeToolDispatcher));
+            }
+            if let Some(mm) = multimodal_config {
+                builder = builder.multimodal_config(mm);
+            }
+            builder.build().expect("agent builder should succeed")
+        }
+
+        #[test]
+        fn build_system_prompt_with_dispatcher_reflects_dispatcher_mode() {
+            let workspace = tempfile::TempDir::new().expect("temp dir");
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                    .expect("memory creation should succeed"),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            let agent = Agent::builder()
+                .model_provider(Box::new(MockModelProvider {
+                    responses: Mutex::new(vec![]),
+                }))
+                .tools(vec![Box::new(MockTool)])
+                .memory(mem)
+                .observer(observer)
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(workspace.path().to_path_buf())
+                .build()
+                .expect("agent builder should succeed");
+
+            let native_prompt = agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher as &dyn ToolDispatcher)
+                .unwrap();
+            assert!(
+                !native_prompt.contains(XML_TOOLS_MARKER),
+                "native dispatcher must not emit XML tool listing"
+            );
+
+            let xml_prompt = agent
+                .build_system_prompt_with_dispatcher(&XmlToolDispatcher as &dyn ToolDispatcher)
+                .unwrap();
+            assert!(
+                xml_prompt.contains(XML_TOOLS_MARKER),
+                "xml dispatcher must emit XML tool listing"
+            );
+        }
+
+        #[test]
+        fn rebuild_system_prompt_switches_to_xml_when_active_provider_non_native() {
+            let (provider, _) = capturing_provider(true);
+            let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+
+            // Seed a native-style system prompt as if the agent was built
+            // against a native-capable base provider.
+            let native_prompt = agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher as &dyn ToolDispatcher)
+                .unwrap();
+            agent.history = vec![ConversationMessage::Chat(ChatMessage::system(
+                native_prompt,
+            ))];
+
+            // Active provider for this turn does not support native tools.
+            agent
+                .rebuild_system_prompt_for_dispatcher(&XmlToolDispatcher)
+                .expect("rebuild should succeed");
+
+            let prompt = match &agent.history[0] {
+                ConversationMessage::Chat(msg) => msg.content.clone(),
+                _ => panic!("history[0] should be a chat message"),
+            };
+            assert!(
+                prompt.contains(XML_TOOLS_MARKER),
+                "prompt must be rebuilt with XML tool listing"
+            );
+        }
+
+        #[test]
+        fn rebuild_system_prompt_switches_to_native_when_active_provider_native() {
+            let (provider, _) = capturing_provider(false);
+            let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+
+            let xml_prompt = agent
+                .build_system_prompt_with_dispatcher(&XmlToolDispatcher as &dyn ToolDispatcher)
+                .unwrap();
+            agent.history = vec![ConversationMessage::Chat(ChatMessage::system(xml_prompt))];
+
+            // Active provider for this turn supports native tools.
+            agent
+                .rebuild_system_prompt_for_dispatcher(&NativeToolDispatcher)
+                .expect("rebuild should succeed");
+
+            let prompt = match &agent.history[0] {
+                ConversationMessage::Chat(msg) => msg.content.clone(),
+                _ => panic!("history[0] should be a chat message"),
+            };
+            assert!(
+                !prompt.contains(XML_TOOLS_MARKER),
+                "prompt must be rebuilt without XML tool listing"
+            );
+        }
+
+        #[tokio::test]
+        async fn turn_uses_active_provider_tool_mode_for_transcript() {
+            let (provider, captured) = capturing_provider(false);
+            let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+
+            // The base provider does not support native tools, so the active
+            // provider resolved by the turn path must be non-native. The
+            // provider-visible transcript should reflect that.
+            agent.turn("hello").await.expect("turn should succeed");
+
+            let messages = captured.lock();
+            let first_call = messages
+                .first()
+                .expect("provider should have received a request");
+            let system = first_call
+                .iter()
+                .find(|m| m.role == "system")
+                .expect("transcript must contain a system message");
+            assert!(
+                system.content.contains(XML_TOOLS_MARKER),
+                "system prompt must advertise XML tools when active provider is non-native"
+            );
+        }
+
+        #[tokio::test]
+        async fn turn_streamed_uses_active_provider_tool_mode_for_transcript() {
+            let (provider, captured) = capturing_provider(false);
+            let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
+
+            agent
+                .turn_streamed("hello", event_tx, None)
+                .await
+                .expect("streamed turn should succeed");
+
+            let messages = captured.lock();
+            let first_call = messages
+                .first()
+                .expect("provider should have received a request");
+            let system = first_call
+                .iter()
+                .find(|m| m.role == "system")
+                .expect("transcript must contain a system message");
+            assert!(
+                system.content.contains(XML_TOOLS_MARKER),
+                "streamed system prompt must advertise XML tools when active provider is non-native"
+            );
+        }
+
+        /// Regression: an image turn that routes to a vision provider with
+        /// different native-tool support rebuilds the stored system prompt and
+        /// provider-visible transcript for that provider (#8054 Surface 2).
+        #[tokio::test]
+        async fn turn_rebuilds_prompt_for_vision_routed_xml_provider() {
+            // Base provider supports native tools but not vision. The configured
+            // vision provider is a custom OpenAI-compatible endpoint: it supports
+            // vision but not native tools.
+            let (base_provider, _captured) = capturing_provider(true);
+            let mm_config = zeroclaw_config::schema::MultimodalConfig {
+                vision_model_provider: Some("custom:http://127.0.0.1:9".into()),
+                ..Default::default()
+            };
+            let mut agent = test_agent_with_provider_and_multimodal(
+                base_provider,
+                vec![Box::new(MockTool)],
+                Some(Box::new(NativeToolDispatcher)),
+                Some(mm_config),
+            );
+
+            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
+
+            // The vision provider will fail to connect to localhost:9, but the
+            // prompt rebuild and provider-visible transcript happen before the
+            // network call.
+            let result = agent.turn(msg).await;
+            assert!(
+                result.is_err(),
+                "vision provider chat should fail to connect"
+            );
+
+            let system_content = match &agent.history[0] {
+                ConversationMessage::Chat(m) => m.content.clone(),
+                _ => panic!("history[0] should be a chat message"),
+            };
+            assert!(
+                system_content.contains(XML_TOOLS_MARKER),
+                "stored system prompt must be rebuilt for XML vision provider"
+            );
+
+            let provider_messages = XmlToolDispatcher.to_provider_messages(&agent.history);
+            let system = provider_messages
+                .iter()
+                .find(|m| m.role == "system")
+                .expect("transcript must contain a system message");
+            assert!(
+                system.content.contains(XML_TOOLS_MARKER),
+                "provider-visible transcript must advertise XML tools for vision provider"
+            );
+        }
+
+        #[tokio::test]
+        async fn turn_streamed_rebuilds_prompt_for_vision_routed_native_provider() {
+            // Base provider does not support native tools or vision. The
+            // configured vision provider is an Anthropic-compatible endpoint:
+            // it supports both vision and native tools.
+            let (base_provider, _captured) = capturing_provider(false);
+            let mm_config = zeroclaw_config::schema::MultimodalConfig {
+                vision_model_provider: Some("anthropic-custom:http://127.0.0.1:9".into()),
+                ..Default::default()
+            };
+            let mut agent = test_agent_with_provider_and_multimodal(
+                base_provider,
+                vec![Box::new(MockTool)],
+                Some(Box::new(XmlToolDispatcher)),
+                Some(mm_config),
+            );
+
+            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
+
+            let result = agent.turn_streamed(msg, event_tx, None).await;
+            assert!(
+                result.is_err(),
+                "vision provider chat should fail to connect"
+            );
+
+            let system_content = match &agent.history[0] {
+                ConversationMessage::Chat(m) => m.content.clone(),
+                _ => panic!("history[0] should be a chat message"),
+            };
+            assert!(
+                !system_content.contains(XML_TOOLS_MARKER),
+                "stored system prompt must be rebuilt for native vision provider"
+            );
+
+            let provider_messages = NativeToolDispatcher.to_provider_messages(&agent.history);
+            let system = provider_messages
+                .iter()
+                .find(|m| m.role == "system")
+                .expect("transcript must contain a system message");
+            assert!(
+                !system.content.contains(XML_TOOLS_MARKER),
+                "provider-visible transcript must advertise native tools for vision provider"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6021,6 +6426,247 @@ mod tests {
         );
     }
 
+    // Regression: the response cache must not serve one agent's
+    // memory-conditioned answer to another. The turn engine prepends a
+    // `[Memory context]` preamble to the last user message AFTER the
+    // response-cache key is computed from the bare transcript, so two agents
+    // that see the SAME user text but recall DIFFERENT memory produce the same
+    // pre-injection key. Pre-fix, agent B hit agent A's cache entry and was
+    // served A's answer (conditioned on A's memory) without ever running the
+    // model against B's own memory. The fix bypasses the cache whenever a real
+    // backend injects; a `none`-backend control proves the shared cache
+    // otherwise does hit, so the test distinguishes the fix rather than passing
+    // because the cache never works.
+    #[tokio::test]
+    async fn response_cache_does_not_cross_serve_memory_conditioned_answers() {
+        // A backend whose recall always returns one Core entry with the given
+        // content, so injection yields a deterministic, agent-specific preamble.
+        // name() != "none" marks it a real, injecting backend for the gate.
+        struct FixtureRecallMemory {
+            content: String,
+        }
+        #[async_trait]
+        impl Memory for FixtureRecallMemory {
+            fn name(&self) -> &str {
+                "fixture"
+            }
+            async fn store(
+                &self,
+                _: &str,
+                _: &str,
+                _: MemoryCategory,
+                _: Option<&str>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn recall(
+                &self,
+                _: &str,
+                _: usize,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+                Ok(vec![zeroclaw_memory::MemoryEntry {
+                    id: "deploy".into(),
+                    key: "deploy".into(),
+                    content: self.content.clone(),
+                    category: MemoryCategory::Core,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    session_id: None,
+                    score: None,
+                    namespace: "default".into(),
+                    importance: None,
+                    superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
+                    agent_alias: None,
+                    agent_id: None,
+                }])
+            }
+            async fn get(&self, _: &str) -> anyhow::Result<Option<zeroclaw_memory::MemoryEntry>> {
+                Ok(None)
+            }
+            async fn list(
+                &self,
+                _: Option<&MemoryCategory>,
+                _: Option<&str>,
+            ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+                Ok(vec![])
+            }
+            async fn forget(&self, _: &str) -> anyhow::Result<bool> {
+                Ok(true)
+            }
+            async fn forget_for_agent(&self, _: &str, _: &str) -> anyhow::Result<bool> {
+                Ok(true)
+            }
+            async fn count(&self) -> anyhow::Result<usize> {
+                Ok(1)
+            }
+            async fn health_check(&self) -> bool {
+                true
+            }
+            async fn store_with_agent(
+                &self,
+                _: &str,
+                _: &str,
+                _: MemoryCategory,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: Option<f64>,
+                _: Option<&str>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn recall_for_agents(
+                &self,
+                _: &[&str],
+                query: &str,
+                limit: usize,
+                session_id: Option<&str>,
+                since: Option<&str>,
+                until: Option<&str>,
+            ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+                self.recall(query, limit, session_id, since, until).await
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for FixtureRecallMemory {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Memory(
+                    ::zeroclaw_api::attribution::MemoryKind::InMemory,
+                )
+            }
+            fn alias(&self) -> &str {
+                "FixtureRecallMemory"
+            }
+        }
+
+        // Frozen clock so both turns share a byte-identical bare transcript (the
+        // per-turn `[CURRENT DATE & TIME]` prefix is otherwise second-precision),
+        // which is what makes the two pre-injection cache keys collide.
+        let fixed = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+
+        let last_user = |seen: &Arc<Mutex<Vec<Vec<ChatMessage>>>>| -> String {
+            seen.lock()
+                .last()
+                .expect("a model call was captured")
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .expect("a user message")
+                .content
+                .clone()
+        };
+
+        let build =
+            |mem: Arc<dyn Memory>,
+             seen: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+             cache: Arc<zeroclaw_memory::response_cache::ResponseCache>| {
+                let provider = Box::new(TranscriptCaptureModelProvider {
+                    responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                        text: Some("answer".into()),
+                        tool_calls: vec![],
+                        usage: None,
+                        reasoning_content: None,
+                    }]),
+                    seen_messages: seen,
+                });
+                Agent::builder()
+                    .model_provider(provider)
+                    .tools(vec![])
+                    .memory(mem)
+                    .observer(observer.clone())
+                    .response_cache(Some(cache))
+                    .tool_dispatcher(Box::new(NativeToolDispatcher))
+                    .workspace_dir(std::path::PathBuf::from("/tmp"))
+                    .model_name("test-model".into())
+                    .temperature(Some(0.0))
+                    .turn_datetime(move || fixed)
+                    .build()
+                    .expect("agent builder should succeed")
+            };
+
+        const PROMPT: &str = "what is the deploy target";
+
+        // Harm case: same prompt, DIFFERENT recalled memory, one shared cache.
+        let harm_dir = tempfile::tempdir().expect("cache dir");
+        let harm_cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(harm_dir.path(), 60, 100)
+                .expect("response cache"),
+        );
+        let seen_a = Arc::new(Mutex::new(Vec::new()));
+        let seen_b = Arc::new(Mutex::new(Vec::new()));
+        let mut agent_a = build(
+            Arc::new(FixtureRecallMemory {
+                content: "the deploy target is prod-3-alpha".into(),
+            }),
+            seen_a.clone(),
+            harm_cache.clone(),
+        );
+        let mut agent_b = build(
+            Arc::new(FixtureRecallMemory {
+                content: "the deploy target is prod-9-beta".into(),
+            }),
+            seen_b.clone(),
+            harm_cache.clone(),
+        );
+        agent_a.turn(PROMPT).await.expect("turn a");
+        agent_b.turn(PROMPT).await.expect("turn b");
+
+        assert_eq!(seen_a.lock().len(), 1, "agent A always runs the model");
+        assert!(
+            last_user(&seen_a).contains("prod-3-alpha"),
+            "agent A's model call must see A's injected memory"
+        );
+        // Pre-fix, B's key equals A's (both pre-injection) so B is served A's
+        // prod-3 answer and never runs against its own prod-9 memory.
+        assert_eq!(
+            seen_b.lock().len(),
+            1,
+            "agent B must run the model, not reuse A's cache entry keyed on the shared pre-injection transcript"
+        );
+        assert!(
+            last_user(&seen_b).contains("prod-9-beta"),
+            "agent B's model call must see B's OWN injected memory, not A's"
+        );
+
+        // Control: `none` backend injects nothing, so the two transcripts really
+        // are identical and the shared cache DOES hit: the second agent is
+        // served from cache and never reaches the model. This proves the harm
+        // case is not passing merely because the cache never works.
+        let ctrl_dir = tempfile::tempdir().expect("cache dir");
+        let ctrl_cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(ctrl_dir.path(), 60, 100)
+                .expect("response cache"),
+        );
+        let none_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let none_mem = || -> Arc<dyn Memory> {
+            Arc::from(
+                zeroclaw_memory::create_memory(&none_cfg, std::path::Path::new("/tmp"), None)
+                    .expect("none memory"),
+            )
+        };
+        let seen_c = Arc::new(Mutex::new(Vec::new()));
+        let seen_d = Arc::new(Mutex::new(Vec::new()));
+        let mut agent_c = build(none_mem(), seen_c.clone(), ctrl_cache.clone());
+        let mut agent_d = build(none_mem(), seen_d.clone(), ctrl_cache.clone());
+        agent_c.turn(PROMPT).await.expect("turn c");
+        agent_d.turn(PROMPT).await.expect("turn d");
+        assert_eq!(seen_c.lock().len(), 1, "agent C always runs the model");
+        assert_eq!(
+            seen_d.lock().len(),
+            0,
+            "control: with no injection the identical prompt is served from the shared response cache"
+        );
+    }
+
     /// Response-cache key must return `None` when messages contain `[IMAGE:]`
     /// markers, preventing stale or semantically wrong cache hits on
     /// multimodal prompts.
@@ -6809,6 +7455,52 @@ mod tests {
         // Should still be just 1 tool — the duplicate was skipped.
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name(), "my_skill__run");
+    }
+
+    #[test]
+    fn register_skill_tools_honors_excluded_tools() {
+        // excluded_tools always subtracts — including skill-defined tools (previously
+        // skill tools bypassed the policy entirely; the #6959 class, missed for skills).
+        let security = Arc::new(crate::security::SecurityPolicy {
+            excluded_tools: Some(vec!["deploy__status".to_string()]),
+            ..crate::security::SecurityPolicy::default()
+        });
+        let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedMockTool::new("builtin_a"))];
+
+        let skills = vec![make_skill("deploy", &["run", "status"])];
+        tools::register_skill_tools(&mut tools, &skills, security);
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            names.contains(&"deploy__run"),
+            "non-excluded skill tool must register, got {names:?}"
+        );
+        assert!(
+            !names.contains(&"deploy__status"),
+            "excluded_tools must subtract the skill tool deploy__status, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn register_skill_tools_allowlist_does_not_hide_skills() {
+        // The allowlist gates built-ins, NOT skill tools: skills are granted explicitly via
+        // skill config, and builtin-kind skill tools are scoped-elevation wrappers meant to
+        // stay callable when the raw tool is off the allowlist. A restrictive allowed_tools
+        // that omits the skill tool must NOT remove it (only excluded_tools does).
+        let security = Arc::new(crate::security::SecurityPolicy {
+            allowed_tools: Some(vec!["shell".to_string()]),
+            ..crate::security::SecurityPolicy::default()
+        });
+        let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+
+        let skills = vec![make_skill("deploy", &["run"])];
+        tools::register_skill_tools(&mut tools, &skills, security);
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            names.contains(&"deploy__run"),
+            "allowlist must not hide an explicitly-granted skill tool, got {names:?}"
+        );
     }
 
     #[test]

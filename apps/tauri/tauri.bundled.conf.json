@@ -1,0 +1,6 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-cli/config.schema.json",
+  "bundle": {
+    "externalBin": ["binaries/zeroclaw"]
+  }
+}

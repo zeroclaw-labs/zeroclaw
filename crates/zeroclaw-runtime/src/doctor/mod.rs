@@ -165,9 +165,75 @@ async fn probe_models(config: &Config) -> Vec<DiagResult> {
     collapse_model_probes(probes)
 }
 
+/// Cross-check OpenAI Codex (OAuth/subscription) credentials against the
+/// OpenAI provider slots that opt into them via `requires_openai_auth`.
+///
+/// Pure — separated for unit testing. Takes the already-resolved fact "is a
+/// Codex credential present?" plus the live `Config`, reads slot state on
+/// demand, and stores nothing (single-source-of-truth rule).
+fn codex_auth_wiring_items(codex_profile_present: bool, config: &Config) -> Vec<DiagItem> {
+    const CAT: &str = "providers.auth";
+
+    let auth_slots: Vec<String> = config
+        .providers
+        .models
+        .openai
+        .iter()
+        .filter(|(_, cfg)| cfg.base.requires_openai_auth)
+        .map(|(alias, _)| format!("openai.{alias}"))
+        .collect();
+
+    let mut items = Vec::new();
+    match (codex_profile_present, auth_slots.is_empty()) {
+        // Credential imported, but nothing references it — silent until the
+        // operator wires a slot and points an agent at it.
+        (true, true) => items.push(DiagItem::warn(
+            CAT,
+            crate::i18n::get_required_cli_string("cli-doctor-codex-auth-profile-no-slot"),
+        )),
+        // Slot opts into Codex auth, but no credential is signed in — fails at
+        // the first model call.
+        (false, false) => items.push(DiagItem::warn(
+            CAT,
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-doctor-codex-auth-slot-no-profile",
+                &[("slots", &auth_slots.join(", "))],
+            ),
+        )),
+        // Both present — wiring is consistent.
+        (true, false) => items.push(DiagItem::ok(
+            CAT,
+            crate::i18n::get_required_cli_string("cli-doctor-codex-auth-ok"),
+        )),
+        // Codex unused on both sides — stay silent (no noise for users who
+        // never touch Codex).
+        (false, true) => {}
+    }
+    items
+}
+
+/// Load Codex auth profiles on demand and report any profile/slot wiring
+/// mismatch. Async because the profile store lives on disk; appended to the
+/// report from `run_structured`, mirroring `probe_models`.
+async fn check_codex_auth_wiring(config: &Config) -> Vec<DiagResult> {
+    let auth = zeroclaw_providers::auth::AuthService::from_config(config);
+    let codex_profile_present = match auth.list_profile_ids().await {
+        Ok(ids) => ids.iter().any(|id| id.starts_with("openai-codex:")),
+        // Store unreadable: skip rather than emit a "no credentials" warning we
+        // cannot substantiate.
+        Err(_) => return Vec::new(),
+    };
+
+    codex_auth_wiring_items(codex_profile_present, config)
+        .into_iter()
+        .map(DiagItem::into_result)
+        .collect()
+}
+
 /// Run the full Doctor suite and return the structured result used by CLI and RPC.
 pub async fn run_structured(config: &Config) -> Vec<DiagResult> {
     let mut results = diagnose(config);
+    results.extend(check_codex_auth_wiring(config).await);
     results.extend(probe_models(config).await);
     results
 }
@@ -440,6 +506,202 @@ pub async fn run_models(
     }
 
     Ok(())
+}
+
+/// Function type for fetching context window from provider.
+/// Allows injection of mock fetch for testing.
+type FetchContextWindowFn = Box<
+    dyn for<'a> Fn(
+            &'a str,
+            &'a zeroclaw_config::schema::ModelProviderConfig,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<usize>> + Send + 'a>,
+        > + Send
+        + Sync,
+>;
+
+/// Update context_window in config.toml from provider /models endpoints.
+/// Returns the number of providers updated.
+pub async fn update_context_windows(
+    config: &mut zeroclaw_config::schema::Config,
+    provider_override: Option<&str>,
+    dry_run: bool,
+    fetch_fn: Option<FetchContextWindowFn>,
+) -> anyhow::Result<usize> {
+    let fetch_fn = fetch_fn.unwrap_or_else(|| {
+        Box::new(
+            |provider_type: &str,
+             provider_config: &zeroclaw_config::schema::ModelProviderConfig| {
+                Box::pin(zeroclaw_providers::fetch_context_window(
+                    provider_type,
+                    provider_config,
+                ))
+            },
+        )
+    });
+    let mut updated = 0usize;
+
+    type ProviderTarget = (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<usize>,
+    );
+
+    // Collect all the data we need first to avoid borrow conflicts
+    let targets: Vec<ProviderTarget> = if let Some(model_provider) = provider_override {
+        // Single provider - use find_by_name to look up by "type.alias" format
+        if let Some((t, a, entry)) = config.providers.models.find_by_name(model_provider) {
+            vec![(
+                model_provider.to_string(),
+                t.to_string(),
+                a.to_string(),
+                entry.model.clone().unwrap_or_default(),
+                entry.uri.clone(),
+                entry.api_key.clone(),
+                entry.context_window,
+            )]
+        } else {
+            anyhow::bail!("Model provider '{model_provider}' not found in config");
+        }
+    } else {
+        // All providers
+        config
+            .providers
+            .models
+            .iter_entries()
+            .map(|(t, a, e)| {
+                (
+                    format!("{t}.{a}"),
+                    t.to_string(),
+                    a.to_string(),
+                    e.model.clone().unwrap_or_default(),
+                    e.uri.clone(),
+                    e.api_key.clone(),
+                    e.context_window,
+                )
+            })
+            .collect()
+    };
+
+    for (provider_ref, provider_type, alias, model, uri, api_key, existing_context_window) in
+        targets
+    {
+        // Skip if already has context_window set
+        if let Some(ctx) = existing_context_window {
+            println!(
+                "{}",
+                crate::i18n::get_required_cli_string_with_args(
+                    "cli-doctor-ctxwin-already-set",
+                    &[
+                        ("provider_ref", provider_ref.as_str()),
+                        ("ctx", ctx.to_string().as_str())
+                    ],
+                )
+            );
+            continue;
+        }
+
+        // Skip if no model configured
+        if model.is_empty() {
+            println!(
+                "{}",
+                crate::i18n::get_required_cli_string_with_args(
+                    "cli-doctor-ctxwin-no-model",
+                    &[("provider_ref", provider_ref.as_str())],
+                )
+            );
+            continue;
+        }
+
+        // Fetch context window from provider
+        let provider_config = zeroclaw_config::schema::ModelProviderConfig {
+            model: Some(model.clone()),
+            uri: uri.clone(),
+            api_key,
+            ..Default::default()
+        };
+        match fetch_fn(&provider_type, &provider_config).await {
+            Some(ctx) => {
+                if dry_run {
+                    println!(
+                        "{}",
+                        crate::i18n::get_required_cli_string_with_args(
+                            "cli-doctor-ctxwin-would-set",
+                            &[
+                                ("provider_ref", provider_ref.as_str()),
+                                ("ctx", ctx.to_string().as_str())
+                            ],
+                        )
+                    );
+                } else {
+                    let path = format!("providers.models.{provider_type}.{alias}.context_window");
+                    match config.set_prop_persistent(&path, &ctx.to_string()) {
+                        Ok(_) => {
+                            updated += 1;
+                            println!(
+                                "{}",
+                                crate::i18n::get_required_cli_string_with_args(
+                                    "cli-doctor-ctxwin-set",
+                                    &[
+                                        ("provider_ref", provider_ref.as_str()),
+                                        ("ctx", ctx.to_string().as_str())
+                                    ],
+                                )
+                            );
+                        }
+                        Err(e) => {
+                            println!(
+                                "{}",
+                                crate::i18n::get_required_cli_string_with_args(
+                                    "cli-doctor-ctxwin-write-failed",
+                                    &[
+                                        ("provider_ref", provider_ref.as_str()),
+                                        ("error", &e.to_string()),
+                                    ],
+                                )
+                            );
+                        }
+                    }
+                }
+            }
+            None => {
+                println!(
+                    "{}",
+                    crate::i18n::get_required_cli_string_with_args(
+                        "cli-doctor-ctxwin-fetch-failed",
+                        &[("provider_ref", provider_ref.as_str())],
+                    )
+                );
+            }
+        }
+    }
+
+    if !dry_run && updated > 0 {
+        config.save().await?;
+        println!(
+            "\n{}",
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-doctor-ctxwin-saved",
+                &[("updated", &updated.to_string())],
+            )
+        );
+    } else if dry_run {
+        println!(
+            "\n{}",
+            crate::i18n::get_required_cli_string("cli-doctor-ctxwin-dry-run")
+        );
+    } else {
+        println!(
+            "\n{}",
+            crate::i18n::get_required_cli_string("cli-doctor-ctxwin-none")
+        );
+    }
+
+    Ok(updated)
 }
 
 /// Fetch a provider's live model catalog — the model IDs advertised by its
@@ -1962,6 +2224,61 @@ mod tests {
         );
     }
 
+    fn openai_codex_slot() -> zeroclaw_config::schema::OpenAIModelProviderConfig {
+        let mut slot = zeroclaw_config::schema::OpenAIModelProviderConfig::default();
+        slot.base.requires_openai_auth = true;
+        slot
+    }
+
+    #[test]
+    fn codex_wiring_warns_when_profile_has_no_slot() {
+        // Credential imported, no slot opts into it — the silent gap.
+        let config = Config::default();
+        let items = codex_auth_wiring_items(true, &config);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].severity, Severity::Warn);
+        assert_eq!(items[0].category, "providers.auth");
+    }
+
+    #[test]
+    fn codex_wiring_warns_when_slot_has_no_profile() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .openai
+            .insert("codex".to_string(), openai_codex_slot());
+        let items = codex_auth_wiring_items(false, &config);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].severity, Severity::Warn);
+        assert!(
+            items[0].message.contains("openai.codex"),
+            "slot warning should name the offending slot; got: {:?}",
+            items[0].message
+        );
+    }
+
+    #[test]
+    fn codex_wiring_ok_when_profile_and_slot_present() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .openai
+            .insert("codex".to_string(), openai_codex_slot());
+        let items = codex_auth_wiring_items(true, &config);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].severity, Severity::Ok);
+    }
+
+    #[test]
+    fn codex_wiring_silent_when_codex_unused() {
+        // No credential and no requiring slot — the common case; no noise.
+        let config = Config::default();
+        let items = codex_auth_wiring_items(false, &config);
+        assert!(items.is_empty());
+    }
+
     #[test]
     fn web_dist_dir_expansion_reason_key_detects_tilde_and_env() {
         assert_eq!(
@@ -2010,5 +2327,77 @@ mod tests {
         assert_eq!(agent_messages.len(), 2);
         assert!(agent_messages[0].contains("agent \"alpha\""));
         assert!(agent_messages[1].contains("agent \"zeta\""));
+    }
+
+    #[tokio::test]
+    async fn update_context_windows_uses_exact_alias_not_model_uri() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let mut config = Config {
+            config_path: temp_dir.path().join("config.toml"),
+            ..Default::default()
+        };
+
+        // Create two groq provider aliases with SAME model and URI
+        // This simulates the bug scenario where multiple aliases share the same
+        // model/endpoint but should be updated independently
+        {
+            let entry1 = config
+                .providers
+                .models
+                .ensure("groq", "alias1")
+                .expect("groq provider type exists");
+            entry1.model = Some("llama-3.1-8b-instant".into());
+            entry1.context_window = Some(8192);
+        }
+        {
+            let entry2 = config
+                .providers
+                .models
+                .ensure("groq", "alias2")
+                .expect("groq provider type exists");
+            entry2.model = Some("llama-3.1-8b-instant".into());
+        }
+
+        // Call update_context_windows for alias2 only
+        // This should ONLY update alias2, leaving alias1 at 8192
+        let mock_fetch: FetchContextWindowFn = Box::new(
+            |_type: &str, _config: &zeroclaw_config::schema::ModelProviderConfig| {
+                Box::pin(async move { Some(4096usize) })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Option<usize>> + Send>>
+            },
+        );
+        let updated =
+            update_context_windows(&mut config, Some("groq.alias2"), false, Some(mock_fetch))
+                .await
+                .expect("update_context_windows should succeed");
+
+        // Should have updated exactly 1 entry (alias2)
+        assert_eq!(updated, 1);
+
+        // alias1 should remain unchanged at 8192
+        let alias1_ctx = config
+            .providers
+            .models
+            .find("groq", "alias1")
+            .expect("alias1 should exist")
+            .context_window;
+        assert_eq!(
+            alias1_ctx,
+            Some(8192),
+            "alias1 context_window should not be modified"
+        );
+
+        // alias2 should be updated to the mock fetch value (4096)
+        let alias2_ctx = config
+            .providers
+            .models
+            .find("groq", "alias2")
+            .expect("alias2 should exist")
+            .context_window;
+        assert_eq!(
+            alias2_ctx,
+            Some(4096),
+            "alias2 context_window should be set to mock fetch value"
+        );
     }
 }
