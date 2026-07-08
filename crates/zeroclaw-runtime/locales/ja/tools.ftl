@@ -60,7 +60,7 @@ tool-file-download-error-write-body = ダウンロードしたバイトの書き
 tool-file-download-error-flush = ダウンロードしたファイルのフラッシュに失敗しました: { $err }
 tool-file-download-error-move = ダウンロードしたファイルの移動に失敗しました: { $err }
 tool-file-download-success = { $written } バイトを { $dest_path } にダウンロードしました ({ $status })
-tool-file-read = 行番号付きのファイルコンテンツを読み込み。offsetとlimitによる部分読み込みをサポート。PDFからテキストを抽出します。その他のバイナリファイルはロッシーUTF-8変換で読み込まれます。
+tool-file-read = 行番号付きのファイルコンテンツを読み込み。offsetとlimitによる部分読み込みをサポート。バイナリファイルと画像ファイルは拒否されます（画像の場合は image_info ツールを使用）。encoding="base64" を設定すると、生のバイトをbase64エンコードして返します（.pdf/.xlsx/.docx などのバイナリファイル用）。そのモードでは offset/limit は無視されます。
 tool-file-write = ワークスペース内のファイルにコンテンツを書き込み
 tool-git-operations = 構造化されたGit操作（status、diff、log、branch、commit、add、checkout、stash）を実行。解析されたJSON出力を提供し、自律性制御のためのセキュリティポリシーと統合します。
 tool-git-operations-error-not-in-repo = '{ $path }' はGitリポジトリ内にありません。Gitワークツリー内のパスを選択し、リポジトリのサブディレクトリに 'path' を渡すか、git_operationsを実行する前にリポジトリを初期化してください。
@@ -81,7 +81,6 @@ tool-memory-store = 事実、好み、またはノートを長期記憶に保存
 tool-microsoft365 = Microsoft 365統合：Microsoft Graph APIを経由してOutlookメール、Teamsメッセージ、カレンダーイベント、OneDriveファイル、SharePoint検索を管理
 tool-model-routing-config = デフォルトモデル設定、シナリオベースのプロバイダー/モデルルート、分類ルール、委譲サブエージェントプロフィールを管理
 tool-notion = Notionと相互作用：データベースをクエリ、ページを読み込み/作成/更新、ワークスペースを検索。
-tool-pdf-read = ワークスペース内のPDFファイルから平文テキストを抽出します。読み取り可能なすべてのテキストを返します。画像のみまたは暗号化されたPDFは空の結果を返します。'rag-pdf'ビルドフィーチャが必要。
 tool-project-intel = プロジェクト配信インテリジェンス：ステータスレポートを生成、リスクを検出、クライアント更新をドラフト、スプリントを要約、作業量を推定。読み取り専用分析ツール。
 tool-proxy-config = ZeroClawプロキシ設定を管理（スコープ：environment | zeroclaw | services）。ランタイムおよびプロセス環境アプリケーション含む
 tool-pushover = Pushover通知をデバイスに送信します。.envファイルにPUSHOVER_TOKENおよびPUSHOVER_USER_KEYが必要。

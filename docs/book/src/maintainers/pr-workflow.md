@@ -64,6 +64,8 @@ For protected issues, record both the stale-exemption reason and the next decisi
 
 Active release trackers and active RFC or design trackers are durable coordination surfaces. When the issue title, body, labels, or milestone clearly identify an active tracker or RFC, the tracker itself supplies the stale-exemption reason and contributor-visible routing surface; it does not need repetitive per-issue comments. Revisit the exemption when the milestone closes, the tracker drifts from live release state, the RFC reaches a decision, is superseded, or closes, or the issue no longer represents an active project decision surface.
 
+When a tracker marker label is needed, use `type:tracker`. It applies to issue-only parent coordination surfaces such as release trackers, roadmap or epic trackers, RFC/design trackers, implementation batch trackers, cleanup trackers, and audit trackers. Do not apply it to ordinary child issues, ordinary feature requests, bugs, PRs, or items merely linked from a tracker. `type:tracker` helps humans and automation find the parent surface; it does not replace the required stale-exemption reason, next decision surface, milestone, assignee, or close criteria. If the live label does not exist yet, do not substitute `roadmap`, `type:roadmap`, or another alias; create and migrate the canonical label through a separate exact label packet.
+
 If none of those exists and the issue is not an active tracker or RFC, the issue can still stay open while triage continues, but it should not rely on `status:no-stale` as a permanent shield. Until the stale-exemption audit lands, missing reason or routing evidence is an audit finding and proposed correction, not an automatic stale-closure trigger.
 
 ## PR lanes
