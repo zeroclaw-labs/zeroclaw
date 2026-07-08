@@ -905,6 +905,7 @@ pub async fn run_gateway(
                 connect_peripherals: false,
                 emit_assembly_logs: false,
                 exclude_memory: false,
+                list_deferred_mcp_specs: true,
             })
             .await;
             // Wire channel-driven tool handles so the dashboard agent can
@@ -1052,6 +1053,7 @@ pub async fn run_gateway(
             connect_peripherals: false,
             emit_assembly_logs: false,
             exclude_memory: false,
+            list_deferred_mcp_specs: true,
         })
         .await;
         let specs: Vec<ToolSpec> = assembled.registry.iter().map(|t| t.spec()).collect();
@@ -2547,7 +2549,13 @@ pub(crate) async fn run_gateway_chat_with_tools(
             turn_usage.clone(),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
-                zeroclaw_runtime::agent::process_message(config, &agent_alias, message, session_id),
+                zeroclaw_runtime::agent::process_message(
+                    config,
+                    &agent_alias,
+                    message,
+                    session_id,
+                    zeroclaw_api::ingress::TurnOrigin::Interactive,
+                ),
             ),
         ))
         .await?;
