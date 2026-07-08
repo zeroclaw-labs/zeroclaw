@@ -34,6 +34,20 @@ pub(crate) fn sse_reader(response: reqwest::Response) -> impl tokio::io::AsyncBu
 /// Read the next SSE line under the shared idle bound, mapping read errors and
 /// stalls onto `StreamError`. The one copy of the timeout/error/idle arms every
 /// provider parser shares.
+macro_rules! next_line_or_break {
+    ($lines:expr, $tx:expr) => {
+        match $crate::stream_guard::next_sse_line(&mut $lines).await {
+            $crate::stream_guard::SseLine::Line(line) => line,
+            $crate::stream_guard::SseLine::Eof => break,
+            $crate::stream_guard::SseLine::Err(e) => {
+                let _ = $tx.send(Err(e)).await;
+                return;
+            }
+        }
+    };
+}
+pub(crate) use next_line_or_break;
+
 pub(crate) async fn next_sse_line<R>(lines: &mut tokio::io::Lines<R>) -> SseLine
 where
     R: tokio::io::AsyncBufRead + Unpin,

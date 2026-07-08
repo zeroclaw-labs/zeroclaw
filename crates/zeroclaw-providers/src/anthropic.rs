@@ -232,6 +232,9 @@ struct NativeContentIn {
 }
 
 impl AnthropicModelProvider {
+    const CONNECT_TIMEOUT_SECS: u64 = 10;
+    const REQUEST_TIMEOUT_SECS: u64 = 120;
+
     pub fn new(alias: &str, credential: Option<&str>) -> Self {
         Self::with_base_url(alias, credential, None)
     }
@@ -831,8 +834,8 @@ impl AnthropicModelProvider {
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "model_provider.anthropic",
-            120,
-            10,
+            Self::REQUEST_TIMEOUT_SECS,
+            Self::CONNECT_TIMEOUT_SECS,
         )
     }
 
@@ -843,7 +846,7 @@ impl AnthropicModelProvider {
     fn streaming_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_streaming_client(
             "model_provider.anthropic",
-            10,
+            Self::CONNECT_TIMEOUT_SECS,
         )
     }
 
@@ -895,14 +898,7 @@ impl AnthropicModelProvider {
         let mut saw_stop_reason = false;
 
         loop {
-            let line = match crate::stream_guard::next_sse_line(&mut lines).await {
-                crate::stream_guard::SseLine::Line(line) => line,
-                crate::stream_guard::SseLine::Eof => break,
-                crate::stream_guard::SseLine::Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
-            };
+            let line = crate::stream_guard::next_line_or_break!(lines, tx);
             let line = line.trim().to_string();
             if !line.starts_with("data: ") {
                 continue;

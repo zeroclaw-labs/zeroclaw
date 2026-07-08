@@ -1614,10 +1614,6 @@ fn sse_bytes_to_chunks(
     .boxed()
 }
 
-/// Line loop for `sse_bytes_to_chunks`, split out so unit tests can feed a
-/// `Cursor<&[u8]>` directly (no mock HTTP server) and drive the idle timeout
-/// under a paused clock. Matches the Anthropic provider's
-/// `parse_anthropic_sse_from_reader`.
 async fn parse_sse_chunks_from_reader<R>(
     reader: R,
     count_tokens: bool,
@@ -1630,14 +1626,7 @@ async fn parse_sse_chunks_from_reader<R>(
     let mut lines = reader.lines();
 
     loop {
-        let line = match crate::stream_guard::next_sse_line(&mut lines).await {
-            crate::stream_guard::SseLine::Line(line) => line,
-            crate::stream_guard::SseLine::Eof => break,
-            crate::stream_guard::SseLine::Err(e) => {
-                let _ = tx.send(Err(e)).await;
-                return;
-            }
-        };
+        let line = crate::stream_guard::next_line_or_break!(lines, tx);
 
         match parse_sse_line(&line) {
             Ok(Some(chunk)) => {
@@ -1704,9 +1693,6 @@ fn sse_bytes_to_events_for_contract(
     .boxed()
 }
 
-/// Line loop for `sse_bytes_to_events_for_contract`, split out so unit tests can
-/// feed a `Cursor<&[u8]>` directly and drive the idle timeout under a paused
-/// clock. Matches the Anthropic provider's `parse_anthropic_sse_from_reader`.
 async fn parse_sse_events_from_reader<R>(
     reader: R,
     count_tokens: bool,
@@ -1724,14 +1710,7 @@ async fn parse_sse_events_from_reader<R>(
     let mut saw_completion = false;
 
     loop {
-        let line = match crate::stream_guard::next_sse_line(&mut lines).await {
-            crate::stream_guard::SseLine::Line(line) => line,
-            crate::stream_guard::SseLine::Eof => break,
-            crate::stream_guard::SseLine::Err(e) => {
-                let _ = tx.send(Err(e)).await;
-                return;
-            }
-        };
+        let line = crate::stream_guard::next_line_or_break!(lines, tx);
 
         // Custom proxy events for pre-executed tool calls
         // (e.g. claude-max-api-proxy streaming x_tool_start/x_tool_result)

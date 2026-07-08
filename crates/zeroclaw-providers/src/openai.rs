@@ -824,14 +824,7 @@ async fn parse_responses_sse_from_reader<R>(
     let mut block = String::new();
 
     loop {
-        let line = match crate::stream_guard::next_sse_line(&mut lines).await {
-            crate::stream_guard::SseLine::Line(line) => line,
-            crate::stream_guard::SseLine::Eof => break,
-            crate::stream_guard::SseLine::Err(e) => {
-                let _ = tx.send(Err(e)).await;
-                return;
-            }
-        };
+        let line = crate::stream_guard::next_line_or_break!(lines, tx);
 
         if line.is_empty() {
             if flush_responses_block(&block, &mut state, tx, count_tokens).await {
