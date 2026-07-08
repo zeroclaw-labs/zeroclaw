@@ -923,11 +923,25 @@ pub fn all_tools_with_runtime(
 
     // Text browser tool (headless text-based browser rendering)
     if root_config.text_browser.enabled {
-        tool_arcs.push(Arc::new(TextBrowserTool::new(
+        match TextBrowserTool::new_with_private_hosts(
             security.clone(),
             root_config.text_browser.preferred_browser.clone(),
             root_config.text_browser.timeout_secs,
-        )));
+            root_config.text_browser.allowed_private_hosts.clone(),
+        ) {
+            Ok(tool) => {
+                tool_arcs.push(Arc::new(tool));
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "text_browser: failed to construct tool, skipping registration"
+                );
+            }
+        }
     }
 
     // Web search tool (enabled by default for GLM and other models)

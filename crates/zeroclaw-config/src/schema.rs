@@ -7513,6 +7513,13 @@ pub struct TextBrowserConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_text_browser_timeout_secs")]
     pub timeout_secs: u64,
+    /// Private/internal hosts allowed to bypass SSRF protection.
+    /// Exact and subdomain matches are supported; `["*"]` permits **all** private/local
+    /// hosts (RFC 1918, loopback, link-local, `.local`). Default: empty (deny).
+    /// Warning: `["*"]` also reaches link-local addresses, including the cloud metadata
+    /// endpoint (`169.254.169.254`) — list specific hosts unless you accept that exposure.
+    #[serde(default)]
+    pub allowed_private_hosts: Vec<String>,
 }
 
 fn default_text_browser_timeout_secs() -> u64 {
@@ -7525,6 +7532,7 @@ impl Default for TextBrowserConfig {
             enabled: false,
             preferred_browser: None,
             timeout_secs: default_text_browser_timeout_secs(),
+            allowed_private_hosts: vec![],
         }
     }
 }
@@ -10307,12 +10315,15 @@ pub struct MemoryConfig {
     /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
-    /// Embedding model identifier — must match a model your chosen embedding model_provider serves (e.g. `text-embedding-3-small` for OpenAI). Changing this invalidates existing embeddings; you'll need to re-index.
+    /// Embedding model identifier — must match a model your chosen embedding model_provider serves (e.g. `text-embedding-3-small` for OpenAI). Changing this invalidates existing embeddings: the change is detected at startup and stale vectors are cleared automatically; run `zeroclaw memory reindex` to re-embed (or set `auto_reindex_on_identity_change`).
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
     /// Vector width produced by the embedding model — must match the model's native dimension or vectors won't store correctly. Look up the number on the model_provider's model page.
     #[serde(default = "default_embedding_dims")]
     pub embedding_dimensions: usize,
+    /// Automatically re-embed all memories in the background when a change of embedding provider/model/dimensions is detected at startup (after the stale vectors have been cleared). Costs one embedding API call per memory, so it's off by default — leave it off for large stores and run `zeroclaw memory reindex` explicitly instead.
+    #[serde(default)]
+    pub auto_reindex_on_identity_change: bool,
     /// Optional API key for the embedding endpoint. When set, embedding calls use this key instead of inheriting one from the seed model provider — decoupling embeddings from the chat model. Use it when the chat model runs on a provider that carries no usable embedding credential (e.g. an OAuth-only provider) while embeddings keep hitting an `openai`/`custom:` endpoint with their own key. Leave unset to inherit the seed provider's key (backward-compatible default).
     #[secret]
     #[credential_class = "encrypted_secret"]
@@ -10587,6 +10598,7 @@ impl Default for MemoryConfig {
             embedding_provider: default_embedding_provider(),
             embedding_model: default_embedding_model(),
             embedding_dimensions: default_embedding_dims(),
+            auto_reindex_on_identity_change: false,
             embedding_api_key: None,
             vector_weight: default_vector_weight(),
             keyword_weight: default_keyword_weight(),
@@ -15163,6 +15175,12 @@ pub struct SecurityConfig {
     #[nested]
     pub audit: AuditConfig,
 
+    /// Outbound credential leak detection and redaction configuration. See
+    /// `[security.leak_detection]` for the detector controls.
+    #[serde(default)]
+    #[nested]
+    pub leak_detection: LeakDetectionConfig,
+
     /// OTP gating configuration for sensitive actions/domains.
     #[serde(default)]
     #[nested]
@@ -15182,6 +15200,52 @@ pub struct SecurityConfig {
     #[serde(default)]
     #[nested]
     pub webauthn: WebAuthnConfig,
+}
+
+/// Outbound credential leak detection configuration.
+///
+/// These settings control the final guardrail pass over outbound channel
+/// responses before they are delivered. Deterministic credential patterns
+/// include API keys, private keys, database URLs, bot tokens, and related
+/// token syntax. The high-entropy pass is a separate heuristic for standalone
+/// opaque tokens.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "security.leak_detection"]
+pub struct LeakDetectionConfig {
+    /// Enable outbound credential leak detection and redaction.
+    #[serde(default = "default_leak_detection_enabled")]
+    pub enabled: bool,
+
+    /// Detection sensitivity from 0.0 to 1.0; higher is more aggressive.
+    #[serde(default = "default_leak_detection_sensitivity")]
+    pub sensitivity: f64,
+
+    /// Enable high-entropy token redaction; deterministic patterns still run when false.
+    #[serde(default = "default_leak_detection_high_entropy_tokens")]
+    pub high_entropy_tokens: bool,
+}
+
+fn default_leak_detection_enabled() -> bool {
+    true
+}
+
+fn default_leak_detection_sensitivity() -> f64 {
+    0.7
+}
+
+fn default_leak_detection_high_entropy_tokens() -> bool {
+    true
+}
+
+impl Default for LeakDetectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_leak_detection_enabled(),
+            sensitivity: default_leak_detection_sensitivity(),
+            high_entropy_tokens: default_leak_detection_high_entropy_tokens(),
+        }
+    }
 }
 
 /// WebAuthn / FIDO2 hardware key authentication configuration (`[security.webauthn]`).
@@ -18792,6 +18856,13 @@ impl Config {
                 RequiredFieldEmpty,
                 "security.estop.state_file",
                 "security.estop.state_file must not be empty"
+            );
+        }
+        if !(0.0..=1.0).contains(&self.security.leak_detection.sensitivity) {
+            validation_bail!(
+                InvalidNumericRange,
+                "security.leak_detection.sensitivity",
+                "security.leak_detection.sensitivity must be between 0.0 and 1.0"
             );
         }
 
@@ -28567,6 +28638,9 @@ default_temperature = 0.7
         assert_eq!(parsed.security.otp.method, OtpMethod::Totp);
         assert!(!parsed.security.estop.enabled);
         assert!(parsed.security.estop.require_otp_to_resume);
+        assert!(parsed.security.leak_detection.enabled);
+        assert_eq!(parsed.security.leak_detection.sensitivity, 0.7);
+        assert!(parsed.security.leak_detection.high_entropy_tokens);
     }
 
     #[test]
@@ -28598,6 +28672,42 @@ require_otp_to_resume = true
         assert_eq!(parsed.security.otp.gated_actions.len(), 2);
         assert_eq!(parsed.security.otp.gated_domains.len(), 2);
         parsed.validate().unwrap();
+    }
+
+    #[test]
+    async fn security_toml_parses_leak_detection_section() {
+        let parsed = parse_test_config(
+            r#"
+default_model_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4.6"
+default_temperature = 0.7
+
+[security.leak_detection]
+enabled = false
+sensitivity = 0.35
+high_entropy_tokens = false
+"#,
+        );
+
+        assert!(!parsed.security.leak_detection.enabled);
+        assert_eq!(parsed.security.leak_detection.sensitivity, 0.35);
+        assert!(!parsed.security.leak_detection.high_entropy_tokens);
+        parsed.validate().unwrap();
+    }
+
+    #[test]
+    async fn security_validation_rejects_out_of_range_leak_detection_sensitivity() {
+        let mut config = Config::default();
+        config.security.leak_detection.sensitivity = 1.5;
+
+        let err = config
+            .validate()
+            .expect_err("expected invalid leak-detection sensitivity");
+        assert!(
+            err.to_string()
+                .contains("security.leak_detection.sensitivity"),
+            "got: {err}"
+        );
     }
 
     #[test]
