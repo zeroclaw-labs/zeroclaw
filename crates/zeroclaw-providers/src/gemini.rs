@@ -616,7 +616,11 @@ impl GeminiBuilder {
 
     /// Override the OAuth client credentials (defaults to the Gemini CLI
     /// public client when unset).
-    pub fn oauth_client(mut self, client_id: Option<String>, client_secret: Option<String>) -> Self {
+    pub fn oauth_client(
+        mut self,
+        client_id: Option<String>,
+        client_secret: Option<String>,
+    ) -> Self {
         self.oauth_client_id = client_id;
         self.oauth_client_secret = client_secret;
         self
@@ -683,11 +687,7 @@ impl GeminiBuilder {
             oauth_project_seed: self.oauth_project_seed,
             oauth_cred_paths,
             oauth_index: Arc::new(tokio::sync::Mutex::new(0)),
-            auth_service: if use_managed {
-                self.auth_service
-            } else {
-                None
-            },
+            auth_service: if use_managed { self.auth_service } else { None },
             auth_profile_override: self.profile_override,
             oauth_client_id: self.oauth_client_id,
             oauth_client_secret: self.oauth_client_secret,

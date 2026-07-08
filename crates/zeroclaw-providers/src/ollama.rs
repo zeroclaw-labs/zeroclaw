@@ -1159,37 +1159,50 @@ mod tests {
 
     #[test]
     fn custom_url_trailing_slash() {
-        let p = OllamaModelProvider::builder("test").base_url(Some("http://192.168.1.100:11434/")).build();
+        let p = OllamaModelProvider::builder("test")
+            .base_url(Some("http://192.168.1.100:11434/"))
+            .build();
         assert_eq!(p.base_url, "http://192.168.1.100:11434");
     }
 
     #[test]
     fn custom_url_no_trailing_slash() {
-        let p = OllamaModelProvider::builder("test").base_url(Some("http://myserver:11434")).build();
+        let p = OllamaModelProvider::builder("test")
+            .base_url(Some("http://myserver:11434"))
+            .build();
         assert_eq!(p.base_url, "http://myserver:11434");
     }
 
     #[test]
     fn custom_url_strips_api_suffix() {
-        let p = OllamaModelProvider::builder("test").base_url(Some("https://ollama.com/api/")).build();
+        let p = OllamaModelProvider::builder("test")
+            .base_url(Some("https://ollama.com/api/"))
+            .build();
         assert_eq!(p.base_url, "https://ollama.com");
     }
 
     #[test]
     fn custom_url_strips_api_chat_suffix() {
-        let p = OllamaModelProvider::builder("test").base_url(Some("http://172.30.30.50:11434/api/chat")).build();
+        let p = OllamaModelProvider::builder("test")
+            .base_url(Some("http://172.30.30.50:11434/api/chat"))
+            .build();
         assert_eq!(p.base_url, "http://172.30.30.50:11434");
     }
 
     #[test]
     fn empty_url_uses_empty() {
-        let p = OllamaModelProvider::builder("test").base_url(Some("")).build();
+        let p = OllamaModelProvider::builder("test")
+            .base_url(Some(""))
+            .build();
         assert_eq!(p.base_url, "");
     }
 
     #[test]
     fn cloud_suffix_strips_model_name() {
-        let p = OllamaModelProvider::builder("test").base_url(Some("https://ollama.com")).api_key(Some("ollama-key")).build();
+        let p = OllamaModelProvider::builder("test")
+            .base_url(Some("https://ollama.com"))
+            .api_key(Some("ollama-key"))
+            .build();
         let (model, should_auth) = p.resolve_request_details("qwen3:cloud").unwrap();
         assert_eq!(model, "qwen3");
         assert!(should_auth);
@@ -1197,7 +1210,9 @@ mod tests {
 
     #[test]
     fn cloud_suffix_with_local_endpoint_errors() {
-        let p = OllamaModelProvider::builder("test").api_key(Some("ollama-key")).build();
+        let p = OllamaModelProvider::builder("test")
+            .api_key(Some("ollama-key"))
+            .build();
         let error = p
             .resolve_request_details("qwen3:cloud")
             .expect_err("cloud suffix should fail on local endpoint");
@@ -1210,7 +1225,10 @@ mod tests {
 
     #[test]
     fn cloud_suffix_with_unspecified_local_endpoint_errors() {
-        let p = OllamaModelProvider::builder("test").base_url(Some("http://0.0.0.0:11434")).api_key(Some("ollama-key")).build();
+        let p = OllamaModelProvider::builder("test")
+            .base_url(Some("http://0.0.0.0:11434"))
+            .api_key(Some("ollama-key"))
+            .build();
         let error = p
             .resolve_request_details("qwen3:cloud")
             .expect_err("cloud suffix should fail on unspecified local endpoint");
@@ -1223,7 +1241,9 @@ mod tests {
 
     #[test]
     fn cloud_suffix_without_api_key_errors() {
-        let p = OllamaModelProvider::builder("test").base_url(Some("https://ollama.com")).build();
+        let p = OllamaModelProvider::builder("test")
+            .base_url(Some("https://ollama.com"))
+            .build();
         let error = p
             .resolve_request_details("qwen3:cloud")
             .expect_err("cloud suffix should require API key");
@@ -1236,7 +1256,9 @@ mod tests {
 
     #[test]
     fn cloud_suffix_preserved_for_private_remote_without_api_key() {
-        let p = OllamaModelProvider::builder("test").base_url(Some("http://192.168.1.100:11434")).build();
+        let p = OllamaModelProvider::builder("test")
+            .base_url(Some("http://192.168.1.100:11434"))
+            .build();
         let (model, should_auth) = p.resolve_request_details("qwen3:cloud").unwrap();
         assert_eq!(model, "qwen3:cloud");
         assert!(!should_auth);
@@ -1255,15 +1277,20 @@ mod tests {
 
     #[test]
     fn remote_endpoint_auth_enabled_when_key_present() {
-        let p = OllamaModelProvider::builder("test").base_url(Some("https://ollama.com")).api_key(Some("ollama-key")).build();
+        let p = OllamaModelProvider::builder("test")
+            .base_url(Some("https://ollama.com"))
+            .api_key(Some("ollama-key"))
+            .build();
         let (_model, should_auth) = p.resolve_request_details("qwen3").unwrap();
         assert!(should_auth);
     }
 
     #[test]
     fn remote_endpoint_with_api_suffix_still_allows_cloud_models() {
-        let p =
-            OllamaModelProvider::builder("test").base_url(Some("https://ollama.com/api")).api_key(Some("ollama-key")).build();
+        let p = OllamaModelProvider::builder("test")
+            .base_url(Some("https://ollama.com/api"))
+            .api_key(Some("ollama-key"))
+            .build();
         let (model, should_auth) = p.resolve_request_details("qwen3:cloud").unwrap();
         assert_eq!(model, "qwen3");
         assert!(should_auth);
@@ -1271,7 +1298,9 @@ mod tests {
 
     #[test]
     fn local_endpoint_auth_disabled_even_with_key() {
-        let p = OllamaModelProvider::builder("test").api_key(Some("ollama-key")).build();
+        let p = OllamaModelProvider::builder("test")
+            .api_key(Some("ollama-key"))
+            .build();
         let (_model, should_auth) = p.resolve_request_details("llama3").unwrap();
         assert!(!should_auth);
     }
@@ -1314,7 +1343,9 @@ mod tests {
                 .expect("test server should run");
         });
 
-        let provider = OllamaModelProvider::builder("test").base_url(Some(&format!("http://{addr}"))).build();
+        let provider = OllamaModelProvider::builder("test")
+            .base_url(Some(&format!("http://{addr}")))
+            .build();
         let messages = vec![
             ChatMessage::system("You are helpful."),
             ChatMessage::user("read a file"),
@@ -1505,11 +1536,13 @@ mod tests {
 
     #[test]
     fn request_includes_overridden_tuning() {
-        let provider = OllamaModelProvider::builder("test").build().with_tuning(OllamaTuning {
-            num_ctx: 4096,
-            num_predict: 1024,
-            temperature_override: None,
-        });
+        let provider = OllamaModelProvider::builder("test")
+            .build()
+            .with_tuning(OllamaTuning {
+                num_ctx: 4096,
+                num_predict: 1024,
+                temperature_override: None,
+            });
         let request = provider.build_chat_request(
             vec![Message {
                 role: "user".to_string(),
@@ -1531,11 +1564,13 @@ mod tests {
 
     #[test]
     fn temperature_override_replaces_per_call_temperature() {
-        let provider = OllamaModelProvider::builder("test").build().with_tuning(OllamaTuning {
-            num_ctx: 8192,
-            num_predict: 2048,
-            temperature_override: Some(0.1),
-        });
+        let provider = OllamaModelProvider::builder("test")
+            .build()
+            .with_tuning(OllamaTuning {
+                num_ctx: 8192,
+                num_predict: 2048,
+                temperature_override: Some(0.1),
+            });
         let request = provider.build_chat_request(
             vec![Message {
                 role: "user".to_string(),

@@ -784,7 +784,8 @@ mod tests {
     fn creates_without_credential() {
         let p = AzureOpenAiModelProvider::builder("test")
             .resource_name("resource")
-            .deployment_name("deployment").build();
+            .deployment_name("deployment")
+            .build();
         assert!(p.credential.is_none());
     }
 
@@ -812,7 +813,8 @@ mod tests {
     async fn chat_fails_without_key() {
         let p = AzureOpenAiModelProvider::builder("test")
             .resource_name("resource")
-            .deployment_name("deployment").build();
+            .deployment_name("deployment")
+            .build();
         let result = p.chat_with_system(None, "hello", "gpt-4o", Some(0.7)).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key not set"));
@@ -822,7 +824,8 @@ mod tests {
     async fn chat_with_system_fails_without_key() {
         let p = AzureOpenAiModelProvider::builder("test")
             .resource_name("resource")
-            .deployment_name("deployment").build();
+            .deployment_name("deployment")
+            .build();
         let result = p
             .chat_with_system(Some("You are ZeroClaw"), "test", "gpt-4o", Some(0.5))
             .await;
@@ -931,7 +934,8 @@ mod tests {
     async fn chat_with_tools_fails_without_key() {
         let p = AzureOpenAiModelProvider::builder("test")
             .resource_name("resource")
-            .deployment_name("deployment").build();
+            .deployment_name("deployment")
+            .build();
         let messages = vec![ChatMessage::user("hello".to_string())];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -1002,7 +1006,8 @@ mod tests {
     async fn warmup_is_noop() {
         let p = AzureOpenAiModelProvider::builder("test")
             .resource_name("resource")
-            .deployment_name("deployment").build();
+            .deployment_name("deployment")
+            .build();
         let result = p.warmup().await;
         assert!(result.is_ok());
     }
