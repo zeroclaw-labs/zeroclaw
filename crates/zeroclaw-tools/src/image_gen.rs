@@ -146,6 +146,11 @@ impl ImageGenTool {
     /// even if `allowed_private_hosts` would otherwise lift the gate — that
     /// matches the matrix-textbrower-browser-file_download pattern (see
     /// `domain_guard::validate_resolved_ips_exclude_metadata`).
+    ///
+    /// This is **layer 1** of the SSRF gate (literal-host string check).
+    /// Layer 3 (resolved-IP DNS check) is applied separately via
+    /// [`Self::validate_resolved_ips_for_image_url`] — split so the
+    /// async DNS lookup is testable in isolation with synthetic IPs.
     fn validate_image_url(&self, raw_url: &str) -> anyhow::Result<String> {
         let url = raw_url.trim();
         if url.is_empty() {
@@ -217,6 +222,56 @@ impl ImageGenTool {
         }
 
         Ok(url.to_string())
+    }
+
+    /// **Layer 3** of the SSRF gate: resolve the URL's host via DNS and
+    /// validate that every resolved IP is a public address (or, for
+    /// allowlist-lifted private hosts, non-metadata). Closes the
+    /// DNS-rebinding vector where `internal.corp` resolves to `10.0.0.5`
+    /// — the literal-host classifier at `validate_image_url` cannot
+    /// catch this.
+    ///
+    /// Mirrors the async-DNS pattern at `http_request.rs:622-185` and
+    /// `web_fetch.rs:702-723`. The redirect policy closure (which is sync
+    /// and cannot await DNS) remains on the literal-host check; that gap
+    /// is documented as a known follow-up.
+    ///
+    /// For IP-literal hosts the literal-host check at `validate_image_url`
+    /// has already classified the IP, so this method is a no-op.
+    async fn validate_resolved_ips_for_image_url(&self, url: &str) -> anyhow::Result<()> {
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| anyhow::Error::msg(format!("Invalid image URL format: {e}")))?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::Error::msg("image URL has no host"))?
+            .to_string();
+
+        // IP literals: the literal-host check already classified the host.
+        if host.parse::<IpAddr>().is_ok() {
+            return Ok(());
+        }
+
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let addrs = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "tool": "image_gen",
+                            "host": host,
+                            "error": e.to_string()
+                        })),
+                    "image_gen: DNS resolution failed for image host"
+                );
+                anyhow::Error::msg(format!("Failed to resolve image host '{host}': {e}"))
+            })?
+            .collect::<Vec<_>>();
+
+        let ips: Vec<IpAddr> = addrs.iter().map(|sa| sa.ip()).collect();
+        check_resolved_ips_for_image_gen(&host, &self.allowed_private_hosts, &ips)
     }
 
     /// Build a reusable HTTP client with reasonable timeouts.
@@ -378,6 +433,15 @@ impl ImageGenTool {
         // leave open.
         let validated_image_url = self.validate_image_url(image_url)?;
 
+        // Layer 3 of the SSRF gate: resolve the host via DNS and check
+        // that every resolved IP is public (or, for allowlist-lifted
+        // private hosts, non-metadata). Closes the DNS-rebinding vector
+        // where `internal.corp` resolves to `10.0.0.5` — the literal-host
+        // check at `validate_image_url` cannot catch this. Mirrors
+        // `http_request.rs:622-185` async-DNS pattern.
+        self.validate_resolved_ips_for_image_url(&validated_image_url)
+            .await?;
+
         // ── Build image-download client with per-redirect SSRF gate ─
         // Mirrors `web_fetch.rs:407-426`. The closure captures a clone of
         // `self.allowed_private_hosts` so the per-redirect check uses the
@@ -508,6 +572,51 @@ fn validate_redirect_image_url(
     }
 
     Ok(())
+}
+
+/// Layer 3 of the SSRF gate: validate a host's pre-resolved IPs against
+/// the same private/local + cloud-metadata policy as the literal-host
+/// check at `ImageGenTool::validate_image_url`. Splits the post-DNS
+/// decision from the DNS-resolution step so the gate is testable with
+/// synthetic IPs (no real DNS, no network).
+///
+/// Semantics:
+/// - If the hostname is in `allowed_private_hosts` (the literal-host
+///   check lifted the gate) → every resolved IP must not be cloud
+///   metadata; private/loopback/link-local IPs are accepted because
+///   the operator explicitly opted in. Uses
+///   `domain_guard::validate_resolved_ips_exclude_metadata`.
+/// - Otherwise → every resolved IP must be globally routable
+///   (`validate_resolved_ips_are_public`). Catches the canonical
+///   DNS-rebinding vector where `cdn.fal.ai` (or any attacker-controlled
+///   hostname that happens to pass the literal-host deny list) resolves
+///   to `10.0.0.5` or `169.254.169.254`.
+///
+/// **Known limitation:** the reqwest redirect policy closure is sync and
+/// cannot await DNS, so per-redirect resolved-IP validation is deferred
+/// across the trilogy (see `[[zeroclaw-ssrf-trilogy-gate-layers-2026-07-04]]`).
+/// The initial-URL check covers the canonical DNS-rebinding vector; a
+/// future PR can add a sync-DNS cache (or `block_in_place` async DNS)
+/// to extend coverage to redirect targets.
+fn check_resolved_ips_for_image_gen(
+    host: &str,
+    allowed_private_hosts: &[String],
+    ips: &[IpAddr],
+) -> anyhow::Result<()> {
+    if ips.is_empty() {
+        anyhow::bail!("Failed to resolve host '{host}'");
+    }
+
+    // Branch on whether the operator's allowlist lifted the gate, not on
+    // whether the hostname *looks* private — `is_private_or_local_host`
+    // is a literal-string classifier and would miss names like
+    // `cdn.internal.example` (a public TLD), which is exactly the
+    // DNS-rebinding case we want the layer-3 gate to catch by IP.
+    if domain_guard::host_matches_allowlist(host, allowed_private_hosts) {
+        domain_guard::validate_resolved_ips_exclude_metadata(host, ips)
+    } else {
+        domain_guard::validate_resolved_ips_are_public(host, ips)
+    }
 }
 
 #[async_trait]
@@ -995,5 +1104,173 @@ mod tests {
         let allowed = vec!["cdn.internal.example".to_string()];
         validate_redirect_image_url("https://cdn.internal.example/x.png", &allowed)
             .expect("allowed_private_hosts must lift the redirect gate");
+    }
+
+    // ── Layer 3 — resolved-IP DNS check tests ────────────────────
+    //
+    // The reqwest `Policy::custom` closure is sync, so the per-redirect
+    // resolved-IP gate is deferred (see `[[zeroclaw-ssrf-trilogy-gate-layers-
+    // 2026-07-04]]`). The initial URL's gate is implemented as
+    // `check_resolved_ips_for_image_gen` — a pure function over
+    // `(host, allowed_private_hosts, resolved_ips)`. These tests pin
+    // that gate hermetically: no network, no real DNS, no reqwest.
+    //
+    // A regression that drops the layer-3 gate (or relaxes the
+    // private-IP check) surfaces here.
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse::<IpAddr>().expect("test fixture must parse")
+    }
+
+    #[test]
+    fn check_resolved_ips_public_hostname_public_ip_accepted() {
+        let ips = vec![ip("93.184.216.34")]; // example.com
+        check_resolved_ips_for_image_gen("cdn.fal.ai", &[], &ips)
+            .expect("public hostname + public IP must be accepted");
+    }
+
+    #[test]
+    fn check_resolved_ips_public_hostname_private_ip_rejected() {
+        // The classic DNS-rebinding vector: hostname is public-looking,
+        // resolved IP is private. Literal-host check passes, layer-3
+        // gate must catch it.
+        let ips = vec![ip("10.0.0.5")];
+        let err = check_resolved_ips_for_image_gen("cdn.fal.ai", &[], &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-global") || err.contains("private") || err.contains("10.0.0.5"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_resolved_ips_public_hostname_loopback_ip_rejected() {
+        let ips = vec![ip("127.0.0.1")];
+        let err = check_resolved_ips_for_image_gen("cdn.fal.ai", &[], &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-global") || err.contains("127.0.0.1"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_resolved_ips_public_hostname_metadata_ip_rejected() {
+        // The IMDS-rebinding vector: hostname is public-looking, but
+        // poisoned DNS returns the cloud-metadata IP. Must be rejected
+        // unconditionally.
+        let ips = vec![ip("169.254.169.254")];
+        let err = check_resolved_ips_for_image_gen("cdn.fal.ai", &[], &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("metadata"), "got: {err}");
+    }
+
+    #[test]
+    fn check_resolved_ips_public_hostname_mixed_ips_rejected() {
+        // Multi-IP resolution: if ANY resolved IP is non-public, the
+        // gate must reject (reqwest may pick any one of the IPs to
+        // connect to).
+        let ips = vec![ip("93.184.216.34"), ip("10.0.0.5")];
+        let err = check_resolved_ips_for_image_gen("cdn.fal.ai", &[], &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-global") || err.contains("10.0.0.5"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_resolved_ips_empty_list_rejected() {
+        // DNS returned no IPs (NXDOMAIN, SERVFAIL, etc.). Must be
+        // rejected, not silently passed through.
+        let err = check_resolved_ips_for_image_gen("cdn.fal.ai", &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("resolve") || err.contains("Failed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_resolved_ips_allowlisted_hostname_private_ip_accepted() {
+        // Operator explicitly allowlisted the internal CDN; resolved
+        // IP is the internal CDN's actual private address.
+        let ips = vec![ip("10.5.5.5")];
+        check_resolved_ips_for_image_gen(
+            "cdn.internal.example",
+            &["cdn.internal.example".to_string()],
+            &ips,
+        )
+        .expect("allowlisted private host + private IP must be accepted");
+    }
+
+    #[test]
+    fn check_resolved_ips_allowlisted_hostname_metadata_ip_rejected() {
+        // Even with the host allowlisted, a resolved cloud-metadata IP
+        // must be rejected (matches the matrix-textbrower-browser
+        // pattern; `*` allowlist does not lift the metadata block).
+        let ips = vec![ip("169.254.169.254")];
+        let err =
+            check_resolved_ips_for_image_gen("cdn.internal.example", &["*".to_string()], &ips)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("metadata"), "got: {err}");
+    }
+
+    #[test]
+    fn check_resolved_ips_wildcard_allowlist_blocks_metadata_rejects_metadata() {
+        // Wildcard allowlist allows private IPs but blocks metadata.
+        // The resolved IP happens to be the metadata service.
+        let ips = vec![ip("169.254.169.254")];
+        let err = check_resolved_ips_for_image_gen("any.private.host", &["*".to_string()], &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("metadata"), "got: {err}");
+    }
+
+    #[test]
+    fn check_resolved_ips_allowlisted_hostname_non_allowlisted_rejected() {
+        // The hostname is a private one but NOT in the allowlist. The
+        // resolved IP is the host's actual address. Layer-3 should
+        // reject defensively (the literal-host check at
+        // `validate_image_url` should have already caught this; the
+        // resolved-IP check is a defense-in-depth re-application).
+        let ips = vec![ip("10.5.5.5")];
+        let err = check_resolved_ips_for_image_gen(
+            "cdn.internal.example",
+            &["other.private.host".to_string()],
+            &ips,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("non-global") || err.contains("10.5.5.5"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_resolved_ips_ipv6_public_accepted() {
+        // IPv6 public address. (2001:4860:4860::8888 = Google DNS.)
+        let ips = vec![ip("2001:4860:4860::8888")];
+        check_resolved_ips_for_image_gen("cdn.fal.ai", &[], &ips)
+            .expect("public IPv6 must be accepted");
+    }
+
+    #[test]
+    fn check_resolved_ips_ipv6_loopback_rejected() {
+        let ips = vec![ip("::1")];
+        let err = check_resolved_ips_for_image_gen("cdn.fal.ai", &[], &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-global") || err.contains("::1"),
+            "got: {err}"
+        );
     }
 }
