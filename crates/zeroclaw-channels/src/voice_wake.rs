@@ -329,6 +329,8 @@ impl Channel for VoiceWakeChannel {
                                         interruption_scope_id: None,
                                         attachments: vec![],
                                         subject: None,
+
+                                        ..Default::default()
                                     };
 
                                     if let Err(e) = tx.send(msg).await {

@@ -46,6 +46,16 @@ pub(crate) fn require_auth(
     }
 
     let token = extract_bearer_token(headers).unwrap_or("");
+    // Defense-in-depth: reject empty tokens explicitly so a future
+    // refactor of is_authenticated cannot accidentally treat "" as valid.
+    if token.is_empty() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            })),
+        ));
+    }
     if state.pairing.is_authenticated(token) {
         Ok(())
     } else {
@@ -2005,6 +2015,15 @@ mod tests {
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
+
+        // Override the trait default (which returns an "unsupported" Err) so
+        // tests that trigger the delete_agent cascade don't have their
+        // `warnings` array polluted with a memory-backend error that has
+        // nothing to do with what they're actually asserting. Mirrors the
+        // behavior of a real backend on a delete-of-a-never-stored agent.
+        async fn purge_agent(&self, _agent_alias: &str) -> anyhow::Result<usize> {
+            Ok(0)
+        }
     }
     impl ::zeroclaw_api::attribution::Attributable for MockMemory {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -2179,6 +2198,9 @@ mod tests {
             namespace: "default".into(),
             importance: Some(0.5),
             superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
             agent_alias: None,
             agent_id: None,
         }
@@ -2276,7 +2298,7 @@ mod tests {
         let spec = |name: &str| ToolSpec {
             name: name.to_string(),
             description: format!("{name} desc"),
-            parameters: serde_json::json!({}),
+            parameters: serde_json::json!({}).into(),
         };
         state.tools_registry = Arc::new(vec![spec("default_tool")]);
         let mut by_agent: std::collections::HashMap<String, Arc<Vec<ToolSpec>>> =
@@ -2657,6 +2679,24 @@ mod tests {
                 .iter()
                 .any(|item| item.contains("Bind this channel"))
         );
+    }
+
+    #[test]
+    fn require_auth_rejects_empty_bearer_token() {
+        let config = zeroclaw_config::schema::Config::default();
+        let mut state = test_state(config);
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer ".parse().unwrap(), // empty token after prefix
+        );
+
+        let result = require_auth(&state, &headers);
+        assert!(result.is_err(), "empty bearer token must be rejected");
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -3802,18 +3842,20 @@ mod tests {
 
         let registry = Arc::new(DeviceRegistry::new(&data_dir));
         let device_id = "dev-1".to_string();
-        registry.register(
-            token_hash,
-            DeviceInfo {
-                id: device_id.clone(),
-                name: None,
-                device_type: None,
-                paired_at: Utc::now(),
-                last_seen: Utc::now(),
-                ip_address: None,
-                capabilities: None,
-            },
-        );
+        registry
+            .register(
+                token_hash,
+                DeviceInfo {
+                    id: device_id.clone(),
+                    name: None,
+                    device_type: None,
+                    paired_at: Utc::now(),
+                    last_seen: Utc::now(),
+                    ip_address: None,
+                    capabilities: None,
+                },
+            )
+            .expect("test device registry insert");
 
         let mut state = test_state(config);
         state.pairing = pairing;
@@ -3840,18 +3882,20 @@ mod tests {
 
         // A real, already-registered device with a name.
         let known_hash = "a".repeat(64);
-        registry.register(
-            known_hash.clone(),
-            DeviceInfo {
-                id: "known".into(),
-                name: Some("My Laptop".into()),
-                device_type: Some("desktop".into()),
-                paired_at: Utc::now(),
-                last_seen: Utc::now(),
-                ip_address: None,
-                capabilities: None,
-            },
-        );
+        registry
+            .register(
+                known_hash.clone(),
+                DeviceInfo {
+                    id: "known".into(),
+                    name: Some("My Laptop".into()),
+                    device_type: Some("desktop".into()),
+                    paired_at: Utc::now(),
+                    last_seen: Utc::now(),
+                    ip_address: None,
+                    capabilities: None,
+                },
+            )
+            .expect("test device registry insert");
 
         let orphan_a = "b".repeat(64);
         let orphan_b = "c".repeat(64);
@@ -3864,6 +3908,7 @@ mod tests {
         // Existing metadata is preserved, not clobbered.
         let known = registry
             .list()
+            .expect("test device registry list")
             .into_iter()
             .find(|d| d.id == "known")
             .expect("known device still present");
@@ -3910,6 +3955,7 @@ mod tests {
         // revoking that hash from the guard actually de-authenticates the token.
         let device = registry
             .list()
+            .expect("test device registry list")
             .into_iter()
             .next()
             .expect("one backfilled device");
@@ -4135,18 +4181,20 @@ mod tests {
                 .generate_new_pairing_code()
                 .expect("pairing enabled");
             let tok = pairing.try_pair(&code, id).await.unwrap().unwrap();
-            registry.register(
-                PairingGuard::token_hash(&tok),
-                DeviceInfo {
-                    id: id.to_string(),
-                    name: None,
-                    device_type: None,
-                    paired_at: Utc::now(),
-                    last_seen: Utc::now(),
-                    ip_address: None,
-                    capabilities: None,
-                },
-            );
+            registry
+                .register(
+                    PairingGuard::token_hash(&tok),
+                    DeviceInfo {
+                        id: id.to_string(),
+                        name: None,
+                        device_type: None,
+                        paired_at: Utc::now(),
+                        last_seen: Utc::now(),
+                        ip_address: None,
+                        capabilities: None,
+                    },
+                )
+                .expect("test device registry insert");
         }
 
         let mut state = test_state(config);

@@ -16,13 +16,10 @@ pub use zeroclaw_log::{LogEvent as RuntimeTraceEvent, LogFilter, LogPage};
 /// [`zeroclaw_log::LogConfig`] (the boundary that breaks the `zeroclaw-config`
 /// dependency cycle; see `docs/book/src/architecture/logging.md`).
 ///
-/// This copies values once, at startup / explicit re-init. The `zeroclaw-log`
-/// writer then holds that snapshot for the life of the process, so a live config
-/// reload does not propagate to it: changes to any `log_persistence*` field,
-/// including the `rotating`-mode knobs (`log_persistence_max_bytes`,
-/// `log_persistence_rotate_daily`, `log_persistence_retention_max_files`,
-/// `log_persistence_retention_max_age_days`), take effect only after a daemon
-/// restart. Hot-reload is tracked as a follow-up in issue #8314.
+/// This copies values at startup and every daemon config reload. The
+/// `zeroclaw-log` writer holds the resulting policy snapshot until the next
+/// explicit re-init, so reload handling must call [`init_from_config`] after a
+/// fresh `Config::load_or_init()` for `log_persistence*` changes to take effect.
 fn to_log_config(config: &zeroclaw_config::schema::ObservabilityConfig) -> zeroclaw_log::LogConfig {
     zeroclaw_log::LogConfig {
         log_persistence: config.log_persistence.as_wire().to_string(),
