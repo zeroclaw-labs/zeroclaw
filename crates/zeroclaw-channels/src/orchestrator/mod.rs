@@ -13319,6 +13319,7 @@ api_key = "anthropic-key"
             agent_cfg,
             model_provider_ref,
             0,
+            hooks,
         )
     }
 
@@ -13329,6 +13330,7 @@ api_key = "anthropic-key"
         agent_cfg: zeroclaw_config::schema::AliasedAgentConfig,
         model_provider_ref: &str,
         context_token_budget: usize,
+        hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
     ) -> Arc<ChannelRuntimeContext> {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
@@ -15905,6 +15907,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_cfg,
             "test-provider",
             1,
+            None,
         );
         runtime_ctx
             .provider_cache
@@ -16003,6 +16006,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_cfg,
             "test-provider",
             1,
+            None,
         );
         runtime_ctx
             .provider_cache
