@@ -7300,13 +7300,14 @@ mod tests {
         use zeroclaw_providers::ModelProvider;
         use zeroclaw_providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
 
-        let groq = OpenAiCompatibleModelProvider::new(
+        let groq = OpenAiCompatibleModelProvider::builder(
             "test",
             "Groq",
             "https://api.groq.com/openai",
             Some("fake_key"),
             AuthStyle::Bearer,
-        );
+        )
+        .build();
 
         // Groq must not support vision.
         assert!(

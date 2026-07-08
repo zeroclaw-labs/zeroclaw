@@ -217,121 +217,71 @@ fn models_dev_to_model_info(ids: Vec<String>) -> Vec<zeroclaw_api::model_provide
         .collect()
 }
 
-impl OpenAiCompatibleModelProvider {
-    pub fn new(
-        alias: &str,
-        name: &str,
-        base_url: &str,
-        credential: Option<&str>,
-        auth_style: AuthStyle,
-    ) -> Self {
-        Self::new_with_options(
-            alias, name, base_url, credential, auth_style, false, None, false,
-        )
+/// Typed builder for [`OpenAiCompatibleModelProvider`].
+///
+/// The five required fields (`alias`, `name`, `base_url`, `credential`,
+/// `auth_style`) are passed to [`OpenAiCompatibleModelProvider::builder`];
+/// everything else has a sensible default and can be tuned via chainable
+/// methods on the builder or (for post-construction tweaks driven by config)
+/// via the same `with_*` methods on the built provider.
+#[must_use]
+pub struct OpenAiCompatibleBuilder {
+    alias: String,
+    name: String,
+    base_url: String,
+    credential: Option<String>,
+    auth_style: AuthStyle,
+    supports_vision: bool,
+    user_agent: Option<String>,
+    merge_system_into_user: bool,
+}
+
+impl OpenAiCompatibleBuilder {
+    /// Enable OpenAI-style multimodal (image) inputs on this provider.
+    pub fn vision(mut self, supports_vision: bool) -> Self {
+        self.supports_vision = supports_vision;
+        self
     }
 
-    pub fn new_with_vision(
-        alias: &str,
-        name: &str,
-        base_url: &str,
-        credential: Option<&str>,
-        auth_style: AuthStyle,
-        supports_vision: bool,
-    ) -> Self {
-        Self::new_with_options(
-            alias,
-            name,
-            base_url,
-            credential,
-            auth_style,
-            supports_vision,
-            None,
-            false,
-        )
-    }
-
-    /// Create a model_provider with a custom User-Agent header.
+    /// Set a custom `User-Agent` header for outbound requests.
     ///
-    /// Some model_providers (for example Kimi Code) require a specific User-Agent
-    /// for request routing and policy enforcement.
-    pub fn new_with_user_agent(
-        alias: &str,
-        name: &str,
-        base_url: &str,
-        credential: Option<&str>,
-        auth_style: AuthStyle,
-        user_agent: &str,
-    ) -> Self {
-        Self::new_with_options(
-            alias,
-            name,
-            base_url,
-            credential,
-            auth_style,
-            false,
-            Some(user_agent),
-            false,
-        )
+    /// Required by providers whose routing / policy stack keys off the UA
+    /// string (for example Kimi Code).
+    pub fn user_agent(mut self, user_agent: &str) -> Self {
+        self.user_agent = Some(user_agent.to_string());
+        self
     }
 
-    pub fn new_with_user_agent_and_vision(
-        alias: &str,
-        name: &str,
-        base_url: &str,
-        credential: Option<&str>,
-        auth_style: AuthStyle,
-        user_agent: &str,
-        supports_vision: bool,
-    ) -> Self {
-        Self::new_with_options(
-            alias,
-            name,
-            base_url,
-            credential,
-            auth_style,
-            supports_vision,
-            Some(user_agent),
-            false,
-        )
+    /// For providers that reject `role: system` outright (e.g. MiniMax).
+    /// Collects all system messages and prepends their content to the first
+    /// user message; also disables native tool calling because such providers
+    /// generally reject OpenAI-style `tools` payloads as well.
+    ///
+    /// Prefer [`OpenAiCompatibleModelProvider::with_merge_system_into_user`]
+    /// on the built provider when you want the merge behaviour but still want
+    /// native tool calling (e.g. Bedrock).
+    pub fn merge_system_into_user(mut self) -> Self {
+        self.merge_system_into_user = true;
+        self
     }
 
-    /// For model_providers that do not support `role: system` (e.g. MiniMax).
-    /// System prompt content is prepended to the first user message instead.
-    pub fn new_merge_system_into_user(
-        alias: &str,
-        name: &str,
-        base_url: &str,
-        credential: Option<&str>,
-        auth_style: AuthStyle,
-    ) -> Self {
-        Self::new_with_options(
-            alias, name, base_url, credential, auth_style, false, None, true,
-        )
-    }
-
-    fn new_with_options(
-        alias: &str,
-        name: &str,
-        base_url: &str,
-        credential: Option<&str>,
-        auth_style: AuthStyle,
-        supports_vision: bool,
-        user_agent: Option<&str>,
-        merge_system_into_user: bool,
-    ) -> Self {
-        Self {
-            alias: alias.to_string(),
-            name: name.to_string(),
-            base_url: base_url.trim_end_matches('/').to_string(),
-            credential: credential.map(ToString::to_string),
+    /// Finalize the builder into a ready provider. Post-construction tweaks
+    /// (timeout, max_tokens, extra headers, TLS CA, catalog keys, …) use the
+    /// `with_*` methods on the returned [`OpenAiCompatibleModelProvider`].
+    pub fn build(self) -> OpenAiCompatibleModelProvider {
+        OpenAiCompatibleModelProvider {
+            alias: self.alias,
+            name: self.name,
+            base_url: self.base_url,
+            credential: self.credential,
             auth_service: None,
             auth_model_provider: None,
             auth_profile_override: None,
-            auth_header: auth_style,
-            supports_vision,
-            user_agent: user_agent.map(ToString::to_string),
-            merge_system_into_user,
-            native_tool_calling: !merge_system_into_user,
+            auth_header: self.auth_style,
+            supports_vision: self.supports_vision,
+            user_agent: self.user_agent,
+            native_tool_calling: !self.merge_system_into_user,
+            merge_system_into_user: self.merge_system_into_user,
             timeout_secs: 120,
             extra_headers: std::collections::HashMap::new(),
             reasoning_effort: None,
@@ -344,6 +294,34 @@ impl OpenAiCompatibleModelProvider {
             public_model_listing: false,
             tls_ca_cert_pem: None,
             extra_body: None,
+        }
+    }
+}
+
+impl OpenAiCompatibleModelProvider {
+    /// Entry point for constructing an OpenAI-compatible provider.
+    ///
+    /// The five required fields land here; everything else is either a
+    /// chainable option on the returned [`OpenAiCompatibleBuilder`] or a
+    /// `with_*` method on the built provider (post-construction tweaks
+    /// driven by config live in the latter so callers can chain them
+    /// conditionally on the finished value).
+    pub fn builder(
+        alias: &str,
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+    ) -> OpenAiCompatibleBuilder {
+        OpenAiCompatibleBuilder {
+            alias: alias.to_string(),
+            name: name.to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            credential: credential.map(ToString::to_string),
+            auth_style,
+            supports_vision: false,
+            user_agent: None,
+            merge_system_into_user: false,
         }
     }
     /// Inject extra JSON fields into every API request body.
@@ -3504,7 +3482,7 @@ mod tests {
         url: &str,
         key: Option<&str>,
     ) -> OpenAiCompatibleModelProvider {
-        OpenAiCompatibleModelProvider::new("test", name, url, key, AuthStyle::Bearer)
+        OpenAiCompatibleModelProvider::builder("test", name, url, key, AuthStyle::Bearer).build()
     }
 
     #[test]
@@ -3906,25 +3884,27 @@ mod tests {
 
     #[test]
     fn x_api_key_auth_style() {
-        let p = OpenAiCompatibleModelProvider::new(
+        let p = OpenAiCompatibleModelProvider::builder(
             "test",
             "moonshot",
             "https://api.moonshot.cn",
             Some("ms-key"),
             AuthStyle::XApiKey,
-        );
+        )
+        .build();
         assert!(matches!(p.auth_header, AuthStyle::XApiKey));
     }
 
     #[test]
     fn custom_auth_style() {
-        let p = OpenAiCompatibleModelProvider::new(
+        let p = OpenAiCompatibleModelProvider::builder(
             "test",
             "custom",
             "https://api.example.com",
             Some("key"),
             AuthStyle::Custom("X-Custom-Key".into()),
-        );
+        )
+        .build();
         assert!(matches!(p.auth_header, AuthStyle::Custom(_)));
     }
 
@@ -3992,13 +3972,14 @@ mod tests {
 
     #[test]
     fn zhipu_jwt_auth_style_applies_correctly() {
-        let p = OpenAiCompatibleModelProvider::new(
+        let p = OpenAiCompatibleModelProvider::builder(
             "test",
             "Z.AI",
             "https://api.z.ai/api/coding/paas/v4",
             Some("testid.testsecret"),
             AuthStyle::ZhipuJwt,
-        );
+        )
+        .build();
         assert!(matches!(p.auth_header, AuthStyle::ZhipuJwt));
     }
 
@@ -4790,14 +4771,15 @@ mod tests {
 
     #[test]
     fn capabilities_reports_vision_for_qwen_compatible_provider() {
-        let p = OpenAiCompatibleModelProvider::new_with_vision(
+        let p = OpenAiCompatibleModelProvider::builder(
             "test",
             "Qwen",
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
             Some("k"),
             AuthStyle::Bearer,
-            true,
-        );
+        )
+        .vision(true)
+        .build();
         let caps = <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
@@ -4805,13 +4787,14 @@ mod tests {
 
     #[test]
     fn minimax_provider_supports_native_tool_calling_with_system_merge() {
-        let p = OpenAiCompatibleModelProvider::new(
+        let p = OpenAiCompatibleModelProvider::builder(
             "test",
             "MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),
             AuthStyle::Bearer,
         )
+        .build()
         .with_merge_system_into_user();
         let caps = <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p);
         assert!(
@@ -4837,13 +4820,15 @@ mod tests {
             ChatMessage::assistant("Here are the results about cats"),
             ChatMessage::user("thanks"),
         ];
-        let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+        let p = OpenAiCompatibleModelProvider::builder(
             "test",
             "MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),
             AuthStyle::Bearer,
-        );
+        )
+        .merge_system_into_user()
+        .build();
         let stripped = p.strip_native_tool_messages(&messages);
         // tool message dropped; the pre-tool narration and the reply that
         // follows the tool result are now coalesced into a single assistant
@@ -4884,13 +4869,15 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"tc1","content":"ok"}"#),
             ChatMessage::assistant("Done"),
         ];
-        let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+        let p = OpenAiCompatibleModelProvider::builder(
             "test",
             "MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),
             AuthStyle::Bearer,
-        );
+        )
+        .merge_system_into_user()
+        .build();
         let stripped = p.strip_native_tool_messages(&messages);
         // assistant with empty content + tool_calls → dropped; tool → dropped
         assert_eq!(stripped.len(), 3);
@@ -4908,13 +4895,15 @@ mod tests {
             ChatMessage::assistant("hi there"),
             ChatMessage::user("bye"),
         ];
-        let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+        let p = OpenAiCompatibleModelProvider::builder(
             "test",
             "MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),
             AuthStyle::Bearer,
-        );
+        )
+        .merge_system_into_user()
+        .build();
         let stripped = p.strip_native_tool_messages(&messages);
         assert_eq!(stripped.len(), 4);
         for (orig, result) in messages.iter().zip(stripped.iter()) {
@@ -4939,13 +4928,14 @@ mod tests {
             ),
             ChatMessage::assistant("Here are the results about cats"),
         ];
-        let p = OpenAiCompatibleModelProvider::new(
+        let p = OpenAiCompatibleModelProvider::builder(
             "test",
             "NativeToolProvider",
             "https://api.example.com/v1",
             Some("k"),
             AuthStyle::Bearer,
-        );
+        )
+        .build();
         assert!(
             <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p).native_tool_calling,
             "model_provider must have native_tool_calling enabled for this test"
@@ -4960,14 +4950,15 @@ mod tests {
 
     #[test]
     fn user_agent_constructor_keeps_native_tool_calling_enabled() {
-        let p = OpenAiCompatibleModelProvider::new_with_user_agent(
+        let p = OpenAiCompatibleModelProvider::builder(
             "test",
             "TestProvider",
             "https://example.com",
             Some("k"),
             AuthStyle::Bearer,
-            "zeroclaw-test/1.0",
-        );
+        )
+        .user_agent("zeroclaw-test/1.0")
+        .build();
         let caps = <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(!caps.vision);
@@ -4976,15 +4967,16 @@ mod tests {
 
     #[test]
     fn user_agent_and_vision_constructor_preserves_capability_flags() {
-        let p = OpenAiCompatibleModelProvider::new_with_user_agent_and_vision(
+        let p = OpenAiCompatibleModelProvider::builder(
             "test",
             "VisionModelProvider",
             "https://example.com",
             Some("k"),
             AuthStyle::Bearer,
-            "zeroclaw-test/vision",
-            true,
-        );
+        )
+        .user_agent("zeroclaw-test/vision")
+        .vision(true)
+        .build();
         let caps = <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
@@ -6277,14 +6269,15 @@ mod tests {
     fn extra_headers_combined_with_user_agent() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Title".to_string(), "zeroclaw".to_string());
-        let p = OpenAiCompatibleModelProvider::new_with_user_agent(
+        let p = OpenAiCompatibleModelProvider::builder(
             "test",
             "test",
             "https://example.com",
             None,
             AuthStyle::Bearer,
-            "CustomAgent/1.0",
         )
+        .user_agent("CustomAgent/1.0")
+        .build()
         .with_extra_headers(headers);
         assert_eq!(p.user_agent.as_deref(), Some("CustomAgent/1.0"));
         assert_eq!(p.extra_headers.len(), 1);
@@ -6432,13 +6425,15 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"t1","content":"Found 10 results"}"#),
             ChatMessage::assistant("Here are the results about cats"),
         ];
-        let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+        let p = OpenAiCompatibleModelProvider::builder(
             "test",
             "MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),
             AuthStyle::Bearer,
-        );
+        )
+        .merge_system_into_user()
+        .build();
         let stripped = p.strip_native_tool_messages(&messages);
         let roles: Vec<&str> = stripped.iter().map(|m| m.role.as_str()).collect();
         assert!(
@@ -6476,13 +6471,15 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"t1","content":"cargo output"}"#),
             ChatMessage::user("go on"),
         ];
-        let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+        let p = OpenAiCompatibleModelProvider::builder(
             "test",
             "Anthropic-compatible",
             "https://example.test/v1",
             Some("k"),
             AuthStyle::Bearer,
-        );
+        )
+        .merge_system_into_user()
+        .build();
         let stripped = p.strip_native_tool_messages(&messages);
         let roles: Vec<&str> = stripped.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles, vec!["user"]);
@@ -6508,13 +6505,15 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"t1","content":"cargo output"}"#),
             ChatMessage::user("go on"),
         ];
-        let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+        let p = OpenAiCompatibleModelProvider::builder(
             "test",
             "Anthropic-compatible",
             "https://example.test/v1",
             Some("k"),
             AuthStyle::Bearer,
-        );
+        )
+        .merge_system_into_user()
+        .build();
         let stripped = p.strip_native_tool_messages(&messages);
         let roles: Vec<&str> = stripped.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles, vec!["user"]);
@@ -6535,13 +6534,15 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"t1","content":"Found"}"#),
             ChatMessage::assistant("Here are the results"),
         ];
-        let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+        let p = OpenAiCompatibleModelProvider::builder(
             "test",
             "MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),
             AuthStyle::Bearer,
-        );
+        )
+        .merge_system_into_user()
+        .build();
         let stripped = p.strip_native_tool_messages(&messages);
         assert_eq!(
             stripped.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
@@ -6594,13 +6595,14 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let provider = OpenAiCompatibleModelProvider::new(
+        let provider = OpenAiCompatibleModelProvider::builder(
             "test",
             "test",
             &format!("http://{addr}"),
             Some("k"),
             AuthStyle::Bearer,
-        );
+        )
+        .build();
 
         let mut stream = provider.stream_chat(
             crate::traits::ChatRequest {

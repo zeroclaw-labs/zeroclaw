@@ -53,7 +53,7 @@ pub trait FamilyProviderFactory {
 ///
 /// Override [`CompatFamilySpec::build_compat`] when the family needs minor
 /// modifiers (e.g. `.without_native_tools()`); otherwise the default
-/// `OpenAiCompatibleModelProvider::new` constructor is used.
+/// `OpenAiCompatibleModelProvider::builder` entry point is used.
 pub trait CompatFamilySpec {
     const DISPLAY: &'static str;
     const DEFAULT_URL: &'static str;
@@ -105,13 +105,14 @@ pub trait CompatFamilySpec {
         key: Option<&str>,
         api_url: Option<&str>,
     ) -> OpenAiCompatibleModelProvider {
-        let mut p = OpenAiCompatibleModelProvider::new(
+        let mut p = OpenAiCompatibleModelProvider::builder(
             alias,
             Self::DISPLAY,
             api_url.unwrap_or(Self::DEFAULT_URL),
             key,
             Self::AUTH,
-        );
+        )
+        .build();
         if let Some(catalog_key) = Self::MODELS_DEV_KEY {
             p = p.with_models_dev_key(catalog_key);
         }
@@ -254,15 +255,16 @@ pub(crate) fn build_kimi_code_compat(
     key: Option<&str>,
     base_url: &str,
 ) -> OpenAiCompatibleModelProvider {
-    OpenAiCompatibleModelProvider::new_with_user_agent_and_vision(
+    OpenAiCompatibleModelProvider::builder(
         alias,
         "Kimi Code",
         base_url,
         key,
         AuthStyle::Bearer,
-        "KimiCLI/0.77",
-        true,
     )
+    .user_agent("KimiCLI/0.77")
+    .vision(true)
+    .build()
     .with_models_dev_key("moonshotai")
 }
 
@@ -431,7 +433,7 @@ pub fn get_default_url(provider_type: &str) -> Option<&'static str> {
 }
 
 // ── Pure-compat families ───────────────────────────────────────────────
-// `OpenAiCompatibleModelProvider::new(DISPLAY, DEFAULT_URL, key, AUTH)` —
+// `OpenAiCompatibleModelProvider::builder(DISPLAY, DEFAULT_URL, key, AUTH).build()` —
 // no modifiers, no per-alias logic. The blanket impl supplies
 // `FamilyProviderFactory` automatically.
 
@@ -781,13 +783,14 @@ impl FamilyProviderFactory for XaiModelProviderConfig {
             return Ok(p);
         }
 
-        let mut p = OpenAiCompatibleModelProvider::new(
+        let mut p = OpenAiCompatibleModelProvider::builder(
             alias,
             "xAI",
             api_url.unwrap_or("https://api.x.ai/v1"),
             key,
             AuthStyle::Bearer,
         )
+        .build()
         .with_models_dev_key("xai");
 
         if !has_api_key(key) {
@@ -839,13 +842,14 @@ impl FamilyProviderFactory for MinimaxModelProviderConfig {
             })
             .transpose()?;
         let resolved_key = refreshed_key.as_deref().or(key);
-        let p = OpenAiCompatibleModelProvider::new(
+        let p = OpenAiCompatibleModelProvider::builder(
             alias,
             "MiniMax",
             api_url.unwrap_or(crate::MINIMAX_INTL_BASE_URL),
             resolved_key,
             AuthStyle::Bearer,
         )
+        .build()
         .with_merge_system_into_user();
         Ok(apply_compat_options(p, opts))
     }
@@ -878,14 +882,15 @@ impl CompatFamilySpec for GlmModelProviderConfig {
         // catalog-conf'd base with vision flag override via the constructor
         // variant; we replay both consts manually since this constructor
         // path doesn't fold through `build_compat_base`.
-        let mut p = OpenAiCompatibleModelProvider::new_with_vision(
+        let mut p = OpenAiCompatibleModelProvider::builder(
             alias,
             Self::DISPLAY,
             api_url.unwrap_or(Self::DEFAULT_URL),
             key,
             Self::AUTH,
-            true,
-        );
+        )
+        .vision(true)
+        .build();
         if let Some(catalog_key) = Self::MODELS_DEV_KEY {
             p = p.with_models_dev_key(catalog_key);
         }
@@ -913,14 +918,15 @@ impl CompatFamilySpec for NvidiaModelProviderConfig {
         // `google/deepseek-r1`). Compose the catalog-conf'd base with vision flag
         // override via the constructor variant; we replay both consts manually
         // since this constructor path doesn't fold through `build_compat_base`.
-        let mut p = OpenAiCompatibleModelProvider::new_with_vision(
+        let mut p = OpenAiCompatibleModelProvider::builder(
             alias,
             Self::DISPLAY,
             api_url.unwrap_or(Self::DEFAULT_URL),
             key,
             Self::AUTH,
-            true,
-        );
+        )
+        .vision(true)
+        .build();
         if let Some(catalog_key) = Self::MODELS_DEV_KEY {
             p = p.with_models_dev_key(catalog_key);
         }
@@ -1053,14 +1059,15 @@ fn build_ollama_compat_provider(
 ) -> OpenAiCompatibleModelProvider {
     let base_url = normalize_ollama_compat_base_url(api_url);
     let ollama_key = key.map(str::trim).filter(|value| !value.is_empty());
-    let mut p = OpenAiCompatibleModelProvider::new_with_vision(
+    let mut p = OpenAiCompatibleModelProvider::builder(
         alias,
         "Ollama",
         &base_url,
         ollama_key,
         AuthStyle::Bearer,
-        true,
     )
+    .vision(true)
+    .build()
     .with_local_model_tool_sanitize()
     .with_public_model_listing();
     if opts.merge_system_into_user {
@@ -1269,24 +1276,26 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
             .or_else(|| oauth_context.base_url.clone())
             .unwrap_or_else(|| crate::QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
         let p = if oauth_context.credential.is_some() {
-            OpenAiCompatibleModelProvider::new_with_user_agent_and_vision(
+            OpenAiCompatibleModelProvider::builder(
                 alias,
                 "Qwen Code",
                 &base_url,
                 resolved_key,
                 AuthStyle::Bearer,
-                "QwenCode/1.0",
-                true,
             )
+            .user_agent("QwenCode/1.0")
+            .vision(true)
+            .build()
         } else {
-            OpenAiCompatibleModelProvider::new_with_vision(
+            OpenAiCompatibleModelProvider::builder(
                 alias,
                 "Qwen",
                 &base_url,
                 resolved_key,
                 AuthStyle::Bearer,
-                true,
             )
+            .vision(true)
+            .build()
         }
         .with_models_dev_key("alibaba")
         .with_openrouter_vendor_prefix("qwen");
@@ -1308,13 +1317,14 @@ impl FamilyProviderFactory for GroqModelProviderConfig {
         _api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let mut p = OpenAiCompatibleModelProvider::new(
+        let mut p = OpenAiCompatibleModelProvider::builder(
             alias,
             "Groq",
             "https://api.groq.com/openai/v1",
             key,
             AuthStyle::Bearer,
         )
+        .build()
         .with_models_dev_key("groq")
         .without_assistant_reasoning_replay();
         // Groq's llama-family models reject native tool calls with HTTP
@@ -1408,13 +1418,14 @@ impl FamilyProviderFactory for LmstudioModelProviderConfig {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("lm-studio");
-        let p = OpenAiCompatibleModelProvider::new(
+        let p = OpenAiCompatibleModelProvider::builder(
             alias,
             "LM Studio",
             api_url.unwrap_or("http://localhost:1234/v1"),
             Some(lm_studio_key),
             AuthStyle::Bearer,
-        );
+        )
+        .build();
         Ok(apply_compat_options(p, opts))
     }
 
@@ -1445,14 +1456,15 @@ impl FamilyProviderFactory for LlamacppModelProviderConfig {
         ) {
             return Ok(p);
         }
-        let mut p = OpenAiCompatibleModelProvider::new_with_vision(
+        let mut p = OpenAiCompatibleModelProvider::builder(
             alias,
             "llama.cpp",
             base_url,
             Some(llama_cpp_key),
             AuthStyle::Bearer,
-            true,
         )
+        .vision(true)
+        .build()
         .with_local_model_tool_sanitize();
         if opts.merge_system_into_user {
             p = p.with_merge_system_into_user();
@@ -1477,13 +1489,14 @@ impl FamilyProviderFactory for OsaurusModelProviderConfig {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("osaurus");
-        let p = OpenAiCompatibleModelProvider::new(
+        let p = OpenAiCompatibleModelProvider::builder(
             alias,
             "Osaurus",
             api_url.unwrap_or("http://localhost:1337/v1"),
             Some(osaurus_key),
             AuthStyle::Bearer,
-        );
+        )
+        .build();
         Ok(apply_compat_options(p, opts))
     }
 
@@ -1542,14 +1555,15 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
         ) {
             return Ok(p);
         }
-        let mut p = OpenAiCompatibleModelProvider::new_with_vision(
+        let mut p = OpenAiCompatibleModelProvider::builder(
             alias,
             "Custom",
             base_url,
             key,
             AuthStyle::Bearer,
-            true,
-        );
+        )
+        .vision(true)
+        .build();
         if opts.native_tools != Some(true) {
             p = p.without_native_tools();
         }
@@ -1583,14 +1597,15 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
         {
             return Ok(p);
         }
-        let mut p = OpenAiCompatibleModelProvider::new_with_vision(
+        let mut p = OpenAiCompatibleModelProvider::builder(
             alias,
             "OpenAI Compatible",
             base_url,
             key,
             AuthStyle::Bearer,
-            true,
-        );
+        )
+        .vision(true)
+        .build();
         if opts.merge_system_into_user {
             p = p.with_merge_system_into_user();
         }
