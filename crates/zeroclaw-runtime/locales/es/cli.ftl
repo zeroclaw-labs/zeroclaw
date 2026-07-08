@@ -109,8 +109,8 @@ cli-cron-remove-about = Eliminar una tarea programada
 cli-cron-update-about = Actualizar uno o más campos de una tarea programada existente
 cli-cron-pause-about = Pausar una tarea programada
 cli-cron-resume-about = Reanudar una tarea pausada
-cli-auth-login-about = Iniciar sesión con OAuth (OpenAI Codex o Gemini)
-cli-auth-refresh-about = Actualizar el token de acceso de OpenAI Codex usando el token de actualización
+cli-auth-login-about = Iniciar sesión con OAuth (OpenAI Codex, Gemini o xAI)
+cli-auth-refresh-about = Actualizar el token de acceso OAuth usando el token de actualización
 cli-auth-logout-about = Eliminar perfil de autenticación
 cli-auth-use-about = Establecer el perfil activo para un proveedor
 cli-auth-list-about = Listar perfiles de autenticación
@@ -128,6 +128,7 @@ cli-models-set-about = Establece el modelo predeterminado en la configuración
 cli-models-status-about = Muestra la configuración actual del modelo y el estado de la caché
 cli-doctor-models-about = Sondea catálogos de modelos en todos los proveedores e informa sobre la disponibilidad
 cli-doctor-traces-about = Consulta eventos de traza en tiempo de ejecución (diagnósticos de herramientas y respuestas de modelos)
+cli-doctor-update-context-windows-about = Actualiza context_window en config.toml desde los endpoints /models del proveedor
 cli-hardware-discover-about = Enumera dispositivos USB y muestra placas conocidas
 cli-hardware-introspect-about = Inspecciona un dispositivo por su número de serie o ruta de dispositivo
 cli-hardware-info-about = Obtiene información del chip vía USB usando probe-rs sobre ST-Link
@@ -287,6 +288,13 @@ cli-skills-install-suggestion =
 
     Capacidad coincidente: {$matched}
     Siguiente: Ejecuta `{$install_command}` para instalarla.
+
+cli-plugin-install-suggestion =
+    Parece que esta solicitud necesita el plugin `{$name}`, pero no está instalado.
+
+    Capacidad coincidente: {$matched}
+    Siguiente: Ejecuta `{$install_command}` para instalarlo.
+
 cli-completions-long-about =
     Genera scripts de autocompletado de shell para `zeroclaw`.
 
@@ -348,6 +356,8 @@ channel-wecom-ws-dm-access-denied =
 channel-discord-interaction-unauthorized = No tienes permiso para usar este comando aquí.
 channel-discord-interaction-malformed = Comando desconocido o mal formado.
 channel-discord-interaction-unavailable = Ese comando ya no está disponible o su entrada estaba vacía.
+channel-discord-component-expired = Este botón o menú ha expirado o ya fue utilizado.
+channel-discord-approval-recorded = Tu decisión ha sido registrada.
 channel-discord-delivery-failure-note-one = (nota: no pude entregar {$count} archivo.)
 channel-discord-delivery-failure-note-many = (nota: no pude entregar {$count} archivos.)
 channel-whatsapp-web-delivery-failure-note-one = (nota: no pude entregar {$count} archivo multimedia de WhatsApp.)
@@ -384,6 +394,9 @@ cli-skills-create-hint = {"  "}Cree uno: mkdir -p ~/.zeroclaw/workspace/skills/m
 cli-skills-install-hint = {"  "}O instale: zeroclaw skills install <source>
 cli-skills-installed-header = Skills instaladas ({$count}):
 cli-skills-tags = Etiquetas:  {$tags}
+cli-skills-skipped-header = Omitidas ({$count}):
+cli-skills-skipped-reason = {"    "}Motivo: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}Establece `skills.allow_scripts = true` en tu configuración de zeroclaw para habilitarla.
 cli-sop-none = No se encontraron SOP.
 cli-sop-create-hint = {"  "}Cree uno: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}luego agregue SOP.toml y SOP.md
@@ -550,6 +563,9 @@ cli-agent-not-created = Tu agente no fue creado — y no se cambió nada en el d
 cli-onboard-deprecated = `zeroclaw onboard` está obsoleto — usa `zeroclaw quickstart`.
 cli-otp-initialized = Secreto OTP inicializado para ZeroClaw.
 cli-otp-enrollment-uri = URI de inscripción: {$uri}
+cli-otp-received = {"  "}✓ OTP recibido
+cli-secret-captured = {"  "}● Valor capturado — pulse Enter para guardar
+cli-secret-received = {"  "}✓ Secreto recibido
 cli-pairing-enabled = 🔐 El emparejamiento del gateway está habilitado.
 cli-pairing-use-code = {"  "}Usa este código de un solo uso para emparejar un nuevo dispositivo:
 cli-pairing-post = {"    "}POST /pair con encabezado X-Pairing-Code: {$code}
@@ -620,7 +636,6 @@ cli-status-otp = {"  "}OTP habilitado:       {$v}
 cli-status-estop = {"  "}Parada de emergencia activada:    {$v}
 cli-status-peripherals-enabled = {"  "}Habilitado:   {$v}
 cli-status-boards = {"  "}Tableros:    {$v}
-cli-status-channel-not-compiled = 🚫 configurado, no compilado
 cli-status-word-enabled = habilitado
 cli-status-word-disabled = deshabilitado
 cli-status-word-yes = sí
@@ -630,6 +645,7 @@ cli-status-word-off = desactivado
 cli-status-word-none = (ninguno)
 cli-status-word-configured = configurado
 cli-status-word-not-configured = no configurado
+cli-status-channel-not-compiled = 🚫 configurado, no compilado
 cli-desktop-not-installed = La aplicación complementaria de ZeroClaw no está instalada.
 cli-desktop-blurb1 = La aplicación complementaria es una ligera app de la barra de menú que
 cli-desktop-blurb2 = se conecta a la misma puerta de enlace que la CLI.
@@ -638,7 +654,13 @@ cli-config-schema-current = La configuración ya está en la versión actual del
 cli-config-applied-ops = Se aplicaron {$count} operación(es):
 cli-plugins-none = No hay complementos instalados.
 cli-plugins-installed = Complementos instalados:
+cli-plugin-search-none = No hay complementos que coincidan con '{$query}'.
+cli-plugin-search-results = Complementos que coinciden con '{$query}' ({$count}):
+cli-plugin-search-result =   {$name} v{$version} — {$description}
+cli-plugin-no-description = (sin descripción)
+cli-plugin-install-resolving = Resolviendo '{$source}' desde el registro de complementos...
 cli-plugin-installed-from = Complemento instalado desde {$source}
+cli-plugin-installed-name-version = Complemento instalado {$name} v{$version}
 cli-plugin-removed = Complemento '{$name}' eliminado.
 cli-plugin-not-found = No se encontró el complemento '{$name}'.
 cli-plugin-legacy-detected = Nota: los complementos en una ubicación heredada ({$path}) no se cargan en el agente. Ejecuta `zeroclaw plugin migrate` para moverlos a {$target}.
@@ -676,6 +698,16 @@ cli-auth-active-for = Perfil activo para {$provider}: {$profile}
 cli-auth-refresh-ok = ✓ Actualización de token correcta (perfil {$profile})
 cli-auth-removed = Perfil de autenticación eliminado {$provider}:{$profile}
 cli-auth-not-found = Perfil de autenticación no encontrado: {$provider}:{$profile}
+cli-auth-xai-imported = Perfil de autenticación de xAI importado desde {$path}
+cli-auth-xai-device-code-started = Inicio de sesión con código de dispositivo de xAI iniciado.
+cli-auth-oauth-visit = Visita: {$uri}
+cli-auth-oauth-code = Código:  {$code}
+cli-auth-oauth-fast-link = Enlace rápido: {$uri}
+cli-auth-xai-open-oauth-url = Abre esta URL OAuth de xAI en tu navegador y autoriza el acceso:
+cli-auth-callback-capture-failed = No se pudo capturar la devolución de llamada: {$error}
+cli-auth-run-paste-redirect = Ejecuta `zeroclaw auth paste-redirect --model-provider {$provider} --profile {$profile}`
+cli-auth-xai-no-pending-login = No se encontró un inicio de sesión pendiente de xAI. Ejecuta `zeroclaw auth login --model-provider xai` primero.
+cli-auth-paste-redirect-requires-input = paste-redirect requiere la URL de redirección o el código OAuth
 cli-locales-fetched = {"  "}descargado {$name} -> {$path}
 cli-locales-skipped = {"  "}omitido {$name}: no está en upstream ({$path}; se intentó {$refs})
 cli-locales-installed = Se instalaron {$count} catálogo(s) para '{$locale}' en {$dir}
@@ -688,7 +720,10 @@ cli-hardware-unsupported-platform = El descubrimiento de USB por hardware no es 
 cli-hardware-supported-platforms = Plataformas compatibles: Linux, macOS, Windows.
 cli-update-already-current = Ya está actualizado (v{$version}).
 cli-update-success = ¡Actualizado correctamente a v{$version}!
-cli-update-prebuilt-channel-note = Las actualizaciones precompiladas usan el paquete ligero de canales predeterminado. Compila desde el código fuente con `./install.sh --source --preset full`, `--features channels-full` o una característica `channel-*` específica para Slack, Discord y otros canales no predeterminados.
+cli-update-prebuilt-channel-note = Las actualizaciones precompiladas usan el paquete ligero de canales predeterminado. Compila desde el código fuente con `./install.sh --source --preset full`, `--features channels-full` o una característica `channel-*` específica para Slack y otros canales no predeterminados.
+cli-update-available = Actualización disponible: v{$current} -> v{$latest}
+cli-update-forcing-reinstall = Forzando la reinstalación: v{$current} -> v{$latest}
+cli-update-not-writable = el directorio de instalación {$dir} no admite escritura ({$error}); vuelve a ejecutar `zeroclaw update` con privilegios elevados (sudo en macOS/Linux, una consola de administrador en Windows)
 cli-selftest-all-passed = Las {$total} comprobaciones pasaron.
 cli-selftest-some-failed = {$failed}/{$total} comprobaciones fallaron.
 cli-selftest-channel-config-uncompiled = {$compiled} tipos de canal compilados, {$configured} compilados/configurados; configurados pero no compilados: {$names}. Compila desde el código fuente con `./install.sh --source --preset full`, `--features channels-full` o la característica `channel-*` específica.
@@ -701,9 +736,15 @@ cli-channels-build-hint = {"  "}Compila desde el código fuente con `./install.s
 cli-channels-start-hint = Para iniciar canales: zeroclaw channel start
 cli-channels-doctor-hint = Para comprobar el estado:    zeroclaw channel doctor
 cli-channels-configure-hint = Para configurar:      zeroclaw config set channels.<name>.<field>=<value>
+cli-models-set-ok = Modelo predeterminado establecido en "{ $model }" en { $provider }.
+cli-models-status-current = Modelo predeterminado: { $model } (proveedor: { $provider })
+cli-models-status-none = No hay ningún modelo predeterminado configurado.
 turn-interrupted-by-user = [interrumpido por el usuario]
 turn-cancelled-client-rpc = [turno cancelado mediante el cliente]
 turn-stream-interrupted = [transmisión interrumpida]
+history-trim-breadcrumb = [earlier turns omitted to fit the context window]
+history-trim-reason-budget = context token budget exceeded
+turn-ingress-dropped = Esta solicitud no se procesó: { $reason }
 turn-tool-interrupted-before-result = [interrumpido por el usuario antes de que esta herramienta produjera un resultado]
 channel-runtime-malformed-tool-output = Generé un error de formato interno en la llamada de herramienta y no pude completar esta solicitud. Inténtalo de nuevo.
 cli-alias-list-empty = (sin entradas en {$section})
@@ -725,6 +766,7 @@ cli-alias-delete-refused-hint = eliminación rechazada — resuelva primero las 
 cli-alias-not-configured = {$path} no está configurado
 cli-alias-delete-failed = error al eliminar: {$error}
 cli-alias-delete-reserved-default = el agente `default` está reservado y no se puede eliminar
+cli-alias-create-reserved-default = el agente `default` está reservado y no se puede crear
 cli-alias-renamed = renombrado {$section}.{$from} → {$section}.{$to} (se reescribieron {$count} ruta(s) de referencia)
 cli-alias-rename-invalid = nuevo alias no válido: {$message}
 cli-alias-rename-reserved = el alias `{$alias}` está reservado y no se puede renombrar
@@ -745,3 +787,17 @@ cli-bundle-warn-archive = advertencia: falló el archivado del directorio del bu
 cli-bundle-deleted = eliminado skill_bundles.{$alias} (eliminado de {$count} agente(s))
 cli-bundle-warn-move = advertencia: falló el movimiento del directorio del bundle: {$error}
 cli-bundle-renamed = renombrado skill_bundles.{$from} → skill_bundles.{$to}
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
+cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
+cli-agent-context-bar-unknown = ctx: desconocido / {$max}
+cli-doctor-ctxwin-already-set = {$provider_ref}: ya tiene context_window = {$ctx}
+cli-doctor-ctxwin-no-model = {$provider_ref}: no hay modelo configurado, omitiendo
+cli-doctor-ctxwin-would-set = {$provider_ref}: establecería context_window = {$ctx} (simulación)
+cli-doctor-ctxwin-set = {$provider_ref}: context_window establecido = {$ctx}
+cli-doctor-ctxwin-not-found = {$provider_ref}: no se encontró la entrada para actualizar
+cli-doctor-ctxwin-fetch-failed = {$provider_ref}: el proveedor no expone ventana de contexto o falló la obtención
+cli-doctor-ctxwin-saved = Guardados {$updated} cambios en config.toml
+cli-doctor-ctxwin-dry-run = Simulación completa — sin cambios. Ejecute sin --dry-run para aplicar.
+cli-doctor-ctxwin-none = No se necesitan actualizaciones.
+cli-doctor-ctxwin-write-failed = {$provider_ref}: error al escribir context_window: {$error}

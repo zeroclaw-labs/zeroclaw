@@ -6,8 +6,8 @@ fn main() {
                 .app_manifest(include_str!("windows/app.manifest")),
         );
         tauri_build::try_build(attrs).expect("failed to run tauri_build");
-        return;
     }
 
+    #[cfg(not(target_os = "windows"))]
     tauri_build::build();
 }

@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(windows)]
+use zeroclaw_config::platform::native::windows_std_cmd_shell_command;
 
 const TEST_FILE_NAME: &str = "TEST.sh";
 
@@ -98,11 +100,7 @@ fn run_test_case(case: &TestCase, skill_dir: &Path, verbose: bool) -> Option<Tes
         println!("    running: {}", case.command);
     }
 
-    let result = Command::new("sh")
-        .arg("-c")
-        .arg(&case.command)
-        .current_dir(skill_dir)
-        .output();
+    let result = build_test_command(&case.command, skill_dir).output();
 
     let output = match result {
         Ok(o) => o,
@@ -146,6 +144,21 @@ fn run_test_case(case: &TestCase, skill_dir: &Path, verbose: bool) -> Option<Tes
             actual_output: combined.to_string(),
         })
     }
+}
+
+#[cfg(windows)]
+fn build_test_command(command: &str, skill_dir: &Path) -> Command {
+    let mut cmd = windows_std_cmd_shell_command(command);
+    cmd.current_dir(skill_dir);
+    cmd
+}
+
+#[cfg(not(windows))]
+fn build_test_command(command: &str, skill_dir: &Path) -> Command {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(command);
+    cmd.current_dir(skill_dir);
+    cmd
 }
 
 /// Test a single skill by parsing and running its TEST.sh.
@@ -432,12 +445,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let skill_dir = dir.path().join("exit-mismatch");
         fs::create_dir_all(&skill_dir).unwrap();
-        fs::write(skill_dir.join("TEST.sh"), "false | 0 | \n").unwrap();
+        fs::write(
+            skill_dir.join("TEST.sh"),
+            format!("{} | 0 | \n", failing_command()),
+        )
+        .unwrap();
 
         let result = test_skill(&skill_dir, "exit-mismatch", false).unwrap();
         assert_eq!(result.tests_run, 1);
         assert_eq!(result.tests_passed, 0);
         assert_eq!(result.failures[0].actual_exit, 1);
+    }
+
+    #[cfg(windows)]
+    fn failing_command() -> &'static str {
+        "exit /B 1"
+    }
+
+    #[cfg(not(windows))]
+    fn failing_command() -> &'static str {
+        "false"
     }
 
     #[test]

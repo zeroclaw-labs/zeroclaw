@@ -13,18 +13,30 @@ use crate::rpc::tui_identity::TuiRegistry;
 
 pub type StarterFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
+/// Per-iteration reload controls passed from the daemon to the supervised gateway.
+///
+/// This is the source of truth for gateway/daemon reload coordination created
+/// by `daemon::run` for one run/reload iteration. Keeping both senders in a
+/// named struct prevents call sites from accidentally swapping two adjacent
+/// `watch::Sender<bool>` arguments.
+#[derive(Clone)]
+pub struct GatewayReloadControls {
+    pub shutdown_tx: watch::Sender<bool>,
+    pub reload_tx: watch::Sender<bool>,
+}
+
 /// Starts the gateway HTTP server for one daemon run/reload iteration.
 ///
 /// The optional broadcast sender carries daemon events, the optional reload
-/// sender lets the gateway trigger in-process reloads, and the optional TUI
-/// registry powers the gateway's TUI identity endpoints.
+/// controls let gateway/RPC surfaces coordinate in-process reloads, and the
+/// optional TUI registry powers the gateway's TUI identity endpoints.
 pub type GatewayStarter = Box<
     dyn Fn(
             String,
             u16,
             Config,
             Option<broadcast::Sender<Value>>,
-            Option<watch::Sender<bool>>,
+            Option<GatewayReloadControls>,
             Option<Arc<TuiRegistry>>,
         ) -> StarterFuture
         + Send

@@ -249,6 +249,8 @@ impl RedditChannel {
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         })
     }
 }
@@ -394,6 +396,15 @@ impl Channel for RedditChannel {
 
     async fn health_check(&self) -> bool {
         self.get_access_token().await.is_ok()
+    }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator endpoint in the Reddit API.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 

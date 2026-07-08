@@ -16,20 +16,25 @@ pub(crate) fn resolve_vision_provider(
     provider_name: &str,
 ) -> Result<(Option<Box<dyn ModelProvider>>, bool)> {
     let image_marker_count = multimodal::count_image_markers(history);
-    // Image markers that came from the user (inbound attachments), as
-    // opposed to tool results. A missing vision capability is handled
-    // differently for the two: a user image must surface an error (we
-    // cannot silently ignore what the user sent), while a tool-result
-    // image may degrade to text-only.
-    let user_image_marker_count = multimodal::count_user_image_markers(history);
+    // Image markers in the most recent user message (the image the user *just*
+    // sent this turn), as opposed to markers carried over from earlier history
+    // or arriving via tool results. A missing vision capability is handled
+    // differently: an image the user just sent must surface an error (we cannot
+    // silently ignore it), while a carried-over or tool-result image degrades to
+    // text-only. Scoping to the latest user message (rather than the whole
+    // history) is what stops a single failed image turn from poisoning every
+    // subsequent text turn: the marker lives in the long-lived session history
+    // permanently, so a history-wide check would re-fail forever.
+    let latest_user_image_marker_count = multimodal::count_latest_user_image_markers(history);
 
     // ── Vision model_provider routing ──────────────────────────
     // When the default model_provider lacks vision support but a dedicated
     // vision_model_provider is configured, create it on demand and use it
     // for this iteration. When no vision route exists at all, either
-    // surface a capability error (the user sent an image) or degrade
-    // gracefully (the markers came only from tool results) — see the
-    // no-vision-route branch below and `degrade_strip_images`.
+    // surface a capability error (the user just sent an image) or degrade
+    // gracefully (the markers are carried over from earlier history or came
+    // only from tool results); see the no-vision-route branch below and
+    // `degrade_strip_images`.
     let mut degrade_strip_images = false;
     let vision_model_provider_box: Option<Box<dyn ModelProvider>> = if image_marker_count > 0
         && !model_provider.supports_vision()
@@ -65,8 +70,8 @@ pub(crate) fn resolve_vision_provider(
                 .into());
             }
             Some(vp_instance)
-        } else if user_image_marker_count > 0 {
-            // The user sent an image we cannot see. Surface a capability
+        } else if latest_user_image_marker_count > 0 {
+            // The user *just* sent an image we cannot see. Surface a capability
             // error so the attachment is not silently ignored — channels
             // render this back to the user (e.g. "⚠️ Error … does not
             // support vision"). Configuring a `vision_model_provider`
@@ -75,21 +80,24 @@ pub(crate) fn resolve_vision_provider(
                         model_provider: provider_name.to_string(),
                         capability: "vision".to_string(),
                         message: format!(
-                            "received {image_marker_count} image marker(s), but this model_provider does not support vision input"
+                            "received {latest_user_image_marker_count} image marker(s), but this model_provider does not support vision input"
                         ),
                     }
                     .into());
         } else {
-            // Markers came only from tool results (e.g. `image_info`,
-            // `screenshot`, `image_gen`). Previously this aborted the
-            // entire turn with a capability error, which turned an
-            // otherwise successful tool call (e.g. `image_info`, which
-            // always returns useful metadata text alongside its `[IMAGE:]`
-            // marker) into a hard failure. Instead, degrade: strip the
-            // image markers from the messages sent to the text-only
+            // The only image markers left are carried over from earlier
+            // history (e.g. a prior failed image turn whose user message
+            // persisted, or a switch from a vision model to a non-vision one)
+            // or arrived via tool results (`image_info`, `screenshot`,
+            // `image_gen`). Erroring here would poison every later turn: the
+            // marker lives in the long-lived session history permanently, so a
+            // history-wide capability error would re-fire on plain text turns
+            // forever. Tool-result markers were already degraded for the same
+            // "don't fail an otherwise useful turn" reason. Instead, degrade:
+            // strip the markers from the messages sent to the text-only
             // provider while preserving the surrounding text, so the
             // conversation continues and the model still receives any
-            // accompanying metadata/caption.
+            // accompanying caption/metadata.
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -99,7 +107,7 @@ pub(crate) fn resolve_vision_provider(
                         "model_provider": provider_name,
                         "image_marker_count": image_marker_count,
                     })),
-                "no vision route for tool-result image marker(s); degrading to text-only (markers stripped)"
+                "no vision route for carried-over/tool-result image marker(s); degrading to text-only (markers stripped)"
             );
             degrade_strip_images = true;
             None
@@ -123,6 +131,24 @@ pub(crate) async fn prepare_messages_for_iteration(
     degrade_strip_images: bool,
     image_cache: Option<&mut multimodal::LocalImageCache>,
 ) -> Result<multimodal::PreparedMessages> {
+    // Enforce the universal leading-turn-order invariant before any provider
+    // sees the history: strict providers reject a first non-system turn that is
+    // not `user`, which context trims and session restores can produce.
+    let mut sanitized = history.to_vec();
+    ChatMessage::sanitize_leading_turn_order(&mut sanitized);
+    // Fail closed before any provider sees the history. A no-user history
+    // (session-only, or a leading assistant/tool block with no anchoring user
+    // turn) sanitizes down to system-only, which every strict provider rejects
+    // and which silently discards the only surviving non-system context.
+    // Refuse to build a provider payload with zero user turns rather than
+    // trade one strict-provider failure shape for another.
+    if !sanitized.iter().any(ChatMessage::is_user) {
+        anyhow::bail!(
+            "refusing to dispatch to provider: prepared history has no user turn \
+             (system-only after leading-turn-order sanitize)"
+        );
+    }
+    let history = sanitized.as_slice();
     if degrade_strip_images {
         // Text-only fallback: replace every media marker with a
         // `[media attachment]` placeholder so no filesystem path or data
@@ -197,5 +223,67 @@ mod tests {
             .await
             .unwrap();
         assert!(uncached.contains_images);
+    }
+
+    /// Regression: a history whose first non-system turn is an assistant
+    /// tool-call (context trim / restore decapitated the anchoring user turn)
+    /// must be sanitized before any provider sees it, so strict providers no
+    /// longer reject the leading tool-call turn.
+    #[tokio::test]
+    async fn prepare_strips_leading_assistant_tool_call() {
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant("[tool_call] fire"),
+            ChatMessage::tool("result"),
+            ChatMessage::user("actual user"),
+        ];
+        let cfg = MultimodalConfig::default();
+        let prepared = prepare_messages_for_iteration(&history, &cfg, false, None)
+            .await
+            .unwrap();
+        let first_non_system = prepared
+            .messages
+            .iter()
+            .find(|m| m.role != "system")
+            .expect("a non-system turn survives");
+        assert_eq!(
+            first_non_system.role, "user",
+            "leading non-user turns must be dropped before dispatch"
+        );
+    }
+
+    /// Fail-closed regression (#6302, "NO USER TURN AT ALL"): a history that
+    /// sanitizes down to system-only must NOT produce a provider payload. The
+    /// prep boundary returns an error before dispatch instead of sending a
+    /// user-less request (or silently discarding the surviving context).
+    #[tokio::test]
+    async fn prepare_fails_closed_when_no_user_turn_survives() {
+        let cfg = MultimodalConfig::default();
+
+        // Pure system history.
+        let system_only = vec![ChatMessage::system("sys")];
+        let err = prepare_messages_for_iteration(&system_only, &cfg, false, None)
+            .await
+            .expect_err("system-only history must not reach the provider");
+        assert!(
+            err.to_string().contains("no user turn"),
+            "expected a no-user-turn fail-closed error, got: {err}"
+        );
+
+        // Leading assistant/tool block with no anchoring user turn: sanitize
+        // drains every non-system turn, leaving system-only, which must fail
+        // closed rather than dispatch.
+        let no_user = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant("[tool_call] fire"),
+            ChatMessage::tool("result"),
+        ];
+        let err = prepare_messages_for_iteration(&no_user, &cfg, false, None)
+            .await
+            .expect_err("no-user history must not reach the provider");
+        assert!(
+            err.to_string().contains("no user turn"),
+            "expected a no-user-turn fail-closed error, got: {err}"
+        );
     }
 }

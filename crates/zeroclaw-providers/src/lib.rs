@@ -37,6 +37,7 @@ pub mod openai;
 pub mod openai_codex;
 pub mod openrouter;
 pub mod openrouter_catalog;
+pub mod pricing;
 pub mod reliable;
 pub mod router;
 pub(crate) mod stream_guard;
@@ -44,13 +45,16 @@ pub mod telnyx;
 pub mod traits;
 
 pub use dispatch::{ProviderDispatch, ProviderDispatchRef};
+
+mod request_payload;
+
 #[allow(unused_imports)]
 pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, ModelProvider,
     ProviderCapabilityError, ToolCall, ToolResultMessage,
 };
 
-use reliable::ReliableModelProvider;
+use reliable::{ReliableModelProvider, ReliableModelProviderEntry};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -622,6 +626,9 @@ pub struct ModelProviderRuntimeOptions {
     /// Extra JSON parameters merged into API request bodies at the top level.
     /// Propagated from `ModelProviderConfig::provider_extra`.
     pub provider_extra: Option<serde_json::Value>,
+    /// When `Some(false)`, strip assistant reasoning fields from outbound
+    /// history replay. `None` honours provider default.
+    pub replay_assistant_reasoning: Option<bool>,
     /// When set, the provider is asked to use its native tool-calling
     /// schema instead of OpenAI-compat tool calls. Generic across families.
     pub native_tools: Option<bool>,
@@ -659,6 +666,7 @@ impl Default for ModelProviderRuntimeOptions {
             provider_max_tokens: None,
             merge_system_into_user: false,
             provider_extra: None,
+            replay_assistant_reasoning: None,
             native_tools: None,
             wire_api: None,
             think: None,
@@ -729,6 +737,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         provider_max_tokens: entry.and_then(|e| e.max_tokens),
         merge_system_into_user,
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
+        replay_assistant_reasoning: entry.and_then(|e| e.replay_assistant_reasoning),
         native_tools: entry.and_then(|e| e.native_tools),
         wire_api: entry.and_then(|e| e.wire_api.map(|w| w.as_str().to_string())),
         think: entry.and_then(|e| e.think),
@@ -1339,7 +1348,7 @@ pub fn create_resilient_model_provider_for_alias(
     let primary_model_provider =
         create_model_provider_inner(Some(config), family, alias, api_key, api_url, options)?;
 
-    let mut model_providers: Vec<(String, Box<dyn ModelProvider>)> = Vec::new();
+    let mut model_providers: Vec<ReliableModelProviderEntry> = Vec::new();
     push_pinned_entries(
         &mut model_providers,
         config,
@@ -1359,7 +1368,7 @@ pub fn create_resilient_model_provider_for_alias(
         )?;
     }
 
-    let reliable = ReliableModelProvider::new(
+    let reliable = ReliableModelProvider::new_with_entries(
         alias,
         model_providers,
         reliability.provider_retries,
@@ -1376,7 +1385,7 @@ pub fn create_resilient_model_provider_for_alias(
 /// next alias. When the alias has no configured model, a single unpinned entry
 /// is pushed and the requested model flows through unchanged.
 fn push_pinned_entries(
-    out: &mut Vec<(String, Box<dyn ModelProvider>)>,
+    out: &mut Vec<ReliableModelProviderEntry>,
     config: &zeroclaw_config::schema::Config,
     family: &str,
     alias: &str,
@@ -1385,15 +1394,17 @@ fn push_pinned_entries(
     let entry = config.providers.models.find(family, alias);
     let primary_model = entry.and_then(|e| e.model.as_deref());
     let extra_models: &[String] = entry.map(|e| e.fallback_models.as_slice()).unwrap_or(&[]);
+    let cooldown_key = format!("{family}.{alias}");
 
     let Some(primary_model) = primary_model else {
-        out.push((family.to_string(), built));
+        out.push(ReliableModelProviderEntry::new(family, cooldown_key, built));
         return;
     };
 
     let built: std::sync::Arc<dyn ModelProvider> = std::sync::Arc::from(built);
-    out.push((
-        family.to_string(),
+    out.push(ReliableModelProviderEntry::new(
+        family,
+        cooldown_key.clone(),
         Box::new(crate::model_pin::ModelPinnedProvider::new(
             alias,
             primary_model,
@@ -1404,8 +1415,9 @@ fn push_pinned_entries(
         if model.trim().is_empty() || model == primary_model {
             continue;
         }
-        out.push((
-            family.to_string(),
+        out.push(ReliableModelProviderEntry::new(
+            family,
+            cooldown_key.clone(),
             Box::new(crate::model_pin::ModelPinnedProvider::new(
                 alias,
                 model,
@@ -1423,7 +1435,7 @@ fn push_pinned_entries(
 /// constructed is a hard error because otherwise operators think the requested
 /// fallback is available when it is not.
 fn append_fallback_chain(
-    out: &mut Vec<(String, Box<dyn ModelProvider>)>,
+    out: &mut Vec<ReliableModelProviderEntry>,
     config: &zeroclaw_config::schema::Config,
     refs: &[zeroclaw_config::providers::ModelProviderRef],
     visited: &mut Vec<String>,
@@ -2234,10 +2246,11 @@ mod tests {
                 provider.supports_vision(),
                 "alias `{alias}` should report vision capability"
             );
+            // Kimi Code moved to api.kimi.com — see issue #8154
             assert_eq!(
                 moonshot_code_base_url(),
-                "https://api.moonshot.cn/coder/v1",
-                "alias `{alias}` should resolve to the Moonshot code endpoint"
+                "https://api.kimi.com/coding/v1",
+                "alias `{alias}` should resolve to the Kimi Code endpoint"
             );
         }
     }
@@ -2766,6 +2779,15 @@ mod tests {
     #[test]
     fn factory_nvidia() {
         assert!(create_model_provider("nvidia", Some("nvapi-test")).is_ok());
+    }
+
+    #[test]
+    fn factory_nvidia_supports_vision() {
+        let provider = create_model_provider("nvidia", Some("nvapi-test")).unwrap();
+        assert!(
+            provider.supports_vision(),
+            "nvidia provider must report supports_vision()=true for multimodal models"
+        );
     }
 
     // ── AI inference routers ─────────────────────────────────
@@ -4105,6 +4127,56 @@ mod tests {
     }
 
     #[test]
+    fn resilient_alias_allows_xai_oauth_fallback_without_api_key() {
+        use zeroclaw_config::schema::{
+            Config, ModelProviderConfig, OpenAIModelProviderConfig, XaiModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "xai.oauth",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.xai.insert(
+            "oauth".to_string(),
+            XaiModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("grok-4.3".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let temp = tempfile::tempdir().expect("temp zeroclaw dir");
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "openai",
+            "primary",
+            Some("primary-key"),
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions {
+                zeroclaw_dir: Some(temp.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "xAI OAuth fallbacks may intentionally omit api_key: {}",
+            result.err().unwrap()
+        );
+    }
+
+    #[test]
     fn resilient_alias_allows_local_fallback_without_profile_api_key() {
         use zeroclaw_config::schema::{Config, ModelProviderConfig, OllamaModelProviderConfig};
 
@@ -4271,4 +4343,80 @@ mod tests {
             "a deep acyclic chain must be depth-capped, never overflow or abort the build"
         );
     }
+}
+
+/// Attempt to fetch context window from provider's /models endpoint.
+/// Returns `None` on any failure (network, parsing, missing field) — caller uses fallback.
+pub async fn fetch_context_window(
+    provider_type: &str,
+    config: &zeroclaw_config::schema::ModelProviderConfig,
+) -> Option<usize> {
+    match provider_type {
+        "openrouter" => fetch_openrouter_context_window(config).await,
+        "together" | "groq" | "fireworks" | "deepinfra" | "hyperbolic" | "anyscale" | "novita"
+        | "nebius" => fetch_openai_compatible_context_window(provider_type, config).await,
+        _ => None, // anthropic, openai, ollama, bedrock, etc. don't expose it
+    }
+}
+
+async fn fetch_openrouter_context_window(
+    config: &zeroclaw_config::schema::ModelProviderConfig,
+) -> Option<usize> {
+    let client = reqwest::Client::new();
+    let url = config
+        .uri
+        .as_deref()
+        .filter(|s| !s.is_empty() && *s != "<unset>")
+        .unwrap_or("https://openrouter.ai/api/v1/models");
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    let model = config.model.as_deref().unwrap_or("");
+    resp["data"]
+        .as_array()?
+        .iter()
+        .find(|m| m["id"].as_str() == Some(model))?["context_length"]
+        .as_u64()
+        .map(|v| v as usize)
+}
+
+async fn fetch_openai_compatible_context_window(
+    provider_type: &str,
+    config: &zeroclaw_config::schema::ModelProviderConfig,
+) -> Option<usize> {
+    let client = reqwest::Client::new();
+    let default_uri = crate::factory::get_default_url(provider_type);
+    let base_url = config
+        .uri
+        .as_deref()
+        .filter(|s| !s.is_empty() && *s != "<unset>")
+        .or(default_uri)
+        .unwrap_or("");
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let mut req = client.get(&url);
+    if let Some(key) = config.api_key.as_deref() {
+        req = req.bearer_auth(key);
+    }
+    let resp = req
+        .send()
+        .await
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    let model = config.model.as_deref().unwrap_or("");
+    let model_entry = resp["data"]
+        .as_array()?
+        .iter()
+        .find(|m| m["id"].as_str() == Some(model))?;
+    model_entry
+        .get("context_length")
+        .or_else(|| model_entry.get("context_window"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
 }

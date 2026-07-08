@@ -318,6 +318,8 @@ impl Channel for NostrChannel {
                             interruption_scope_id: None,
                             attachments: vec![],
                             subject: None,
+
+                            ..Default::default()
                         };
                         if tx.send(msg).await.is_err() {
                             ::zeroclaw_log::record!(
@@ -353,6 +355,15 @@ impl Channel for NostrChannel {
             .await
             .values()
             .any(|r| r.is_connected())
+    }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator concept in any published NIP.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 

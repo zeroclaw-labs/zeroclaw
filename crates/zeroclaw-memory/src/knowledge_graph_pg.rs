@@ -99,56 +99,30 @@ impl PgKnowledgeGraph {
     }
 
     fn node_type_str(nt: &NodeType) -> &'static str {
-        match nt {
-            NodeType::Pattern => "pattern",
-            NodeType::Decision => "decision",
-            NodeType::Lesson => "lesson",
-            NodeType::Expert => "expert",
-            NodeType::Technology => "technology",
-        }
+        nt.as_str()
     }
 
-    fn parse_node_type(s: &str) -> NodeType {
-        match s {
-            "pattern" => NodeType::Pattern,
-            "decision" => NodeType::Decision,
-            "lesson" => NodeType::Lesson,
-            "expert" => NodeType::Expert,
-            "technology" => NodeType::Technology,
-            _ => NodeType::Pattern,
-        }
+    fn parse_node_type(s: &str) -> Result<NodeType> {
+        NodeType::parse(s)
     }
 
     fn relation_str(r: &Relation) -> &'static str {
-        match r {
-            Relation::Uses => "uses",
-            Relation::Replaces => "replaces",
-            Relation::Extends => "extends",
-            Relation::AuthoredBy => "authored_by",
-            Relation::AppliesTo => "applies_to",
-        }
+        r.as_str()
     }
 
     #[cfg(test)]
-    fn parse_relation(s: &str) -> Relation {
-        match s {
-            "uses" => Relation::Uses,
-            "replaces" => Relation::Replaces,
-            "extends" => Relation::Extends,
-            "authored_by" => Relation::AuthoredBy,
-            "applies_to" => Relation::AppliesTo,
-            _ => Relation::Uses,
-        }
+    fn parse_relation(s: &str) -> Result<Relation> {
+        Relation::parse(s)
     }
 
-    fn row_to_node(row: &Row) -> PgNode {
-        PgNode {
+    fn row_to_node(row: &Row) -> Result<PgNode> {
+        Ok(PgNode {
             id: row.get(0),
             name: row.get(1),
-            node_type: Self::parse_node_type(&row.get::<_, String>(2)),
+            node_type: Self::parse_node_type(&row.get::<_, String>(2))?,
             content: row.get(3),
             tags: row.get(4),
-        }
+        })
     }
 
     pub async fn add_node(
@@ -194,7 +168,7 @@ impl PgKnowledgeGraph {
         run_on_os_thread(move || {
             let mut client = client.lock();
             let row = client.query_opt(&format!(r#"SELECT id, name, node_type, content, tags FROM "{schema}".kg_nodes WHERE id = $1"#), &[&id])?;
-            Ok(row.as_ref().map(Self::row_to_node))
+            row.as_ref().map(Self::row_to_node).transpose()
         }).await
     }
 
@@ -207,7 +181,7 @@ impl PgKnowledgeGraph {
         run_on_os_thread(move || {
             let mut client = client.lock();
             let rows = client.query(&format!(r#"SELECT id, name, node_type, content, tags FROM "{schema}".kg_nodes WHERE tags && $1 LIMIT $2"#), &[&tags, &limit])?;
-            Ok(rows.iter().map(Self::row_to_node).collect())
+            rows.iter().map(Self::row_to_node).collect()
         }).await
     }
 
@@ -220,7 +194,7 @@ impl PgKnowledgeGraph {
         run_on_os_thread(move || {
             let mut client = client.lock();
             let rows = client.query(&format!(r#"SELECT id, name, node_type, content, tags FROM "{schema}".kg_nodes WHERE to_tsvector('simple', name || ' ' || content) @@ plainto_tsquery('simple', $1) LIMIT $2"#), &[&query, &limit])?;
-            Ok(rows.iter().map(Self::row_to_node).collect())
+            rows.iter().map(Self::row_to_node).collect()
         }).await
     }
 
@@ -232,7 +206,7 @@ impl PgKnowledgeGraph {
         run_on_os_thread(move || {
             let mut client = client.lock();
             let rows = client.query(&format!(r#"SELECT n.id, n.name, n.node_type, n.content, n.tags FROM "{schema}".kg_nodes n JOIN "{schema}".kg_edges e ON n.id = e.target_id WHERE e.source_id = $1 UNION SELECT n.id, n.name, n.node_type, n.content, n.tags FROM "{schema}".kg_nodes n JOIN "{schema}".kg_edges e ON n.id = e.source_id WHERE e.target_id = $1 LIMIT $2"#), &[&node_id, &limit])?;
-            Ok(rows.iter().map(Self::row_to_node).collect())
+            rows.iter().map(Self::row_to_node).collect()
         }).await
     }
 
@@ -244,7 +218,7 @@ impl PgKnowledgeGraph {
         run_on_os_thread(move || {
             let mut client = client.lock();
             let rows = client.query(&format!(r#"WITH RECURSIVE reachable AS (SELECT id, name, node_type, content, tags, 0 AS depth FROM "{schema}".kg_nodes WHERE id = $1 UNION SELECT n.id, n.name, n.node_type, n.content, n.tags, r.depth + 1 FROM "{schema}".kg_nodes n JOIN "{schema}".kg_edges e ON n.id = e.target_id JOIN reachable r ON e.source_id = r.id WHERE r.depth < $2) SELECT DISTINCT id, name, node_type, content, tags FROM reachable"#), &[&root_id, &max_depth])?;
-            Ok(rows.iter().map(Self::row_to_node).collect())
+            rows.iter().map(Self::row_to_node).collect()
         }).await
     }
 
@@ -271,46 +245,28 @@ mod tests {
 
     #[test]
     fn node_type_roundtrips() {
-        for nt in &[
-            NodeType::Pattern,
-            NodeType::Decision,
-            NodeType::Lesson,
-            NodeType::Expert,
-            NodeType::Technology,
-        ] {
+        for nt in NodeType::ALL {
             let s = PgKnowledgeGraph::node_type_str(nt);
-            assert_eq!(&PgKnowledgeGraph::parse_node_type(s), nt);
+            assert_eq!(PgKnowledgeGraph::parse_node_type(s).unwrap(), *nt);
         }
     }
 
     #[test]
     fn relation_roundtrips() {
-        for r in &[
-            Relation::Uses,
-            Relation::Replaces,
-            Relation::Extends,
-            Relation::AuthoredBy,
-            Relation::AppliesTo,
-        ] {
+        for r in Relation::ALL {
             let s = PgKnowledgeGraph::relation_str(r);
-            assert_eq!(&PgKnowledgeGraph::parse_relation(s), r);
+            assert_eq!(PgKnowledgeGraph::parse_relation(s).unwrap(), *r);
         }
     }
 
     #[test]
-    fn unknown_node_type_defaults_to_pattern() {
-        assert_eq!(
-            PgKnowledgeGraph::parse_node_type("nonexistent"),
-            NodeType::Pattern
-        );
+    fn unknown_node_type_errors() {
+        assert!(PgKnowledgeGraph::parse_node_type("nonexistent").is_err());
     }
 
     #[test]
-    fn unknown_relation_defaults_to_uses() {
-        assert_eq!(
-            PgKnowledgeGraph::parse_relation("nonexistent"),
-            Relation::Uses
-        );
+    fn unknown_relation_errors() {
+        assert!(PgKnowledgeGraph::parse_relation("nonexistent").is_err());
     }
 
     #[test]

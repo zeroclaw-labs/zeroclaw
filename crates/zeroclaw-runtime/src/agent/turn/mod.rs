@@ -53,6 +53,7 @@ pub(crate) mod context;
 pub(crate) mod context_recovery;
 pub(crate) mod delivery_defaults;
 pub(crate) mod events;
+pub(crate) mod execution;
 pub(crate) mod history_append;
 pub(crate) mod history_window;
 pub(crate) mod knobs;
@@ -71,11 +72,14 @@ pub(crate) mod tool_specs;
 pub(crate) mod vision_route;
 
 pub(crate) use call_prep::{PreparedToolCalls, prepare_tool_calls};
-pub(crate) use context::TurnCtx;
+pub(crate) use context::{TurnCtx, TurnMeta};
 pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overflow};
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
+pub use execution::{
+    ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+};
 pub(crate) use history_append::append_tool_round_to_history;
 pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior};
@@ -104,13 +108,12 @@ pub(crate) use stream_consume::consume_provider_streaming_response;
 pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};
 pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_provider};
 
+use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
 use crate::agent::tool_execution::{
-    execute_tools_parallel, execute_tools_sequential, should_execute_tools_in_parallel,
+    ToolDispatchContext, execute_tools_parallel, execute_tools_sequential,
+    should_execute_tools_in_parallel,
 };
-use crate::approval::ApprovalManager;
-use crate::observability::Observer;
 use crate::security::ingress::{IngressPolicy, ingress_policy};
-use crate::tools::Tool;
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -118,7 +121,6 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::ingress::{IngressContext, IngressDecision};
@@ -165,67 +167,75 @@ pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 /// destructures it once at entry, so the body reads exactly as it did when
 /// these were positional parameters.
 pub struct ToolLoop<'a> {
-    pub model_provider: &'a dyn ModelProvider,
+    /// The resolved per-agent execution context: model binding, gated tool
+    /// registry, approval, observability, and resolved runtime knobs. Stable
+    /// for every turn to this agent; built once and reused. See
+    /// [`ResolvedAgentExecution`]. Everything below is per-message turn state.
+    pub exec: ResolvedAgentExecution<'a>,
     pub history: &'a mut Vec<ChatMessage>,
-    pub tools_registry: &'a [Box<dyn Tool>],
-    pub observer: &'a dyn Observer,
-    pub provider_name: &'a str,
-    pub model: &'a str,
-    pub temperature: Option<f64>,
-    pub silent: bool,
-    pub approval: Option<&'a ApprovalManager>,
     pub channel_name: &'a str,
     pub channel_reply_target: Option<&'a str>,
-    pub multimodal_config: &'a zeroclaw_config::schema::MultimodalConfig,
-    pub max_tool_iterations: usize,
     pub cancellation_token: Option<CancellationToken>,
     pub on_delta: Option<tokio::sync::mpsc::Sender<DraftEvent>>,
-    pub hooks: Option<&'a crate::hooks::HookRunner>,
-    pub excluded_tools: &'a [String],
-    pub dedup_exempt_tools: &'a [String],
-    pub activated_tools:
-        Option<&'a std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
-    pub model_switch_callback: Option<ModelSwitchCallback>,
-    pub pacing: &'a zeroclaw_config::schema::PacingConfig,
-    pub strict_tool_parsing: bool,
-    pub parallel_tools: bool,
-    pub max_tool_result_chars: usize,
-    pub context_token_budget: usize,
     pub shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
     pub channel: Option<&'a dyn Channel>,
-    pub receipt_generator: Option<&'a crate::agent::tool_receipts::ReceiptGenerator>,
     pub collected_receipts: Option<&'a std::sync::Mutex<Vec<String>>>,
     pub event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
     pub steering: Option<&'a mut tokio::sync::mpsc::Receiver<String>>,
     pub new_messages_out: Option<&'a mut Vec<ChatMessage>>,
-    pub knobs: &'a LoopKnobs,
     pub image_cache: Option<&'a mut zeroclaw_providers::multimodal::LocalImageCache>,
     /// The ingress envelope stamped by the entry layer (RFC #6971). Travels
     /// with the turn into the engine, where the universal SOP policy layer
     /// dispositions it at P1 (turn entry) and P2 (each steering injection).
-    /// Phase-1 callers stamp [`IngressContext::internal`]; real per-transport
+    /// Phase-1 callers stamp a per-origin envelope; real per-transport
     /// stamping is phase 2. Owned (not borrowed) — the envelope is small and
     /// consumed by the policy front door for the turn's lifetime.
     pub ingress: IngressContext,
+    /// The per-turn memory half for unified memory-context injection: the
+    /// handle, raw recall query, session scopes, and spawn-site suppression.
+    /// `None` for nested sub-turn sites and paths without a memory backend;
+    /// the injection decision itself is keyed on `ingress.origin`.
+    pub memory: Option<crate::agent::memory_inject::TurnMemory<'a>>,
+    /// Observer metadata: agent alias and turn id, stamped onto every
+    /// turn-level observer event so OTel spans correlate across the loop.
+    pub agent_alias: Option<&'a str>,
+    pub turn_id: &'a str,
 }
 
 pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     let ToolLoop {
-        model_provider,
+        exec,
         history,
-        tools_registry,
-        observer,
-        provider_name,
-        model,
-        temperature,
-        silent,
-        approval,
         channel_name,
         channel_reply_target,
-        multimodal_config,
-        max_tool_iterations,
         cancellation_token,
         on_delta,
+        shared_budget,
+        channel,
+        collected_receipts,
+        event_tx,
+        mut steering,
+        mut new_messages_out,
+        mut image_cache,
+        ingress,
+        memory,
+        agent_alias,
+        turn_id,
+    } = p;
+    let ResolvedAgentExecution {
+        model_access:
+            ResolvedModelAccess {
+                model_provider,
+                provider_name,
+                model,
+                temperature,
+            },
+        tools_registry,
+        observer,
+        silent,
+        approval,
+        multimodal_config,
+        max_tool_iterations,
         hooks,
         excluded_tools,
         dedup_exempt_tools,
@@ -236,17 +246,9 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         parallel_tools,
         max_tool_result_chars,
         context_token_budget,
-        shared_budget,
-        channel,
         receipt_generator,
-        collected_receipts,
-        event_tx,
-        mut steering,
-        mut new_messages_out,
         knobs,
-        mut image_cache,
-        ingress,
-    } = p;
+    } = exec;
 
     // ── Ingress policy · P1 (turn entry) ────────────────────────────────────
     // RFC #6971: every inbound turn passes the universal SOP policy layer before
@@ -282,13 +284,52 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         }
     }
 
+    // ── Memory-context injection (unified) ──────────────────────────────────
+    // The ONE injection point for the memory preamble, replacing the per-path
+    // inline renderers. The decision is keyed on the ingress origin (sub-turns
+    // never inject; scheduled origins exclude Conversation entries); the
+    // pipeline and its documented uniform behavior live in
+    // `agent::memory_inject`. Injection prepends to the trailing user message
+    // AFTER the P1 policy scan, so policy always sees the caller's own text.
+    if let Some(turn_memory) = &memory {
+        let has_session = turn_memory.sessions.iter().any(Option::is_some);
+        if let crate::agent::memory_inject::InjectPolicy::Inject {
+            exclude_conversation,
+        } = crate::agent::memory_inject::resolve_inject_policy(
+            ingress.origin,
+            has_session,
+            turn_memory.suppress,
+        ) && let Some(last_user_idx) = history.iter().rposition(|m| m.role == "user")
+            // Idempotence: a model-switch retry re-enters the engine with the
+            // same history; the preamble must not stack.
+            && !history[last_user_idx]
+                .content
+                .starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN)
+        {
+            let scopes: Vec<Option<&str>> =
+                turn_memory.sessions.iter().map(|s| s.as_deref()).collect();
+            let context = crate::agent::memory_inject::render_memory_context(
+                turn_memory.handle,
+                observer,
+                &turn_memory.query,
+                &scopes,
+                &turn_memory.cfg,
+                exclude_conversation,
+            )
+            .await;
+            if !context.is_empty() {
+                let existing = &history[last_user_idx].content;
+                history[last_user_idx].content = format!("{context}{existing}");
+            }
+        }
+    }
+
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
         max_tool_iterations
     };
 
-    let turn_id = Uuid::new_v4().to_string();
     let loop_started_at = Instant::now();
     let loop_ignore_tools: HashSet<&str> = pacing
         .loop_ignore_tools
@@ -309,6 +350,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
     let mut malformed_tool_protocol_retries: usize = 0;
+    let mut prompt_approval_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
     // Shared-ref context for the turn step functions. Every `&mut` the loop
     // owns stays a loop local passed as an explicit argument (RUN_SHEET
@@ -329,7 +371,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         pacing,
         strict_tool_parsing,
         channel,
-        turn_id: &turn_id,
+        turn_id,
+        agent_alias,
     };
 
     for iteration in 0..max_iterations {
@@ -391,7 +434,75 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             budget.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        preflight_history_maintenance(history, context_token_budget, iteration);
+        preflight_history_maintenance(history);
+
+        if iteration == 0 && context_token_budget > 0 {
+            let taken = std::mem::take(history);
+            let result =
+                crate::agent::history_trim::trim_to_recent_turns(taken, context_token_budget);
+            if result.trimmed {
+                let mut trimmed = result.history;
+                let system_count = trimmed.iter().take_while(|m| m.role == "system").count();
+                trimmed.insert(system_count, crate::agent::history_trim::breadcrumb());
+                *history = trimmed;
+                {
+                    let __zc_trim_span = ::zeroclaw_log::info_span!(
+                        target: "zeroclaw_log_internal_scope",
+                        "zeroclaw_scope",
+                        model = %model,
+                        model_provider = %provider_name,
+                    );
+                    let _zc_trim_guard = __zc_trim_span.entered();
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_attrs(::serde_json::json!({
+                                "dropped_messages": result.dropped_messages,
+                                "dropped_turns": result.dropped_turns,
+                                "kept_turns": result.kept_turns,
+                                "budget_tokens": context_token_budget,
+                                "tokens_before": result.tokens_before,
+                                "tokens_after": result.tokens_after,
+                                "tokens_reclaimed": result.tokens_before.saturating_sub(result.tokens_after),
+                                "budget_headroom": context_token_budget.saturating_sub(result.tokens_after),
+                            })),
+                        format!(
+                            "History trimmed: dropped {} oldest turn(s) ({} msgs), {} -> {} tok (budget {}), reclaimed {} tok",
+                            result.dropped_turns,
+                            result.dropped_messages,
+                            result.tokens_before,
+                            result.tokens_after,
+                            context_token_budget,
+                            result.tokens_before.saturating_sub(result.tokens_after)
+                        )
+                    );
+                }
+                if let Some(tx) = event_tx.as_ref() {
+                    let _ = tx
+                        .send(TurnEvent::HistoryTrimmed {
+                            dropped_messages: result.dropped_messages,
+                            kept_turns: result.kept_turns,
+                            reason: crate::i18n::get_required_cli_string(
+                                "history-trim-reason-budget",
+                            ),
+                        })
+                        .await;
+                }
+                observer.record_event(
+                    &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                        dropped_messages: result.dropped_messages,
+                        kept_turns: result.kept_turns,
+                        reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                        channel: None,
+                        agent_alias: None,
+                        turn_id: None,
+                    },
+                );
+            } else {
+                *history = result.history;
+            }
+        }
 
         // Check if model switch was requested via model_switch tool
         if let Some(ref callback) = model_switch_callback
@@ -445,6 +556,14 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             use_native_tools,
             ..
         } = iteration_tool_specs;
+
+        // ── Per-turn system prompt anchor refresh (#8054 Surface 3) ──
+        // The system prompt in `history[0]` was built by
+        // `Agent::build_system_prompt()` against the base provider, and
+        // may not reflect this iteration's `active_model_provider` after
+        // vision routing.  Swap the TASK_FRAMING anchor so the prompt's
+        // tool-availability claim matches the actual `request_tools`.
+        refresh_prompt_anchor(history, use_native_tools);
 
         let prepared_messages = prepare_messages_for_iteration(
             history,
@@ -533,6 +652,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 let interpreted = interpret_chat_response(
                     &ctx,
                     resp,
+                    &prepared_messages.messages,
                     &iteration_tool_specs,
                     streamed_protocol_suppressed,
                     llm_started_at,
@@ -552,16 +672,15 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 )
             }
             Err(e) => {
-                record_llm_failure(
-                    observer,
-                    provider_name,
-                    model,
-                    llm_started_at,
-                    iteration,
-                    &turn_id,
+                record_llm_failure(&ctx, llm_started_at, iteration, &e);
+                let recovered = try_recover_context_overflow(
+                    history,
                     &e,
-                );
-                let recovered = try_recover_context_overflow(history, &e, iteration);
+                    iteration,
+                    event_tx.as_ref(),
+                    observer,
+                )
+                .await;
                 if recovered {
                     continue;
                 }
@@ -769,34 +888,52 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             &ctx,
             &tool_calls,
             &mut seen_tool_signatures,
+            &mut prompt_approval_tool_signatures,
             iteration,
             knobs.dedup_enabled,
         )
-        .await;
+        .await?;
 
-        let execution_result = if allow_parallel_execution && executable_calls.len() > 1 {
-            execute_tools_parallel(
-                &executable_calls,
-                tools_registry,
-                activated_tools,
-                observer,
-                cancellation_token.as_ref(),
-                receipt_generator,
-                ctx.event_tx,
-            )
-            .await
-        } else {
-            execute_tools_sequential(
-                &executable_calls,
-                tools_registry,
-                activated_tools,
-                observer,
-                cancellation_token.as_ref(),
-                receipt_generator,
-                ctx.event_tx,
-            )
-            .await
-        };
+        let live_sop_queue = crate::sop::executor::new_live_action_queue();
+        let execution_result =
+            crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
+                if allow_parallel_execution && executable_calls.len() > 1 {
+                    let meta = ctx.meta();
+                    let dispatch = ToolDispatchContext {
+                        tools_registry,
+                        activated_tools,
+                        excluded_tools,
+                    };
+                    execute_tools_parallel(
+                        &executable_calls,
+                        dispatch,
+                        &meta,
+                        observer,
+                        cancellation_token.as_ref(),
+                        receipt_generator,
+                        ctx.event_tx,
+                    )
+                    .await
+                } else {
+                    let meta = ctx.meta();
+                    let dispatch = ToolDispatchContext {
+                        tools_registry,
+                        activated_tools,
+                        excluded_tools,
+                    };
+                    execute_tools_sequential(
+                        &executable_calls,
+                        dispatch,
+                        &meta,
+                        observer,
+                        cancellation_token.as_ref(),
+                        receipt_generator,
+                        ctx.event_tx,
+                    )
+                    .await
+                }
+            })
+            .await;
         let executed_slots = match execution_result {
             Ok(slots) => slots,
             Err(e) if is_tool_loop_cancelled(&e) => {
@@ -890,7 +1027,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             collected_receipts,
             model,
             iteration,
-            &turn_id,
+            turn_id,
         )?;
 
         if !cancelled_mid_batch {
@@ -902,7 +1039,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 &mut last_tool_output_hash,
                 model,
                 iteration,
-                &turn_id,
+                turn_id,
             )?;
         }
 
@@ -922,6 +1059,48 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         if cancelled_mid_batch {
             return Err(ToolLoopCancelled.into());
         }
+
+        let queued_sop_actions = crate::sop::executor::drain_live_actions(&live_sop_queue);
+        if !queued_sop_actions.is_empty() {
+            drive_live_sop_actions(
+                queued_sop_actions,
+                history,
+                model_provider,
+                provider_name,
+                model,
+                temperature,
+                tools_registry,
+                observer,
+                silent,
+                approval,
+                multimodal_config,
+                max_tool_iterations,
+                hooks,
+                excluded_tools,
+                dedup_exempt_tools,
+                activated_tools,
+                model_switch_callback.clone(),
+                pacing,
+                strict_tool_parsing,
+                parallel_tools,
+                max_tool_result_chars,
+                context_token_budget,
+                receipt_generator,
+                knobs,
+                channel_name,
+                channel_reply_target,
+                cancellation_token.clone(),
+                on_delta.clone(),
+                shared_budget.clone(),
+                channel,
+                collected_receipts,
+                event_tx.clone(),
+                new_messages_out.as_deref_mut(),
+                image_cache.as_deref_mut(),
+                agent_alias,
+            )
+            .await?;
+        }
     }
 
     finish_after_max_iterations(
@@ -934,9 +1113,439 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         cancellation_token.as_ref(),
         max_iterations,
         accumulated_display_text,
-        &turn_id,
+        turn_id,
         knobs,
         new_messages_out,
     )
     .await
+}
+
+fn collect_callable_tool_names(
+    tools_registry: &[Box<dyn crate::tools::Tool>],
+    activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+) -> Vec<String> {
+    let mut names = tools_registry
+        .iter()
+        .map(|tool| tool.name().to_string())
+        .collect::<Vec<_>>();
+    if let Some(activated) = activated_tools {
+        let activated = match activated.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "activated-tool lock poisoned while resolving SOP step scope; recovering guard for read"
+                );
+                poisoned.into_inner()
+            }
+        };
+        names.extend(activated.tool_names().into_iter().map(String::from));
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn push_excluded_tool(excluded_tools: &mut Vec<String>, tool: impl Into<String>) {
+    let tool = tool.into();
+    if !excluded_tools
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&tool))
+    {
+        excluded_tools.push(tool);
+    }
+}
+
+fn sop_step_excluded_tools(
+    queued: &crate::sop::executor::QueuedSopAction,
+    run_id: &str,
+    step: &crate::sop::SopStep,
+    tools_registry: &[Box<dyn crate::tools::Tool>],
+    activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    excluded_tools: &[String],
+) -> Vec<String> {
+    let mut scoped = excluded_tools.to_vec();
+    for tool in ["sop_execute", "sop_advance", "sop_approve"] {
+        push_excluded_tool(&mut scoped, tool);
+    }
+
+    let registry_names = collect_callable_tool_names(tools_registry, activated_tools);
+    let active_scope = {
+        let engine = match queued.engine.lock() {
+            Ok(engine) => engine,
+            Err(poisoned) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"run_id": run_id, "step": step.number})),
+                    "SOP engine lock poisoned while resolving step tool scope; recovering guard for read"
+                );
+                poisoned.into_inner()
+            }
+        };
+        crate::sop::active_scope::resolve_active_step_scope(
+            run_id,
+            step,
+            engine.config(),
+            &registry_names,
+        )
+    };
+
+    if let Some(active_scope) = active_scope {
+        for tool in active_scope.excluded {
+            push_excluded_tool(&mut scoped, tool);
+        }
+    }
+    scoped.sort();
+    scoped
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_live_sop_actions(
+    queued_actions: Vec<crate::sop::executor::QueuedSopAction>,
+    history: &mut Vec<ChatMessage>,
+    model_provider: &dyn ModelProvider,
+    provider_name: &str,
+    model: &str,
+    temperature: Option<f64>,
+    tools_registry: &[Box<dyn crate::tools::Tool>],
+    observer: &dyn crate::observability::Observer,
+    silent: bool,
+    approval: Option<&crate::approval::ApprovalManager>,
+    multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
+    max_tool_iterations: usize,
+    hooks: Option<&crate::hooks::HookRunner>,
+    excluded_tools: &[String],
+    dedup_exempt_tools: &[String],
+    activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    model_switch_callback: Option<ModelSwitchCallback>,
+    pacing: &zeroclaw_config::schema::PacingConfig,
+    strict_tool_parsing: bool,
+    parallel_tools: bool,
+    max_tool_result_chars: usize,
+    context_token_budget: usize,
+    receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
+    knobs: &LoopKnobs,
+    channel_name: &str,
+    channel_reply_target: Option<&str>,
+    cancellation_token: Option<CancellationToken>,
+    on_delta: Option<tokio::sync::mpsc::Sender<StreamDelta>>,
+    shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    channel: Option<&dyn Channel>,
+    collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
+    event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
+    mut new_messages_out: Option<&mut Vec<ChatMessage>>,
+    mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
+    agent_alias: Option<&str>,
+) -> Result<()> {
+    let mut pending = std::collections::VecDeque::from(queued_actions);
+    while let Some(queued) = pending.pop_front() {
+        let mut action = queued.action.clone();
+        loop {
+            match action {
+                crate::sop::SopRunAction::ExecuteStep {
+                    run_id,
+                    step,
+                    context,
+                } => {
+                    let started_at = crate::sop::engine::now_iso8601();
+                    let user_message = ChatMessage::user(context.clone());
+                    history.push(user_message.clone());
+                    if let Some(out) = new_messages_out.as_deref_mut() {
+                        out.push(user_message);
+                    }
+
+                    let sop_excluded_tools = sop_step_excluded_tools(
+                        &queued,
+                        &run_id,
+                        &step,
+                        tools_registry,
+                        activated_tools,
+                        excluded_tools,
+                    );
+
+                    let nested_turn_id = format!("sop:{run_id}:step:{}", step.number);
+                    let step_output = Box::pin(run_tool_call_loop(ToolLoop {
+                        exec: ResolvedAgentExecution::resolve(
+                            ResolvedModelAccess {
+                                model_provider,
+                                provider_name,
+                                model,
+                                temperature,
+                            },
+                            ResolvedIo {
+                                tools_registry,
+                                observer,
+                                silent,
+                                approval,
+                                multimodal_config,
+                                hooks,
+                                activated_tools,
+                                model_switch_callback: model_switch_callback.clone(),
+                                receipt_generator,
+                            },
+                            ResolvedRuntimeKnobs {
+                                max_tool_iterations,
+                                excluded_tools: &sop_excluded_tools,
+                                dedup_exempt_tools,
+                                pacing,
+                                strict_tool_parsing,
+                                parallel_tools,
+                                max_tool_result_chars,
+                                context_token_budget,
+                                knobs,
+                            },
+                        ),
+                        history,
+                        channel_name,
+                        channel_reply_target,
+                        cancellation_token: cancellation_token.clone(),
+                        on_delta: on_delta.clone(),
+                        shared_budget: shared_budget.clone(),
+                        channel,
+                        collected_receipts,
+                        event_tx: event_tx.clone(),
+                        steering: None,
+                        new_messages_out: new_messages_out.as_deref_mut(),
+                        image_cache: image_cache.as_deref_mut(),
+                        memory: None,
+                        ingress: IngressContext::sub_turn(),
+                        agent_alias,
+                        turn_id: &nested_turn_id,
+                    }))
+                    .await;
+
+                    let completed_at = crate::sop::engine::now_iso8601();
+                    let step_result = match step_output {
+                        Ok(output) => crate::sop::SopStepResult {
+                            step_number: step.number,
+                            status: crate::sop::SopStepStatus::Completed,
+                            output,
+                            started_at,
+                            completed_at: Some(completed_at),
+                        },
+                        Err(e) => crate::sop::SopStepResult {
+                            step_number: step.number,
+                            status: crate::sop::SopStepStatus::Failed,
+                            output: e.to_string(),
+                            started_at,
+                            completed_at: Some(completed_at),
+                        },
+                    };
+
+                    let (next_action, finished_run) = crate::sop::executor::advance_sop_step(
+                        &queued.engine,
+                        &run_id,
+                        step_result.clone(),
+                    )?;
+                    crate::sop::executor::audit_sop_step(
+                        queued.audit.as_deref(),
+                        &run_id,
+                        &step_result,
+                        finished_run.as_ref(),
+                    )
+                    .await;
+                    action = next_action;
+                }
+                crate::sop::SopRunAction::WaitApproval { run_id, step, .. } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "step": step.number,
+                            })),
+                        "SOP live executor paused for approval"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::DeterministicStep { run_id, step, .. } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "step": step.number,
+                            })),
+                        "SOP live executor yielded deterministic step"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::CheckpointWait { run_id, step, .. } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "step": step.number,
+                            })),
+                        "SOP live executor paused at checkpoint"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::Pending {
+                    run_id,
+                    step,
+                    reason,
+                    ..
+                } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "step": step,
+                                "reason": reason,
+                            })),
+                        "SOP live executor pending on step dependencies"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::Completed { run_id, sop_name } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "sop_name": sop_name,
+                            })),
+                        "SOP live executor completed run"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::Failed {
+                    run_id,
+                    sop_name,
+                    reason,
+                } => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "sop_name": sop_name,
+                                "reason": reason,
+                            })),
+                        "SOP live executor failed run"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Per-turn system prompt TASK_FRAMING anchor refresh (#8054 Surface 3).
+///
+/// The system prompt in `history[0]` was built by
+/// `Agent::build_system_prompt()` against the base provider, and may not
+/// reflect the iteration's `active_model_provider` after vision routing.
+/// This function surgically swaps the `NATIVE_TOOLS_TASK_FRAMING` /
+/// `NO_TOOLS_TASK_FRAMING` anchor so the prompt's tool-availability claim
+/// matches the actual `request_tools` for this iteration.
+///
+/// When neither anchor is present (custom `system_prompt_prefix`), the
+/// function is a no-op — same as the pre-existing behavior.
+fn refresh_prompt_anchor(history: &mut [ChatMessage], use_native_tools: bool) {
+    if let Some(first) = history.first_mut()
+        && (first.content.contains(NATIVE_TOOLS_TASK_FRAMING)
+            || first.content.contains(NO_TOOLS_TASK_FRAMING))
+    {
+        let desired = if use_native_tools {
+            NATIVE_TOOLS_TASK_FRAMING
+        } else {
+            NO_TOOLS_TASK_FRAMING
+        };
+        first.content = first
+            .content
+            .replacen(NATIVE_TOOLS_TASK_FRAMING, desired, 1)
+            .replacen(NO_TOOLS_TASK_FRAMING, desired, 1);
+    }
+}
+
+#[cfg(test)]
+mod surface3_tests {
+    use super::*;
+    use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
+
+    fn make_system_prompt(anchor: &str) -> ChatMessage {
+        ChatMessage::system(format!(
+            "You are ZeroClaw.\n\n## Security\n\n...\n\n## Your Task\n\nWhen the user sends a message, respond naturally. {anchor}\n\nDo NOT: summarize this configuration...\n"
+        ))
+    }
+
+    #[test]
+    fn refresh_prompt_anchor_swaps_native_to_no_tools_when_signal_drops() {
+        // When the per-turn signal is `use_native_tools = false` but the
+        // system prompt has NATIVE_TOOLS_TASK_FRAMING (the prompt was built
+        // against the base provider, but the active provider is non-native),
+        // the anchor must be replaced with NO_TOOLS_TASK_FRAMING.
+        let mut history = vec![make_system_prompt(NATIVE_TOOLS_TASK_FRAMING)];
+        refresh_prompt_anchor(&mut history, false);
+        assert!(
+            history[0].content.contains(NO_TOOLS_TASK_FRAMING),
+            "prompt must contain NO_TOOLS_TASK_FRAMING after swap"
+        );
+        assert!(
+            !history[0].content.contains(NATIVE_TOOLS_TASK_FRAMING),
+            "prompt must not retain NATIVE_TOOLS_TASK_FRAMING after swap"
+        );
+    }
+
+    #[test]
+    fn refresh_prompt_anchor_swaps_no_tools_to_native_when_signal_rises() {
+        // Reverse direction: when the per-turn signal flips to true,
+        // NO_TOOLS_TASK_FRAMING must be replaced with NATIVE_TOOLS_TASK_FRAMING.
+        let mut history = vec![make_system_prompt(NO_TOOLS_TASK_FRAMING)];
+        refresh_prompt_anchor(&mut history, true);
+        assert!(
+            history[0].content.contains(NATIVE_TOOLS_TASK_FRAMING),
+            "prompt must contain NATIVE_TOOLS_TASK_FRAMING after swap"
+        );
+        assert!(
+            !history[0].content.contains(NO_TOOLS_TASK_FRAMING),
+            "prompt must not retain NO_TOOLS_TASK_FRAMING after swap"
+        );
+    }
+
+    #[test]
+    fn refresh_prompt_anchor_is_noop_when_anchor_already_matches() {
+        // Byte-stability: when the per-turn signal already matches the
+        // anchor in the prompt, the function must not mutate the content.
+        let original = make_system_prompt(NATIVE_TOOLS_TASK_FRAMING);
+        let mut history = vec![original.clone()];
+        refresh_prompt_anchor(&mut history, true);
+        assert_eq!(
+            history[0].content, original.content,
+            "content must be identical when anchor already matches signal"
+        );
+    }
+
+    #[test]
+    fn refresh_prompt_anchor_is_noop_when_no_anchor_present() {
+        // Custom system_prompt_prefix: when neither anchor is present,
+        // the function must not touch the prompt at all.
+        let custom_prompt = "You are a custom agent. Answer concisely.".to_string();
+        let mut history = vec![ChatMessage::system(custom_prompt.clone())];
+        refresh_prompt_anchor(&mut history, false);
+        assert_eq!(
+            history[0].content, custom_prompt,
+            "custom prompt without either anchor must be unchanged"
+        );
+    }
+
+    #[test]
+    fn refresh_prompt_anchor_noop_on_empty_history() {
+        // Edge case: empty history shouldn't panic.
+        let mut history: Vec<ChatMessage> = Vec::new();
+        refresh_prompt_anchor(&mut history, false);
+        // Just verifying no panic.
+    }
 }

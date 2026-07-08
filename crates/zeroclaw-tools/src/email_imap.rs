@@ -142,3 +142,49 @@ pub async fn imap_connect(
             .map_err(|(e, _)| anyhow::Error::msg(format!("IMAP login failed: {}", e)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_tls_close_notify_matches_unexpected_eof() {
+        // Exchange-style truncation lands here. The ErrorKind is the stable
+        // signal; message text is irrelevant for this branch.
+        let e = io::Error::new(io::ErrorKind::UnexpectedEof, "anything");
+        assert!(is_tls_close_notify(&e));
+    }
+
+    #[test]
+    fn is_tls_close_notify_matches_string_marker() {
+        // Some rustls variants only surface close_notify via the Display
+        // string. The substring match is the fallback for that case.
+        let e = io::Error::other("peer closed without sending close_notify alert");
+        assert!(is_tls_close_notify(&e));
+    }
+
+    #[test]
+    fn is_tls_close_notify_rejects_unrelated_errors() {
+        // ConnectionReset / InvalidData must NOT be swallowed: those are
+        // real failures the caller needs to see.
+        let reset = io::Error::new(io::ErrorKind::ConnectionReset, "reset by peer");
+        assert!(!is_tls_close_notify(&reset));
+
+        let tls = io::Error::new(io::ErrorKind::InvalidData, "bad certificate");
+        assert!(!is_tls_close_notify(&tls));
+
+        // Other kind with a benign message must not match either — only the
+        // exact substring `close_notify` triggers the string fallback.
+        let benign = io::Error::other("operation successful");
+        assert!(!is_tls_close_notify(&benign));
+    }
+
+    #[test]
+    fn is_tls_close_notify_string_match_is_case_sensitive() {
+        // The implementation does a literal `contains("close_notify")`. This
+        // test pins that contract so a future case-insensitive refactor is a
+        // conscious decision, not an accident.
+        let upper = io::Error::other("Close_Notify received");
+        assert!(!is_tls_close_notify(&upper));
+    }
+}

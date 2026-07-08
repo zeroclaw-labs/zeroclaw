@@ -108,8 +108,8 @@ cli-cron-remove-about = 移除计划任务
 cli-cron-update-about = 更新现有计划任务的一个或多个字段
 cli-cron-pause-about = 暂停计划任务
 cli-cron-resume-about = 恢复已暂停的任务
-cli-auth-login-about = 使用 OAuth 登录（OpenAI Codex 或 Gemini）
-cli-auth-refresh-about = 使用刷新令牌刷新 OpenAI Codex 访问令牌
+cli-auth-login-about = 使用 OAuth 登录（OpenAI Codex、Gemini 或 xAI）
+cli-auth-refresh-about = 使用刷新令牌刷新 OAuth 访问令牌
 cli-auth-logout-about = 移除认证配置文件
 cli-auth-use-about = 为提供商设置活动配置文件
 cli-auth-list-about = 列出认证配置文件
@@ -127,6 +127,7 @@ cli-models-set-about = 在配置中设置默认模型
 cli-models-status-about = 显示当前模型配置和缓存状态
 cli-doctor-models-about = 探测各提供商的模型目录并报告可用性
 cli-doctor-traces-about = 查询运行时跟踪事件（工具诊断和模型回复）
+cli-doctor-update-context-windows-about = 从提供商的 /models 端点更新 config.toml 中的 context_window
 cli-hardware-discover-about = 枚举 USB 设备并显示已知开发板
 cli-hardware-introspect-about = 通过序列号或设备路径检视设备
 cli-hardware-info-about = 通过 ST-Link 使用 probe-rs 经 USB 获取芯片信息
@@ -286,6 +287,13 @@ cli-skills-install-suggestion =
 
     匹配的能力：{$matched}
     下一步：运行 `{$install_command}` 进行安装。
+
+cli-plugin-install-suggestion =
+    看起来此请求需要 `{$name}` 插件，但它尚未安装。
+
+    匹配的能力：{$matched}
+    下一步：运行 `{$install_command}` 进行安装。
+
 cli-completions-long-about =
     为 `zeroclaw` 生成 shell 补全脚本。
 
@@ -347,6 +355,8 @@ channel-wecom-ws-dm-access-denied =
 channel-discord-interaction-unauthorized = 你没有权限在此处使用该命令。
 channel-discord-interaction-malformed = 未知或格式错误的命令。
 channel-discord-interaction-unavailable = 该命令已不可用，或其输入为空。
+channel-discord-component-expired = 此按钮或菜单已过期或已被使用。
+channel-discord-approval-recorded = 您的决定已记录。
 channel-discord-delivery-failure-note-one = （注意：我无法传送 {$count} 个文件。）
 channel-discord-delivery-failure-note-many = （注意：我无法传送 {$count} 个文件。）
 channel-whatsapp-web-delivery-failure-note-one = （注意：我无法传送 {$count} 个 WhatsApp 媒体附件。）
@@ -383,6 +393,9 @@ cli-skills-create-hint = {"  "}创建一个: mkdir -p ~/.zeroclaw/workspace/skil
 cli-skills-install-hint = {"  "}或安装: zeroclaw skills install <source>
 cli-skills-installed-header = 已安装的技能 ({$count}):
 cli-skills-tags = 标签:  {$tags}
+cli-skills-skipped-header = 已跳过 ({$count}):
+cli-skills-skipped-reason = {"    "}原因: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}在 zeroclaw 配置中设置 `skills.allow_scripts = true` 以启用它。
 cli-sop-none = 未找到 SOP。
 cli-sop-create-hint = {"  "}创建一个: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}然后添加 SOP.toml 和 SOP.md
@@ -549,6 +562,9 @@ cli-agent-not-created = 未创建您的 agent — 磁盘上没有任何更改。
 cli-onboard-deprecated = `zeroclaw onboard` 已弃用 — 请使用 `zeroclaw quickstart`。
 cli-otp-initialized = 已为 ZeroClaw 初始化 OTP 密钥。
 cli-otp-enrollment-uri = 注册 URI：{$uri}
+cli-otp-received = {"  "}✓ OTP 已接收
+cli-secret-captured = {"  "}● 已接收输入 — 按 Enter 保存
+cli-secret-received = {"  "}✓ 密钥已接收
 cli-pairing-enabled = 🔐 已启用 gateway 配对。
 cli-pairing-use-code = {"  "}使用此一次性代码配对新设备：
 cli-pairing-post = {"    "}POST /pair，附带请求头 X-Pairing-Code: {$code}
@@ -619,7 +635,6 @@ cli-status-otp = {"  "}已启用 OTP：       {$v}
 cli-status-estop = {"  "}已启用急停：    {$v}
 cli-status-peripherals-enabled = {"  "}已启用：   {$v}
 cli-status-boards = {"  "}Boards:    {$v}
-cli-status-channel-not-compiled = 🚫 已配置，未编译
 cli-status-word-enabled = 已启用
 cli-status-word-disabled = 已禁用
 cli-status-word-yes = 是
@@ -629,6 +644,7 @@ cli-status-word-off = 关闭
 cli-status-word-none = （无）
 cli-status-word-configured = 已配置
 cli-status-word-not-configured = 未配置
+cli-status-channel-not-compiled = 🚫 已配置，未编译
 cli-desktop-not-installed = 未安装 ZeroClaw 配套应用。
 cli-desktop-blurb1 = 该配套应用是一个轻量级菜单栏应用，
 cli-desktop-blurb2 = 它连接到与 CLI 相同的网关。
@@ -637,7 +653,13 @@ cli-config-schema-current = 配置已为当前架构版本。
 cli-config-applied-ops = 已应用 {$count} 个操作：
 cli-plugins-none = 未安装任何插件。
 cli-plugins-installed = 已安装的插件：
+cli-plugin-search-none = 没有匹配 '{$query}' 的插件。
+cli-plugin-search-results = 匹配 '{$query}' 的插件（{$count}）：
+cli-plugin-search-result =   {$name} v{$version} — {$description}
+cli-plugin-no-description = （无描述）
+cli-plugin-install-resolving = 正在从插件注册表解析 '{$source}'...
 cli-plugin-installed-from = 已从 {$source} 安装插件
+cli-plugin-installed-name-version = 已安装插件 {$name} v{$version}
 cli-plugin-removed = 已移除插件“{$name}”。
 cli-plugin-not-found = 未找到插件“{$name}”。
 cli-plugin-legacy-detected = 注意：位于旧位置（{$path}）的插件未被代理加载。请运行 `zeroclaw plugin migrate` 将其移动到 {$target}。
@@ -675,6 +697,16 @@ cli-auth-active-for = {$provider} 的活动配置文件：{$profile}
 cli-auth-refresh-ok = ✓ 令牌刷新成功（配置文件 {$profile}）
 cli-auth-removed = 已移除身份验证配置文件 {$provider}:{$profile}
 cli-auth-not-found = 未找到身份验证配置文件：{$provider}:{$profile}
+cli-auth-xai-imported = 已从 {$path} 导入 xAI 身份验证配置文件
+cli-auth-xai-device-code-started = xAI 设备码登录已开始。
+cli-auth-oauth-visit = 访问：{$uri}
+cli-auth-oauth-code = 代码：  {$code}
+cli-auth-oauth-fast-link = 快速链接：{$uri}
+cli-auth-xai-open-oauth-url = 在浏览器中打开此 xAI OAuth URL 并授权访问：
+cli-auth-callback-capture-failed = 回调捕获失败：{$error}
+cli-auth-run-paste-redirect = 运行 `zeroclaw auth paste-redirect --model-provider {$provider} --profile {$profile}`
+cli-auth-xai-no-pending-login = 未找到待处理的 xAI 登录。请先运行 `zeroclaw auth login --model-provider xai`。
+cli-auth-paste-redirect-requires-input = paste-redirect 需要重定向 URL 或 OAuth 代码
 cli-locales-fetched = {"  "}已获取 {$name} -> {$path}
 cli-locales-skipped = {"  "}已跳过 {$name}：不在上游（{$path}；已尝试 {$refs}）
 cli-locales-installed = 已为“{$locale}”在 {$dir} 下安装 {$count} 个目录
@@ -687,7 +719,10 @@ cli-hardware-unsupported-platform = 此平台不支持硬件 USB 发现。
 cli-hardware-supported-platforms = 支持的平台：Linux、macOS、Windows。
 cli-update-already-current = 已是最新版本（v{$version}）。
 cli-update-success = 已成功更新至 v{$version}！
-cli-update-prebuilt-channel-note = 预构建更新使用精简默认通道包。如需 Slack、Discord 和其他非默认通道，请从源码构建：`./install.sh --source --preset full`、`--features channels-full`，或指定对应的 `channel-*` 功能。
+cli-update-prebuilt-channel-note = 预构建更新使用精简默认通道包。如需 Slack 和其他非默认通道，请从源码构建：`./install.sh --source --preset full`、`--features channels-full`，或指定对应的 `channel-*` 功能。
+cli-update-available = 有可用更新：v{$current} -> v{$latest}
+cli-update-forcing-reinstall = 强制重新安装：v{$current} -> v{$latest}
+cli-update-not-writable = 安装目录 {$dir} 不可写（{$error}）；请使用更高权限重新运行 `zeroclaw update`（在 macOS/Linux 上使用 sudo，在 Windows 上使用管理员控制台）
 cli-selftest-all-passed = 全部 {$total} 项检查通过。
 cli-selftest-some-failed = {$failed}/{$total} 项检查失败。
 cli-selftest-channel-config-uncompiled = {$compiled} 个通道类型已编译，{$configured} 个已编译且已配置；已配置但未编译：{$names}。请从源码构建：`./install.sh --source --preset full`、`--features channels-full`，或指定对应的 `channel-*` 功能。
@@ -700,11 +735,24 @@ cli-channels-build-hint = {"  "}请从源码构建：`./install.sh --source --pr
 cli-channels-start-hint = 启动渠道：zeroclaw channel start
 cli-channels-doctor-hint = 检查健康状况：    zeroclaw channel doctor
 cli-channels-configure-hint = 配置方法：      zeroclaw config set channels.<name>.<field>=<value>
+
+cli-models-set-ok = 默认模型已设置为 "{ $model }" (provider: { $provider })。
+cli-models-status-current = 默认模型: { $model } (provider: { $provider })
+cli-models-status-none = 未配置默认模型。
 turn-interrupted-by-user = [被用户中断]
 turn-cancelled-client-rpc = [已通过客户端取消回合]
 turn-stream-interrupted = [流已中断]
+history-trim-breadcrumb = [earlier turns omitted to fit the context window]
+history-trim-reason-budget = context token budget exceeded
+turn-ingress-dropped = 此请求未被处理：{ $reason }
 turn-tool-interrupted-before-result = [在此工具产生结果前被用户中断]
 channel-runtime-malformed-tool-output = 我生成了内部工具调用格式错误，无法完成此请求。请重试。
+channel-runtime-new-session = 对话历史已清除。重新开始。
+channel-runtime-stop-sent = 已发送停止信号。
+channel-runtime-stop-no-task = 此发送者范围内没有正在执行的任务。
+channel-runtime-model-empty = 模型 ID 不能为空。请使用 `/model <model-id>`。
+channel-runtime-model-switched = 已切换到模型 `{ $model }`（model_provider：`{ $provider }`）。上下文已保留。
+channel-runtime-request-timeout = ⚠️ 等待模型响应超时，请重试。
 cli-alias-list-empty = （{$section} 下无条目）
 cli-alias-created = 已创建 {$section}.{$alias}
 cli-alias-exists = {$section}.{$alias} 已存在（未更改）
@@ -724,6 +772,7 @@ cli-alias-delete-refused-hint = 删除被拒绝——请先解决硬引用问题
 cli-alias-not-configured = {$path} 未配置
 cli-alias-delete-failed = 删除失败：{$error}
 cli-alias-delete-reserved-default = `default` agent 为保留项，无法删除
+cli-alias-create-reserved-default = `default` agent 为保留项，无法创建
 cli-alias-renamed = 已重命名 {$section}.{$from} → {$section}.{$to}（重写了 {$count} 个引用路径）
 cli-alias-rename-invalid = 新别名无效：{$message}
 cli-alias-rename-reserved = 别名 `{$alias}` 为保留项，无法重命名
@@ -744,3 +793,17 @@ cli-bundle-warn-archive = 警告：bundle 目录归档失败：{$error}
 cli-bundle-deleted = 已删除 skill_bundles.{$alias}（已从 {$count} 个 agent 中移除）
 cli-bundle-warn-move = 警告：bundle 目录移动失败：{$error}
 cli-bundle-renamed = 已重命名 skill_bundles.{$from} → skill_bundles.{$to}
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
+cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
+cli-agent-context-bar-unknown = ctx: 未知 / {$max}
+cli-doctor-ctxwin-already-set = {$provider_ref}: 已有 context_window = {$ctx}
+cli-doctor-ctxwin-no-model = {$provider_ref}: 未配置模型，跳过
+cli-doctor-ctxwin-would-set = {$provider_ref}: 将设置 context_window = {$ctx} (试运行)
+cli-doctor-ctxwin-set = {$provider_ref}: 已设置 context_window = {$ctx}
+cli-doctor-ctxwin-not-found = {$provider_ref}: 找不到要更新的条目
+cli-doctor-ctxwin-fetch-failed = {$provider_ref}: 提供商未暴露上下文窗口或获取失败
+cli-doctor-ctxwin-saved = 已保存 {$updated} 项更新到 config.toml
+cli-doctor-ctxwin-dry-run = 试运行完成 — 未写入更改。去掉 --dry-run 以应用。
+cli-doctor-ctxwin-none = 无需更新。
+cli-doctor-ctxwin-write-failed = {$provider_ref}: 写入 context_window 失败: {$error}

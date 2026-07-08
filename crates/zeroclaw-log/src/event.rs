@@ -167,6 +167,7 @@ pub const ATTRIBUTION_FIELDS: &[&str] = &[
     "model",
     "embedding_provider",
     "owner_tui_id",
+    "system_alias",
 ];
 
 /// Composite alias-bound prefixes. Each prefix gets three on-disk keys:
@@ -305,8 +306,10 @@ pub struct LogEvent {
     pub service: ServiceDescriptor,
 
     /// Per-turn trace identifier so multiple events from one agent
-    /// turn group together in the UI. Hex string; populated by the
-    /// agent loop at run() entry.
+    /// turn group together in the UI. Populated by the `LogCaptureLayer`,
+    /// which promotes it from `attributes.trace_id`, set at the call site
+    /// via `record!(.. with_attrs(json!({"trace_id": ..})))` or inherited
+    /// from a `scope!(trace_id: ..)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
 
