@@ -8601,7 +8601,6 @@ fn collect_configured_channels(
         );
     }
 
-
     #[cfg(feature = "channel-mochat")]
     for (alias, mc) in &config.channels.mochat {
         if !active_channel_aliases.contains(&format!("mochat.{alias}")) {
