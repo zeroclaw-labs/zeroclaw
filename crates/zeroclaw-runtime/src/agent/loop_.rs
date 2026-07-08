@@ -274,6 +274,13 @@ pub fn clear_model_switch_request() {
     }
 }
 
+/// Process-wide serialization lock for tests that read or write the global
+/// `MODEL_SWITCH_REQUEST`. Because the request is a process-wide singleton,
+/// tests across modules (the `model_switch` tool and `Agent::turn_streamed`)
+/// must hold this lock so they don't race each other on it.
+#[cfg(test)]
+pub(crate) static MODEL_SWITCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn glob_match(pattern: &str, name: &str) -> bool {
     match pattern.find('*') {
         None => pattern == name,
