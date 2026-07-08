@@ -422,26 +422,10 @@ mod tests {
             ),
         ];
 
-        let sources = [
-            ("en", include_str!("../locales/en/cli.ftl")),
-            ("es", include_str!("../locales/es/cli.ftl")),
-            ("fr", include_str!("../locales/fr/cli.ftl")),
-            ("ja", include_str!("../locales/ja/cli.ftl")),
-            ("zh-CN", include_str!("../locales/zh-CN/cli.ftl")),
-        ]
-        .into_iter()
-        .collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(sources.len(), available_locales().len());
-
         for locale in available_locales() {
-            let source = sources.get(locale.code.as_str()).unwrap_or_else(|| {
-                panic!(
-                    "{} in locales.toml has no cli.ftl source wired into this test",
-                    locale.code
-                )
-            });
+            let sources = load_cli_ftl_sources(locale.code.as_str());
             for (key, args, expected_parts) in keys {
-                let value = format_ftl_message(source, locale.code.as_str(), key, args)
+                let value = format_cli_string_with_args(&sources, key, args)
                     .unwrap_or_else(|| panic!("{key} should format in {}", locale.code));
                 for expected_part in expected_parts {
                     assert!(
@@ -645,26 +629,25 @@ mod tests {
             ),
         ];
 
-        for (source, locale) in [
-            (include_str!("../locales/en/cli.ftl"), "en"),
-            (include_str!("../locales/es/cli.ftl"), "es"),
-            (include_str!("../locales/fr/cli.ftl"), "fr"),
-            (include_str!("../locales/ja/cli.ftl"), "ja"),
-            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
-        ] {
+        for locale in available_locales() {
+            let sources = load_cli_ftl_sources(locale.code.as_str());
             for (key, args, expected_parts) in cases {
-                let value = format_ftl_message(source, locale, key, args)
-                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                let value = format_cli_string_with_args(&sources, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {}", locale.code));
                 for expected in expected_parts {
                     assert!(
                         value.contains(expected),
-                        "{key} in {locale} should preserve {expected:?}"
+                        "{} in {} should preserve {expected:?}",
+                        key,
+                        locale.code
                     );
                 }
                 if key == "cli-update-prebuilt-channel-note" {
                     assert!(
                         !value.contains("Discord"),
-                        "{key} in {locale} should not mention Discord because it is in default-channels"
+                        "{} in {} should not mention Discord because it is in default-channels",
+                        key,
+                        locale.code
                     );
                 }
             }
