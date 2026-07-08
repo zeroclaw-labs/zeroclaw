@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_config::schema::{Config, StreamMode};
+use zeroclaw_config::schema::{Config, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL};
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
 /// Telegram's maximum message length for text messages
@@ -363,6 +363,39 @@ fn is_image_extension(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Map a TTS audio output format to the Telegram send method, multipart field
+/// name, upload filename, and MIME type.
+///
+/// Telegram `sendVoice` only renders OGG/Opus as a true voice note, so only
+/// `opus`/`ogg` takes that path. Every other format (WAV from Groq Orpheus or
+/// Piper, MP3 from ElevenLabs/Google/Edge, …) is uploaded via `sendAudio` with
+/// its real MIME type so it stays playable instead of being mislabeled.
+fn telegram_audio_send_spec(
+    format: &str,
+) -> anyhow::Result<(&'static str, &'static str, &'static str, &'static str)> {
+    Ok(match format.trim().to_ascii_lowercase().as_str() {
+        "opus" | "ogg" => ("sendVoice", "voice", "voice.ogg", "audio/ogg"),
+        "mp3" | "mpeg" => ("sendAudio", "audio", "voice.mp3", "audio/mpeg"),
+        "wav" => ("sendAudio", "audio", "voice.wav", "audio/wav"),
+        "aac" => ("sendAudio", "audio", "voice.aac", "audio/aac"),
+        "flac" => ("sendAudio", "audio", "voice.flac", "audio/flac"),
+        // Raw PCM is not a container format; reject so the caller reconfigures
+        // the TTS provider to emit a supported container format.
+        "pcm" => {
+            return Err(anyhow::Error::msg(
+                "Telegram does not accept raw PCM audio; \
+                 configure the TTS provider to output opus, mp3, wav, aac, or flac",
+            ));
+        }
+        _ => (
+            "sendAudio",
+            "audio",
+            "voice.bin",
+            "application/octet-stream",
+        ),
+    })
+}
+
 /// Build the user-facing content string for an incoming attachment.
 ///
 /// Photos with a recognized image extension use `[IMAGE:/path]` so the
@@ -536,6 +569,7 @@ pub struct TelegramChannel {
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     mention_only: bool,
     bot_username: Mutex<Option<String>>,
+    bot_id: Mutex<Option<i64>>,
     /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
     /// Override for local Bot API servers or testing.
     api_base: String,
@@ -546,10 +580,9 @@ pub struct TelegramChannel {
     ack_reactions: bool,
     tts_manager: Option<Arc<super::tts::TtsManager>>,
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-    /// Peers that always receive voice replies, sourced from peer-group
-    /// `output_modality = "voice"` config. Populated once at startup by
-    /// `with_voice_peer_prefs`; never mutated by session events.
-    static_voice_peers: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Resolves voice peers from canonical config at call-time.
+    /// See AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH" — no cache.
+    voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     pending_voice:
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Per-channel proxy URL override.
@@ -577,6 +610,10 @@ enum EditMessageResult {
     Success,
     NotModified,
     Failed(reqwest::StatusCode),
+}
+
+fn normalize_telegram_api_base(api_base: &str) -> String {
+    api_base.trim_end_matches('/').to_string()
 }
 
 impl TelegramChannel {
@@ -611,7 +648,8 @@ impl TelegramChannel {
             typing_handle: Mutex::new(None),
             mention_only,
             bot_username: Mutex::new(None),
-            api_base: "https://api.telegram.org".to_string(),
+            bot_id: Mutex::new(None),
+            api_base: TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
             transcription: None,
             transcription_manager: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
@@ -619,13 +657,22 @@ impl TelegramChannel {
             ack_reactions: true,
             tts_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            static_voice_peers: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            voice_peer_resolver: Arc::new(Vec::new) as Arc<dyn Fn() -> Vec<String> + Send + Sync>,
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             proxy_url: None,
             tool_command_specs: Vec::new(),
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
         }
+    }
+
+    /// Set the resolver used to resolve voice-chat peers live (no cached state).
+    pub fn with_voice_peer_resolver(
+        mut self,
+        voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
+        self.voice_peer_resolver = voice_peer_resolver;
+        self
     }
 
     /// Override the approval prompt timeout (default 120s).
@@ -638,6 +685,13 @@ impl TelegramChannel {
     pub fn with_ack_reactions(mut self, enabled: bool) -> Self {
         self.ack_reactions = enabled;
         self
+    }
+
+    /// Returns `true` if `recipient` is in a peer group configured with
+    /// `output_modality = "voice"` for this channel. Resolved live from config
+    /// via `voice_peer_resolver` so it stays correct across hot-reloads.
+    pub(crate) fn is_voice_peer(&self, recipient: &str) -> bool {
+        (self.voice_peer_resolver)().iter().any(|p| p == recipient)
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
@@ -676,7 +730,7 @@ impl TelegramChannel {
     /// Override the Telegram Bot API base URL.
     /// Useful for local Bot API servers or testing.
     pub fn with_api_base(mut self, api_base: String) -> Self {
-        self.api_base = api_base;
+        self.api_base = normalize_telegram_api_base(&api_base);
         self
     }
 
@@ -723,6 +777,65 @@ impl TelegramChannel {
         self
     }
 
+    /// Load typed `[providers.transcription.<family>.<alias>]` entries into the
+    /// channel-internal `TranscriptionManager` and bind `agent_alias` as the
+    /// resolved provider. Must be called after `with_transcription`.
+    ///
+    /// If no legacy manager exists yet (e.g. `[transcription]` is absent or
+    /// disabled), an empty manager shell is created first so typed-only configs
+    /// still work. The full dotted alias (e.g. `"groq.default"`) is stored
+    /// without stripping so it resolves against the typed provider keys.
+    pub fn with_typed_transcription_providers(
+        mut self,
+        typed: &zeroclaw_config::providers::TranscriptionProviders,
+        agent_alias: &str,
+    ) -> Self {
+        if agent_alias.is_empty() || typed.is_empty() {
+            return self;
+        }
+        let base = match self.transcription_manager.take() {
+            Some(arc) => match std::sync::Arc::try_unwrap(arc) {
+                Ok(m) => m,
+                Err(arc) => {
+                    self.transcription_manager = Some(arc);
+                    return self;
+                }
+            },
+            None => super::transcription::TranscriptionManager::empty(),
+        };
+        let updated = base
+            .with_typed_providers(typed)
+            .with_agent_transcription_provider(agent_alias.to_string());
+        self.transcription_manager = Some(std::sync::Arc::new(updated));
+        self
+    }
+
+    /// Set the agent transcription provider alias on the internal TranscriptionManager.
+    /// Must be called after `with_transcription`. No-op if transcription was not configured.
+    /// The alias should be the provider type key ("groq", "openai", etc.) registered in
+    /// the TranscriptionManager, or the full "type.alias" form (the type prefix is extracted).
+    pub fn with_agent_transcription_provider(mut self, alias: impl Into<String>) -> Self {
+        let alias = alias.into();
+        if alias.is_empty() {
+            return self;
+        }
+        // Resolve "groq.default" → "groq" (TranscriptionManager keys by type, not full alias)
+        let key = alias.split('.').next().unwrap_or(&alias).to_string();
+        if let Some(manager) = self.transcription_manager.take() {
+            match std::sync::Arc::try_unwrap(manager) {
+                Ok(m) => {
+                    self.transcription_manager = Some(std::sync::Arc::new(
+                        m.with_agent_transcription_provider(key),
+                    ));
+                }
+                Err(arc) => {
+                    self.transcription_manager = Some(arc);
+                }
+            }
+        }
+        self
+    }
+
     /// Configure text-to-speech for outgoing voice replies.
     ///
     /// Builds a [`super::tts::TtsManager`] from the
@@ -742,7 +855,7 @@ impl TelegramChannel {
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                     "TTS disabled"
                 ),
             }
@@ -804,37 +917,6 @@ impl TelegramChannel {
 
     fn normalize_identity(value: &str) -> String {
         value.trim().trim_start_matches('@').to_string()
-    }
-
-    /// Pre-seed static voice preferences from peer-group config.
-    ///
-    /// Iterates `[peer_groups.*]` entries that reference this channel and
-    /// carry `output_modality = "voice"`, then records every `external_peers`
-    /// entry in `static_voice_peers`. These peers always receive TTS replies —
-    /// including cron/proactive messages with no inbound voice note to mirror.
-    ///
-    /// Unlike the session `voice_chats` set, `static_voice_peers` is never
-    /// cleared by voice-send or text-message events.
-    pub fn with_voice_peer_prefs(
-        self,
-        config: &zeroclaw_config::schema::Config,
-        channel_type: &str,
-        alias: impl AsRef<str>,
-    ) -> Self {
-        use zeroclaw_config::multi_agent::OutputModality;
-        let alias = alias.as_ref();
-        let dotted = format!("{channel_type}.{alias}");
-        if let Ok(mut sp) = self.static_voice_peers.lock() {
-            for group in config.peer_groups.values() {
-                let matches = group.channel == channel_type || group.channel == dotted;
-                if matches && group.output_modality == OutputModality::Voice {
-                    for peer in &group.external_peers {
-                        sp.insert(peer.to_string());
-                    }
-                }
-            }
-        }
-        self
     }
 
     /// write a paired user into `peer_groups` and save. The long-running
@@ -925,6 +1007,7 @@ impl TelegramChannel {
     async fn register_bot_commands(&self) {
         let mut commands: Vec<serde_json::Value> = vec![
             serde_json::json!({ "command": "new",    "description": "Start a new conversation session" }),
+            serde_json::json!({ "command": "clear",  "description": "Clear this conversation session" }),
             serde_json::json!({ "command": "stop",   "description": "Cancel the current in-flight task" }),
             serde_json::json!({ "command": "model",  "description": "Show or switch the current model" }),
             serde_json::json!({ "command": "models", "description": "List available model_providers or switch model_provider" }),
@@ -1030,7 +1113,7 @@ impl TelegramChannel {
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                     "Failed to register Telegram bot commands"
                 );
             }
@@ -1047,21 +1130,17 @@ impl TelegramChannel {
     /// Returns true if this recipient should receive a TTS voice reply —
     /// either because they triggered a voice-note session (`voice_chats`) or
     /// because their peer group has `output_modality = "voice"` in config
-    /// (`static_voice_peers`).
+    /// (resolved live via `voice_peer_resolver`).
     fn is_voice_chat(&self, recipient: &str) -> bool {
         self.voice_chats
             .lock()
             .map(|vs| vs.contains(recipient))
             .unwrap_or(false)
-            || self
-                .static_voice_peers
-                .lock()
-                .map(|sp| sp.contains(recipient))
-                .unwrap_or(false)
+            || (self.voice_peer_resolver)().iter().any(|p| p == recipient)
     }
 
-    fn try_queue_voice_reply(&self, recipient: &str, content: &str, immediate: bool) {
-        if !self.is_voice_chat(recipient) || self.tts_manager.is_none() {
+    fn try_queue_voice_reply(&self, recipient: &str, content: &str, immediate: bool, force: bool) {
+        if (!force && !self.is_voice_chat(recipient)) || self.tts_manager.is_none() {
             return;
         }
 
@@ -1082,6 +1161,7 @@ impl TelegramChannel {
 
         let (chat_id, thread_id) = Self::parse_reply_target(recipient);
         let voice_chats = self.voice_chats.clone();
+        let voice_peer_resolver = self.voice_peer_resolver.clone();
         let api_base = self.api_base.clone();
         let bot_token = self.bot_token.clone();
         let tts_manager = self.tts_manager.clone().unwrap();
@@ -1091,7 +1171,8 @@ impl TelegramChannel {
             let text = content.to_string();
             let recipient = recipient.to_string();
             zeroclaw_spawn::spawn!(async move {
-                if let Ok(mut vc) = voice_chats.lock() {
+                let is_config_voice_peer = voice_peer_resolver().contains(&recipient);
+                if !is_config_voice_peer && let Ok(mut vc) = voice_chats.lock() {
                     vc.remove(&recipient);
                 }
                 match Self::synthesize_and_send_voice(
@@ -1122,7 +1203,7 @@ impl TelegramChannel {
                                 ::zeroclaw_log::Action::Note
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                             "TTS voice reply failed"
                         );
                     }
@@ -1157,7 +1238,8 @@ impl TelegramChannel {
             });
 
             if let Some(text) = to_voice {
-                if let Ok(mut vc) = voice_chats.lock() {
+                let is_config_voice_peer = voice_peer_resolver().contains(&recipient);
+                if !is_config_voice_peer && let Ok(mut vc) = voice_chats.lock() {
                     vc.remove(&recipient);
                 }
                 match Self::synthesize_and_send_voice(
@@ -1188,7 +1270,7 @@ impl TelegramChannel {
                                 ::zeroclaw_log::Action::Note
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                             "TTS voice reply failed"
                         );
                     }
@@ -1219,16 +1301,19 @@ impl TelegramChannel {
             anyhow::bail!("TTS returned empty audio");
         }
 
-        let url = format!("{api_base}/bot{bot_token}/sendVoice");
+        // synthesize_opus already transcodes to OGG/Opus via ffmpeg internally
+        let (method, field, filename, mime) = telegram_audio_send_spec("opus")?;
+
+        let url = format!("{api_base}/bot{bot_token}/{method}");
         let client = zeroclaw_config::schema::build_runtime_proxy_client("channel.telegram");
 
         let mut form = reqwest::multipart::Form::new()
             .text("chat_id", chat_id.to_string())
             .part(
-                "voice",
+                field,
                 reqwest::multipart::Part::bytes(audio_bytes)
-                    .file_name("voice.ogg")
-                    .mime_str("audio/ogg; codecs=opus")?,
+                    .file_name(filename)
+                    .mime_str(mime)?,
             );
 
         if let Some(tid) = thread_id {
@@ -1239,7 +1324,7 @@ impl TelegramChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("sendVoice failed: status={status}, body={body}");
+            anyhow::bail!("{method} failed: status={status}, body={body}");
         }
 
         ::zeroclaw_log::record!(
@@ -1273,11 +1358,19 @@ impl TelegramChannel {
         }
 
         let data: serde_json::Value = resp.json().await?;
-        let username = data
+        let result = data
             .get("result")
-            .and_then(|r| r.get("username"))
+            .context("missing result in getMe response")?;
+        let username = result
+            .get("username")
             .and_then(|u| u.as_str())
             .context("Bot username not found in response")?;
+
+        // Cache the bot's user ID for reply-to-self detection
+        if let Some(id) = result.get("id").and_then(|i| i.as_i64()) {
+            let mut cache = self.bot_id.lock();
+            *cache = Some(id);
+        }
 
         Ok(username.to_string())
     }
@@ -1301,7 +1394,7 @@ impl TelegramChannel {
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                     "Failed to fetch bot username"
                 );
                 None
@@ -1375,6 +1468,17 @@ impl TelegramChannel {
             .unwrap_or(false)
     }
 
+    /// Check whether `message` is a reply to a message sent by the bot
+    /// itself. When true, the `mention_only` gate should be bypassed.
+    fn is_reply_to_bot(message: &serde_json::Value, bot_id: i64) -> bool {
+        message
+            .get("reply_to_message")
+            .and_then(|r| r.get("from"))
+            .and_then(|f| f.get("id"))
+            .and_then(|i| i.as_i64())
+            .is_some_and(|id| id == bot_id)
+    }
+
     /// Apply the `mention_only` gate to a non-text update (photo / document /
     /// voice) using its caption as the channel for the mention.
     ///
@@ -1404,6 +1508,16 @@ impl TelegramChannel {
         }
         let bot_username_guard = self.bot_username.lock();
         let bot_username = bot_username_guard.as_ref()?;
+
+        // If the user is replying directly to the bot's message, bypass the
+        // mention check — replies are an unambiguous signal of intent.
+        if let Some(caption) = caption
+            && let Some(bot_id) = *self.bot_id.lock()
+            && Self::is_reply_to_bot(message, bot_id)
+        {
+            return Some(Self::normalize_incoming_content(caption, bot_username));
+        }
+
         let caption = caption?;
         if !Self::contains_bot_mention(caption, bot_username) {
             return None;
@@ -1625,10 +1739,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
     /// Download a file from the Telegram CDN.
     async fn download_file(&self, file_path: &str) -> anyhow::Result<Vec<u8>> {
-        let url = format!(
-            "https://api.telegram.org/file/bot{}/{file_path}",
-            self.bot_token
-        );
+        let url = format!("{}/file/bot{}/{file_path}", self.api_base, self.bot_token);
         let resp = self
             .http_client()
             .get(&url)
@@ -1785,7 +1896,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                 "Failed to create telegram_files directory"
             );
             return None;
@@ -1799,7 +1910,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                     "Failed to get attachment file path"
                 );
                 return None;
@@ -1813,7 +1924,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                     "Failed to download attachment"
                 );
                 return None;
@@ -1836,7 +1947,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                 &format!("Failed to save attachment to {}", local_path.display())
             );
             return None;
@@ -1881,6 +1992,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         })
     }
 
@@ -1958,7 +2071,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                     "Failed to get voice file path"
                 );
                 return None;
@@ -1978,7 +2091,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                     "Failed to download voice file"
                 );
                 return None;
@@ -1992,7 +2105,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                     "Voice transcription failed"
                 );
                 return None;
@@ -2050,6 +2163,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         })
     }
 
@@ -2247,8 +2362,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             if let Some(ref bot_username) = *bot_username {
+                // If the user is replying directly to the bot's message, bypass
+                // the mention check — replies are an unambiguous signal of intent.
                 if !Self::contains_bot_mention(text, bot_username) {
-                    return None;
+                    let bot_id = *self.bot_id.lock();
+                    if bot_id.is_none_or(|id| !Self::is_reply_to_bot(message, id)) {
+                        return None;
+                    }
                 }
             } else {
                 return None;
@@ -2300,8 +2420,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             content
         };
 
-        // Exit voice-chat mode when user switches back to typing
-        if let Ok(mut vc) = self.voice_chats.lock() {
+        // Exit input-driven voice mode when user switches back to typing.
+        // Config-mandated voice peers (output_modality = "voice") stay in
+        // voice mode regardless of whether they send text or voice.
+        if !self.is_voice_peer(&reply_target)
+            && let Ok(mut vc) = self.voice_chats.lock()
+        {
             vc.remove(&reply_target);
         }
 
@@ -2320,6 +2444,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+
+            ..Default::default()
         })
     }
 
@@ -2653,7 +2779,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(
-                            ::serde_json::json!({"url": target, "error": format!("{}", e)})
+                            ::serde_json::json!({"url": target, "error": zeroclaw_runtime::security::scrub(&format!("{}", e))})
                         ),
                     "Telegram send media by URL failed; falling back to text link"
                 );
@@ -3287,7 +3413,7 @@ impl Channel for TelegramChannel {
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(
-                            ::serde_json::json!({"error": format!("{}", e), "message_id": message_id})
+                            ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e)), "message_id": message_id})
                         ),
                     "Invalid Telegram message_id ''"
                 );
@@ -3326,15 +3452,36 @@ impl Channel for TelegramChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        suppress_voice: bool,
     ) -> anyhow::Result<()> {
         let text = &strip_tool_call_tags(text);
         let (chat_id, thread_id) = Self::parse_reply_target(recipient);
 
-        // Queue TTS voice reply — immediate mode since text is already final
-        self.try_queue_voice_reply(recipient, text, true);
+        // Queue TTS voice reply — immediate mode since text is already final.
+        // Skipped when suppress_voice is set (explicit text-only routing override).
+        if !suppress_voice {
+            self.try_queue_voice_reply(recipient, text, true, false);
+        }
 
         // Clean up rate-limit tracking for this chat
         self.last_draft_edit.lock().remove(&chat_id);
+
+        // Voice-only peers: delete the draft placeholder and let the voice
+        // bubble be the sole reply. Bypassed when suppress_voice forces text.
+        if !suppress_voice && self.is_voice_peer(recipient) {
+            if let Ok(id) = message_id.parse::<i64>() {
+                let _ = self
+                    .client
+                    .post(self.api_url("deleteMessage"))
+                    .json(&serde_json::json!({
+                        "chat_id": chat_id,
+                        "message_id": id,
+                    }))
+                    .send()
+                    .await;
+            }
+            return Ok(());
+        }
 
         // Parse attachments before processing
         let (text_without_markers, attachments) = parse_attachment_markers(text);
@@ -3348,7 +3495,7 @@ impl Channel for TelegramChannel {
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(
-                            ::serde_json::json!({"error": format!("{}", e), "message_id": message_id})
+                            ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e)), "message_id": message_id})
                         ),
                     "Invalid Telegram message_id ''"
                 );
@@ -3516,7 +3663,7 @@ impl Channel for TelegramChannel {
                     DEBUG,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_attrs(
-                            ::serde_json::json!({"error": format!("{}", e), "message_id": message_id})
+                            ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e)), "message_id": message_id})
                         ),
                     "Invalid Telegram draft message_id ''"
                 );
@@ -3558,11 +3705,19 @@ impl Channel for TelegramChannel {
             None => (message.recipient.as_str(), None),
         };
 
-        // Voice chat mode: send text normally AND queue a voice note of the
-        // final answer. Text in → text out. Voice in → text + voice out.
-        self.try_queue_voice_reply(&message.recipient, &content, false);
+        // Voice chat mode: queue a voice note. Suppressed messages (errors,
+        // system notices) are never voiced.
+        if !message.suppress_voice {
+            self.try_queue_voice_reply(&message.recipient, &content, false, message.force_voice);
+        }
 
-        // Always send text reply (voice chat gets both text and voice)
+        // Voice-only peers (or explicit force_voice): the voice note is the sole reply — skip text.
+        if !message.suppress_voice
+            && (self.is_voice_peer(&message.recipient) || message.force_voice)
+        {
+            return Ok(());
+        }
+
         let (text_without_markers, attachments) = parse_attachment_markers(&content);
 
         if !attachments.is_empty() {
@@ -3618,7 +3773,9 @@ impl Channel for TelegramChannel {
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            .with_attrs(
+                                ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})
+                            ),
                         "startup probe error; retrying in 5s"
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -3717,7 +3874,9 @@ impl Channel for TelegramChannel {
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            .with_attrs(
+                                ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})
+                            ),
                         "poll error"
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -3732,7 +3891,9 @@ impl Channel for TelegramChannel {
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            .with_attrs(
+                                ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})
+                            ),
                         "parse error"
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -3860,7 +4021,7 @@ Ensure only one `zeroclaw` process is using this bot token."
                                         ::zeroclaw_log::Action::Note
                                     )
                                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                    .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                                     "answerCallbackQuery failed"
                                 );
                             }
@@ -3924,7 +4085,7 @@ Ensure only one `zeroclaw` process is using this bot token."
                 ::zeroclaw_log::record!(
                     DEBUG,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                     "health check failed"
                 );
                 false
@@ -4112,11 +4273,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn with_voice_peer_prefs_seeds_static_voice_peers_for_matching_groups_only() {
+    fn scrub_masks_poll_error_url() {
+        let raw = "error sending request for url (https://api.telegram.org/bot123456:ABC-def_GHI/getUpdates)";
+        let redacted = zeroclaw_runtime::security::scrub(raw);
+        assert!(!redacted.contains("123456:ABC-def_GHI"));
+        assert!(redacted.contains("[REDACTED_BOT_TOKEN]"));
+    }
+
+    #[test]
+    fn scrub_leaves_unrelated_text_untouched() {
+        let raw = "connection reset by peer";
+        assert_eq!(zeroclaw_runtime::security::scrub(raw), raw);
+    }
+
+    #[test]
+    fn voice_peer_resolver_resolves_live_from_config() {
         use zeroclaw_config::multi_agent::{OutputModality, PeerGroupConfig, PeerUsername};
 
         let mut config = zeroclaw_config::schema::Config::default();
-        // Voice group on this channel type — should be seeded.
+        // Voice group on this channel type — should be resolved.
         config.peer_groups.insert(
             "voicers".to_string(),
             PeerGroupConfig {
@@ -4153,31 +4328,36 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             false,
         )
-        .with_voice_peer_prefs(&config, "telegram", "default");
+        .with_voice_peer_resolver(Arc::new({
+            let cfg = config.clone();
+            move || cfg.channel_voice_peers("telegram", "default")
+        }));
 
-        // Peers go into static_voice_peers, not into the session voice_chats set.
-        let sp = ch.static_voice_peers.lock().unwrap();
-        assert!(sp.contains("@alice"), "voice peer should be in static set");
-        assert!(sp.contains("@bob"), "voice peer should be in static set");
+        // is_voice_chat resolves live via voice_peer_resolver — no cache.
         assert!(
-            !sp.contains("@carol"),
-            "peers on another channel must not be seeded"
+            ch.is_voice_chat("@alice"),
+            "voice peer should be recognized"
+        );
+        assert!(ch.is_voice_chat("@bob"), "voice peer should be recognized");
+        assert!(
+            !ch.is_voice_chat("@carol"),
+            "peers on another channel must not be recognized"
         );
         assert!(
-            !sp.contains("@dave"),
-            "mirror-modality peers must not be seeded"
+            !ch.is_voice_chat("@dave"),
+            "mirror-modality peers must not be recognized"
         );
-        drop(sp);
 
+        // Live resolver must NOT pollute the session voice_chats set.
         let vc = ch.voice_chats.lock().unwrap();
         assert!(
             !vc.contains("@alice"),
-            "static peers must not pollute the session voice_chats set"
+            "live-resolved peers must not pollute the session voice_chats set"
         );
     }
 
     #[test]
-    fn static_voice_peers_survive_session_voice_chats_removal() {
+    fn voice_peer_resolver_survives_session_voice_chats_removal() {
         use zeroclaw_config::multi_agent::{OutputModality, PeerGroupConfig, PeerUsername};
 
         let mut config = zeroclaw_config::schema::Config::default();
@@ -4197,17 +4377,71 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             false,
         )
-        .with_voice_peer_prefs(&config, "telegram", "default");
+        .with_voice_peer_resolver(Arc::new({
+            let cfg = config.clone();
+            move || cfg.channel_voice_peers("telegram", "default")
+        }));
 
         // Simulate a voice-send removing @alice from voice_chats (even though
-        // she was never in it — this proves static peers are checked separately).
+        // she was never in it — this proves live-resolved peers are separate).
         ch.voice_chats.lock().unwrap().remove("@alice");
 
-        // is_voice_chat must still return true via static_voice_peers.
+        // is_voice_chat must still return true via voice_peer_resolver.
         assert!(
             ch.is_voice_chat("@alice"),
-            "static voice peer must remain active after voice_chats removal"
+            "live-resolved voice peer must remain active after voice_chats removal"
         );
+    }
+
+    #[test]
+    fn audio_send_spec_opus_is_voice_note() {
+        // Only OGG/Opus becomes a real Telegram voice note.
+        let (method, field, filename, mime) = telegram_audio_send_spec("opus").unwrap();
+        assert_eq!(method, "sendVoice");
+        assert_eq!(field, "voice");
+        assert_eq!(filename, "voice.ogg");
+        assert_eq!(mime, "audio/ogg");
+        // "ogg" is an accepted alias for the same path.
+        assert_eq!(telegram_audio_send_spec("ogg").unwrap().0, "sendVoice");
+    }
+
+    #[test]
+    fn audio_send_spec_wav_uses_send_audio_with_real_mime() {
+        // Groq Orpheus / Piper emit WAV — must not be mislabeled as audio/ogg.
+        let (method, field, filename, mime) = telegram_audio_send_spec("wav").unwrap();
+        assert_eq!(method, "sendAudio");
+        assert_eq!(field, "audio");
+        assert_eq!(filename, "voice.wav");
+        assert_eq!(mime, "audio/wav");
+    }
+
+    #[test]
+    fn audio_send_spec_mp3_uses_send_audio() {
+        let (method, _field, filename, mime) = telegram_audio_send_spec("mp3").unwrap();
+        assert_eq!(method, "sendAudio");
+        assert_eq!(filename, "voice.mp3");
+        assert_eq!(mime, "audio/mpeg");
+    }
+
+    #[test]
+    fn audio_send_spec_is_case_and_whitespace_insensitive() {
+        assert_eq!(telegram_audio_send_spec("  WAV ").unwrap().2, "voice.wav");
+        assert_eq!(telegram_audio_send_spec("Opus").unwrap().0, "sendVoice");
+    }
+
+    #[test]
+    fn audio_send_spec_pcm_is_rejected() {
+        let err = telegram_audio_send_spec("pcm")
+            .expect_err("pcm must be rejected — it is not a container format");
+        assert!(err.to_string().contains("PCM"), "got: {err}");
+    }
+
+    #[test]
+    fn audio_send_spec_unknown_format_falls_back_to_octet_stream() {
+        let (method, _field, filename, mime) = telegram_audio_send_spec("speex").unwrap();
+        assert_eq!(method, "sendAudio");
+        assert_eq!(filename, "voice.bin");
+        assert_eq!(mime, "application/octet-stream");
     }
 
     #[test]
@@ -4470,7 +4704,9 @@ mod tests {
 
         // For oversized text + invalid draft message_id, finalize_draft should
         // fall back to chunked send instead of returning early.
-        let result = ch.finalize_draft("123", "not-a-number", &long_text).await;
+        let result = ch
+            .finalize_draft("123", "not-a-number", &long_text, false)
+            .await;
         assert!(result.is_err());
     }
 
@@ -4486,6 +4722,40 @@ mod tests {
         assert_eq!(
             ch.api_url("getMe"),
             "https://api.telegram.org/bot123:ABC/getMe"
+        );
+    }
+
+    #[test]
+    fn telegram_api_url_uses_custom_api_base() {
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "123:ABC".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new),
+            mention_only,
+        )
+        .with_api_base("http://127.0.0.1:8081".to_string());
+
+        assert_eq!(
+            ch.api_url("getMe"),
+            "http://127.0.0.1:8081/bot123:ABC/getMe"
+        );
+    }
+
+    #[test]
+    fn telegram_api_url_normalizes_custom_api_base_trailing_slash() {
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "123:ABC".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new),
+            mention_only,
+        )
+        .with_api_base("http://127.0.0.1:8081/".to_string());
+
+        assert_eq!(
+            ch.api_url("getMe"),
+            "http://127.0.0.1:8081/bot123:ABC/getMe"
         );
     }
 
@@ -5646,6 +5916,166 @@ mod tests {
             .parse_update_message(&mention_only_update)
             .expect("mention-only body admits");
         assert_eq!(parsed.content, "@mybot");
+    }
+
+    #[test]
+    fn parse_update_reply_to_bot_bypasses_mention_only_gate() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        {
+            let mut cache = ch.bot_id.lock();
+            *cache = Some(42);
+        }
+
+        // Reply to the bot's own message — no mention needed.
+        let update = serde_json::json!({
+            "update_id": 20,
+            "message": {
+                "message_id": 55,
+                "text": "do this",
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" },
+                "reply_to_message": {
+                    "message_id": 50,
+                    "from": { "id": 42, "username": "mybot", "is_bot": true },
+                    "text": "original"
+                }
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .expect("reply-to-bot should bypass mention_only gate");
+        // extract_reply_context prepends the quote; the gate returns the body,
+        // and the quote is re-added by the normal reply-handling path.
+        assert_eq!(parsed.content, "> @mybot:\n> original\n\ndo this");
+    }
+
+    #[test]
+    fn parse_update_reply_to_non_bot_still_dropped_in_mention_only() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        {
+            let mut cache = ch.bot_id.lock();
+            *cache = Some(42);
+        }
+
+        // Reply to another user (not the bot) — still needs a mention.
+        let update = serde_json::json!({
+            "update_id": 21,
+            "message": {
+                "message_id": 56,
+                "text": "hello",
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" },
+                "reply_to_message": {
+                    "message_id": 51,
+                    "from": { "id": 99, "username": "charlie" },
+                    "text": "some message"
+                }
+            }
+        });
+
+        assert!(ch.parse_update_message(&update).is_none());
+    }
+
+    #[test]
+    fn parse_update_reply_bot_id_unresolved_falls_through_in_mention_only() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        // bot_id stays None — unresolved.
+
+        // Reply to the bot's message, but bot_id is unresolved — falls through.
+        let update = serde_json::json!({
+            "update_id": 22,
+            "message": {
+                "message_id": 57,
+                "text": "hello",
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" },
+                "reply_to_message": {
+                    "message_id": 52,
+                    "from": { "id": 42, "username": "mybot", "is_bot": true },
+                    "text": "original"
+                }
+            }
+        });
+
+        assert!(ch.parse_update_message(&update).is_none());
+    }
+
+    #[test]
+    fn parse_update_reply_to_bot_bypasses_mention_only_gate_caption_path() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        {
+            let mut cache = ch.bot_id.lock();
+            *cache = Some(42);
+        }
+
+        // Photo with a caption, replying to the bot — caption should pass.
+        // This exercises check_media_mention_gate directly because
+        // parse_update_message requires `message.text` and photo updates
+        // carry only `message.caption`.
+        let message = serde_json::json!({
+            "message_id": 58,
+            "caption": "enhance this",
+            "from": { "id": 555, "username": "alice" },
+            "chat": { "id": -100_200_300, "type": "group" },
+            "photo": [
+                { "file_id": "abc", "width": 100, "height": 100 }
+            ],
+            "reply_to_message": {
+                "message_id": 53,
+                "from": { "id": 42, "username": "mybot", "is_bot": true },
+                "text": "original photo"
+            }
+        });
+
+        let result = ch.check_media_mention_gate(&message, Some("enhance this"));
+        assert!(
+            result.is_some(),
+            "reply-to-bot caption should bypass mention_only gate"
+        );
+        let gated = result.unwrap();
+        assert!(gated.is_some(), "gate should return the normalized caption");
+        assert_eq!(gated.unwrap(), "enhance this");
     }
 
     #[test]
@@ -7284,6 +7714,7 @@ mod tests {
         let expected_body = serde_json::json!({
             "commands": [
                 { "command": "new",    "description": "Start a new conversation session" },
+                { "command": "clear",  "description": "Clear this conversation session" },
                 { "command": "stop",   "description": "Cancel the current in-flight task" },
                 { "command": "model",  "description": "Show or switch the current model" },
                 { "command": "models", "description": "List available model_providers or switch model_provider" },
@@ -7445,6 +7876,7 @@ mod tests {
         let expected_body = serde_json::json!({
             "commands": [
                 { "command": "new",     "description": "Start a new conversation session" },
+                { "command": "clear",   "description": "Clear this conversation session" },
                 { "command": "stop",    "description": "Cancel the current in-flight task" },
                 { "command": "model",   "description": "Show or switch the current model" },
                 { "command": "models",  "description": "List available model_providers or switch model_provider" },
@@ -7487,6 +7919,7 @@ mod tests {
         let expected_body = serde_json::json!({
             "commands": [
                 { "command": "new",       "description": "Start a new conversation session" },
+                { "command": "clear",     "description": "Clear this conversation session" },
                 { "command": "stop",      "description": "Cancel the current in-flight task" },
                 { "command": "model",     "description": "Show or switch the current model" },
                 { "command": "models",    "description": "List available model_providers or switch model_provider" },

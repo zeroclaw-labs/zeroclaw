@@ -17,6 +17,7 @@ use crate::client::{ConnectionState, RpcClient};
 use crate::config;
 use crate::config_manager;
 use crate::dashboard;
+use crate::doctor;
 use crate::keymap::{GlobalAction, ModalAction};
 use crate::logs;
 use crate::mouse;
@@ -44,16 +45,23 @@ pub struct CrossReconnectState {
 
 pub type SharedReconnectState = Arc<Mutex<CrossReconnectState>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuickstartChatDrain {
+    Immediate,
+    AfterReconnect,
+}
+
 /// How often the UI redraws when no input arrives (for live panes).
 const TICK: Duration = Duration::from_millis(200);
 
 /// Mode bar entries. Shared between drawing and click detection.
-const MODES: [Mode; 6] = [
+const MODES: [Mode; 7] = [
     Mode::Dashboard,
     Mode::Config,
     Mode::Acp,
     Mode::Chat,
     Mode::Logs,
+    Mode::Doctor,
     Mode::Quickstart,
 ];
 
@@ -63,6 +71,7 @@ const MODES: [Mode; 6] = [
 enum Mode {
     Dashboard,
     Config,
+    Doctor,
     Acp, // displayed as "Code" in the UI
     Chat,
     Logs,
@@ -74,6 +83,7 @@ impl Mode {
         match self {
             Mode::Dashboard => "zc-pane-dashboard",
             Mode::Config => "zc-pane-config",
+            Mode::Doctor => "zc-pane-doctor",
             Mode::Acp => "zc-pane-code",
             Mode::Chat => "zc-pane-chat",
             Mode::Logs => "zc-pane-logs",
@@ -113,27 +123,41 @@ async fn switch_mode(
     *mode = next;
 }
 
-async fn consume_immediate_start_chat(
+fn take_pending_quickstart_chat(
+    reconnect_state: &SharedReconnectState,
+    drain: QuickstartChatDrain,
+) -> Option<String> {
+    let Ok(mut guard) = reconnect_state.lock() else {
+        return None;
+    };
+    let pending = guard.pending_quickstart_chat.take()?;
+    match (drain, pending) {
+        (QuickstartChatDrain::Immediate, PendingQuickstartChat::Immediate(alias))
+        | (QuickstartChatDrain::AfterReconnect, PendingQuickstartChat::AfterReconnect(alias)) => {
+            Some(alias)
+        }
+        (_, other) => {
+            guard.pending_quickstart_chat = Some(other);
+            None
+        }
+    }
+}
+
+async fn consume_pending_quickstart_chat(
+    conn_state: &ConnectionState,
     reconnect_state: &SharedReconnectState,
     mode: &mut Mode,
     chat_pane: &mut chat::Chat,
 ) {
-    let alias = {
-        let Ok(mut guard) = reconnect_state.lock() else {
-            return;
-        };
-        match guard.pending_quickstart_chat.take() {
-            Some(PendingQuickstartChat::Immediate(alias)) => Some(alias),
-            other => {
-                guard.pending_quickstart_chat = other;
-                None
-            }
-        }
-    };
-    if let Some(alias) = alias {
-        chat_pane.focus_agent(&alias).await;
-        *mode = Mode::Chat;
+    if matches!(conn_state, ConnectionState::Disconnected { .. }) {
+        return;
     }
+    let Some(alias) = take_pending_quickstart_chat(reconnect_state, QuickstartChatDrain::Immediate)
+    else {
+        return;
+    };
+    chat_pane.focus_agent(&alias).await;
+    *mode = Mode::Chat;
 }
 
 // ── Top-level entry point ────────────────────────────────────────
@@ -199,6 +223,7 @@ pub async fn run(
                 dashboard_pane.init().await?;
                 let mut config_app = config_manager::App::new(rpc.clone(), config_dir);
                 config_app.init().await?;
+                let doctor_pane = doctor::Doctor::new(rpc.clone());
                 let mut acp_pane = acp::Acp::new(rpc.clone());
                 // Carry the pre-disconnect session across a reconnect rebuild so
                 // the rebuilt pane resumes the daemon-retained session (#7182)
@@ -210,16 +235,10 @@ pub async fn run(
                 chat_pane.set_resume_session_id($resume_chat.0);
                 chat_pane.set_resume_agent_alias($resume_chat.1);
                 chat_pane.init().await?;
-                let pending_start_chat = {
-                    let mut guard = reconnect_state.lock().expect("reconnect state poisoned");
-                    match guard.pending_quickstart_chat.take() {
-                        Some(PendingQuickstartChat::AfterReconnect(alias)) => Some(alias),
-                        other => {
-                            guard.pending_quickstart_chat = other;
-                            None
-                        }
-                    }
-                };
+                let pending_start_chat = take_pending_quickstart_chat(
+                    &reconnect_state,
+                    QuickstartChatDrain::AfterReconnect,
+                );
                 let mut logs_pane = logs::Logs::new(rpc.clone());
                 logs_pane.init().await?;
                 let mut quickstart =
@@ -232,6 +251,7 @@ pub async fn run(
                 anyhow::Ok((
                     dashboard_pane,
                     config_app,
+                    doctor_pane,
                     acp_pane,
                     chat_pane,
                     logs_pane,
@@ -245,6 +265,7 @@ pub async fn run(
     let (
         mut dashboard_pane,
         mut config_app,
+        mut doctor_pane,
         mut acp_pane,
         mut chat_pane,
         mut logs_pane,
@@ -257,7 +278,10 @@ pub async fn run(
     loop {
         // Draw
         let conn_state = rpc.connection_state();
-
+        doctor_pane.poll_refresh().await;
+        if mode == Mode::Doctor && !matches!(conn_state, ConnectionState::Disconnected { .. }) {
+            doctor_pane.refresh_if_inactive();
+        }
         // Per-agent theme override: while the Code or Chat pane is focused on
         // an agent with a configured override, swap that palette in for the
         // whole frame (backdrop, pane, bars) so the pane reads cohesively, then
@@ -318,6 +342,7 @@ pub async fn run(
             match mode {
                 Mode::Dashboard => dashboard_pane.draw(frame, chunks[1]),
                 Mode::Config => config_app.draw_into(frame, chunks[1]),
+                Mode::Doctor => doctor_pane.draw(frame, chunks[1]),
                 Mode::Acp => acp_pane.draw(frame, chunks[1]),
                 Mode::Chat => chat_pane.draw(frame, chunks[1]),
                 Mode::Logs => logs_pane.draw(frame, chunks[1]),
@@ -341,6 +366,11 @@ pub async fn run(
                 Mode::Acp => acp_pane.ctx_tokens(),
                 _ => (None, None),
             };
+            let browse_mode = match mode {
+                Mode::Chat => chat_pane.in_browse_mode(),
+                Mode::Acp => acp_pane.in_browse_mode(),
+                _ => false,
+            };
             draw_status_bar(
                 frame,
                 chunks[status_idx],
@@ -348,6 +378,7 @@ pub async fn run(
                 rpc.tui_id(),
                 CtxBar::new(ctx_input, ctx_max),
                 needs_intervention,
+                browse_mode,
             );
 
             // Help modal overlay (drawn last so it sits on top).
@@ -378,6 +409,7 @@ pub async fn run(
                 let pane_node = match mode {
                     Mode::Dashboard => dashboard_pane.help_context(),
                     Mode::Config => config_app.help_context(),
+                    Mode::Doctor => doctor_pane.help_context(),
                     Mode::Acp => acp_pane.help_context(),
                     Mode::Chat => chat_pane.help_context(),
                     Mode::Logs => logs_pane.help_context(),
@@ -471,10 +503,11 @@ pub async fn run(
                             Ok(panes) => {
                                 dashboard_pane = panes.0;
                                 config_app = panes.1;
-                                acp_pane = panes.2;
-                                chat_pane = panes.3;
-                                logs_pane = panes.4;
-                                quickstart = panes.5;
+                                doctor_pane = panes.2;
+                                acp_pane = panes.3;
+                                chat_pane = panes.4;
+                                logs_pane = panes.5;
+                                quickstart = panes.6;
                                 reconnect_last_attempt = None;
                                 ephemeral_respawn_done = false;
                                 needs_intervention = false;
@@ -511,6 +544,13 @@ pub async fn run(
             if mode == Mode::Quickstart {
                 quickstart.tick().await;
             }
+            consume_pending_quickstart_chat(
+                &conn_state,
+                &reconnect_state,
+                &mut mode,
+                &mut chat_pane,
+            )
+            .await;
             continue;
         }
 
@@ -523,6 +563,7 @@ pub async fn run(
                 let in_text_input = match mode {
                     Mode::Dashboard => dashboard_pane.wants_text_input(),
                     Mode::Config => config_app.wants_text_input(),
+                    Mode::Doctor => doctor_pane.wants_text_input(),
                     Mode::Acp => acp_pane.wants_text_input(),
                     Mode::Chat => chat_pane.wants_text_input(),
                     Mode::Logs => logs_pane.wants_text_input(),
@@ -548,9 +589,25 @@ pub async fn run(
                     continue;
                 }
 
-                if global == Some(GlobalAction::Quit) {
-                    // Close all transient widgets, then arm the confirm modal
-                    // rather than exiting outright.
+                let pane_wants_quit_chord = match mode {
+                    Mode::Chat => chat_pane.wants_quit_chord(),
+                    Mode::Acp => acp_pane.wants_quit_chord(),
+                    _ => false,
+                };
+                if global == Some(GlobalAction::Quit) && !pane_wants_quit_chord {
+                    // First Ctrl+C: clear input bar text, clear transient
+                    // state (browse mode, overlay, …) and arm the confirm modal.
+                    match mode {
+                        Mode::Chat => {
+                            chat_pane.exit_browse_mode();
+                            chat_pane.clear_input();
+                        }
+                        Mode::Acp => {
+                            acp_pane.exit_browse_mode();
+                            acp_pane.clear_input();
+                        }
+                        _ => {}
+                    }
                     show_help = false;
                     reload_confirm = false;
                     reload_status = None;
@@ -612,8 +669,10 @@ pub async fn run(
                     continue;
                 }
 
-                // `?` opens help unless pane is in text-input mode.
-                if global == Some(GlobalAction::Help) && !in_text_input {
+                let help_bypasses_text_input = crate::keymap::help_bypasses_text_input(&key);
+                if global == Some(GlobalAction::Help)
+                    && (!in_text_input || help_bypasses_text_input)
+                {
                     show_help = true;
                     continue;
                 }
@@ -627,6 +686,7 @@ pub async fn run(
                 let quit = match mode {
                     Mode::Dashboard => dashboard_pane.handle_key(key).await,
                     Mode::Config => config_app.handle_key(key, term).await?,
+                    Mode::Doctor => doctor_pane.handle_key(key).await,
                     Mode::Acp => acp_pane.handle_key(key, term).await,
                     Mode::Chat => chat_pane.handle_key(key, term).await,
                     Mode::Logs => logs_pane.handle_key(key).await,
@@ -646,7 +706,13 @@ pub async fn run(
                     )
                     .await;
                 }
-                consume_immediate_start_chat(&reconnect_state, &mut mode, &mut chat_pane).await;
+                consume_pending_quickstart_chat(
+                    &conn_state,
+                    &reconnect_state,
+                    &mut mode,
+                    &mut chat_pane,
+                )
+                .await;
             }
             Event::Mouse(mouse) => {
                 // Dismiss help on any click
@@ -680,6 +746,15 @@ pub async fn run(
                         continue;
                     }
                 }
+                // Help-hint click: every pane renders the `?=help` indicator at
+                // the bottom-left of the content area; clicking it opens help,
+                // mirroring the `?` key.
+                if matches!(mouse.kind, MouseEventKind::Down(_))
+                    && mouse::help_hint_click(mouse.column, mouse.row, content_area)
+                {
+                    show_help = true;
+                    continue;
+                }
                 // Forward to active pane (skip when disconnected).
                 if !matches!(conn_state, ConnectionState::Disconnected { .. }) {
                     match mode {
@@ -704,6 +779,9 @@ pub async fn run(
                         Mode::Config => {
                             config_app.handle_mouse(mouse, content_area, term).await?;
                         }
+                        Mode::Doctor => {
+                            doctor_pane.handle_mouse(mouse, content_area);
+                        }
                         Mode::Logs => {
                             logs_pane.handle_mouse(mouse, content_area);
                         }
@@ -717,7 +795,13 @@ pub async fn run(
                             quickstart.handle_mouse(mouse, content_area).await;
                         }
                     }
-                    consume_immediate_start_chat(&reconnect_state, &mut mode, &mut chat_pane).await;
+                    consume_pending_quickstart_chat(
+                        &conn_state,
+                        &reconnect_state,
+                        &mut mode,
+                        &mut chat_pane,
+                    )
+                    .await;
                 }
             }
             Event::Paste(text) if !matches!(conn_state, ConnectionState::Disconnected { .. }) => {
@@ -725,10 +809,18 @@ pub async fn run(
                     Mode::Chat => chat_pane.handle_paste(&text),
                     Mode::Acp => acp_pane.handle_paste(&text),
                     Mode::Config => config_app.handle_paste(&text),
+                    Mode::Doctor => doctor_pane.handle_paste(&text),
                     Mode::Quickstart => quickstart.handle_paste(&text),
                     Mode::Dashboard => dashboard_pane.handle_paste(&text),
                     Mode::Logs => logs_pane.handle_paste(&text),
                 }
+                consume_pending_quickstart_chat(
+                    &conn_state,
+                    &reconnect_state,
+                    &mut mode,
+                    &mut chat_pane,
+                )
+                .await;
             }
             _ => {} // Resize, etc. — just redraw on next iteration
         }
@@ -761,21 +853,27 @@ fn resolve_agent_overrides(
 // ── Mode bar ─────────────────────────────────────────────────────
 
 fn draw_mode_bar(frame: &mut ratatui::Frame, area: Rect, active: Mode) {
-    let mut spans = Vec::new();
-    for m in &MODES {
-        let label_style = if *m == active {
-            theme::selected_style().add_modifier(Modifier::BOLD)
-        } else {
-            theme::body_style()
-        };
-        spans.push(Span::styled(
-            format!(" {} ", crate::i18n::t(m.fluent_key())),
-            label_style,
-        ));
-        spans.push(Span::raw(" "));
-    }
+    use ratatui::widgets::Tabs;
 
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    let active_idx = MODES.iter().position(|m| *m == active).unwrap_or(0);
+    let titles: Vec<ratatui::text::Line> = MODES
+        .iter()
+        .map(|m| {
+            let label = crate::i18n::t(m.fluent_key());
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                format!(" {} ", label),
+                theme::body_style(),
+            ))
+        })
+        .collect();
+
+    let tabs = Tabs::new(titles)
+        .select(active_idx)
+        .style(theme::bar_style())
+        .highlight_style(theme::selected_style().add_modifier(Modifier::BOLD))
+        .divider("│")
+        .padding("", "");
+    frame.render_widget(tabs, area);
 }
 
 // ── Status bar ───────────────────────────────────────────────────
@@ -790,6 +888,7 @@ fn draw_status_bar(
     tui_id: Option<&str>,
     ctx: CtxBar,
     needs_intervention: bool,
+    browse_mode: bool,
 ) {
     let (dot, label, style) = match state {
         ConnectionState::Connected => (
@@ -840,10 +939,31 @@ fn draw_status_bar(
     spans.push(Span::styled(label, style));
     frame.render_widget(Paragraph::new(Line::from(spans)), right_area);
 
-    // Left: ctx bar, left-aligned in its own column. The bar is held back
-    // until the context-accounting feature is ready to show; there is no
-    // user-facing switch — the gate flips when the work lands.
-    const SHOW_CTX_BAR: bool = false;
+    // Left: ctx bar, possibly preceded by a browse-mode badge.
+    // The ctx bar is held back until the context-accounting feature is
+    // ready to show; there is no user-facing switch — the gate flips
+    // when the work lands.
+    const SHOW_CTX_BAR: bool = true;
+    // If browse mode is active, split off a fixed-width badge first.
+    let left_area = if browse_mode {
+        let badge_w = "  BROWSE  ".len() as u16 + 1;
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(badge_w), Constraint::Min(0)])
+            .split(left_area);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
+                " BROWSE ",
+                Style::default()
+                    .fg(HEALTHY_GREEN)
+                    .add_modifier(Modifier::REVERSED),
+            )])),
+            chunks[0],
+        );
+        chunks[1]
+    } else {
+        left_area
+    };
     if SHOW_CTX_BAR && let Some(w) = ctx.widget() {
         frame.render_widget(w, left_area);
     }
@@ -1178,4 +1298,58 @@ fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
         Paragraph::new(Span::styled(text, theme::body_style())).style(theme::fill_style()),
         inner,
     );
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quickstart_chat_handoff_consumes_immediate_target() {
+        let state = SharedReconnectState::default();
+        {
+            let mut guard = state.lock().unwrap();
+            guard.pending_quickstart_chat = Some(PendingQuickstartChat::Immediate("scout".into()));
+        }
+
+        assert_eq!(
+            take_pending_quickstart_chat(&state, QuickstartChatDrain::Immediate),
+            Some("scout".into())
+        );
+        assert!(state.lock().unwrap().pending_quickstart_chat.is_none());
+    }
+
+    #[test]
+    fn quickstart_chat_handoff_immediate_drain_preserves_after_reconnect_target() {
+        let state = SharedReconnectState::default();
+        {
+            let mut guard = state.lock().unwrap();
+            guard.pending_quickstart_chat =
+                Some(PendingQuickstartChat::AfterReconnect("scout".into()));
+        }
+
+        assert_eq!(
+            take_pending_quickstart_chat(&state, QuickstartChatDrain::Immediate),
+            None
+        );
+        assert_eq!(
+            state.lock().unwrap().pending_quickstart_chat,
+            Some(PendingQuickstartChat::AfterReconnect("scout".into()))
+        );
+    }
+
+    #[test]
+    fn quickstart_chat_handoff_consumes_after_reconnect_target() {
+        let state = SharedReconnectState::default();
+        {
+            let mut guard = state.lock().unwrap();
+            guard.pending_quickstart_chat =
+                Some(PendingQuickstartChat::AfterReconnect("scout".into()));
+        }
+
+        assert_eq!(
+            take_pending_quickstart_chat(&state, QuickstartChatDrain::AfterReconnect),
+            Some("scout".into())
+        );
+        assert!(state.lock().unwrap().pending_quickstart_chat.is_none());
+    }
 }

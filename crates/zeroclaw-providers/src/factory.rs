@@ -199,6 +199,9 @@ pub fn apply_compat_options(
     if let Some(ref cert_path) = opts.tls_ca_cert_path {
         p = p.with_tls_ca_cert_path(cert_path);
     }
+    if opts.replay_assistant_reasoning == Some(false) {
+        p = p.without_assistant_reasoning_replay();
+    }
     if let Some(extra) = &opts.provider_extra {
         if extra.is_object() {
             p = p.with_extra_body(extra.clone());
@@ -396,18 +399,36 @@ use zeroclaw_config::schema::{
     HunyuanModelProviderConfig, HyperbolicModelProviderConfig, InceptionModelProviderConfig,
     KiloCliModelProviderConfig, KiloModelProviderConfig, LambdaAiModelProviderConfig,
     LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
-    LmstudioModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
-    MoonshotEndpoint, MoonshotModelProviderConfig, MorphModelProviderConfig,
-    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
-    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
-    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
-    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
-    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
-    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
-    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
-    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
-    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    LmstudioModelProviderConfig, ManifestModelProviderConfig, MinimaxModelProviderConfig,
+    MistralModelProviderConfig, MoonshotEndpoint, MoonshotModelProviderConfig,
+    MorphModelProviderConfig, NearaiModelProviderConfig, NebiusModelProviderConfig,
+    NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
+    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
+    OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
+    PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
+    RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
+    SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
+    TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
+    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
+    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
 };
+
+/// Get the default API URL for a provider type (matches CompatFamilySpec::DEFAULT_URL).
+/// Returns None if the provider type is not an OpenAI-compatible family with a DEFAULT_URL const.
+pub fn get_default_url(provider_type: &str) -> Option<&'static str> {
+    Some(match provider_type {
+        "groq" => "https://api.groq.com/openai/v1",
+        "together" => <TogetherModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "fireworks" => <FireworksModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "deepinfra" => <DeepinfraModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "hyperbolic" => <HyperbolicModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "anyscale" => <AnyscaleModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "novita" => <NovitaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "nebius" => <NebiusModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "nvidia" => <NvidiaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        _ => return None,
+    })
+}
 
 // ── Pure-compat families ───────────────────────────────────────────────
 // `OpenAiCompatibleModelProvider::new(DISPLAY, DEFAULT_URL, key, AUTH)` —
@@ -602,6 +623,11 @@ impl CompatFamilySpec for LeptonModelProviderConfig {
     const DEFAULT_URL: &'static str = "https://llama3-1-405b.lepton.run/api/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
 }
+impl CompatFamilySpec for ManifestModelProviderConfig {
+    const DISPLAY: &'static str = "Manifest";
+    const DEFAULT_URL: &'static str = "https://app.manifest.build/v1";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+}
 impl CompatFamilySpec for MorphModelProviderConfig {
     const DISPLAY: &'static str = "Morph";
     const DEFAULT_URL: &'static str = "https://api.morphllm.com/v1";
@@ -712,6 +738,11 @@ impl CompatFamilySpec for VeniceModelProviderConfig {
             .without_native_tools()
     }
 }
+impl CompatFamilySpec for NearaiModelProviderConfig {
+    const DISPLAY: &'static str = "NEAR AI Cloud";
+    const DEFAULT_URL: &'static str = "https://cloud-api.near.ai/v1";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+}
 impl CompatFamilySpec for AtomicChatModelProviderConfig {
     const DISPLAY: &'static str = "Atomic Chat";
     /// Default endpoint for the Jan / Atomic Chat local OpenAI-compatible
@@ -732,11 +763,50 @@ impl CompatFamilySpec for AtomicChatModelProviderConfig {
     }
 }
 
-impl CompatFamilySpec for XaiModelProviderConfig {
-    const DISPLAY: &'static str = "xAI";
-    const DEFAULT_URL: &'static str = "https://api.x.ai/v1";
-    const AUTH: AuthStyle = AuthStyle::Bearer;
-    const MODELS_DEV_KEY: Option<&'static str> = Some("xai");
+impl FamilyProviderFactory for XaiModelProviderConfig {
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        if let Some(p) = build_responses_provider_if_requested(
+            self.base.wire_api,
+            alias,
+            api_url.or(Some("https://api.x.ai/v1")),
+            key,
+            opts,
+        ) {
+            return Ok(p);
+        }
+
+        let mut p = OpenAiCompatibleModelProvider::new(
+            alias,
+            "xAI",
+            api_url.unwrap_or("https://api.x.ai/v1"),
+            key,
+            AuthStyle::Bearer,
+        )
+        .with_models_dev_key("xai");
+
+        if !has_api_key(key) {
+            let state_dir = opts.zeroclaw_dir.clone().unwrap_or_else(|| {
+                directories::UserDirs::new().map_or_else(
+                    || std::path::PathBuf::from(".zeroclaw"),
+                    |dirs| dirs.home_dir().join(".zeroclaw"),
+                )
+            });
+            let auth_service = crate::auth::AuthService::new(&state_dir, opts.secrets_encrypt);
+            p = p.with_auth_profile("xai", auth_service, opts.auth_profile_override.clone());
+        }
+
+        Ok(apply_compat_options(p, opts))
+    }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
 }
 
 impl FamilyProviderFactory for MinimaxModelProviderConfig {
@@ -832,6 +902,33 @@ impl CompatFamilySpec for NvidiaModelProviderConfig {
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("nvidia");
     const OPENROUTER_VENDOR_PREFIX: Option<&'static str> = Some("nvidia");
+
+    fn build_compat(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+    ) -> OpenAiCompatibleModelProvider {
+        // NVIDIA NIM exposes vision-capable models (e.g. `nvidia/llama-3.2-90av`,
+        // `google/deepseek-r1`). Compose the catalog-conf'd base with vision flag
+        // override via the constructor variant; we replay both consts manually
+        // since this constructor path doesn't fold through `build_compat_base`.
+        let mut p = OpenAiCompatibleModelProvider::new_with_vision(
+            alias,
+            Self::DISPLAY,
+            api_url.unwrap_or(Self::DEFAULT_URL),
+            key,
+            Self::AUTH,
+            true,
+        );
+        if let Some(catalog_key) = Self::MODELS_DEV_KEY {
+            p = p.with_models_dev_key(catalog_key);
+        }
+        if let Some(prefix) = Self::OPENROUTER_VENDOR_PREFIX {
+            p = p.with_openrouter_vendor_prefix(prefix);
+        }
+        p
+    }
 }
 
 impl CompatFamilySpec for QianfanModelProviderConfig {
@@ -1218,7 +1315,8 @@ impl FamilyProviderFactory for GroqModelProviderConfig {
             key,
             AuthStyle::Bearer,
         )
-        .with_models_dev_key("groq");
+        .with_models_dev_key("groq")
+        .without_assistant_reasoning_replay();
         // Groq's llama-family models reject native tool calls with HTTP
         // 400; default to text-fallback. Operators can override per-alias
         // via `[providers.models.groq.<alias>] native_tools = true`.
@@ -1550,6 +1648,59 @@ mod tests {
             .create_provider("test", None, None, &ModelProviderRuntimeOptions::default())
             .unwrap();
         assert!(!provider.capabilities().native_tool_calling);
+    }
+
+    #[tokio::test]
+    async fn openai_factory_forwards_timeout_to_native_provider() {
+        use axum::{Json, Router, routing::post};
+        use serde_json::json;
+        use tokio::time::{Duration, Instant};
+
+        async fn slow_chat_completion() -> Json<serde_json::Value> {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Json(json!({
+                "choices": [{"message": {"content": "too late"}}]
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new().route("/chat/completions", post(slow_chat_completion));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let opts = ModelProviderRuntimeOptions {
+            provider_timeout_secs: Some(1),
+            ..Default::default()
+        };
+        let provider = OpenAIModelProviderConfig::default()
+            .create_provider(
+                "native",
+                Some("test-key"),
+                Some(&format!("http://{addr}")),
+                &opts,
+            )
+            .expect("openai provider should build");
+
+        let started = Instant::now();
+        let result = provider
+            .chat_with_system(None, "hello", "gpt-4o", Some(0.7))
+            .await;
+        let elapsed = started.elapsed();
+
+        server.abort();
+
+        assert!(
+            result.is_err(),
+            "slow response should time out when factory forwards provider_timeout_secs"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "request waited for the server response instead of using configured timeout: {elapsed:?}"
+        );
     }
 
     #[tokio::test]

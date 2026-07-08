@@ -29,7 +29,8 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, oneshot};
 use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, RoomCreationOptions,
+    SendMessage,
 };
 use zeroclaw_config::schema::{DEFAULT_REPLY_QUEUE_DEPTH, HasReplyPacing, PACING_RECIPIENT_CAP};
 
@@ -48,6 +49,7 @@ enum PacedOp {
         recipient: String,
         message_id: String,
         text: String,
+        suppress_voice: bool,
     },
 }
 
@@ -76,7 +78,12 @@ impl PacedOp {
                 recipient,
                 message_id,
                 text,
-            } => inner.finalize_draft(&recipient, &message_id, &text).await,
+                suppress_voice,
+            } => {
+                inner
+                    .finalize_draft(&recipient, &message_id, &text, suppress_voice)
+                    .await
+            }
         }
     }
 }
@@ -422,7 +429,13 @@ impl Channel for PacedChannel {
             .await
     }
 
-    async fn finalize_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        suppress_voice: bool,
+    ) -> Result<()> {
         // Finalise is the terminal write to the draft — route it through the
         // same pacing queue as `send` so a burst of streamed replies respects
         // the floor and the overflow contract. The op preserves its identity
@@ -432,6 +445,7 @@ impl Channel for PacedChannel {
             recipient: recipient.to_string(),
             message_id: message_id.to_string(),
             text: text.to_string(),
+            suppress_voice,
         })
         .await
     }
@@ -469,6 +483,14 @@ impl Channel for PacedChannel {
             .await
     }
 
+    async fn create_room(&self, options: &RoomCreationOptions) -> Result<String> {
+        self.inner.create_room(options).await
+    }
+
+    async fn invite_user(&self, room_id: &str, user_id: &str) -> Result<()> {
+        self.inner.invite_user(room_id, user_id).await
+    }
+
     async fn request_approval(
         &self,
         recipient: &str,
@@ -484,6 +506,19 @@ impl Channel for PacedChannel {
         timeout: Duration,
     ) -> Result<Option<String>> {
         self.inner.request_choice(question, choices, timeout).await
+    }
+
+    async fn request_multi_choice(
+        &self,
+        question: &str,
+        choices: &[String],
+        min_items: usize,
+        max_items: usize,
+        timeout: Duration,
+    ) -> Result<Option<Vec<String>>> {
+        self.inner
+            .request_multi_choice(question, choices, min_items, max_items, timeout)
+            .await
     }
 
     fn supports_free_form_ask(&self) -> bool {
@@ -547,8 +582,47 @@ mod tests {
             _recipient: &str,
             _message_id: &str,
             _text: &str,
+            _suppress_voice: bool,
         ) -> Result<()> {
             self.finalize_drafts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct RoomManagementChannel {
+        creates: AtomicUsize,
+        invites: AtomicUsize,
+    }
+
+    impl Attributable for RoomManagementChannel {
+        fn role(&self) -> Role {
+            Role::Channel(zeroclaw_api::attribution::ChannelKind::Matrix)
+        }
+        fn alias(&self) -> &str {
+            "room-management"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for RoomManagementChannel {
+        fn name(&self) -> &str {
+            "room-management"
+        }
+        async fn send(&self, _message: &SendMessage) -> Result<()> {
+            Ok(())
+        }
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+            Ok(())
+        }
+        async fn create_room(&self, options: &RoomCreationOptions) -> Result<String> {
+            assert_eq!(options.name.as_deref(), Some("ops"));
+            self.creates.fetch_add(1, Ordering::SeqCst);
+            Ok("!ops:example.org".to_string())
+        }
+        async fn invite_user(&self, room_id: &str, user_id: &str) -> Result<()> {
+            assert_eq!(room_id, "!ops:example.org");
+            assert_eq!(user_id, "@alice:example.org");
+            self.invites.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -724,7 +798,7 @@ mod tests {
         };
         let paced = PacedChannel::wrap(inner, &cfg);
         paced
-            .finalize_draft("alice", "msg-1", "final text")
+            .finalize_draft("alice", "msg-1", "final text", false)
             .await
             .unwrap();
         // A draft finalization must edit the existing draft via the inner
@@ -762,7 +836,7 @@ mod tests {
         // Second op (a finalize) is queued behind the floor and drained by
         // the worker — it must still dispatch as a finalize, not a send.
         paced
-            .finalize_draft("alice", "msg-1", "final text")
+            .finalize_draft("alice", "msg-1", "final text", false)
             .await
             .unwrap();
         assert_eq!(
@@ -775,6 +849,35 @@ mod tests {
             1,
             "only the first send should reach inner.send; the finalize must not",
         );
+    }
+
+    #[tokio::test]
+    async fn room_management_forwards_to_inner_channel() {
+        let counting = Arc::new(RoomManagementChannel {
+            creates: AtomicUsize::new(0),
+            invites: AtomicUsize::new(0),
+        });
+        let inner: Arc<dyn Channel> = counting.clone();
+        let cfg = PacingFixture {
+            interval_secs: 3600,
+            depth: 4,
+        };
+        let paced = PacedChannel::wrap(inner, &cfg);
+
+        let room_id = paced
+            .create_room(&RoomCreationOptions {
+                name: Some("ops".into()),
+                ..RoomCreationOptions::default()
+            })
+            .await
+            .unwrap();
+        paced
+            .invite_user(&room_id, "@alice:example.org")
+            .await
+            .unwrap();
+
+        assert_eq!(counting.creates.load(Ordering::SeqCst), 1);
+        assert_eq!(counting.invites.load(Ordering::SeqCst), 1);
     }
 
     /// A channel whose `send` blocks until the test releases a gate, so the

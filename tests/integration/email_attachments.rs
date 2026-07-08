@@ -164,10 +164,10 @@ fn extract_attachments_with_limit(
             ct.map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or("octet-stream")));
 
         // Skip text parts — already handled by extract_text()
-        if let Some(ref m) = mime_str {
-            if m.starts_with("text/") {
-                continue;
-            }
+        if let Some(ref m) = mime_str
+            && m.starts_with("text/")
+        {
+            continue;
         }
 
         let data = part.contents().to_vec();

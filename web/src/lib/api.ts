@@ -14,6 +14,7 @@ import type {
   SessionMessagesResponse,
   TuiEntry,
 } from "../types/api";
+import type { components } from "./api-generated";
 import { clearToken, getToken, setToken } from "./auth";
 import { apiOrigin, basePath } from "./basePath";
 
@@ -50,68 +51,129 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Stable config-API error codes, sourced from the generated OpenAPI schema
+ * (`ConfigApiCode`). Branch on these constants, never a bare string literal, so
+ * a backend rename or a typo fails `tsc` here instead of silently regressing
+ * the behaviour that depends on the code.
+ */
+export type ConfigApiCode = components["schemas"]["ConfigApiCode"];
+export const ConfigApiCodes = {
+  configChangedExternally: "config_changed_externally",
+} as const satisfies Record<string, ConfigApiCode>;
+
+// A response reduced to the plain data the downstream logic needs, so it can be
+// shared between coalesced callers (a Response body can only be read once).
+interface RawResult {
+  ok: boolean;
+  status: number;
+  statusText: string;
+  text: string;
+}
+
+// In-flight GET coalescer. Concurrent identical GETs (same URL + token, no body)
+// share a single network request instead of each firing their own — this folds
+// away the duplicate fetches from React StrictMode's double-invoked effects and
+// from sibling components polling the same endpoint. Each caller re-parses the
+// shared response TEXT below, so no two callers ever share a mutable object.
+// Keyed entries are removed as soon as the request settles, so this only merges
+// genuinely-overlapping requests, never caches stale data.
+const inFlightGets = new Map<string, Promise<RawResult>>();
+
 export async function apiFetch<T = unknown>(
   path: string,
   options: RequestInit = {},
 ): Promise<T> {
   const token = getToken();
-  const headers = new Headers(options.headers);
+  const url = `${apiOrigin}${basePath}${path}`;
+  const method = (options.method ?? "GET").toUpperCase();
+  // Only idempotent, body-less GETs are safe to coalesce. Skip coalescing when
+  // the request carries custom headers (which could change the response) or an
+  // AbortSignal — the cached entry closes over the FIRST caller's options, so a
+  // later caller would silently get the wrong response and have its signal
+  // ignored. Plain header-less, signal-less GETs still share one request.
+  const coalesceKey =
+    method === "GET" && !options.body && !options.headers && !options.signal
+      ? `${token ?? ""} ${url}`
+      : null;
 
-  if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
+  const doFetch = async (): Promise<RawResult> => {
+    const headers = new Headers(options.headers);
+    if (token) {
+      headers.set("Authorization", `Bearer ${token}`);
+    }
+    if (
+      options.body &&
+      typeof options.body === "string" &&
+      !headers.has("Content-Type")
+    ) {
+      headers.set("Content-Type", "application/json");
+    }
+    const response = await fetch(url, { ...options, headers });
+    const text =
+      response.status === 204 ? "" : await response.text().catch(() => "");
+    return {
+      ok: response.ok,
+      status: response.status,
+      statusText: response.statusText,
+      text,
+    };
+  };
+
+  let result: RawResult;
+  if (coalesceKey) {
+    const existing = inFlightGets.get(coalesceKey);
+    if (existing) {
+      result = await existing;
+    } else {
+      const pending = doFetch().finally(() => inFlightGets.delete(coalesceKey));
+      inFlightGets.set(coalesceKey, pending);
+      result = await pending;
+    }
+  } else {
+    result = await doFetch();
   }
 
-  if (
-    options.body &&
-    typeof options.body === "string" &&
-    !headers.has("Content-Type")
-  ) {
-    headers.set("Content-Type", "application/json");
-  }
-
-  const response = await fetch(`${apiOrigin}${basePath}${path}`, {
-    ...options,
-    headers,
-  });
-
-  if (response.status === 401) {
+  if (result.status === 401) {
     clearToken();
     window.dispatchEvent(new Event("zeroclaw-unauthorized"));
     throw new UnauthorizedError();
   }
 
-  if (!response.ok) {
+  if (!result.ok) {
     // Try to parse a structured ConfigApiError envelope. Falls back to a
     // plain Error when the body is non-JSON or doesn't match the shape.
     // Centralises the parsing so callers (including the Quickstart flow)
     // never have to regex-match `error.message` to recover the structured
     // code — they just `instanceof ApiError` and read `.envelope.code`.
-    const text = await response.text().catch(() => "");
-    if (text) {
+    if (result.text) {
       try {
-        const parsed = JSON.parse(text);
+        const parsed = JSON.parse(result.text);
         if (
           parsed &&
           typeof parsed === "object" &&
           typeof parsed.code === "string" &&
           typeof parsed.message === "string"
         ) {
-          throw new ApiError(response.status, parsed);
+          throw new ApiError(result.status, parsed);
         }
       } catch (e) {
         if (e instanceof ApiError) throw e;
         // JSON.parse failure → fall through to the plain Error path.
       }
     }
-    throw new Error(`API ${response.status}: ${text || response.statusText}`);
+    throw new Error(`API ${result.status}: ${result.text || result.statusText}`);
   }
 
-  // Some endpoints may return 204 No Content
-  if (response.status === 204) {
+  // Only 204 No Content is a genuinely empty success. A non-204 success with
+  // an empty body is a contract violation (truncated/misbehaving response):
+  // fall through to JSON.parse so it surfaces as a clear parse error here
+  // rather than silently coercing to `undefined` and exploding far away.
+  if (result.status === 204) {
     return undefined as unknown as T;
   }
 
-  return response.json() as Promise<T>;
+  return JSON.parse(result.text) as T;
 }
 
 function unwrapField<T>(value: T | Record<string, T>, key: string): T {
@@ -133,10 +195,47 @@ function unwrapField<T>(value: T | Record<string, T>, key: string): T {
 // Pairing
 // ---------------------------------------------------------------------------
 
+/** Best-effort human label for the paired device, shown in the device list. */
+function pairingDeviceName(): string {
+  const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
+  const browser = /Edg/.test(ua)
+    ? "Edge"
+    : /OPR|Opera/.test(ua)
+      ? "Opera"
+      : /Chrome/.test(ua)
+        ? "Chrome"
+        : /Firefox/.test(ua)
+          ? "Firefox"
+          : /Safari/.test(ua)
+            ? "Safari"
+            : "Browser";
+  const os = /Windows/.test(ua)
+    ? "Windows"
+    : /Android/.test(ua)
+      ? "Android"
+      : /iPhone|iPad|iOS/.test(ua)
+        ? "iOS"
+        : /Mac/.test(ua)
+          ? "macOS"
+          : /Linux/.test(ua)
+            ? "Linux"
+            : "";
+  return os ? `${browser} on ${os}` : browser;
+}
+
 export async function pair(code: string): Promise<{ token: string }> {
-  const response = await fetch(`${basePath}/pair`, {
+  // Use the enhanced /api/pair endpoint (not legacy /pair): it registers the
+  // device in the device_registry so it shows up in the paired-devices list and
+  // can be revoked. /pair only persists the bearer token, leaving the device
+  // invisible/unmanageable in the UI. Both are unauthenticated (code-gated).
+  const response = await fetch(`${basePath}/api/pair`, {
     method: "POST",
-    headers: { "X-Pairing-Code": code },
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      code,
+      device_name: pairingDeviceName(),
+      device_type: "browser",
+    }),
   });
 
   if (!response.ok) {
@@ -173,6 +272,46 @@ export async function getAdminPairCode(): Promise<{
     pairing_code: string | null;
     pairing_required: boolean;
   }>;
+}
+
+/** Thrown when the localhost-only mint endpoint rejects a non-loopback caller. */
+export class PairCodeForbiddenError extends Error {
+  constructor() {
+    super('forbidden');
+    this.name = 'PairCodeForbiddenError';
+  }
+}
+
+/**
+ * Mint a fresh pairing code on demand against the localhost-only
+ * `POST /admin/paircode/new` endpoint (the "add another client" path — it does
+ * not revoke existing tokens). This is the in-band recovery for #5266: an
+ * already-paired gateway never mints a code on restart, so a new browser/device
+ * (e.g. on an alternate port) would otherwise face the pairing prompt with no
+ * code anywhere.
+ *
+ * The endpoint is restricted to loopback peers, so a remote/Docker dashboard
+ * gets a 403 — surfaced as {@link PairCodeForbiddenError} so the caller can fall
+ * back to showing the equivalent CLI command instead of a raw error.
+ */
+export async function generatePairCode(): Promise<{
+  pairing_code: string | null;
+  pairing_required: boolean;
+  message?: string;
+}> {
+  const response = await fetch(`${basePath}/admin/paircode/new`, { method: 'POST' });
+  if (response.status === 403) {
+    throw new PairCodeForbiddenError();
+  }
+  const data = (await response.json().catch(() => null)) as {
+    pairing_code: string | null;
+    pairing_required: boolean;
+    message?: string;
+  } | null;
+  if (!response.ok || !data) {
+    throw new Error(data?.message || `Failed to generate pairing code (${response.status})`);
+  }
+  return data;
 }
 
 // ---------------------------------------------------------------------------
@@ -279,7 +418,12 @@ export interface ListResponseEntry {
   is_secret: boolean;
   /** Variants for `kind === 'enum'` fields (drives <select> options). */
   enum_variants?: string[];
-  /** Alias namespace for `kind === 'alias-ref'` fields (drives the resolved picker). */
+  /**
+   * Alias namespace for `kind === 'alias-ref'` fields (drives the resolved
+   * picker). Emitted by the schema-driven `PropKind::AliasRef` backend from
+   * zeroclaw-labs/zeroclaw#7594; absent on backends that predate it, in which
+   * case FieldForm falls back to its per-section alias maps.
+   */
   alias_source?: string;
   section?: string;
   /** Tab grouping from `ConfigTab` enum. Absent when `ConfigTab::None`. */
@@ -363,11 +507,28 @@ export function listProps(prefix?: string): Promise<ListResponse> {
   return apiFetch<ListResponse>(`/api/config/list${q}`);
 }
 
-export function patchConfig(ops: PatchOp[]): Promise<PatchResponse> {
-  return apiFetch<PatchResponse>("/api/config", {
+export async function patchConfig(
+  ops: PatchOp[],
+  opts?: {
+    /** Send `X-ZeroClaw-Override-Drift: true` so the server overwrites the
+     *  on-disk file even when it has drifted from in-memory state on a patched
+     *  path (otherwise that returns 409 `config_changed_externally`). Use only
+     *  after the operator has chosen to overwrite a known drift. */
+    overrideDrift?: boolean;
+  },
+): Promise<PatchResponse> {
+  const result = await apiFetch<PatchResponse>("/api/config", {
     method: "PATCH",
     body: JSON.stringify(ops),
+    ...(opts?.overrideDrift
+      ? { headers: { "X-ZeroClaw-Override-Drift": "true" } }
+      : {}),
   });
+  // Config structure changed: notify listeners (e.g. the ⌘K search index)
+  // so they can invalidate caches. Decoupled via a browser event to avoid a
+  // circular import (configSearch.ts imports from this module).
+  window.dispatchEvent(new Event("zeroclaw-config-mutated"));
+  return result;
 }
 
 export function initSection(
@@ -529,6 +690,33 @@ export async function putPersonalityFile(
 
 // ── Skills (api_skills.rs) ───────────────────────────────────────────
 
+/** A predefined choice for a typed slash option. Only meaningful for
+ *  string/integer/number options; `value` is kept as text and coerced to the
+ *  option's type by the channel. Mirrors the runtime `SkillSlashChoice`. */
+export interface SkillSlashChoice {
+  name: string;
+  value: string;
+}
+
+/** A typed option a `slash`-tagged skill exposes on its slash command. Mirrors
+ *  the runtime `SkillSlashOption` (SKILL.md `slash_options:` /
+ *  SKILL.toml `[[skill.slash_options]]`), shaped after Discord's application
+ *  command option model. `type` is one of `string | integer | number |
+ *  boolean | user | channel | role | mentionable`; unknown values are dropped
+ *  by the channel. `choices` apply to string/integer/number; `min`/`max` to
+ *  integer/number; `min_length`/`max_length` to string. */
+export interface SkillSlashOption {
+  name: string;
+  description: string;
+  type: string;
+  required?: boolean;
+  choices?: SkillSlashChoice[];
+  min?: number | null;
+  max?: number | null;
+  min_length?: number | null;
+  max_length?: number | null;
+}
+
 export interface SkillFrontmatter {
   name: string;
   description: string;
@@ -536,6 +724,13 @@ export interface SkillFrontmatter {
   author?: string | null;
   version?: string | null;
   category?: string | null;
+  /** Free-form skill tags. The `slash` tag opts the skill into Discord slash
+   *  commands (zeroclaw-labs/zeroclaw#7490); `open-skills` is loader-managed. */
+  tags?: string[];
+  /** Typed slash-command options (zeroclaw-labs/zeroclaw#8021). Only meaningful
+   *  with the `slash` tag; edited by the bespoke editor in SkillsBundleEditor.
+   *  Omitted by the backend when empty. */
+  slash_options?: SkillSlashOption[];
 }
 
 export interface SkillBundleEntry {
@@ -559,6 +754,59 @@ export interface SkillDocument {
   body: string;
 }
 
+/** Where a skill in an agent's effective set was loaded from. */
+export type AgentSkillOrigin = "workspace" | "open-skills" | "plugin" | "bundle";
+
+/**
+ * A lower-precedence same-name skill that a winning skill shadowed (it did
+ * not load). `origin` is the loser's origin tag (e.g. `"bundle"`).
+ */
+export interface ShadowedSkillEntry {
+  name: string;
+  origin: string;
+}
+
+/**
+ * A candidate skill the audited resolver dropped (failed its security audit,
+ * was unauditable, or its manifest failed to parse). Surfaced so operators
+ * can tell "no skills configured" apart from "all skills failed audit".
+ */
+export interface DroppedSkillEntry {
+  name: string;
+  origin: string;
+  /** Stable machine-readable reason tag. */
+  reason_kind:
+    | "audit_findings"
+    | "audit_error"
+    | "manifest_parse_error"
+    | string;
+  /** Human-readable detail (the audit summary / error text). */
+  reason: string;
+  /** On-disk directory of the dropped skill, when known. */
+  directory?: string | null;
+}
+
+/**
+ * One skill in an agent's EFFECTIVE skill set, as resolved by the runtime
+ * (not just the configured bundles). Returned by {@link listAgentSkills}.
+ */
+export interface AgentSkillEntry {
+  name: string;
+  description: string;
+  origin: AgentSkillOrigin;
+  /** Present only when `origin === 'plugin'`. */
+  plugin?: string | null;
+  /** Present only when `origin === 'bundle'`. */
+  bundle?: string | null;
+  /** On-disk directory of the skill, when known. */
+  directory?: string | null;
+  /** True only when `origin === 'bundle'` — i.e. the skill is editable via
+   *  the bundle endpoints and can be expanded for detail. */
+  editable: boolean;
+  /** Lower-precedence same-name skills this one shadows. Empty normally. */
+  shadowed?: ShadowedSkillEntry[];
+}
+
 export interface SkillCreateRequest {
   name: string;
   frontmatter: SkillFrontmatter;
@@ -570,10 +818,41 @@ export function listSkillBundles(): Promise<{ bundles: SkillBundleEntry[] }> {
   return apiFetch("/api/skills/bundles");
 }
 
+/** One kind's capability row from the backend slash-option kind registry. The
+ *  editor walks these rather than hardcoding the kind list or which constraints
+ *  each kind carries. Sourced from the generated OpenAPI schema, which is built
+ *  by walking the backend `SlashOptionKind` enum. */
+export type SlashOptionKindDescriptor =
+  components["schemas"]["SlashOptionKindDescriptor"];
+
+/** Fetch the canonical typed-slash-option kind registry (kind list + per-kind
+ *  choice/numeric-bound/length-bound capabilities). */
+export function listSlashOptionKinds(): Promise<{
+  kinds: SlashOptionKindDescriptor[];
+}> {
+  return apiFetch("/api/skills/slash-option-kinds");
+}
+
 export function listSkillsInBundle(
   alias: string,
 ): Promise<{ skills: SkillEntry[] }> {
   return apiFetch(`/api/skills/bundles/${encodeURIComponent(alias)}/skills`);
+}
+
+/**
+ * The agent's EFFECTIVE skill set — every skill the runtime actually loads
+ * for `alias`, across workspace / open-skills / plugin / bundle origins.
+ * Unlike {@link listSkillsInBundle} (which only sees configured bundles),
+ * this reflects what the agent can really use.
+ */
+export function listAgentSkills(
+  alias: string,
+): Promise<{
+  agent: string;
+  skills: AgentSkillEntry[];
+  dropped?: DroppedSkillEntry[];
+}> {
+  return apiFetch(`/api/agents/${encodeURIComponent(alias)}/skills`);
 }
 
 export function readSkill(
@@ -790,6 +1069,43 @@ export function objectArrayElementProps(
     });
   }
   return out;
+}
+
+/** Read the backend-stamped `x-required-by-transport` metadata off the
+ *  `McpServerConfig` schema (a `mcp.servers.<name>` map value). The backend
+ *  derives this map from `McpTransport::required_leaf`, the same relationship
+ *  `validate_mcp_config` enforces, so the form classifies a transport's
+ *  required leaf by reading the registry rather than re-encoding the enum.
+ *  Returns `null` when the path doesn't resolve or the backend predates the
+ *  extension, in which case callers leave required-ness unclassified. */
+export function mcpRequiredByTransport(
+  schema: JsonSchema,
+): Record<string, string> | null {
+  if (!schema) return null;
+  // Walk root -> mcp -> servers (a map whose value type is McpServerConfig).
+  let cur: unknown = schema;
+  for (const seg of ["mcp", "servers"]) {
+    cur = unwrapOptional(resolveRef(cur, schema));
+    if (!cur || typeof cur !== "object") return null;
+    const props = (cur as { properties?: Record<string, unknown> }).properties;
+    if (!props || !Object.prototype.hasOwnProperty.call(props, seg)) return null;
+    cur = props[seg];
+  }
+  // `cur` is the servers map; its value type (McpServerConfig) carries the
+  // extension, reachable through `additionalProperties`.
+  cur = unwrapOptional(resolveRef(cur, schema));
+  if (!cur || typeof cur !== "object") return null;
+  const additional = (cur as { additionalProperties?: unknown })
+    .additionalProperties;
+  const serverDef = unwrapOptional(resolveRef(additional, schema));
+  if (!serverDef || typeof serverDef !== "object") return null;
+  const raw = (serverDef as Record<string, unknown>)["x-required-by-transport"];
+  if (!raw || typeof raw !== "object") return null;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v === "string") out[k.toLowerCase()] = v;
+  }
+  return Object.keys(out).length > 0 ? out : null;
 }
 
 export function descriptionForPath(
@@ -1064,6 +1380,11 @@ export interface SectionInfo {
     | "typed_family_map"
     | "backend_picker"
     | null;
+  /** Backend-owned cost-rate category for this section, emitted from
+   *  `cost_category_for_provider_section`. One of `models` / `tts` /
+   *  `transcription` for rate-bearing provider sections, or `""` otherwise.
+   *  Drives the Costs tab without a frontend section-key table. */
+  cost_category: string;
 }
 
 export interface SectionsResponse {
@@ -1121,6 +1442,13 @@ export interface ResolveAliasSourceResponse {
   values: string[];
 }
 
+/**
+ * Resolve the live alias values for a schema-declared `alias_source`
+ * namespace. Backs the generic `kind === 'alias-ref'` picker introduced by
+ * zeroclaw-labs/zeroclaw#7594. The endpoint only exists on backends that
+ * declare `PropKind::AliasRef`; callers must gate on `entry.alias_source`
+ * being present so this is never hit on older daemons.
+ */
 export function resolveAliasSource(
   source: string,
 ): Promise<ResolveAliasSourceResponse> {
@@ -1154,13 +1482,13 @@ export interface SelectItemResponse {
   created: boolean;
 }
 
-export function selectSectionItem(
+export async function selectSectionItem(
   section: string,
   key: string,
   alias?: string,
 ): Promise<SelectItemResponse> {
   const body = alias ? JSON.stringify({ alias }) : undefined;
-  return apiFetch<SelectItemResponse>(
+  const result = await apiFetch<SelectItemResponse>(
     `/api/config/sections/${encodeURIComponent(section)}/items/${encodeURIComponent(key)}`,
     {
       method: "POST",
@@ -1168,6 +1496,12 @@ export function selectSectionItem(
       body,
     },
   );
+  // Selecting an item may instantiate a new alias (config entity): notify
+  // listeners (e.g. the ⌘K search index) to invalidate their caches.
+  // Decoupled via a browser event to avoid a circular import
+  // (configSearch.ts imports from this module).
+  window.dispatchEvent(new Event("zeroclaw-config-mutated"));
+  return result;
 }
 // ── Quickstart ───────────────────────────────────────────────────────
 
@@ -1358,28 +1692,68 @@ export interface MapKeyMutResponse {
   key: string;
   renamed?: boolean;
   created?: boolean;
+  /** Agent rename only: owned-state cascade warnings — stores (memory / cron /
+   *  acp / session) that did NOT follow the rename and need operator attention. */
+  warnings?: string[];
 }
 
-export function deleteMapKey(
+export async function deleteMapKey(
   path: string,
   key: string,
 ): Promise<MapKeyMutResponse> {
-  return apiFetch<MapKeyMutResponse>(
+  const result = await apiFetch<MapKeyMutResponse>(
     `/api/config/map-key?path=${encodeURIComponent(path)}&key=${encodeURIComponent(key)}`,
     { method: "DELETE" },
   );
+  // An entity was removed: notify listeners (e.g. the ⌘K search index) to
+  // invalidate their caches. Decoupled via a browser event to avoid a
+  // circular import (configSearch.ts imports from this module).
+  window.dispatchEvent(new Event("zeroclaw-config-mutated"));
+  return result;
 }
 
-export function renameMapKey(
+export async function renameMapKey(
   path: string,
   from: string,
   to: string,
 ): Promise<MapKeyMutResponse> {
-  return apiFetch<MapKeyMutResponse>("/api/config/rename-map-key", {
+  const result = await apiFetch<MapKeyMutResponse>("/api/config/rename-map-key", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path, from, to }),
   });
+  // The alias changed: invalidate caches (⌘K search index, etc.).
+  window.dispatchEvent(new Event("zeroclaw-config-mutated"));
+  return result;
+}
+
+/** A config reference site to an aliased entry, surfaced in the delete preview. */
+export interface DeletePlanRefSite {
+  path: string;
+  raw_value: string;
+}
+
+/** Dry-run impact of deleting an aliased entry (GET /api/config/delete-plan). */
+export interface DeletePlan {
+  path: string;
+  key: string;
+  /** True iff nothing HARD blocks the delete (no hard ref, no live ACP session). */
+  allowed: boolean;
+  /** HARD references that block the delete (must be changed first). */
+  blockers: DeletePlanRefSite[];
+  /** SOFT references the delete would scrub automatically. */
+  scrubs: DeletePlanRefSite[];
+  /** Agent delete: live ACP sessions (a non-zero count blocks the delete). */
+  live_acp_sessions?: number | null;
+  /** Agent delete: owned non-config state (memory/cron/session) is removed. */
+  cascades_owned_state: boolean;
+}
+
+/** Preview the delete cascade for an aliased entry — read-only, no mutation. */
+export function getDeletePlan(path: string, key: string): Promise<DeletePlan> {
+  return apiFetch<DeletePlan>(
+    `/api/config/delete-plan?path=${encodeURIComponent(path)}&key=${encodeURIComponent(key)}`,
+  );
 }
 
 // ── Daemon admin (localhost-only on the gateway) ─────────────────────
@@ -1404,8 +1778,9 @@ export function reloadDaemon(): Promise<AdminResponse> {
 // Tools
 // ---------------------------------------------------------------------------
 
-export function getTools(): Promise<ToolSpec[]> {
-  return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>("/api/tools").then(
+export function getTools(agent?: string): Promise<ToolSpec[]> {
+  const qs = agent ? `?agent=${encodeURIComponent(agent)}` : "";
+  return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>(`/api/tools${qs}`).then(
     (data) => {
       const result = unwrapField(data, "tools");
       return Array.isArray(result) ? result : [];
@@ -1484,12 +1859,20 @@ export function triggerCronJob(id: string): Promise<CronTriggerResult> {
 export function patchCronJob(
   id: string,
   patch: {
+    /**
+     * The job's configured agent alias. Always send it: the gateway's
+     * CronPatchBody requires `agent` (it gates a shell-command change by the
+     * agent's risk profile), so a patch that omits it fails with
+     * `422 missing field agent` even for a pure schedule/name/enabled change.
+     */
+    agent: string;
     name?: string;
     schedule?: string;
     tz?: string;
     clear_tz?: boolean;
     command?: string;
     prompt?: string;
+    enabled?: boolean;
   },
 ): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>(
@@ -1711,8 +2094,18 @@ export interface LogEvent {
 
 export interface LogsResponse {
   events: LogEvent[];
-  /** `[timestamp, id]` to feed back as `until_ts` + `until_id` for older. */
+  /** Legacy cursor: `[timestamp, id]` to feed back as `until_ts` +
+   *  `until_id` for older. Tie-breaks same-timestamp events by
+   *  lexicographic id, which can drop earlier-written events when id
+   *  order diverges from file insertion order. Prefer
+   *  [`Self::next_cursor_line_offset`] when available — it is
+   *  independent of id ordering. */
   next_cursor: [string, string] | null;
+  /** Byte offset past the OLDEST event on the current page. Pass back
+   *  as [`LogsQueryParams::until_line_offset`] on the next request to
+   *  walk older pages deterministically regardless of id ordering.
+   *  `null` when the page is empty. */
+  next_cursor_line_offset: number | null;
   at_end: boolean;
   daemon_started_at: string;
   /** Canonical attribution-field names the daemon currently emits. Sourced
@@ -1727,6 +2120,11 @@ export interface LogsQueryParams {
   since_ts?: string;
   until_ts?: string;
   until_id?: string;
+  /** Byte offset cap passed back from the previous page's
+   *  `next_cursor_line_offset`. When set, the reader stops scanning at
+   *  this offset so the follow-up page only sees lines strictly older
+   *  than the previous one. Independent of id ordering. */
+  until_line_offset?: number;
   action?: string;
   category?: string;
   outcome?: string;

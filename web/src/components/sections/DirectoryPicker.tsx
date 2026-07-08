@@ -6,8 +6,10 @@
 // rules live in `zeroclaw_runtime::browse::list_directory`; this
 // component is presentation-only.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ArrowUp, FolderOpen, ChevronRight, RefreshCw, FolderPlus, Trash2 } from 'lucide-react';
+import { Button, ConfirmDialog } from '@/components/ui';
+import { t } from '@/lib/i18n';
 import {
   ApiError,
   browseShared,
@@ -34,6 +36,54 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
   const [creating, setCreating] = useState(false);
   const [newDirName, setNewDirName] = useState('');
   const [busyDir, setBusyDir] = useState<string | null>(null);
+  // The directory name queued for deletion; non-null opens the confirm dialog.
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  // Restore focus to the trigger only on keyboard/explicit close — NOT when
+  // the user dismissed by clicking another element (outside-click), where
+  // restoring would steal focus from whatever they just clicked.
+  const restoreFocusRef = useRef(true);
+
+  // Focus the popover panel on open so keyboard users land inside it, and
+  // restore focus to the trigger when it closes (unless dismissed by an
+  // outside click).
+  useEffect(() => {
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    panelRef.current?.focus();
+    return () => {
+      if (restoreFocusRef.current) previouslyFocused?.focus?.();
+    };
+  }, []);
+
+  // Esc dismisses the picker; outside (backdrop-equivalent) clicks dismiss it
+  // too. The inline "new folder" input owns Esc while open, and the delete
+  // confirm dialog owns it while open, so only close the whole picker from Esc
+  // when neither is active.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !creating && pendingDelete === null) {
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    const onPointerDown = (e: PointerEvent) => {
+      // Ignore clicks on the trigger that opened us — it owns its own toggle,
+      // and closing here would race its onClick and reopen the picker.
+      const target = e.target as Element | null;
+      if (target?.closest?.('[data-dirpicker-trigger]')) return;
+      if (panelRef.current && !panelRef.current.contains(e.target as Node)) {
+        restoreFocusRef.current = false;
+        onClose();
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    document.addEventListener('pointerdown', onPointerDown);
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      document.removeEventListener('pointerdown', onPointerDown);
+    };
+  }, [onClose, creating, pendingDelete]);
 
   useEffect(() => {
     let cancelled = false;
@@ -66,7 +116,7 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
     const name = newDirName.trim();
     if (!name) return;
     if (name.includes('/') || name.includes('\\')) {
-      setError("Directory name cannot contain '/' or '\\\\'");
+      setError(t('dir_picker.name_no_slashes'));
       return;
     }
     const target = cwd ? `${cwd}/${name}` : name;
@@ -87,11 +137,9 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
     }
   };
 
-  const handleDelete = async (name: string) => {
+  // Run the actual delete once the operator confirms via the dialog.
+  const confirmDelete = async (name: string) => {
     const target = cwd ? `${cwd}/${name}` : name;
-    if (!window.confirm(`Delete shared/${target}? This removes the directory and everything inside it.`)) {
-      return;
-    }
     setBusyDir(name);
     setError(null);
     try {
@@ -122,45 +170,39 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
 
   return (
     <div
-      className="rounded-lg border shadow-xl overflow-hidden"
-      style={{
-        background: 'var(--pc-bg-surface)',
-        borderColor: 'var(--pc-border)',
-      }}
+      ref={panelRef}
+      tabIndex={-1}
+      className="rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface shadow-[var(--pc-shadow-md)] overflow-hidden focus:outline-none"
       role="dialog"
-      aria-label="Directory picker"
+      aria-label={t('dir_picker.aria_label')}
     >
-      <div
-        className="flex items-center gap-2 px-3 py-2 border-b text-xs"
-        style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-secondary)' }}
-      >
+      <div className="flex items-center gap-2 px-3 py-2 border-b border-pc-border text-xs text-pc-text-secondary">
         <FolderOpen className="h-3.5 w-3.5 flex-shrink-0" />
-        <code className="flex-1 min-w-0 truncate" style={{ color: 'var(--pc-text-primary)' }}>
+        <code className="flex-1 min-w-0 truncate text-pc-text">
           shared/{cwd}
         </code>
         <button
           type="button"
           onClick={() => setCreating((v) => !v)}
-          title="New folder here"
-          className="btn-icon"
+          title={t('dir_picker.new_folder_here')}
+          aria-label={t('dir_picker.new_folder_here')}
+          className="h-6 w-6 inline-flex items-center justify-center rounded-[var(--radius-sm)] text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-surface"
         >
           <FolderPlus className="h-3.5 w-3.5" />
         </button>
         <button
           type="button"
           onClick={reload}
-          title="Refresh"
-          className="btn-icon"
+          title={t('common.refresh')}
+          aria-label={t('common.refresh')}
+          className="h-6 w-6 inline-flex items-center justify-center rounded-[var(--radius-sm)] text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-surface"
         >
           <RefreshCw className="h-3.5 w-3.5" />
         </button>
       </div>
 
       {creating && (
-        <div
-          className="flex items-center gap-2 px-3 py-2 border-b"
-          style={{ borderColor: 'var(--pc-border)' }}
-        >
+        <div className="flex items-center gap-2 px-3 py-2 border-b border-pc-border">
           <input
             type="text"
             value={newDirName}
@@ -172,42 +214,41 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
                 setNewDirName('');
               }
             }}
-            placeholder="new folder name"
+            placeholder={t('dir_picker.new_folder_placeholder')}
             className="input-electric flex-1 px-2 py-1 text-xs"
             autoFocus
           />
-          <button
-            type="button"
+          <Button
+            size="sm"
+            variant="primary"
             onClick={() => void handleCreate()}
             disabled={!newDirName.trim()}
-            className="btn-electric text-xs px-2 py-1 disabled:opacity-50"
           >
-            Create
-          </button>
-          <button
-            type="button"
+            {t('dir_picker.create')}
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
             onClick={() => {
               setCreating(false);
               setNewDirName('');
             }}
-            className="btn-secondary text-xs px-2 py-1"
           >
-            Cancel
-          </button>
+            {t('common.cancel')}
+          </Button>
         </div>
       )}
 
-      <ul className="max-h-72 overflow-y-auto divide-y" style={{ borderColor: 'var(--pc-border)' }}>
+      <ul className="max-h-72 overflow-y-auto divide-y divide-pc-border">
         {parent !== null && (
           <li>
             <button
               type="button"
               onClick={() => setCwd(parent)}
-              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:opacity-90"
-              style={{ color: 'var(--pc-text-secondary)' }}
+              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left text-pc-text-secondary transition-colors hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--pc-focus)]"
             >
               <ArrowUp className="h-3.5 w-3.5 flex-shrink-0" />
-              .. (up one level)
+              {t('dir_picker.up_one_level')}
             </button>
           </li>
         )}
@@ -219,18 +260,12 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
             />
           </li>
         ) : error ? (
-          <li
-            className="px-3 py-3 text-xs"
-            style={{ color: 'var(--color-status-error)' }}
-          >
+          <li className="px-3 py-3 text-xs text-status-error">
             {error}
           </li>
         ) : entries.length === 0 ? (
-          <li
-            className="px-3 py-3 text-xs italic"
-            style={{ color: 'var(--pc-text-faint)' }}
-          >
-            (empty)
+          <li className="px-3 py-3 text-xs italic text-pc-text-faint">
+            {t('dir_picker.empty')}
           </li>
         ) : (
           entries.map((entry) => (
@@ -240,39 +275,29 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
                   <button
                     type="button"
                     onClick={() => enterDir(entry.name)}
-                    className="flex-1 flex items-center gap-2 px-3 py-2 text-sm text-left hover:opacity-90"
-                    style={{ color: 'var(--pc-text-primary)' }}
+                    className="flex-1 flex items-center gap-2 px-3 py-2 text-sm text-left text-pc-text transition-colors hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--pc-focus)]"
                   >
-                    <FolderOpen
-                      className="h-3.5 w-3.5 flex-shrink-0"
-                      style={{ color: 'var(--pc-accent)' }}
-                    />
+                    <FolderOpen className="h-3.5 w-3.5 flex-shrink-0 text-pc-accent" />
                     <span className="flex-1 min-w-0 truncate">{entry.name}</span>
-                    <ChevronRight
-                      className="h-3.5 w-3.5 flex-shrink-0"
-                      style={{ color: 'var(--pc-text-muted)' }}
-                    />
+                    <ChevronRight className="h-3.5 w-3.5 flex-shrink-0 text-pc-text-muted" />
                   </button>
                   <button
                     type="button"
-                    onClick={() => void handleDelete(entry.name)}
+                    onClick={() => setPendingDelete(entry.name)}
                     disabled={busyDir === entry.name}
-                    title={`Delete shared/${cwd ? `${cwd}/` : ''}${entry.name}`}
-                    className="px-2 hover:opacity-100 opacity-60 disabled:opacity-30"
-                    style={{ color: 'var(--color-status-error)' }}
+                    title={`${t('dir_picker.delete_prefix')}shared/${cwd ? `${cwd}/` : ''}${entry.name}`}
+                    aria-label={`${t('dir_picker.delete_prefix')}shared/${cwd ? `${cwd}/` : ''}${entry.name}`}
+                    className="px-2 text-status-error opacity-60 transition-colors hover:opacity-100 hover:bg-status-error/10 disabled:opacity-30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--pc-focus)]"
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>
                 </div>
               ) : (
-                <div
-                  className="flex items-center gap-2 px-3 py-2 text-sm"
-                  style={{ color: 'var(--pc-text-muted)' }}
-                >
+                <div className="flex items-center gap-2 px-3 py-2 text-sm text-pc-text-muted">
                   <span className="h-3.5 w-3.5 flex-shrink-0" />
                   <span className="flex-1 min-w-0 truncate">{entry.name}</span>
                   {typeof entry.size === 'number' && (
-                    <span className="text-xs" style={{ color: 'var(--pc-text-faint)' }}>
+                    <span className="text-xs text-pc-text-faint">
                       {formatBytes(entry.size)}
                     </span>
                   )}
@@ -283,31 +308,42 @@ export default function DirectoryPicker({ value, onSelect, onClose }: DirectoryP
         )}
       </ul>
 
-      <div
-        className="flex items-center justify-between gap-2 px-3 py-2 border-t"
-        style={{ borderColor: 'var(--pc-border)' }}
-      >
-        <span className="text-xs" style={{ color: 'var(--pc-text-faint)' }}>
-          Picks a directory relative to <code>shared/</code>.
+      <div className="flex items-center justify-between gap-2 px-3 py-2 border-t border-pc-border">
+        <span className="text-xs text-pc-text-faint">
+          {t('dir_picker.relative_hint_prefix')}<code>shared/</code>{t('dir_picker.relative_hint_suffix')}
         </span>
         <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={onClose}
-            className="btn-secondary text-xs px-3 py-1.5"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
+          <Button size="sm" variant="ghost" onClick={onClose}>
+            {t('common.cancel')}
+          </Button>
+          <Button
+            size="sm"
+            variant="primary"
             onClick={() => onSelect(cwd ? `shared/${cwd}` : 'shared')}
-            className="btn-electric text-xs px-3 py-1.5"
-            title="Use this directory"
+            title={t('dir_picker.use_this_title')}
           >
-            Use this
-          </button>
+            {t('dir_picker.use_this')}
+          </Button>
         </div>
       </div>
+
+      {/* Themed confirm for the destructive directory delete. Rendered inside
+          the picker panel so its backdrop/clicks are treated as in-bounds by
+          the outside-click handler above and don't dismiss the picker. */}
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        danger
+        title={t('dir_picker.delete_dialog_title')}
+        message={`${t('dir_picker.delete_prefix')}shared/${
+          cwd ? `${cwd}/${pendingDelete}` : pendingDelete
+        }${t('dir_picker.delete_dialog_suffix')}`}
+        confirmLabel={t('common.delete')}
+        onConfirm={() => {
+          if (pendingDelete !== null) void confirmDelete(pendingDelete);
+          setPendingDelete(null);
+        }}
+        onClose={() => setPendingDelete(null)}
+      />
     </div>
   );
 }

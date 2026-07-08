@@ -1,8 +1,11 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { usePolling } from '@/hooks/usePolling';
 import { Monitor, Trash2, History, RefreshCw } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
 import { basePath } from '@/lib/basePath';
 import { getToken } from '@/lib/auth';
+import { Badge, Button, Card, PageHeader } from '@/components/ui';
+import { t } from '@/lib/i18n';
 
 interface CanvasFrame {
   frame_id: string;
@@ -25,7 +28,35 @@ export default function Canvas() {
   const [connected, setConnected] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [canvasList, setCanvasList] = useState<string[]>([]);
+  const [clearArmed, setClearArmed] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const armTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const errorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Surface an action failure inline; auto-clears after a few seconds.
+  const showActionError = useCallback((message: string) => {
+    setActionError(message);
+    if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+    errorTimerRef.current = setTimeout(() => setActionError(null), 5000);
+  }, []);
+
+  // Disarm the Clear confirm and cancel its pending timeout.
+  const disarmClear = useCallback(() => {
+    if (armTimerRef.current) {
+      clearTimeout(armTimerRef.current);
+      armTimerRef.current = null;
+    }
+    setClearArmed(false);
+  }, []);
+
+  // Cancel any pending timers on unmount.
+  useEffect(() => {
+    return () => {
+      if (armTimerRef.current) clearTimeout(armTimerRef.current);
+      if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+    };
+  }, []);
 
   // Build WebSocket URL for canvas
   const getWsUrl = useCallback((id: string) => {
@@ -76,20 +107,15 @@ export default function Canvas() {
     };
   }, [canvasId, connectWs]);
 
-  // Fetch canvas list periodically
-  useEffect(() => {
-    const fetchList = async () => {
-      try {
-        const data = await apiFetch<{ canvases: string[] }>('/api/canvas');
-        setCanvasList(data.canvases || []);
-      } catch {
-        // ignore
-      }
-    };
-    fetchList();
-    const interval = setInterval(fetchList, 5000);
-    return () => clearInterval(interval);
-  }, []);
+  // Fetch the canvas list every 5s — paused while the tab is hidden.
+  usePolling(async (isStale) => {
+    try {
+      const data = await apiFetch<{ canvases: string[] }>('/api/canvas');
+      if (!isStale()) setCanvasList(data.canvases || []);
+    } catch {
+      // ignore
+    }
+  }, 5000);
 
   // Build srcdoc HTML for the iframe — avoids needing allow-same-origin to
   // access contentDocument.  Content types that don't need scripts get a
@@ -169,22 +195,52 @@ export default function Canvas() {
   }, [currentFrame]);
 
   const handleSwitchCanvas = () => {
-    if (canvasIdInput.trim()) {
-      setCanvasId(canvasIdInput.trim());
+    const next = canvasIdInput.trim();
+    if (!next) return;
+    setActionError(null);
+    disarmClear();
+    try {
+      setCanvasId(next);
       setCurrentFrame(null);
       setHistory([]);
+    } catch (err) {
+      showActionError(`${t('canvas.switch_failed')}${err instanceof Error ? err.message : t('canvas.unknown_error')}`);
     }
   };
 
+  const handleReconnect = () => {
+    setActionError(null);
+    try {
+      connectWs(canvasId);
+    } catch (err) {
+      showActionError(`${t('canvas.reconnect_failed')}${err instanceof Error ? err.message : t('canvas.unknown_error')}`);
+    }
+  };
+
+  // Armed two-click clear: the first click arms a danger "Confirm clear?"
+  // state that disarms itself after a short window; the second click within
+  // that window performs the destructive DELETE.
   const handleClear = async () => {
+    if (!clearArmed) {
+      setActionError(null);
+      setClearArmed(true);
+      if (armTimerRef.current) clearTimeout(armTimerRef.current);
+      armTimerRef.current = setTimeout(() => {
+        armTimerRef.current = null;
+        setClearArmed(false);
+      }, 4000);
+      return;
+    }
+
+    disarmClear();
     try {
       await apiFetch(`/api/canvas/${encodeURIComponent(canvasId)}`, {
         method: 'DELETE',
       });
       setCurrentFrame(null);
       setHistory([]);
-    } catch {
-      // ignore
+    } catch (err) {
+      showActionError(`${t('canvas.clear_failed')}${err instanceof Error ? err.message : t('canvas.unknown_error')}`);
     }
   };
 
@@ -195,94 +251,98 @@ export default function Canvas() {
   return (
     <div className="p-6 space-y-4 h-full flex flex-col">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <Monitor className="h-6 w-6" style={{ color: 'var(--pc-accent)' }} />
-          <h1 className="text-xl font-semibold" style={{ color: 'var(--pc-text-primary)' }}>
-            Live Canvas
-          </h1>
-          <span
-            className="text-xs px-2 py-0.5 rounded-full font-medium"
-            style={{
-              background: connected ? 'rgba(34, 197, 94, 0.15)' : 'rgba(239, 68, 68, 0.15)',
-              color: connected ? '#22c55e' : '#ef4444',
-            }}
-          >
-            {connected ? 'Connected' : 'Disconnected'}
+      <PageHeader
+        title={
+          <span className="inline-flex items-center gap-2.5">
+            <Monitor className="h-5 w-5 text-pc-accent" />
+            {t('canvas.title')}
+            <Badge tone={connected ? 'ok' : 'error'}>
+              {connected ? t('canvas.connected') : t('canvas.disconnected')}
+            </Badge>
           </span>
+        }
+        actions={
+          <>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setShowHistory(!showHistory)}
+              title={t('canvas.toggle_history')}
+              aria-pressed={showHistory}
+            >
+              <History className="h-4 w-4" />
+            </Button>
+            <Button
+              variant={clearArmed ? 'danger' : 'ghost'}
+              size="sm"
+              onClick={handleClear}
+              onBlur={disarmClear}
+              title={clearArmed ? t('canvas.confirm_clear') : t('canvas.clear_canvas')}
+              aria-label={clearArmed ? t('canvas.confirm_clear_canvas') : t('canvas.clear_canvas')}
+            >
+              <Trash2 className="h-4 w-4" />
+              {clearArmed && <span className="text-xs">{t('canvas.confirm_clear_prompt')}</span>}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleReconnect}
+              title={t('canvas.reconnect')}
+            >
+              <RefreshCw className="h-4 w-4" />
+            </Button>
+          </>
+        }
+      />
+
+      {/* Inline action error — surfaces failures from clear / reconnect / switch */}
+      {actionError && (
+        <div
+          role="alert"
+          className="flex items-center gap-2 px-3 py-2 rounded-[var(--radius-md)] text-xs border border-status-error/25 bg-status-error/10 text-status-error"
+        >
+          {actionError}
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => setShowHistory(!showHistory)}
-            className="p-2 rounded-lg transition-colors hover:opacity-80"
-            style={{ background: 'var(--pc-bg-elevated)', color: 'var(--pc-text-muted)' }}
-            title="Toggle history"
-          >
-            <History className="h-4 w-4" />
-          </button>
-          <button
-            onClick={handleClear}
-            className="p-2 rounded-lg transition-colors hover:opacity-80"
-            style={{ background: 'var(--pc-bg-elevated)', color: 'var(--pc-text-muted)' }}
-            title="Clear canvas"
-          >
-            <Trash2 className="h-4 w-4" />
-          </button>
-          <button
-            onClick={() => connectWs(canvasId)}
-            className="p-2 rounded-lg transition-colors hover:opacity-80"
-            style={{ background: 'var(--pc-bg-elevated)', color: 'var(--pc-text-muted)' }}
-            title="Reconnect"
-          >
-            <RefreshCw className="h-4 w-4" />
-          </button>
-        </div>
-      </div>
+      )}
 
       {/* Canvas selector */}
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 flex-wrap">
         <input
           type="text"
           value={canvasIdInput}
           onChange={(e) => setCanvasIdInput(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && handleSwitchCanvas()}
-          placeholder="Canvas ID"
-          className="px-3 py-1.5 rounded-lg text-sm border"
-          style={{
-            background: 'var(--pc-bg-elevated)',
-            borderColor: 'var(--pc-border)',
-            color: 'var(--pc-text-primary)',
-          }}
+          placeholder={t('canvas.canvas_id_placeholder')}
+          className="h-9 px-3 rounded-[var(--radius-md)] text-sm border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pc-accent/40 focus-visible:border-pc-accent/40"
         />
-        <button
-          onClick={handleSwitchCanvas}
-          className="px-3 py-1.5 rounded-lg text-sm font-medium"
-          style={{ background: 'var(--pc-accent)', color: '#fff' }}
-        >
-          Switch
-        </button>
+        <Button size="md" onClick={handleSwitchCanvas}>
+          {t('canvas.switch')}
+        </Button>
         {canvasList.length > 0 && (
-          <div className="flex items-center gap-1 ml-2">
-            <span className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>Active:</span>
-            {canvasList.map((id) => (
-              <button
-                key={id}
-                onClick={() => {
-                  setCanvasIdInput(id);
-                  setCanvasId(id);
-                  setCurrentFrame(null);
-                  setHistory([]);
-                }}
-                className="px-2 py-0.5 rounded text-xs font-mono transition-colors"
-                style={{
-                  background: id === canvasId ? 'var(--pc-accent-dim)' : 'var(--pc-bg-elevated)',
-                  color: id === canvasId ? 'var(--pc-accent)' : 'var(--pc-text-muted)',
-                  borderColor: 'var(--pc-border)',
-                }}
-              >
-                {id}
-              </button>
-            ))}
+          <div className="flex items-center gap-1.5 ml-2 flex-wrap">
+            <span className="text-xs text-pc-text-muted">{t('canvas.active')}</span>
+            {canvasList.map((id) => {
+              const active = id === canvasId;
+              return (
+                <button
+                  key={id}
+                  onClick={() => {
+                    setCanvasIdInput(id);
+                    setCanvasId(id);
+                    setCurrentFrame(null);
+                    setHistory([]);
+                  }}
+                  className={[
+                    'px-2 py-1 rounded-[var(--radius-sm)] text-xs font-mono border transition-colors',
+                    active
+                      ? 'bg-pc-accent/10 text-pc-accent border-pc-accent/30'
+                      : 'bg-pc-elevated text-pc-text-muted border-pc-border hover:text-pc-text hover:border-pc-border-strong',
+                  ].join(' ')}
+                >
+                  {id}
+                </button>
+              );
+            })}
           </div>
         )}
       </div>
@@ -290,30 +350,24 @@ export default function Canvas() {
       {/* Main content area */}
       <div className="flex-1 flex gap-4 min-h-0">
         {/* Canvas viewer */}
-        <div
-          className="flex-1 rounded-lg border overflow-hidden"
-          style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-base)' }}
-        >
+        <div className="flex-1 rounded-[var(--radius-lg)] border border-pc-border bg-pc-base overflow-hidden shadow-[var(--pc-shadow-sm)]">
           {currentFrame ? (
             <iframe
               sandbox="allow-scripts"
               srcDoc={srcdoc}
               className="w-full h-full border-0"
-              title={`Canvas: ${canvasId}`}
+              title={`${t('canvas.iframe_title_prefix')}${canvasId}`}
               style={{ background: 'var(--pc-bg-base)' }}
             />
           ) : (
             <div className="flex items-center justify-center h-full">
               <div className="text-center">
-                <Monitor
-                  className="h-12 w-12 mx-auto mb-3 opacity-30"
-                  style={{ color: 'var(--pc-text-muted)' }}
-                />
-                <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
-                  Waiting for content on canvas <span className="font-mono">"{canvasId}"</span>
+                <Monitor className="h-12 w-12 mx-auto mb-3 text-pc-text-faint" />
+                <p className="text-sm text-pc-text-muted">
+                  {t('canvas.waiting_prefix')} <span className="font-mono text-pc-text-secondary">"{canvasId}"</span>
                 </p>
-                <p className="text-xs mt-1" style={{ color: 'var(--pc-text-muted)', opacity: 0.6 }}>
-                  The agent can push content here using the canvas tool
+                <p className="text-xs mt-1 text-pc-text-faint">
+                  {t('canvas.waiting_hint')}
                 </p>
               </div>
             </div>
@@ -322,74 +376,55 @@ export default function Canvas() {
 
         {/* History panel */}
         {showHistory && (
-          <div
-            className="w-64 rounded-lg border overflow-y-auto"
-            style={{
-              borderColor: 'var(--pc-border)',
-              background: 'var(--pc-bg-elevated)',
-            }}
-          >
-            <div
-              className="px-3 py-2 border-b text-xs font-medium sticky top-0"
-              style={{
-                borderColor: 'var(--pc-border)',
-                background: 'var(--pc-bg-elevated)',
-                color: 'var(--pc-text-muted)',
-              }}
-            >
-              Frame History ({history.length})
+          <Card padded={false} className="w-64 overflow-y-auto">
+            <div className="px-3 py-2 border-b border-pc-border text-[11px] font-medium uppercase tracking-wide text-pc-text-faint sticky top-0 bg-pc-surface">
+              {t('canvas.frame_history')} ({history.length})
             </div>
             {history.length === 0 ? (
-              <p className="p-3 text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-                No frames yet
-              </p>
+              <p className="p-3 text-xs text-pc-text-muted">{t('canvas.no_frames')}</p>
             ) : (
               <div className="space-y-1 p-2">
-                {[...history].reverse().map((frame) => (
-                  <button
-                    key={frame.frame_id}
-                    onClick={() => handleSelectHistoryFrame(frame)}
-                    className="w-full text-left px-2 py-1.5 rounded text-xs transition-colors"
-                    style={{
-                      background:
-                        currentFrame?.frame_id === frame.frame_id
-                          ? 'var(--pc-accent-dim)'
-                          : 'transparent',
-                      color: 'var(--pc-text-primary)',
-                    }}
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="font-mono truncate" style={{ color: 'var(--pc-accent)' }}>
-                        {frame.content_type}
-                      </span>
-                      <span style={{ color: 'var(--pc-text-muted)' }}>
-                        {new Date(frame.timestamp).toLocaleTimeString()}
-                      </span>
-                    </div>
-                    <div
-                      className="truncate mt-0.5"
-                      style={{ color: 'var(--pc-text-muted)', fontSize: '0.65rem' }}
+                {[...history].reverse().map((frame) => {
+                  const active = currentFrame?.frame_id === frame.frame_id;
+                  return (
+                    <button
+                      key={frame.frame_id}
+                      onClick={() => handleSelectHistoryFrame(frame)}
+                      className={[
+                        'w-full text-left px-2 py-1.5 rounded-[var(--radius-sm)] text-xs transition-colors border',
+                        active
+                          ? 'bg-pc-accent/10 border-pc-accent/30'
+                          : 'border-transparent hover:bg-[var(--pc-hover)]',
+                      ].join(' ')}
                     >
-                      {frame.content.substring(0, 60)}
-                      {frame.content.length > 60 ? '...' : ''}
-                    </div>
-                  </button>
-                ))}
+                      <div className="flex items-center justify-between">
+                        <span className="font-mono truncate text-pc-accent">
+                          {frame.content_type}
+                        </span>
+                        <span className="text-pc-text-muted">
+                          {new Date(frame.timestamp).toLocaleTimeString()}
+                        </span>
+                      </div>
+                      <div className="truncate mt-0.5 text-[0.65rem] text-pc-text-muted">
+                        {frame.content.substring(0, 60)}
+                        {frame.content.length > 60 ? '...' : ''}
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
             )}
-          </div>
+          </Card>
         )}
       </div>
 
       {/* Frame info bar */}
       {currentFrame && (
-        <div
-          className="flex items-center justify-between px-3 py-1.5 rounded-lg text-xs"
-          style={{ background: 'var(--pc-bg-elevated)', color: 'var(--pc-text-muted)' }}
-        >
+        <div className="flex items-center justify-between px-3 py-2 rounded-[var(--radius-md)] text-xs bg-pc-elevated border border-pc-border text-pc-text-muted">
           <span>
-            Type: <span className="font-mono">{currentFrame.content_type}</span> | Frame:{' '}
-            <span className="font-mono">{currentFrame.frame_id.substring(0, 8)}</span>
+            {t('canvas.type_label')} <span className="font-mono text-pc-text-secondary">{currentFrame.content_type}</span>
+            <span className="mx-2 text-pc-text-faint">|</span>
+            {t('canvas.frame_label')} <span className="font-mono text-pc-text-secondary">{currentFrame.frame_id.substring(0, 8)}</span>
           </span>
           <span>{new Date(currentFrame.timestamp).toLocaleString()}</span>
         </div>

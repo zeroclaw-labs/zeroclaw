@@ -332,6 +332,17 @@ pub async fn poll_device_code_tokens(
 /// If the callback server can't receive the redirect (e.g., remote/headless environment),
 /// the user can paste the full callback URL or just the code.
 pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> Result<String> {
+    ::zeroclaw_log::scope!(
+        model_provider_type: "gemini",
+        model_provider_alias: "oauth",
+        => async move {
+            receive_loopback_code_inner(expected_state, timeout).await
+        }
+    )
+    .await
+}
+
+async fn receive_loopback_code_inner(expected_state: &str, timeout: Duration) -> Result<String> {
     // Try to bind to the callback port
     let listener = match TcpListener::bind("127.0.0.1:1456").await {
         Ok(l) => l,

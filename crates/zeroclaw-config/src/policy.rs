@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -182,7 +183,7 @@ impl Default for PerSenderTracker {
 ///   `AccessMode::Read` grants.
 /// - `allowed_roots_write_only`: write but NOT read. Populated from
 ///   `AccessMode::Write` grants. The bot can append/overwrite under
-///   the path but `file_read` / `pdf_read` / `glob_search` /
+///   the path but `file_read` / `glob_search` /
 ///   `content_search` reject it.
 ///
 /// Read-side tools call [`SecurityPolicy::is_resolved_path_readable`],
@@ -202,6 +203,13 @@ pub struct SecurityPolicy {
     /// Whether and to which agents this profile may delegate.
     pub delegation_policy: crate::autonomy::DelegationPolicy,
     pub workspace_dir: PathBuf,
+    /// Absolute path to the active `config.toml`. Used to protect the
+    /// runtime config from agent self-modification regardless of how
+    /// deeply the per-agent workspace is nested under the install root
+    /// (the config lives at the install root, not at
+    /// `workspace_dir.parent()`). `None` falls back to the legacy
+    /// `workspace_dir.parent()` location.
+    pub config_path: Option<PathBuf>,
     pub workspace_only: bool,
     pub allowed_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
@@ -218,8 +226,8 @@ pub struct SecurityPolicy {
     /// Directories the agent can write but NOT read under. Populated
     /// from cross-agent `AccessMode::Write` grants at policy
     /// construction time. Empty when no write-only cross-agent access
-    /// is configured. Read-side tools (`file_read`, `pdf_read`,
-    /// `glob_search`, `content_search`) ignore this list; write-side
+    /// is configured. Read-side tools (`file_read`, `glob_search`,
+    /// `content_search`) ignore this list; write-side
     /// tools (`file_write`, `file_edit`, `git_operations`) honor it.
     pub allowed_roots_write_only: Vec<PathBuf>,
     pub max_actions_per_hour: u32,
@@ -265,11 +273,22 @@ impl SecurityPolicy {
             .allowed_tools
             .as_ref()
             .is_none_or(|list| list.iter().any(|t| t == name));
-        let excluded = self
-            .excluded_tools
+        allowed && !self.is_tool_excluded(name)
+    }
+
+    /// True when `name` is on the `excluded_tools` denylist.
+    ///
+    /// `excluded_tools` always subtracts, independent of the `allowed_tools`
+    /// allowlist. Skill-defined tools are gated by this denylist (not the
+    /// allowlist): they are granted explicitly via skill config, and
+    /// `builtin`-kind skill tools are scoped-elevation wrappers whose whole
+    /// purpose is to remain callable when the raw tool is not on the allowlist -
+    /// so applying the allowlist to them would defeat that mechanism. The
+    /// denylist still applies: excluding a skill tool by name removes it.
+    pub fn is_tool_excluded(&self, name: &str) -> bool {
+        self.excluded_tools
             .as_ref()
-            .is_some_and(|list| list.iter().any(|t| t == name));
-        allowed && !excluded
+            .is_some_and(|list| list.iter().any(|t| t == name))
     }
 }
 
@@ -539,6 +558,7 @@ impl Default for SecurityPolicy {
             risk_profile_name: String::new(),
             delegation_policy: crate::autonomy::DelegationPolicy::default(),
             workspace_dir: PathBuf::from("."),
+            config_path: None,
             workspace_only: true,
             allowed_commands: default_allowed_commands(),
             forbidden_paths: default_forbidden_paths(),
@@ -628,6 +648,62 @@ fn rootless_path(path: &Path) -> Option<PathBuf> {
     } else {
         Some(relative)
     }
+}
+
+struct NormalizedRootlessPath {
+    drive: Option<u8>,
+    text: String,
+}
+
+fn normalized_rootless_path_text(path: &Path) -> Option<NormalizedRootlessPath> {
+    let mut text = path.to_string_lossy().replace('\\', "/");
+
+    if let Some(rest) = text.strip_prefix("//?/UNC/") {
+        text = rest.to_string();
+    } else if let Some(rest) = text.strip_prefix("//?/") {
+        text = rest.to_string();
+    }
+
+    let mut drive = None;
+    let bytes = text.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        drive = Some(bytes[0].to_ascii_lowercase());
+        text = text[2..].to_string();
+    }
+
+    let parts: Vec<&str> = text
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+
+    if parts.is_empty() || parts.contains(&"..") {
+        None
+    } else {
+        Some(NormalizedRootlessPath {
+            drive,
+            text: parts.join("/"),
+        })
+    }
+}
+
+fn workspace_prefixed_relative_suffix(path: &Path, workspace_dir: &Path) -> Option<PathBuf> {
+    let path_text = normalized_rootless_path_text(path)?;
+    let workspace_text = normalized_rootless_path_text(workspace_dir)?;
+
+    if path_text.drive.is_some() && path_text.drive != workspace_text.drive {
+        return None;
+    }
+
+    if path_text.text == workspace_text.text {
+        return Some(PathBuf::new());
+    }
+
+    let prefix = format!("{}/", workspace_text.text);
+    path_text
+        .text
+        .strip_prefix(&prefix)
+        .map(|suffix| PathBuf::from(suffix.replace('/', std::path::MAIN_SEPARATOR_STR)))
 }
 
 // ── Shell Command Parsing Utilities ───────────────────────────────────────
@@ -1860,7 +1936,7 @@ impl SecurityPolicy {
 
     /// Validate that a resolved path is readable by the current
     /// security policy. Used by read-side tools (`file_read`,
-    /// `pdf_read`, `glob_search`, `content_search`) that should honor
+    /// `glob_search`, `content_search`) that should honor
     /// the read-write `allowed_roots` AND the read-only
     /// `allowed_roots_read_only` lists, plus the universal POSIX
     /// device files (`/dev/null`, `/dev/zero`, `/dev/random`,
@@ -1993,33 +2069,44 @@ impl SecurityPolicy {
         false
     }
 
-    fn runtime_config_dir(&self) -> Option<PathBuf> {
-        let parent = self.workspace_dir.parent()?;
-        Some(
-            parent
-                .canonicalize()
-                .unwrap_or_else(|_| parent.to_path_buf()),
-        )
+    /// Directories whose `config.toml`-family files are protected from
+    /// agent self-modification. Includes the real config directory (the
+    /// parent of `config_path`, i.e. the install root) and, for
+    /// backward compatibility with the legacy flat layout, the parent of
+    /// `workspace_dir`. The two differ once per-agent workspaces nest
+    /// under `<install>/agents/<alias>/workspace/`: the config lives at
+    /// the install root, which is no longer `workspace_dir.parent()`.
+    fn runtime_config_dirs(&self) -> Vec<PathBuf> {
+        let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(parent) = self.config_path.as_deref().and_then(Path::parent) {
+            dirs.push(canon(parent));
+        }
+        if let Some(parent) = self.workspace_dir.parent() {
+            let dir = canon(parent);
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+        dirs
     }
 
     pub fn is_runtime_config_path(&self, resolved: &Path) -> bool {
-        let Some(config_dir) = self.runtime_config_dir() else {
-            return false;
-        };
-        if !resolved.starts_with(&config_dir) {
-            return false;
-        }
-        if resolved.parent() != Some(config_dir.as_path()) {
-            return false;
-        }
-
         let Some(file_name) = resolved.file_name().and_then(|value| value.to_str()) else {
             return false;
         };
-
-        file_name == "config.toml"
+        let is_config_name = file_name == "config.toml"
             || file_name == "config.toml.bak"
-            || file_name.starts_with(".config.toml.tmp-")
+            || file_name.starts_with(".config.toml.tmp-");
+        if !is_config_name {
+            return false;
+        }
+        let Some(parent) = resolved.parent() else {
+            return false;
+        };
+        self.runtime_config_dirs()
+            .iter()
+            .any(|dir| parent == dir.as_path())
     }
 
     pub fn runtime_config_violation_message(&self, resolved: &Path) -> String {
@@ -2108,6 +2195,14 @@ impl SecurityPolicy {
                 } else {
                     self.workspace_dir.join(stripped)
                 }
+            } else if let Some(stripped) =
+                workspace_prefixed_relative_suffix(&expanded, &self.workspace_dir)
+            {
+                if stripped.as_os_str().is_empty() {
+                    self.workspace_dir.clone()
+                } else {
+                    self.workspace_dir.join(stripped)
+                }
             } else {
                 self.workspace_dir.join(expanded)
             }
@@ -2155,7 +2250,7 @@ impl SecurityPolicy {
     /// Check whether the given raw path falls under
     /// `allowed_roots` (rw), `allowed_roots_read_only`, OR
     /// `allowed_roots_write_only`. Read-side tools (`file_read`,
-    /// `pdf_read`, `glob_search`, `content_search`) call
+    /// `glob_search`, `content_search`) call
     /// [`Self::is_resolved_path_readable`] for the resolved-path form,
     /// which intentionally excludes the write-only tier. This raw-path
     /// helper is the union of all three, used where read+write tools
@@ -2336,6 +2431,9 @@ impl SecurityPolicy {
             risk_profile_name: String::new(),
             delegation_policy: risk_profile.delegation_policy.clone(),
             workspace_dir: workspace_dir.to_path_buf(),
+            // Set by `for_agent` once the install root is known; the
+            // profile-only constructor has no config path.
+            config_path: None,
             workspace_only: effective_workspace_only,
             allowed_commands: risk_profile.allowed_commands.clone(),
             forbidden_paths: risk_profile.forbidden_paths.clone(),
@@ -2413,10 +2511,26 @@ impl SecurityPolicy {
         // file_read/write/edit and the shell tool jail to the agent's
         // own dir, not the install-wide legacy path.
         let agent_workspace = config.agent_workspace_dir(agent_alias);
+        // The per-agent workspace is the shell tool's spawn cwd and the file-tool
+        // jail root. Create it here so every path that builds a per-agent policy
+        // (agent loop, gateway, channels) has the directory present. A missing cwd
+        // makes the shell tool's process spawn fail with ENOENT on a fresh agent.
+        std::fs::create_dir_all(&agent_workspace).with_context(|| {
+            format!(
+                "SecurityPolicy::for_agent: failed to create agent workspace dir {}",
+                agent_workspace.display()
+            )
+        })?;
         let mut policy = Self::from_profiles(risk_profile, runtime_profile, &agent_workspace);
         if let Some(agent_cfg) = config.agents.get(agent_alias) {
             policy.risk_profile_name = agent_cfg.risk_profile.trim().to_string();
         }
+        // Protect the active runtime config from agent self-modification.
+        // The per-agent workspace nests several levels under the install
+        // root, so `workspace_dir.parent()` alone no longer points at the
+        // directory holding `config.toml`. Record the real config path so
+        // `is_runtime_config_path` guards it directly.
+        policy.config_path = Some(config.config_path.clone());
 
         // Shared skills directory: every agent reads from
         // `<install>/shared/skills/` so the `read_skills` tool resolves
@@ -2717,6 +2831,30 @@ mod tests {
         assert!(!p.is_tool_allowed("spawn_subagent"));
     }
 
+    #[test]
+    fn is_tool_excluded_reflects_denylist_independent_of_allowlist() {
+        // No denylist → nothing excluded, regardless of allowlist.
+        let none = SecurityPolicy {
+            allowed_tools: Some(vec!["shell".into()]),
+            excluded_tools: None,
+            ..SecurityPolicy::default()
+        };
+        assert!(!none.is_tool_excluded("shell"));
+        assert!(
+            !none.is_tool_excluded("deploy__run"),
+            "a tool omitted from the allowlist is not 'excluded' — the denylist is separate"
+        );
+
+        // Denylist subtracts by name, independent of the allowlist.
+        let denied = SecurityPolicy {
+            allowed_tools: None,
+            excluded_tools: Some(vec!["deploy__status".into()]),
+            ..SecurityPolicy::default()
+        };
+        assert!(denied.is_tool_excluded("deploy__status"));
+        assert!(!denied.is_tool_excluded("deploy__run"));
+    }
+
     // ── from_profiles propagation coverage ────────────────────
     //
     // Every authorization-shaped field on RiskProfileConfig must reach
@@ -2742,6 +2880,7 @@ mod tests {
             always_ask: vec!["shell".into()],
             allowed_roots: vec!["/tmp/extra".into()],
             delegation_policy: crate::autonomy::DelegationPolicy::default(),
+            approval_route: None,
             allowed_tools: vec!["shell".into(), "memory_recall".into()],
             excluded_tools: vec!["spawn_subagent".into()],
             sandbox_enabled: Some(true),
@@ -2817,6 +2956,29 @@ mod tests {
         assert!(
             !policy.workspace_only,
             "Full autonomy must drop workspace_only even when the profile sets it true"
+        );
+    }
+
+    #[test]
+    fn from_profiles_empty_allowed_tools_means_unrestricted_not_deny_all() {
+        use crate::schema::RiskProfileConfig;
+        use std::path::Path;
+
+        let risk = RiskProfileConfig {
+            allowed_tools: Vec::new(),
+            ..RiskProfileConfig::default()
+        };
+
+        let policy = SecurityPolicy::from_profiles(&risk, None, Path::new("/ws"));
+
+        assert!(
+            policy.allowed_tools.is_none(),
+            "RiskProfileConfig cannot distinguish an omitted allowed_tools field \
+             from allowed_tools = []; both map to no authorization constraint"
+        );
+        assert!(
+            policy.is_tool_allowed("filesystem__write_file"),
+            "empty risk-profile allowed_tools is unrestricted, not deny-all"
         );
     }
 
@@ -4476,6 +4638,47 @@ mod tests {
     }
 
     #[test]
+    fn for_agent_creates_the_per_agent_workspace_dir() {
+        use crate::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        let root =
+            std::env::temp_dir().join(format!("zeroclaw-for-agent-mkdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut cfg = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        cfg.risk_profiles
+            .insert("default".into(), RiskProfileConfig::default());
+        cfg.agents.insert(
+            "agent_a".into(),
+            AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let ws = cfg.agent_workspace_dir("agent_a");
+        assert!(
+            !ws.exists(),
+            "precondition: workspace dir must not exist yet"
+        );
+
+        let policy = SecurityPolicy::for_agent(&cfg, "agent_a").unwrap();
+
+        assert!(
+            ws.exists(),
+            "for_agent must create the per-agent workspace dir at the chokepoint"
+        );
+        assert_eq!(
+            policy.workspace_dir, ws,
+            "policy cwd/jail root must be the created workspace dir"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn for_agent_unrestricted_filesystem_disables_workspace_only() {
         use crate::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
 
@@ -4897,6 +5100,32 @@ mod tests {
     }
 
     #[test]
+    fn resolve_tool_path_normalizes_windows_workspace_prefixed_relative_paths() {
+        let workspace = PathBuf::from(r"C:\Users\me\.zeroclaw\agents\default\workspace");
+        let p = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        let resolved =
+            p.resolve_tool_path(r"Users\me\.zeroclaw\agents\default\workspace\nested\out.txt");
+
+        assert_eq!(resolved, workspace.join("nested").join("out.txt"));
+    }
+
+    #[test]
+    fn resolve_tool_path_does_not_normalize_mismatched_drive_prefixed_relative_paths() {
+        let workspace = PathBuf::from(r"C:\Users\me\.zeroclaw\agents\default\workspace");
+        let p = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        let resolved =
+            p.resolve_tool_path(r"D:Users\me\.zeroclaw\agents\default\workspace\nested\out.txt");
+
+        assert_ne!(resolved, workspace.join("nested").join("out.txt"));
+    }
+
+    #[test]
     fn is_under_allowed_root_matches_allowed_roots() {
         let p = SecurityPolicy {
             workspace_dir: tp_ws(),
@@ -5284,6 +5513,46 @@ mod tests {
 
         assert!(!policy.is_runtime_config_path(&workspace.join("notes.txt")));
         assert!(!policy.is_runtime_config_path(&nested_dir.join("config.toml")));
+    }
+
+    #[test]
+    fn is_runtime_config_path_protects_install_root_for_nested_agent_layout() {
+        // Real per-agent layout: `<install>/agents/<alias>/workspace`, with
+        // the active config.toml at the install root, two levels above
+        // `workspace_dir.parent()`. Regression guard: the old check only
+        // looked at `workspace_dir.parent()`, leaving the install-root
+        // config.toml unprotected for nested agent workspaces.
+        let install_root = PathBuf::from("/tmp/zeroclaw-install-nested");
+        let workspace = install_root
+            .join("agents")
+            .join("agent-alpha")
+            .join("workspace");
+        let config_path = install_root.join("config.toml");
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            config_path: Some(config_path.clone()),
+            ..SecurityPolicy::default()
+        };
+
+        // The real config at the install root is now protected.
+        assert!(policy.is_runtime_config_path(&config_path));
+        assert!(policy.is_runtime_config_path(&install_root.join("config.toml.bak")));
+        assert!(policy.is_runtime_config_path(&install_root.join(".config.toml.tmp-42")));
+
+        // Legacy fallback (config_path = None) only guards
+        // `workspace.parent()`, so it misses the nested install-root
+        // config. This is exactly the gap the config_path field closes.
+        let legacy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        assert!(!legacy.is_runtime_config_path(&config_path));
+
+        // A config.toml inside the agent workspace is still not a runtime
+        // config path under either policy.
+        assert!(!policy.is_runtime_config_path(&workspace.join("config.toml")));
+        assert!(!legacy.is_runtime_config_path(&workspace.join("config.toml")));
     }
 
     // ── prompt_summary ──────────────────────────────────────

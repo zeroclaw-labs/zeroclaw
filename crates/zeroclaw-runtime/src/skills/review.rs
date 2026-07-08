@@ -56,6 +56,7 @@ pub async fn maybe_run_skill_review(
     max_tool_result_chars: usize,
     max_context_tokens: usize,
     cancellation_token: Option<&CancellationToken>,
+    agent_alias: Option<&str>,
 ) {
     if !config.enabled {
         return;
@@ -87,55 +88,76 @@ pub async fn maybe_run_skill_review(
     let review_input = build_review_input(&failed_slugs);
 
     let mut review_history = history;
+    let fork_start_len = review_history.len();
     review_history.push(ChatMessage::user(&review_input));
 
     let receipts: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let turn_id = uuid::Uuid::new_v4().to_string();
 
     let result = SKILL_REVIEW_ACTIVE
         .scope((), async {
-            crate::agent::loop_::run_tool_call_loop(
-                provider,
-                &mut review_history,
-                &tools,
-                observer,
-                provider_name,
-                model_name,
-                Some(0.3),      // temperature — low so the fork doesn't ramble
-                true,           // silent
-                None,           // approval: no human in the loop here
-                "skill_review", // channel_name
-                None,           // channel_reply_target
-                multimodal,
-                config.max_review_iterations as usize,
-                cancellation_token.cloned(), // cancellation_token
-                None,                        // on_delta
-                None,                        // hooks
-                &[],                         // excluded_tools
-                &[],                         // dedup_exempt_tools
-                None,                        // activated_tools
-                None,                        // model_switch_callback
-                pacing,
-                false, // strict_tool_parsing — lenient for the restricted fork
-                false, // parallel_tools — sequential for the mutation-capable fork
-                max_tool_result_chars,
-                max_context_tokens,
-                None, // shared_budget
-                None, // channel
-                None, // receipt_generator
-                Some(&receipts),
-                None, // event_tx
-                None, // steering
-                None, // new_messages_out
-                &crate::agent::loop_::LoopKnobs::default(),
-                None, // image_cache
-            )
+            crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                    crate::agent::loop_::ResolvedModelAccess {
+                        model_provider: provider,
+                        provider_name,
+                        model: model_name,
+                        temperature: Some(0.3),
+                    },
+                    crate::agent::loop_::ResolvedIo {
+                        tools_registry: &tools,
+                        observer,
+                        // low so the fork doesn't ramble
+                        silent: true,
+                        approval: None,
+                        multimodal_config: multimodal,
+                        hooks: None,
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        receipt_generator: None,
+                    },
+                    crate::agent::loop_::ResolvedRuntimeKnobs {
+                        max_tool_iterations: config.max_review_iterations as usize,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &[],
+                        pacing,
+                        strict_tool_parsing: false,
+                        // lenient for the restricted fork
+                        parallel_tools: false,
+                        // sequential for the mutation-capable fork
+                        max_tool_result_chars,
+                        context_token_budget: max_context_tokens,
+                        knobs: &crate::agent::loop_::LoopKnobs::default(),
+                    },
+                ),
+                history: &mut review_history,
+                // no human in the loop here
+                channel_name: "skill_review",
+                channel_reply_target: None,
+                cancellation_token: cancellation_token.cloned(),
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: Some(&receipts),
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                // Phase 1: stamp Internal/Trusted. Real per-transport
+                // stamping is PR C (RFC #6971 §4).
+                memory: None,
+                ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
+                agent_alias,
+                turn_id: &turn_id,
+            })
             .await
         })
         .await;
 
     match result {
         Ok(final_text) => {
-            let summary = summarize_actions(&receipts, &final_text);
+            let summary =
+                summarize_actions(&receipts, &review_history[fork_start_len..], &final_text);
             if !summary.is_empty() {
                 println!(
                     "{}",
@@ -199,7 +221,15 @@ fn count_tool_iterations(history: &[ChatMessage]) -> usize {
 
 /// Convert the review's tool receipts + final text into a one-line summary
 /// for the user. Returns "" if the fork did nothing notable.
-fn summarize_actions(receipts: &Mutex<Vec<String>>, final_text: &str) -> String {
+///
+/// `fork_history` must contain only messages produced by the review fork
+/// itself (not the parent turn), so that the fallback scan does not pick up
+/// tool results from the user's main turn.
+fn summarize_actions(
+    receipts: &Mutex<Vec<String>>,
+    fork_history: &[ChatMessage],
+    final_text: &str,
+) -> String {
     let receipts = receipts.lock().ok();
     let actions: Vec<String> = receipts
         .as_ref()
@@ -208,6 +238,18 @@ fn summarize_actions(receipts: &Mutex<Vec<String>>, final_text: &str) -> String 
 
     if !actions.is_empty() {
         return actions.join(" · ");
+    }
+
+    // The fork passes `collected_receipts` but `run_tool_call_loop` does not
+    // populate it without a receipt generator. Fall back to the tool-result
+    // messages produced by the review fork itself (not the parent turn).
+    let from_history: Vec<String> = fork_history
+        .iter()
+        .filter(|m| m.role == "tool")
+        .filter_map(|m| extract_action_summary(&m.content))
+        .collect();
+    if !from_history.is_empty() {
+        return from_history.join(" · ");
     }
 
     let trimmed = final_text.trim();
@@ -316,7 +358,7 @@ mod tests {
             "Patched skill 'deploy'.".to_string(),
             "Wrote references/staging.md for skill 'deploy'.".to_string(),
         ]);
-        let summary = summarize_actions(&receipts, "");
+        let summary = summarize_actions(&receipts, &[], "");
         assert!(summary.contains("patched deploy"));
         assert!(summary.contains("wrote file for deploy"));
     }
@@ -324,14 +366,14 @@ mod tests {
     #[test]
     fn summarize_actions_empty_for_nothing_to_save() {
         let receipts = Mutex::new(Vec::new());
-        let summary = summarize_actions(&receipts, "Nothing to save.");
+        let summary = summarize_actions(&receipts, &[], "Nothing to save.");
         assert_eq!(summary, "");
     }
 
     #[test]
     fn summarize_actions_empty_when_no_receipts_and_no_text() {
         let receipts = Mutex::new(Vec::new());
-        let summary = summarize_actions(&receipts, "");
+        let summary = summarize_actions(&receipts, &[], "");
         assert_eq!(summary, "");
     }
 
@@ -340,6 +382,7 @@ mod tests {
         let receipts = Mutex::new(Vec::new());
         let summary = summarize_actions(
             &receipts,
+            &[],
             "Noted that deploy needs DEPLOY_TOKEN.\nMore details below.",
         );
         assert!(summary.starts_with("Noted that deploy"));
@@ -350,10 +393,34 @@ mod tests {
         let receipts = Mutex::new(Vec::new());
         // 80+ chars of multi-byte content — must not panic on slicing.
         let text = "あ".repeat(50);
-        let summary = summarize_actions(&receipts, &text);
+        let summary = summarize_actions(&receipts, &[], &text);
         assert!(!summary.is_empty());
         // Verify it's valid UTF-8 (would have panicked if not).
         let _ = summary.chars().count();
+    }
+
+    #[test]
+    fn summarize_actions_reads_skill_manage_results_from_history() {
+        let receipts = Mutex::new(Vec::new());
+        let fork_history = vec![msg(
+            "tool",
+            "Patched skill 'file-lister' to provide a flat bullet list by default.",
+        )];
+        let summary = summarize_actions(&receipts, &fork_history, "ignored prose fallback");
+        assert_eq!(summary, "patched file-lister");
+    }
+
+    #[test]
+    fn summarize_actions_ignores_parent_turn_tool_messages() {
+        // A parent-turn tool message matching the action parser must not
+        // produce a false summary when the review fork itself did nothing.
+        let receipts = Mutex::new(Vec::new());
+        let fork_history: Vec<ChatMessage> = vec![]; // fork produced no tool messages
+        let summary = summarize_actions(&receipts, &fork_history, "Nothing to save.");
+        assert_eq!(
+            summary, "",
+            "parent-turn tool messages must not leak into the summary"
+        );
     }
 
     #[test]

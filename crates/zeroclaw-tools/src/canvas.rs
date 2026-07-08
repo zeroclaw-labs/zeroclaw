@@ -401,6 +401,33 @@ mod tests {
         assert!(store.snapshot("nonexistent").is_none());
     }
 
+    #[tokio::test]
+    async fn canvas_tool_renders_into_shared_store() {
+        // Regression for #7563: WS chat / ACP sessions must build the
+        // `canvas` tool from the gateway's shared CanvasStore so frames
+        // pushed by the agent are visible to the `/canvas` reader. The
+        // store is Arc-backed, so a clone handed to the tool and the
+        // handle the gateway reads from must observe the same frames.
+        let gateway_store = CanvasStore::new();
+        let tool = CanvasTool::new(gateway_store.clone());
+
+        let result = tool
+            .execute(json!({
+                "action": "render",
+                "canvas_id": "default",
+                "content_type": "html",
+                "content": "<h1>from chat</h1>",
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "render failed: {:?}", result.error);
+
+        let seen = gateway_store
+            .snapshot("default")
+            .expect("frame must be visible via the shared gateway store");
+        assert_eq!(seen.content, "<h1>from chat</h1>");
+    }
+
     #[test]
     fn canvas_store_clear_removes_content() {
         let store = CanvasStore::new();

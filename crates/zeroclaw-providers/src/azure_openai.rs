@@ -107,7 +107,9 @@ struct NativeToolSpec {
 struct NativeToolFunctionSpec {
     name: String,
     description: String,
-    parameters: serde_json::Value,
+    /// `Arc`-shared with the tool registry's stored schema — serialized
+    /// transparently, never deep-cloned per request (#8642).
+    parameters: std::sync::Arc<serde_json::Value>,
 }
 
 fn parse_native_tool_spec(value: serde_json::Value) -> anyhow::Result<NativeToolSpec> {
@@ -200,9 +202,13 @@ impl AzureOpenAiModelProvider {
             "https://{}.openai.azure.com/openai/deployments/{}",
             resource_name, deployment_name
         );
+        let credential = credential
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
         Self {
             alias: alias.to_string(),
-            credential: credential.map(ToString::to_string),
+            credential,
             resource_name: resource_name.to_string(),
             deployment_name: deployment_name.to_string(),
             api_version: version.to_string(),
@@ -249,7 +255,7 @@ impl AzureOpenAiModelProvider {
                     function: NativeToolFunctionSpec {
                         name: tool.name.clone(),
                         description: tool.description.clone(),
-                        parameters: tool.parameters.clone(),
+                        parameters: std::sync::Arc::clone(&tool.parameters),
                     },
                 })
                 .collect()
@@ -277,10 +283,7 @@ impl AzureOpenAiModelProvider {
                             },
                         })
                         .collect::<Vec<_>>();
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
+                    let content = crate::request_payload::non_empty_string_field(&value, "content");
                     let reasoning_content = value
                         .get("reasoning_content")
                         .and_then(serde_json::Value::as_str)
@@ -488,7 +491,12 @@ impl ModelProvider for AzureOpenAiModelProvider {
         let native_request = NativeChatRequest {
             messages: Self::convert_messages(request.messages),
             temperature,
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            // Omit tool_choice when the tool list is empty — Azure (and
+            // spec-compliant validators) reject tool_choice without a
+            // non-empty tools field (HTTP 400).
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools,
             reasoning_effort: self.reasoning_effort_for_model(model),
             max_completion_tokens: None,
@@ -566,7 +574,10 @@ impl ModelProvider for AzureOpenAiModelProvider {
         let native_request = NativeChatRequest {
             messages: Self::convert_messages(messages),
             temperature,
-            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
+            // See above: omit tool_choice when the tool list is empty.
+            tool_choice: native_tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools: native_tools,
             reasoning_effort: self.reasoning_effort_for_model(model),
             max_completion_tokens: None,
@@ -717,6 +728,32 @@ mod tests {
     fn creates_without_credential() {
         let p = AzureOpenAiModelProvider::new("test", None, "resource", "deployment", None, None);
         assert!(p.credential.is_none());
+    }
+
+    #[test]
+    fn blank_credential_is_treated_as_missing() {
+        let p = AzureOpenAiModelProvider::new(
+            "test",
+            Some("   \t  "),
+            "resource",
+            "deployment",
+            None,
+            None,
+        );
+        assert!(p.credential.is_none());
+    }
+
+    #[test]
+    fn credential_is_trimmed_before_storage() {
+        let p = AzureOpenAiModelProvider::new(
+            "test",
+            Some("  azure-test-credential \n"),
+            "resource",
+            "deployment",
+            None,
+            None,
+        );
+        assert_eq!(p.credential.as_deref(), Some("azure-test-credential"));
     }
 
     #[tokio::test]

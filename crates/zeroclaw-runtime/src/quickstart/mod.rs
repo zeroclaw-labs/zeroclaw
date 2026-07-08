@@ -1076,6 +1076,35 @@ fn apply_model_provider(
                     return None;
                 }
             }
+            // Auto-populate context_window from provider's /models endpoint if supported.
+            // Silently ignores failures (falls back to config default).
+            // Only runs on multi-threaded Tokio runtime (actual CLI), not single-threaded test runtime.
+            let provider_config = zeroclaw_config::schema::ModelProviderConfig {
+                model: Some(choice.model.clone()),
+                uri: config.get_prop(&format!("{prefix}.uri")).ok(),
+                api_key: choice
+                    .fields
+                    .get("api_key")
+                    .and_then(|v| if v.is_empty() { None } else { Some(v.clone()) }),
+                ..Default::default()
+            };
+            if tokio::runtime::Handle::try_current()
+                .map(|h| {
+                    matches!(
+                        h.runtime_flavor(),
+                        tokio::runtime::RuntimeFlavor::MultiThread
+                    )
+                })
+                .unwrap_or(false)
+                && let Some(ctx) = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        zeroclaw_providers::fetch_context_window(&provider_type, &provider_config),
+                    )
+                })
+            {
+                let _ = config
+                    .set_prop_persistent(&format!("{prefix}.context_window"), &ctx.to_string());
+            }
             Some(format!("{}.{}", provider_type, choice.alias))
         }
     }
@@ -1185,7 +1214,7 @@ fn apply_memory(
                     return None;
                 }
             };
-            if !section_has_alias(config, "storage", family, alias) {
+            if !storage_has_ref(config, reference) {
                 let path = format!("storage.{family}.{alias}");
                 errors.push(QuickstartError::for_surface(
                     ctx,
@@ -1673,7 +1702,13 @@ fn apply_agent(
     }
 
     let prefix = format!("agents.{}", identity.name);
-    if let Err(err) = config.create_map_key("agents", &identity.name) {
+    // Operator-facing surface: route through the shared guard so onboarding an
+    // agent literally named `default` is refused (the reserved runtime fallback),
+    // symmetric with the create/RPC/CLI surfaces. Non-`default` names create as
+    // before.
+    if let Err(err) =
+        zeroclaw_config::alias_refs::create_map_key_checked(config, "agents", &identity.name)
+    {
         errors.push(QuickstartError::new(
             QuickstartStep::Agent,
             "name",
@@ -1738,6 +1773,12 @@ fn section_has_alias(config: &Config, prefix: &str, family: &str, alias: &str) -
     false
 }
 
+fn storage_has_ref(config: &Config, reference: &str) -> bool {
+    collect_aliased_refs(&config.storage)
+        .iter()
+        .any(|configured| configured == reference)
+}
+
 /// Live model catalog for a provider type. `(models, pricing, live)`:
 /// `live=true` means surfaces should render a picker; `live=false`
 /// means fall back to free text. Tries `ModelProvider::list_models_with_pricing()`
@@ -1750,7 +1791,9 @@ pub async fn model_catalog(
     bool,
 ) {
     if let Ok(handle) = zeroclaw_providers::create_model_provider(model_provider, None)
-        && let Ok(models) = handle.list_models_with_pricing().await
+        && let Ok(models) = zeroclaw_providers::ProviderDispatch::from_ref(&*handle)
+            .list_models_with_pricing()
+            .await
         && !models.is_empty()
     {
         let raw_pricing: std::collections::HashMap<
@@ -1865,6 +1908,56 @@ mod tests {
                 personality_file: None,
                 personality_files: vec![],
             },
+        }
+    }
+
+    #[test]
+    fn existing_postgres_memory_storage_ref_is_accepted() {
+        let mut cfg = Config::default();
+        cfg.storage.postgres.insert(
+            "default".into(),
+            zeroclaw_config::schema::PostgresStorageConfig::default(),
+        );
+        let choice = SelectorChoice::Existing("postgres.default".to_string());
+        let mut errors = Vec::new();
+
+        let applied = apply_memory(&mut cfg, &choice, &mut errors, None);
+
+        assert!(errors.is_empty(), "apply_memory errors: {errors:?}");
+        assert_eq!(applied.as_deref(), Some("postgres.default"));
+        assert_eq!(cfg.memory.backend, "postgres.default");
+    }
+
+    #[test]
+    fn memory_storage_refs_from_snapshot_are_accepted() {
+        let mut cfg = Config::default();
+        cfg.storage.postgres.insert(
+            "default".into(),
+            zeroclaw_config::schema::PostgresStorageConfig::default(),
+        );
+        let snapshot = snapshot_state(&cfg);
+
+        assert!(
+            snapshot
+                .storage
+                .iter()
+                .any(|ref_| ref_ == "postgres.default"),
+            "snapshot should expose configured postgres storage: {:?}",
+            snapshot.storage
+        );
+        for reference in snapshot.storage {
+            let mut candidate = cfg.clone();
+            let choice = SelectorChoice::Existing(reference.clone());
+            let mut errors = Vec::new();
+
+            let applied = apply_memory(&mut candidate, &choice, &mut errors, None);
+
+            assert!(
+                errors.is_empty(),
+                "snapshot storage ref {reference:?} should apply without errors: {errors:?}"
+            );
+            assert_eq!(applied.as_deref(), Some(reference.as_str()));
+            assert_eq!(candidate.memory.backend, reference);
         }
     }
 

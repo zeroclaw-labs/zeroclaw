@@ -227,6 +227,39 @@ pub fn canonicalize_tool_result_media_markers(output: &str) -> String {
     rewritten
 }
 
+/// Tools whose output merely *lists* or *quotes* local filesystem paths
+/// (search hits, glob matches) rather than presenting an image as visual
+/// content. Their incidental image-file paths must NOT be auto-promoted to
+/// `[IMAGE:...]` markers: the agent loop counts the current iteration's
+/// tool-result markers (`multimodal::count_image_markers`) when deciding
+/// whether to switch to a vision provider, so a path echo here falsely
+/// triggers vision routing - producing a provider-capability error on a
+/// text-only provider. See PR #7345.
+///
+/// This is a denylist (default-allow): any other tool - including ones that
+/// genuinely *generate* or *fetch* an image and print its path (e.g.
+/// `image_gen`, `file_download`) - keeps canonicalization, so real
+/// tool-produced images still route to a configured vision provider.
+fn is_path_listing_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name.to_ascii_lowercase().as_str(),
+        "content_search" | "glob_search"
+    )
+}
+
+/// Provenance-aware wrapper around [`canonicalize_tool_result_media_markers`].
+///
+/// Returns the output unchanged for path-listing tools (`is_path_listing_tool`)
+/// so their incidental image paths never become routable `[IMAGE:...]` markers;
+/// all other tools are canonicalized exactly as before.
+pub fn canonicalize_tool_result_media_markers_for(tool_name: &str, output: &str) -> String {
+    if is_path_listing_tool(tool_name) {
+        output.to_string()
+    } else {
+        canonicalize_tool_result_media_markers(output)
+    }
+}
+
 /// Truncate a tool message's content, preserving JSON structure when the
 /// message stores `tool_call_id` alongside `content` (native tool-call
 /// format). Without this, `truncate_tool_result` destroys the JSON envelope
@@ -247,71 +280,56 @@ pub fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
     truncate_tool_result(msg_content, max_chars)
 }
 
-/// Aggressively trim old tool result messages in history to recover from
-/// context overflow. Keeps the last `protect_last_n` messages untouched.
-/// Returns total characters saved.
-pub fn fast_trim_tool_results(
-    history: &mut [zeroclaw_providers::ChatMessage],
-    protect_last_n: usize,
-) -> usize {
-    let trim_to = 2000;
-    let mut saved = 0;
-    let cutoff = history.len().saturating_sub(protect_last_n);
-    for msg in &mut history[..cutoff] {
-        if msg.role == "tool" && msg.content.len() > trim_to {
-            let original_len = msg.content.len();
-            msg.content = truncate_tool_message(&msg.content, trim_to);
-            saved += original_len - msg.content.len();
-        }
-    }
-    saved
-}
-
-/// Emergency: drop oldest non-system, non-recent messages from history.
-/// Tool groups (assistant + consecutive tool messages) are dropped
-/// atomically to preserve tool_use/tool_result pairing.
-/// Returns number of messages dropped.
-pub fn emergency_history_trim(
-    history: &mut Vec<zeroclaw_providers::ChatMessage>,
-    keep_recent: usize,
-) -> usize {
-    let mut dropped = 0;
-    let target_drop = history.len() / 3;
-    let mut i = 0;
-    while dropped < target_drop && i < history.len().saturating_sub(keep_recent) {
-        if history[i].role == "system" {
-            i += 1;
-        } else if history[i].role == "assistant" {
-            // Count following tool messages — drop as atomic group
-            let mut tool_count = 0;
-            while i + 1 + tool_count < history.len().saturating_sub(keep_recent)
-                && history[i + 1 + tool_count].role == "tool"
-            {
-                tool_count += 1;
-            }
-            for _ in 0..=tool_count {
-                history.remove(i);
-                dropped += 1;
-            }
-        } else {
-            history.remove(i);
-            dropped += 1;
-        }
-    }
-    dropped += remove_orphaned_tool_messages(history).removed;
-    dropped
+/// Estimate the token cost of a single message using the ~4 chars/token
+/// heuristic plus ~4 framing tokens (role, delimiters). Single-sourced so the
+/// history and system-floor estimates stay in lock-step.
+fn estimate_message_tokens(message: &ChatMessage) -> usize {
+    message.content.len().div_ceil(4) + 4
 }
 
 /// Estimate token count for a message history using ~4 chars/token heuristic.
 /// Includes a small overhead per message for role/framing tokens.
 pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
+    history.iter().map(estimate_message_tokens).sum()
+}
+
+/// Estimate the irreducible token floor of a history: the content trimming can
+/// never drop. That is every `system` message (system prompt + inlined tool
+/// definitions), which whole-turn trimming always keeps.
+///
+/// When this floor alone meets or exceeds the context budget, no amount of
+/// conversation trimming can bring the request under budget — trimming only
+/// sheds whole turns, never the protected system content (#5808). Callers use
+/// this to detect that condition and surface an actionable remediation hint
+/// (raise `[runtime_profiles.<name>] max_context_tokens` or reduce the tool
+/// surface) instead of a generic overflow error. Mirrors
+/// `estimate_history_tokens`' heuristic exactly.
+pub fn estimate_system_floor_tokens(history: &[ChatMessage]) -> usize {
     history
         .iter()
-        .map(|m| {
-            // ~4 chars per token + ~4 framing tokens per message (role, delimiters)
-            m.content.len().div_ceil(4) + 4
-        })
+        .filter(|m| m.role == "system")
+        .map(estimate_message_tokens)
         .sum()
+}
+
+/// Actionable one-line remediation for the #5808 floor-exceeds-budget
+/// condition. Names the resolved effective budget (`budget`) and the system
+/// floor (`system_floor`) the runtime actually measured, and points operators
+/// at the config surface they can change (`[runtime_profiles.<name>]
+/// max_context_tokens`) rather than the inert `agent.max_context_tokens` knob.
+///
+/// Every emission site (iteration-0 preemptive trim, the turn-boundary trim,
+/// and the in-loop reactive recovery) formats the visible message and its
+/// stderr copy through this one function, so the human-facing text and the
+/// structured log attrs can never drift and always name the same `N`.
+#[must_use]
+pub fn context_floor_remediation(system_floor: usize, budget: usize) -> String {
+    let floor_s = system_floor.to_string();
+    let budget_s = budget.to_string();
+    crate::i18n::get_required_cli_string_with_args(
+        "history-trim-floor-exceeds-budget",
+        &[("floor", floor_s.as_str()), ("budget", budget_s.as_str())],
+    )
 }
 
 pub fn normalize_system_messages(history: &mut Vec<ChatMessage>) {
@@ -502,6 +520,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn estimate_system_floor_counts_only_system_messages() {
+        let history = vec![
+            ChatMessage::system("You are helpful."), // 16 chars -> 4 + 4 = 8
+            ChatMessage::user("What is Rust?"),      // counted by history, not floor
+            ChatMessage::assistant("A language."),   // counted by history, not floor
+        ];
+        // Floor = system message only; conversation turns are prunable.
+        assert_eq!(estimate_system_floor_tokens(&history), 8);
+        assert!(estimate_system_floor_tokens(&history) < estimate_history_tokens(&history));
+    }
+
+    #[test]
+    fn estimate_system_floor_empty_and_no_system() {
+        assert_eq!(estimate_system_floor_tokens(&[]), 0);
+        let history = vec![ChatMessage::user("hi"), ChatMessage::assistant("yo")];
+        assert_eq!(estimate_system_floor_tokens(&history), 0);
+    }
+
+    #[test]
+    fn context_floor_remediation_names_budget_floor_and_runtime_profile_surface() {
+        let msg = context_floor_remediation(2000, 100);
+        // Names the resolved budget N the runtime actually used ...
+        assert!(
+            msg.contains("100"),
+            "remediation must name the resolved budget: {msg}"
+        );
+        // ... and the measured system floor ...
+        assert!(
+            msg.contains("2000"),
+            "remediation must name the system floor: {msg}"
+        );
+        // ... points at the config surface an operator can change ...
+        assert!(
+            msg.contains("[runtime_profiles"),
+            "remediation must point at the runtime-profile surface: {msg}"
+        );
+        // ... and never at the inert agent-inline knob (#6877).
+        assert!(
+            !msg.contains("agent.max_context_tokens"),
+            "remediation must not reference the inert agent.max_context_tokens: {msg}"
+        );
+    }
+
+    #[test]
     fn canonicalize_tool_result_media_markers_wraps_existing_local_image_path() {
         let dir = tempfile::tempdir().unwrap();
         let image = dir.path().join("generated.png");
@@ -529,6 +591,42 @@ mod tests {
         let input = "Already tagged [IMAGE:/tmp/already-tagged.png]";
         let output = canonicalize_tool_result_media_markers(input);
         assert_eq!(output, input);
+    }
+
+    #[test]
+    fn canonicalize_for_skips_path_listing_tools() {
+        // A search/listing tool that surfaces a real image path must be left
+        // untouched - promoting it to [IMAGE:...] would falsely trigger vision
+        // routing (PR #7345).
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("hit.png");
+        std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let input = format!("match: {}", image.display());
+
+        for tool in ["content_search", "glob_search", "GLOB_SEARCH"] {
+            let output = canonicalize_tool_result_media_markers_for(tool, &input);
+            assert_eq!(output, input, "{tool} output must be left untouched");
+            assert!(!output.contains("[IMAGE:"));
+        }
+    }
+
+    #[test]
+    fn canonicalize_for_wraps_image_producing_and_fetching_tools() {
+        // Default-allow: image_gen (produces) and file_download (fetches) keep
+        // canonicalization so a genuinely produced/fetched image still routes.
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("generated.png");
+        std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let input = format!("Saved to {}", image.display());
+        let expected = format!("[IMAGE:{}]", image.display());
+
+        for tool in ["image_gen", "file_download", "some_future_tool"] {
+            let output = canonicalize_tool_result_media_markers_for(tool, &input);
+            assert!(
+                output.contains(&expected),
+                "{tool} output should be canonicalized into a marker"
+            );
+        }
     }
 
     #[test]

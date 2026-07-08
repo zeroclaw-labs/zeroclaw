@@ -8,7 +8,7 @@
 //! Ref: <https://github.com/zeroclaw-labs/zeroclaw/issues/618> (item 6)
 
 use crate::support::helpers::{
-    StaticMemoryStrategy, build_agent, build_agent_xml, build_recording_agent, text_response,
+    StaticRecallMemory, build_agent, build_agent_xml, build_recording_agent, text_response,
     tool_response,
 };
 use crate::support::{CountingTool, EchoTool, MockModelProvider, RecordingModelProvider};
@@ -261,17 +261,16 @@ async fn e2e_multi_turn_history_fidelity() {
     );
 }
 
-/// Validates that a custom MemoryStrategy injects RAG context into user
-/// messages before they reach the model_provider.
+/// Validates that the engine's unified memory-context injection enriches
+/// the outgoing user message before it reaches the model_provider.
 #[tokio::test]
 async fn e2e_memory_enrichment_injects_context() {
     let (model_provider, recorded) =
         RecordingModelProvider::new(vec![text_response("enriched response")]);
 
-    let memory_context = "[Memory context]\n- user_name: test_user\n[/Memory context]\n\n";
-    let strategy = Arc::new(StaticMemoryStrategy::new(memory_context));
+    let mem = Arc::new(StaticRecallMemory::new(&[("user_name", "test_user")]));
 
-    let mut agent = build_recording_agent(Box::new(model_provider), vec![], Some(strategy));
+    let mut agent = build_recording_agent(Box::new(model_provider), vec![], Some(mem));
 
     let response = agent.turn("hello").await.unwrap();
     assert_eq!(response, "enriched response");
@@ -295,29 +294,31 @@ async fn e2e_memory_enrichment_injects_context() {
         user_msg.content,
     );
 
-    // Agent history also stores enriched message
+    // Agent history stores the CLEAN message: the engine injects the
+    // memory block per turn onto the outgoing request, and it is not
+    // persisted into conversation history (no stale-block accumulation).
     let history = agent.history();
     match &history[1] {
         ConversationMessage::Chat(c) => {
             assert_eq!(c.role, "user");
-            assert!(c.content.contains("[Memory context]"));
+            assert!(!c.content.contains("[Memory context]"));
             assert!(c.content.ends_with("hello"));
         }
         other => panic!("Expected Chat variant for user message, got: {other:?}"),
     }
 }
 
-/// Validates multi-turn conversation with memory enrichment: every user
-/// message is enriched, and the model_provider sees the full enriched history.
+/// Validates multi-turn conversation with memory enrichment: each turn's
+/// outgoing user message is enriched fresh; prior turns stay clean in
+/// history (memory blocks are per-request state, not persisted history).
 #[tokio::test]
 async fn e2e_multi_turn_with_memory_enrichment() {
     let (model_provider, recorded) =
         RecordingModelProvider::new(vec![text_response("answer 1"), text_response("answer 2")]);
 
-    let memory_context = "[Memory context]\n- project: zeroclaw\n[/Memory context]\n\n";
-    let strategy = Arc::new(StaticMemoryStrategy::new(memory_context));
+    let mem = Arc::new(StaticRecallMemory::new(&[("project", "zeroclaw")]));
 
-    let mut agent = build_recording_agent(Box::new(model_provider), vec![], Some(strategy));
+    let mut agent = build_recording_agent(Box::new(model_provider), vec![], Some(mem));
 
     let r1 = agent.turn("first question").await.unwrap();
     assert_eq!(r1, "answer 1");
@@ -334,15 +335,15 @@ async fn e2e_multi_turn_with_memory_enrichment() {
     assert!(req1_user.content.contains("project: zeroclaw"));
     assert!(req1_user.content.ends_with("first question"));
 
-    // Turn 2: both user messages enriched, assistant from turn 1 present
+    // Turn 2: only the CURRENT turn's user message is enriched. The
+    // engine injects per turn onto the outgoing request; earlier user
+    // messages stay clean in history (no stale-block accumulation).
     let req2_users: Vec<&ChatMessage> = requests[1].iter().filter(|m| m.role == "user").collect();
     assert_eq!(req2_users.len(), 2, "Request 2 should have 2 user messages");
 
-    // Turn 1 user message still enriched in history
-    assert!(req2_users[0].content.contains("[Memory context]"));
+    assert!(!req2_users[0].content.contains("[Memory context]"));
     assert!(req2_users[0].content.ends_with("first question"));
 
-    // Turn 2 user message also enriched
     assert!(req2_users[1].content.contains("[Memory context]"));
     assert!(req2_users[1].content.ends_with("second question"));
 
@@ -365,9 +366,9 @@ async fn e2e_empty_memory_context_passthrough() {
     let (model_provider, recorded) =
         RecordingModelProvider::new(vec![text_response("plain response")]);
 
-    let strategy = Arc::new(StaticMemoryStrategy::new(""));
+    let mem = Arc::new(StaticRecallMemory::new(&[]));
 
-    let mut agent = build_recording_agent(Box::new(model_provider), vec![], Some(strategy));
+    let mut agent = build_recording_agent(Box::new(model_provider), vec![], Some(mem));
 
     let response = agent.turn("hello").await.unwrap();
     assert_eq!(response, "plain response");

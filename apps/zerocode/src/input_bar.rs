@@ -17,6 +17,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::attachment::PendingAttachment;
@@ -390,6 +391,46 @@ fn wrapped_line_count(text: &str, width: u16) -> u16 {
         .unwrap_or(u16::MAX)
 }
 
+fn is_word_character(character: char) -> bool {
+    character == '_' || character.is_alphanumeric()
+}
+
+fn previous_word_boundary(text: &str, cursor: usize) -> Option<usize> {
+    let mut chars = text[..cursor].char_indices().rev();
+
+    let mut target_is_word = None;
+    for (_, character) in chars.by_ref() {
+        if character.is_whitespace() {
+            continue;
+        }
+        target_is_word = Some(is_word_character(character));
+        break;
+    }
+
+    let Some(target_is_word) = target_is_word else {
+        return (cursor > 0).then_some(0);
+    };
+
+    for (index, character) in chars {
+        if character.is_whitespace() || is_word_character(character) != target_is_word {
+            return Some(index + character.len_utf8());
+        }
+    }
+
+    Some(0)
+}
+
+/// Decide which overflow arrows to show for `(up, down)` given the total
+/// content rows, the visible window, and the current scroll offset. Arrows
+/// only appear when content exceeds the window.
+fn overflow_arrows(content_rows: u16, visible_rows: u16, scroll_offset: u16) -> (bool, bool) {
+    if content_rows <= visible_rows {
+        return (false, false);
+    }
+    let max_scroll = content_rows.saturating_sub(visible_rows);
+    (scroll_offset > 0, scroll_offset < max_scroll)
+}
+
 /// Map a byte offset within `text` to `(row, col)` in wrapped coordinates.
 /// `width` is the inner area width (excluding borders).
 fn cursor_to_visual(text: &str, cursor: usize, width: u16) -> (u16, u16) {
@@ -557,7 +598,6 @@ impl InputBarState {
         &self.clipboard_temps
     }
 
-    #[cfg(test)]
     pub fn has_file_explorer(&self) -> bool {
         self.file_explorer.is_some()
     }
@@ -748,7 +788,7 @@ impl InputBarState {
         self.update_autocomplete();
     }
 
-    /// Delete the character immediately before the cursor (backspace).
+    /// Delete the grapheme cluster immediately before the cursor (backspace).
     pub fn pop_input_char(&mut self) {
         if self.selection.is_some() {
             self.delete_selection();
@@ -756,33 +796,50 @@ impl InputBarState {
             return;
         }
         if self.cursor > 0 {
-            let prev = self.input[..self.cursor]
-                .char_indices()
+            let prev_grapheme = self.input[..self.cursor]
+                .graphemes(true)
                 .next_back()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            self.input.remove(prev);
-            self.cursor = prev;
+                .unwrap_or("");
+            let prev_start = self.cursor - prev_grapheme.len();
+            self.input.replace_range(prev_start..self.cursor, "");
+            self.cursor = prev_start;
             self.update_autocomplete();
         }
+    }
+
+    pub fn delete_previous_word(&mut self) {
+        if self.selection.is_some() {
+            self.delete_selection();
+            self.update_autocomplete();
+            return;
+        }
+        let Some(delete_from) = previous_word_boundary(&self.input, self.cursor) else {
+            return;
+        };
+        self.input.replace_range(delete_from..self.cursor, "");
+        self.cursor = delete_from;
+        self.update_autocomplete();
     }
 
     pub fn move_cursor_left(&mut self) {
         self.clear_selection();
         if self.cursor > 0 {
-            self.cursor = self.input[..self.cursor]
-                .char_indices()
+            let prev_grapheme = self.input[..self.cursor]
+                .graphemes(true)
                 .next_back()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
+                .unwrap_or("");
+            self.cursor -= prev_grapheme.len();
         }
     }
 
     pub fn move_cursor_right(&mut self) {
         self.clear_selection();
         if self.cursor < self.input.len() {
-            let c = self.input[self.cursor..].chars().next().unwrap();
-            self.cursor += c.len_utf8();
+            let next_grapheme = self.input[self.cursor..]
+                .graphemes(true)
+                .next()
+                .unwrap_or("");
+            self.cursor += next_grapheme.len();
         }
     }
 
@@ -884,6 +941,16 @@ impl InputBarState {
         self.clear_selection();
         self.dismiss_autocomplete();
         self.cleanup_temps();
+    }
+
+    /// Clear the typed text without disturbing pending attachments, history,
+    /// or clipboard temps. Bound to the ClearInput action.
+    pub fn clear_input(&mut self) {
+        self.input.clear();
+        self.cursor = 0;
+        self.scroll_offset = 0;
+        self.clear_selection();
+        self.dismiss_autocomplete();
     }
 
     /// Remove clipboard temp files (called after turn completes).
@@ -997,21 +1064,20 @@ impl InputBarState {
                 self.move_cursor_down();
                 return InputBarAction::Consumed;
             }
+            Some(IbWidgetAction::OpenFileBrowser) => {
+                let start = UserDirs::new()
+                    .map(|u| u.home_dir().to_path_buf())
+                    .unwrap_or_else(|| {
+                        if cfg!(windows) {
+                            PathBuf::from("C:\\")
+                        } else {
+                            PathBuf::from("/")
+                        }
+                    });
+                self.file_explorer = Some(FileExplorerState::new(start));
+                return InputBarAction::Consumed;
+            }
             Some(IbWidgetAction::CursorStart) => {
-                let was_ctrl_a = crate::keymap::Chord::ctrl('a').matches(&key);
-                if was_ctrl_a {
-                    let start = UserDirs::new()
-                        .map(|u| u.home_dir().to_path_buf())
-                        .unwrap_or_else(|| {
-                            if cfg!(windows) {
-                                PathBuf::from("C:\\")
-                            } else {
-                                PathBuf::from("/")
-                            }
-                        });
-                    self.file_explorer = Some(FileExplorerState::new(start));
-                    return InputBarAction::Consumed;
-                }
                 let width = self.last_inner_width;
                 if width > 0 {
                     let (row, _) = cursor_to_visual(&self.input, self.cursor, width);
@@ -1040,6 +1106,14 @@ impl InputBarState {
             }
             Some(IbWidgetAction::Backspace) => {
                 self.pop_input_char();
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::DeletePreviousWord) => {
+                self.delete_previous_word();
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::ClearInput) => {
+                self.clear_input();
                 return InputBarAction::Consumed;
             }
             _ => {}
@@ -1434,6 +1508,13 @@ impl InputBarState {
         let visible_rows = content_rows.min(MAX_INPUT_ROWS);
         let input_height = visible_rows + 2; // +2 for top/bottom border
 
+        // Clamp scroll to the valid range unconditionally so the paragraph
+        // offset and the overflow arrows always reflect the same true state,
+        // even on frames where the cursor-follow block below does not run
+        // (e.g. an approval overlay suppresses the cursor).
+        let max_scroll = content_rows.saturating_sub(visible_rows);
+        self.scroll_offset = self.scroll_offset.min(max_scroll);
+
         let mut constraints = vec![Constraint::Min(3)];
         if has_attachments {
             constraints.push(Constraint::Length(1));
@@ -1505,8 +1586,11 @@ impl InputBarState {
         }
 
         // Terminal owns cursor blinking; a software blink that skips
-        // set_cursor_position can latch the cursor hidden.
-        if show_cursor && !turn_in_flight && inner_width > 0 && self.file_explorer.is_none() {
+        // set_cursor_position can latch the cursor hidden. The cursor shows
+        // whenever the input box is editable — including while a turn is in
+        // flight, since the user can type a queued message then. Only an
+        // approval overlay (show_cursor=false) or the file browser suppress it.
+        if show_cursor && inner_width > 0 && self.file_explorer.is_none() {
             let (cursor_row, cursor_col) = cursor_to_visual(&self.input, self.cursor, inner_width);
 
             if cursor_row < self.scroll_offset {
@@ -1523,19 +1607,19 @@ impl InputBarState {
         }
 
         // Scroll indicators on the right border when content overflows.
-        if content_rows > MAX_INPUT_ROWS && input_area.width > 2 {
+        let (show_up, show_down) = overflow_arrows(content_rows, visible_rows, self.scroll_offset);
+        if (show_up || show_down) && input_area.width > 2 {
             let indicator_x = input_area.x + input_area.width - 1;
             let indicator_style = theme::accent_style();
 
-            if self.scroll_offset > 0 {
+            if show_up {
                 // Content above — show up arrow on top border.
                 let buf = f.buffer_mut();
                 buf[(indicator_x, input_area.y)]
                     .set_char('\u{25b2}')
                     .set_style(indicator_style);
             }
-            let max_scroll = content_rows.saturating_sub(MAX_INPUT_ROWS);
-            if self.scroll_offset < max_scroll {
+            if show_down {
                 // Content below — show down arrow on bottom border.
                 let buf = f.buffer_mut();
                 buf[(indicator_x, input_area.y + input_area.height - 1)]
@@ -1639,13 +1723,15 @@ impl crate::widgets::HelpContext for InputBarState {
                 ),
             ]);
         }
-        HelpNode::entries(vec![
-            E::key("Enter", crate::i18n::t("zc-input-help-send")),
-            E::key("Shift+Enter", crate::i18n::t("zc-input-help-newline")),
-            E::key("Ctrl+A", crate::i18n::t("zc-input-help-file-browser")),
-            E::key("Ctrl+V", crate::i18n::t("zc-input-help-paste")),
-            E::key("/attach", crate::i18n::t("zc-input-help-attach-cmd")),
-        ])
+        HelpNode::entries(crate::help::help_entries::<crate::keymap::InputBarAction>()).with_child(
+            HelpNode::titled(
+                crate::i18n::t("zc-input-help-slash-commands"),
+                SLASH_COMMANDS
+                    .iter()
+                    .map(|cmd| E::key(*cmd, String::new()))
+                    .collect(),
+            ),
+        )
     }
 }
 
@@ -1663,6 +1749,101 @@ mod tests {
         assert_eq!(bar.input(), "hi");
         let taken = bar.take_input();
         assert_eq!(taken, "hi");
+        assert_eq!(bar.input(), "");
+        assert_eq!(bar.cursor(), 0);
+    }
+
+    #[test]
+    fn clear_input_empties_text_and_resets_cursor() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello world");
+        assert_eq!(bar.cursor(), 11);
+        bar.clear_input();
+        assert_eq!(bar.input(), "");
+        assert_eq!(bar.cursor(), 0);
+    }
+
+    #[test]
+    fn ctrl_u_clears_input() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("scratch this");
+        let act = bar.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(matches!(act, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "");
+    }
+
+    #[test]
+    fn ctrl_w_deletes_previous_word() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello world");
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "hello ");
+        assert_eq!(bar.cursor(), 6);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_trailing_space_and_word() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello world   ");
+        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "hello ");
+        assert_eq!(bar.cursor(), 6);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_word_before_cursor() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello brave world");
+        for _ in 0..5 {
+            bar.move_cursor_left();
+        }
+        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "hello world");
+        assert_eq!(bar.cursor(), 6);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_selection() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello world");
+        bar.selection = Some((6, 11));
+        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "hello ");
+        assert_eq!(bar.cursor(), 6);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_punctuation_run_like_vim() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello world...");
+        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "hello world");
+        assert_eq!(bar.cursor(), 11);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_word_after_punctuation_like_vim() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("hello-world");
+        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "hello-");
+        assert_eq!(bar.cursor(), 6);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_only_whitespace_before_cursor() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = InputBarState::new();
+        bar.insert_text("   ");
+        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
         assert_eq!(bar.input(), "");
         assert_eq!(bar.cursor(), 0);
     }
@@ -2015,6 +2196,27 @@ mod tests {
     }
 
     #[test]
+    fn help_context_lists_slash_commands_from_canonical_source() {
+        use crate::widgets::HelpContext;
+        let bar = InputBarState::new();
+        let node = bar.help_context();
+        let title = crate::i18n::t("zc-input-help-slash-commands");
+        let section = node
+            .children
+            .iter()
+            .find(|c| c.title.as_deref() == Some(title.as_str()))
+            .expect("slash-commands section present");
+        let listed: Vec<String> = section.entries.iter().map(|e| e.key_str()).collect();
+        for cmd in SLASH_COMMANDS {
+            assert!(
+                listed.iter().any(|k| k == cmd),
+                "slash command {cmd} must appear in the help section"
+            );
+        }
+        assert_eq!(listed.len(), SLASH_COMMANDS.len());
+    }
+
+    #[test]
     fn model_provider_picker_command_returns_open_action() {
         let mut bar = InputBarState::new();
         bar.insert_text("/model-provider");
@@ -2043,6 +2245,29 @@ mod tests {
     }
 
     // ── Wrap geometry tests ──────────────────────────────────
+
+    #[test]
+    fn overflow_arrows_none_when_fits() {
+        assert_eq!(overflow_arrows(3, 5, 0), (false, false));
+        assert_eq!(overflow_arrows(5, 5, 0), (false, false));
+    }
+
+    #[test]
+    fn overflow_arrows_down_only_at_top() {
+        // 10 rows, window 5, scrolled to top: more below, none above.
+        assert_eq!(overflow_arrows(10, 5, 0), (false, true));
+    }
+
+    #[test]
+    fn overflow_arrows_both_in_middle() {
+        assert_eq!(overflow_arrows(10, 5, 2), (true, true));
+    }
+
+    #[test]
+    fn overflow_arrows_up_only_at_bottom() {
+        // max_scroll = 10 - 5 = 5; at offset 5 nothing remains below.
+        assert_eq!(overflow_arrows(10, 5, 5), (true, false));
+    }
 
     #[test]
     fn wrapped_line_count_empty() {

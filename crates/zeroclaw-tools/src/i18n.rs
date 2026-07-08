@@ -179,7 +179,36 @@ fn detect_locale() -> String {
         }
     }
 
-    "en".to_string()
+    locale_from_system().unwrap_or_else(|| "en".to_string())
+}
+
+/// Auto-detect locale from the OS when config sets none. Same as
+/// `zeroclaw-runtime`'s `i18n::detect_locale`: `sys-locale` is
+/// cross-platform — on Unix it checks `LANGUAGE` > `LC_ALL` > `LC_MESSAGES` >
+/// `LANG`, and on Windows/macOS it queries the OS directly.
+fn locale_from_system() -> Option<String> {
+    pick_locale(sys_locale::get_locales())
+}
+
+/// Pure: take the first candidate that isn't a POSIX "no locale" sentinel.
+/// Walks every candidate rather than just the first: `LC_ALL=C` (common in
+/// CI/containers to force deterministic tool output) would otherwise shadow
+/// a perfectly usable `LANG=zh_CN.UTF-8` and we'd give up instead of trying it.
+fn pick_locale(mut candidates: impl Iterator<Item = String>) -> Option<String> {
+    candidates.find_map(|raw| normalized_env_locale(&raw))
+}
+
+/// Pure: normalize a raw env-var locale value, rejecting the POSIX
+/// "no locale configured" sentinels ("", "C", "POSIX").
+fn normalized_env_locale(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("c")
+        || trimmed.eq_ignore_ascii_case("posix")
+    {
+        return None;
+    }
+    Some(normalize_locale(trimmed))
 }
 
 fn locale_from_table(table: toml::Table) -> Option<String> {
@@ -194,6 +223,38 @@ fn normalize_locale(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalized_env_locale_rejects_posix_sentinels() {
+        assert_eq!(normalized_env_locale(""), None);
+        assert_eq!(normalized_env_locale("   "), None);
+        assert_eq!(normalized_env_locale("C"), None);
+        assert_eq!(normalized_env_locale("posix"), None);
+    }
+
+    #[test]
+    fn normalized_env_locale_normalizes_posix_format() {
+        assert_eq!(
+            normalized_env_locale("zh_CN.UTF-8"),
+            Some("zh-CN".to_string())
+        );
+        assert_eq!(normalized_env_locale(" ja "), Some("ja".to_string()));
+    }
+
+    #[test]
+    fn pick_locale_skips_posix_sentinel_to_find_a_usable_candidate() {
+        let candidates = ["C".to_string(), "zh-CN".to_string()];
+        assert_eq!(
+            pick_locale(candidates.into_iter()),
+            Some("zh-CN".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_locale_returns_none_when_all_candidates_are_sentinels() {
+        let candidates = ["C".to_string(), "POSIX".to_string(), "".to_string()];
+        assert_eq!(pick_locale(candidates.into_iter()), None);
+    }
 
     #[test]
     fn file_download_schema_strings_are_in_tools_catalogue() {
