@@ -266,6 +266,11 @@ zc-quickstart-selector-agent = Agent
 zc-quickstart-selector-submit = Submit
 
 zc-quickstart-reuse-alias-help = Reuse this alias instead of creating a new one.
+zc-quickstart-existing-providers-heading = Existing providers
+zc-quickstart-existing-providers-show-more = [+ Show { $count } more existing providers]
+zc-quickstart-existing-providers-show-fewer = [- Show fewer existing providers]
+zc-quickstart-new-provider-heading = Create new provider
+zc-quickstart-provider-alias-exists = Alias `{ $alias }` already exists. Pick another alias or use the existing provider.
 
 zc-quickstart-risk-locked-down = Locked Down
 zc-quickstart-risk-locked-down-desc = Tight defaults. Workspace-only fs, approval on med/high risk.
@@ -316,6 +321,11 @@ zc-quickstart-status-first-error = { $where }{ $field }: { $message }{ $more }
 zc-quickstart-status-more-errors = { " " }(+{ $count } more)
 zc-quickstart-status-can-create = All required selectors ✓. Press `{ $chord }` to Create.
 zc-quickstart-status-hint = ↑/↓ to move, Enter to open. `{ $chord }` enables when all required selectors are ✓.
+zc-quickstart-missing-model-provider = Choose a model provider before creating.
+zc-quickstart-missing-risk-profile = Choose a risk profile before creating.
+zc-quickstart-missing-runtime-profile = Choose a runtime profile before creating.
+zc-quickstart-missing-memory = Choose a memory backend before creating.
+zc-quickstart-missing-agent = Name the agent before creating.
 
 zc-quickstart-channels-empty = No channels configured. An agent without channels still works via `zeroclaw agent <name>` from the CLI.
 zc-quickstart-channels-add = + Add channel
@@ -335,6 +345,7 @@ zc-chat-pane-acp = ACP
 zc-chat-no-agents = No enabled agents yet. Open Quickstart to create one, or use Config to add and enable an agent.
 zc-chat-error-fetch-agents = Failed to fetch agents: { $error }
 zc-chat-error-create-session = Failed to create session: { $error }
+zc-chat-elicitation-dropped = A prompt from the agent was dropped before it could be shown (the client fell behind). The agent's question may be waiting; try again.
 zc-chat-session-restarted = New session started.
 zc-chat-session-restart-error = Failed to start a new session: { $error }
 

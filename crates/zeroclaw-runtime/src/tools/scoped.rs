@@ -949,6 +949,7 @@ mod tests {
             connect_mcp: false,
             connect_peripherals: false,
             exclude_memory: false,
+            list_deferred_mcp_specs: false,
             emit_assembly_logs: false,
         })
         .await;

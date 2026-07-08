@@ -22,8 +22,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use zeroclaw_api::model_provider::{ChatRequest, ChatResponse};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
-use zeroclaw_providers::ModelProvider;
+use zeroclaw_providers::{ModelProvider, ProviderDispatch};
 
 use super::{LoopKnobs, ModelSwitchCallback};
 use crate::agent::tool_receipts::ReceiptGenerator;
@@ -41,6 +42,38 @@ pub struct ResolvedModelAccess<'a> {
     pub provider_name: &'a str,
     pub model: &'a str,
     pub temperature: Option<f64>,
+}
+
+impl ResolvedModelAccess<'_> {
+    /// The one metered, attribution-preserving, non-streaming provider call.
+    ///
+    /// Budget-gate, then dispatch through [`ProviderDispatch`] (which opens the
+    /// single `attribution_span!` for the call - see #7748; do NOT wrap another),
+    /// then record token usage against the enclosing tool-loop cost tracker.
+    ///
+    /// Metering degrades to a no-op (not an error) when there is no
+    /// `TOOL_LOOP_COST_TRACKING_CONTEXT` scope on the current task (tests, CLI
+    /// without cost tracking): the budget check allows and usage recording is
+    /// skipped. This is the shared entry point for one-shot LLM queries that are
+    /// not full agentic turns (skill reflection today; the reply-intent
+    /// classifier, graceful-summary, and other ad-hoc callers as they are routed
+    /// through it). The engine's streaming turn call stays in
+    /// `provider_call::call_provider`, which additionally emits the
+    /// `TurnCtx`-bound announce/observer surface this method deliberately omits.
+    pub async fn run_model_query(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse> {
+        // Fail closed before spending a provider call when the enclosing turn's
+        // cost budget is already exhausted. No-op when unscoped.
+        crate::agent::turn::provider_call::enforce_tool_loop_budget()?;
+        let resp = ProviderDispatch::from_ref(self.model_provider)
+            .chat(request, self.model, self.temperature)
+            .await?;
+        // Record spend immediately after the call (before any caller-side output
+        // validation) so a downstream failure still counts the provider usage.
+        if let Some(usage) = resp.usage.as_ref() {
+            crate::agent::cost::record_tool_loop_cost_usage(self.provider_name, self.model, usage);
+        }
+        Ok(resp)
+    }
 }
 
 /// The per-agent-stable execution context the turn engine requires: the model
@@ -154,5 +187,119 @@ impl<'a> ResolvedAgentExecution<'a> {
             receipt_generator: io.receipt_generator,
             knobs: runtime.knobs,
         }
+    }
+}
+
+#[cfg(test)]
+mod run_model_query_tests {
+    use super::ResolvedModelAccess;
+    use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_api::model_provider::{ChatRequest, ChatResponse};
+    use zeroclaw_providers::traits::TokenUsage;
+    use zeroclaw_providers::{ChatMessage, ModelProvider};
+
+    /// Provider stub returning a fixed reply WITH token usage, so the seam's
+    /// cost-recording path has something to record.
+    struct UsageProvider;
+
+    #[async_trait]
+    impl ModelProvider for UsageProvider {
+        // Required by the trait but unused: `run_model_query` dispatches through
+        // `chat`, which is overridden below to carry token usage.
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(100),
+                    output_tokens: Some(20),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl Attributable for UsageProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "usage-provider"
+        }
+    }
+
+    fn access(provider: &UsageProvider) -> ResolvedModelAccess<'_> {
+        ResolvedModelAccess {
+            model_provider: provider,
+            provider_name: "custom",
+            model: "test-model",
+            temperature: None,
+        }
+    }
+
+    // Unscoped: no cost-tracking context on the task. Budget-gate allows (no-op),
+    // usage recording is skipped, and the call still returns the provider's
+    // response. This is the tests / CLI-without-cost shape.
+    #[tokio::test]
+    async fn run_model_query_returns_response_and_no_op_meters_when_unscoped() {
+        let provider = UsageProvider;
+        let messages = [ChatMessage::user("hi")];
+        let resp = access(&provider)
+            .run_model_query(ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            })
+            .await
+            .expect("query ok");
+        assert_eq!(resp.text.as_deref(), Some("ok"));
+    }
+
+    // Scoped: an accumulation-only cost context is present, so the seam records
+    // the returned token usage into the turn accumulator (proving budget-gate ->
+    // dispatch -> record are wired, not just the dispatch).
+    #[tokio::test]
+    async fn run_model_query_records_usage_under_cost_scope() {
+        let provider = UsageProvider;
+        let messages = [ChatMessage::user("hi")];
+        let ctx = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = Arc::clone(&ctx.turn_usage);
+
+        let resp = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ctx), async {
+                access(&provider)
+                    .run_model_query(ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    })
+                    .await
+            })
+            .await
+            .expect("query ok");
+
+        assert_eq!(resp.text.as_deref(), Some("ok"));
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 100);
+        assert_eq!(recorded.output_tokens, 20);
     }
 }

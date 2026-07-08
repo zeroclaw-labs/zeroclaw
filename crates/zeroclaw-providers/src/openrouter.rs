@@ -12,6 +12,7 @@ use futures_util::stream;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use zeroclaw_api::tool::ToolSpec;
 
 pub struct OpenRouterModelProvider {
@@ -136,7 +137,9 @@ struct NativeToolSpec {
 struct NativeToolFunctionSpec {
     name: String,
     description: String,
-    parameters: serde_json::Value,
+    /// `Arc`-shared with the tool registry's stored schema — serialized
+    /// transparently, never deep-cloned per request (#8642).
+    parameters: Arc<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -241,7 +244,7 @@ impl OpenRouterModelProvider {
                 function: NativeToolFunctionSpec {
                     name: tool.name.clone(),
                     description: tool.description.clone(),
-                    parameters: tool.parameters.clone(),
+                    parameters: Arc::clone(&tool.parameters),
                 },
             })
             .collect();
@@ -937,10 +940,11 @@ impl ModelProvider for OpenRouterModelProvider {
                                 .and_then(|d| d.as_str())
                                 .unwrap_or("")
                                 .to_string(),
-                            parameters: func
-                                .get("parameters")
-                                .cloned()
-                                .unwrap_or(serde_json::json!({})),
+                            parameters: Arc::new(
+                                func.get("parameters")
+                                    .cloned()
+                                    .unwrap_or(serde_json::json!({})),
+                            ),
                         },
                     })
                 })
@@ -1894,17 +1898,17 @@ mod tests {
             ToolSpec {
                 name: "valid_tool".into(),
                 description: "A valid tool".into(),
-                parameters: serde_json::json!({"type": "object"}),
+                parameters: serde_json::json!({"type": "object"}).into(),
             },
             ToolSpec {
                 name: "mcp:server.bad".into(),
                 description: "Invalid name".into(),
-                parameters: serde_json::json!({"type": "object"}),
+                parameters: serde_json::json!({"type": "object"}).into(),
             },
             ToolSpec {
                 name: "another-valid".into(),
                 description: "Also valid".into(),
-                parameters: serde_json::json!({"type": "object"}),
+                parameters: serde_json::json!({"type": "object"}).into(),
             },
         ];
 
@@ -1931,13 +1935,13 @@ mod tests {
             ToolSpec {
                 name: "openrouter-spend__check_openrouter_spend".into(),
                 description: "Skill tool".into(),
-                parameters: serde_json::json!({"type": "object"}),
+                parameters: serde_json::json!({"type": "object"}).into(),
             },
             // Old format — must still be rejected so the regression stays caught.
             ToolSpec {
                 name: "openrouter-spend.check_openrouter_spend".into(),
                 description: "Skill tool with legacy dotted name".into(),
-                parameters: serde_json::json!({"type": "object"}),
+                parameters: serde_json::json!({"type": "object"}).into(),
             },
         ];
 
@@ -1960,7 +1964,7 @@ mod tests {
         let tools = vec![ToolSpec {
             name: "mcp:bad.name".into(),
             description: "Invalid".into(),
-            parameters: serde_json::json!({"type": "object"}),
+            parameters: serde_json::json!({"type": "object"}).into(),
         }];
 
         assert!(OpenRouterModelProvider::convert_tools(Some(&tools)).is_none());
