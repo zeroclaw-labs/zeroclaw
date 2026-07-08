@@ -1,0 +1,89 @@
+name: Cross-Platform Clippy
+
+on:
+  # Manual plus scheduled only: keep platform-gated lint regressions visible
+  # without adding macOS/Windows latency to the required PR gate.
+  workflow_dispatch:
+  schedule:
+    - cron: "17 10 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  clippy:
+    name: Clippy (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+          components: clippy
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Ensure web/dist placeholder exists
+        shell: bash
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Clippy
+        shell: bash
+        run: |
+          set +e
+          cargo_log="${RUNNER_TEMP}/cargo-clippy-${{ matrix.target }}.log"
+          SECONDS=0
+          cargo clippy \
+            --workspace \
+            --exclude zeroclaw-desktop \
+            --all-targets \
+            --features ci-all \
+            --target ${{ matrix.target }} \
+            -- -D warnings 2>&1 | tee "$cargo_log"
+          cargo_status=${PIPESTATUS[0]}
+          duration_seconds=$SECONDS
+          set -e
+
+          workspace_path_compiles="$(grep -E -c 'Compiling.*\([^)]*zeroclaw' "$cargo_log" || true)"
+          total_compiles="$(grep -c 'Compiling' "$cargo_log" || true)"
+          downloaded_crates="$(grep -c 'Downloaded' "$cargo_log" || true)"
+          cache_hit="${RUST_CACHE_HIT:-unknown}"
+          summary_file="${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          {
+            echo "### Cross-platform Clippy diagnostics: ${{ matrix.target }}"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Target | \`${{ matrix.target }}\` |"
+            echo "| Runner OS | \`${{ runner.os }}\` |"
+            echo "| Rust cache exact hit | \`${cache_hit}\` |"
+            echo "| Clippy duration | \`${duration_seconds}s\` |"
+            echo "| Clippy status | \`${cargo_status}\` |"
+            echo "| Workspace path compile lines | \`${workspace_path_compiles}\` |"
+            echo "| Total compile lines | \`${total_compiles}\` |"
+            echo "| Downloaded crate lines | \`${downloaded_crates}\` |"
+          } >> "$summary_file"
+
+          exit "$cargo_status"
+        env:
+          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}

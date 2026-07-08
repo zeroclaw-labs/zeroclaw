@@ -376,6 +376,8 @@ impl Channel for DingTalkChannel {
                         interruption_scope_id: None,
                         attachments: vec![],
                         subject: None,
+
+                        ..Default::default()
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -400,6 +402,15 @@ impl Channel for DingTalkChannel {
 
     async fn health_check(&self) -> bool {
         self.register_connection().await.is_ok()
+    }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator API in the DingTalk Open Platform.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 

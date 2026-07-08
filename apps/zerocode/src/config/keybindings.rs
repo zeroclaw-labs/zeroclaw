@@ -14,8 +14,8 @@ use anyhow::{Result, bail};
 use crossterm::event::KeyCode;
 
 use crate::keymap::{
-    ChatTabAction, Chord, ConfigTabAction, DashboardTabAction, FileExplorerAction, GlobalAction,
-    InputBarAction, LogsTabAction, QuickstartTabAction, RebindableActions,
+    ChatTabAction, Chord, ConfigTabAction, DashboardTabAction, DoctorTabAction, FileExplorerAction,
+    GlobalAction, InputBarAction, LogsTabAction, QuickstartTabAction, RebindableActions,
     overrides::OverrideTable,
 };
 
@@ -39,6 +39,7 @@ fn all_defaults() -> HashMap<String, Vec<Chord>> {
     fill_defaults::<LogsTabAction>(&mut map);
     fill_defaults::<DashboardTabAction>(&mut map);
     fill_defaults::<ConfigTabAction>(&mut map);
+    fill_defaults::<DoctorTabAction>(&mut map);
     fill_defaults::<QuickstartTabAction>(&mut map);
     fill_defaults::<InputBarAction>(&mut map);
     fill_defaults::<FileExplorerAction>(&mut map);

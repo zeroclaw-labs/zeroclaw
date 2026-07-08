@@ -109,11 +109,13 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "clawdtalk",
     "reddit",
     "bluesky",
+    "git",
     "voice_call",
     "voice_wake",
     "voice_duplex",
     "mqtt",
     "amqp",
+    "filesystem",
 ];
 
 impl V2Config {

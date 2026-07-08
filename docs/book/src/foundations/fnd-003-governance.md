@@ -74,7 +74,7 @@ These are three distinct concerns. Conflating them, putting everything in one bo
 |---|---|---|
 | Work pipeline (backlog → release) | **GitHub Projects v2** | Custom fields, multiple views, Kanban + roadmap, built-in automation, milestone tracking |
 | Community discussion and idea incubation | **GitHub Discussions** | Community-visible, no PR required, separates early conversation from committed work, promotes concrete outcomes into the owning tracked surface |
-| Governance and decision authority | **RFC process + Team Tiers + CODEOWNERS** | Already partially established via `docs/proposals/`; needs formalization and close loop |
+| Governance and decision authority | **RFC process + Team Tiers + CODEOWNERS** | Established through RFC issues, foundation docs, and CODEOWNERS; needs formalization and close loop |
 
 The key principle: **the Project board contains only work the team has committed to thinking about.** Early community discussion, ideas, Q&A, and showcases can live in Discussions when the lane is maintained. Work that has been evaluated, accepted, and scoped lives in the Project. This distinction is what keeps the board useful.
 
@@ -227,13 +227,13 @@ Use this split:
 | Surface | Owns | Does not own |
 |---|---|---|
 | Labels | durable classification: type, scope, risk, size, contributor tier, stale/triage policy | per-push review state, active CI status, personal task lists |
-| Project board | planning state: readiness, active owner or steward path, roadmap grouping, dependency/blocker state, stale-exemption reason when a field exists | authoritative PR review queue, mergeability, required checks |
+| Project board | planning state: readiness, routing evidence, roadmap grouping, dependency/blocker state, stale-exemption reason when a field exists | authoritative PR review queue, mergeability, required checks |
 | Native PR state | review decision, required checks, branch freshness, conflicts, mergeability, draft/ready state | long-term roadmap ownership |
 | Issues/RFCs | durable discussion record, acceptance state, user need, linked implementation trail | live replacement for maintainer docs after policy promotion |
 
 PR lanes, contributor-pickup labels, stale-exemption labels, and label migration are durable governance concepts, but their exact operational criteria live in maintainer docs. FND-003 owns the split: labels classify durable work, project boards plan work, native PR state owns live review and merge state, and issues/RFCs preserve decisions. The [Maintainer PR workflow](../maintainers/pr-workflow.md#pr-lanes) owns PR lane definitions, the [Labels guide](../maintainers/labels.md) owns exact label meanings and cleanup rules, and the [Reviewer playbook](../maintainers/reviewer-playbook.md#issue-triage) owns how reviewers apply those signals during triage and review. Treat live label migration as a separate maintainer-approved cleanup, not ordinary PR review.
 
-Stale exemptions are governance exceptions, not permanent label shields. The target policy is that `status:no-stale` is valid only when the lane's operational source records both why the issue is exempt and who owns the next movement. The maintainer docs define where those facts live and how stale automation or stale sweeps enforce the rule.
+Stale exemptions are governance exceptions, not permanent label shields. The target policy is that `status:no-stale` is valid only when the lane's operational source records why the issue is exempt and what visible routing evidence carries the next decision. The maintainer docs define where those facts live and how stale automation or stale sweeps enforce the rule.
 
 ---
 
@@ -243,7 +243,7 @@ Stale exemptions are governance exceptions, not permanent label shields. The tar
 
 Treat GitHub Discussions as a maintained community surface. Discussions are useful for questions, ideas, polls, announcements, showcases, project or integration demos, and exploratory threads that need more permanence than Discord but are not yet tracked work.
 
-Exact categories, category descriptions, and steward cadence are operational details. They belong in the contributor communication guide and maintainer stewardship docs, and they may evolve without revising this foundation document.
+Exact categories, category descriptions, and review cadence are operational details. They belong in the contributor communication guide and maintainer workflow docs, and they may evolve without revising this foundation document.
 
 ### 4.2 Promotion From Discussion To Tracked Work
 
@@ -387,7 +387,7 @@ Create `.github/CODEOWNERS`:
 ```
 # CODEOWNERS — Automatic review routing by risk tier
 # See AGENTS.md for risk tier definitions.
-# See docs/proposals/project-governance.md for team tier definitions.
+# See the governance foundation doc and RFC issue template for team tier definitions.
 
 # ── High Risk: requires Core Team approval ──────────────────────────────────
 
@@ -407,8 +407,8 @@ deny.toml                       @zeroclaw-labs/zeroclaw-core
 
 # ── Architecture documents: requires Core Team review ───────────────────────
 
-docs/proposals/**               @zeroclaw-labs/zeroclaw-core
-docs/architecture/decisions/**  @zeroclaw-labs/zeroclaw-core
+docs/book/src/foundations/**    @zeroclaw-labs/zeroclaw-core
+docs/book/src/architecture/decisions/**  @zeroclaw-labs/zeroclaw-core
 AGENTS.md                       @zeroclaw-labs/zeroclaw-core
 
 # ── Default: any Contributor or Core Team member can review ─────────────────
@@ -501,276 +501,23 @@ This policy is not a limitation on AI or on automation. It is a recognition that
 
 Issue templates route incoming reports to the right process before they reach a human. A well-written template gathers the information needed for triage automatically. A missing or ignored template results in issues that take three comment exchanges to understand.
 
-Create the following templates in `.github/ISSUE_TEMPLATE/`:
+The operational source of truth is `.github/ISSUE_TEMPLATE/`. Do not duplicate full template YAML here. When template wording changes, update the issue form itself and keep this section at the level of durable intent.
 
-### Template 1: Bug Report (`bug_report.yml`)
+Current intake lanes:
 
-```yaml
-name: Bug Report
-description: Something is not working as expected
-labels: ["type:bug", "status:needs-triage"]
-body:
-  - type: markdown
-    attributes:
-      value: |
-        Before submitting: search existing issues to avoid duplicates.
-        For security vulnerabilities, use the private security report
-        process described in SECURITY.md — do not open a public issue.
-  - type: textarea
-    id: description
-    attributes:
-      label: What happened?
-      description: A clear description of the bug.
-    validations:
-      required: true
-  - type: textarea
-    id: reproduction
-    attributes:
-      label: Steps to reproduce
-      description: The exact steps to reproduce the bug.
-      placeholder: |
-        1. Run `zeroclaw ...`
-        2. With config `...`
-        3. See error
-    validations:
-      required: true
-  - type: textarea
-    id: expected
-    attributes:
-      label: What did you expect to happen?
-    validations:
-      required: true
-  - type: textarea
-    id: environment
-    attributes:
-      label: Environment
-      placeholder: |
-        - ZeroClaw version:
-        - OS and version:
-        - Rust version (if built from source):
-        - Provider:
-    validations:
-      required: true
-  - type: dropdown
-    id: risk
-    attributes:
-      label: Does this bug have security implications?
-      options:
-        - "No"
-        - "Yes — I have already filed a private security report"
-        - "I am not sure"
-    validations:
-      required: true
-```
+| Template | Purpose | Intake signals collected |
+|---|---|---|
+| `bug_report.yml` | Reproducible defects | Component, severity, reproduction, expected behavior, environment, privacy check |
+| `support_config.yml` | Setup, configuration, and usage help | Goal, observed behavior, redacted config or commands when relevant |
+| `feature_request.yml` | Ordinary feature ideas | User problem, proposed solution, non-goals, architecture/risk hints, expected routing |
+| `rfc_design.yml` | Architecture, governance, default, release, or contribution-model proposals | Problem, proposal, risks, breaking-change assessment, decision/revisit surface |
+| `roadmap_tracker.yml` | Active release, roadmap, RFC, implementation, cleanup, or audit trackers | Purpose, scope, linked work, routing evidence, close criteria, stale-exemption request |
+| `docs_issue.yml` | Missing, wrong, confusing, or outdated docs | Location, problem, expected documentation, related source of truth |
+| `contributor_task.yml` | Maintainer-scoped work intended for external contributors | Context, acceptance criteria, likely files, pickup fit, mentor or review contact |
 
-### Template 2: Feature Request (`feature_request.yml`)
+Security vulnerabilities do not get a public issue template. `config.yml` links to the private security policy, Discord, GitHub Discussions, the contribution guide, the RFC process, and the maintainer PR workflow so contributors can choose the right surface before creating a tracked issue.
 
-```yaml
-name: Feature Request
-description: Suggest a new capability or improvement
-labels: ["type:feature", "status:needs-triage"]
-body:
-  - type: markdown
-    attributes:
-      value: |
-        Feature requests that have been discussed and upvoted in GitHub
-        Discussions → Ideas are more likely to be prioritized. Consider
-        posting there first if you want community feedback before filing.
-  - type: textarea
-    id: problem
-    attributes:
-      label: What problem does this solve?
-      description: Describe the problem or limitation you are experiencing.
-    validations:
-      required: true
-  - type: textarea
-    id: solution
-    attributes:
-      label: What would you like to happen?
-      description: Describe the feature or change you are proposing.
-    validations:
-      required: true
-  - type: textarea
-    id: alternatives
-    attributes:
-      label: What alternatives have you considered?
-      description: Other ways to solve the problem, including doing nothing.
-  - type: dropdown
-    id: component
-    attributes:
-      label: Which component does this affect?
-      options:
-        - Kernel / Agent Loop
-        - Gateway / Web UI
-        - Channels
-        - Tools
-        - Memory
-        - Security
-        - Hardware / Peripherals
-        - Documentation
-        - Infrastructure / CI
-        - Not sure
-    validations:
-      required: true
-```
-
-### Template 3: RFC / Architecture Proposal (`rfc.yml`)
-
-```yaml
-name: RFC / Architecture Proposal
-description: Propose a significant architectural or behavioral change
-labels: ["type:rfc", "status:discussion"]
-body:
-  - type: markdown
-    attributes:
-      value: |
-        RFCs are for significant changes that affect architecture, public
-        interfaces, or project direction. Before filing an RFC issue:
-        1. Write the proposal document and add it to `docs/proposals/`
-        2. Open a PR with that document
-        3. Then open this issue to start the formal discussion period
-
-        For smaller changes, open a regular feature request or just a PR.
-  - type: input
-    id: proposal-pr
-    attributes:
-      label: Link to the proposal document PR
-      placeholder: "https://github.com/zeroclaw-labs/zeroclaw/pull/..."
-    validations:
-      required: true
-  - type: textarea
-    id: summary
-    attributes:
-      label: One-paragraph summary
-      description: What is being proposed and why?
-    validations:
-      required: true
-  - type: textarea
-    id: impact
-    attributes:
-      label: Impact and tradeoffs
-      description: What does this change affect? What are the tradeoffs?
-    validations:
-      required: true
-  - type: dropdown
-    id: breaking
-    attributes:
-      label: Is this a breaking change?
-      options:
-        - "No"
-        - "Yes — existing configurations or APIs change"
-        - "Potentially — needs investigation"
-    validations:
-      required: true
-```
-
-### Template 4: Documentation Issue (`docs_issue.yml`)
-
-```yaml
-name: Documentation Issue
-description: Something in the docs is missing, wrong, or confusing
-labels: ["type:docs", "status:needs-triage"]
-body:
-  - type: input
-    id: location
-    attributes:
-      label: Where is the documentation issue?
-      placeholder: "URL or file path (e.g. docs/reference/api/config-reference.md)"
-    validations:
-      required: true
-  - type: dropdown
-    id: issue-type
-    attributes:
-      label: Type of issue
-      options:
-        - Missing documentation
-        - Incorrect information
-        - Confusing or unclear
-        - Outdated (code has changed)
-        - Broken link
-    validations:
-      required: true
-  - type: textarea
-    id: description
-    attributes:
-      label: Describe the problem
-    validations:
-      required: true
-  - type: textarea
-    id: suggestion
-    attributes:
-      label: Suggested improvement (optional)
-      description: If you know what the correct content should be, share it here.
-```
-
-### Template 5: Security Report Redirect
-
-Create `.github/ISSUE_TEMPLATE/security.md` as a redirect: GitHub will show it as a template option but the content redirects rather than creating an issue:
-
-```yaml
-name: Security Vulnerability
-description: ⚠️ Do not use this template. See SECURITY.md for private reporting.
-labels: []
-body:
-  - type: markdown
-    attributes:
-      value: |
-        ## ⚠️ Do not report security vulnerabilities as public issues.
-
-        Security vulnerabilities disclosed publicly before a fix is available
-        put all ZeroClaw users at risk. Please follow the private disclosure
-        process described in [SECURITY.md](https://github.com/zeroclaw-labs/zeroclaw/blob/master/SECURITY.md).
-
-        If you have already filed this as a public issue by mistake, please
-        delete it and re-report privately. A Core Team member will contact
-        you to confirm receipt.
-```
-
-### Template 6: Good First Issue (`good_first_issue.yml`)
-
-```yaml
-name: Good First Issue (Core Team only)
-description: Tag an issue as a good entry point for new contributors
-labels: ["good first issue"]
-body:
-  - type: markdown
-    attributes:
-      value: |
-        This template is for Core Team members identifying good entry
-        points for new contributors. A good first issue must have:
-        - A clear, self-contained scope (no cross-cutting changes)
-        - Size of XS or S
-        - Links to the relevant code files
-        - A named mentor the new contributor can ping for help
-  - type: textarea
-    id: description
-    attributes:
-      label: What needs to be done?
-      description: Be specific. Include file paths and function names where known.
-    validations:
-      required: true
-  - type: textarea
-    id: context
-    attributes:
-      label: Context and background
-      description: What does a new contributor need to understand to work on this?
-    validations:
-      required: true
-  - type: input
-    id: mentor
-    attributes:
-      label: Mentor / point of contact
-      placeholder: "@username"
-    validations:
-      required: true
-  - type: textarea
-    id: acceptance
-    attributes:
-      label: Acceptance criteria
-      description: How will we know when this is done?
-    validations:
-      required: true
-```
+Issue templates collect evidence; they do not decide final labels by themselves. Maintainers still apply judgment-only labels such as `status:accepted`, `status:no-stale`, `help wanted`, and `good first issue` after checking the body, discussion, and linked work. In particular, `status:no-stale` should not be applied automatically from a template. A tracker, RFC, or long-lived accepted issue must record both the stale-exemption reason and the visible next decision or revisit surface before stale protection is added or kept.
 
 ---
 
@@ -781,18 +528,14 @@ The RFC process was established in the documentation RFC and the architecture RF
 ### 8.1 The Full RFC Lifecycle
 
 ```
-1. AUTHOR writes proposal → docs/proposals/<slug>.md
+1. AUTHOR opens an RFC issue using the RFC issue template
+   with the proposal and any supporting PR or document links
            ↓
-2. AUTHOR opens PR with the proposal document
-           ↓
-3. AUTHOR opens RFC issue using the RFC issue template
-   linking to the PR
-           ↓
-4. DISCUSSION PERIOD — minimum 7 days
+2. DISCUSSION PERIOD — minimum 7 days
    Anyone can comment. Core Team members engage substantively.
-   Discussions happen on the issue, not the PR.
+   Discussions happen on the issue.
            ↓
-5. CORE TEAM VOTE on the issue
+3. CORE TEAM VOTE on the issue
    Format: comment with one of:
      ✅ APPROVE — with brief rationale
      ❌ REJECT — with specific objections
@@ -802,7 +545,7 @@ The RFC process was established in the documentation RFC and the architecture RF
    │  RFC is accepted                                          │
    │  PR is merged                                            │
    │  Issue labeled rfc:accepted                              │
-   │  Author writes ADR(s) in docs/architecture/decisions/    │
+   │  Author writes ADR(s) under docs/book/src/architecture/decisions/ │
    │  ADR issue(s) linked back to RFC issue                   │
    │  RFC issue closed                                        │
    └──────────────────────────────────────────────────────────┘
@@ -820,7 +563,7 @@ The RFC process was established in the documentation RFC and the architecture RF
    │  Issue labeled rfc:revision-requested                    │
    │  Author revises proposal document                        │
    │  Author re-requests review via issue comment             │
-   │  Process returns to step 4                               │
+   │  Process returns to step 2                               │
    └──────────────────────────────────────────────────────────┘
 ```
 
@@ -840,15 +583,16 @@ Every accepted RFC must produce at least one ADR before the corresponding implem
 
 RFCs are proposals. ADRs are decisions. Both are necessary. Neither replaces the other.
 
-### 8.4 Existing RFCs in This Repository
+### 8.4 Foundational RFCs
 
-The following RFCs have been filed as of this writing and should be converted to formal RFC issues immediately:
+The early proposal documents have since been represented as RFC issues
+and foundation documents:
 
-| RFC Document | Issue to create | Priority |
+| RFC issue | Current durable surface | Priority |
 |---|---|---|
-| `docs/proposals/microkernel-architecture.md` | Microkernel Architecture RFC (v0.7.0+) | High |
-| `docs/proposals/documentation-standards.md` | Documentation Standards and i18n RFC | High |
-| `docs/proposals/project-governance.md` | Team Organization and Governance RFC | Medium |
+| [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574) | [FND-001: Intentional architecture](./fnd-001-intentional-architecture.md) | High |
+| [#5576](https://github.com/zeroclaw-labs/zeroclaw/issues/5576) | [FND-002: Documentation standards](./fnd-002-documentation-standards.md) | High |
+| [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577) | [FND-003: Governance](./fnd-003-governance.md) | Medium |
 
 ---
 
@@ -884,11 +628,11 @@ Use a **namespaced** label system. Each label has a prefix that identifies its c
 
 | Label | Color | Use |
 |---|---|---|
-| `size:xs` | `#dcfce7` Light green | Under 2 hours |
-| `size:s` | `#bbf7d0` Green | Half a day |
-| `size:m` | `#86efac` Medium green | 1–3 days |
-| `size:l` | `#4ade80` Dark green | 1–2 weeks |
-| `size:xl` | `#16a34a` Deep green | More than 2 weeks; should be broken down |
+| `size:XS` | `#dcfce7` Light green | Under 2 hours |
+| `size:S` | `#bbf7d0` Green | Half a day |
+| `size:M` | `#86efac` Medium green | 1–3 days |
+| `size:L` | `#4ade80` Dark green | 1–2 weeks |
+| `size:XL` | `#16a34a` Deep green | More than 2 weeks; should be broken down |
 
 ### `component:` Which part of the system?
 
@@ -915,7 +659,7 @@ This table records governance intent and historical taxonomy shape. For current 
 | `status:blocked` | `#b60205` Red | Waiting on a recorded unresolved external dependency, maintainer decision, or linked prerequisite |
 | `status:in-progress` | `#0075ca` Blue | Open PR is actively targeting the issue; verify live PR state during stale passes |
 | `status:stale` | `#e4e669` Yellow | No original-author activity for the stale threshold window |
-| `status:no-stale` | `#0e8a16` Green | Explicit stale exemption for accepted or otherwise long-lived work; target policy requires a recorded reason and active owner or steward path in the operational source |
+| `status:no-stale` | `#0e8a16` Green | Explicit stale exemption for accepted or otherwise long-lived work; target policy requires a recorded reason and visible routing evidence in the operational source |
 | `status:help-wanted` | `#059669` Green | Looking for a contributor |
 | `status:good-first-issue` | `#059669` Green | Suitable for new contributors |
 | `status:discussion` | `#a78bfa` Purple | Needs team discussion before work begins |
@@ -996,11 +740,11 @@ GitHub enforces CODEOWNERS automatically when the file exists and branch protect
 
 **Stale issue management (`.github/workflows/stale.yml`):**
 
-Issues with no activity for 45 days are labeled `status:stale` and a comment is posted asking if the issue is still relevant. Issues with no activity for 15 days after the stale label is applied are closed. This prevents the backlog from accumulating hundreds of issues that are months old and no longer relevant. Exclude `priority:p0`, `type:rfc`, issues with open linked PRs, and issues with `status:blocked` while a recorded blocker remains unresolved. The intended `status:no-stale` follow-up is to exclude it only while the operational source records both the stale-exemption reason and a contributor-visible active owner or steward path. The maintainer label guide and issue-triage protocol carry the current operational details.
+Issues with no activity for 45 days are labeled `status:stale` and a comment is posted asking if the issue is still relevant. Issues with no activity for 15 days after the stale label is applied are closed. This prevents the backlog from accumulating hundreds of issues that are months old and no longer relevant. Exclude `priority:p0`, `type:rfc`, issues with open linked PRs, and issues with `status:blocked` while a recorded blocker remains unresolved. The intended `status:no-stale` follow-up is to exclude it only while the operational source records both the stale-exemption reason and contributor-visible routing evidence. The maintainer label guide and issue-triage protocol carry the current operational details.
 
-**PR size labeling (`.github/workflows/pr-size.yml`):**
+**PR size labeling (future/optional):**
 
-Automatically label PRs with `size:xs` through `size:xl` based on lines changed. This gives reviewers and maintainers an immediate sense of scope without opening the diff. Use these thresholds as a starting point: XS < 10 lines, S < 50, M < 250, L < 1000, XL ≥ 1000.
+If size automation is added later, it should follow the maintainer label guide's live names (`size:XS` through `size:XL`) and recalculate on pushed updates so the label describes the diff under review. Until then, size labels are maintainer-applied.
 
 **Milestone check on PR merge (`.github/workflows/milestone-check.yml`):**
 
@@ -1026,9 +770,9 @@ The minimum viable governance setup. Gets the team coordinating immediately.
 
 - [ ] Create the GitHub Project with Status, Type, Priority, and Milestone fields
 - [ ] Create the four Project views (Roadmap, Board, Backlog, My Work)
-- [ ] Enable GitHub Discussions with maintained categories documented in the contributor communication and maintainer stewardship docs
+- [ ] Enable GitHub Discussions with maintained categories documented in the contributor communication and maintainer workflow docs
 - [ ] Create the three RFC issues for the existing proposals (Section 8.4)
-- [ ] Add the six issue templates (Section 7)
+- [ ] Add the issue templates listed in Section 7
 - [ ] Create the `CODEOWNERS` file (Section 6.1)
 - [ ] Enable branch protection rules on `master` (Section 6.2)
 - [ ] Add the remaining label taxonomy (Section 9) to the repository

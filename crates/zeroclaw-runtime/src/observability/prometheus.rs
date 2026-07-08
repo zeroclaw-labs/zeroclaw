@@ -353,7 +353,10 @@ impl Observer for PrometheusObserver {
             | ObserverEvent::TurnComplete
             | ObserverEvent::LlmRequest { .. }
             | ObserverEvent::DeploymentStarted { .. }
-            | ObserverEvent::RecoveryCompleted { .. } => {}
+            | ObserverEvent::RecoveryCompleted { .. }
+            | ObserverEvent::MemoryRecall { .. }
+            | ObserverEvent::MemoryStore { .. }
+            | ObserverEvent::RagRetrieve { .. } => {}
             ObserverEvent::ToolCall {
                 tool,
                 duration,
@@ -422,6 +425,9 @@ impl Observer for PrometheusObserver {
                     self.deployment_failure_rate.set(f as f64 / total as f64);
                 }
             }
+            // `ObserverEvent` is `#[non_exhaustive]` — silently ignore any
+            // future variant added by upstream `zeroclaw-api`.
+            _ => {}
         }
     }
 
@@ -677,6 +683,7 @@ mod tests {
             error_message: None,
             input_tokens: Some(100),
             output_tokens: Some(50),
+            messages: None,
             channel: None,
             agent_alias: None,
             turn_id: None,
@@ -689,6 +696,7 @@ mod tests {
             error_message: None,
             input_tokens: Some(200),
             output_tokens: Some(80),
+            messages: None,
             channel: None,
             agent_alias: None,
             turn_id: None,
@@ -718,6 +726,7 @@ mod tests {
             error_message: Some("timeout".into()),
             input_tokens: None,
             output_tokens: None,
+            messages: None,
             channel: None,
             agent_alias: None,
             turn_id: None,

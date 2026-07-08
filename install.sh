@@ -146,6 +146,13 @@ validate_feature() {
   die "Unknown feature '$1'. Run: $0 --list-features"
 }
 
+selected_feature_enabled() {
+  case ",$USER_FEATURES," in
+  *",$1,"*) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
 # ── List features ─────────────────────────────────────────────────
 
 list_features() {
@@ -164,7 +171,7 @@ list_features() {
     default | ci-all | fantoccini | landlock | metrics) continue ;;
     channel-*) channels="${channels:+$channels, }$feat" ;;
     observability-*) observability="${observability:+$observability, }$feat" ;;
-    hardware | peripheral-* | sandbox-* | browser-* | probe | rag-pdf | webauthn)
+    hardware | peripheral-* | sandbox-* | browser-* | probe | webauthn)
       platform="${platform:+$platform, }$feat"
       ;;
     *) other="${other:+$other, }$feat" ;;
@@ -225,17 +232,39 @@ shell_export_syntax() {
 
 # ── Platform / target triple detection ───────────────────────────
 
+detect_libc() {
+  if [ -e /lib/ld-musl-*.so.1 ] 2>/dev/null || \
+     ldd --version 2>&1 | grep -qi musl || \
+     { [ -r /etc/os-release ] && grep -qiE 'alpine|postmarket' /etc/os-release; }; then
+    echo "musl"
+  else
+    echo "gnu"
+  fi
+}
+
 detect_target_triple() {
-  local os arch
+  local os arch libc
   os=$(uname -s)
   arch=$(uname -m)
 
   case "$os" in
-  Darwin) echo "aarch64-apple-darwin" ;; # presume M-series
+  Darwin)
+    # Apple Silicon reports arm64; Intel reports x86_64. A Rosetta-translated
+    # shell on Apple Silicon also reports x86_64 from `uname -m`, so consult
+    # `sysctl hw.optional.arm64` to recover the true CPU. Without this an Intel
+    # Mac (or an M-series Mac run under Rosetta) is handed the wrong-arch
+    # binary and hits "bad CPU type in executable".
+    if [ "$arch" = "arm64" ] || [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
+      echo "aarch64-apple-darwin"
+    else
+      echo "x86_64-apple-darwin"
+    fi
+    ;;
   Linux)
+    libc=$(detect_libc)
     case "$arch" in
-    x86_64) echo "x86_64-unknown-linux-gnu" ;;
-    aarch64 | arm64) echo "aarch64-unknown-linux-gnu" ;;
+    x86_64) echo "x86_64-unknown-linux-${libc}" ;;
+    aarch64 | arm64) echo "aarch64-unknown-linux-${libc}" ;;
     armv7l) echo "armv7-unknown-linux-gnueabihf" ;;
     armv6l | arm*) echo "arm-unknown-linux-gnueabihf" ;;
     *) echo "" ;;
@@ -273,6 +302,8 @@ install_prebuilt() {
   printf "%s\n" "$(bold "Installing ZeroClaw ${version} (pre-built)")"
   info "Platform: $triple"
   info "Source:   $asset_url"
+  info "Channels: pre-built binaries ship the full distribution channel set (all channels, no heavyweight extras)."
+  info "For heavyweight extras excluded from the distribution set (e.g. whatsapp-web), build from source with --preset full."
   echo
 
   # Resolve platform-correct web data directory to match gateway auto-detect
@@ -289,14 +320,11 @@ install_prebuilt() {
   tmp_dir=$(mktemp -d)
   trap 'rm -rf "$tmp_dir"' EXIT
 
-  curl -fSL --progress-bar "$asset_url" -o "$tmp_dir/$asset_name" ||
-    {
-      warn "Download failed — falling back to source build"
-      rm -rf "$tmp_dir"
-      return 1
-    }
-
-  # Verify checksum — all failure modes fall back to source rather than install unverified
+  # Fetch the checksum manifest first — it lists every published asset, so we
+  # can tell "no pre-built binary for this platform" (e.g. Intel macOS, which
+  # ships no release tarball) from a genuine download failure, and we never
+  # pull a tarball we couldn't verify anyway. All failure modes fall back to
+  # source rather than install unverified.
   if ! curl -fsSL "$sha256_url" -o "$tmp_dir/SHA256SUMS" 2>/dev/null; then
     warn "Could not fetch SHA256SUMS — falling back to source build"
     rm -rf "$tmp_dir"
@@ -305,10 +333,17 @@ install_prebuilt() {
 
   expected=$(grep "$asset_name" "$tmp_dir/SHA256SUMS" | awk '{print $1}')
   if [ -z "$expected" ]; then
-    warn "Asset not found in SHA256SUMS — falling back to source build"
+    warn "No pre-built binary published for $triple — falling back to source build"
     rm -rf "$tmp_dir"
     return 1
   fi
+
+  curl -fSL --progress-bar "$asset_url" -o "$tmp_dir/$asset_name" ||
+    {
+      warn "Download failed — falling back to source build"
+      rm -rf "$tmp_dir"
+      return 1
+    }
 
   if command -v sha256sum >/dev/null 2>&1; then
     actual=$(sha256sum "$tmp_dir/$asset_name" | awk '{print $1}')
@@ -356,7 +391,10 @@ Options:
   --prebuilt           Download and install a pre-built binary (default when asked)
   --source             Build from source (skips the pre-built prompt)
   --preset NAME        Named feature preset: 'minimal' (kernel only, ~6.6MB) or
-                       'full' (default features). Source builds only.
+                       'full' (every channel plus heavyweight extras such as
+                       whatsapp-web and channel-matrix). Source builds only.
+  --full               Install everything: the 'full' feature preset plus every
+                       installable app (implies --source)
   --minimal            Alias for --preset minimal
   --features X,Y       Select specific features — source only (comma-separated)
   --apps X,Y           Select apps to install (e.g. zerocode); "none" to skip all
@@ -367,6 +405,8 @@ Options:
   --prefix PATH        Install everything under PATH (default: \$HOME)
                        Sets CARGO_HOME, RUSTUP_HOME, source checkout, config
   --dry-run            Show what would happen without building or installing
+  --no-modify-path     Don't add ZeroClaw to PATH in your shell profile; just
+                       print the line to add manually
   --skip-quickstart       Skip the post-install quickstart prompt
   --uninstall          Remove ZeroClaw binary and optionally config/data
   -h, --help           Show this help
@@ -378,6 +418,8 @@ Examples:
   $0 --source                                  # always build from source
   $0 --source --minimal                        # smallest possible binary
   $0 --source --features agent-runtime,channel-discord  # custom feature set
+  $0 --source --preset full                   # every channel plus heavyweight extras
+  $0 --full                                    # everything: full preset + every app
   $0 --skip-quickstart                            # install only, configure later
   $0 --prefix /tmp/zc-test --skip-quickstart      # isolated test install
   $0 --dry-run --prebuilt                      # preview without installing
@@ -428,6 +470,21 @@ do_uninstall() {
     else
       info "Config preserved at $config_dir (non-interactive — use rm -rf to remove)"
     fi
+  fi
+
+  # Strip the PATH marker block this installer may have added to the profile.
+  local profile
+  profile=$(detect_shell_profile)
+  if [ -f "$profile" ] && grep -q "# >>> zeroclaw >>>" "$profile" 2>/dev/null; then
+    local tmp_profile
+    tmp_profile=$(mktemp)
+    if sed '/# >>> zeroclaw >>>/,/# <<< zeroclaw <<</d' "$profile" >"$tmp_profile" 2>/dev/null &&
+      cat "$tmp_profile" >"$profile" 2>/dev/null; then
+      info "Removed PATH entry from $profile"
+    else
+      warn "Could not edit $profile — remove the zeroclaw PATH block manually"
+    fi
+    rm -f "$tmp_profile"
   fi
 
   # Check if another zeroclaw still lurks in PATH
@@ -622,11 +679,18 @@ install_web_dist() {
 # present — never to run cargo by hand.
 build_web_dashboard() {
   src_dir="$1"
+  required="${2:-false}"
   if [ ! -d "$src_dir/web" ]; then
+    if [ "$required" = true ]; then
+      die "feature embedded-web requires a web/ directory in the source checkout."
+    fi
     warn "Source has no web/ directory; skipping dashboard build."
     return 0
   fi
   if ! command -v npm >/dev/null 2>&1; then
+    if [ "$required" = true ]; then
+      die "feature embedded-web requires Node.js/npm to build web/dist before cargo install. Install the Node version from .nvmrc and re-run, or remove embedded-web."
+    fi
     warn "npm not found — skipping dashboard build. The gateway will run"
     warn "  in API-only mode. Install Node.js (npm) and re-run ./install.sh"
     warn "  --source to build and install the dashboard."
@@ -637,6 +701,9 @@ build_web_dashboard() {
   # re-runs cheap.
   info "Building web dashboard (cargo web build)..."
   (cd "$src_dir" && cargo web build) || {
+    if [ "$required" = true ]; then
+      die "feature embedded-web requires a successful dashboard build before cargo install."
+    fi
     warn "Dashboard build failed — gateway will run in API-only mode."
     return 0
   }
@@ -678,12 +745,14 @@ SKIP_QUICKSTART=false
 LIST_FEATURES=false
 UNINSTALL=false
 DRY_RUN=false
+MODIFY_PATH=true # append PATH export to the shell profile; --no-modify-path opts out
 PREFIX="$HOME"
 INSTALL_MODE="" # ""=ask, "prebuilt"=force prebuilt, "source"=force source
 PRESET=""       # ""=unset, "minimal"=alias for --minimal, "full"=default-features
 WITH_GATEWAY="" # ""=unset (preset/feature default applies), "true"/"false"=explicit toggle
 WITHOUT_TUI=""  # ""=unset (default: install TUI), "true"=skip TUI
 USER_APPS=""    # ""=unset (default apps), "none"=skip all, or comma list (e.g. "zerocode")
+FULL_APPS=false # true when --full: install every discovered app, not just the defaults
 
 # Support legacy env var
 if [ -n "${ZEROCLAW_CARGO_FEATURES:-}" ]; then
@@ -706,6 +775,11 @@ while [ $# -gt 0 ]; do
     full) PRESET="full" ;;
     *) die "Unknown preset '$1'. Expected: minimal or full" ;;
     esac
+    ;;
+  --full)
+    # Everything: the 'full' feature preset plus every installable app.
+    PRESET="full"
+    FULL_APPS=true
     ;;
   --features)
     if [ $# -lt 2 ]; then
@@ -733,6 +807,7 @@ while [ $# -gt 0 ]; do
     PREFIX=$(echo "$1" | sed 's|/*$||')
     ;;
   --dry-run) DRY_RUN=true ;;
+  --no-modify-path) MODIFY_PATH=false ;;
   --skip-quickstart) SKIP_QUICKSTART=true ;;
   --prebuilt) INSTALL_MODE="prebuilt" ;;
   --source) INSTALL_MODE="source" ;;
@@ -950,6 +1025,22 @@ See all available features:
     esac
   fi
 
+  # `--preset full` must actually deliver the broad bundle the installer
+  # advertises (whatsapp-web, channel-matrix, the heavyweight extras), not
+  # Cargo's lean `default`. Resolve the explicit feature list from the
+  # canonical registry (`cargo generate features --selection all`), the same
+  # source of truth the release workflow consumes, and build with
+  # --no-default-features against it so the advertised set is exact.
+  if [ "$PRESET" = "full" ]; then
+    preset_features=$(cargo run --quiet -p xtask --bin generate -- features --selection all 2>/dev/null || true)
+    if [ -n "$preset_features" ]; then
+      CARGO_FLAGS="--no-default-features"
+      USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$preset_features"
+    else
+      warn "Could not resolve --preset full from the feature registry; falling back to default features."
+    fi
+  fi
+
   # Interactive picker — only when the operator did not pin features or
   # apps via the CLI and is running under a TTY. Skipped on `--minimal`,
   # `--preset`, `--features`, `--apps`, `--with-gateway` /
@@ -1017,7 +1108,7 @@ See all available features:
       fi
     fi
     if [ "$PRESET" = "full" ] && [ "$DRY_RUN" != true ] && [ -t 1 ]; then
-      info "--preset full: building from source with the full default feature set."
+      info "--preset full: building from source with the complete feature set (every channel plus heavyweight extras) resolved from the registry."
     fi
   fi
 
@@ -1026,6 +1117,11 @@ See all available features:
   apply_low_mem_lto_default
 
   # ── Build and install ─────────────────────────────────────────────
+
+  WANT_EMBEDDED_WEB=false
+  if selected_feature_enabled embedded-web; then
+    WANT_EMBEDDED_WEB=true
+  fi
 
   echo
   printf "%s\n" "$(bold "Building ZeroClaw v$VERSION")"
@@ -1036,6 +1132,17 @@ See all available features:
   fi
   echo
 
+  # embedded-web includes web/dist at Rust compile time, so the dashboard must
+  # exist before cargo install reaches zeroclaw-gateway's build script.
+  if [ "$WANT_EMBEDDED_WEB" = true ]; then
+    if [ "$DRY_RUN" = true ]; then
+      info "[dry-run] Would build web dashboard before cargo install for embedded-web"
+    else
+      build_web_dashboard "$INSTALL_DIR" true
+    fi
+  fi
+
+  # >>> generated:source-cargo-install by `cargo generate installers` - do not edit <<<
   if [ "$DRY_RUN" = true ]; then
     # shellcheck disable=SC2086
     info "[dry-run] Would run: cargo install --path . --locked --force $CARGO_FLAGS"
@@ -1043,6 +1150,7 @@ See all available features:
     # shellcheck disable=SC2086
     cargo install --path . --locked --force $CARGO_FLAGS
   fi
+  # >>> end generated:source-cargo-install <<<
 
   # ── Web dashboard (gateway feature only) ──────────────────────────
   # When the install includes the `gateway` feature, build `web/dist` so
@@ -1060,7 +1168,13 @@ See all available features:
   esac
   if [ "$WANT_GATEWAY" = true ]; then
     if [ "$DRY_RUN" = true ]; then
-      info "[dry-run] Would build web dashboard"
+      if [ "$WANT_EMBEDDED_WEB" = true ]; then
+        info "[dry-run] Web dashboard would already be built for embedded-web"
+      else
+        info "[dry-run] Would build web dashboard"
+      fi
+    elif [ "$WANT_EMBEDDED_WEB" = true ]; then
+      info "Web dashboard already built for embedded-web"
     else
       build_web_dashboard "$INSTALL_DIR"
     fi
@@ -1074,16 +1188,22 @@ See all available features:
   # Resolve the app set: explicit --apps list, "none" to skip, or the
   # full installable set by default. --without-tui is back-compat for
   # dropping the TUI app from the default set.
-  if [ "$USER_APPS" = "none" ]; then
+  if [ "$FULL_APPS" = true ] && [ -z "$USER_APPS" ]; then
+    # --full installs every discovered app (an explicit --apps still wins).
+    WANT_APPS="$APPS"
+  elif [ "$USER_APPS" = "none" ]; then
     WANT_APPS=""
   elif [ -n "$USER_APPS" ]; then
     WANT_APPS=$(printf '%s' "$USER_APPS" | tr ',[:space:]' '\n' | grep -v '^$' | sort -u | paste -sd' ' -)
     for app in $WANT_APPS; do validate_app "$app"; done
   else
     WANT_APPS="$DEFAULT_APPS"
-    if [ "$WITHOUT_TUI" = true ]; then
-      WANT_APPS=$(printf '%s' "$WANT_APPS" | tr ' ' '\n' | grep -vx "$TUI_BIN_NAME" | paste -sd' ' -)
-    fi
+  fi
+
+  # --without-tui drops the TUI app from the resolved default or --full
+  # set (an explicit --apps list is honored as-is).
+  if [ "$WITHOUT_TUI" = true ] && [ -z "$USER_APPS" ]; then
+    WANT_APPS=$(printf '%s' "$WANT_APPS" | tr ' ' '\n' | grep -vx "$TUI_BIN_NAME" | paste -sd' ' -)
   fi
 
   # agent-runtime is a default feature; if defaults are stripped and it
@@ -1141,21 +1261,19 @@ fi # end source build block
 
 BIN="$CARGO_HOME/bin/zeroclaw"
 
-# ── PATH guidance ─────────────────────────────────────────────────
+# ── PATH setup ────────────────────────────────────────────────────
 
 PROFILE=$(detect_shell_profile)
 EXPORT_LINE=$(shell_export_syntax)
 
-SHOW_PATH_HELP=false
-if [ "$PREFIX" != "$HOME" ]; then
-  SHOW_PATH_HELP=true
-elif [ -f "$PROFILE" ] && ! grep -q "$CARGO_HOME/bin" "$PROFILE" 2>/dev/null; then
-  SHOW_PATH_HELP=true
-elif [ ! -f "$PROFILE" ]; then
-  SHOW_PATH_HELP=true
+# Is our bin dir already on PATH via the profile — either pre-existing or
+# from a prior run of this installer? If so there's nothing to do.
+PATH_ALREADY_SET=false
+if [ -f "$PROFILE" ] && grep -q "$CARGO_HOME/bin" "$PROFILE" 2>/dev/null; then
+  PATH_ALREADY_SET=true
 fi
 
-if [ "$SHOW_PATH_HELP" = true ]; then
+print_path_help() {
   echo
   printf "  %s (%s):\n" "$(bold "Add to your shell profile")" "$PROFILE"
   echo
@@ -1165,6 +1283,29 @@ if [ "$SHOW_PATH_HELP" = true ]; then
   echo
   printf "    source %s\n" "$PROFILE"
   echo
+}
+
+if [ "$PATH_ALREADY_SET" = true ]; then
+  : # already on PATH — nothing to do
+elif [ "$MODIFY_PATH" = true ] && [ "$PREFIX" = "$HOME" ]; then
+  # Auto-append to the profile, wrapped in a marker block so re-installs
+  # stay idempotent and an uninstall can strip it cleanly.
+  if [ "$DRY_RUN" = true ]; then
+    info "[dry-run] Would add $CARGO_HOME/bin to PATH in $PROFILE"
+  elif {
+    printf '\n# >>> zeroclaw >>>\n'
+    printf '%s\n' "$EXPORT_LINE"
+    printf '# <<< zeroclaw <<<\n'
+  } >>"$PROFILE" 2>/dev/null; then
+    info "Added $CARGO_HOME/bin to PATH in $PROFILE"
+    printf "    Reload your shell or run: source %s\n" "$PROFILE"
+  else
+    warn "Could not write to $PROFILE — add this line manually:"
+    print_path_help
+  fi
+else
+  # --no-modify-path, or a custom --prefix install we won't auto-edit for.
+  print_path_help
 fi
 
 # ── Quickstart prompt ─────────────────────────────────────────────

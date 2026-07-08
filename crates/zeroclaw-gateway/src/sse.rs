@@ -98,13 +98,16 @@ pub async fn handle_events_history(
     if let Err(e) = super::api::require_auth(&state, &headers) {
         return e.into_response();
     }
-    let events: Vec<_> = state
-        .event_buffer
+    Json(history_events_payload(&state.event_buffer)).into_response()
+}
+
+fn history_events_payload(buffer: &EventBuffer) -> serde_json::Value {
+    let events: Vec<_> = buffer
         .snapshot()
         .into_iter()
         .filter(is_public_sse_event)
         .collect();
-    Json(serde_json::json!({ "events": events })).into_response()
+    serde_json::json!({ "events": events })
 }
 
 /// Returns true for events that should be visible on the global SSE stream.
@@ -288,6 +291,27 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 add_optional_string(&mut json, "turn_id", turn_id);
                 json
             }
+            zeroclaw_runtime::observability::ObserverEvent::HistoryTrimmed {
+                dropped_messages,
+                kept_turns,
+                reason,
+                channel,
+                agent_alias,
+                turn_id,
+            } => {
+                let mut json = serde_json::json!({
+                    "type": "history_trimmed",
+                    "source": "observability",
+                    "dropped_messages": dropped_messages,
+                    "kept_turns": kept_turns,
+                    "reason": reason,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                });
+                add_optional_string(&mut json, "channel", channel);
+                add_optional_string(&mut json, "agent_alias", agent_alias);
+                add_optional_string(&mut json, "turn_id", turn_id);
+                json
+            }
             _ => return, // Skip events we don't broadcast
         };
 
@@ -369,6 +393,31 @@ mod tests {
     }
 
     #[test]
+    fn history_trimmed_event_is_broadcast_with_cut_accounting() {
+        let (obs, mut rx, _buffer) = make_broadcast();
+
+        obs.record_event(&ObserverEvent::HistoryTrimmed {
+            dropped_messages: 12,
+            kept_turns: 1,
+            reason: "context token budget exceeded".into(),
+            channel: Some("wss".into()),
+            agent_alias: Some("trimtest".into()),
+            turn_id: Some("turn-1".into()),
+        });
+
+        let value = rx.try_recv().expect("history_trimmed must broadcast");
+        assert_eq!(value["type"], "history_trimmed");
+        assert_eq!(value["source"], "observability");
+        assert_eq!(value["dropped_messages"], 12);
+        assert_eq!(value["kept_turns"], 1);
+        assert_eq!(value["reason"], "context token budget exceeded");
+        assert_eq!(value["channel"], "wss");
+        assert_eq!(value["agent_alias"], "trimtest");
+        assert_eq!(value["turn_id"], "turn-1");
+        assert!(is_public_sse_event(&value));
+    }
+
+    #[test]
     fn unmapped_events_are_skipped() {
         let (obs, mut rx, buffer) = make_broadcast();
 
@@ -392,6 +441,32 @@ mod tests {
 
         assert!(!is_public_sse_event(&session_event));
         assert!(is_public_sse_event(&global_event));
+    }
+
+    #[test]
+    fn history_payload_returns_only_public_events() {
+        let buffer = EventBuffer::new(8);
+        buffer.push(serde_json::json!({
+            "type": "message",
+            "session_id": "operator-1",
+            "content": "private session notification"
+        }));
+        buffer.push(serde_json::json!({
+            "type": "agent_start",
+            "source": "observability",
+            "model_provider": "test",
+            "model": "test-model"
+        }));
+        buffer.push(serde_json::json!({
+            "type": "gateway_lifecycle",
+            "phase": "ready"
+        }));
+
+        let payload = history_events_payload(&buffer);
+        let events = payload["events"].as_array().expect("events array");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "agent_start");
+        assert_eq!(events[1]["type"], "gateway_lifecycle");
     }
 
     #[test]
@@ -525,7 +600,7 @@ mod tests {
 
         // Same factory call site as `process_message` in the agent loop.
         let cfg = zeroclaw_config::schema::ObservabilityConfig {
-            backend: "noop".into(),
+            backend: zeroclaw_config::schema::ObservabilityBackend::None,
             ..Default::default()
         };
         let observer = zeroclaw_runtime::observability::create_observer(&cfg);

@@ -87,6 +87,29 @@ body:
       required: false
 
   - type: dropdown
+    id: routing
+    attributes:
+      label: Expected routing
+      description: Helps maintainers choose triage, design discussion, tracker routing, or contributor scoping.
+      options:
+        - Ordinary feature triage
+        - Needs design or RFC discussion first
+        - Should attach to an existing roadmap/tracker issue
+        - Could become contributor-ready after maintainer scoping
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: decision_surface
+    attributes:
+      label: Next decision surface
+      description: If this should stay open for later planning, where should the next decision or revisit happen?
+      placeholder: Linked tracker/RFC/discussion, milestone, maintainer decision point, or "ordinary triage is enough".
+    validations:
+      required: true
+
+  - type: dropdown
     id: breaking
     attributes:
       label: Breaking change?

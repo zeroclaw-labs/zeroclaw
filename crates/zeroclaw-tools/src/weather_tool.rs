@@ -140,8 +140,9 @@ impl WeatherTool {
 
     /// Build the wttr.in request URL for the given location.
     fn build_url(location: &str) -> String {
-        // Percent-encode spaces; wttr.in also accepts `+` but %20 is safer.
-        let encoded = location.trim().replace(' ', "+");
+        let encoded = urlencoding::encode(location.trim())
+            .replace("%20", "+")
+            .replace("%2C", ",");
         format!("{WTTR_BASE_URL}/{encoded}?format=j1")
     }
 
@@ -543,6 +544,24 @@ mod tests {
     fn build_url_zip_code() {
         let url = WeatherTool::build_url("74015");
         assert_eq!(url, "https://wttr.in/74015?format=j1");
+    }
+
+    #[test]
+    fn build_url_encodes_ampersand_in_location() {
+        let url = WeatherTool::build_url("A&B");
+        assert_eq!(url, "https://wttr.in/A%26B?format=j1");
+    }
+
+    #[test]
+    fn build_url_encodes_query_chars_in_location() {
+        let url = WeatherTool::build_url("Paris?format=3");
+        assert_eq!(url, "https://wttr.in/Paris%3Fformat%3D3?format=j1");
+    }
+
+    #[test]
+    fn build_url_encodes_non_ascii_location() {
+        let url = WeatherTool::build_url("北京");
+        assert_eq!(url, "https://wttr.in/%E5%8C%97%E4%BA%AC?format=j1");
     }
 
     // ── execute: parameter validation ─────────────────────────────────────────

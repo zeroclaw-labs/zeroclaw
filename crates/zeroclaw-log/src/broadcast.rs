@@ -76,7 +76,8 @@ pub fn subscribe_or_install() -> broadcast::Receiver<Value> {
 /// hook must hold this so a parallel test cannot clear the hook mid-flight and
 /// drop another test's event. Lives at module scope (not inside `mod tests`)
 /// so sibling modules (e.g. `layer::e2e_tests`) acquire the SAME lock.
-#[cfg(test)]
+/// Always compiled (not gated behind `#[cfg(test)]`) so peer crates can
+/// borrow it via the `__private_test_hook_lock` helper in `lib.rs`.
 pub(crate) static HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 #[cfg(test)]

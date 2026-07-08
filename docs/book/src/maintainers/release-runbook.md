@@ -14,13 +14,13 @@ Last verified against the `0.8.0-beta` cycle.
 
 ## The process in seven steps
 
-1. Generate `CHANGELOG-next.md` using the changelog skill
-2. Open and merge a version bump PR
-3. Dry-run the release workflows locally with `act`
-4. Trigger the `Release Stable` workflow via manual dispatch
-5. Approve the two environment gates when prompted
-6. Verify the release exists and assets are downloadable
-7. Versioned documentation deployment
+1. [Generate `CHANGELOG-next.md` using the changelog skill](#step-1-generate-changelog-nextmd)
+2. [Open and merge a version bump PR](#step-2-bump-and-merge-the-version-pr)
+3. [Dry-run the release workflows locally with `act`](#step-3-dry-run-the-release-workflows-locally-with-act)
+4. [Trigger the `Release Stable` workflow via manual dispatch](#step-4-trigger-the-release)
+5. [Approve the two environment gates when prompted](#step-5-approve-the-environment-gates)
+6. [Verify the release exists and assets are downloadable](#step-6-verify-the-release)
+7. [Versioned documentation deployment](#step-7-versioned-documentation-deployment)
 
 That is the entire process. Everything else (Docker, website redeploy, Scoop,
 AUR, Homebrew, Discord, tweet) runs automatically as downstream jobs. You do not
@@ -45,27 +45,63 @@ review it for accuracy before reusing it.
 
 ## Step 2: Bump and merge the version PR
 
-Bump `workspace.package.version` in the workspace `Cargo.toml`, then sync all other version references:
+Bump `workspace.package.version` in the workspace `Cargo.toml`, then run the two release scripts in order. First sync every version reference across the repo:
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-bash scripts/release/bump-version.sh X.Y.Z
+./scripts/release/bump-version.sh    # version from Cargo.toml
 ```
 
 </div>
 
-This updates README badges, the Tauri config, and
-workflow description examples. Commit everything together:
+This updates README badges, the Tauri config, and workflow description
+examples, then regenerates every spec-driven install surface via
+`cargo generate installers`: setup.bat, `dist/aur/PKGBUILD`,
+`dist/scoop/zeroclaw.json`, `flake.nix`, the Dockerfile/Containerfile feature
+sets, and `dev/ci/docker-tags.toml`. Those surfaces derive their version and
+feature lists from the canonical install spec (`Cargo.toml` plus
+`[package.metadata.zeroclaw]`), so the bump keeps them in step automatically;
+never hand-edit a generated region. This script also refreshes the Nix git
+dependency hashes (`nix/hashes.json`) via `scripts/dev/refresh-nix-hashes.sh`.
+
+Then refresh the docs translation catalogues and pin them to the matching tag:
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+./scripts/release/refresh-translations.sh    # init submodule, refresh catalogues, tag, pin
+```
+
+</div>
+
+`refresh-translations.sh` reads the version from `Cargo.toml` (nothing typed by
+hand), runs the translation pass, commits and pushes the catalogues to the
+[`zeroclaw-labs/zeroclaw-docs-translations`](https://github.com/zeroclaw-labs/zeroclaw-docs-translations)
+submodule, cuts the `v{version}` tag there, and stages the main-repo gitlink
+pinned to that tag. It initialises the submodule if it is not already checked
+out. Run it after `bump-version.sh` so the `Cargo.toml` version it reads is the
+release version. Pass `--no-translate` to skip the sync pass when the catalogues
+are already current, or an explicit version to override the `Cargo.toml` default.
+
+Commit everything together:
 
 ```text
 chore: bump version to vX.Y.Z
 ```
 
-Open a PR. Label it `chore`, `size: XS`. Get one maintainer review. Merge when
-CI is green.
+Open a PR. Label it `type:ci`, `size:XS`, and any path labels the PR labeler
+adds. Get one maintainer review. Merge when CI is green. The **Installer Drift**
+gate in CI fails the PR if a generated surface is out of sync with the spec, so
+a missed regeneration cannot land. The
+**Validate Translations Pin** gate resolves the submodule at the pinned commit
+and validates catalogue format and msgid parity, so a bad pin cannot land
+either. See [Docs & Translations](../maintainers/docs-and-translations.md) for
+catalogue refresh details.
 
 **Confirm the merge landed correctly:**
 
@@ -309,6 +345,10 @@ You do not need to manually verify Docker or the distribution channels
 unless a job in the workflow run shows red. Check the workflow run summary; if
 all jobs are green, you are done.
 
+Consumers who want to verify signatures, SBOMs, or SLSA provenance on the
+published artifacts can follow
+[Release artifact verification](./release-verification.md).
+
 ---
 
 ## Step 7: Versioned documentation deployment
@@ -318,8 +358,10 @@ ZeroClaw docs use a versioned structure on the `gh-pages` branch. When a tag is 
 ### What happens automatically
 
 - Pushing a tag (e.g., `v0.8.0`) triggers a build that lands in `/v0.8.0/`.
-- If the tag is a GA release (no pre-release suffix), it is also copied to `/stable/`.
+- "Stable" is a pointer, not a copy. The release tag deploy (e.g., `v0.8.0`) is what builds and publishes that version's docs directory. `bump-version.sh` writes the released version to `docs/book/stable-version.txt`; landing that change on master refreshes the stable metadata only. The master deploy does not rebuild or republish the release tag's docs; it copies `stable-version.txt` to the `gh-pages` root and regenerates the root `/` redirect and the version-selector's "Stable (latest release)" entry so both resolve to that release's already-published version dir. The deploy fails loudly if the named version dir is not present on `gh-pages`. There is no duplicate `/stable/` tree.
+- `gh-pages` is ephemeral: every deploy force-pushes a single orphan commit (no accumulating history) and enforces retention via `DOCS_KEEP_VERSIONS` (master plus the newest N final releases; pre-releases and older finals are pruned). This keeps clone size bounded.
 - The `_shared/` directory (containing UI CSS, JS, and favicons) is updated from the build so the theme cascades to all deployed versions.
+- Translated locales (`es`, `fr`, `ja`, `zh-CN`) render from the `docs/book/po` submodule, which the deploy resolves via `submodules: recursive` at whatever commit the deployed ref pins. That pin is set during the version bump; see [Step 2](#step-2-bump-and-merge-the-version-pr) for the refresh, tag, and pin procedure. English needs no submodule.
 
 ### Bootstrapping `gh-pages`
 
@@ -331,6 +373,9 @@ If `gh-pages` is ever deleted or needs to be fully recreated, seed the versions 
 
 > [!IMPORTANT]
 > `master` must be deployed **last** during bootstrapping. It writes the definitive `_shared/` chrome layer that all other versions use.
+
+> [!NOTE]
+> Stable resolves from `docs/book/stable-version.txt` (committed in source, published to the gh-pages root as `stable-version.txt`). After bootstrapping, confirm that file names the intended GA release; the root redirect and the "Stable (latest release)" selector entry follow it. No `/stable/` directory is created.
 
 ### Manual redeploys and the Version Floor
 
@@ -347,7 +392,7 @@ To prevent accidentally deploying very old or unsupported versions, the workflow
 
 If you need to raise the floor to drop support for an older version:
 1. Update the `DOCS_MIN_VERSION` environment variable in `.github/workflows/docs-deploy.yml`.
-2. (Optional) Delete the old version's directory from the `gh-pages` branch to save space.
+2. Old version directories are pruned automatically on the next deploy by the `DOCS_KEEP_VERSIONS` retention pass; no manual `gh-pages` edit is required to reclaim space.
 
 ---
 

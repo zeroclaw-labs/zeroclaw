@@ -1,5 +1,6 @@
 zc-pane-dashboard = Dashboard
 zc-pane-config = Config
+zc-pane-doctor = Doctor
 zc-pane-code = Code
 zc-pane-chat = Chat
 zc-pane-logs = Logs
@@ -22,6 +23,7 @@ zc-app-quit-prompt = Quit zerocode?
 zc-app-quit-explainer = The TUI closes. The daemon keeps running; reconnect anytime.
 zc-app-reload-status-signalled = Daemon reload signalled — reconnecting…
 zc-app-reload-confirm-row = { $confirm_chord } = reload   { $cancel_chord } = cancel
+zc-error-daemon-version-mismatch = Version mismatch: zerocode is { $client_version } but the daemon is { $server_version }. Rebuild and restart the daemon from the same checkout as zerocode.
 
 zc-zerocode-tab-theme = Theme
 zc-zerocode-tab-agent-theme = Agent Themes
@@ -86,15 +88,11 @@ zc-input-no-pending-attachments = No pending attachments.
 zc-input-no-clipboard-image = Clipboard is empty.
 zc-input-placeholder-chat = Type to chat
 
+zc-input-help-slash-commands = Slash commands
 zc-input-help-completions-navigate = Navigate completions
 zc-input-help-completions-accept = Accept
 zc-input-help-completions-dismiss = Dismiss
 
-zc-input-help-send = Send
-zc-input-help-newline = Insert newline
-zc-input-help-file-browser = File browser
-zc-input-help-paste = Paste
-zc-input-help-attach-cmd = Attach file by path
 
 zc-input-attached = Attached: { $label }
 zc-input-attach-error = Attach error: { $error }
@@ -142,25 +140,24 @@ zc-logs-loading = Loading…
 zc-logs-search-action-apply = apply
 zc-logs-search-action-cancel = cancel
 
-zc-logs-help-apply-search = Apply search
-zc-logs-help-cancel-search = Cancel search
-zc-logs-help-close-detail = Close detail
-zc-logs-help-move-cursor = Move list cursor
-zc-logs-help-scroll-detail = Scroll detail pane
-zc-logs-help-resize-detail = Resize detail pane
-zc-logs-help-toggle-follow = Toggle follow mode
-zc-logs-help-search = Search
-zc-logs-help-severity-filter = Raise / lower severity filter
-zc-logs-help-clear-search = Clear search filter
-zc-logs-help-yank-detail = Yank detail to clipboard
-zc-logs-help-this-help = This help
-zc-logs-help-move-cursor-list = Move cursor
-zc-logs-help-jump-bottom = Jump to bottom (follow)
-zc-logs-help-jump-top = Jump to top
-zc-logs-help-page = Page down / up
-zc-logs-help-open-detail = Open detail pane
 zc-logs-help-mouse-label = Mouse
 zc-logs-help-mouse-desc = Click to select, scroll wheel, double-click detail
+
+zc-doctor-title = Doctor
+zc-doctor-loading = Loading diagnostics...
+zc-doctor-error = Doctor failed: { $error }
+zc-doctor-error-unsupported-daemon = Doctor RPC is not available on this daemon yet. Restart the daemon with a build that includes doctor/run.
+zc-doctor-no-results = No diagnostics yet
+zc-doctor-summary = { $ok } ok  { $warnings } warnings  { $errors } errors
+zc-doctor-filter-status = filter: { $filter }
+zc-doctor-filter-all = All
+zc-doctor-filter-problems = Problems
+zc-doctor-filter-errors = Errors
+zc-doctor-list-title = Diagnostics ({ $filter })
+zc-doctor-detail-title = Detail
+zc-doctor-no-selection = No diagnostic selected
+zc-doctor-label-message = Message
+zc-doctor-help-mouse = Mouse: click filter/select, scroll wheel
 
 zc-dashboard-tab-overview = Overview
 zc-dashboard-tab-sessions = Sessions
@@ -214,9 +211,10 @@ zc-dashboard-detail-schedule = Schedule
 zc-dashboard-detail-next-run = Next Run
 zc-dashboard-detail-last-run = Last Run
 zc-dashboard-detail-last-status = Last Status
-zc-dashboard-detail-live-sessions = Live Sessions
+zc-dashboard-detail-sessions = Sessions
 zc-dashboard-detail-persisted-sessions = Persisted Sessions
 zc-dashboard-cost-not-available = Cost tracking is not available. Configure a cost backend to see usage data.
+zc-dashboard-cost-org-error = Organization billing snapshot is present but could not be read. Check the org_cost.json sync.
 
 zc-dashboard-message-history = Message History ({ $count })
 zc-dashboard-loading-messages = Loading messages…
@@ -228,32 +226,29 @@ zc-dashboard-section-process = Process
 zc-dashboard-section-components = Components
 zc-dashboard-section-details = Details
 zc-dashboard-section-summary = Summary
+zc-dashboard-section-by-period = By Period (your account)
+zc-dashboard-section-org = Organization (billed)
+zc-dashboard-period-today = Today
+zc-dashboard-period-month = Month
+zc-dashboard-period-quarter-prefix = Q
+zc-dashboard-period-ytd = YTD
+zc-dashboard-col-period = period
+zc-dashboard-col-cost = cost($)
+zc-dashboard-col-paid-tok = paid tok
+zc-dashboard-col-free-tok = free tok
+zc-dashboard-col-reqs = reqs
+zc-dashboard-org-tok = tok
+zc-dashboard-org-projyr = proj/yr
+zc-dashboard-org-name = Organization
+zc-dashboard-org-personal = You (billed)
+zc-dashboard-org-fy-prefix = FY
+zc-dashboard-org-asof = as of
 zc-dashboard-section-by-model = By Model
 zc-dashboard-section-by-agent = By Agent
 zc-dashboard-section-command = Command
 zc-dashboard-section-prompt = Prompt
 zc-dashboard-section-last-output = Last Output
 
-zc-dashboard-help-next-tab = Next tab
-zc-dashboard-help-prev-tab = Previous tab
-zc-dashboard-help-jump-tab = Jump to tab
-zc-dashboard-help-refresh = Refresh now
-zc-dashboard-help-this-help = This help
-zc-dashboard-help-apply-search = Apply search
-zc-dashboard-help-cancel-search = Cancel search
-zc-dashboard-help-close-detail = Close detail
-zc-dashboard-help-move-cursor = Move list cursor
-zc-dashboard-help-scroll-detail = Scroll detail
-zc-dashboard-help-resize-detail = Resize detail pane
-zc-dashboard-help-refresh-short = Refresh
-zc-dashboard-help-search = Search
-zc-dashboard-help-clear-search = Clear search
-zc-dashboard-help-move-cursor-list = Move cursor
-zc-dashboard-help-jump-bottom = Jump to bottom
-zc-dashboard-help-jump-top = Jump to top
-zc-dashboard-help-open-detail = Open detail pane
-zc-dashboard-help-search-filter = Search / filter
-zc-dashboard-help-kill-session = Kill session
 
 zc-dashboard-yes = yes
 zc-dashboard-no = no
@@ -291,10 +286,6 @@ zc-quickstart-provider-cloud = Cloud. Provide an API key when prompted.
 
 zc-quickstart-submit-create = Create the agent
 
-zc-quickstart-help-move = Move between selectors
-zc-quickstart-help-open = Open the highlighted selector
-zc-quickstart-help-create = Create the agent (or hit { $enter } on Submit)
-zc-quickstart-help-leave = Leave (no config written)
 
 zc-quickstart-modal-action-move = move
 zc-quickstart-modal-action-pick = pick
@@ -390,9 +381,10 @@ zc-chat-help-return-to-input = Return to input
 zc-chat-help-browse-mode = Browse mode
 zc-chat-help-scroll-conversation = Scroll conversation
 zc-chat-help-toggle-thoughts = Toggle thoughts
-zc-chat-help-toggle-thinking-cmd = Toggle thinking visibility
 zc-chat-help-new-session = New session
-zc-chat-help-session-list = Session list
+zc-elicit-help-toggle = Toggle choice
+zc-elicit-help-confirm = Confirm choice
+zc-elicit-help-cancel = Cancel
 
 zc-chat-approval-title = Approve tool call: { $tool }  [{ $secs }s]
 zc-chat-approval-action-allow = Allow
@@ -403,6 +395,7 @@ zc-chat-approval-action-edit = Edit
 
 zc-chat-clipboard-you = You: { $text }
 zc-chat-clipboard-agent = Agent: { $text }
+zc-chat-copied-clipboard = Copied to clipboard
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section
@@ -452,17 +445,49 @@ zc-config-help-save-value = Save value
 zc-config-help-reset-default = Reset to default
 
 zc-config-status-alias-empty = Alias name cannot be empty
+zc-config-status-alias-deleted = Deleted { $alias }
+zc-config-status-alias-create-failed = Create failed: { $err }
+zc-config-status-delete-failed = Delete failed: { $err }
+zc-config-status-field-reset = Reset { $prop }
+zc-config-status-load-failed = Load failed: { $err }
+zc-config-status-save-failed = Save failed: { $err }
+zc-config-status-personality-loading-file = Loading { $filename }...
+zc-config-status-personality-saving-file = Saving { $filename }...
+zc-config-status-personality-saved-file = Saved { $filename }
+zc-config-status-template-loaded = Template loaded for { $filename }
+zc-config-status-template-missing = No template available for { $filename }
+zc-config-status-template-fetch-failed = Template fetch failed: { $err }
+zc-config-status-skill-loading = Loading { $name }...
+zc-config-status-skill-saving = Saving { $name }...
+zc-config-status-skill-saved = Saved { $name }
+zc-config-status-skill-deleting = Deleting { $name }...
+zc-config-status-skill-archived = Archived { $name }
+zc-config-status-fetching-models = Fetching models for { $family }...
+zc-config-status-field-set = Set { $prop }
+zc-config-status-invalid-float = Invalid value for { $prop }: expected a number
+zc-config-status-invalid-integer = Invalid value for { $prop }: expected an integer
+zc-config-status-set-failed = Set failed: { $err }
 zc-config-status-loading-personality = Loading personality files...
 zc-config-status-loading-skills = Loading skills...
 zc-config-status-fetching-templates = Fetching templates...
 zc-config-status-unsaved-discarded = Unsaved changes discarded
 zc-config-status-no-models = No models returned — enter manually
 zc-config-status-model-fetch-failed = Model fetch failed — enter manually
+zc-config-status-loading-aliases = Loading options...
+zc-config-status-no-aliases = None configured yet. Enter manually.
+zc-config-status-alias-fetch-failed = Options fetch failed. Enter manually.
 
 zc-config-footer-action-create = create
 zc-config-footer-action-cancel = cancel
 zc-config-footer-action-save = save
+zc-config-footer-action-edit = edit
+zc-config-footer-action-reset = reset
+zc-config-footer-action-clear-filter = clear filter
 zc-config-footer-action-back-to-files = back to files
 zc-config-footer-action-back-to-skills = back to skills
 zc-config-footer-action-help = help
 zc-config-footer-action-new-line = new line
+
+## Inline hint shown on the selected config field row. The { $keys } placeholder
+## is resolved from the current keybinding for ConfigTabAction::Enter.
+zc-config-field-edit-hint = { $keys } → press to edit

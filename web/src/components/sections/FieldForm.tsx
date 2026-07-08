@@ -8,7 +8,8 @@
 //  * enum       → <select> with enum_variants
 //  * string-array → <textarea>, one value per line
 //  * integer/float → <input type="number">
-//  * secret     → <input type="password"> with populated indicator
+//  * secret     → "set" indicator + Change when populated; masked input with
+//    a reveal/hide toggle when unset or changing
 //  * provider model field (path matches `model_providers.<name>.model`) →
 //    fetches /api/config/catalog/models?provider=<name>, populates a
 //    <datalist>; on fetch failure falls back to free-text with help text.
@@ -28,23 +29,34 @@ import {
 import { Link } from "react-router-dom";
 import {
   ExternalLink,
+  Eye,
+  EyeOff,
   FolderOpen,
   List as ListIcon,
+  MessageSquarePlus,
   Plus,
   Save,
   Trash2,
   Type as TypeIcon,
+  X,
 } from "lucide-react";
 import DirectoryPicker from "./DirectoryPicker";
+import ToolPicker from "@/components/ToolPicker";
+import { Badge, Button, ComboBox, Select } from "@/components/ui";
+import type { BadgeTone } from "@/components/ui";
+import { t } from "@/lib/i18n";
 import {
   ApiError,
   descriptionForPath,
   fetchConfigSchema,
   getAgentOptions,
   getCatalogModels,
+  getChannels,
   listProps,
+  mcpRequiredByTransport,
   objectArrayElementProps,
   patchConfig,
+  resolveAliasSource,
   type AgentOptionsResponse,
   type ConfigApiError,
   type DriftEntry,
@@ -134,11 +146,15 @@ interface FieldFormProps {
   drift?: DriftEntry[];
   /** Filter for which entries this form renders. Returning false hides
    *  the entry. Used to partition a section's fields across tabs (e.g.
-   *  Model providers: Connection / Model / Advanced). The form still
-   *  fetches every entry under `prefix`; the predicate only gates
-   *  rendering, so saves still validate against the full server-side
-   *  config. */
+   *  Model providers: Connection / Model / Advanced). By default, the
+   *  form still fetches every entry under `prefix`; the predicate only
+   *  gates rendering, so saves still validate against the full
+   *  server-side config. */
   includePath?: (path: string) => boolean;
+  /** When true, `includePath` also limits save, dirty-count, and
+   *  successful-save discard scope. Use this when hidden fields belong to a
+   *  different editor, not just another tab of the same editor. */
+  scopeActionsToIncludedPaths?: boolean;
   /** Render the save bar as a normal inline element instead of
    *  `sticky bottom-0`. Set when the FieldForm is embedded inside a
    *  taller composite editor (e.g. an expandable rate-sheet row) where
@@ -156,7 +172,7 @@ export interface FieldFormHandle {
 
 function rendererFor(
   entry: ListResponseEntry,
-): "bool" | "array" | "object-array" | "secret" | "select" | "number" | "text" {
+): "bool" | "array" | "object-array" | "secret" | "select" | "alias-ref" | "number" | "text" {
   if (entry.is_secret) return "secret";
   switch (entry.kind) {
     case "bool":
@@ -172,13 +188,51 @@ function rendererFor(
       return entry.enum_variants && entry.enum_variants.length > 0
         ? "select"
         : "text";
+    // Schema-driven alias reference (zeroclaw-labs/zeroclaw#7594). Dormant
+    // until the backend declares `PropKind::AliasRef`; until then no entry has
+    // this kind, so the per-section alias maps in FieldRow resolve refs.
+    case "alias-ref":
+      return "alias-ref";
     default:
       return "text";
   }
 }
 
+// The dotted path's LAST segment, de-kebab/de-snake'd into space-separated
+// words (lower-case form — used for sorting/search).
+function leafLabel(path: string): string {
+  return (path.split(".").pop() ?? path).replace(/[-_]/g, " ");
+}
+
 function fieldShortLabel(entry: ListResponseEntry): string {
-  return entry.path.split(".").pop()!.replace(/[-_]/g, " ");
+  return leafLabel(entry.path);
+}
+
+// Common acronyms that should render fully upper-cased in a humanized label
+// (so `api_key` → "API Key", `mcp` → "MCP", not "Api Key" / "Mcp").
+const LABEL_ACRONYMS = new Set([
+  "api", "url", "uri", "id", "ip", "ui", "os", "db", "vm", "ai", "llm",
+  "mcp", "tts", "acp", "ttl", "sop", "cpu", "ram", "gpu", "dns", "ssl",
+  "tls", "json", "toml", "yaml", "csv", "sql", "jwt", "sse", "ws", "wss",
+  "http", "https", "rpc", "grpc", "cli", "sdk", "pdf", "cwd", "env",
+]);
+
+// Humanize the schema-provided dotted path's LAST segment into a Title-ish
+// label (de-kebab/de-snake, capitalize words, upper-case known acronyms).
+// Purely a presentation transform of the schema's own path — no hardcoded field
+// names — so the config renderer stays schema-driven (#6175). The dotted path
+// itself remains visible as a secondary line for unambiguous identification.
+function humanizeFieldLabel(path: string): string {
+  return leafLabel(path)
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((w) =>
+      LABEL_ACRONYMS.has(w.toLowerCase())
+        ? w.toUpperCase()
+        : w.charAt(0).toUpperCase() + w.slice(1),
+    )
+    .join(" ");
 }
 
 function setupFieldPriority(entry: ListResponseEntry): number {
@@ -220,20 +274,22 @@ function setupFieldPriority(entry: ListResponseEntry): number {
 
 function setupRequirement(
   entry: ListResponseEntry,
+  mcpTransport?: string | null,
+  requiredByTransport?: Record<string, string> | null,
 ): { label: string; tone: "required" | "choice" | "optional" } | null {
   const leaf = entry.path.split(".").pop() ?? "";
   if (/^providers\.models\.[^.]+\.[^.]+\./.test(entry.path)) {
     const localProvider = isLocalModelProviderPath(entry.path);
-    if (leaf === "model") return { label: "Required", tone: "required" };
+    if (leaf === "model") return { label: t("fieldform.badge_required"), tone: "required" };
     if (leaf === "api_key") {
       return localProvider
-        ? { label: "Optional for remote auth", tone: "optional" }
-        : { label: "Required for API-key auth", tone: "required" };
+        ? { label: t("fieldform.badge_optional_for_remote_auth"), tone: "optional" }
+        : { label: t("fieldform.badge_required_for_api_key_auth"), tone: "required" };
     }
     if (leaf === "requires_openai_auth")
-      return { label: "Auth option", tone: "choice" };
-    if (leaf === "uri") return { label: "Endpoint option", tone: "choice" };
-    return { label: "Optional", tone: "optional" };
+      return { label: t("fieldform.badge_auth_option"), tone: "choice" };
+    if (leaf === "uri") return { label: t("fieldform.badge_endpoint_option"), tone: "choice" };
+    return { label: t("fieldform.badge_optional"), tone: "optional" };
   }
   const topLevelAgentField =
     entry.path.match(/^agents\.[^.]+\.([^.]+)$/)?.[1] ?? null;
@@ -243,19 +299,58 @@ function setupRequirement(
         topLevelAgentField,
       )
     ) {
-      return { label: "Required", tone: "required" };
+      return { label: t("fieldform.badge_required"), tone: "required" };
     }
-    return { label: "Optional", tone: "optional" };
+    return { label: t("fieldform.badge_optional"), tone: "optional" };
   }
   if (
     /^risk_profiles\.[^.]+\./.test(entry.path) ||
     /^runtime_profiles\.[^.]+\./.test(entry.path)
   ) {
-    return { label: "Advanced", tone: "optional" };
+    return { label: t("fieldform.badge_advanced"), tone: "optional" };
   }
   if (entry.path === "memory.backend")
-    return { label: "Recommended", tone: "choice" };
+    return { label: t("fieldform.badge_recommended"), tone: "choice" };
+  // MCP server command/url: required-ness tracks the chosen transport, not the
+  // Rust type (see mcpFieldRequired). Badge names the transport it's for so the
+  // operator knows why `command` is optional under http/sse (and vice versa).
+  const mcpRequired = mcpFieldRequired(
+    entry.path,
+    mcpTransport,
+    requiredByTransport,
+  );
+  if (mcpRequired !== null) {
+    // `leaf` (declared at the top of this fn) is `command` | `url` here.
+    if (mcpRequired) {
+      return {
+        label:
+          leaf === "command"
+            ? t("fieldform.badge_required_for_stdio")
+            : t("fieldform.badge_required_for_http_sse"),
+        tone: "required",
+      };
+    }
+    return {
+      label:
+        leaf === "command"
+          ? t("fieldform.badge_stdio_only")
+          : t("fieldform.badge_http_sse_only"),
+      tone: "optional",
+    };
+  }
   return null;
+}
+
+// Map the schema-derived requirement tone to a calm Badge tone. The label
+// text is whatever `setupRequirement` produced from the schema path — only
+// the tint is chosen here, so nothing is hardcoded.
+function requirementBadgeTone(
+  tone: "required" | "choice" | "optional",
+): BadgeTone {
+  if (tone === "required") return "warn";
+  // `choice` and `optional` both render the calm `neutral` tint, so they
+  // share the default below (the `choice` branch was identity with default).
+  return "neutral";
 }
 
 function isLocalModelProviderPath(path: string): boolean {
@@ -360,6 +455,160 @@ function isOptionalArray(typeHint: string): boolean {
   );
 }
 
+// Reference-type fields name an alias of another section: their `type_hint`
+// is a bare `*Ref` (e.g. `TtsProviderRef`, `TranscriptionProviderRef`,
+// `ModelProviderRef`, `ChannelRef`). Even though they aren't wrapped in
+// `Option<…>`, an EMPTY value is usually legitimate — it means "none" / unset.
+// The exception is a ref that `setupRequirement` explicitly marks "Required"
+// (e.g. an agent's `model_provider`), so the optional/required decision for
+// refs is made at the call site against the badge, not here. Detected purely
+// from the schema's own `type_hint` (the `Ref` suffix), nothing hardcoded.
+function isReferenceField(typeHint: string): boolean {
+  return typeHint.replace(/\s+/g, "").endsWith("Ref");
+}
+
+// A field is "required" (in the display-only validation sense) when its Rust
+// type signature is NOT wrapped in `Option<…>`. Read purely from the schema's
+// own `type_hint`, so nothing is hardcoded per field. Used only to surface an
+// inline hint — the authoritative required/optional check still runs in
+// `Config::validate()` on the server at save time. (Empty-able reference types
+// are excused by `treatAsOptional` at the call site, not here, so a genuinely
+// required ref like `model_provider` keeps its hint.)
+function isRequiredField(typeHint: string): boolean {
+  return !typeHint.replace(/\s+/g, "").startsWith("Option<");
+}
+
+// MCP server entries (`mcp.servers.<name>.<leaf>`) carry a transport-conditional
+// requirement the bare Rust type can't express: `command` is a non-optional
+// `String` (so the generic rule would always read it "required") yet is ONLY
+// needed for the stdio transport, while `url` is `Option<String>` (never
+// client-required) yet IS mandatory for the http/sse transports. Mirror the
+// server-side `validate_mcp_config` contract here so the badge + empty hint
+// follow the chosen transport instead of the type. Returns null for any field
+// that isn't one of these two transport-gated leaves (transport itself, args,
+// headers, ...), leaving the generic `Option<...>` rule in charge.
+// Which leaf each transport makes mandatory comes from the backend, not from a
+// map kept here: `mcpRequiredByTransport` reads the `x-required-by-transport`
+// metadata the server stamps onto the `McpServerConfig` schema, derived from
+// `McpTransport::required_leaf` (the same relationship `validate_mcp_config`
+// enforces). The form reads what the backend hands it, so a transport variant
+// added backend-side classifies correctly with no change here. When the metadata
+// is absent (a backend predating it) the map is null and required-ness is left
+// UNCLASSIFIED rather than re-encoding the enum, so the generic `Option<...>`
+// rule stays in charge.
+function mcpFieldRequired(
+  path: string,
+  transport: string | null | undefined,
+  requiredByTransport: Record<string, string> | null | undefined,
+): boolean | null {
+  const leaf = path.match(/^mcp\.servers\.[^.]+\.([^.]+)$/)?.[1];
+  if (leaf !== "command" && leaf !== "url") return null;
+  // Backend predates the x-required-by-transport metadata: do not assert
+  // required-ness rather than guessing it from a hand-kept map.
+  if (!requiredByTransport) return null;
+  // Empty / unset transport defaults to stdio (the schema default).
+  const t = (transport ?? "").trim().toLowerCase() || "stdio";
+  const requiredLeaf = requiredByTransport[t];
+  // Unknown transport (a variant the metadata has no rule for): do not assert
+  // required-ness, so a new variant cannot be silently misclassified.
+  if (!requiredLeaf) return null;
+  return leaf === requiredLeaf;
+}
+
+// Resolve the live transport draft value for the `mcp.servers.<name>` group a
+// given field belongs to, so the transport-conditional badge/hint update
+// reactively when the operator flips the transport <select>. Falls back to the
+// entry's saved/default value, then null when the field isn't an MCP server row.
+function resolveMcpTransport(
+  path: string,
+  entries: ListResponseEntry[],
+  draft: Record<string, string>,
+): string | null {
+  const name = path.match(/^mcp\.servers\.([^.]+)\./)?.[1];
+  if (!name) return null;
+  const transportPath = `mcp.servers.${name}.transport`;
+  const drafted = draft[transportPath];
+  if (drafted !== undefined && drafted.length > 0) return drafted;
+  const entry = entries.find((e) => e.path === transportPath);
+  return entry ? defaultInputValue(entry) : null;
+}
+
+// Display-only, pre-save validation derived entirely from the entry's own
+// metadata (`kind` + `type_hint`). Returns a short message to show under the
+// input (red), or null when the current draft value looks fine. This NEVER
+// blocks typing and NEVER changes what gets serialized on save — the
+// authoritative validation remains `Config::validate()` server-side, surfaced
+// inline via the `.path`-bound `ConfigApiError`. Scope is deliberately narrow:
+// only constraints we can read locally (a required scalar left empty; a
+// non-numeric value in an integer/float field).
+function validationHint(
+  entry: ListResponseEntry,
+  raw: string,
+  // When the field's badge says it's optional, don't also flag an empty value
+  // as "required". `isRequiredField` keys off `Option<…>`, but reference types
+  // (e.g. `TtsProviderRef`, `TranscriptionProviderRef`) aren't `Option` yet are
+  // legitimately empty ("= none"), so without this a field shows BOTH an
+  // "Optional" badge and a red "required" hint. The server's
+  // `Config::validate()` stays authoritative.
+  treatAsOptional = false,
+  // Live transport draft value for the enclosing `mcp.servers.<name>` group, so
+  // the empty-required check on `command` / `url` tracks the chosen transport
+  // rather than the bare Rust type. Null for non-MCP rows.
+  mcpTransport?: string | null,
+  // Backend-emitted transport->required-leaf map (see mcpRequiredByTransport);
+  // null when the backend predates the metadata.
+  requiredByTransport?: Record<string, string> | null,
+): string | null {
+  // Secrets: an empty box means "keep the stored value", never "cleared" —
+  // so emptiness is never an error here.
+  if (entry.is_secret) return null;
+  const renderer = rendererFor(entry);
+  const trimmed = raw.trim();
+
+  if (renderer === "number" && trimmed.length > 0) {
+    const n = Number(trimmed);
+    if (!Number.isFinite(n)) {
+      return entry.kind === "integer"
+        ? t("cfg.field.validation.mustBeWholeNumber")
+        : t("cfg.field.validation.mustBeNumber");
+    }
+    if (entry.kind === "integer" && !Number.isInteger(n)) {
+      return t("cfg.field.validation.noDecimals");
+    }
+  }
+
+  // MCP transport-gated fields own their own required decision (command-for-
+  // stdio / url-for-http-sse), overriding the generic Option<...> rule - `url` is
+  // optional at the type level yet client-required under http/sse, and `command`
+  // is type-required yet optional under http/sse.
+  const mcpRequired = mcpFieldRequired(
+    entry.path,
+    mcpTransport,
+    requiredByTransport,
+  );
+  if (mcpRequired !== null) {
+    if (mcpRequired && renderer !== "bool" && trimmed.length === 0) {
+      return t("cfg.field.validation.required");
+    }
+    return null;
+  }
+
+  // Required scalar left empty. Arrays/object-arrays carry their own three-state
+  // semantics (empty list vs none) handled at save time, so we don't flag them.
+  if (
+    !treatAsOptional &&
+    isRequiredField(entry.type_hint) &&
+    renderer !== "array" &&
+    renderer !== "object-array" &&
+    renderer !== "bool" &&
+    trimmed.length === 0
+  ) {
+    return t("cfg.field.validation.required");
+  }
+
+  return null;
+}
+
 // Per-provider+alias catalog cache. Cleared via clearFieldFormCatalogCaches() on
 // nav so a new model alias added under (say) `anthropic` shows up the next
 // time the user opens an agent form without a hard refresh.
@@ -380,6 +629,25 @@ function loadAgentOptions(): Promise<AgentOptionsResponse> {
     agentOptionsPromise = null;
   });
   return agentOptionsPromise;
+}
+
+// Generic alias-source resolution with in-flight de-dupe, keyed by the wire
+// `alias_source` value. Backs the schema-driven `kind === 'alias-ref'` picker
+// from zeroclaw-labs/zeroclaw#7594. Dormant on backends that predate that PR
+// (they never emit `alias_source`, so loadAliasSource is never called); when
+// the backend does declare it, this resolves the live values generically with
+// no per-path special-casing, superseding the per-section maps below.
+const aliasSourcePromises: Record<string, Promise<string[]> | undefined> = {};
+function loadAliasSource(source: string): Promise<string[]> {
+  const inflight = aliasSourcePromises[source];
+  if (inflight) return inflight;
+  const p = resolveAliasSource(source)
+    .then((r) => r.values)
+    .finally(() => {
+      aliasSourcePromises[source] = undefined;
+    });
+  aliasSourcePromises[source] = p;
+  return p;
 }
 
 /// Clear the per-provider model catalog cache. Called by Config.tsx when
@@ -414,6 +682,9 @@ const AGENT_MULTI_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
   "skill_bundles": "skill_bundles",
   "knowledge_bundles": "knowledge_bundles",
   "mcp_bundles": "mcp_bundles",
+  // Delegates is a subset of the configured agents — give it the same themed
+  // multi-select (with agent suggestions) as the bundle fields, not free text.
+  delegates: "agents",
 };
 
 // Peer-groups carry the same alias-ref shape as agents do: a single
@@ -441,6 +712,57 @@ function agentFieldKey(path: string): string | null {
 function peerGroupFieldKey(path: string): string | null {
   const m = path.match(/^peer_groups\.[^.]+\.(.+)$/);
   return m && m[1] ? m[1] : null;
+}
+
+// Leaf-based single-alias reference map. The agent/peer-group maps above are
+// gated on the `agents.*` / `peer_groups.*` prefix; this map matches the same
+// clearly-referential fields by their dotted-path LEAF, in the same
+// field-semantic spirit as the `…model` datalist and `allowed_tools` ToolPicker
+// hooks (no hardcoded parent section). It is consulted only as a fallback when
+// the prefixed maps don't apply, so existing behavior is unchanged. Each leaf's
+// value is a single alias string of the target section — byte-identical to the
+// free-text value it replaces — so the save/PATCH serialization is untouched.
+// If the target section's aliases can't be fetched, the field FALLS BACK to the
+// existing text input (the picker only renders when `agentOptions` is loaded
+// and the option list is non-empty).
+const LEAF_SINGLE_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
+  model_provider: "model_providers",
+  risk_profile: "risk_profiles",
+  runtime_profile: "runtime_profiles",
+  memory_namespace: "memory_namespaces",
+};
+
+// Resolve the single-alias reference section for a field by its path leaf.
+// Returns null for anything not in the conservative reference map, leaving the
+// field as free text.
+function leafSingleAliasKind(path: string): keyof AgentOptionsResponse | null {
+  const leaf = path.split(".").pop() ?? "";
+  return LEAF_SINGLE_ALIAS_FIELDS[leaf] ?? null;
+}
+
+// `kind:"alias-ref"` fields carry a `<Type>Ref` type_hint naming the section
+// they reference. Map it to the `resolve-alias-source` query value (the backend
+// AliasSource variants). Used to DERIVE the source when the daemon emits the
+// kind but omits `alias_source` (older builds): the generic resolver still works
+// — covering provider refs (incl. tts/transcription/classifier) that have no
+// AgentOptionsResponse list, so they get a real dropdown, not a stuck spinner.
+const ALIAS_REF_TYPE_TO_SOURCE: Record<string, string> = {
+  ModelProviderRef: "model_providers",
+  TtsProviderRef: "tts_providers",
+  TranscriptionProviderRef: "transcription_providers",
+  RiskProfileRef: "risk_profiles",
+  RuntimeProfileRef: "runtime_profiles",
+  ChannelRef: "channels",
+};
+
+// The `resolve-alias-source` query value for an alias-ref entry: prefer the
+// daemon-declared `alias_source`; else derive it from the `<Type>Ref` type_hint.
+// Returns null for non-alias-ref entries or unmapped ref types.
+function aliasRefSource(entry: ListResponseEntry): string | null {
+  if (entry.kind !== "alias-ref") return null;
+  if (entry.alias_source) return entry.alias_source;
+  const m = entry.type_hint?.match(/(\w+Ref)\b/);
+  return (m && ALIAS_REF_TYPE_TO_SOURCE[m[1] ?? ""]) ?? null;
 }
 
 // Cross-section navigation map for agent alias-ref fields. Each entry
@@ -475,13 +797,13 @@ function AgentEmptyAliasFallback({
         background: "var(--pc-bg-surface-subtle)",
       }}
     >
-      No {label} configured yet.{" "}
+      {t("fieldform.no_alias_configured_prefix")}{label}{t("fieldform.no_alias_configured_suffix")}{" "}
       <Link
         to={path}
         className="inline-flex items-center gap-1 underline"
         style={{ color: "var(--pc-text-link)" }}
       >
-        Configure {label} <ExternalLink className="h-3 w-3" />
+        {t("fieldform.configure_prefix")}{label} <ExternalLink className="h-3 w-3" />
       </Link>
     </div>
   );
@@ -508,6 +830,96 @@ function agentAliasJumpPath(
   return `${base}/${encodeURIComponent(alias)}`;
 }
 
+// Secret field renderer. A populated secret shows a static "set" indicator and
+// a Change button so the stored value (and its length) is never represented in
+// the DOM until the operator opts in. Entering change mode reveals a masked
+// input with a reveal/hide eye toggle and a cancel control that reverts to the
+// set state. An unset secret renders the input directly with no cancel.
+//
+// The draft contract is unchanged: an empty value means "keep the stored
+// secret" (handled by handleSave's `e.is_secret && raw.length === 0` guard), so
+// cancelling clears the draft back to empty.
+function SecretField({
+  inputId,
+  populated,
+  value,
+  onChange,
+}: {
+  inputId: string;
+  populated: boolean;
+  value: string;
+  onChange: (next: string) => void;
+}) {
+  // Start in change mode when a populated field already carries a staged draft
+  // value (operator typed a replacement, navigated away, came back). Otherwise
+  // the pending edit would hide behind the "set" indicator and the operator
+  // could not see or read back their own unsaved change.
+  const [changing, setChanging] = useState(populated && value.length > 0);
+  const [revealed, setRevealed] = useState(false);
+
+  const editing = !populated || changing;
+
+  if (!editing) {
+    return (
+      <button
+        type="button"
+        onClick={() => {
+          setChanging(true);
+          setRevealed(false);
+        }}
+        className="btn-secondary text-sm px-3 py-1.5 inline-flex items-center gap-1"
+      >
+        {t("fieldform.secret_change")}
+      </button>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-2">
+      <div className="relative flex-1">
+        <input
+          id={inputId}
+          type={revealed ? "text" : "password"}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="input-electric w-full px-3 py-2 pr-10 text-sm"
+          placeholder={t("fieldform.secret_enter_placeholder")}
+          autoComplete="off"
+        />
+        <button
+          type="button"
+          onClick={() => setRevealed((r) => !r)}
+          title={revealed ? t("fieldform.secret_hide") : t("fieldform.secret_reveal")}
+          aria-label={revealed ? t("fieldform.secret_hide") : t("fieldform.secret_reveal")}
+          aria-pressed={revealed}
+          className="btn-icon absolute right-1.5 top-1/2 -translate-y-1/2"
+        >
+          {revealed ? (
+            <EyeOff className="h-4 w-4" />
+          ) : (
+            <Eye className="h-4 w-4" />
+          )}
+        </button>
+      </div>
+      {populated && (
+        <button
+          type="button"
+          onClick={() => {
+            onChange("");
+            setChanging(false);
+            setRevealed(false);
+          }}
+          title={t("fieldform.secret_cancel_change")}
+          aria-label={t("fieldform.secret_cancel_change")}
+          className="btn-icon flex-shrink-0"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      )}
+    </div>
+  );
+}
+
 const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
   function FieldForm(
     {
@@ -517,6 +929,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
       title,
       drift,
       includePath,
+      scopeActionsToIncludedPaths = false,
       inlineSaveBar = false,
     },
     ref,
@@ -537,6 +950,36 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     );
     const [filter, setFilter] = useState("");
 
+    // When this form edits a channel block (`channels.<type>.<alias>`), its
+    // `excluded_tools` ToolPicker should list the OWNING agent's scoped tools
+    // (built-ins + its `mcp_bundles` MCP), not the default agent's. The owner
+    // is the agent whose `channels` list contains `<type>.<alias>` (a reverse
+    // lookup the gateway already does and returns as `owning_agent`), so it
+    // is NOT the alias in the path. `undefined` for non-channel sections
+    // (risk profiles are shared across agents; pipeline/claude_code are
+    // global) leaves the picker on the default-agent catalog.
+    const [toolAgent, setToolAgent] = useState<string | undefined>(undefined);
+    useEffect(() => {
+      if (!prefix.startsWith("channels.")) {
+        setToolAgent(undefined);
+        return;
+      }
+      const channelName = prefix.slice("channels.".length);
+      let cancelled = false;
+      void getChannels()
+        .then((channels) => {
+          if (cancelled) return;
+          const owner = channels.find((c) => c.name === channelName)?.owning_agent;
+          setToolAgent(owner ?? undefined);
+        })
+        .catch(() => {
+          if (!cancelled) setToolAgent(undefined);
+        });
+      return () => {
+        cancelled = true;
+      };
+    }, [prefix]);
+
     // Schema is whole-Config and ETag-cached server-side; fetch once per
     // session so every form row can resolve its `///` doc-comment helper
     // text via descriptionForPath without per-field round trips.
@@ -549,6 +992,15 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         cancelled = true;
       };
     }, []);
+
+    // Transport->required-leaf map, read once from the cached schema so every
+    // MCP server row classifies command/url required-ness from the registry
+    // (`x-required-by-transport`) instead of a hardcoded map. Null on backends
+    // that predate the metadata; rows then leave required-ness unclassified.
+    const requiredByTransport = useMemo(
+      () => mcpRequiredByTransport(schema),
+      [schema],
+    );
 
     const reload = async () => {
       setLoading(true);
@@ -571,7 +1023,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
           setTopError(`[${e.envelope.code}] ${e.envelope.message}`);
         } else {
           setTopError(
-            `Couldn't load fields for ${prefix}: ${e instanceof Error ? e.message : String(e)}`,
+            `${t("fieldform.load_failed_prefix")}${prefix}: ${e instanceof Error ? e.message : String(e)}`,
           );
         }
       } finally {
@@ -583,6 +1035,16 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
       void reload();
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [prefix]);
+
+    const actionableEntries = useMemo(() => {
+      if (!scopeActionsToIncludedPaths || !includePath) return entries;
+      return entries.filter((e) => includePath(e.path));
+    }, [entries, includePath, scopeActionsToIncludedPaths]);
+
+    const actionablePaths = useMemo(
+      () => actionableEntries.map((e) => e.path),
+      [actionableEntries],
+    );
 
     // Returns true when nothing was dirty or the save succeeded; false on
     // any error so callers (e.g. the wizard's Next button) can refuse to
@@ -612,7 +1074,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         }
         return value;
       };
-      for (const e of entries) {
+      for (const e of actionableEntries) {
         if (configDraft.tombstones.has(e.path)) {
           ops.push({ op: "remove", path: e.path });
           continue;
@@ -656,8 +1118,12 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
 
       try {
         const resp = await patchConfig(ops);
-        setSavedAt(`Saved ${resp.results.length} field(s).`);
-        configDraft.discardSection(prefix);
+        setSavedAt(`${t("fieldform.saved_prefix")}${resp.results.length}${t("fieldform.saved_suffix")}`);
+        if (scopeActionsToIncludedPaths && includePath) {
+          configDraft.discardPaths(actionablePaths);
+        } else {
+          configDraft.discardSection(prefix);
+        }
         await reload();
         onSaved?.();
         return true;
@@ -667,14 +1133,14 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
           if (env.path) {
             setFieldErrors({ [env.path]: env });
             setTopError(
-              `Save failed: [${env.code}] ${env.message} (field: ${env.path})`,
+              `${t("fieldform.save_failed_prefix")}[${env.code}] ${env.message} (${t("fieldform.field_label")}: ${env.path})`,
             );
           } else {
-            setTopError(`Save failed: [${env.code}] ${env.message}`);
+            setTopError(`${t("fieldform.save_failed_prefix")}[${env.code}] ${env.message}`);
           }
         } else {
           setTopError(
-            `Save failed: ${e instanceof Error ? e.message : String(e)}`,
+            `${t("fieldform.save_failed_prefix")}${e instanceof Error ? e.message : String(e)}`,
           );
         }
         return false;
@@ -747,7 +1213,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     // across the loading / loaded transition (React error #310).
     const unsavedCount = useMemo(() => {
       let n = 0;
-      for (const e of entries) {
+      for (const e of actionableEntries) {
         if (configDraft.tombstones.has(e.path)) {
           n += 1;
           continue;
@@ -760,7 +1226,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         if (valueChanged || commentChanged) n += 1;
       }
       return n;
-    }, [entries, draft, comments, configDraft.tombstones]);
+    }, [actionableEntries, draft, comments, configDraft.tombstones]);
 
     // Warn user before navigating away with unsaved changes.
     useEffect(() => {
@@ -852,9 +1318,9 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
             type="text"
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
-            placeholder={`Filter ${visibleEntries.length} fields — fuzzy match on name or path`}
+            placeholder={`${t("fieldform.filter_prefix")}${visibleEntries.length}${t("fieldform.filter_suffix")}`}
             className="input-electric w-full px-3 py-2 text-sm"
-            aria-label="Filter fields"
+            aria-label={t("fieldform.filter_aria")}
           />
         )}
 
@@ -863,7 +1329,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
             className="surface-panel p-6 text-center text-sm"
             style={{ color: "var(--pc-text-muted)" }}
           >
-            No fields under{" "}
+            {t("fieldform.no_fields_under")}{" "}
             <code style={{ color: "var(--pc-text-faint)" }}>{prefix}</code>.
           </div>
         ) : (
@@ -881,10 +1347,10 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                 style={{ color: "var(--pc-text-muted)" }}
               >
                 {filter.trim().length === 0 ? (
-                  <>No configurable settings for this selection.</>
+                  <>{t("fieldform.no_configurable_settings")}</>
                 ) : (
                   <>
-                    No fields match{" "}
+                    {t("fieldform.no_fields_match")}{" "}
                     <code style={{ color: "var(--pc-text-faint)" }}>
                       {filter}
                     </code>
@@ -897,6 +1363,9 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
               <FieldRow
                 key={f.path}
                 entry={f}
+                toolAgent={toolAgent}
+                mcpTransport={resolveMcpTransport(f.path, entries, draft)}
+                requiredByTransport={requiredByTransport}
                 value={draft[f.path] ?? ""}
                 onChange={(v) => {
                   setDraft((d) => ({ ...d, [f.path]: v }));
@@ -976,24 +1445,27 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                   </span>
                 ) : unsavedCount > 0 ? (
                   <span style={{ color: "var(--pc-text-secondary)" }}>
-                    {unsavedCount} unsaved{" "}
-                    {unsavedCount === 1 ? "change" : "changes"}
+                    {unsavedCount}{" "}
+                    {unsavedCount === 1
+                      ? t("fieldform.unsaved_change")
+                      : t("fieldform.unsaved_changes")}
                   </span>
                 ) : (
                   <span style={{ color: "var(--pc-text-faint)" }}>
-                    No unsaved changes
+                    {t("fieldform.no_unsaved_changes")}
                   </span>
                 )}
               </div>
-              <button
-                type="button"
+              <Button
+                variant="primary"
+                size="md"
                 onClick={() => void handleSave()}
                 disabled={saving || unsavedCount === 0}
-                className="btn-electric flex items-center gap-2 text-sm px-4 py-2 flex-shrink-0"
+                className="flex-shrink-0"
               >
                 <Save className="h-4 w-4" />
-                {saving ? "Saving…" : "Save"}
-              </button>
+                {saving ? t("fieldform.saving") : t("common.save")}
+              </Button>
             </div>
           </div>
         )}
@@ -1024,6 +1496,17 @@ interface FieldRowProps {
   tombstoned?: boolean;
   /** Pulls the row out of tombstoned state. */
   onUndoTombstone?: () => void;
+  /** Owning agent for an `allowed_tools`/`excluded_tools` ToolPicker in this
+   *  section (e.g. a channel's `owning_agent`), so the picker lists that
+   *  agent's scoped tools. `undefined` keeps the default-agent catalog. */
+  toolAgent?: string;
+  /** Live transport draft value for the enclosing `mcp.servers.<name>` group
+   *  (null when this row isn't an MCP server field). Drives the
+   *  transport-conditional required badge/hint on `command` and `url`. */
+  mcpTransport?: string | null;
+  /** Backend transport->required-leaf map for MCP rows (null on older
+   *  backends); drives the required badge/hint without a hardcoded map. */
+  requiredByTransport?: Record<string, string> | null;
 }
 
 function FieldRow({
@@ -1039,15 +1522,48 @@ function FieldRow({
   drift,
   tombstoned,
   onUndoTombstone,
+  toolAgent,
+  mcpTransport,
+  requiredByTransport,
 }: FieldRowProps) {
   const renderer = rendererFor(entry);
-  const requirement = setupRequirement(entry);
+  const requirement = setupRequirement(entry, mcpTransport, requiredByTransport);
+  // Display-only inline validation derived from this entry's schema metadata.
+  // Pure read of `value` — it does not feed the save/PATCH path in any way.
+  // If the badge marks the field optional, don't also flag empty as required
+  // (keeps the "Optional" badge and the validation hint from contradicting).
+  const validationMessage = validationHint(
+    entry,
+    value,
+    // Suppress the "required when empty" hint when: the badge marks the field
+    // optional/choice (keeps badge + hint from contradicting), OR it's an
+    // empty-able reference type that the badge does NOT mark required (the #8
+    // residual: a *Ref with no badge). A ref that IS badged "required" (e.g.
+    // model_provider) still gets its hint.
+    (requirement != null && requirement.tone !== "required") ||
+      (requirement?.tone !== "required" && isReferenceField(entry.type_hint)),
+    mcpTransport,
+    requiredByTransport,
+  );
+  // Suppress the local hint while a server-side error is already bound to this
+  // field so the two don't stack; the authoritative server message wins.
+  const showValidation = validationMessage !== null && !error;
+  // The per-row "why?" comment is gated behind a reveal so it doesn't add a
+  // permanent second input to every row. Open it automatically when a
+  // comment value is already staged so the operator sees their own note.
+  const [showComment, setShowComment] = useState(comment.length > 0);
   const [providerModels, setProviderModels] = useState<string[] | null>(null);
   const [modelsFetchFailed, setModelsFetchFailed] = useState(false);
   // Per-alias model field — `providers.models.<type>.<alias>.model`.
   const isProviderModelField = /^providers\.models\.[^.]+\.[^.]+\.model$/.test(
     entry.path,
   );
+  // The same alias's `fallback_models` array — a list of model IDs from the
+  // same provider catalog, so it gets the same known-model dropdown per row.
+  const isProviderModelArrayField =
+    /^providers\.models\.[^.]+\.[^.]+\.fallback_models$/.test(entry.path);
+  // Either model field needs the provider's catalog fetched.
+  const needsProviderModels = isProviderModelField || isProviderModelArrayField;
   // Skill-bundle directory field — `skill-bundles.<alias>.directory` (or
   // the legacy snake form `skill_bundles.<alias>.directory`). When unset
   // the runtime falls back to `<install>/shared/skills/<alias>/`; render
@@ -1074,6 +1590,24 @@ function FieldRow({
   const showPicker = skillBundleAlias !== null || isDirectoryField;
   const [pickerOpen, setPickerOpen] = useState(false);
 
+  // Tool-list enrichment — mirrors the per-alias `…model` field hook above.
+  // Any `string-array` field whose dotted-path leaf is `allowed_tools`
+  // (risk profiles, agents, …) renders the multi-select ToolPicker instead
+  // of the one-value-per-line chip/text editor. Matched on the schema's own
+  // path leaf, not a hardcoded section, so every `*.allowed_tools` list
+  // gets the same picker. The draft value it reads/writes is the SAME
+  // JSON-array string the ArrayFieldEditor uses, so parseInput() at save
+  // time is untouched and the PATCH op is byte-identical.
+  // Tool-list fields (allowed_tools / excluded_tools) get the catalog-backed
+  // ToolPicker; detection is by leaf name, in the same field-semantic spirit
+  // as the provider model-field datalist hook (no hardcoded section keys).
+  const isAllowedToolsField =
+    entry.kind === "string-array" &&
+    (() => {
+      const leaf = entry.path.split(".").pop();
+      return leaf === "allowed_tools" || leaf === "excluded_tools";
+    })();
+
   // Agent-form alias pickers. Each `agents.<alias>.<field>` row that
   // references another section's aliases (channels, model_provider, etc.)
   // renders as a picker over the live config rather than a free-text
@@ -1082,11 +1616,20 @@ function FieldRow({
   const peerGroupField = peerGroupFieldKey(entry.path);
   // Schema path is kebab-case (matches prop_fields() emission).
   const isAgentSystemPrompt = agentField === "system-prompt";
-  const agentSingleAliasKind: keyof AgentOptionsResponse | null = agentField
-    ? (AGENT_SINGLE_ALIAS_FIELDS[agentField] ?? null)
-    : peerGroupField
-      ? (PEER_GROUP_SINGLE_ALIAS_FIELDS[peerGroupField] ?? null)
-      : null;
+  // Resolve which referenced section (if any) this single-value field points
+  // at. Prefer the agent / peer-group field maps; otherwise fall back to a
+  // leaf-name match (model_provider / risk_profile / runtime_profile /
+  // memory_namespace). The leaf fallback runs LAST so it also covers those
+  // reference fields when they appear UNDER `agents.*` (e.g.
+  // agents.<alias>.risk_profile, which the agent field map doesn't list).
+  // Falls back to free text if the target section's aliases can't be fetched.
+  const agentSingleAliasKind: keyof AgentOptionsResponse | null =
+    (agentField ? AGENT_SINGLE_ALIAS_FIELDS[agentField] : undefined) ??
+    (peerGroupField
+      ? PEER_GROUP_SINGLE_ALIAS_FIELDS[peerGroupField]
+      : undefined) ??
+    leafSingleAliasKind(entry.path) ??
+    null;
   const agentMultiAliasKind: keyof AgentOptionsResponse | null = agentField
     ? (AGENT_MULTI_ALIAS_FIELDS[agentField] ?? null)
     : peerGroupField
@@ -1099,7 +1642,7 @@ function FieldRow({
   );
 
   useEffect(() => {
-    if (!isProviderModelField) return;
+    if (!needsProviderModels) return;
     void primeModelProviderCatalog();
     const [, , provider, alias] = entry.path.split('.');
     if (!provider || !alias) return;
@@ -1125,7 +1668,7 @@ function FieldRow({
         setProviderModels([]);
         setModelsFetchFailed(true);
       });
-  }, [isProviderModelField, entry.path]);
+  }, [needsProviderModels, entry.path]);
 
   // Refetch on every mount so newly-created channels / agents / bundles
   // (added in a different section) surface without a page reload.
@@ -1144,6 +1687,44 @@ function FieldRow({
     };
   }, [agentNeedsOptions]);
 
+  // Generic alias-reference picker (zeroclaw-labs/zeroclaw#7594). Any field the
+  // schema types as `PropKind::AliasRef` carries `alias_source`; resolve its
+  // values from the live config with no per-path special-casing. Dormant on
+  // backends that predate #7594 — they never set `kind === 'alias-ref'`, so
+  // `aliasSource` is undefined and the effect is a no-op, leaving the maps
+  // above to resolve refs. When the backend does declare it, the
+  // `renderer === 'alias-ref'` branch takes precedence over those maps.
+  const aliasSource = aliasRefSource(entry);
+  const [aliasValues, setAliasValues] = useState<string[] | null>(null);
+  useEffect(() => {
+    if (!aliasSource) return;
+    let cancelled = false;
+    void loadAliasSource(aliasSource)
+      .then((values) => {
+        if (!cancelled) setAliasValues(values);
+      })
+      .catch(() => {
+        if (!cancelled) setAliasValues([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [aliasSource]);
+
+  // Resolve the option list for an `alias-ref` field. Prefer the resolver values
+  // (keyed off `aliasSource`, which `aliasRefSource` derives from the type_hint
+  // when the daemon omits `alias_source`); else fall back to the agent/leaf alias
+  // map (`/api/config/agent-options`). `null` = no options yet.
+  const aliasRefOptions: string[] | null =
+    aliasValues ??
+    (agentSingleAliasKind && agentOptions
+      ? (agentOptions[agentSingleAliasKind] ?? [])
+      : null);
+  // Distinguish "actively resolving" (a source IS being fetched, show a spinner)
+  // from "unresolvable" (no source AND no fallback — render an empty, usable
+  // picker rather than a spinner that never finishes).
+  const aliasRefResolving = aliasSource !== null && aliasRefOptions === null;
+
   if (tombstoned) {
     return (
       <div className="px-4 py-3 flex items-center justify-between gap-3 opacity-70">
@@ -1158,7 +1739,7 @@ function FieldRow({
             className="text-xs mt-0.5"
             style={{ color: "var(--pc-text-muted)" }}
           >
-            Staged for removal. Commits on Save.
+            {t("fieldform.staged_for_removal")}
           </p>
         </div>
         {onUndoTombstone && (
@@ -1167,7 +1748,7 @@ function FieldRow({
             onClick={onUndoTombstone}
             className="btn-secondary text-xs px-2 py-1 flex-shrink-0"
           >
-            Undo
+            {t("fieldform.undo")}
           </button>
         )}
       </div>
@@ -1179,49 +1760,35 @@ function FieldRow({
       <div className="flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0">
           <label
-            className="block text-sm font-medium font-mono break-all"
+            className="block text-sm font-medium font-sans break-words"
             style={{ color: "var(--pc-text-primary)" }}
             htmlFor={entry.path}
-            title={entry.type_hint}
+            title={`${entry.path}${entry.type_hint ? ` — ${entry.type_hint}` : ""}`}
           >
-            {entry.path}
+            {humanizeFieldLabel(entry.path)}
             {requirement && (
-              <span
-                className="ml-2 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide font-sans"
-                style={{
-                  color:
-                    requirement.tone === "required"
-                      ? "#fca5a5"
-                      : requirement.tone === "choice"
-                        ? "#67e8f9"
-                        : "var(--pc-text-muted)",
-                  background:
-                    requirement.tone === "required"
-                      ? "rgba(239, 68, 68, 0.12)"
-                      : requirement.tone === "choice"
-                        ? "rgba(34, 211, 238, 0.10)"
-                        : "var(--pc-bg-surface-subtle)",
-                  border: "1px solid",
-                  borderColor:
-                    requirement.tone === "required"
-                      ? "rgba(239, 68, 68, 0.24)"
-                      : requirement.tone === "choice"
-                        ? "rgba(34, 211, 238, 0.20)"
-                        : "var(--pc-border)",
-                }}
+              <Badge
+                tone={requirementBadgeTone(requirement.tone)}
+                className="ml-2 uppercase tracking-wide"
               >
                 {requirement.label}
-              </span>
+              </Badge>
             )}
             {entry.is_secret && (
-              <span
-                className="ml-2 text-xs font-sans"
-                style={{ color: "var(--pc-text-muted)" }}
-              >
-                🔒 {entry.populated ? "set" : "unset"}
+              <span className="ml-2 text-xs font-sans text-pc-text-muted">
+                🔒 {entry.populated ? t("fieldform.secret_set") : t("fieldform.secret_unset")}
               </span>
             )}
           </label>
+          {/* Demoted: the raw schema path stays visible (faint, monospace) so
+              the field is still unambiguously identifiable, but the humanized
+              leaf above is now the primary label. */}
+          <code
+            className="block text-[11px] font-mono break-all mt-0.5"
+            style={{ color: "var(--pc-text-faint)" }}
+          >
+            {entry.path}
+          </code>
           {description && (
             <p
               className="text-xs mt-0.5"
@@ -1236,7 +1803,7 @@ function FieldRow({
           <button
             type="button"
             onClick={onDelete}
-            title="Reset to default / unset"
+            title={t("fieldform.reset_to_default")}
             className="btn-icon flex-shrink-0"
           >
             <Trash2 className="h-4 w-4" />
@@ -1244,7 +1811,14 @@ function FieldRow({
         )}
       </div>
 
-      <div className="mt-2 space-y-1.5">
+      <div
+        className={
+          showValidation
+            ? "mt-2 space-y-1.5 rounded-[var(--radius-md)] ring-1 ring-status-error p-1.5 -m-1.5"
+            : "mt-2 space-y-1.5"
+        }
+        aria-invalid={showValidation || undefined}
+      >
         {renderer === "bool" ? (
           <BoolSwitch
             id={entry.path}
@@ -1252,37 +1826,67 @@ function FieldRow({
             onChange={(next) => onChange(next ? "true" : "false")}
           />
         ) : renderer === "select" ? (
-          <select
+          // Themed locked dropdown for enum variants (no browser-styled <option>
+          // list). The leading "—" is the empty/unset choice.
+          <Select
             id={entry.path}
             value={value}
-            onChange={(e) => onChange(e.target.value)}
-            className="input-electric w-full px-3 py-2 text-sm appearance-none cursor-pointer"
-          >
-            <option value="">—</option>
-            {(entry.enum_variants ?? []).map((v) => (
-              <option key={v} value={v}>
-                {v}
-              </option>
-            ))}
-          </select>
+            onChange={onChange}
+            aria-label={fieldShortLabel(entry)}
+            options={[
+              { value: "", label: "—" },
+              ...(entry.enum_variants ?? []).map((v) => ({
+                value: v,
+                label: v,
+              })),
+            ]}
+          />
+        ) : renderer === "alias-ref" ? (
+          // Schema-driven alias-ref picker (zeroclaw-labs/zeroclaw#7594): a
+          // themed, click-to-open ComboBox of the live values (resolved from
+          // `entry.alias_source`, with an agent-options fallback — see
+          // `aliasRefOptions`). Uses the same primitive as the model-field picker
+          // so it matches the rest of the page instead of a browser-styled native
+          // <select>. `openOnFocus` makes clicking the field open the list, since
+          // the configured aliases ARE the expected input. Free text is still
+          // accepted verbatim (and validated on save) so an existing or
+          // not-yet-created alias is never dropped. Precedes the per-section maps.
+          aliasRefResolving ? (
+            <input
+              id={entry.path}
+              value={value}
+              disabled
+              readOnly
+              className="input-electric w-full px-3 py-2 text-sm"
+              placeholder={t("fieldform.alias_loading")}
+            />
+          ) : (
+            <ComboBox
+              id={entry.path}
+              value={value}
+              onChange={onChange}
+              options={aliasRefOptions ?? []}
+              openOnFocus
+              placeholder={t("fieldform.alias_pick_or_type")}
+              aria-label={fieldShortLabel(entry)}
+            />
+          )
         ) : isProviderModelField &&
           providerModels !== null &&
           providerModels.length > 0 ? (
-          <>
-            <input
-              id={entry.path}
-              list={`models-${entry.path}`}
-              value={value}
-              onChange={(e) => onChange(e.target.value)}
-              className="input-electric w-full px-3 py-2 text-sm"
-              placeholder="Pick from list or type a model name"
-            />
-            <datalist id={`models-${entry.path}`}>
-              {providerModels.map((m) => (
-                <option key={m} value={m} />
-              ))}
-            </datalist>
-          </>
+          // Discoverable combobox (caret + filterable listbox) rather than a
+          // native <datalist>, which showed no affordance — users never saw
+          // the known-model list. Free text is still accepted for unlisted IDs.
+          <ComboBox
+            id={entry.path}
+            value={value}
+            onChange={onChange}
+            options={providerModels}
+            openOnFocus
+            placeholder={t("fieldform.model_combo_placeholder")}
+            emptyText={t("fieldform.model_combo_empty")}
+            aria-label={t("fieldform.model_aria")}
+          />
         ) : isProviderModelField && modelsFetchFailed ? (
           // Fetch failed — fall back to free text with explicit help.
           <>
@@ -1291,11 +1895,10 @@ function FieldRow({
               value={value}
               onChange={(e) => onChange(e.target.value)}
               className="input-electric w-full px-3 py-2 text-sm"
-              placeholder="Type a model identifier (catalog unreachable)"
+              placeholder={t("fieldform.model_input_unreachable_placeholder")}
             />
             <p className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
-              Could not fetch model catalog for this provider. Type the
-              identifier from your provider's docs (e.g.{" "}
+              {t("fieldform.model_catalog_unreachable_help")}{" "}
               <code>{modelFallbackExample(entry.path)}</code>).
             </p>
           </>
@@ -1307,11 +1910,11 @@ function FieldRow({
               value={value}
               onChange={(e) => onChange(e.target.value)}
               className="input-electric w-full px-3 py-2 text-sm"
-              placeholder="Fetching models…"
+              placeholder={t("fieldform.fetching_models_placeholder")}
               disabled
             />
             <p className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
-              Fetching available models from the provider's catalog…
+              {t("fieldform.fetching_models_help")}
             </p>
           </>
         ) : isAgentSystemPrompt ? (
@@ -1321,7 +1924,7 @@ function FieldRow({
             value={value}
             onChange={(e) => onChange(e.target.value)}
             className="input-electric w-full px-3 py-2 text-sm font-mono resize-y"
-            placeholder="Optional. Prefer placing prose in agents/<alias>/AGENTS.md."
+            placeholder={t("fieldform.system_prompt_placeholder")}
           />
         ) : agentSingleAliasKind && agentOptions ? (
           (agentOptions[agentSingleAliasKind] ?? []).length === 0 ? (
@@ -1334,7 +1937,7 @@ function FieldRow({
                 onChange={(e) => onChange(e.target.value)}
                 className="input-electric flex-1 px-3 py-2 text-sm appearance-none cursor-pointer"
               >
-                <option value="">— (none)</option>
+                <option value="">{t("fieldform.option_none")}</option>
                 {(agentOptions[agentSingleAliasKind] ?? []).map((a) => (
                   <option key={a} value={a}>
                     {a}
@@ -1344,7 +1947,7 @@ function FieldRow({
               {value && (
                 <Link
                   to={agentAliasJumpPath(agentSingleAliasKind, value)}
-                  title={`Edit ${value} in its source section`}
+                  title={`${t("fieldform.edit_in_source_prefix")}${value}${t("fieldform.edit_in_source_suffix")}`}
                   className="btn-icon flex-shrink-0"
                 >
                   <ExternalLink className="h-4 w-4" />
@@ -1364,6 +1967,30 @@ function FieldRow({
               suggestions={agentOptions[agentMultiAliasKind]}
             />
           )
+        ) : isAllowedToolsField ? (
+          // `allowed_tools` lists get the catalog-backed multi-select. We
+          // bridge to the picker using the SAME draft representation every
+          // other string-array field uses: the value is the JSON-array
+          // string, so `parseArrayRows` decodes it to `string[]` for the
+          // picker and `JSON.stringify` re-encodes the picker's output —
+          // identical to ArrayFieldEditor.writeRows. The save path
+          // (parseInput → parseStringArrayValue) never sees a difference.
+          <ToolPicker
+            id={entry.path}
+            agent={toolAgent}
+            value={parseArrayRows(value)}
+            onChange={(next) => onChange(JSON.stringify(next))}
+          />
+        ) : isProviderModelArrayField ? (
+          // Fallback models: same array editor, but each row gets the known-
+          // model dropdown (falls back to free text while the catalog loads).
+          <ArrayFieldEditor
+            inputId={entry.path}
+            value={value}
+            onChange={onChange}
+            isOptional={isOptionalArray(entry.type_hint)}
+            suggestions={providerModels ?? undefined}
+          />
         ) : renderer === "array" ? (
           <ArrayFieldEditor
             inputId={entry.path}
@@ -1397,19 +2024,20 @@ function FieldRow({
                 className="input-electric flex-1 px-3 py-2 text-sm"
                 placeholder={
                   skillBundleAlias
-                    ? `shared/skills/${skillBundleAlias}/ (default — leave empty)`
-                    : "shared/… (leave empty to use the schema default)"
+                    ? `shared/skills/${skillBundleAlias}/ ${t("fieldform.dir_default_leave_empty")}`
+                    : t("fieldform.dir_shared_placeholder")
                 }
               />
               <button
                 type="button"
+                data-dirpicker-trigger
                 onClick={() => setPickerOpen((open) => !open)}
                 className="btn-secondary inline-flex items-center gap-1.5 text-sm px-3 py-2 flex-shrink-0"
-                title="Browse shared/ for a directory"
+                title={t("fieldform.browse_shared_title")}
                 aria-expanded={pickerOpen}
               >
                 <FolderOpen className="h-4 w-4" />
-                Browse
+                {t("fieldform.browse")}
               </button>
             </div>
             {pickerOpen && (
@@ -1425,31 +2053,62 @@ function FieldRow({
               </div>
             )}
           </div>
+        ) : renderer === "secret" ? (
+          <SecretField
+            inputId={entry.path}
+            populated={entry.populated}
+            value={value}
+            onChange={onChange}
+          />
         ) : (
           <input
             id={entry.path}
-            type={renderer === "secret" ? "password" : "text"}
+            type="text"
             value={value}
             onChange={(e) => onChange(e.target.value)}
             className="input-electric w-full px-3 py-2 text-sm"
-            placeholder={
-              renderer === "secret"
-                ? entry.populated
-                  ? "Leave blank to keep current value"
-                  : "Enter value"
-                : ""
-            }
           />
         )}
 
-        <input
-          type="text"
-          value={comment}
-          onChange={(e) => onCommentChange(e.target.value)}
-          placeholder="Optional comment (why?)"
-          className="input-electric w-full px-3 py-1.5 text-xs"
-          style={{ color: "var(--pc-text-secondary)" }}
-        />
+        {showValidation && (
+          <p className="text-xs text-status-error" role="alert">
+            {validationMessage}
+          </p>
+        )}
+
+        {showComment ? (
+          <div className="flex items-center gap-1.5">
+            <input
+              type="text"
+              value={comment}
+              autoFocus={comment.length === 0}
+              onChange={(e) => onCommentChange(e.target.value)}
+              placeholder={t("cfg.field.commentPlaceholder")}
+              className="input-electric flex-1 px-3 py-1.5 text-xs text-pc-text-secondary"
+            />
+            <button
+              type="button"
+              onClick={() => {
+                onCommentChange("");
+                setShowComment(false);
+              }}
+              title={t("cfg.field.commentHide")}
+              aria-label={t("cfg.field.commentHide")}
+              className="btn-icon flex-shrink-0"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setShowComment(true)}
+            className="inline-flex items-center gap-1 text-xs text-pc-text-faint hover:text-pc-text-secondary transition-colors"
+          >
+            <MessageSquarePlus className="h-3.5 w-3.5" />
+            {t("cfg.field.commentAdd")}
+          </button>
+        )}
 
         {error && (
           <p
@@ -1511,8 +2170,13 @@ function ArrayFieldEditor({
     <div className="space-y-2">
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs" style={{ color: "var(--pc-text-faint)" }}>
-          {rows.length} {rows.length === 1 ? "entry" : "entries"}
-          {isOptional && rows.length === 0 ? " — saves as null" : null}
+          {rows.length}{" "}
+          {rows.length === 1
+            ? t("fieldform.entry")
+            : t("fieldform.entries")}
+          {isOptional && rows.length === 0
+            ? t("fieldform.saves_as_null")
+            : null}
         </span>
         <div
           className="inline-flex rounded-md overflow-hidden border text-xs"
@@ -1534,7 +2198,7 @@ function ArrayFieldEditor({
             }}
             aria-pressed={mode === "rows"}
           >
-            <ListIcon className="h-3 w-3" /> Rows
+            <ListIcon className="h-3 w-3" /> {t("fieldform.mode_rows")}
           </button>
           <button
             type="button"
@@ -1552,7 +2216,7 @@ function ArrayFieldEditor({
             }}
             aria-pressed={mode === "text"}
           >
-            <TypeIcon className="h-3 w-3" /> Text
+            <TypeIcon className="h-3 w-3" /> {t("fieldform.mode_text")}
           </button>
         </div>
       </div>
@@ -1564,28 +2228,38 @@ function ArrayFieldEditor({
               className="text-xs italic px-1 py-2"
               style={{ color: "var(--pc-text-faint)" }}
             >
-              No entries. Click "+ Add" to add one.
+              {t("fieldform.no_entries_add_one")}
             </p>
           ) : (
             <ul className="space-y-1.5" id={inputId}>
               {rows.map((row, i) => (
                 <li key={i} className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    value={row}
-                    onChange={(e) => setRow(i, e.target.value)}
-                    className="input-electric flex-1 px-3 py-1.5 text-sm"
-                    placeholder={
-                      suggestions && suggestions.length > 0
-                        ? "pick from list"
-                        : "empty"
-                    }
-                    list={suggestions ? `${inputId}-suggestions` : undefined}
-                  />
+                  {suggestions && suggestions.length > 0 ? (
+                    // Discoverable dropdown (caret + filterable listbox) instead
+                    // of a native <datalist>, which showed no affordance. Free
+                    // text is still accepted for values not in the list.
+                    <ComboBox
+                      className="flex-1"
+                      value={row}
+                      onChange={(v) => setRow(i, v)}
+                      options={suggestions}
+                      openOnFocus
+                      placeholder={t("fieldform.value_combo_placeholder")}
+                      emptyText={t("fieldform.value_combo_empty")}
+                    />
+                  ) : (
+                    <input
+                      type="text"
+                      value={row}
+                      onChange={(e) => setRow(i, e.target.value)}
+                      className="input-electric flex-1 px-3 py-1.5 text-sm"
+                      placeholder={t("fieldform.empty")}
+                    />
+                  )}
                   <button
                     type="button"
                     onClick={() => removeRow(i)}
-                    title="Remove this entry"
+                    title={t("fieldform.remove_entry")}
                     className="btn-icon flex-shrink-0"
                   >
                     <Trash2 className="h-4 w-4" />
@@ -1594,19 +2268,12 @@ function ArrayFieldEditor({
               ))}
             </ul>
           )}
-          {suggestions && (
-            <datalist id={`${inputId}-suggestions`}>
-              {suggestions.map((s) => (
-                <option key={s} value={s} />
-              ))}
-            </datalist>
-          )}
           <button
             type="button"
             onClick={addRow}
             className="btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1"
           >
-            <Plus className="h-3 w-3" /> Add
+            <Plus className="h-3 w-3" /> {t("fieldform.add")}
           </button>
         </>
       ) : (
@@ -1692,7 +2359,7 @@ function ObjectArrayEditor({
     return (
       <div className="space-y-1.5">
         <p className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
-          Element shape unavailable from schema; edit raw JSON below.
+          {t("fieldform.element_shape_unavailable")}
         </p>
         <textarea
           id={inputId}
@@ -1710,14 +2377,15 @@ function ObjectArrayEditor({
     <div className="space-y-2" id={inputId}>
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs" style={{ color: "var(--pc-text-faint)" }}>
-          {rows.length} {rows.length === 1 ? "entry" : "entries"}
+          {rows.length}{" "}
+          {rows.length === 1 ? t("fieldform.entry") : t("fieldform.entries")}
         </span>
         <button
           type="button"
           onClick={addRow}
           className="btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1"
         >
-          <Plus className="h-3 w-3" /> Add
+          <Plus className="h-3 w-3" /> {t("fieldform.add")}
         </button>
       </div>
       {rows.length === 0 ? (
@@ -1725,7 +2393,7 @@ function ObjectArrayEditor({
           className="text-xs italic px-1 py-2"
           style={{ color: "var(--pc-text-faint)" }}
         >
-          No entries. Click "+ Add" to create one.
+          {t("fieldform.no_entries_create_one")}
         </p>
       ) : (
         <ul className="space-y-3">
@@ -1756,7 +2424,7 @@ function ObjectArrayEditor({
                 <button
                   type="button"
                   onClick={() => removeRow(rowIdx)}
-                  title="Remove this entry"
+                  title={t("fieldform.remove_entry")}
                   className="btn-icon"
                 >
                   <Trash2 className="h-4 w-4" />
@@ -1806,7 +2474,7 @@ function ObjectArrayField({
             className="ml-1.5 text-[10px]"
             style={{ color: "var(--pc-text-faint)" }}
           >
-            optional
+            {t("fieldform.optional_label")}
           </span>
         )}
       </label>
@@ -1949,7 +2617,8 @@ function KeyValueChipEditor({
     <div className="space-y-1.5 mt-1">
       <div className="flex items-center justify-between gap-2">
         <span className="text-xs" style={{ color: "var(--pc-text-faint)" }}>
-          {pairs.length} {pairs.length === 1 ? "entry" : "entries"}
+          {pairs.length}{" "}
+          {pairs.length === 1 ? t("fieldform.entry") : t("fieldform.entries")}
         </span>
         <div
           className="inline-flex rounded-md overflow-hidden border text-xs"
@@ -1971,7 +2640,7 @@ function KeyValueChipEditor({
             }}
             aria-pressed={mode === "rows"}
           >
-            <ListIcon className="h-3 w-3" /> Rows
+            <ListIcon className="h-3 w-3" /> {t("fieldform.mode_rows")}
           </button>
           <button
             type="button"
@@ -1989,7 +2658,7 @@ function KeyValueChipEditor({
             }}
             aria-pressed={mode === "text"}
           >
-            <TypeIcon className="h-3 w-3" /> Text
+            <TypeIcon className="h-3 w-3" /> {t("fieldform.mode_text")}
           </button>
         </div>
       </div>
@@ -2034,7 +2703,7 @@ function KeyValueChipEditor({
               className="text-[11px] italic"
               style={{ color: "var(--pc-text-faint)" }}
             >
-              No entries.
+              {t("fieldform.no_entries")}
             </p>
           ) : (
             <ul className="space-y-1">
@@ -2045,7 +2714,7 @@ function KeyValueChipEditor({
                     value={k}
                     onChange={(e) => setKey(i, e.target.value)}
                     className="input-electric flex-1 px-2 py-1 text-sm font-mono"
-                    placeholder="key"
+                    placeholder={t("fieldform.key_placeholder")}
                   />
                   <span style={{ color: "var(--pc-text-faint)" }}>=</span>
                   <input
@@ -2053,12 +2722,12 @@ function KeyValueChipEditor({
                     value={v}
                     onChange={(e) => setValue(i, e.target.value)}
                     className="input-electric flex-1 px-2 py-1 text-sm"
-                    placeholder="value"
+                    placeholder={t("fieldform.value_placeholder")}
                   />
                   <button
                     type="button"
                     onClick={() => removeAt(i)}
-                    title="Remove this entry"
+                    title={t("fieldform.remove_entry")}
                     className="btn-icon flex-shrink-0"
                   >
                     <Trash2 className="h-4 w-4" />
@@ -2072,7 +2741,7 @@ function KeyValueChipEditor({
             onClick={() => onChange([...pairs, ["", ""]])}
             className="btn-secondary text-xs px-2.5 py-1 inline-flex items-center gap-1"
           >
-            <Plus className="h-3 w-3" /> Add
+            <Plus className="h-3 w-3" /> {t("fieldform.add")}
           </button>
         </>
       )}
@@ -2091,7 +2760,7 @@ function DriftDiff({ drift }: { drift: DriftEntry }) {
         className="text-xs mt-1 inline-flex items-center gap-1"
         style={{ color: "var(--color-status-warning, #f5b400)" }}
       >
-        ⚠ secret value differs from on-disk
+        ⚠ {t("fieldform.drift_secret_differs")}
       </p>
     );
   }
@@ -2103,11 +2772,11 @@ function DriftDiff({ drift }: { drift: DriftEntry }) {
       style={{ color: "var(--color-status-warning, #f5b400)" }}
     >
       <span>
-        in-memory:{" "}
+        {t("fieldform.drift_in_memory")}{" "}
         <code style={{ color: "var(--pc-text-secondary)" }}>{inMem}</code>
       </span>
       <span>
-        on-disk:{" "}
+        {t("fieldform.drift_on_disk")}{" "}
         <code style={{ color: "var(--pc-text-secondary)" }}>{onDisk}</code>
       </span>
     </div>

@@ -8,7 +8,7 @@ use anyhow::Result;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::PacingConfig;
-use zeroclaw_providers::{ChatMessage, ModelProvider};
+use zeroclaw_providers::{ChatMessage, ModelProvider, ProviderDispatch};
 
 /// Graceful shutdown after the loop exhausts `max_iterations` (upstream loop
 /// body, max-iteration exit): log exhaustion, push a summary-request user
@@ -34,6 +34,7 @@ pub(crate) async fn finish_after_max_iterations(
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
             .with_attrs(::serde_json::json!({
                 "model": model,
@@ -53,10 +54,39 @@ pub(crate) async fn finish_after_max_iterations(
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
             .with_attrs(::serde_json::json!({"max_iterations": max_iterations})),
         "Max iterations reached, requesting final summary"
     );
+    // Sanitise tool_use / tool_result pairing before the graceful-shutdown
+    // request. When the loop exits immediately after the model emits a
+    // tool_use (hitting max_tool_iterations before the runner records a
+    // tool_result), the history carries an unpaired tool_use block.
+    // Bedrock/Anthropic reject the follow-up tools-free summary call with:
+    // "Expected toolResult blocks at messages.N.content for the following
+    // Ids: tooluse_*". Two complementary sweeps:
+    //   1. strip_orphaned_tool_calls_from_assistants — removes tool_calls from
+    //      assistant messages whose ids have no following tool result.
+    //   2. remove_orphaned_tool_messages — removes tool-role messages that no
+    //      longer have a matching assistant (symmetric case).
+    let tool_calls_stripped =
+        crate::agent::history_pruner::strip_orphaned_tool_calls_from_assistants(history);
+    let tool_messages_removed =
+        crate::agent::history_pruner::remove_orphaned_tool_messages(history).removed;
+    if tool_calls_stripped > 0 || tool_messages_removed > 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "tool_calls_stripped": tool_calls_stripped,
+                    "tool_messages_removed": tool_messages_removed,
+                })),
+            "Sanitised orphaned tool_use/tool_result pairing before graceful shutdown"
+        );
+    }
+
     let summary_prompt = ChatMessage::user(
         "You have reached the maximum number of tool iterations. \
          Please provide your best answer based on the work completed so far. \
@@ -85,7 +115,8 @@ pub(crate) async fn finish_after_max_iterations(
                 .ok()
                 .flatten(),
         };
-        let summary_future = model_provider.chat(summary_request, model, temperature);
+        let dispatcher = ProviderDispatch::from_ref(model_provider);
+        let summary_future = dispatcher.chat(summary_request, model, temperature);
         match pacing.step_timeout_secs {
             Some(step_secs) if step_secs > 0 => {
                 let step_timeout = Duration::from_secs(step_secs);
@@ -130,6 +161,7 @@ pub(crate) async fn finish_after_max_iterations(
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "model": model,

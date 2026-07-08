@@ -9,12 +9,20 @@
 
 pub mod actions;
 mod chord;
+mod guard;
 pub mod overrides;
 
 pub use actions::*;
 pub use chord::Chord;
 
 use crossterm::event::KeyEvent;
+
+pub fn help_bypasses_text_input(event: &KeyEvent) -> bool {
+    GlobalAction::Help
+        .resolved()
+        .iter()
+        .any(|chord| !chord.modifiers.is_empty() && chord.matches(event))
+}
 
 /// Uniform interface over every `keyactions!`-generated enum so generic
 /// code (the keybind surface) can walk variants, names, labels, and
@@ -78,6 +86,16 @@ mod tests {
     }
 
     #[test]
+    fn global_help_resolves_from_question_mark_and_f1() {
+        let q = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        assert_eq!(GlobalAction::from_chord(&q), Some(GlobalAction::Help));
+        let f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE);
+        assert_eq!(GlobalAction::from_chord(&f1), Some(GlobalAction::Help));
+        let ctrl_f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::CONTROL);
+        assert_eq!(GlobalAction::from_chord(&ctrl_f1), Some(GlobalAction::Help));
+    }
+
+    #[test]
     fn input_bar_enter_is_submit() {
         let ev = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(
@@ -126,19 +144,27 @@ mod tests {
                 }
             }
         }
-        check("global", GlobalAction::bindings());
-        check("chat", ChatTabAction::bindings());
-        check("logs", LogsTabAction::bindings());
-        check("dashboard", DashboardTabAction::bindings());
-        check("config", ConfigTabAction::bindings());
-        check("quickstart", QuickstartTabAction::bindings());
-        check("input_bar", InputBarAction::bindings());
-        check("modal", ModalAction::bindings());
-        check("file_explorer", FileExplorerAction::bindings());
-        check("file_explorer_search", FileExplorerSearchAction::bindings());
-        check("search_box", SearchBoxAction::bindings());
-        check("config_editor", ConfigEditorAction::bindings());
-        check("quickstart_modal", QuickstartModalAction::bindings());
+        check(GlobalAction::TAG, GlobalAction::bindings());
+        check(ChatTabAction::TAG, ChatTabAction::bindings());
+        check(LogsTabAction::TAG, LogsTabAction::bindings());
+        check(DashboardTabAction::TAG, DashboardTabAction::bindings());
+        check(ConfigTabAction::TAG, ConfigTabAction::bindings());
+        check(DoctorTabAction::TAG, DoctorTabAction::bindings());
+        check(QuickstartTabAction::TAG, QuickstartTabAction::bindings());
+        check(InputBarAction::TAG, InputBarAction::bindings());
+        check(ModalAction::TAG, ModalAction::bindings());
+        check(CaptureAction::TAG, CaptureAction::bindings());
+        check(FileExplorerAction::TAG, FileExplorerAction::bindings());
+        check(
+            FileExplorerSearchAction::TAG,
+            FileExplorerSearchAction::bindings(),
+        );
+        check(SearchBoxAction::TAG, SearchBoxAction::bindings());
+        check(ConfigEditorAction::TAG, ConfigEditorAction::bindings());
+        check(
+            QuickstartModalAction::TAG,
+            QuickstartModalAction::bindings(),
+        );
     }
 
     #[test]

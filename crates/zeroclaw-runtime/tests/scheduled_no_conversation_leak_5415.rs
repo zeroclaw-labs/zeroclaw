@@ -4,15 +4,16 @@
 //! daemon heartbeat path (`crates/zeroclaw-runtime/src/daemon/mod.rs`) calls
 //! `agent::run(..., interactive=false, session_state_file=None, ...)`. With
 //! no session_state_file, the agent's `memory_session_id` is `None`, so the
-//! SQLite recall inside `build_context` is unscoped and returns Conversation
-//! memories from any channel session. Before the fix, those entries were
-//! embedded into the prompt sent to the provider.
+//! engine's memory-context recall (`agent::memory_inject`) is unscoped and
+//! returns Conversation memories from any channel session. Before the fix,
+//! those entries were embedded into the prompt sent to the provider.
 //!
 //! (The cron path generates a fresh `cron-{uuid}` session per run, so SQLite
 //! session scoping happens to mask the leak there under the SQLite backend.
-//! The build_context filter is still required for defense in depth — the
-//! markdown backend ignores session_id entirely (memory/markdown.rs:163), and
-//! the heartbeat path has no session scoping at all.)
+//! The engine's Conversation-category exclusion for scheduled origins is
+//! still required for defense in depth: the markdown backend ignores
+//! session_id entirely (memory/markdown.rs:163), and the heartbeat path has
+//! no session scoping at all.)
 //!
 //! Setup
 //! 1. Spin up a minimal axum-based OpenAI-compatible server that records every
@@ -33,10 +34,10 @@ use tokio::sync::Mutex as AsyncMutex;
 use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
 use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
 
-// Unique sentinel that exists ONLY in the planted Conversation entry — must
+// Unique sentinel that exists ONLY in the planted Conversation entry: it must
 // not appear in the cron prompt or any system prompt. If it surfaces in the
-// captured request body, the only path it could have taken is build_context's
-// recall + injection.
+// captured request body, the only path it could have taken is the engine's
+// memory-context recall + injection.
 const SECRET_SENTINEL: &str = "blue-walrus-7421-conversation-leak-canary";
 const FAKE_OPENAI_RESPONSE: &str = r#"{"id":"chatcmpl-test","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
 
@@ -82,8 +83,9 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
     // session_id is `None` to model the user-reported repro: Conversation
     // entries that lack session scoping (older data, channels that don't
     // populate session_id, or backends without strict session filtering).
-    // With a session_id set, SQLite's recall filter scopes it out before
-    // build_context runs — the bug manifests precisely when scoping fails.
+    // With a session_id set, SQLite's recall filter scopes it out before the
+    // engine's memory-context render runs; the bug manifests precisely when
+    // scoping fails.
     {
         let mem = SqliteMemory::new("sqlite", &workspace_dir).unwrap();
         mem.store(
@@ -123,7 +125,7 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
         AliasedAgentConfig {
             enabled: true,
             model_provider: format!("{provider_type}.default").into(),
-            risk_profile: "default".to_string(),
+            risk_profile: "default".into(),
             ..Default::default()
         },
     );
@@ -146,7 +148,8 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
     config.reliability.provider_retries = 0;
     // Drop the relevance threshold so the recall surfaces the planted entry
     // deterministically; production threshold is 0.4 and would filter out
-    // weakly-matching entries before build_context's category filter runs.
+    // weakly-matching entries before the engine renderer's category filter
+    // runs.
     config.memory.min_relevance_score = 0.0;
 
     // ── Drive the daemon-heartbeat invocation pattern ──────────────
@@ -156,7 +159,8 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
     //       vec![], false, None, None,
     //   )
     // `interactive=false` + `session_state_file=None` is exactly the heartbeat
-    // shape that bypasses session scoping inside `build_context`.
+    // shape that bypasses session scoping in the engine's memory-context
+    // recall.
     let prompt = "Any reminders to surface today? Pull anything relevant from memory.".to_string();
     let run_result = zeroclaw_runtime::agent::run(
         config,
@@ -169,6 +173,7 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
         false,
         None,
         None,
+        zeroclaw_api::ingress::TurnOrigin::Daemon,
         zeroclaw_runtime::agent::loop_::AgentRunOverrides::default(),
     )
     .await;
