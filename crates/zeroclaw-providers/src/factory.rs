@@ -970,9 +970,11 @@ impl FamilyProviderFactory for OpenRouterModelProviderConfig {
         _api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let mut p =
-            crate::openrouter::OpenRouterModelProvider::new(alias, key, opts.provider_timeout_secs)
-                .with_max_tokens(opts.provider_max_tokens);
+        let mut p = crate::openrouter::OpenRouterModelProvider::new(alias, key)
+            .with_max_tokens(opts.provider_max_tokens);
+        if let Some(t) = opts.provider_timeout_secs {
+            p = p.with_timeout_secs(t);
+        }
         if let Some(extra) = opts.provider_extra.clone() {
             p = p.with_extra_body(extra);
         }
