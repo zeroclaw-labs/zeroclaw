@@ -15,13 +15,6 @@ use zeroclaw_api::tool::ToolSpec;
 const TEMPERATURE_DEFAULT: f64 = 1.0;
 /// Anthropic's public API endpoint. Overrideable via `model_providers.<name>.base_url`.
 pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
-/// Max wait for the next SSE line before the stream is treated as stalled.
-/// reqwest's overall `.timeout()` does not reliably fire once a streaming body
-/// is being drained chunk-by-chunk, so a connection that goes silent after
-/// `message_start` (proxy/load-balancer hiccup) parks `next_line().await`
-/// forever — the detached parser task leaks and the turn hangs on "working".
-/// A per-line idle bound converts that into a retryable `StreamError`.
-const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 use crate::stream_guard::AbortOnDrop;
 
@@ -856,12 +849,7 @@ impl AnthropicModelProvider {
         response: reqwest::Response,
         tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
     ) {
-        use tokio_util::io::StreamReader;
-
-        let byte_stream = response
-            .bytes_stream()
-            .map(|result| result.map_err(std::io::Error::other));
-        let reader = StreamReader::new(byte_stream);
+        let reader = crate::stream_guard::sse_reader(response);
         Self::parse_anthropic_sse_from_reader(reader, tx).await;
     }
 
@@ -896,41 +884,11 @@ impl AnthropicModelProvider {
         let mut saw_stop_reason = false;
 
         loop {
-            let line = match tokio::time::timeout(SSE_IDLE_TIMEOUT, lines.next_line()).await {
-                Ok(Ok(Some(line))) => line,
-                Ok(Ok(None)) => break,
-                Ok(Err(err)) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_category(::zeroclaw_log::EventCategory::Provider)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "error": format!("{err}"),
-                            })),
-                        "stream: SSE read error — aborting stream"
-                    );
-                    let _ = tx
-                        .send(Err(StreamError::Http(format!("SSE read error: {err}"))))
-                        .await;
-                    return;
-                }
-                Err(_) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "idle_secs": SSE_IDLE_TIMEOUT.as_secs(),
-                            })),
-                        "stream: SSE idle timeout — connection stalled, aborting stream"
-                    );
-                    let _ = tx
-                        .send(Err(StreamError::Http(format!(
-                            "SSE stream stalled: no data for {}s",
-                            SSE_IDLE_TIMEOUT.as_secs()
-                        ))))
-                        .await;
+            let line = match crate::stream_guard::next_sse_line(&mut lines).await {
+                crate::stream_guard::SseLine::Line(line) => line,
+                crate::stream_guard::SseLine::Eof => break,
+                crate::stream_guard::SseLine::Err(e) => {
+                    let _ = tx.send(Err(e)).await;
                     return;
                 }
             };
@@ -1638,7 +1596,7 @@ impl ModelProvider for AnthropicModelProvider {
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Spawn)
                 .with_category(::zeroclaw_log::EventCategory::Provider)
                 .with_attrs(::serde_json::json!({
-                    "idle_timeout_secs": SSE_IDLE_TIMEOUT.as_secs(),
+                    "idle_timeout_secs": crate::stream_guard::SSE_IDLE_TIMEOUT.as_secs(),
                     "channel_capacity": 64,
                 })),
             "stream: spawning detached Anthropic SSE parser task"
@@ -1876,7 +1834,10 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
         tokio::task::yield_now().await;
         // Advance virtual time past the idle bound; the parser should wake,
         // emit an error, and return — closing the channel.
-        tokio::time::advance(SSE_IDLE_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        tokio::time::advance(
+            crate::stream_guard::SSE_IDLE_TIMEOUT + std::time::Duration::from_secs(1),
+        )
+        .await;
 
         let mut last_err = None;
         while let Some(ev) = rx.recv().await {

@@ -18,17 +18,6 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Per-read idle bound on the SSE byte stream. A local runtime (llama.cpp,
-/// Ollama, vLLM) can accept the request, emit 200 headers, then stall at 0%
-/// CPU without ever sending a chunk (e.g. while the server-side tool-call
-/// parser churns on an oversized tool result). The streaming client carries no
-/// total timeout by design (a legitimate long generation must not be killed
-/// mid-stream), so an idle upstream leaves `bytes_stream.next()` pending
-/// forever and the turn hangs on "working". Bounding each read converts that
-/// stall into a retryable `StreamError`. Matches the Anthropic provider's
-/// `SSE_IDLE_TIMEOUT`.
-const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
-
 /// A model_provider that speaks the OpenAI-compatible chat completions API.
 /// Used by: Venice, Vercel AI Gateway, Cloudflare AI Gateway, Moonshot,
 /// Synthetic, `OpenCode` Zen, `OpenCode` Go, `Z.AI`, `GLM`, `MiniMax`, Bedrock, Qianfan, Groq, Mistral, `xAI`, etc.
@@ -1614,10 +1603,7 @@ fn sse_bytes_to_chunks(
             }
         }
 
-        let byte_stream = response
-            .bytes_stream()
-            .map(|result| result.map_err(std::io::Error::other));
-        let reader = tokio_util::io::StreamReader::new(byte_stream);
+        let reader = crate::stream_guard::sse_reader(response);
         parse_sse_chunks_from_reader(reader, count_tokens, &tx).await;
     });
 
@@ -1644,42 +1630,11 @@ async fn parse_sse_chunks_from_reader<R>(
     let mut lines = reader.lines();
 
     loop {
-        let line = match tokio::time::timeout(SSE_IDLE_TIMEOUT, lines.next_line()).await {
-            Ok(Ok(Some(line))) => line,
-            Ok(Ok(None)) => break,
-            Ok(Err(err)) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_category(::zeroclaw_log::EventCategory::Provider)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "error": format!("{err}"),
-                        })),
-                    "stream: SSE read error, aborting stream"
-                );
-                let _ = tx
-                    .send(Err(StreamError::Http(format!("SSE read error: {err}"))))
-                    .await;
-                return;
-            }
-            Err(_) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_category(::zeroclaw_log::EventCategory::Provider)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "idle_secs": SSE_IDLE_TIMEOUT.as_secs(),
-                        })),
-                    "stream: SSE idle timeout, connection stalled, aborting stream"
-                );
-                let _ = tx
-                    .send(Err(StreamError::Http(format!(
-                        "SSE stream stalled: no data for {}s",
-                        SSE_IDLE_TIMEOUT.as_secs()
-                    ))))
-                    .await;
+        let line = match crate::stream_guard::next_sse_line(&mut lines).await {
+            crate::stream_guard::SseLine::Line(line) => line,
+            crate::stream_guard::SseLine::Eof => break,
+            crate::stream_guard::SseLine::Err(e) => {
+                let _ = tx.send(Err(e)).await;
                 return;
             }
         };
@@ -1692,7 +1647,7 @@ async fn parse_sse_chunks_from_reader<R>(
                     chunk
                 };
                 if tx.send(Ok(chunk)).await.is_err() {
-                    return; // Receiver dropped
+                    return;
                 }
             }
             Ok(None) => {}
@@ -1732,10 +1687,7 @@ fn sse_bytes_to_events_for_contract(
             }
         }
 
-        let byte_stream = response
-            .bytes_stream()
-            .map(|result| result.map_err(std::io::Error::other));
-        let reader = tokio_util::io::StreamReader::new(byte_stream);
+        let reader = crate::stream_guard::sse_reader(response);
         parse_sse_events_from_reader(
             reader,
             count_tokens,
@@ -1772,42 +1724,11 @@ async fn parse_sse_events_from_reader<R>(
     let mut saw_completion = false;
 
     loop {
-        let line = match tokio::time::timeout(SSE_IDLE_TIMEOUT, lines.next_line()).await {
-            Ok(Ok(Some(line))) => line,
-            Ok(Ok(None)) => break,
-            Ok(Err(err)) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_category(::zeroclaw_log::EventCategory::Provider)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "error": format!("{err}"),
-                        })),
-                    "stream: SSE read error, aborting stream"
-                );
-                let _ = tx
-                    .send(Err(StreamError::Http(format!("SSE read error: {err}"))))
-                    .await;
-                return;
-            }
-            Err(_) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_category(::zeroclaw_log::EventCategory::Provider)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "idle_secs": SSE_IDLE_TIMEOUT.as_secs(),
-                        })),
-                    "stream: SSE idle timeout, connection stalled, aborting stream"
-                );
-                let _ = tx
-                    .send(Err(StreamError::Http(format!(
-                        "SSE stream stalled: no data for {}s",
-                        SSE_IDLE_TIMEOUT.as_secs()
-                    ))))
-                    .await;
+        let line = match crate::stream_guard::next_sse_line(&mut lines).await {
+            crate::stream_guard::SseLine::Line(line) => line,
+            crate::stream_guard::SseLine::Eof => break,
+            crate::stream_guard::SseLine::Err(e) => {
+                let _ = tx.send(Err(e)).await;
                 return;
             }
         };
@@ -3834,7 +3755,10 @@ mod tests {
         });
 
         tokio::task::yield_now().await;
-        tokio::time::advance(SSE_IDLE_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        tokio::time::advance(
+            crate::stream_guard::SSE_IDLE_TIMEOUT + std::time::Duration::from_secs(1),
+        )
+        .await;
 
         let mut last_err = None;
         while let Some(ev) = rx.recv().await {
@@ -3861,7 +3785,10 @@ mod tests {
         });
 
         tokio::task::yield_now().await;
-        tokio::time::advance(SSE_IDLE_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        tokio::time::advance(
+            crate::stream_guard::SSE_IDLE_TIMEOUT + std::time::Duration::from_secs(1),
+        )
+        .await;
 
         let mut last_err = None;
         while let Some(ev) = rx.recv().await {
