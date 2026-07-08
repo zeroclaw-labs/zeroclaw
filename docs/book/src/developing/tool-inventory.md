@@ -56,7 +56,6 @@ boundaries because they add platform, dependency, network, or UI surface area.
 |---|---|---|
 | `browser`, `browser_open`, `browser_delegate`, `text_browser` | Config-gated and runtime-dependent. | Keep first-party, but continue tightening feature/config gates because browser automation is a large trusted surface. |
 | `http_request`, `web_fetch`, `web_search_tool` | Config-gated network access. | Keep first-party while SSRF, allowlist, provider routing, and receipt behavior remain ZeroClaw-owned. Revisit only after MCP/plugin replacements can express the same network policy. |
-| `pdf_read` | Compile-feature gated. | Keep feature-gated; do not move until generated docs, file extraction, and path policy have an equivalent external contract. |
 | SOP tools (`sop_list`, `sop_execute`, `sop_advance`, `sop_approve`, `sop_status`) | Runtime-handle gated. | Keep first-party; SOP lifecycle, approvals, and audit records are runtime state, not a generic external integration. |
 | WASM plugin tools | Compile-feature and config-gated host bridge. | Keep the host bridge first-party; individual plugin capabilities should live outside core. |
 | `execute_pipeline` | Config-gated tool chaining. | Keep gated until tool chaining policy, per-step receipts, and caller allowlists are stable enough to judge whether it is core. |

@@ -630,14 +630,6 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
 /// Implemented by strategy objects that wrap one or more `Memory` backends.
 #[async_trait]
 pub trait MemoryStrategy: Send + Sync {
-    /// Load and format relevant memory context for a conversation turn.
-    async fn load_context(
-        &self,
-        observer: &dyn crate::observability_traits::Observer,
-        query: &str,
-        session_id: Option<&str>,
-    ) -> anyhow::Result<String>;
-
     /// Consolidate a conversation turn into long-term memory.
     async fn consolidate_turn(
         &self,
