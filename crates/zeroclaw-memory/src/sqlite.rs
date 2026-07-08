@@ -47,10 +47,11 @@ fn acquire_sqlite_startup_lock() -> MutexGuard<'static, ()> {
 pub struct SqliteMemory {
     alias: String,
     conn: Arc<Mutex<Connection>>,
-    // Behind an `RwLock` so `config/set` can hot-swap the embedder on a
-    // long-lived handle after a provider-profile change, without a daemon
-    // restart (#8359). Reads snapshot the `Arc` and drop the guard before any
-    // `.await`, so the lock is never held across async work.
+    // `Arc` so `#[derive(Clone)]` handles share ONE lock: a `swap_embedder`
+    // on any clone is observed by all others (the shared-embedder contract in
+    // the type doc). `RwLock` inside lets `config/set` hot-swap the embedder on
+    // a long-lived handle without a daemon restart (#8359). Reads snapshot the
+    // inner `Arc` and drop the guard before any `.await`.
     embedder: Arc<RwLock<Arc<dyn EmbeddingProvider>>>,
     vector_weight: f32,
     keyword_weight: f32,
