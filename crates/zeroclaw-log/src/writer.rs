@@ -4,12 +4,34 @@
 //! that goes to disk + the `serde_json::Value` clone that goes to the
 //! broadcast hook). Rolling rotation streams through `BufReader::lines`
 //! into a temp file rather than slurping the whole file into a `String`.
+//!
+//! ## Hot-path write concurrency model
+//!
+//! Disk persistence runs on a dedicated `std::thread` named
+//! `zeroclaw-log-writer` so `record_event` does not block on file I/O
+//! or fsync. The async runtime emits an event by serializing it once
+//! and `try_send`-ing onto a bounded `std::sync::mpsc::sync_channel`;
+//! when the channel is full (worker is slow or disk is stalled) the
+//! event is dropped with a `tracing::warn!` so a single slow disk
+//! cannot wedge an agent turn. The worker re-opens the active file
+//! per write (matching the prior single-threaded semantics — required
+//! because rolling trim and size-based rotation rename the file out
+//! from under an open handle), runs the rotation hooks inline, and
+//! calls `sync_all` on a periodic cadence (every
+//! [`SYNC_EVERY_N_WRITES`] writes or [`SYNC_INTERVAL`] of wall-clock
+//! time, whichever comes first). This trades per-event durability
+//! (the prior behaviour was `sync_data` after every write) for bounded
+//! write latency: a process crash may lose up to one sync interval of
+//! pending writes.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Utc};
 
@@ -22,9 +44,68 @@ use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use serde_json::Value;
 
+/// Capacity of the bounded mpsc between `record_event` and the worker.
+/// Sized for high-throughput agent turns (each turn can emit 20-100 events)
+/// while keeping the queue's RSS footprint bounded. When the queue is full
+/// the producer drops the event with a `tracing::warn!` rather than
+/// blocking the async task.
+const QUEUE_CAPACITY: usize = 1024;
+
+/// Worker calls `sync_all` after every N successful writes (in addition
+/// to the wall-clock cadence below). Tuned so a steady-state event stream
+/// of 1000 events/sec still gets ~10 fsyncs/sec.
+const SYNC_EVERY_N_WRITES: u64 = 100;
+
+/// Worker calls `sync_all` at least this often in wall-clock time even if
+/// `SYNC_EVERY_N_WRITES` has not been reached. Bounds the data-loss window
+/// under a slow trickle of events.
+const SYNC_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Maximum time the worker blocks on `recv_timeout` between idle ticks.
+/// Kept short so shutdown is prompt and the periodic sync interval is
+/// honoured even when no events are flowing.
+const IDLE_TICK: Duration = Duration::from_millis(50);
+
+/// A unit of work sent from the async runtime to the disk-persistence
+/// worker. The `Value` payload is unavoidable because we serialize once
+/// on the producer side to keep the queue small.
+enum WriterJob {
+    /// Serialize-and-write a single event to the log file.
+    Write(Value),
+    /// Block until the worker has drained all previously-queued jobs and
+    /// completed a `sync_all`. Acks via a rendezvous channel.
+    Flush(SyncSender<()>),
+}
+
+/// Set when the worker thread has exited (panic or normal). Used by
+/// `flush_for_test` to short-circuit on a dead worker rather than block.
+type WorkerDead = Arc<AtomicBool>;
+
+/// Per-worker state (no `tx` — the worker is the consumer, not a producer).
+/// The `policy` and `worker_dead` fields are shared with the producer-facing
+/// [`WriterState`].
+struct WorkerState {
+    policy: ResolvedPolicy,
+    /// Reserved for future serialized-rotation paths. The worker thread
+    /// is the sole owner of the file handle for the active path today,
+    /// so this lock is currently unheld; kept on the struct so a future
+    /// refactor that needs to pause the worker for atomic file swaps
+    /// has a place to acquire it.
+    #[allow(dead_code)]
+    write_lock: Mutex<()>,
+    worker_dead: WorkerDead,
+}
+
+/// Producer-facing state. The `tx` sender is NOT shared with the worker
+/// so the channel's [`Disconnected`](std::sync::mpsc::TrySendError::Disconnected)
+/// exit path can fire once the last producer drops their sender.
 struct WriterState {
     policy: ResolvedPolicy,
+    /// Reserved for future serialized-rotation paths.
+    #[allow(dead_code)]
     write_lock: Mutex<()>,
+    tx: SyncSender<WriterJob>,
+    worker_dead: WorkerDead,
 }
 
 static WRITER: OnceLock<parking_lot::RwLock<Option<Arc<WriterState>>>> = OnceLock::new();
@@ -39,7 +120,8 @@ fn current_state() -> Option<Arc<WriterState>> {
 
 /// Initialize (or disable) the persistence writer from config. Idempotent.
 /// When enabled, runs a streaming in-place migration of any schema-1 rows
-/// in the existing file before resuming appends.
+/// in the existing file before resuming appends, then spawns the disk
+/// worker thread.
 pub fn init_from_config(config: &LogConfig, workspace_dir: &Path) {
     let policy = ResolvedPolicy::from_config(config, workspace_dir);
 
@@ -55,11 +137,186 @@ pub fn init_from_config(config: &LogConfig, workspace_dir: &Path) {
         );
     }
 
+    let (tx, rx) = sync_channel::<WriterJob>(QUEUE_CAPACITY);
+    let worker_dead: WorkerDead = Arc::new(AtomicBool::new(false));
+
+    if policy.storage.is_enabled() {
+        let worker_state = Arc::new(WorkerState {
+            policy: policy.clone(),
+            write_lock: Mutex::new(()),
+            worker_dead: Arc::clone(&worker_dead),
+        });
+        spawn_worker(rx, worker_state);
+    }
+
     let state = Arc::new(WriterState {
         policy,
         write_lock: Mutex::new(()),
+        tx,
+        worker_dead,
     });
     *slot().write() = Some(state);
+}
+
+/// Spawn the disk-persistence worker thread. The worker owns the active
+/// log file handle and processes `WriterJob`s until either the channel
+/// closes (all senders dropped) or the process exits. On normal exit the
+/// worker performs a final `sync_all` so any pending writes are durable.
+fn spawn_worker(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
+    let dead = Arc::clone(&state.worker_dead);
+    let builder = thread::Builder::new().name("zeroclaw-log-writer".into());
+    if let Err(err) = builder.spawn(move || worker_main(rx, state)) {
+        tracing::warn!(
+            target: "zeroclaw_log",
+            error = %err,
+            "log: failed to spawn zeroclaw-log-writer thread; persistence disabled"
+        );
+        dead.store(true, Ordering::Release);
+    }
+}
+
+/// Worker main loop. Re-opens the active log file on every write
+/// (matching the prior single-threaded semantics where each `append_line`
+/// opened the file fresh — required because rolling trim and size-based
+/// rotation both rename the file out from under an open handle). The
+/// real perf win is dropping the per-record `sync_data` and replacing
+/// it with periodic `sync_all` based on either write count or
+/// wall-clock time, whichever fires first.
+fn worker_main(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
+    let mut writes_since_sync: u64 = 0;
+    let mut last_sync = Instant::now();
+
+    loop {
+        // Block on the channel with a short timeout so a graceful shutdown
+        // (channel close from dropped senders) is not blocked on an idle
+        // worker. The timeout is NOT used for periodic sync or date-rotation
+        // polling — those are driven by write activity in `write_one` and by
+        // the gated sync check below.
+        let job = match rx.recv_timeout(IDLE_TICK) {
+            Ok(job) => Some(job),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        if let Some(job) = job {
+            match job {
+                WriterJob::Write(value) => {
+                    if let Err(err) = write_one(&state, &value) {
+                        tracing::warn!(
+                            target: "zeroclaw_log_internal",
+                            error = ?err,
+                            path = %state.policy.path.display(),
+                            "log: worker write failed"
+                        );
+                    } else {
+                        writes_since_sync += 1;
+                    }
+                }
+                WriterJob::Flush(ack) => {
+                    if let Err(err) = sync_active_file(&state) {
+                        tracing::warn!(
+                            target: "zeroclaw_log_internal",
+                            error = ?err,
+                            "log: worker flush sync_all failed"
+                        );
+                    }
+                    writes_since_sync = 0;
+                    last_sync = Instant::now();
+                    let _ = ack.send(());
+                }
+            }
+        }
+
+        // Periodic sync. Only actually syncs when there are unsynced writes.
+        // Write-count and wall-clock cadences are combined: whichever fires
+        // first wins. When the worker has no unsynced writes (e.g. after a
+        // Flush rendezvous or a quiet period), no disk activity occurs —
+        // the sync_all inside `write_one` before every actual write already
+        // covers the burst-driven case.
+        if writes_since_sync > 0
+            && (writes_since_sync >= SYNC_EVERY_N_WRITES || last_sync.elapsed() >= SYNC_INTERVAL)
+        {
+            if let Err(err) = sync_active_file(&state) {
+                tracing::warn!(
+                    target: "zeroclaw_log_internal",
+                    error = ?err,
+                    "log: worker periodic sync_all failed"
+                );
+            }
+            writes_since_sync = 0;
+            last_sync = Instant::now();
+        }
+    }
+
+    // Channel closed (all senders dropped). Final sync so any pending
+    // writes that the worker pulled off the queue land on disk before
+    // we exit.
+    let _ = sync_active_file(&state);
+    state.worker_dead.store(true, Ordering::Release);
+}
+
+/// Serialize + write one event. Opens the active file fresh, runs the
+/// rotation hooks inline (so they can rename the file out from under
+/// the next write), and drops the handle on return. No `sync_data` —
+/// durability is the worker's periodic `sync_all`.
+fn write_one(state: &Arc<WorkerState>, value: &Value) -> Result<()> {
+    // Date-boundary rotation runs *before* the append so a new day's
+    // first event lands in a fresh file. Idempotent when no rotation
+    // is needed.
+    if state.policy.storage == StoragePolicy::Rotating {
+        maybe_rotate_for_date(state)?;
+    }
+    let mut file = open_active_file(state)?;
+    {
+        let mut writer = BufWriter::new(&mut file);
+        write_jsonl_line(&mut writer, value)?;
+        writer.flush()?;
+    }
+    match state.policy.storage {
+        StoragePolicy::Rolling => trim_to_last_entries(state)?,
+        StoragePolicy::Rotating => maybe_rotate_for_size(state)?,
+        StoragePolicy::None | StoragePolicy::Full => {}
+    }
+    Ok(())
+}
+
+/// Open the active file just long enough to call `sync_all`. Used for
+/// Flush and the periodic sync cadence. Returns Ok(()) when the file
+/// does not exist yet (no writes have happened this run).
+fn sync_active_file(state: &Arc<WorkerState>) -> Result<()> {
+    let file = match open_active_file(state) {
+        Ok(f) => f,
+        Err(_) => return Ok(()),
+    };
+    file.sync_all().context("sync_all log file")?;
+    Ok(())
+}
+
+/// Open (or create) the active log file in append mode with the
+/// 0o600 Unix permission bit. Called once at worker startup and again
+/// after any operation that may have renamed the file out from under
+/// us (rotation, rolling trim).
+fn open_active_file(state: &Arc<WorkerState>) -> Result<File> {
+    if let Some(parent) = state.policy.path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating log directory {}", parent.display()))?;
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&state.policy.path)
+        .with_context(|| format!("opening log file {}", state.policy.path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&state.policy.path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(file)
 }
 
 /// Public accessor for the canonical log file path. Used by the gateway's
@@ -70,16 +327,30 @@ pub fn runtime_trace_path() -> Option<PathBuf> {
 
 /// Synchronously wait for all pending log writes to land on disk.
 ///
-/// **Currently a no-op** — `record_event` is still synchronous, so any
-/// `record!` call has already hit disk + fsync by the time the macro returns.
-/// A follow-up PR will move disk persistence to a background worker; this
-/// function will then become a real round-trip signal so test code can
-/// keep asserting on the file's contents immediately after `record_event`.
+/// Sends a `WriterJob::Flush` to the worker and blocks on the
+/// rendezvous ack, so callers can assert on the log file's contents
+/// immediately after `record_event` returns. No-op when no writer is
+/// installed (no worker thread to flush) and short-circuits when the
+/// worker has died (e.g. panicked) to avoid hanging the test.
 ///
-/// Callers must be in the `zeroclaw-log` crate's own test module (or any
-/// other test code that re-exports this function). Not part of the
-/// production runtime API.
+/// Callers must be in a context where blocking on the rendezvous is
+/// acceptable (a `#[test]` or a `spawn_blocking` worker). Not part of
+/// the production runtime API.
 pub fn flush_for_test() -> Result<()> {
+    let Some(state) = current_state() else {
+        return Ok(());
+    };
+    if state.worker_dead.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    if !state.policy.storage.is_enabled() {
+        return Ok(());
+    }
+    let (ack_tx, ack_rx) = sync_channel(0);
+    if state.tx.send(WriterJob::Flush(ack_tx)).is_err() {
+        return Ok(());
+    }
+    let _ = ack_rx.recv();
     Ok(())
 }
 
@@ -97,7 +368,8 @@ pub fn llm_request_payload_policy() -> Option<(LlmRequestPayloadPolicy, usize)> 
 }
 
 /// Emit one event. Always fans out to the broadcast hook + tracing event.
-/// If persistence is enabled, also appends a JSON line to disk.
+/// If persistence is enabled, hands the serialized value to the disk
+/// worker via a bounded `try_send`. The hot path performs no file I/O.
 ///
 /// This is the function the `record!` macro expands into. Direct callers
 /// (the schema migration tool, tests) can invoke it too, but production
@@ -129,13 +401,31 @@ pub fn record_event(event: LogEvent) {
         return;
     }
 
-    if let Err(err) = append_line(&state, &value) {
-        tracing::warn!(
-            target: "zeroclaw_log_internal",
-            error = ?err,
-            path = %state.policy.path.display(),
-            "log: append failed",
-        );
+    let job = WriterJob::Write(value);
+    match state.tx.try_send(job) {
+        Ok(()) => {}
+        Err(TrySendError::Full(dropped)) => {
+            // Worker is slow or disk is stalled; drop the event rather than
+            // block the async task. A burst of drops shows up as one
+            // `tracing::warn!` per record_event call; high-volume noise is
+            // acceptable because the alternative — blocking the async
+            // executor — is strictly worse.
+            let _ = dropped;
+            tracing::warn!(
+                target: "zeroclaw_log_internal",
+                path = %state.policy.path.display(),
+                queue_capacity = QUEUE_CAPACITY,
+                "log: writer queue full; dropping event"
+            );
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            // Worker thread has exited (panic or normal shutdown). Mark
+            // dead so `flush_for_test` short-circuits. We do NOT fall
+            // through to inline writes — the synchronous path would
+            // re-introduce the very fsync-on-hot-path we just removed,
+            // and the worker will not come back.
+            state.worker_dead.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -154,61 +444,10 @@ fn write_jsonl_line<W: Write + ?Sized>(writer: &mut W, value: &Value) -> Result<
     Ok(())
 }
 
-fn append_line(state: &Arc<WriterState>, value: &Value) -> Result<()> {
-    let _guard = state.write_lock.lock();
-
-    if let Some(parent) = state.policy.path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating log directory {}", parent.display()))?;
-    }
-
-    // Date-boundary rotation runs *before* the append so a new day's first
-    // event lands in a fresh file and the archived file holds exactly the prior
-    // day(s). Size rotation runs *after* the append (below), since it depends on
-    // the post-append file size.
-    if state.policy.storage == StoragePolicy::Rotating {
-        maybe_rotate_for_date(state)?;
-    }
-
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-
-    let file = options
-        .open(&state.policy.path)
-        .with_context(|| format!("opening log file {}", state.policy.path.display()))?;
-    let mut writer = BufWriter::new(file);
-    write_jsonl_line(&mut writer, value)?;
-    writer.flush().context("flushing log line")?;
-    let file = writer
-        .into_inner()
-        .context("taking log file out of buf writer")?;
-    file.sync_data().context("fsync log line")?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&state.policy.path, fs::Permissions::from_mode(0o600));
-    }
-
-    match state.policy.storage {
-        StoragePolicy::Rolling => trim_to_last_entries(state)?,
-        StoragePolicy::Rotating => maybe_rotate_for_size(state)?,
-        StoragePolicy::None | StoragePolicy::Full => {}
-    }
-
-    Ok(())
-}
-
 /// Rolling trim. Streams the file line-by-line into a temp file, keeping
 /// the last `max_entries` lines, then atomically renames. Never loads the
 /// whole file into memory.
-fn trim_to_last_entries(state: &Arc<WriterState>) -> Result<()> {
+fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
     // Count lines first (cheap pass).
     let total = count_nonempty_lines(&state.policy.path)?;
     if total <= state.policy.max_entries {
@@ -298,7 +537,7 @@ fn count_nonempty_lines(path: &Path) -> Result<usize> {
 /// Rotate the active file to an archive when it has crossed a UTC day boundary
 /// since its last write. No-op when daily rotation is off, the file is absent,
 /// or it was last written today.
-fn maybe_rotate_for_date(state: &Arc<WriterState>) -> Result<()> {
+fn maybe_rotate_for_date(state: &Arc<WorkerState>) -> Result<()> {
     if !state.policy.rotate_daily {
         return Ok(());
     }
@@ -325,7 +564,7 @@ fn maybe_rotate_for_date(state: &Arc<WriterState>) -> Result<()> {
 /// Rotate the active file when a just-completed append left it at or above the
 /// configured byte budget. No-op when size rotation is disabled (`max_bytes`
 /// `== 0`) or the file is under budget.
-fn maybe_rotate_for_size(state: &Arc<WriterState>) -> Result<()> {
+fn maybe_rotate_for_size(state: &Arc<WorkerState>) -> Result<()> {
     let max = state.policy.max_bytes;
     if max == 0 {
         return Ok(());
@@ -353,7 +592,7 @@ fn maybe_rotate_for_size(state: &Arc<WriterState>) -> Result<()> {
 /// archives. Archive names keep the active file's extension so an operator's
 /// `*.jsonl` tooling still matches them, e.g.
 /// `runtime-trace.jsonl` → `runtime-trace.20260624-031500.jsonl`.
-fn rotate_active(state: &Arc<WriterState>, when: DateTime<Utc>) -> Result<()> {
+fn rotate_active(state: &Arc<WorkerState>, when: DateTime<Utc>) -> Result<()> {
     let path = &state.policy.path;
     let archive = archive_path(path, when)?;
     fs::rename(path, &archive)
@@ -365,7 +604,7 @@ fn rotate_active(state: &Arc<WriterState>, when: DateTime<Utc>) -> Result<()> {
         let _ = fs::set_permissions(&archive, fs::Permissions::from_mode(0o600));
     }
 
-    run_retention(state);
+    run_retention(&state.policy);
     Ok(())
 }
 
@@ -489,14 +728,14 @@ fn list_archives(active: &Path) -> Result<Vec<(PathBuf, SystemTime)>> {
 /// Prune rotated archives by age then by count. Best-effort: a removal failure
 /// is logged but never fails the enclosing append, since retention is
 /// housekeeping rather than part of the durability contract.
-fn run_retention(state: &Arc<WriterState>) {
-    let max_files = state.policy.retention_max_files;
-    let max_age_days = state.policy.retention_max_age_days;
+fn run_retention(policy: &ResolvedPolicy) {
+    let max_files = policy.retention_max_files;
+    let max_age_days = policy.retention_max_age_days;
     if max_files == 0 && max_age_days == 0 {
         return;
     }
 
-    let mut archives = match list_archives(&state.policy.path) {
+    let mut archives = match list_archives(&policy.path) {
         Ok(a) => a,
         Err(err) => {
             tracing::warn!(
@@ -578,6 +817,7 @@ mod tests {
             record_event(ev);
         }
 
+        flush_for_test().unwrap();
         let path = runtime_trace_path().unwrap();
         let contents = fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -727,6 +967,7 @@ mod tests {
             emit(&format!("event-{i}"));
         }
 
+        flush_for_test().unwrap();
         let path = runtime_trace_path().unwrap();
         let archives = list_archives(&path).unwrap();
         assert!(
@@ -756,6 +997,7 @@ mod tests {
         // Today's first event must archive the stale file and start fresh.
         emit("today");
 
+        flush_for_test().unwrap();
         let archives = list_archives(&path).unwrap();
         assert_eq!(
             archives.len(),
@@ -781,6 +1023,7 @@ mod tests {
             emit(&format!("e-{i}"));
         }
 
+        flush_for_test().unwrap();
         let path = runtime_trace_path().unwrap();
         assert!(
             list_archives(&path).unwrap().is_empty(),
@@ -805,6 +1048,7 @@ mod tests {
             emit(&format!("f-{i}"));
         }
 
+        flush_for_test().unwrap();
         let path = runtime_trace_path().unwrap();
         assert_eq!(total_events(&path), 6, "full keeps every event");
         assert!(list_archives(&path).unwrap().is_empty());
@@ -828,7 +1072,7 @@ mod tests {
             archives.push(p);
         }
 
-        run_retention(&current_state().unwrap());
+        run_retention(&current_state().unwrap().policy);
 
         assert!(
             !archives[0].exists() && !archives[1].exists(),
@@ -856,7 +1100,7 @@ mod tests {
         set_mtime(&old, SystemTime::now() - Duration::from_secs(3 * 86_400));
         set_mtime(&recent, SystemTime::now() - Duration::from_secs(3_600));
 
-        run_retention(&current_state().unwrap());
+        run_retention(&current_state().unwrap().policy);
 
         assert!(!old.exists(), "archive older than the age cap is pruned");
         assert!(recent.exists(), "recent archive is kept");
@@ -930,6 +1174,7 @@ mod tests {
             emit(&format!("event-{i}"));
         }
 
+        flush_for_test().unwrap();
         let path = runtime_trace_path().unwrap();
         // Retention ran as a side effect of the real append path, capping the
         // archive set even though many more rotations occurred.
@@ -957,6 +1202,7 @@ mod tests {
             emit(&format!("burst-{i}"));
         }
 
+        flush_for_test().unwrap();
         let archives = list_archives(&path).unwrap();
         // Daily rotation archives the stale file; size rotation adds more.
         assert!(
@@ -1013,6 +1259,7 @@ mod tests {
             emit(&format!("e-{i}"));
         }
 
+        flush_for_test().unwrap();
         let archives = list_archives(&path).unwrap();
         assert_eq!(
             archives.len(),
@@ -1060,6 +1307,7 @@ mod tests {
             emit(&format!("e-{i}"));
         }
 
+        flush_for_test().unwrap();
         let archives = list_archives(&path).unwrap();
         assert!(
             archives.iter().all(|(p, _)| p != &foreign),
