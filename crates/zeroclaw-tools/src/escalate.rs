@@ -237,19 +237,20 @@ impl Tool for EscalateToHumanTool {
             (name.clone(), ch.clone())
         };
 
-        // Channels without free-form `listen` support (e.g. ACP today, until
-        // the elicitation RFD lands) can't deliver the human's reply. Fail
+        // Channels without free-form `listen` support (e.g. ACP in Phase 1
+        // of the elicitation rollout) can't deliver the human's reply. Fail
         // fast so the agent can route the escalation differently or proceed
         // without blocking — the alternative is silently timing out for
-        // `timeout_secs` seconds.
-        // RFD: https://github.com/zed-industries/agent-client-protocol/blob/main/docs/rfds/elicitation.mdx
+        // `timeout_secs` seconds. Phase 2 of the elicitation rollout will
+        // flip ACP's `supports_free_form_ask` to true.
+        // ACP elicitation RFD: https://agentclientprotocol.com/rfds/elicitation
         if wait_for_response && !channel.supports_free_form_ask() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
                     "Channel '{channel_name}' cannot receive a free-form reply, \
-                     so `wait_for_response` is unsupported (awaits ACP elicitation RFD). \
+                     so `wait_for_response` is unsupported (awaits ACP elicitation Phase 2). \
                      Retry with `wait_for_response: false`."
                 )),
             });
@@ -427,6 +428,8 @@ mod tests {
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             };
             let _ = tx.send(msg).await;
             Ok(())

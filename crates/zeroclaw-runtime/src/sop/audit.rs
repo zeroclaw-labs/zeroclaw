@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use super::types::{SopRun, SopStepResult};
+use super::engine::now_iso8601;
+use super::types::{SopRun, SopStepResult, SopTriggerSource};
 use zeroclaw_memory::traits::{Memory, MemoryCategory};
 
 const SOP_CATEGORY: &str = "sop";
@@ -45,6 +46,74 @@ impl SopAuditLogger {
         Ok(())
     }
 
+    /// Log a suspicious but allowed untrusted SOP event.
+    pub async fn log_suspicious_untrusted(
+        &self,
+        source: SopTriggerSource,
+        topic: Option<&str>,
+        patterns: &[String],
+        score: f64,
+    ) -> Result<()> {
+        let now = now_iso8601();
+        let key = event_key("suspicious_untrusted", &now);
+        let content = serde_json::to_string_pretty(&serde_json::json!({
+            "kind": "suspicious_untrusted",
+            "source": source,
+            "topic": topic,
+            "patterns": patterns,
+            "score": score,
+            "timestamp": now,
+        }))?;
+        self.memory.store(&key, &content, category(), None).await?;
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "source": source,
+                    "topic": topic,
+                    "patterns": patterns,
+                    "score": score,
+                })),
+            "SOP audit: suspicious untrusted trigger content allowed"
+        );
+        Ok(())
+    }
+
+    /// Log a blocked unsafe SOP event.
+    pub async fn log_blocked_unsafe(
+        &self,
+        sop_name: Option<&str>,
+        source: SopTriggerSource,
+        topic: Option<&str>,
+        reason: &str,
+    ) -> Result<()> {
+        let now = now_iso8601();
+        let key = event_key("blocked_unsafe", &now);
+        let content = serde_json::to_string_pretty(&serde_json::json!({
+            "kind": "blocked_unsafe",
+            "sop_name": sop_name,
+            "source": source,
+            "topic": topic,
+            "reason": reason,
+            "timestamp": now,
+        }))?;
+        self.memory.store(&key, &content, category(), None).await?;
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "sop_name": sop_name,
+                    "source": source,
+                    "topic": topic,
+                    "reason": reason,
+                })),
+            "SOP audit: blocked unsafe untrusted trigger content"
+        );
+        Ok(())
+    }
+
     /// Log run completion (updates the run record with final state).
     pub async fn log_run_complete(&self, run: &SopRun) -> Result<()> {
         let key = run_key(&run.run_id);
@@ -61,37 +130,16 @@ impl SopAuditLogger {
         Ok(())
     }
 
-    /// Log an operator approval event for a specific step.
-    pub async fn log_approval(&self, run: &SopRun, step_number: u32) -> Result<()> {
-        let key = format!("sop_approval_{}_{step_number}", run.run_id);
-        let content = serde_json::to_string_pretty(run)?;
-        self.memory.store(&key, &content, category(), None).await?;
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            &format!(
-                "SOP audit: run {} step {step_number} approved by operator",
-                run.run_id
-            )
-        );
-        Ok(())
-    }
-
-    /// Log a timeout-based auto-approval event for a specific step.
-    pub async fn log_timeout_auto_approve(&self, run: &SopRun, step_number: u32) -> Result<()> {
-        let key = format!("sop_timeout_approve_{}_{step_number}", run.run_id);
-        let content = serde_json::to_string_pretty(run)?;
-        self.memory.store(&key, &content, category(), None).await?;
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            &format!(
-                "SOP audit: run {} step {step_number} auto-approved after timeout",
-                run.run_id
-            )
-        );
-        Ok(())
-    }
+    // NOTE (EPIC C): the per-gate approval audit (`log_approval` /
+    // `log_timeout_auto_approve`) was removed. Those wrote last-write-wins Memory
+    // keys (`sop_approval_{run}_{step}` / `sop_timeout_approve_{run}_{step}`, no
+    // who/where, clobbered on re-approval). The audit of record for gate
+    // resolutions is now the append-only run-store event log
+    // (`SopRunStore::append_event`, written inside `engine.resolve_gate` with the
+    // transport-derived principal); read it via `engine.run_events`. The metrics
+    // restart-recovery path (`SopMetricsCollector::rebuild_from_persistence`)
+    // reconstructs the approval / timeout-auto-approval counters from that ledger,
+    // not these keys.
 
     /// Retrieve a stored run by ID (if it exists in memory).
     pub async fn get_run(&self, run_id: &str) -> Result<Option<SopRun>> {
@@ -136,6 +184,15 @@ fn step_key(run_id: &str, step_number: u32) -> String {
     format!("sop_step_{run_id}_{step_number}")
 }
 
+fn event_key(kind: &str, timestamp: &str) -> String {
+    let safe_timestamp: String = timestamp
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect();
+    let suffix = rand::random::<u32>();
+    format!("sop_event_{kind}_{safe_timestamp}_{suffix:08x}")
+}
+
 fn category() -> MemoryCategory {
     MemoryCategory::Custom(SOP_CATEGORY.into())
 }
@@ -155,6 +212,7 @@ mod tests {
                 payload: None,
                 timestamp: "2026-02-19T12:00:00Z".into(),
             },
+            frame_marker_id: "marker-test".into(),
             status: SopRunStatus::Running,
             current_step: 1,
             total_steps: 3,
@@ -212,52 +270,6 @@ mod tests {
         // List runs
         let keys = logger.list_runs().await.unwrap();
         assert!(keys.contains(&"sop_run_run-test-001".to_string()));
-    }
-
-    #[tokio::test]
-    async fn log_approval_persists_entry() {
-        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "sqlite".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let tmp = tempfile::tempdir().unwrap();
-        let memory: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-
-        let logger = SopAuditLogger::new(memory.clone());
-        let run = test_run();
-        logger.log_approval(&run, 1).await.unwrap();
-
-        let entries = memory.list(Some(&category()), None).await.unwrap();
-        let approval_keys: Vec<_> = entries
-            .iter()
-            .filter(|e| e.key.starts_with("sop_approval_"))
-            .collect();
-        assert_eq!(approval_keys.len(), 1);
-        assert!(approval_keys[0].key.contains("run-test-001"));
-    }
-
-    #[tokio::test]
-    async fn log_timeout_auto_approve_persists_entry() {
-        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "sqlite".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let tmp = tempfile::tempdir().unwrap();
-        let memory: Arc<dyn Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-
-        let logger = SopAuditLogger::new(memory.clone());
-        let run = test_run();
-        logger.log_timeout_auto_approve(&run, 1).await.unwrap();
-
-        let entries = memory.list(Some(&category()), None).await.unwrap();
-        let timeout_keys: Vec<_> = entries
-            .iter()
-            .filter(|e| e.key.starts_with("sop_timeout_approve_"))
-            .collect();
-        assert_eq!(timeout_keys.len(), 1);
-        assert!(timeout_keys[0].key.contains("run-test-001"));
     }
 
     #[tokio::test]

@@ -8,7 +8,8 @@
 //  * enum       → <select> with enum_variants
 //  * string-array → <textarea>, one value per line
 //  * integer/float → <input type="number">
-//  * secret     → <input type="password"> with populated indicator
+//  * secret     → "set" indicator + Change when populated; masked input with
+//    a reveal/hide toggle when unset or changing
 //  * provider model field (path matches `model_providers.<name>.model`) →
 //    fetches /api/config/catalog/models?provider=<name>, populates a
 //    <datalist>; on fetch failure falls back to free-text with help text.
@@ -28,6 +29,8 @@ import {
 import { Link } from "react-router-dom";
 import {
   ExternalLink,
+  Eye,
+  EyeOff,
   FolderOpen,
   List as ListIcon,
   MessageSquarePlus,
@@ -48,7 +51,9 @@ import {
   fetchConfigSchema,
   getAgentOptions,
   getCatalogModels,
+  getChannels,
   listProps,
+  mcpRequiredByTransport,
   objectArrayElementProps,
   patchConfig,
   resolveAliasSource,
@@ -269,6 +274,8 @@ function setupFieldPriority(entry: ListResponseEntry): number {
 
 function setupRequirement(
   entry: ListResponseEntry,
+  mcpTransport?: string | null,
+  requiredByTransport?: Record<string, string> | null,
 ): { label: string; tone: "required" | "choice" | "optional" } | null {
   const leaf = entry.path.split(".").pop() ?? "";
   if (/^providers\.models\.[^.]+\.[^.]+\./.test(entry.path)) {
@@ -304,6 +311,33 @@ function setupRequirement(
   }
   if (entry.path === "memory.backend")
     return { label: t("fieldform.badge_recommended"), tone: "choice" };
+  // MCP server command/url: required-ness tracks the chosen transport, not the
+  // Rust type (see mcpFieldRequired). Badge names the transport it's for so the
+  // operator knows why `command` is optional under http/sse (and vice versa).
+  const mcpRequired = mcpFieldRequired(
+    entry.path,
+    mcpTransport,
+    requiredByTransport,
+  );
+  if (mcpRequired !== null) {
+    // `leaf` (declared at the top of this fn) is `command` | `url` here.
+    if (mcpRequired) {
+      return {
+        label:
+          leaf === "command"
+            ? t("fieldform.badge_required_for_stdio")
+            : t("fieldform.badge_required_for_http_sse"),
+        tone: "required",
+      };
+    }
+    return {
+      label:
+        leaf === "command"
+          ? t("fieldform.badge_stdio_only")
+          : t("fieldform.badge_http_sse_only"),
+      tone: "optional",
+    };
+  }
   return null;
 }
 
@@ -444,6 +478,61 @@ function isRequiredField(typeHint: string): boolean {
   return !typeHint.replace(/\s+/g, "").startsWith("Option<");
 }
 
+// MCP server entries (`mcp.servers.<name>.<leaf>`) carry a transport-conditional
+// requirement the bare Rust type can't express: `command` is a non-optional
+// `String` (so the generic rule would always read it "required") yet is ONLY
+// needed for the stdio transport, while `url` is `Option<String>` (never
+// client-required) yet IS mandatory for the http/sse transports. Mirror the
+// server-side `validate_mcp_config` contract here so the badge + empty hint
+// follow the chosen transport instead of the type. Returns null for any field
+// that isn't one of these two transport-gated leaves (transport itself, args,
+// headers, ...), leaving the generic `Option<...>` rule in charge.
+// Which leaf each transport makes mandatory comes from the backend, not from a
+// map kept here: `mcpRequiredByTransport` reads the `x-required-by-transport`
+// metadata the server stamps onto the `McpServerConfig` schema, derived from
+// `McpTransport::required_leaf` (the same relationship `validate_mcp_config`
+// enforces). The form reads what the backend hands it, so a transport variant
+// added backend-side classifies correctly with no change here. When the metadata
+// is absent (a backend predating it) the map is null and required-ness is left
+// UNCLASSIFIED rather than re-encoding the enum, so the generic `Option<...>`
+// rule stays in charge.
+function mcpFieldRequired(
+  path: string,
+  transport: string | null | undefined,
+  requiredByTransport: Record<string, string> | null | undefined,
+): boolean | null {
+  const leaf = path.match(/^mcp\.servers\.[^.]+\.([^.]+)$/)?.[1];
+  if (leaf !== "command" && leaf !== "url") return null;
+  // Backend predates the x-required-by-transport metadata: do not assert
+  // required-ness rather than guessing it from a hand-kept map.
+  if (!requiredByTransport) return null;
+  // Empty / unset transport defaults to stdio (the schema default).
+  const t = (transport ?? "").trim().toLowerCase() || "stdio";
+  const requiredLeaf = requiredByTransport[t];
+  // Unknown transport (a variant the metadata has no rule for): do not assert
+  // required-ness, so a new variant cannot be silently misclassified.
+  if (!requiredLeaf) return null;
+  return leaf === requiredLeaf;
+}
+
+// Resolve the live transport draft value for the `mcp.servers.<name>` group a
+// given field belongs to, so the transport-conditional badge/hint update
+// reactively when the operator flips the transport <select>. Falls back to the
+// entry's saved/default value, then null when the field isn't an MCP server row.
+function resolveMcpTransport(
+  path: string,
+  entries: ListResponseEntry[],
+  draft: Record<string, string>,
+): string | null {
+  const name = path.match(/^mcp\.servers\.([^.]+)\./)?.[1];
+  if (!name) return null;
+  const transportPath = `mcp.servers.${name}.transport`;
+  const drafted = draft[transportPath];
+  if (drafted !== undefined && drafted.length > 0) return drafted;
+  const entry = entries.find((e) => e.path === transportPath);
+  return entry ? defaultInputValue(entry) : null;
+}
+
 // Display-only, pre-save validation derived entirely from the entry's own
 // metadata (`kind` + `type_hint`). Returns a short message to show under the
 // input (red), or null when the current draft value looks fine. This NEVER
@@ -462,6 +551,13 @@ function validationHint(
   // "Optional" badge and a red "required" hint. The server's
   // `Config::validate()` stays authoritative.
   treatAsOptional = false,
+  // Live transport draft value for the enclosing `mcp.servers.<name>` group, so
+  // the empty-required check on `command` / `url` tracks the chosen transport
+  // rather than the bare Rust type. Null for non-MCP rows.
+  mcpTransport?: string | null,
+  // Backend-emitted transport->required-leaf map (see mcpRequiredByTransport);
+  // null when the backend predates the metadata.
+  requiredByTransport?: Record<string, string> | null,
 ): string | null {
   // Secrets: an empty box means "keep the stored value", never "cleared" —
   // so emptiness is never an error here.
@@ -479,6 +575,22 @@ function validationHint(
     if (entry.kind === "integer" && !Number.isInteger(n)) {
       return t("cfg.field.validation.noDecimals");
     }
+  }
+
+  // MCP transport-gated fields own their own required decision (command-for-
+  // stdio / url-for-http-sse), overriding the generic Option<...> rule - `url` is
+  // optional at the type level yet client-required under http/sse, and `command`
+  // is type-required yet optional under http/sse.
+  const mcpRequired = mcpFieldRequired(
+    entry.path,
+    mcpTransport,
+    requiredByTransport,
+  );
+  if (mcpRequired !== null) {
+    if (mcpRequired && renderer !== "bool" && trimmed.length === 0) {
+      return t("cfg.field.validation.required");
+    }
+    return null;
   }
 
   // Required scalar left empty. Arrays/object-arrays carry their own three-state
@@ -718,6 +830,96 @@ function agentAliasJumpPath(
   return `${base}/${encodeURIComponent(alias)}`;
 }
 
+// Secret field renderer. A populated secret shows a static "set" indicator and
+// a Change button so the stored value (and its length) is never represented in
+// the DOM until the operator opts in. Entering change mode reveals a masked
+// input with a reveal/hide eye toggle and a cancel control that reverts to the
+// set state. An unset secret renders the input directly with no cancel.
+//
+// The draft contract is unchanged: an empty value means "keep the stored
+// secret" (handled by handleSave's `e.is_secret && raw.length === 0` guard), so
+// cancelling clears the draft back to empty.
+function SecretField({
+  inputId,
+  populated,
+  value,
+  onChange,
+}: {
+  inputId: string;
+  populated: boolean;
+  value: string;
+  onChange: (next: string) => void;
+}) {
+  // Start in change mode when a populated field already carries a staged draft
+  // value (operator typed a replacement, navigated away, came back). Otherwise
+  // the pending edit would hide behind the "set" indicator and the operator
+  // could not see or read back their own unsaved change.
+  const [changing, setChanging] = useState(populated && value.length > 0);
+  const [revealed, setRevealed] = useState(false);
+
+  const editing = !populated || changing;
+
+  if (!editing) {
+    return (
+      <button
+        type="button"
+        onClick={() => {
+          setChanging(true);
+          setRevealed(false);
+        }}
+        className="btn-secondary text-sm px-3 py-1.5 inline-flex items-center gap-1"
+      >
+        {t("fieldform.secret_change")}
+      </button>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-2">
+      <div className="relative flex-1">
+        <input
+          id={inputId}
+          type={revealed ? "text" : "password"}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="input-electric w-full px-3 py-2 pr-10 text-sm"
+          placeholder={t("fieldform.secret_enter_placeholder")}
+          autoComplete="off"
+        />
+        <button
+          type="button"
+          onClick={() => setRevealed((r) => !r)}
+          title={revealed ? t("fieldform.secret_hide") : t("fieldform.secret_reveal")}
+          aria-label={revealed ? t("fieldform.secret_hide") : t("fieldform.secret_reveal")}
+          aria-pressed={revealed}
+          className="btn-icon absolute right-1.5 top-1/2 -translate-y-1/2"
+        >
+          {revealed ? (
+            <EyeOff className="h-4 w-4" />
+          ) : (
+            <Eye className="h-4 w-4" />
+          )}
+        </button>
+      </div>
+      {populated && (
+        <button
+          type="button"
+          onClick={() => {
+            onChange("");
+            setChanging(false);
+            setRevealed(false);
+          }}
+          title={t("fieldform.secret_cancel_change")}
+          aria-label={t("fieldform.secret_cancel_change")}
+          className="btn-icon flex-shrink-0"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      )}
+    </div>
+  );
+}
+
 const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
   function FieldForm(
     {
@@ -748,6 +950,36 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     );
     const [filter, setFilter] = useState("");
 
+    // When this form edits a channel block (`channels.<type>.<alias>`), its
+    // `excluded_tools` ToolPicker should list the OWNING agent's scoped tools
+    // (built-ins + its `mcp_bundles` MCP), not the default agent's. The owner
+    // is the agent whose `channels` list contains `<type>.<alias>` (a reverse
+    // lookup the gateway already does and returns as `owning_agent`), so it
+    // is NOT the alias in the path. `undefined` for non-channel sections
+    // (risk profiles are shared across agents; pipeline/claude_code are
+    // global) leaves the picker on the default-agent catalog.
+    const [toolAgent, setToolAgent] = useState<string | undefined>(undefined);
+    useEffect(() => {
+      if (!prefix.startsWith("channels.")) {
+        setToolAgent(undefined);
+        return;
+      }
+      const channelName = prefix.slice("channels.".length);
+      let cancelled = false;
+      void getChannels()
+        .then((channels) => {
+          if (cancelled) return;
+          const owner = channels.find((c) => c.name === channelName)?.owning_agent;
+          setToolAgent(owner ?? undefined);
+        })
+        .catch(() => {
+          if (!cancelled) setToolAgent(undefined);
+        });
+      return () => {
+        cancelled = true;
+      };
+    }, [prefix]);
+
     // Schema is whole-Config and ETag-cached server-side; fetch once per
     // session so every form row can resolve its `///` doc-comment helper
     // text via descriptionForPath without per-field round trips.
@@ -760,6 +992,15 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         cancelled = true;
       };
     }, []);
+
+    // Transport->required-leaf map, read once from the cached schema so every
+    // MCP server row classifies command/url required-ness from the registry
+    // (`x-required-by-transport`) instead of a hardcoded map. Null on backends
+    // that predate the metadata; rows then leave required-ness unclassified.
+    const requiredByTransport = useMemo(
+      () => mcpRequiredByTransport(schema),
+      [schema],
+    );
 
     const reload = async () => {
       setLoading(true);
@@ -1122,6 +1363,9 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
               <FieldRow
                 key={f.path}
                 entry={f}
+                toolAgent={toolAgent}
+                mcpTransport={resolveMcpTransport(f.path, entries, draft)}
+                requiredByTransport={requiredByTransport}
                 value={draft[f.path] ?? ""}
                 onChange={(v) => {
                   setDraft((d) => ({ ...d, [f.path]: v }));
@@ -1252,6 +1496,17 @@ interface FieldRowProps {
   tombstoned?: boolean;
   /** Pulls the row out of tombstoned state. */
   onUndoTombstone?: () => void;
+  /** Owning agent for an `allowed_tools`/`excluded_tools` ToolPicker in this
+   *  section (e.g. a channel's `owning_agent`), so the picker lists that
+   *  agent's scoped tools. `undefined` keeps the default-agent catalog. */
+  toolAgent?: string;
+  /** Live transport draft value for the enclosing `mcp.servers.<name>` group
+   *  (null when this row isn't an MCP server field). Drives the
+   *  transport-conditional required badge/hint on `command` and `url`. */
+  mcpTransport?: string | null;
+  /** Backend transport->required-leaf map for MCP rows (null on older
+   *  backends); drives the required badge/hint without a hardcoded map. */
+  requiredByTransport?: Record<string, string> | null;
 }
 
 function FieldRow({
@@ -1267,9 +1522,12 @@ function FieldRow({
   drift,
   tombstoned,
   onUndoTombstone,
+  toolAgent,
+  mcpTransport,
+  requiredByTransport,
 }: FieldRowProps) {
   const renderer = rendererFor(entry);
-  const requirement = setupRequirement(entry);
+  const requirement = setupRequirement(entry, mcpTransport, requiredByTransport);
   // Display-only inline validation derived from this entry's schema metadata.
   // Pure read of `value` — it does not feed the save/PATCH path in any way.
   // If the badge marks the field optional, don't also flag empty as required
@@ -1284,6 +1542,8 @@ function FieldRow({
     // model_provider) still gets its hint.
     (requirement != null && requirement.tone !== "required") ||
       (requirement?.tone !== "required" && isReferenceField(entry.type_hint)),
+    mcpTransport,
+    requiredByTransport,
   );
   // Suppress the local hint while a server-side error is already bound to this
   // field so the two don't stack; the authoritative server message wins.
@@ -1717,6 +1977,7 @@ function FieldRow({
           // (parseInput → parseStringArrayValue) never sees a difference.
           <ToolPicker
             id={entry.path}
+            agent={toolAgent}
             value={parseArrayRows(value)}
             onChange={(next) => onChange(JSON.stringify(next))}
           />
@@ -1792,20 +2053,20 @@ function FieldRow({
               </div>
             )}
           </div>
+        ) : renderer === "secret" ? (
+          <SecretField
+            inputId={entry.path}
+            populated={entry.populated}
+            value={value}
+            onChange={onChange}
+          />
         ) : (
           <input
             id={entry.path}
-            type={renderer === "secret" ? "password" : "text"}
+            type="text"
             value={value}
             onChange={(e) => onChange(e.target.value)}
             className="input-electric w-full px-3 py-2 text-sm"
-            placeholder={
-              renderer === "secret"
-                ? entry.populated
-                  ? t("fieldform.secret_keep_placeholder")
-                  : t("fieldform.secret_enter_placeholder")
-                : ""
-            }
           />
         )}
 

@@ -108,6 +108,17 @@ export const SkillCard = ({ skill, onExpand, isExpanded, skillDetail }: SkillCar
         >
           {originLabel(skill)}
         </span>
+        {skill.shadowed && skill.shadowed.length > 0 && (
+          <span
+            className="text-[10px] font-semibold px-2 py-0.5 rounded shrink-0"
+            style={{ background: 'rgba(251, 146, 60, 0.15)', color: '#f97316' }}
+            title={skill.shadowed
+              .map((s) => `${s.origin}:${s.name}`)
+              .join(', ')}
+          >
+            {t('skills.shadows')} {skill.shadowed.map((s) => s.origin).join(', ')}
+          </span>
+        )}
         {skill.editable && (
           <Pencil
             className="h-3 w-3 shrink-0 ml-auto"

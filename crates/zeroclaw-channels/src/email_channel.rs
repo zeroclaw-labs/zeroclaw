@@ -351,6 +351,25 @@ impl EmailChannel {
     /// Bounds peak memory when the mailbox has a large unseen backlog.
     const MAX_FETCH_BATCH: usize = 10;
 
+    /// Defense in depth: keep the reserved SOP-ingress subject namespace
+    /// out of user-fillable email subjects. The orchestrator no longer
+    /// routes on `subject` (it keys on an internal producer-only marker),
+    /// but stripping the prefix here means the reserved string can never
+    /// originate from an inbound email at all.
+    fn sanitize_subject(subject: &str) -> String {
+        let mut cleaned = subject;
+        while let Some(rest) =
+            cleaned.strip_prefix(zeroclaw_api::channel::CHANNEL_SOP_SUBJECT_PREFIX)
+        {
+            cleaned = rest;
+        }
+        if cleaned.len() == subject.len() {
+            subject.to_string()
+        } else {
+            cleaned.trim_start().to_string()
+        }
+    }
+
     fn build_parsed_email(
         &self,
         parsed: &mail_parser::Message,
@@ -358,7 +377,7 @@ impl EmailChannel {
         uid_validity: Option<u32>,
     ) -> ParsedEmail {
         let sender = Self::extract_sender(parsed);
-        let subject = parsed.subject().unwrap_or("(no subject)").to_string();
+        let subject = Self::sanitize_subject(parsed.subject().unwrap_or("(no subject)"));
         let body_text = Self::extract_text(parsed);
         let content = format!("Subject: {}\n\n{}", subject, body_text);
         let msg_id = parsed
@@ -798,6 +817,8 @@ impl EmailChannel {
             interruption_scope_id: None,
             attachments: email.attachments,
             subject: Some(email.subject),
+
+            ..Default::default()
         };
         Ok(tx.send(msg).await.is_ok())
     }
@@ -896,6 +917,16 @@ fn is_synthetic_email_message_id(value: &str) -> bool {
 #[async_trait]
 
 impl Channel for EmailChannel {
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Email has no typing-indicator concept.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Email has no typing-indicator concept.
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "email"
     }
@@ -1070,6 +1101,25 @@ mod tests {
         assert_eq!(got.matches('\x01').count(), 3);
         assert!(got.starts_with("user="));
         assert!(got.ends_with("\x01\x01"));
+    }
+
+    #[test]
+    fn sanitize_subject_strips_reserved_sop_prefix() {
+        // Defense in depth: an inbound email must not be able to carry the
+        // reserved SOP-ingress subject namespace.
+        let forged = "zeroclaw:sop-event:git.main:pull_request.opened";
+        let cleaned = super::EmailChannel::sanitize_subject(forged);
+        assert!(
+            !cleaned.starts_with(zeroclaw_api::channel::CHANNEL_SOP_SUBJECT_PREFIX),
+            "reserved prefix must be stripped, got: {cleaned}"
+        );
+        assert_eq!(cleaned, "git.main:pull_request.opened");
+    }
+
+    #[test]
+    fn sanitize_subject_leaves_ordinary_subjects_untouched() {
+        let ordinary = "Re: Weekly report";
+        assert_eq!(super::EmailChannel::sanitize_subject(ordinary), ordinary);
     }
 
     #[test]

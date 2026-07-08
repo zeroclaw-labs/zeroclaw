@@ -109,8 +109,8 @@ cli-cron-remove-about = Eliminar una tarea programada
 cli-cron-update-about = Actualizar uno o más campos de una tarea programada existente
 cli-cron-pause-about = Pausar una tarea programada
 cli-cron-resume-about = Reanudar una tarea pausada
-cli-auth-login-about = Iniciar sesión con OAuth (OpenAI Codex o Gemini)
-cli-auth-refresh-about = Actualizar el token de acceso de OpenAI Codex usando el token de actualización
+cli-auth-login-about = Iniciar sesión con OAuth (OpenAI Codex, Gemini o xAI)
+cli-auth-refresh-about = Actualizar el token de acceso OAuth usando el token de actualización
 cli-auth-logout-about = Eliminar perfil de autenticación
 cli-auth-use-about = Establecer el perfil activo para un proveedor
 cli-auth-list-about = Listar perfiles de autenticación
@@ -128,6 +128,7 @@ cli-models-set-about = Establece el modelo predeterminado en la configuración
 cli-models-status-about = Muestra la configuración actual del modelo y el estado de la caché
 cli-doctor-models-about = Sondea catálogos de modelos en todos los proveedores e informa sobre la disponibilidad
 cli-doctor-traces-about = Consulta eventos de traza en tiempo de ejecución (diagnósticos de herramientas y respuestas de modelos)
+cli-doctor-update-context-windows-about = Actualiza context_window en config.toml desde los endpoints /models del proveedor
 cli-hardware-discover-about = Enumera dispositivos USB y muestra placas conocidas
 cli-hardware-introspect-about = Inspecciona un dispositivo por su número de serie o ruta de dispositivo
 cli-hardware-info-about = Obtiene información del chip vía USB usando probe-rs sobre ST-Link
@@ -287,6 +288,13 @@ cli-skills-install-suggestion =
 
     Capacidad coincidente: {$matched}
     Siguiente: Ejecuta `{$install_command}` para instalarla.
+
+cli-plugin-install-suggestion =
+    Parece que esta solicitud necesita el plugin `{$name}`, pero no está instalado.
+
+    Capacidad coincidente: {$matched}
+    Siguiente: Ejecuta `{$install_command}` para instalarlo.
+
 cli-completions-long-about =
     Genera scripts de autocompletado de shell para `zeroclaw`.
 
@@ -348,10 +356,15 @@ channel-wecom-ws-dm-access-denied =
 channel-discord-interaction-unauthorized = No tienes permiso para usar este comando aquí.
 channel-discord-interaction-malformed = Comando desconocido o mal formado.
 channel-discord-interaction-unavailable = Ese comando ya no está disponible o su entrada estaba vacía.
+channel-discord-component-expired = Este botón o menú ha expirado o ya fue utilizado.
+channel-discord-approval-recorded = Tu decisión ha sido registrada.
 channel-discord-delivery-failure-note-one = (nota: no pude entregar {$count} archivo.)
 channel-discord-delivery-failure-note-many = (nota: no pude entregar {$count} archivos.)
 channel-whatsapp-web-delivery-failure-note-one = (nota: no pude entregar {$count} archivo multimedia de WhatsApp.)
 channel-whatsapp-web-delivery-failure-note-many = (nota: no pude entregar {$count} archivos multimedia de WhatsApp.)
+channel-line-bind-success = ✅ ¡Emparejado! Ya puedes chatear.
+channel-line-bind-invalid-code = ❌ Código no válido. Inténtalo de nuevo.
+channel-line-bind-rate-limited = ⏳ Demasiados intentos. Reintenta en { $secs }s.
 onboard-openai-auth-note =
     Autenticación de OpenAI:
     • Clave de API — acceso estándar a la API mediante platform.openai.com (sk-...)
@@ -365,10 +378,17 @@ onboard-openai-codex-followup =
 cli-web-dist-dir-reason-tilde = comienza con `~`, que no se expande
 cli-web-dist-dir-reason-dollar = contiene `$`, que no se expande
 cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason}; gateway.web_dist_dir se lee literalmente, así que expande el valor tú mismo (p. ej., una ruta absoluta)
+cli-doctor-codex-auth-profile-no-slot = Las credenciales de OpenAI Codex tienen sesión iniciada, pero ningún slot de proveedor de modelo las usa. Establece `requires_openai_auth = true` en un slot de proveedor OpenAI y apunta el `model_provider` de un agente a él, o ejecuta `zeroclaw quickstart`.
+cli-doctor-codex-auth-slot-no-profile = Los slots OpenAI {$slots} tienen `requires_openai_auth = true`, pero no hay credenciales de OpenAI Codex con sesión iniciada. Ejecuta `zeroclaw auth login --provider openai-codex`.
+cli-doctor-codex-auth-ok = Las credenciales de OpenAI Codex tienen sesión iniciada y están referenciadas por un slot de proveedor de modelo.
+cli-doctor-systemd-linger-enabled = la permanencia de usuario de systemd está habilitada
+cli-doctor-systemd-linger-disabled = la permanencia de usuario de systemd está deshabilitada; el servicio de usuario puede detenerse tras cerrar sesión. Habilítala con: loginctl enable-linger {$user}
+cli-doctor-systemd-linger-unknown = no se pudo comprobar la permanencia de usuario de systemd con loginctl
 cli-self-test-web-dist-dir-name = web_dist_dir
 cli-self-test-web-dist-dir-pass-unset = no establecido (usando detección automática)
 cli-self-test-web-dist-dir-pass-literal = {$path} (ruta literal)
 cli-self-test-web-dist-dir-fail-expansion = ADVERTENCIA: {$path} — {$reason}; gateway.web_dist_dir se lee literalmente, así que expande el valor tú mismo (p. ej., una ruta absoluta)
+cli-service-systemd-linger-disabled-warning = la permanencia de usuario de systemd está deshabilitada. El servicio de usuario de ZeroClaw puede detenerse tras cerrar sesión. Habilítala con: loginctl enable-linger {$user}
 cli-peripherals-none = No hay periféricos configurados.
 cli-peripherals-add-hint = Agregue uno con: zeroclaw peripheral add <board> <path>
 cli-peripherals-add-example = {"  "}Ejemplo: zeroclaw peripheral add nucleo-f401re <serial-path>
@@ -384,7 +404,17 @@ cli-skills-create-hint = {"  "}Cree uno: mkdir -p ~/.zeroclaw/workspace/skills/m
 cli-skills-install-hint = {"  "}O instale: zeroclaw skills install <source>
 cli-skills-installed-header = Skills instaladas ({$count}):
 cli-skills-tags = Etiquetas:  {$tags}
+cli-skills-skipped-header = Omitidas ({$count}):
+cli-skills-skipped-reason = {"    "}Motivo: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}Establece `skills.allow_scripts = true` en tu configuración de zeroclaw para habilitarla.
 cli-sop-none = No se encontraron SOP.
+cli-sop-pending-none = No hay ejecuciones de SOP esperando aprobación.
+cli-sop-pending-header = Ejecuciones de SOP esperando aprobación:
+cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] paso {$step}/{$total}
+cli-sop-ws-invalid-approval = sop approval_response requiere run_id y una decisión approve o deny
+cli-sop-ws-resolve-failed = error al resolver SOP: {$error}
+cli-sop-ws-engine-lock-poisoned = bloqueo del motor SOP envenenado
+cli-sop-ws-subsystem-disabled = el subsistema SOP no está habilitado
 cli-sop-create-hint = {"  "}Cree uno: mkdir -p <workspace>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}luego agregue SOP.toml y SOP.md
 cli-sop-loaded-header = SOP cargados ({$count}):
@@ -550,6 +580,9 @@ cli-agent-not-created = Tu agente no fue creado — y no se cambió nada en el d
 cli-onboard-deprecated = `zeroclaw onboard` está obsoleto — usa `zeroclaw quickstart`.
 cli-otp-initialized = Secreto OTP inicializado para ZeroClaw.
 cli-otp-enrollment-uri = URI de inscripción: {$uri}
+cli-otp-received = {"  "}✓ OTP recibido
+cli-secret-captured = {"  "}● Valor capturado — pulse Enter para guardar
+cli-secret-received = {"  "}✓ Secreto recibido
 cli-pairing-enabled = 🔐 El emparejamiento del gateway está habilitado.
 cli-pairing-use-code = {"  "}Usa este código de un solo uso para emparejar un nuevo dispositivo:
 cli-pairing-post = {"    "}POST /pair con encabezado X-Pairing-Code: {$code}
@@ -620,7 +653,6 @@ cli-status-otp = {"  "}OTP habilitado:       {$v}
 cli-status-estop = {"  "}Parada de emergencia activada:    {$v}
 cli-status-peripherals-enabled = {"  "}Habilitado:   {$v}
 cli-status-boards = {"  "}Tableros:    {$v}
-cli-status-channel-not-compiled = 🚫 configurado, no compilado
 cli-status-word-enabled = habilitado
 cli-status-word-disabled = deshabilitado
 cli-status-word-yes = sí
@@ -630,6 +662,7 @@ cli-status-word-off = desactivado
 cli-status-word-none = (ninguno)
 cli-status-word-configured = configurado
 cli-status-word-not-configured = no configurado
+cli-status-channel-not-compiled = 🚫 configurado, no compilado
 cli-desktop-not-installed = La aplicación complementaria de ZeroClaw no está instalada.
 cli-desktop-blurb1 = La aplicación complementaria es una ligera app de la barra de menú que
 cli-desktop-blurb2 = se conecta a la misma puerta de enlace que la CLI.
@@ -638,7 +671,17 @@ cli-config-schema-current = La configuración ya está en la versión actual del
 cli-config-applied-ops = Se aplicaron {$count} operación(es):
 cli-plugins-none = No hay complementos instalados.
 cli-plugins-installed = Complementos instalados:
+cli-plugin-search-none = No hay complementos que coincidan con '{$query}'.
+cli-plugin-search-results = Complementos que coinciden con '{$query}' ({$count}):
+cli-plugin-search-result =   {$name} v{$version} — {$description}
+cli-plugin-no-description = (sin descripción)
+cli-plugin-install-resolving = Resolviendo '{$source}' desde el registro de complementos...
 cli-plugin-installed-from = Complemento instalado desde {$source}
+cli-plugin-installed-name-version = Complemento instalado {$name} v{$version}
+cli-plugin-config-entry-seeded = Se creó [[plugins.entries]] para '{$name}'. Establece los valores de configuración del plugin con `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-seed-skipped = advertencia: se omitió crear la entrada de configuración para '{$name}': la sección [plugins] en disco está mal formada. Repárala, agrega un bloque [[plugins.entries]] con `name = "{$name}"`, y luego establece valores con `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-seed-unaddressable = advertencia: se omitió crear la entrada de configuración para '{$name}': los nombres de plugin que contienen '.' no se pueden direccionar mediante rutas de configuración con puntos (`config set` divide por '.'). Agrega a mano un bloque [[plugins.entries]] con `name = "{$name}"` al archivo de configuración.
+cli-config-section-degraded = advertencia: la sección de configuración `{$section}` en {$path} está mal formada y se restableció a los valores predeterminados para esta ejecución. Los valores de esa sección NO están en efecto. Ejecuta `zeroclaw config migrate` para ver el error de análisis y luego repara el archivo.
 cli-plugin-removed = Complemento '{$name}' eliminado.
 cli-plugin-not-found = No se encontró el complemento '{$name}'.
 cli-plugin-legacy-detected = Nota: los complementos en una ubicación heredada ({$path}) no se cargan en el agente. Ejecuta `zeroclaw plugin migrate` para moverlos a {$target}.
@@ -676,6 +719,16 @@ cli-auth-active-for = Perfil activo para {$provider}: {$profile}
 cli-auth-refresh-ok = ✓ Actualización de token correcta (perfil {$profile})
 cli-auth-removed = Perfil de autenticación eliminado {$provider}:{$profile}
 cli-auth-not-found = Perfil de autenticación no encontrado: {$provider}:{$profile}
+cli-auth-xai-imported = Perfil de autenticación de xAI importado desde {$path}
+cli-auth-xai-device-code-started = Inicio de sesión con código de dispositivo de xAI iniciado.
+cli-auth-oauth-visit = Visita: {$uri}
+cli-auth-oauth-code = Código:  {$code}
+cli-auth-oauth-fast-link = Enlace rápido: {$uri}
+cli-auth-xai-open-oauth-url = Abre esta URL OAuth de xAI en tu navegador y autoriza el acceso:
+cli-auth-callback-capture-failed = No se pudo capturar la devolución de llamada: {$error}
+cli-auth-run-paste-redirect = Ejecuta `zeroclaw auth paste-redirect --model-provider {$provider} --profile {$profile}`
+cli-auth-xai-no-pending-login = No se encontró un inicio de sesión pendiente de xAI. Ejecuta `zeroclaw auth login --model-provider xai` primero.
+cli-auth-paste-redirect-requires-input = paste-redirect requiere la URL de redirección o el código OAuth
 cli-locales-fetched = {"  "}descargado {$name} -> {$path}
 cli-locales-skipped = {"  "}omitido {$name}: no está en upstream ({$path}; se intentó {$refs})
 cli-locales-installed = Se instalaron {$count} catálogo(s) para '{$locale}' en {$dir}
@@ -704,13 +757,24 @@ cli-channels-build-hint = {"  "}Compila desde el código fuente con `./install.s
 cli-channels-start-hint = Para iniciar canales: zeroclaw channel start
 cli-channels-doctor-hint = Para comprobar el estado:    zeroclaw channel doctor
 cli-channels-configure-hint = Para configurar:      zeroclaw config set channels.<name>.<field>=<value>
+cli-models-set-ok = Modelo predeterminado establecido en "{ $model }" en { $provider }.
+cli-models-status-current = Modelo predeterminado: { $model } (proveedor: { $provider })
+cli-models-status-none = No hay ningún modelo predeterminado configurado.
 turn-interrupted-by-user = [interrumpido por el usuario]
 turn-cancelled-client-rpc = [turno cancelado mediante el cliente]
 turn-stream-interrupted = [transmisión interrumpida]
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
+history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
+turn-ingress-dropped = Esta solicitud no se procesó: { $reason }
 turn-tool-interrupted-before-result = [interrumpido por el usuario antes de que esta herramienta produjera un resultado]
 channel-runtime-malformed-tool-output = Generé un error de formato interno en la llamada de herramienta y no pude completar esta solicitud. Inténtalo de nuevo.
+channel-runtime-new-session = Historial de conversación borrado. Empezando de nuevo.
+channel-runtime-stop-sent = Señal de detención enviada.
+channel-runtime-stop-no-task = No hay tarea en curso para este alcance de remitente.
+channel-runtime-model-empty = El ID de modelo no puede estar vacío. Usa `/model <model-id>`.
+channel-runtime-model-switched = Modelo cambiado a `{ $model }` (model_provider: `{ $provider }`). Contexto conservado.
+channel-runtime-request-timeout = ⚠️ Se agotó el tiempo de espera mientras se esperaba al modelo. Inténtalo de nuevo.
 cli-alias-list-empty = (sin entradas en {$section})
 cli-alias-created = creado {$section}.{$alias}
 cli-alias-exists = {$section}.{$alias} ya existe (sin cambios)
@@ -751,3 +815,20 @@ cli-bundle-warn-archive = advertencia: falló el archivado del directorio del bu
 cli-bundle-deleted = eliminado skill_bundles.{$alias} (eliminado de {$count} agente(s))
 cli-bundle-warn-move = advertencia: falló el movimiento del directorio del bundle: {$error}
 cli-bundle-renamed = renombrado skill_bundles.{$from} → skill_bundles.{$to}
+
+cli-daemon-gateway-already-running = Ya hay un gateway de ZeroClaw ejecutándose en {$host}:{$port}. El daemon supervisa su propio gateway y no iniciará un segundo en la misma dirección. Detén ese gateway (o apunta el daemon a un puerto libre con `zeroclaw config set gateway.port <port>`) y luego vuelve a ejecutar el daemon.
+cli-daemon-gateway-port-occupied = La dirección del gateway {$host}:{$port} ya está en uso por otro proceso. Libera el puerto o apunta el daemon a un puerto libre (`zeroclaw config set gateway.port <port>`) y luego vuelve a ejecutar el daemon.
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
+cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
+cli-agent-context-bar-unknown = ctx: desconocido / {$max}
+cli-doctor-ctxwin-already-set = {$provider_ref}: ya tiene context_window = {$ctx}
+cli-doctor-ctxwin-no-model = {$provider_ref}: no hay modelo configurado, omitiendo
+cli-doctor-ctxwin-would-set = {$provider_ref}: establecería context_window = {$ctx} (simulación)
+cli-doctor-ctxwin-set = {$provider_ref}: context_window establecido = {$ctx}
+cli-doctor-ctxwin-not-found = {$provider_ref}: no se encontró la entrada para actualizar
+cli-doctor-ctxwin-fetch-failed = {$provider_ref}: el proveedor no expone ventana de contexto o falló la obtención
+cli-doctor-ctxwin-saved = Guardados {$updated} cambios en config.toml
+cli-doctor-ctxwin-dry-run = Simulación completa — sin cambios. Ejecute sin --dry-run para aplicar.
+cli-doctor-ctxwin-none = No se necesitan actualizaciones.
+cli-doctor-ctxwin-write-failed = {$provider_ref}: error al escribir context_window: {$error}
