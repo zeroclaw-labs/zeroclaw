@@ -1819,7 +1819,7 @@ export default function Dashboard() {
 
   return (
     <div className="p-6 space-y-6 animate-fade-in">
-      <AgentsSection />
+      <AgentsSection inFlightByAgent={typeof status.in_flight === 'object' ? status.in_flight.by_agent : undefined} />
 
       {/* Global system stats — tab navigation. Scrolls horizontally when the
           six tabs don't fit (mobile) instead of overflowing the frame; each
@@ -2895,7 +2895,7 @@ function DashboardMetrics({ agents }: { agents: AgentSummary[] }) {
 // rather than "the agent". Same card component used on /agents.
 // ---------------------------------------------------------------------------
 
-function AgentsSection() {
+function AgentsSection({ inFlightByAgent }: { inFlightByAgent?: Record<string, number> }) {
   const [agents, setAgents] = useState<AgentSummary[] | null>(null);
   const [quickstartLabel, setQuickstartLabel] = useState(
     t("dashboard.start_quickstart"),
@@ -3069,6 +3069,7 @@ function AgentsSection() {
               agent={agent}
               selected={agent.alias === selectedAlias}
               onSelect={() => setSelectedAlias(agent.alias)}
+              inFlightCount={inFlightByAgent?.[agent.alias] ?? 0}
             />
           ))}
           {hiddenCount > 0 && (

@@ -1,4 +1,5 @@
 pub mod dora;
+pub mod inflight;
 pub mod log;
 pub mod multi;
 pub mod noop;
@@ -12,6 +13,8 @@ pub mod runtime_trace;
 pub mod traits;
 pub mod verbose;
 
+#[allow(unused_imports)]
+pub use self::inflight::{InFlightObserver, InFlightRegistry, in_flight_registry};
 #[allow(unused_imports)]
 pub use self::log::LogObserver;
 #[allow(unused_imports)]
@@ -167,14 +170,17 @@ impl Drop for FlushGuard {
 }
 
 /// Wrapper that forwards every event to a primary observer plus the
-/// process-wide broadcast hook (when set). Metrics flow only to the primary.
+/// process-wide broadcast hook (when set) and the in-flight counter.
+/// Metrics flow only to the primary.
 struct TeeObserver {
     primary: Box<dyn Observer>,
+    inflight: inflight::InFlightObserver,
 }
 
 impl Observer for TeeObserver {
     fn record_event(&self, event: &ObserverEvent) {
         self.primary.record_event(event);
+        self.inflight.record_event(event);
         if let Some(hook) = current_broadcast_hook() {
             hook.record_event(event);
         }
@@ -248,6 +254,7 @@ fn warn_otel_content_policy(config: OtelContentConfig) {
 pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     Box::new(TeeObserver {
         primary: create_primary_observer(config),
+        inflight: inflight::InFlightObserver::default(),
     })
 }
 

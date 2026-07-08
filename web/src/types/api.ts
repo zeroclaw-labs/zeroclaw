@@ -20,6 +20,9 @@ export interface StatusResponse {
    * and FreeBSD via the `sysinfo` crate; on unsupported hosts
    * `rss_bytes = 0` and `cpu_percent = null`. */
   process?: ProcessStats;
+  /** Per-agent in-flight turn count(s). Without `?agent=`, an object with
+   * `by_agent` and `total`. With `?agent=<alias>`, a plain number. */
+  in_flight: number | { by_agent: Record<string, number>; total: number };
 }
 
 export interface ProcessStats {

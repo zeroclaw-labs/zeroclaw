@@ -295,6 +295,17 @@ pub async fn handle_api_status(
 
     let process = zeroclaw_runtime::process_stats::sample();
 
+    // Per-agent in-flight turn counts from the observability pipeline.
+    let in_flight_reg = zeroclaw_runtime::observability::in_flight_registry();
+    let in_flight = if let Some(alias) = agent_alias {
+        serde_json::Value::Number(serde_json::Number::from(in_flight_reg.get(alias)))
+    } else {
+        serde_json::json!({
+            "by_agent": in_flight_reg.snapshot(),
+            "total": in_flight_reg.total(),
+        })
+    };
+
     let body = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "model_provider": model_provider,
@@ -309,6 +320,7 @@ pub async fn handle_api_status(
         "channels": channels,
         "health": health,
         "agent_alias": agent_alias,
+        "in_flight": in_flight,
         "process": process,
     });
 

@@ -6,6 +6,7 @@ import {
   MessageSquare,
   Power,
   Wifi,
+  Zap,
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import type { AgentSummary } from '@/lib/agents';
@@ -19,6 +20,8 @@ export interface AgentCardProps {
   onSelect: () => void;
   /** Highlight when this row's agent is the one shown in the drawer. */
   selected?: boolean;
+  /** Current in-flight turn count for this agent (from /api/status). */
+  inFlightCount?: number;
 }
 
 // A compact inline fact: icon + value, with a muted caption that collapses on
@@ -52,7 +55,7 @@ function RowFact({
  * inline facts (channels / sessions / memories / spend). Full detail + actions
  * (Open chat, Edit, the per-entity config links) live in the drawer.
  */
-export default function AgentCard({ agent, onSelect, selected = false }: AgentCardProps) {
+export default function AgentCard({ agent, onSelect, selected = false, inFlightCount }: AgentCardProps) {
   const navigate = useNavigate();
   const channelCount = agent.channels.length;
   const chatHref = `/agent/${encodeURIComponent(agent.alias)}`;
@@ -100,6 +103,14 @@ export default function AgentCard({ agent, onSelect, selected = false }: AgentCa
 
       {/* Inline facts — hidden on the narrowest viewports to keep the row clean */}
       <div className="hidden sm:flex items-center gap-4 flex-shrink-0">
+        {inFlightCount !== undefined && inFlightCount > 0 && (
+          <RowFact
+            icon={Zap}
+            value={inFlightCount}
+            label={inFlightCount === 1 ? t('agentcard.in_flight_turn') : t('agentcard.in_flight_turns')}
+            title={t('agentcard.in_flight_title')}
+          />
+        )}
         <RowFact
           icon={Wifi}
           value={channelCount}
