@@ -187,10 +187,15 @@ pub struct ToolLoop<'a> {
     /// The ingress envelope stamped by the entry layer (RFC #6971). Travels
     /// with the turn into the engine, where the universal SOP policy layer
     /// dispositions it at P1 (turn entry) and P2 (each steering injection).
-    /// Phase-1 callers stamp [`IngressContext::internal`]; real per-transport
+    /// Phase-1 callers stamp a per-origin envelope; real per-transport
     /// stamping is phase 2. Owned (not borrowed) — the envelope is small and
     /// consumed by the policy front door for the turn's lifetime.
     pub ingress: IngressContext,
+    /// The per-turn memory half for unified memory-context injection: the
+    /// handle, raw recall query, session scopes, and spawn-site suppression.
+    /// `None` for nested sub-turn sites and paths without a memory backend;
+    /// the injection decision itself is keyed on `ingress.origin`.
+    pub memory: Option<crate::agent::memory_inject::TurnMemory<'a>>,
     /// Observer metadata: agent alias and turn id, stamped onto every
     /// turn-level observer event so OTel spans correlate across the loop.
     pub agent_alias: Option<&'a str>,
@@ -213,6 +218,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         mut new_messages_out,
         mut image_cache,
         ingress,
+        memory,
         agent_alias,
         turn_id,
     } = p;
@@ -275,6 +281,46 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 "turn-ingress-dropped",
                 &[("reason", reason.as_str())],
             ));
+        }
+    }
+
+    // ── Memory-context injection (unified) ──────────────────────────────────
+    // The ONE injection point for the memory preamble, replacing the per-path
+    // inline renderers. The decision is keyed on the ingress origin (sub-turns
+    // never inject; scheduled origins exclude Conversation entries); the
+    // pipeline and its documented uniform behavior live in
+    // `agent::memory_inject`. Injection prepends to the trailing user message
+    // AFTER the P1 policy scan, so policy always sees the caller's own text.
+    if let Some(turn_memory) = &memory {
+        let has_session = turn_memory.sessions.iter().any(Option::is_some);
+        if let crate::agent::memory_inject::InjectPolicy::Inject {
+            exclude_conversation,
+        } = crate::agent::memory_inject::resolve_inject_policy(
+            ingress.origin,
+            has_session,
+            turn_memory.suppress,
+        ) && let Some(last_user_idx) = history.iter().rposition(|m| m.role == "user")
+            // Idempotence: a model-switch retry re-enters the engine with the
+            // same history; the preamble must not stack.
+            && !history[last_user_idx]
+                .content
+                .starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN)
+        {
+            let scopes: Vec<Option<&str>> =
+                turn_memory.sessions.iter().map(|s| s.as_deref()).collect();
+            let context = crate::agent::memory_inject::render_memory_context(
+                turn_memory.handle,
+                observer,
+                &turn_memory.query,
+                &scopes,
+                &turn_memory.cfg,
+                exclude_conversation,
+            )
+            .await;
+            if !context.is_empty() {
+                let existing = &history[last_user_idx].content;
+                history[last_user_idx].content = format!("{context}{existing}");
+            }
         }
     }
 
@@ -391,6 +437,39 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         preflight_history_maintenance(history);
 
         if iteration == 0 && context_token_budget > 0 {
+            // The system prompt + inlined tool definitions form an irreducible
+            // floor whole-turn trimming can never drop. When that floor alone
+            // meets or exceeds the budget, trimming conversation history can
+            // never bring the request under budget — surface the actionable
+            // root cause once per turn (this block is gated on iteration == 0)
+            // so the misconfiguration is not silent (#5808). Whole-turn
+            // trimming below still runs and is harmless (it keeps the most
+            // recent turn); the model call / reactive recovery proceeds.
+            let system_floor = crate::agent::history::estimate_system_floor_tokens(history);
+            if system_floor >= context_token_budget {
+                let __zc_floor_span = ::zeroclaw_log::info_span!(
+                    target: "zeroclaw_log_internal_scope",
+                    "zeroclaw_scope",
+                    model = %model,
+                    model_provider = %provider_name,
+                );
+                let _zc_floor_guard = __zc_floor_span.entered();
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "system_floor": system_floor,
+                            "budget": context_token_budget,
+                            "error_key": "context_floor_exceeds_budget",
+                        })),
+                    crate::agent::history::context_floor_remediation(
+                        system_floor,
+                        context_token_budget,
+                    )
+                );
+            }
             let taken = std::mem::take(history);
             let result =
                 crate::agent::history_trim::trim_to_recent_turns(taken, context_token_budget);
@@ -633,6 +712,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     iteration,
                     event_tx.as_ref(),
                     observer,
+                    context_token_budget,
                 )
                 .await;
                 if recovered {
@@ -1269,7 +1349,8 @@ async fn drive_live_sop_actions(
                         steering: None,
                         new_messages_out: new_messages_out.as_deref_mut(),
                         image_cache: image_cache.as_deref_mut(),
-                        ingress: IngressContext::internal(),
+                        memory: None,
+                        ingress: IngressContext::sub_turn(),
                         agent_alias,
                         turn_id: &nested_turn_id,
                     }))

@@ -961,6 +961,7 @@ impl DelegateTool {
                 connect_mcp: true,
                 connect_peripherals: false,
                 exclude_memory: false,
+                list_deferred_mcp_specs: false,
                 emit_assembly_logs: true,
             },
         )
@@ -3036,7 +3037,8 @@ impl DelegateTool {
                 image_cache: None,
                 // Phase 1: stamp Internal/Trusted. Real per-transport
                 // stamping is PR C (RFC #6971 §4).
-                ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                memory: None,
+                ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
                 agent_alias: Some(agent_name),
                 turn_id: &turn_id,
             })
