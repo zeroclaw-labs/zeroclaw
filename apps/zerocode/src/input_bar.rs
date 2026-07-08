@@ -2592,11 +2592,16 @@ mod tests {
             .iter()
             .find(|c| c.title.as_deref() == Some(title.as_str()))
             .expect("slash-commands section present");
-        let listed: Vec<String> = section.entries.iter().map(|e| e.key_str()).collect();
-        for cmd in SLASH_COMMANDS {
+        let listed: Vec<String> = section
+            .entries
+            .iter()
+            .map(|entry| entry.key_str())
+            .collect();
+        for command in SLASH_COMMANDS {
             assert!(
-                listed.iter().any(|k| k == cmd),
-                "slash command {cmd} must appear in the help section"
+                listed.iter().any(|key| key == command.name),
+                "slash command {} must appear in the help section",
+                command.name
             );
         }
         assert_eq!(listed.len(), SLASH_COMMANDS.len());
