@@ -440,6 +440,7 @@ capabilities = ["tool"]
             wasm_path: None,
             wasm_sha256: None,
             capabilities: vec![zeroclaw::plugins::PluginCapability::Tool],
+            provides: None,
             permissions: Vec::new(),
             signature: None,
             publisher_key: None,

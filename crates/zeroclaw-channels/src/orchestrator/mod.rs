@@ -7919,6 +7919,20 @@ pub(crate) fn composite_channel_key(name: &str, alias: Option<&str>) -> String {
     }
 }
 
+/// The set of keys a plugin channel must not collide with to honor native-wins.
+/// For each native channel it includes BOTH the bare platform id and the
+/// composite `<name>.<alias>` registry key, so a per-alias mirror plugin (dedup
+/// key `<id>.<alias>`) and a novel plugin (bare name) are each shadowed by the
+/// matching native form — and a *different* alias is left free (native-wins is
+/// per-alias, not per-platform).
+pub(crate) fn native_channel_dedup_keys<'a>(
+    channels: impl Iterator<Item = (&'a str, Option<&'a str>)>,
+) -> std::collections::HashSet<String> {
+    channels
+        .flat_map(|(name, alias)| [name.to_string(), composite_channel_key(name, alias)])
+        .collect()
+}
+
 fn configured_channel_map(configured: &[ConfiguredChannel]) -> HashMap<String, Arc<dyn Channel>> {
     let mut map: HashMap<String, Arc<dyn Channel>> = HashMap::new();
     let mut name_counts: HashMap<&str, usize> = HashMap::new();
@@ -10596,24 +10610,26 @@ pub async fn start_channels(
             // WASM channel plugins — registered and supervised exactly like
             // native channels, but a compiled-in channel of the same id wins
             // (native-wins), mirroring the tool-plugin and skill-tool shadow
-            // policy. The building lives in `zeroclaw-runtime` (this crate has no
-            // `zeroclaw-plugins` dependency); the dedup set is computed here where
-            // the native channel ids are known. Downstream — the supervised
-            // listener and the `channels_by_name` registry — consume these
-            // appended entries unchanged.
-            let native_channel_ids: std::collections::HashSet<String> = configured_channels
-                .iter()
-                .map(|cc| cc.channel.name().to_string())
-                .collect();
-            for (id, channel) in zeroclaw_runtime::plugin_channels::build_channel_plugins(
+            // policy. Building lives in `zeroclaw-runtime` (this crate has no
+            // `zeroclaw-plugins` dependency). Dedup is by both the bare platform
+            // id and the composite `"<type>.<alias>"` key, so a per-alias mirror
+            // (`"telegram.main"`) is shadowed by the matching native channel,
+            // while a novel plugin is shadowed by name. The runtime builder
+            // applies this materialized view before invoking any plugin export.
+            let native_channel_keys = native_channel_dedup_keys(
+                configured_channels
+                    .iter()
+                    .map(|cc| (cc.channel.name(), cc.alias.as_deref())),
+            );
+            for (alias, channel) in zeroclaw_runtime::plugin_channels::build_channel_plugins(
                 &config_arc,
-                &native_channel_ids,
+                &native_channel_keys,
             )
             .await
             {
                 configured_channels.push(ConfiguredChannel {
                     display_name: "Plugin",
-                    alias: Some(id),
+                    alias: Some(alias),
                     channel,
                 });
             }
@@ -11666,6 +11682,19 @@ temperature = 0.3
         // Empty-string alias collapses to bare name so we never produce a
         // `discord.` key that no message would ever match.
         assert_eq!(composite_channel_key("discord", Some("")), "discord");
+    }
+
+    #[test]
+    fn native_channel_dedup_keys_cover_bare_and_composite() {
+        let keys =
+            native_channel_dedup_keys([("telegram", Some("main")), ("notion", None)].into_iter());
+        // A per-alias mirror (dedup key "telegram.main") and a novel bare-name
+        // plugin are both shadowed by their native counterparts.
+        assert!(keys.contains("telegram"));
+        assert!(keys.contains("telegram.main"));
+        assert!(keys.contains("notion"));
+        // A DIFFERENT alias is not shadowed — native-wins is per-alias.
+        assert!(!keys.contains("telegram.other"));
     }
 
     #[test]

@@ -227,7 +227,7 @@ async fn supervised_wasm_listener_cancels_its_only_poll_generation() {
         .await
         .expect("real supervised listener polls the fixture")
         .expect("listener forwards fixture message");
-    assert_eq!(message.content, "ping");
+    assert_eq!(message.content, "{}");
     assert_eq!(message.channel, zeroclaw_api::channel::PLUGIN_CHANNEL_TYPE);
     assert_eq!(message.channel_alias.as_deref(), Some(PLUGIN_NAME));
     tokio::time::sleep(Duration::from_millis(100)).await;

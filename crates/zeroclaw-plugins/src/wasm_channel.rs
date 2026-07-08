@@ -38,7 +38,9 @@ pub type SenderAuthorizer = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// A channel backed by a WIT component-model plugin.
 pub struct WasmChannel {
-    alias: String,
+    /// Canonical host-owned routing identity: `plugin.<manifest-name>` for a
+    /// novel plugin or `<provided-channel>.<config-alias>` for a mirror.
+    channel_ref: String,
     capabilities: ChannelCapabilities,
     state: Arc<Mutex<(Store<PluginState>, ChannelPlugin)>>,
     inbound: InboundQueue,
@@ -67,8 +69,18 @@ impl Attributable for WasmChannel {
         Role::Channel(ChannelKind::Plugin)
     }
     fn alias(&self) -> &str {
-        &self.alias
+        split_channel_ref(&self.channel_ref)
+            .1
+            .unwrap_or(&self.channel_ref)
     }
+}
+
+fn split_channel_ref(channel_ref: &str) -> (&str, Option<&str>) {
+    channel_ref
+        .split_once('.')
+        .map_or((channel_ref, None), |(channel_type, alias)| {
+            (channel_type, Some(alias))
+        })
 }
 
 /// Resolve the JSON config section handed to a channel plugin's `configure`.
@@ -106,42 +118,16 @@ fn build_linker(http: bool) -> Result<Linker<PluginState>> {
 }
 
 impl WasmChannel {
-    /// Compile and instantiate a channel plugin, caching its capabilities and
-    /// the static-identity exports needed by the sync trait methods. The
-    /// permission set decides whether the store and linker expose outbound
-    /// `wasi:http`; without `HttpClient` the channel cannot reach the network.
-    /// The returned channel owns an [`InboundQueue`]; a host-run listener obtains
-    /// its handle via [`WasmChannel::inbound`] and enqueues received traffic for
-    /// the plugin's `poll-message` to drain. `limits` bounds the per-call fuel
-    /// and the memory/table/instance ceilings.
-    pub async fn from_wasm(
-        alias: impl Into<String>,
-        wasm_path: &Path,
-        permissions: &[PluginPermission],
-        config: &HashMap<String, String>,
-        limits: crate::component::PluginLimits,
-        authorizer: SenderAuthorizer,
-    ) -> Result<Self> {
-        Self::from_wasm_with_digest(
-            alias,
-            wasm_path,
-            None,
-            permissions,
-            config,
-            limits,
-            authorizer,
-        )
-        .await
-    }
-
-    /// Instantiate a channel plugin while binding the compiled component to
-    /// the digest carried by its verified manifest.
-    pub async fn from_wasm_with_digest(
-        alias: impl Into<String>,
+    /// Compile and instantiate one channel plugin from digest-bound bytes.
+    /// `channel_ref` is the host-owned routing identity and `config_json` is the
+    /// permission-filtered canonical config passed to `configure` before any
+    /// other guest export.
+    async fn instantiate(
+        channel_ref: String,
         wasm_path: &Path,
         expected_sha256: Option<&str>,
         permissions: &[PluginPermission],
-        config: &HashMap<String, String>,
+        config_json: String,
         limits: crate::component::PluginLimits,
         authorizer: SenderAuthorizer,
     ) -> Result<Self> {
@@ -159,11 +145,6 @@ impl WasmChannel {
 
         let channel = bindings.zeroclaw_plugin_channel();
 
-        // Hand the plugin its resolved config once, before any other call. The
-        // section is withheld unless the manifest granted `ConfigRead`, matching
-        // the tool-plugin `__config` rule, so a plugin without the permission is
-        // configured with an empty object rather than another channel's secrets.
-        let config_json = resolve_configure_json(config, permissions);
         wt(
             channel.call_configure(&mut store, &config_json).await,
             "channel.configure trapped",
@@ -203,7 +184,7 @@ impl WasmChannel {
             };
 
         Ok(Self {
-            alias: alias.into(),
+            channel_ref,
             capabilities,
             state: Arc::new(Mutex::new((store, bindings))),
             inbound,
@@ -213,6 +194,106 @@ impl WasmChannel {
             poll_healthy: Arc::new(AtomicBool::new(true)),
             authorizer,
         })
+    }
+
+    /// Instantiate a novel channel plugin from its `[[plugins.entries]]` config.
+    pub async fn from_wasm(
+        plugin_name: impl Into<String>,
+        wasm_path: &Path,
+        permissions: &[PluginPermission],
+        config: &HashMap<String, String>,
+        limits: crate::component::PluginLimits,
+        authorizer: SenderAuthorizer,
+    ) -> Result<Self> {
+        Self::from_wasm_with_digest(
+            plugin_name,
+            wasm_path,
+            None,
+            permissions,
+            config,
+            limits,
+            authorizer,
+        )
+        .await
+    }
+
+    /// Instantiate a novel channel plugin while binding its component to the
+    /// digest carried by the verified manifest.
+    pub async fn from_wasm_with_digest(
+        plugin_name: impl Into<String>,
+        wasm_path: &Path,
+        expected_sha256: Option<&str>,
+        permissions: &[PluginPermission],
+        config: &HashMap<String, String>,
+        limits: crate::component::PluginLimits,
+        authorizer: SenderAuthorizer,
+    ) -> Result<Self> {
+        let plugin_name = plugin_name.into();
+        let config_json = resolve_configure_json(config, permissions);
+        Self::instantiate(
+            zeroclaw_api::channel::plugin_channel_ref(&plugin_name),
+            wasm_path,
+            expected_sha256,
+            permissions,
+            config_json,
+            limits,
+            authorizer,
+        )
+        .await
+    }
+
+    /// Instantiate a mirror from canonical `[channels.<type>.<alias>]` config.
+    pub async fn from_wasm_mirror(
+        channel_type: impl Into<String>,
+        alias: impl Into<String>,
+        wasm_path: &Path,
+        permissions: &[PluginPermission],
+        config_json: &str,
+        limits: crate::component::PluginLimits,
+        authorizer: SenderAuthorizer,
+    ) -> Result<Self> {
+        Self::from_wasm_mirror_with_digest(
+            channel_type,
+            alias,
+            wasm_path,
+            None,
+            permissions,
+            config_json,
+            limits,
+            authorizer,
+        )
+        .await
+    }
+
+    /// Instantiate a mirror while binding its component to the digest carried
+    /// by the verified manifest.
+    pub async fn from_wasm_mirror_with_digest(
+        channel_type: impl Into<String>,
+        alias: impl Into<String>,
+        wasm_path: &Path,
+        expected_sha256: Option<&str>,
+        permissions: &[PluginPermission],
+        config_json: &str,
+        limits: crate::component::PluginLimits,
+        authorizer: SenderAuthorizer,
+    ) -> Result<Self> {
+        let channel_type = channel_type.into();
+        let alias = alias.into();
+        let config_json = if permissions.contains(&PluginPermission::ConfigRead) {
+            config_json.to_string()
+        } else {
+            "{}".to_string()
+        };
+        Self::instantiate(
+            format!("{channel_type}.{alias}"),
+            wasm_path,
+            expected_sha256,
+            permissions,
+            config_json,
+            limits,
+            authorizer,
+        )
+        .await
     }
 
     /// Handle to this channel's inbound queue. A host-run listener clones it and
@@ -250,16 +331,17 @@ fn to_wit_send(msg: &SendMessage) -> WitSendMessage {
     }
 }
 
-fn from_wit_inbound(msg: WitInboundMessage, channel_name: &str) -> ChannelMessage {
+fn from_wit_inbound(msg: WitInboundMessage, channel_ref: &str) -> ChannelMessage {
+    let (channel_type, alias) = split_channel_ref(channel_ref);
     ChannelMessage {
         id: msg.id,
         sender: msg.sender,
         reply_target: msg.reply_target,
         content: msg.content,
-        channel: zeroclaw_api::channel::PLUGIN_CHANNEL_TYPE.to_string(),
-        // Host-stamp the verified manifest name. Guest-provided aliases cannot
-        // select a different agent route.
-        channel_alias: Some(channel_name.to_string()),
+        channel: channel_type.to_string(),
+        // Always stamp the host-owned route. Guest-provided identity cannot
+        // select a different owner or session namespace.
+        channel_alias: alias.map(str::to_string),
         timestamp: msg.timestamp,
         thread_ts: msg.thread_ts,
         interruption_scope_id: msg.interruption_scope_id,
@@ -320,7 +402,7 @@ fn from_wit_approval_response(r: WitApprovalResponse) -> ChannelApprovalResponse
 #[async_trait]
 impl Channel for WasmChannel {
     fn name(&self) -> &str {
-        zeroclaw_api::channel::PLUGIN_CHANNEL_TYPE
+        split_channel_ref(&self.channel_ref).0
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
@@ -341,7 +423,7 @@ impl Channel for WasmChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        let channel_name = self.alias.clone();
+        let channel_ref = self.channel_ref.clone();
         let authorizer = Arc::clone(&self.authorizer);
         const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
         const MAX_BACKOFF: Duration = Duration::from_millis(500);
@@ -364,8 +446,8 @@ impl Channel for WasmChannel {
                     if forward_if_authorized(
                         &tx,
                         &authorizer,
-                        &channel_name,
-                        from_wit_inbound(wit_msg, &channel_name),
+                        &channel_ref,
+                        from_wit_inbound(wit_msg, &channel_ref),
                     )
                     .await
                     .is_err()
@@ -385,7 +467,7 @@ impl Channel for WasmChannel {
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
-                                "channel_alias": channel_name,
+                                "channel_ref": channel_ref,
                                 "error": format!("{e:#}"),
                             })),
                         "channel plugin poll-message trapped; backing off"
@@ -893,7 +975,7 @@ mod tests {
                 attachments: Vec::new(),
                 subject: None,
             },
-            "weather-alerts",
+            "plugin.weather-alerts",
         );
 
         assert_eq!(message.channel, zeroclaw_api::channel::PLUGIN_CHANNEL_TYPE);
@@ -935,5 +1017,34 @@ mod tests {
         assert_eq!(drained.id, "evt-1");
         assert_eq!(drained.content, "inbound sms");
         assert_eq!(queue.pending(), 0, "draining empties the shared queue");
+    }
+
+    #[test]
+    fn from_wit_inbound_host_stamps_canonical_route() {
+        let make = || WitInboundMessage {
+            id: "1".into(),
+            sender: "u".into(),
+            reply_target: "u".into(),
+            content: "hi".into(),
+            channel: "plugin-ignored".into(),
+            channel_alias: Some("plugin-supplied".into()),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: Vec::new(),
+            subject: None,
+        };
+
+        // A mirror stamps the host-owned alias, overriding whatever the plugin
+        // put in `channel_alias`, so routing/session keys never trust the plugin.
+        let stamped = from_wit_inbound(make(), "telegram.main");
+        assert_eq!(stamped.channel, "telegram");
+        assert_eq!(stamped.channel_alias.as_deref(), Some("main"));
+
+        // Novel plugins use the same host-owned route grammar and never trust
+        // the guest's channel or alias fields.
+        let novel = from_wit_inbound(make(), "plugin.echo.channel");
+        assert_eq!(novel.channel, zeroclaw_api::channel::PLUGIN_CHANNEL_TYPE);
+        assert_eq!(novel.channel_alias.as_deref(), Some("echo.channel"));
     }
 }

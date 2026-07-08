@@ -1,11 +1,8 @@
-//! End-to-end: drive a real WASM channel plugin through the host's `WasmChannel`
-//! exactly as the daemon does. Loads `channel-fixture.wasm` — a minimal echo
-//! channel built for `wasm32-wasip2` (source in `tests/fixtures/channel-fixture/`)
-//! — instantiates it with `WasmChannel::from_wasm`, and exercises the full path:
-//! configure → get-channel-capabilities → name → self-handle → health-check →
-//! send → inbound poll (via `listen`).
+//! End-to-end coverage for novel and built-in-mirror WASM channel plugins.
 //!
-//! The component is built from its checked-in source on demand:
+//! The checked-in fixture echoes the JSON received by `configure` as its first
+//! inbound message. Tests build that real component on demand, bind execution
+//! to its digest, and exercise the long-running host listener.
 //!
 //! ```text
 //! cd crates/zeroclaw-plugins/tests/fixtures/channel-fixture
@@ -15,12 +12,13 @@
 #![cfg(feature = "plugins-wasm-cranelift")]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use zeroclaw_api::channel::{Channel, SendMessage};
+use serde_json::Value;
+use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_plugins::PluginPermission;
 use zeroclaw_plugins::component::PluginLimits;
 use zeroclaw_plugins::error::PluginError;
@@ -61,6 +59,12 @@ fn fixture() -> PathBuf {
         .clone()
 }
 
+fn fixture_digest(wasm: &Path) -> String {
+    zeroclaw_plugins::signature::sha256_hex(
+        &std::fs::read(wasm).expect("read channel component fixture"),
+    )
+}
+
 fn test_limits() -> PluginLimits {
     PluginLimits {
         call_fuel: 1_000_000_000,
@@ -84,30 +88,47 @@ fn outbound(content: &str) -> SendMessage {
     }
 }
 
-#[tokio::test]
-async fn channel_plugin_runs_end_to_end() {
-    let wasm = fixture();
+async fn first_inbound(channel: &Arc<WasmChannel>) -> ChannelMessage {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let listener_channel = Arc::clone(channel);
+    let listener = ::zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+    let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("inbound message arrives within timeout")
+        .expect("channel sender not dropped");
+    assert!(!listener.is_finished(), "listen remains long-running");
+    listener.abort();
+    assert!(
+        listener
+            .await
+            .expect_err("listener cancellation returns a join error")
+            .is_cancelled()
+    );
+    message
+}
 
-    // Instantiate exactly as the runtime helper does: alias, permissions, config,
-    // limits. Succeeding proves `configure` and `get-channel-capabilities` ran.
-    let config: HashMap<String, String> = HashMap::new();
-    let bytes = std::fs::read(&wasm).expect("read fixture for signed digest");
-    let digest = zeroclaw_plugins::signature::sha256_hex(&bytes);
-    let channel = WasmChannel::from_wasm_with_digest(
-        "echo-channel",
-        &wasm,
-        Some(&digest),
-        &[PluginPermission::ConfigRead],
-        &config,
-        test_limits(),
-        allow_all(),
-    )
-    .await
-    .expect("channel plugin instantiates (configure + get-channel-capabilities)");
+#[tokio::test]
+async fn novel_channel_plugin_runs_end_to_end() {
+    let wasm = fixture();
+    let digest = fixture_digest(&wasm);
+    let config = HashMap::from([("greeting".to_string(), "hi".to_string())]);
+    let channel = Arc::new(
+        WasmChannel::from_wasm_with_digest(
+            "echo-channel",
+            &wasm,
+            Some(&digest),
+            &[PluginPermission::ConfigRead],
+            &config,
+            test_limits(),
+            allow_all(),
+        )
+        .await
+        .expect("novel channel plugin instantiates"),
+    );
 
     let tampered_dir = tempfile::tempdir().expect("temporary tampered fixture");
     let tampered_path = tampered_dir.path().join("channel-fixture.wasm");
-    let mut tampered = bytes;
+    let mut tampered = std::fs::read(&wasm).expect("read fixture for tampering");
     tampered.push(0);
     std::fs::write(&tampered_path, tampered).expect("write tampered fixture");
     let error = WasmChannel::from_wasm_with_digest(
@@ -130,42 +151,81 @@ async fn channel_plugin_runs_end_to_end() {
         "unexpected tamper error: {error:#}"
     );
 
-    // Identity + capability-gated exports cached at load time.
     assert_eq!(channel.name(), zeroclaw_api::channel::PLUGIN_CHANNEL_TYPE);
-    assert_eq!(
-        channel.self_handle().as_deref(),
-        Some("@echo"),
-        "fixture advertises SELF_HANDLE and returns @echo"
-    );
-    assert!(channel.health_check().await, "fixture reports healthy");
-
-    // Outbound send is accepted by the plugin.
+    assert_eq!(channel.self_handle().as_deref(), Some("@echo"));
+    assert!(channel.health_check().await);
     channel
         .send(&outbound("pong"))
         .await
         .expect("send succeeds");
 
-    // Inbound: the host listen loop drains the plugin's `poll-message` and
-    // forwards the one canned message the fixture delivers.
-    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-    let listener = ::zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
-    let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .expect("inbound message arrives within timeout")
-        .expect("channel sender not dropped");
-    assert_eq!(msg.content, "ping");
-    assert_eq!(msg.channel, zeroclaw_api::channel::PLUGIN_CHANNEL_TYPE);
-    assert_eq!(msg.channel_alias.as_deref(), Some("echo-channel"));
+    let message = first_inbound(&channel).await;
+    assert_eq!(message.channel, zeroclaw_api::channel::PLUGIN_CHANNEL_TYPE);
+    assert_eq!(message.channel_alias.as_deref(), Some("echo-channel"));
+    let echoed: Value = serde_json::from_str(&message.content).expect("echoed config is JSON");
+    assert_eq!(echoed.get("greeting").and_then(Value::as_str), Some("hi"));
+}
 
-    assert!(
-        !listener.is_finished(),
-        "listen must own the polling loop until its caller cancels it"
-    );
-    listener.abort();
-    let err = listener
+#[tokio::test]
+async fn mirror_channel_plugin_receives_plaintext_typed_config() {
+    let wasm = fixture();
+    let digest = fixture_digest(&wasm);
+    let config_json =
+        r#"{"bot_token":"secret-123","mention_only":true,"guild_ids":[1,2],"enabled":true}"#;
+    let channel = Arc::new(
+        WasmChannel::from_wasm_mirror_with_digest(
+            "telegram",
+            "main",
+            &wasm,
+            Some(&digest),
+            &[PluginPermission::ConfigRead],
+            config_json,
+            test_limits(),
+            allow_all(),
+        )
         .await
-        .expect_err("aborting the listener should cancel the polling loop");
-    assert!(err.is_cancelled());
+        .expect("mirror channel plugin instantiates"),
+    );
+
+    assert_eq!(channel.name(), "telegram");
+    let message = first_inbound(&channel).await;
+    assert_eq!(message.channel, "telegram");
+    assert_eq!(message.channel_alias.as_deref(), Some("main"));
+    let echoed: Value = serde_json::from_str(&message.content).expect("echoed config is JSON");
+    assert_eq!(
+        echoed.get("bot_token").and_then(Value::as_str),
+        Some("secret-123")
+    );
+    assert_eq!(
+        echoed.get("mention_only").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(echoed.get("guild_ids"), Some(&serde_json::json!([1, 2])));
+}
+
+#[tokio::test]
+async fn mirror_without_config_read_is_withheld() {
+    let wasm = fixture();
+    let digest = fixture_digest(&wasm);
+    let channel = Arc::new(
+        WasmChannel::from_wasm_mirror_with_digest(
+            "telegram",
+            "main",
+            &wasm,
+            Some(&digest),
+            &[],
+            r#"{"bot_token":"secret-123","enabled":true}"#,
+            test_limits(),
+            allow_all(),
+        )
+        .await
+        .expect("mirror instantiates with withheld config"),
+    );
+
+    let message = first_inbound(&channel).await;
+    assert_eq!(message.content, "{}");
+    assert_eq!(message.channel, "telegram");
+    assert_eq!(message.channel_alias.as_deref(), Some("main"));
 }
 
 #[tokio::test]

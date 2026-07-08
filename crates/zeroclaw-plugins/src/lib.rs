@@ -46,6 +46,15 @@ pub struct PluginManifest {
     pub wasm_sha256: Option<String>,
     /// Capabilities this plugin provides
     pub capabilities: Vec<PluginCapability>,
+    /// The compiled-in channel id this plugin *mirrors*, when it is a drop-in
+    /// for a built-in channel — the snake_case config id (e.g. `"telegram"`,
+    /// `"gmail_push"`). When set, the host builds one instance per configured
+    /// `[channels.<id>.<alias>]` and feeds each that alias's canonical config,
+    /// instead of a `[[plugins.entries]]` block. `None` (the default) means a
+    /// novel plugin with no built-in equivalent, configured from its own
+    /// `[[plugins.entries.<name>]]` map.
+    #[serde(default)]
+    pub provides: Option<String>,
     /// Permissions this plugin requests
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
