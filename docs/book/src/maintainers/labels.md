@@ -61,6 +61,19 @@ Use this sequence:
 
 Every live cleanup batch needs exact maintainer approval for the labels and issue/PR refs being changed.
 
+## Policy holdbacks
+
+Some label families are intentionally outside mechanical cleanup, even when they look inconsistent with newer spelling or taxonomy preferences. They should change only after a separate policy decision and an exact live operation packet.
+
+| Family | Current maintainer action it supports | Before changing live labels |
+|---|---|---|
+| Terminal and resolution labels | Explain why work left the active queue: not pursued, invalid, duplicate, or explicitly declined. | Preserve historical closure meaning and contributor expectations; define any rename, alias, migration, or deletion packet before mutating live labels. Replacement and superseding remain documented processes unless a later approved packet creates or maps a live label. |
+| Status and stale labels | Drive issue lifecycle and stale behavior, including accepted work, blockers, active implementation, `status:stale`, `status:no-stale`, and PR backlog stale handling. | Treat as policy-first because automation may protect, warn, or close issues differently. Do not change these labels as cosmetic or module-label cleanup; handle them through a stale/lifecycle policy packet that accounts for automation and routing-evidence rules. |
+| Contributor-tier labels | Signal reviewer trust and contributor experience using `.github/label-policy.json` thresholds. | Update the policy file and this guide together; do not delete or rename tiers as cosmetic cleanup because the labels affect people and review routing. |
+| GitHub default labels | Preserve familiar contributor entry points such as `bug`, `enhancement`, `documentation`, and `question`. | Replace or retire only through an explicit contributor-facing taxonomy decision. Defaults may be used by templates, searches, external links, and integrations. |
+
+The test for keeping a sensitive label live is operational: can maintainers name a real action that becomes harder if the live label disappears? If yes, keep or replace it deliberately. If no, preserve the historical mapping in the audit packet and migrate or delete through the approved operation.
+
 ## Type labels
 
 Type labels capture the high-level work class. They are separate from path labels such as `docs`, `ci`, or `dependencies`.
