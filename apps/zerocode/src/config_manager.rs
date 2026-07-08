@@ -1278,10 +1278,10 @@ impl App {
             // Create a synthetic entry for global channels settings
             let global_entry = ConfigTemplateEntry {
                 path: "channels.global_settings".to_string(),
-                description: Some(
-                    "Global channel settings (show_tool_calls, ack_reactions, etc.)".to_string(),
-                ),
-                ..Default::default()
+                kind: zeroclaw_config::traits::MapKeyKind::Map,
+                value_type: "ChannelsConfig".to_string(),
+                description: "Global channel settings (show_tool_calls, ack_reactions, message_timeout_secs, session_persistence, etc.)"
+                    .to_string(),
             };
             types.push(global_entry);
         }
@@ -1852,7 +1852,10 @@ impl App {
                 self.screen = Screen::FieldList {
                     section_idx,
                     prefix: "channels".to_string(),
-                    breadcrumb: vec![section_key, "Global settings".to_string()],
+                    breadcrumb: vec![
+                        section_key,
+                        crate::i18n::t("zc-config-channels-global-settings"),
+                    ],
                 };
                 return Ok(());
             }

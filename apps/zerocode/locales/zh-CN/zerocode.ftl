@@ -413,4 +413,5 @@ zc-config-footer-action-back-to-files = 返回文件
 zc-config-footer-action-back-to-skills = 返回技能
 zc-config-footer-action-help = 帮助
 zc-config-footer-action-new-line = 换行
+zc-config-channels-global-settings = 全局设置
 zc-config-field-edit-hint = { $keys } → 按下以编辑
