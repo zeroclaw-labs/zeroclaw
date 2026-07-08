@@ -16001,7 +16001,7 @@ impl ChannelConfig for BlueskyConfig {
 /// access token against the instance's `/api/v1` endpoint, named by the
 /// required `api_base_url`. Inbound issue/PR comments are polled from the
 /// forge REST API, so the daemon needs no inbound network exposure.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[derive(Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.git"]
 pub struct GitConfig {
@@ -16109,6 +16109,35 @@ pub struct GitConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+}
+
+impl std::fmt::Debug for GitConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitConfig")
+            .field("enabled", &self.enabled)
+            .field("provider", &self.provider)
+            .field("app_id", &self.app_id)
+            .field("private_key", &self.private_key.as_ref().map(|_| "***"))
+            .field("installation_id", &self.installation_id)
+            .field("api_base_url", &self.api_base_url)
+            .field(
+                "access_token",
+                &if self.access_token.is_empty() {
+                    ""
+                } else {
+                    "***"
+                },
+            )
+            .field("repos", &self.repos)
+            .field("poll_interval_secs", &self.poll_interval_secs)
+            .field("mention_only", &self.mention_only)
+            .field("listen_to_bots", &self.listen_to_bots)
+            .field("proxy_url", &self.proxy_url)
+            .field("events", &self.events)
+            .field("events_backbone", &self.events_backbone)
+            .field("excluded_tools", &self.excluded_tools)
+            .finish()
+    }
 }
 
 fn default_github_poll_interval_secs() -> u64 {
@@ -29084,6 +29113,31 @@ url = "http://localhost:8080/mcp"
         assert!(
             debug_output.contains("[REDACTED]"),
             "Debug output must show [REDACTED] for client_secret"
+        );
+    }
+
+    #[test]
+    async fn git_config_debug_redacts_private_key_and_access_token() {
+        let cfg = GitConfig {
+            private_key: Some(
+                "-----BEGIN RSA PRIVATE KEY-----\nSUPERSECRETPEM\n-----END RSA PRIVATE KEY-----"
+                    .into(),
+            ),
+            access_token: "ghp_supersecrettoken".into(),
+            ..GitConfig::default()
+        };
+        let debug_output = format!("{cfg:?}");
+        assert!(
+            !debug_output.contains("SUPERSECRETPEM"),
+            "Debug output must not contain the raw private_key PEM"
+        );
+        assert!(
+            !debug_output.contains("ghp_supersecrettoken"),
+            "Debug output must not contain the raw access_token"
+        );
+        assert!(
+            debug_output.contains("***"),
+            "Debug output must mask the private_key and access_token"
         );
     }
 
