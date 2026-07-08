@@ -856,6 +856,7 @@ mod tests {
         install_rotating(tmp.path(), 0, false, 0, 0);
 
         emit("before-reload");
+        flush_for_test().unwrap();
 
         let path = runtime_trace_path().unwrap();
         assert!(
@@ -866,6 +867,7 @@ mod tests {
 
         install_rotating(tmp.path(), 1, false, 1, 0);
         emit("after-reload");
+        flush_for_test().unwrap();
 
         let archives = list_archives(&path).unwrap();
         assert_eq!(
@@ -887,6 +889,7 @@ mod tests {
         install_writer(tmp.path(), 10);
 
         emit("persisted-before-disable");
+        flush_for_test().unwrap();
 
         let path = runtime_trace_path().unwrap();
         assert_eq!(count_lines(&path), 1);
@@ -898,6 +901,7 @@ mod tests {
         init_from_config(&cfg, tmp.path());
 
         emit("not-persisted-after-disable");
+        flush_for_test().unwrap();
 
         assert_eq!(
             count_lines(&path),
