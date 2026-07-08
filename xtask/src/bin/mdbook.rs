@@ -97,6 +97,7 @@ fn main() -> anyhow::Result<()> {
             let root = xtask::util::repo_root();
             cmd::mdbook::keymap::run(&root)?;
             cmd::mdbook::hardware::run(&root)?;
+            cmd::mdbook::feature_matrix::run(&root)?;
             cmd::mdbook::peer_groups::run()
         }
         Cmd::Sync {
