@@ -3198,6 +3198,7 @@ impl Channel for LarkChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        _suppress_voice: bool,
     ) -> anyhow::Result<()> {
         if message_id.is_empty() {
             return self.send(&SendMessage::new(text, recipient)).await;
@@ -6364,6 +6365,7 @@ mod tests {
             "oc_test_chat_id",
             "om_draft_media",
             "final caption [IMAGE:draft.png]",
+            false,
         )
         .await
         .expect("finalize_draft should clean text and send image");

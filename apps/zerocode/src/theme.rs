@@ -235,6 +235,13 @@ pub(crate) fn warn_style() -> Style {
     Style::default().fg(active().warn)
 }
 
+/// Positive / "free" / savings emphasis. No palette role maps cleanly to
+/// "good", so this uses a stable green that reads as $0 / free work across
+/// themes (matching the CLI's green-for-free convention).
+pub(crate) fn success_style() -> Style {
+    Style::default().fg(Color::Green)
+}
+
 pub(crate) fn selected_style() -> Style {
     let t = active();
     Style::default()

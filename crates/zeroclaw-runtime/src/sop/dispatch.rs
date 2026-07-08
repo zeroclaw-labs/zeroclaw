@@ -626,6 +626,9 @@ mod tests {
                 namespace: namespace.unwrap_or("default").to_string(),
                 importance,
                 superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
                 agent_alias: agent_id.map(str::to_string),
                 agent_id: agent_id.map(str::to_string),
             }

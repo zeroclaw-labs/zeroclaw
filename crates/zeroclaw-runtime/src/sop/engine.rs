@@ -12,7 +12,8 @@ use super::route::{self, NextStep, RouteCtx};
 use super::rundata::RunData;
 use super::schema;
 use super::store::{
-    InMemoryRunStore, PersistedRun, RetentionPolicy, SopEventRecord, SopRunStore, StoreError,
+    ClaimToken, InMemoryRunStore, PersistedRun, ProposalRecord, ProposalStatus, RetentionPolicy,
+    SopEventRecord, SopRunStore, StoreError,
 };
 use super::types::{
     DeterministicRunState, DeterministicSavings, FilesystemEventKind, Sop, SopEvent,
@@ -103,6 +104,34 @@ impl SopEngine {
             Ok(runs) => {
                 let mut restored = 0usize;
                 for pr in runs {
+                    // Re-establish the claim WITHOUT admission caps: a restored run
+                    // was already admitted before the restart, so reconstruction is
+                    // not new admission. This keeps `active_runs` and the live-claim
+                    // count aligned 1:1 even for an over-cap restored set (the old
+                    // capped `try_claim_run` silently dropped the claim over cap,
+                    // leaving a locally active run with no store claim). On a renew
+                    // error the run is left out of `active_runs` rather than cached
+                    // orphaned, and the failure is logged loudly.
+                    if let Err(e) = self
+                        .store
+                        .renew_claim_for_restore(&pr.run.run_id, &pr.run.sop_name)
+                    {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": pr.run.run_id.as_str(),
+                                "sop_name": pr.run.sop_name.as_str(),
+                                "error": e.to_string(),
+                            })),
+                            "SOP engine: dropping restored run, could not re-establish its store claim"
+                        );
+                        continue;
+                    }
                     if self
                         .active_runs
                         .insert(pr.run.run_id.clone(), pr.run)
@@ -144,6 +173,7 @@ impl SopEngine {
     /// effect for the in-memory default.
     fn persist_active(&self, run_id: &str) {
         if let Some(run) = self.active_runs.get(run_id) {
+            self.heartbeat_claim_for_run(run);
             let mut pr = PersistedRun::new(run.clone(), now_iso8601(), run.trigger_event.source);
             // Each persist is a new state revision; the store rejects a
             // same-revision divergent write, so advance past what is stored.
@@ -159,6 +189,74 @@ impl SopEngine {
                     "SOP engine: failed to persist run"
                 );
             }
+        }
+    }
+
+    /// Admit a run through the store CAS claim before it becomes locally active.
+    /// The durable store is the concurrency source of truth; `active_runs` is the
+    /// execution cache/status surface.
+    fn claim_admission(&self, run_id: &str, sop: &Sop) -> Result<ClaimToken> {
+        match self.store.try_claim_run(
+            run_id,
+            &sop.name,
+            sop.max_concurrent as usize,
+            self.config.max_concurrent_total,
+        ) {
+            Ok(Some(token)) => Ok(token),
+            Ok(None) => {
+                bail!(
+                    "Cannot start SOP '{}': cooldown or concurrency limit reached",
+                    sop.name
+                );
+            }
+            Err(e) => Err(anyhow::Error::new(e)),
+        }
+    }
+
+    fn release_claim_best_effort(&self, token: &ClaimToken) {
+        if let Err(e) = self.store.release_claim(token) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "run_id": token.run_id.as_str(),
+                        "error": e.to_string(),
+                    })),
+                "SOP engine: failed to release run admission claim"
+            );
+        }
+    }
+
+    fn claim_handle_for_run(run: &SopRun) -> ClaimToken {
+        ClaimToken {
+            run_id: run.run_id.clone(),
+            sop_name: run.sop_name.clone(),
+            claimed_at: String::new(),
+            lease_expires: String::new(),
+            holder: "engine".to_string(),
+        }
+    }
+
+    fn heartbeat_claim_for_run(&self, run: &SopRun) {
+        let token = Self::claim_handle_for_run(run);
+        if let Err(e) = self.store.heartbeat_claim(&token) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "run_id": run.run_id.as_str(),
+                        "error": e.to_string(),
+                    })),
+                "SOP engine: failed to heartbeat run admission claim"
+            );
+        }
+    }
+
+    fn heartbeat_active_claims(&self) {
+        for run in self.active_runs.values() {
+            self.heartbeat_claim_for_run(run);
         }
     }
 
@@ -272,28 +370,41 @@ impl SopEngine {
             None => return false,
         };
 
-        // Per-SOP concurrency limit
-        let active_for_sop = self
-            .active_runs
-            .values()
-            .filter(|r| r.sop_name == sop_name)
-            .count();
-        if active_for_sop >= sop.max_concurrent as usize {
-            return false;
-        }
-
-        // Global concurrency limit
-        if self.active_runs.len() >= self.config.max_concurrent_total {
-            return false;
-        }
-
-        // Cooldown: check most recent finished run for this SOP
-        if sop.cooldown_secs > 0
-            && let Some(last) = self.last_finished_run(sop_name)
-            && let Some(ref completed_at) = last.completed_at
-            && !cooldown_elapsed(completed_at, sop.cooldown_secs)
+        // Concurrency limits are backed by the store's live CAS claims so
+        // multiple engine holders observe the same admission source.
+        let (active_for_sop, active_total) = match self.store.claim_counts(sop_name) {
+            Ok(counts) => counts,
+            Err(_) => (
+                self.active_runs
+                    .values()
+                    .filter(|r| r.sop_name == sop_name)
+                    .count(),
+                self.active_runs.len(),
+            ),
+        };
+        if active_for_sop >= sop.max_concurrent as usize
+            || active_total >= self.config.max_concurrent_total
         {
             return false;
+        }
+
+        // Cooldown: the last terminal completion is read from the shared store so
+        // every engine holder observes the same marker (an engine that did not run
+        // the SOP has no local finished entry). Fall back to the in-memory
+        // `last_finished_run` only if the store call errors - mirrors the
+        // claim-counts store->memory fallback above.
+        if sop.cooldown_secs > 0 {
+            let last_completed = match self.store.last_terminal_completed_at(sop_name) {
+                Ok(completed) => completed,
+                Err(_) => self
+                    .last_finished_run(sop_name)
+                    .and_then(|last| last.completed_at.clone()),
+            };
+            if let Some(completed_at) = last_completed
+                && !cooldown_elapsed(&completed_at, sop.cooldown_secs)
+            {
+                return false;
+            }
         }
 
         true
@@ -339,8 +450,8 @@ impl SopEngine {
         let dur = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        let epoch_ms = dur.as_secs() * 1000 + u64::from(dur.subsec_millis());
-        let run_id = format!("run-{epoch_ms}-{:04}", self.run_counter);
+        let epoch_ns = dur.as_nanos();
+        let run_id = format!("run-{epoch_ns}-{:04}", self.run_counter);
         let now = now_iso8601();
 
         let run = SopRun {
@@ -358,6 +469,7 @@ impl SopEngine {
             llm_calls_saved: 0,
         };
 
+        let claim = self.claim_admission(&run_id, &sop)?;
         self.active_runs.insert(run_id.clone(), run);
 
         ::zeroclaw_log::record!(
@@ -366,7 +478,14 @@ impl SopEngine {
             &format!("SOP run {} started for '{}'", run_id, sop_name)
         );
 
-        self.dispatch_llm_step(&run_id, &sop, 1, None)
+        match self.dispatch_llm_step(&run_id, &sop, 1, None) {
+            Ok(action) => Ok(action),
+            Err(e) => {
+                self.active_runs.remove(&run_id);
+                self.release_claim_best_effort(&claim);
+                Err(e)
+            }
+        }
     }
 
     /// Report the result of the current step and advance the run.
@@ -1113,6 +1232,25 @@ impl SopEngine {
         &self.deterministic_savings
     }
 
+    /// Save a procedural-memory proposal into the shared SOP store. This is the
+    /// production-facing engine surface EPIC F consumes for approval/write-back.
+    pub fn save_proposal(&self, proposal: &ProposalRecord) -> Result<(), StoreError> {
+        self.store.save_proposal(proposal)
+    }
+
+    /// Load a procedural-memory proposal by id from the shared SOP store.
+    pub fn load_proposal(&self, id: &str) -> Result<Option<ProposalRecord>, StoreError> {
+        self.store.load_proposal(id)
+    }
+
+    /// List procedural-memory proposals, optionally filtered by lifecycle status.
+    pub fn list_proposals(
+        &self,
+        status: Option<ProposalStatus>,
+    ) -> Result<Vec<ProposalRecord>, StoreError> {
+        self.store.list_proposals(status)
+    }
+
     // ── Deterministic execution ─────────────────────────────────
 
     /// Start a deterministic SOP run. Steps execute sequentially without LLM
@@ -1159,8 +1297,8 @@ impl SopEngine {
         let dur = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        let epoch_ms = dur.as_secs() * 1000 + u64::from(dur.subsec_millis());
-        let run_id = format!("det-{epoch_ms}-{:04}", self.run_counter);
+        let epoch_ns = dur.as_nanos();
+        let run_id = format!("det-{epoch_ns}-{:04}", self.run_counter);
         let now = now_iso8601();
 
         let total_steps = u32::try_from(sop.steps.len()).unwrap_or(u32::MAX);
@@ -1179,6 +1317,7 @@ impl SopEngine {
             llm_calls_saved: 0,
         };
 
+        let claim = self.claim_admission(&run_id, &sop)?;
         self.active_runs.insert(run_id.clone(), run);
         ::zeroclaw_log::record!(
             INFO,
@@ -1189,7 +1328,14 @@ impl SopEngine {
             )
         );
 
-        self.dispatch_deterministic_step(&run_id, &sop, 1, serde_json::Value::Null)
+        match self.dispatch_deterministic_step(&run_id, &sop, 1, serde_json::Value::Null) {
+            Ok(action) => Ok(action),
+            Err(e) => {
+                self.active_runs.remove(&run_id);
+                self.release_claim_best_effort(&claim);
+                Err(e)
+            }
+        }
     }
 
     /// Drive a just-started headless deterministic run to a terminal state.
@@ -1618,6 +1764,7 @@ impl SopEngine {
         // alone would under-report the escalations.
         let timed_out = self.overdue_waiting_run_ids().len();
         let timeout_actions = self.check_approval_timeouts();
+        self.heartbeat_active_claims();
         let reaped_claims = self.reap_expired_claims();
         let pruned_runs = self.prune_terminal_runs();
         MaintenanceSummary {
@@ -1874,6 +2021,26 @@ fn trigger_matches(trigger: &SopTrigger, event: &SopEvent) -> bool {
             }
         }
 
+        (
+            SopTrigger::Amqp {
+                routing_key,
+                condition,
+            },
+            SopTriggerSource::Amqp,
+        ) => {
+            let key_match = event
+                .topic
+                .as_deref()
+                .is_some_and(|t| amqp_routing_key_matches(routing_key, t));
+            if !key_match {
+                return false;
+            }
+            match condition {
+                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
+                None => true,
+            }
+        }
+
         (SopTrigger::Webhook { path }, SopTriggerSource::Webhook) => {
             event.topic.as_deref().is_some_and(|t| t == path)
         }
@@ -1997,6 +2164,26 @@ fn mqtt_topic_matches(pattern: &str, topic: &str) -> bool {
 
     // Both must be fully consumed (unless pattern ended with #)
     pi == pat_parts.len() && ti == top_parts.len()
+}
+
+/// AMQP topic-exchange routing-key matching. Keys are `.`-delimited words;
+/// `*` matches exactly one word and `#` matches zero or more words. A `#` that
+/// can absorb zero segments is what distinguishes this from MQTT matching.
+fn amqp_routing_key_matches(pattern: &str, key: &str) -> bool {
+    let pat: Vec<&str> = pattern.split('.').collect();
+    let words: Vec<&str> = key.split('.').collect();
+    amqp_match_from(&pat, &words)
+}
+
+fn amqp_match_from(pat: &[&str], words: &[&str]) -> bool {
+    match pat.first() {
+        None => words.is_empty(),
+        Some(&"#") => (0..=words.len()).any(|skip| amqp_match_from(&pat[1..], &words[skip..])),
+        Some(&"*") => !words.is_empty() && amqp_match_from(&pat[1..], &words[1..]),
+        Some(seg) => {
+            !words.is_empty() && *seg == words[0] && amqp_match_from(&pat[1..], &words[1..])
+        }
+    }
 }
 
 /// Glob match a filesystem trigger `pattern` against a normalized `path`,
@@ -2259,6 +2446,7 @@ fn parse_iso8601_secs(input: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::store::ProposalKind;
     use super::*;
     use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, ResolveOutcome};
     use crate::sop::step_contract::StepFailure;
@@ -2401,6 +2589,48 @@ mod tests {
         let event = mqtt_event("sensors/temp", "{}");
         let matches = engine.match_trigger(&event);
         assert!(matches.is_empty());
+    }
+
+    fn amqp_event(routing_key: &str, payload: &str) -> SopEvent {
+        SopEvent {
+            source: SopTriggerSource::Amqp,
+            topic: Some(routing_key.into()),
+            payload: Some(payload.into()),
+            timestamp: now_iso8601(),
+        }
+    }
+
+    #[test]
+    fn amqp_routing_key_exact_star_hash() {
+        assert!(amqp_routing_key_matches("a.b.c", "a.b.c"));
+        assert!(!amqp_routing_key_matches("a.b.c", "a.b"));
+        assert!(amqp_routing_key_matches("a.*.c", "a.b.c"));
+        assert!(!amqp_routing_key_matches("a.*.c", "a.b.b.c"));
+        assert!(amqp_routing_key_matches("a.#", "a.b.c.d"));
+        assert!(amqp_routing_key_matches("a.#", "a"));
+        assert!(amqp_routing_key_matches("#", ""));
+        assert!(amqp_routing_key_matches("a.#.d", "a.d"));
+        assert!(amqp_routing_key_matches("a.#.d", "a.b.c.d"));
+        assert!(!amqp_routing_key_matches("a.#.d", "a.b.c"));
+    }
+
+    #[test]
+    fn match_amqp_trigger_wildcard() {
+        let sop = Sop {
+            triggers: vec![SopTrigger::Amqp {
+                routing_key: "org.*.anitya.#".into(),
+                condition: None,
+            }],
+            ..test_sop("anitya-sop", SopExecutionMode::Auto, SopPriority::Normal)
+        };
+        let engine = engine_with_sops(vec![sop]);
+        let hit = engine.match_trigger(&amqp_event(
+            "org.release-monitoring.anitya.project.version.update",
+            "{}",
+        ));
+        assert_eq!(hit.len(), 1);
+        let miss = engine.match_trigger(&amqp_event("org.release-monitoring.fedmsg.x", "{}"));
+        assert!(miss.is_empty());
     }
 
     #[test]
@@ -3291,6 +3521,92 @@ mod tests {
         assert!(!engine.can_start("s2"));
     }
 
+    #[test]
+    fn start_run_uses_store_claims_across_engine_instances() {
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let sops = vec![test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal)];
+        let mut first = engine_with_sops(sops.clone()).with_store(store.clone());
+        let mut second = engine_with_sops(sops).with_store(store.clone());
+
+        let action = first.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        assert!(
+            !second.can_start("s1"),
+            "read-only admission check must see the shared store claim"
+        );
+        assert!(
+            second.start_run("s1", manual_event()).is_err(),
+            "CAS claim must block a second engine with an empty local active map"
+        );
+
+        first.cancel_run(&run_id).unwrap();
+        assert!(
+            second.can_start("s1"),
+            "finishing the first run releases the shared claim slot"
+        );
+        assert!(second.start_run("s1", manual_event()).is_ok());
+    }
+
+    #[test]
+    fn deterministic_start_uses_store_claims() {
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let sops = vec![deterministic_sop("det-sop")];
+        let mut first = engine_with_sops(sops.clone()).with_store(store.clone());
+        let mut second = engine_with_sops(sops).with_store(store);
+
+        first.start_run("det-sop", manual_event()).unwrap();
+
+        assert!(
+            second.start_run("det-sop", manual_event()).is_err(),
+            "deterministic runs must use the same CAS admission gate"
+        );
+    }
+
+    #[test]
+    fn proposals_round_trip_through_engine_store_surface() {
+        let engine = SopEngine::new(SopConfig::default());
+        let now = now_iso8601();
+        let proposal = ProposalRecord {
+            id: "prop-1".to_string(),
+            kind: ProposalKind::Update,
+            status: ProposalStatus::Pending,
+            source_run_id: Some("run-1".to_string()),
+            sop_name: "s1".to_string(),
+            target_content_hash: Some("sha256:abc".to_string()),
+            manifest_toml: "[sop]\nname = \"s1\"\ndescription = \"S1\"\n".to_string(),
+            procedure_markdown: "## Steps\n\n1. **Do** - It.\n".to_string(),
+            provenance: serde_json::json!({"producer": "test"}),
+            created_at: now.clone(),
+            updated_at: now,
+            status_reason: None,
+            applied_at: None,
+            applied_by: None,
+            rollback_path: None,
+        };
+
+        engine.save_proposal(&proposal).unwrap();
+
+        assert_eq!(
+            engine.load_proposal("prop-1").unwrap().unwrap().sop_name,
+            "s1"
+        );
+        assert_eq!(engine.list_proposals(None).unwrap().len(), 1);
+        assert_eq!(
+            engine
+                .list_proposals(Some(ProposalStatus::Pending))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            engine
+                .list_proposals(Some(ProposalStatus::Applied))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     // ── Cooldown ────────────────────────────────────────
 
     #[test]
@@ -3329,6 +3645,108 @@ mod tests {
 
         // Cooldown not elapsed — should block
         assert!(!engine.can_start("s1"));
+    }
+
+    #[test]
+    fn cooldown_is_shared_across_engine_instances() {
+        // Two engines share ONE store. Engine A runs and finishes a run; the
+        // cooldown marker lives only in A's local `finished_runs`, but B must still
+        // honor the cooldown because it reads the last terminal completion from the
+        // shared store. Without FIX 1 (store-backed cooldown), B sees no local
+        // finished run and admits early - this test fails.
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.cooldown_secs = 3600; // 1 hour
+        let sops = vec![sop];
+        let mut engine_a = engine_with_sops(sops.clone()).with_store(store.clone());
+        let mut engine_b = engine_with_sops(sops).with_store(store.clone());
+
+        // Engine A starts and finishes a run (writes a terminal row to the store).
+        let action = engine_a.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        engine_a.finish_run(&run_id, SopRunStatus::Completed, None);
+
+        // Engine B never ran this SOP, so it has no local finished entry. It must
+        // still see the cooldown via the shared store.
+        assert!(
+            !engine_b.can_start("s1"),
+            "a second engine must observe the cooldown from the shared store"
+        );
+        assert!(
+            engine_b.start_run("s1", manual_event()).is_err(),
+            "start_run must bail while the shared-store cooldown is active"
+        );
+
+        // Advance the stored completion past the cooldown window (supersede the
+        // same run's terminal row with an older completed_at, newer revision). The
+        // store now reports an elapsed cooldown, so B may start.
+        let stored = store.load_run(&run_id).unwrap().unwrap();
+        let mut aged = stored.clone();
+        aged.revision = stored.revision + 1;
+        aged.run.completed_at = Some("2000-01-01T00:00:00Z".to_string());
+        store.finish_run(&run_id, &aged).unwrap();
+
+        assert!(
+            engine_b.can_start("s1"),
+            "once the shared-store cooldown window passes, the second engine may start"
+        );
+        assert!(
+            engine_b.start_run("s1", manual_event()).is_ok(),
+            "start_run succeeds after the shared-store cooldown elapses"
+        );
+    }
+
+    #[test]
+    fn restore_runs_keeps_active_and_claims_aligned_over_cap() {
+        // Pre-seed the shared store with non-terminal runs OVER the per-SOP cap,
+        // then restore onto a fresh engine. FIX 2 re-establishes a claim for every
+        // restored run without applying admission caps, so `active_runs` and the
+        // live-claim total stay aligned 1:1 (the old capped path silently dropped
+        // the over-cap claim, leaving a locally active run with no store claim).
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let mut sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.max_concurrent = 1; // cap of 1, but seed 3 already-running runs
+        let now = now_iso8601();
+        for i in 0..3 {
+            let run = SopRun {
+                run_id: format!("restore-{i}"),
+                sop_name: "s1".to_string(),
+                trigger_event: manual_event(),
+                frame_marker_id: format!("marker-{i}"),
+                status: SopRunStatus::Running,
+                current_step: 1,
+                total_steps: 2,
+                started_at: now.clone(),
+                completed_at: None,
+                step_results: Vec::new(),
+                waiting_since: None,
+                llm_calls_saved: 0,
+            };
+            store
+                .save_run(&PersistedRun::new(
+                    run,
+                    now.clone(),
+                    SopTriggerSource::Manual,
+                ))
+                .unwrap();
+        }
+
+        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
+        engine.restore_runs();
+
+        // Every restored run is active...
+        assert_eq!(engine.active_runs().len(), 3, "all over-cap runs restored");
+        // ...and each has a live store claim (counts == active_runs.len()).
+        let (per_sop, total) = store.claim_counts("s1").unwrap();
+        assert_eq!(
+            total,
+            engine.active_runs().len(),
+            "every active restored run must hold a live store claim"
+        );
+        assert_eq!(
+            per_sop, 3,
+            "all three claims are accounted for under the SOP"
+        );
     }
 
     // ── Execution modes ─────────────────────────────────

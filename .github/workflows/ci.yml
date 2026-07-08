@@ -40,6 +40,45 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  repo-structure:
+    name: Repository Structure
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Guard declared submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gitlinks="$(mktemp)"
+          declared="$(mktemp)"
+          allowed="$(mktemp)"
+
+          git ls-files -s | awk '$1 == "160000" { print $4 }' | sort > "$gitlinks"
+          { git config --file .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null || true; } \
+            | awk '{ print $2 }' | sort > "$declared"
+          printf '%s\n' 'docs/book/po' > "$allowed"
+
+          if ! cmp -s "$gitlinks" "$declared"; then
+            echo "::error::Gitlink paths must exactly match .gitmodules paths."
+            echo "Index gitlinks:"
+            sed 's/^/  /' "$gitlinks"
+            echo ".gitmodules paths:"
+            sed 's/^/  /' "$declared"
+            exit 1
+          fi
+
+          if ! cmp -s "$gitlinks" "$allowed"; then
+            echo "::error::Unexpected submodule path. Update this guard when adding an intentional submodule."
+            echo "Allowed submodule paths:"
+            sed 's/^/  /' "$allowed"
+            echo "Actual gitlink paths:"
+            sed 's/^/  /' "$gitlinks"
+            exit 1
+          fi
+
   # ── Post-format required quality gate ─────────────────────────────────────
 
   lint:
@@ -72,6 +111,7 @@ jobs:
           SECONDS=0
           cargo clippy \
             --workspace \
+            --exclude zeroclaw-desktop \
             --all-targets \
             --features ci-all \
             -- -D warnings 2>&1 | tee "$cargo_log"
@@ -106,6 +146,108 @@ jobs:
         run: cargo test --test architecture tests_that_persist_config_isolate_the_path
       - name: Fluent coverage guard (no bare user-facing strings)
         run: cargo test --test architecture user_facing_strings_route_through_fluent
+
+  windows-clippy-tools-changes:
+    name: Detect Windows Clippy changes
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.changed.outputs.run }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Detect targeted Windows Clippy changes
+        id: changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          changed_files="$(mktemp)"
+
+          case "${{ github.event_name }}" in
+            pull_request)
+              git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
+              ;;
+            push|merge_group)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            *)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          if grep -Eq '^(crates/zeroclaw-tools/|\.github/workflows/(ci|cross-platform-clippy)\.yml$)' "$changed_files"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  windows-clippy-tools:
+    name: Clippy (x86_64-pc-windows-msvc, targeted)
+    needs: [windows-clippy-tools-changes]
+    if: needs.windows-clippy-tools-changes.outputs.run == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+          components: clippy
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Ensure web/dist placeholder exists
+        shell: bash
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Clippy
+        shell: bash
+        run: |
+          set +e
+          cargo_log="${RUNNER_TEMP}/cargo-clippy-windows-tools.log"
+          SECONDS=0
+          cargo clippy \
+            -p zeroclaw-tools \
+            --all-targets \
+            --all-features \
+            --target x86_64-pc-windows-msvc \
+            --no-deps \
+            -- -D warnings 2>&1 | tee "$cargo_log"
+          cargo_status=${PIPESTATUS[0]}
+          duration_seconds=$SECONDS
+          set -e
+
+          workspace_path_compiles="$(grep -E -c 'Compiling.*\([^)]*zeroclaw' "$cargo_log" || true)"
+          total_compiles="$(grep -c 'Compiling' "$cargo_log" || true)"
+          downloaded_crates="$(grep -c 'Downloaded' "$cargo_log" || true)"
+          cache_hit="${RUST_CACHE_HIT:-unknown}"
+          summary_file="${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          {
+            echo "### Targeted Windows Clippy diagnostics"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Target | \`x86_64-pc-windows-msvc\` |"
+            echo "| Runner OS | \`${{ runner.os }}\` |"
+            echo "| Rust cache exact hit | \`${cache_hit}\` |"
+            echo "| Clippy duration | \`${duration_seconds}s\` |"
+            echo "| Clippy status | \`${cargo_status}\` |"
+            echo "| Workspace path compile lines | \`${workspace_path_compiles}\` |"
+            echo "| Total compile lines | \`${total_compiles}\` |"
+            echo "| Downloaded crate lines | \`${downloaded_crates}\` |"
+          } >> "$summary_file"
+
+          exit "$cargo_status"
+        env:
+          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
 
   # ── Post-format build + check fan-out ─────────────────────────────────────
 
@@ -335,7 +477,7 @@ jobs:
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
       - name: Run tests
-        run: cargo nextest run --locked --workspace
+        run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
@@ -506,7 +648,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, lint, build, check, check-32bit, bench, test, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary]
+    needs: [fmt, repo-structure, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-32bit, bench, test, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary]
     runs-on: ubuntu-latest
     steps:
       - name: Check results

@@ -137,6 +137,9 @@ impl MarkdownMemory {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
                     agent_alias: None,
                     agent_id: None,
                 }
