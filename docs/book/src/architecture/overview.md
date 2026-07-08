@@ -16,7 +16,7 @@ flowchart TB
         CH["zeroclaw-channels<br/>30+ messaging integrations"]
         GW["zeroclaw-gateway<br/>REST · WebSocket · dashboard"]
         PR["zeroclaw-providers<br/>LLM clients · retry · routing"]
-        TL["zeroclaw-tools<br/>browser · HTTP · PDF · hardware"]
+        TL["zeroclaw-tools<br/>browser · HTTP · hardware"]
     end
 
     subgraph Core["Core"]
@@ -47,7 +47,7 @@ flowchart TB
 | `zeroclaw-providers` | All LLM client impls (Anthropic, OpenAI, Ollama, …) plus the hint-based router and same-provider retry wrapper |
 | `zeroclaw-channels` | 30+ messaging integrations (Discord, Slack, Telegram, Matrix, email, voice, …) |
 | `zeroclaw-gateway` | HTTP / WebSocket gateway, web dashboard, webhook ingress |
-| `zeroclaw-tools` | Callable tool implementations the agent invokes (browser, HTTP, PDF, hardware probes) |
+| `zeroclaw-tools` | Callable tool implementations the agent invokes (browser, HTTP, hardware probes) |
 | `zeroclaw-tool-call-parser` | Model-side tool-call syntax parsing and normalisation |
 | `zeroclaw-memory` | Conversation memory, embeddings, vector retrieval |
 | `zeroclaw-plugins` | Sandboxed WASM plugin host (WIT component model) |

@@ -65,7 +65,9 @@ Every live cleanup batch needs exact maintainer approval for the labels and issu
 
 Type labels capture the high-level work class. They are separate from path labels such as `docs`, `ci`, or `dependencies`.
 
-New or manual applications should use the canonical no-space labels below. Existing legacy open refs may keep spaced labels until the open-reference migration packet handles them; see [Canonical spelling](#canonical-spelling).
+New or manual applications should use the canonical no-space labels below when the live label exists. Existing legacy open refs may keep spaced labels until the open-reference migration packet handles them; see [Canonical spelling](#canonical-spelling).
+
+`type:tracker` is the canonical tracker-marker spelling for active parent coordination issues. Do not create or apply `roadmap`, `type:roadmap`, or another tracker marker as an alias. If the live `type:tracker` label does not exist yet, label creation and any tracker-marker migration must happen only through a separate exact maintainer-approved packet.
 
 | Label | Purpose |
 |---|---|
@@ -74,6 +76,7 @@ New or manual applications should use the canonical no-space labels below. Exist
 | `type:docs` | Documentation-only or docs-primary work |
 | `type:rfc` | RFC issue or proposal; protected from stale closure while active |
 | `type:test` | Test-only or test-primary work |
+| `type:tracker` | Active parent coordination issue for a release, roadmap, RFC/design thread, implementation batch, cleanup, or audit. Issue-only marker; does not by itself create stale protection, assignment, acceptance, or contributor-ready scope. |
 
 ## Path labels
 
