@@ -296,9 +296,15 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 ///    `agent::run`-level `allowed_tools` parameter).
 ///
 /// A tool survives only when BOTH gates admit its name. `None` on
-/// either gate is unrestricted for that gate alone. Built-in tools,
-/// MCP tools, and skill tools all flow through the same filter; the
-/// helper does not know or care about category.
+/// either gate is unrestricted for that gate alone. The helper itself is
+/// category-agnostic - it filters whatever names are in `tools`. In
+/// production, however, the categories are gated at different layers:
+/// built-in tools flow through this filter, MCP tools through their
+/// `ToolAccessPolicy`, and skill tools through the `is_tool_excluded`
+/// denylist gate applied at skill registration (`register_skill_tools*`) -
+/// skill tools are deliberately NOT subject to the `allowed_tools`
+/// allowlist (they are granted via skill config; see
+/// `SecurityPolicy::is_tool_excluded`).
 pub fn apply_policy_tool_filter(
     tools: &mut Vec<Box<dyn Tool>>,
     policy: Option<&zeroclaw_config::policy::SecurityPolicy>,
@@ -1142,6 +1148,7 @@ pub async fn run(
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let eff_model_context_window = agent.resolved.model_context_window;
+        let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -1470,7 +1477,7 @@ pub async fn run(
             ),
         ];
         if matches!(
-            config.skills.prompt_injection_mode,
+            eff_prompt_injection_mode,
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
         ) {
             tool_descs.push((
@@ -1591,7 +1598,7 @@ pub async fn run(
             &prompt_excluded_tools,
             activated_handle.as_ref(),
             agent.resolved.strict_tool_parsing,
-            config.skills.prompt_injection_mode,
+            eff_prompt_injection_mode,
             eff_compact_context,
             eff_max_system_prompt_chars,
             true,
@@ -1686,7 +1693,7 @@ pub async fn run(
                 &excluded_tools,
                 activated_handle.as_ref(),
                 agent.resolved.strict_tool_parsing,
-                config.skills.prompt_injection_mode,
+                eff_prompt_injection_mode,
                 eff_compact_context,
                 eff_max_system_prompt_chars,
                 true,
@@ -1789,7 +1796,7 @@ pub async fn run(
                         &excluded_tools,
                         activated_handle.as_ref(),
                         agent.resolved.strict_tool_parsing,
-                        config.skills.prompt_injection_mode,
+                        eff_prompt_injection_mode,
                         eff_compact_context,
                         eff_max_system_prompt_chars,
                         true,
@@ -2346,7 +2353,7 @@ pub async fn run(
                             &excluded_tools,
                             activated_handle.as_ref(),
                             agent.resolved.strict_tool_parsing,
-                            config.skills.prompt_injection_mode,
+                            eff_prompt_injection_mode,
                             eff_compact_context,
                             eff_max_system_prompt_chars,
                             true,
@@ -2562,6 +2569,17 @@ pub async fn run(
                                     continue;
                                 }
                                 history = result.history;
+                                // When the system prompt + inlined tool
+                                // definitions alone meet or exceed the budget,
+                                // the single remaining turn can never fit;
+                                // surface the actionable root cause + remedy
+                                // rather than a generic "cannot trim" warning
+                                // (#5808).
+                                let system_floor =
+                                    crate::agent::history::estimate_system_floor_tokens(&history);
+                                let context_token_budget =
+                                    agent.resolved.effective_context_budget();
+                                let floor_exceeds_budget = system_floor >= context_token_budget;
                                 {
                                     let __zc_trim_span = ::zeroclaw_log::info_span!(
                                         target: "zeroclaw_log_internal_scope",
@@ -2570,16 +2588,48 @@ pub async fn run(
                                         model_provider = %provider_name,
                                     );
                                     let _zc_trim_guard = __zc_trim_span.entered();
-                                    ::zeroclaw_log::record!(
-                                        WARN,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Fail
+                                    if floor_exceeds_budget {
+                                        ::zeroclaw_log::record!(
+                                            WARN,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Fail
+                                            )
+                                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                            .with_attrs(::serde_json::json!({
+                                                "system_floor": system_floor,
+                                                "budget": context_token_budget,
+                                                "error_key": "context_floor_exceeds_budget",
+                                            })),
+                                            crate::agent::history::context_floor_remediation(
+                                                system_floor,
+                                                context_token_budget,
+                                            )
+                                        );
+                                    } else {
+                                        ::zeroclaw_log::record!(
+                                            WARN,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Fail
+                                            )
+                                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                            "Context overflow but only one turn remains; cannot trim further"
+                                        );
+                                    }
+                                }
+
+                                if floor_exceeds_budget {
+                                    eprintln!(
+                                        "\nError: {e}\n{}\n",
+                                        crate::agent::history::context_floor_remediation(
+                                            system_floor,
+                                            context_token_budget,
                                         )
-                                        .with_category(::zeroclaw_log::EventCategory::Agent)
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                                        "Context overflow but only one turn remains; cannot trim further"
                                     );
+                                    break String::new();
                                 }
                             }
 
@@ -2763,6 +2813,7 @@ pub async fn process_message(
         // See `Config::resolved_agent_config` for precedence rules.
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
+        let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
 
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
@@ -2970,7 +3021,7 @@ pub async fn process_message(
             ("image_info", "Read image metadata."),
         ];
         if matches!(
-            config.skills.prompt_injection_mode,
+            eff_prompt_injection_mode,
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
         ) {
             tool_descs.push((
@@ -3085,7 +3136,7 @@ pub async fn process_message(
                 bootstrap_max_chars,
                 Some(&risk_profile),
                 native_tool_specs_present,
-                config.skills.prompt_injection_mode,
+                eff_prompt_injection_mode,
                 eff_compact_context,
                 eff_max_system_prompt_chars,
                 false,
