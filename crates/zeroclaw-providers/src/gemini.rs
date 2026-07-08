@@ -633,6 +633,14 @@ impl GeminiBuilder {
             .and_then(GeminiModelProvider::normalize_non_empty)
             .map(GeminiAuth::ExplicitKey);
 
+        // Layer 3 — CLI OAuth fallback. Used both when no managed service is
+        // wired at all, and when a managed service was wired but no profile
+        // was found on disk.
+        let load_cli_oauth = || {
+            GeminiModelProvider::try_load_gemini_cli_token(oauth_cred_paths.first())
+                .map(|state| GeminiAuth::OAuthToken(Arc::new(tokio::sync::Mutex::new(state))))
+        };
+
         // Layer 2 — managed OAuth (only probed when an AuthService is wired
         // and no explicit key beat it).
         let (auth, use_managed) = match (explicit_key, self.auth_service.as_ref()) {
@@ -662,25 +670,10 @@ impl GeminiBuilder {
                 if has_managed {
                     (Some(GeminiAuth::ManagedOAuth), true)
                 } else {
-                    // Layer 3 — CLI OAuth fallback.
-                    let cli = GeminiModelProvider::try_load_gemini_cli_token(
-                        oauth_cred_paths.first(),
-                    )
-                    .map(|state| {
-                        GeminiAuth::OAuthToken(Arc::new(tokio::sync::Mutex::new(state)))
-                    });
-                    (cli, false)
+                    (load_cli_oauth(), false)
                 }
             }
-            (None, None) => {
-                // No managed service configured — go straight to CLI OAuth.
-                let cli =
-                    GeminiModelProvider::try_load_gemini_cli_token(oauth_cred_paths.first())
-                        .map(|state| {
-                            GeminiAuth::OAuthToken(Arc::new(tokio::sync::Mutex::new(state)))
-                        });
-                (cli, false)
-            }
+            (None, None) => (load_cli_oauth(), false),
         };
 
         GeminiModelProvider {
