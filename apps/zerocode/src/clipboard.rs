@@ -8,22 +8,11 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-/// Number of full probe+read attempts. Each attempt re-enumerates the
-/// clipboard's advertised targets and reads a live image target in one shot.
-///
-/// Two independent failure modes make a single read unreliable:
-///   1. A freshly captured screenshot populates the clipboard asynchronously;
-///      the image target can be advertised a beat before the bytes are
-///      servable.
-///   2. A hostile clipboard owner (observed: a long-running GLFW app that
-///      re-grabs the selection every few ms, shadowing the screenshot with
-///      text-only targets) can win the selection back between a probe and a
-///      read.
-///
-/// Both are races. Re-probing and re-reading as an ATOMIC unit each attempt is
-/// what beats mode 2: re-reading a stale target (the previous behaviour) can
-/// never recover once the owner has changed. Bounded so a genuinely image-less
-/// clipboard still returns promptly.
+/// Number of full probe+read attempts, each re-enumerating the clipboard's
+/// advertised targets and reading a live image target as one atomic unit.
+/// Recovers the async-export race and a competing owner moving the servable
+/// target mid-read while an image is still advertised. Bounded so an
+/// image-less clipboard still returns promptly.
 const IMAGE_READ_ATTEMPTS: u32 = 10;
 
 /// Delay between probe+read attempts.
@@ -32,15 +21,8 @@ const IMAGE_READ_RETRY_DELAY: Duration = Duration::from_millis(80);
 /// Try to read image data from the system clipboard.
 ///
 /// Returns `Some((bytes, mime_type))` on success, `None` when the clipboard
-/// genuinely holds no image or no clipboard tool is available.
-///
-/// Each attempt re-enumerates the clipboard's advertised targets and reads the
-/// first servable image target, retrying the whole probe+read to survive both
-/// the async-export race and a hostile clipboard owner that re-grabs the
-/// selection. Hardcoding `image/png` and reading once (the previous behaviour)
-/// silently lost screenshots whenever the image was offered under a different
-/// target, had not finished exporting, or was shadowed by another owner — which
-/// is why paste "sometimes worked and sometimes didn't."
+/// genuinely holds no image or no clipboard tool is available. An owner that
+/// advertises only text targets is not recoverable here and lands in `None`.
 pub(crate) fn read_clipboard_image() -> Option<(Vec<u8>, String)> {
     let tool = which_clipboard_tool()?;
 
