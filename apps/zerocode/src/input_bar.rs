@@ -1977,7 +1977,7 @@ impl crate::widgets::HelpContext for InputBarState {
                 crate::i18n::t("zc-input-help-slash-commands"),
                 SLASH_COMMANDS
                     .iter()
-                    .map(|cmd| E::key(*cmd, String::new()))
+                    .map(|cmd| E::key(cmd.name, String::new()))
                     .collect(),
             ),
         )

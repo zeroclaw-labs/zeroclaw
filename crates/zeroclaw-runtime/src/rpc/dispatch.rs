@@ -12,6 +12,8 @@ use super::types::*;
 const RPC_RELOAD_REPLY_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 const RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY: std::time::Duration =
     std::time::Duration::from_millis(200);
+const SESSION_NOT_FOUND_TURN_COMPLETE_CONTENT: &str = "turn cancelled by daemon: session_not_found";
+
 use crate::agent::agent::TurnEvent;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -281,6 +283,14 @@ fn render_skill_prompt(skill: &crate::skills::Skill, arguments: &str) -> String 
         skill.prompts.join("\n\n")
     };
     expand_skill_template(&template, arguments)
+}
+
+fn skill_prompt_failure_content(error: &JsonRpcError) -> String {
+    if error.code == SESSION_NOT_FOUND {
+        SESSION_NOT_FOUND_TURN_COMPLETE_CONTENT.to_string()
+    } else {
+        format!("turn failed: {}", error.message)
+    }
 }
 
 fn expand_skill_template(template: &str, arguments: &str) -> String {
@@ -1598,19 +1608,38 @@ impl RpcDispatcher {
     }
 
     async fn handle_session_prompt_method(&self, method: Method, params: &Value) -> RpcResult {
-        let req = match method {
-            Method::SessionPrompt => parse_params(params)?,
-            Method::SessionSkillPrompt => self.expand_session_skill_prompt(params).await?,
+        match method {
+            Method::SessionPrompt => {
+                let req = parse_params(params)?;
+                self.handle_session_prompt(req).await
+            }
+            Method::SessionSkillPrompt => self.handle_session_skill_prompt(params).await,
             _ => unreachable!("session prompt dispatcher received non-prompt method"),
-        };
-        self.handle_session_prompt(req).await
+        }
+    }
+
+    async fn handle_session_skill_prompt(&self, params: &Value) -> RpcResult {
+        let req: SessionSkillPromptParams = parse_params(params)?;
+        let session_id = req.session_id.clone();
+        match self.expand_session_skill_prompt(req).await {
+            Ok(req) => self.handle_session_prompt(req).await,
+            Err(error) => {
+                let content = skill_prompt_failure_content(&error);
+                self.emit_turn_complete(
+                    &session_id,
+                    crate::rpc::types::TurnCompletionOutcome::Failed,
+                    content,
+                )
+                .await;
+                Err(error)
+            }
+        }
     }
 
     async fn expand_session_skill_prompt(
         &self,
-        params: &Value,
+        req: SessionSkillPromptParams,
     ) -> Result<SessionPromptParams, JsonRpcError> {
-        let req: SessionSkillPromptParams = parse_params(params)?;
         let skill_name = req.skill.trim();
         if skill_name.is_empty() {
             return Err(rpc_err(
@@ -1694,7 +1723,7 @@ impl RpcDispatcher {
                         self.emit_turn_complete(
                             sid,
                             crate::rpc::types::TurnCompletionOutcome::Failed,
-                            "turn cancelled by daemon: session_not_found".to_string(),
+                            SESSION_NOT_FOUND_TURN_COMPLETE_CONTENT.to_string(),
                         )
                         .await;
                         return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
@@ -7745,16 +7774,54 @@ mod tests {
         (dispatcher, rx, sessions)
     }
 
-    /// RED guard: a `session/prompt` for a session that no longer exists
-    /// (e.g. evicted by the reaper while the TUI thought the session was
-    /// still live) MUST emit a `session/update TurnComplete::Failed`
-    /// notification so the TUI can exit `working` state. Silently dropping
-    /// the request — the production behaviour — leaves the TUI parked
-    /// forever with no `TurnComplete` ever arriving. This is the second
-    /// half of the freeze: a reaped session + a fresh prompt = hang.
+    fn captured_turn_complete(raw: &str) -> serde_json::Value {
+        let value: serde_json::Value =
+            serde_json::from_str(raw).expect("notification must be JSON");
+        assert_eq!(value["method"], notification::SESSION_UPDATE);
+        assert_eq!(value["params"]["outcome"], "failed");
+        value
+    }
+
+    async fn captured_turn_complete_from_rx(
+        receiver: &mut tokio::sync::mpsc::Receiver<String>,
+    ) -> serde_json::Value {
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("session/update notification must arrive before timeout")
+            .expect("session/update notification channel must stay open");
+        captured_turn_complete(&raw)
+    }
+
+    async fn insert_minimal_session(
+        sessions: &crate::rpc::session::SessionStore,
+        session_id: &str,
+        agent_alias: &str,
+        workspace: &str,
+    ) {
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(DummyModelProvider))
+            .tools(vec![])
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from(workspace))
+            .build()
+            .expect("minimal Agent should build");
+        let session = crate::rpc::session::RpcSession::new(
+            agent,
+            agent_alias,
+            workspace,
+            crate::rpc::types::ChatMode::Chat,
+        );
+        sessions
+            .insert(session_id.to_string(), session)
+            .await
+            .expect("insert test session");
+    }
+
     #[tokio::test]
     async fn session_prompt_on_missing_session_emits_turn_complete_failed() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
         let config = make_acp_test_config(&tmp);
         let (dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
 
@@ -7767,28 +7834,133 @@ mod tests {
             .await;
         assert!(
             result.is_err(),
-            "missing session must still produce an RPC error for legacy \
-             request-form callers; the new behaviour is the additional \
-             notification, not replacing the error"
+            "missing session must still produce an RPC error for request-form callers"
         );
 
-        // The notification must already be queued on the writer channel by
-        // the time `handle_session_prompt` returns. `try_recv` rules out
-        // any test flakiness from racing with a spawned task.
-        let raw = rx.try_recv().expect(
-            "handle_session_prompt must emit a session/update TurnComplete \
-             notification before returning on missing-session — without it \
-             the TUI's `working` state never clears and the next prompt is \
-             the production freeze",
-        );
-        let v: serde_json::Value = serde_json::from_str(&raw).expect("notification must be JSON");
-        assert_eq!(v["method"], notification::SESSION_UPDATE);
-        assert_eq!(v["params"]["session_id"], "gone-id");
+        let raw = rx
+            .try_recv()
+            .expect("missing session must emit TurnComplete before returning");
+        let value = captured_turn_complete(&raw);
+        assert_eq!(value["params"]["session_id"], "gone-id");
+    }
+
+    #[tokio::test]
+    async fn session_skill_prompt_on_missing_session_emits_turn_complete_failed() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
+
+        let error = dispatcher
+            .handle_session_prompt_method(
+                Method::SessionSkillPrompt,
+                &json!({
+                    "session_id": "gone-skill-session",
+                    "skill": "not-installed",
+                }),
+            )
+            .await
+            .expect_err("missing session must return an RPC error");
+        assert_eq!(error.code, SESSION_NOT_FOUND);
+
+        let raw = rx
+            .try_recv()
+            .expect("missing skill session must emit TurnComplete before returning");
+        let value = captured_turn_complete(&raw);
+        assert_eq!(value["params"]["session_id"], "gone-skill-session");
         assert_eq!(
-            v["params"]["outcome"], "failed",
-            "missing-session is not Completed and not Cancelled — it is a \
-             distinct Failed verdict. Folding it into Cancelled would lie \
-             about whether the user pressed Esc."
+            value["params"]["content"],
+            SESSION_NOT_FOUND_TURN_COMPLETE_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn session_skill_prompt_for_missing_skill_emits_turn_complete_failed() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let config = make_acp_test_config(&tmp);
+        let workspace = tmp.path().to_string_lossy().to_string();
+        let (dispatcher, mut rx, sessions) = make_dispatcher_with_capture(config);
+        insert_minimal_session(&sessions, "live-skill-session", "test-agent", &workspace).await;
+
+        let error = dispatcher
+            .handle_session_prompt_method(
+                Method::SessionSkillPrompt,
+                &json!({
+                    "session_id": "live-skill-session",
+                    "skill": "not-installed",
+                }),
+            )
+            .await
+            .expect_err("missing skill must return an RPC error");
+        assert_eq!(error.code, INVALID_PARAMS);
+
+        let raw = rx
+            .try_recv()
+            .expect("missing skill must emit TurnComplete before returning");
+        let value = captured_turn_complete(&raw);
+        assert_eq!(value["params"]["session_id"], "live-skill-session");
+        let content = value["params"]["content"]
+            .as_str()
+            .expect("turn_complete content must be text");
+        assert!(content.contains("Skill not found for agent `test-agent`: not-installed"));
+    }
+
+    #[tokio::test]
+    async fn session_skill_prompt_notification_for_missing_skill_completes_turn() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let config = make_acp_test_config(&tmp);
+        let workspace = tmp.path().to_string_lossy().to_string();
+        let (mut dispatcher, mut rx, sessions) = make_dispatcher_with_capture(config);
+        dispatcher.authenticated = true;
+        insert_minimal_session(&sessions, "notify-skill-session", "test-agent", &workspace).await;
+
+        dispatcher
+            .process_line_for_test(
+                &json!({
+                    "jsonrpc": JSONRPC_VERSION,
+                    "method": "session/skill_prompt",
+                    "params": {
+                        "session_id": "notify-skill-session",
+                        "skill": "not-installed"
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+
+        let value = captured_turn_complete_from_rx(&mut rx).await;
+        assert_eq!(value["params"]["session_id"], "notify-skill-session");
+        let content = value["params"]["content"]
+            .as_str()
+            .expect("turn_complete content must be text");
+        assert!(content.contains("Skill not found for agent `test-agent`: not-installed"));
+    }
+
+    #[tokio::test]
+    async fn session_skill_prompt_notification_for_missing_session_completes_turn() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
+        dispatcher.authenticated = true;
+
+        dispatcher
+            .process_line_for_test(
+                &json!({
+                    "jsonrpc": JSONRPC_VERSION,
+                    "method": "session/skill_prompt",
+                    "params": {
+                        "session_id": "notify-gone-skill-session",
+                        "skill": "not-installed"
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+
+        let value = captured_turn_complete_from_rx(&mut rx).await;
+        assert_eq!(value["params"]["session_id"], "notify-gone-skill-session");
+        assert_eq!(
+            value["params"]["content"],
+            SESSION_NOT_FOUND_TURN_COMPLETE_CONTENT
         );
     }
 
