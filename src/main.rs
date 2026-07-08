@@ -3759,6 +3759,7 @@ async fn main() -> Result<()> {
                 true,
                 session_state_file,
                 None,
+                zeroclaw_api::ingress::TurnOrigin::Interactive,
                 zeroclaw_runtime::agent::loop_::AgentRunOverrides::default(),
             ))
             .await
