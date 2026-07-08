@@ -39,6 +39,11 @@ fn acquire_sqlite_startup_lock() -> MutexGuard<'static, ()> {
 /// - **Hybrid Merge**: weighted fusion of vector + keyword results
 /// - **Embedding Cache**: LRU-evicted cache to avoid redundant API calls
 /// - **Safe Reindex**: temp DB → seed → sync → atomic swap → rollback
+///
+/// Cloning is cheap and yields a handle to the SAME database connection and
+/// embedder (all shared state is behind `Arc`) — used to hand a background
+/// task (e.g. an auto-triggered reindex) its own handle.
+#[derive(Clone)]
 pub struct SqliteMemory {
     alias: String,
     conn: Arc<Mutex<Connection>>,
@@ -305,7 +310,15 @@ impl SqliteMemory {
                 created_at   TEXT NOT NULL,
                 accessed_at  TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);",
+            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);
+
+            -- Store-level metadata (e.g. the embedding identity that produced
+            -- the stored vectors). Sits beside schema_version, which is keyed
+            -- by component with an INTEGER version and can't carry strings.
+            CREATE TABLE IF NOT EXISTS memory_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
         )
         .with_context(|| "SQLite init_schema failed: CREATE base schema")?;
 
@@ -536,6 +549,99 @@ impl SqliteMemory {
     /// Provide access to the connection for advanced queries (e.g. retrieval pipeline).
     pub fn connection(&self) -> &Arc<Mutex<Connection>> {
         &self.conn
+    }
+
+    /// Read the embedding identity recorded in `memory_meta`, if any.
+    ///
+    /// Returns `None` when the store predates identity tracking (or any of
+    /// the three keys is missing/unparseable) — callers treat that as "adopt
+    /// the current identity" rather than a mismatch.
+    pub fn stored_embedding_identity(
+        &self,
+    ) -> anyhow::Result<Option<super::embeddings::EmbeddingIdentity>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT key, value FROM memory_meta WHERE key IN \
+             ('embedding_provider', 'embedding_model', 'embedding_dimensions')",
+        )?;
+        let mut provider = None;
+        let mut model = None;
+        let mut dimensions = None;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let key: String = row.get(0)?;
+            let value: String = row.get(1)?;
+            match key.as_str() {
+                "embedding_provider" => provider = Some(value),
+                "embedding_model" => model = Some(value),
+                "embedding_dimensions" => dimensions = value.parse::<usize>().ok(),
+                _ => {}
+            }
+        }
+        Ok(match (provider, model, dimensions) {
+            (Some(provider), Some(model), Some(dimensions)) => {
+                Some(super::embeddings::EmbeddingIdentity {
+                    provider,
+                    model,
+                    dimensions,
+                })
+            }
+            _ => None,
+        })
+    }
+
+    /// Record `identity` in `memory_meta` without touching any vectors.
+    ///
+    /// Used to adopt the current identity on stores that predate identity
+    /// tracking, and after a match check confirms nothing changed.
+    pub fn record_embedding_identity(
+        &self,
+        identity: &super::embeddings::EmbeddingIdentity,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        Self::write_identity_rows(&tx, identity)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Migrate the store to a new embedding identity: NULL every stored
+    /// vector, clear the (identity-agnostic, content-hash-keyed)
+    /// `embedding_cache`, and stamp the new identity — atomically.
+    ///
+    /// This is the cheap, lossless half of an identity migration: `content`
+    /// is retained on every row, so `reindex()` can re-embed from it later.
+    /// No embedding API calls are made here. Returns the number of rows
+    /// whose vector was invalidated.
+    pub fn invalidate_embeddings_for_identity_change(
+        &self,
+        new_identity: &super::embeddings::EmbeddingIdentity,
+    ) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let invalidated = tx.execute(
+            "UPDATE memories SET embedding = NULL WHERE embedding IS NOT NULL",
+            [],
+        )?;
+        tx.execute("DELETE FROM embedding_cache", [])?;
+        Self::write_identity_rows(&tx, new_identity)?;
+        tx.commit()?;
+        Ok(invalidated)
+    }
+
+    fn write_identity_rows(
+        conn: &Connection,
+        identity: &super::embeddings::EmbeddingIdentity,
+    ) -> anyhow::Result<()> {
+        let mut stmt =
+            conn.prepare("INSERT OR REPLACE INTO memory_meta (key, value) VALUES (?1, ?2)")?;
+        stmt.execute(params!["embedding_provider", identity.provider])?;
+        stmt.execute(params!["embedding_model", identity.model])?;
+        stmt.execute(params![
+            "embedding_dimensions",
+            identity.dimensions.to_string()
+        ])?;
+        Ok(())
     }
 
     /// Get embedding from cache, or compute + cache it
@@ -2943,6 +3049,133 @@ mod tests {
         // FTS should still work after rebuild
         let results = mem.recall("reindex", 10, None, None, None).await.unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    // ── Embedding identity primitives (issue #7948) ──────────────
+
+    /// Embedder that returns a fixed vector, so store() persists real
+    /// (non-NULL) embeddings and populates the embedding cache.
+    struct FixedEmbedding(usize);
+
+    #[async_trait::async_trait]
+    impl super::super::embeddings::EmbeddingProvider for FixedEmbedding {
+        fn name(&self) -> &str {
+            "fixed"
+        }
+        fn dimensions(&self) -> usize {
+            self.0
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.5f32; self.0]).collect())
+        }
+    }
+
+    fn identity(
+        provider: &str,
+        model: &str,
+        dimensions: usize,
+    ) -> super::super::embeddings::EmbeddingIdentity {
+        super::super::embeddings::EmbeddingIdentity {
+            provider: provider.into(),
+            model: model.into(),
+            dimensions,
+        }
+    }
+
+    fn count_scalar(mem: &SqliteMemory, sql: &str) -> i64 {
+        let conn = mem.connection().lock();
+        conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    #[test]
+    fn embedding_identity_roundtrip() {
+        let (_tmp, mem) = temp_sqlite();
+        // A fresh store (and any store predating identity tracking) has none.
+        assert_eq!(mem.stored_embedding_identity().unwrap(), None);
+
+        let id = identity("openai", "text-embedding-3-small", 1536);
+        mem.record_embedding_identity(&id).unwrap();
+        assert_eq!(mem.stored_embedding_identity().unwrap(), Some(id));
+    }
+
+    #[test]
+    fn embedding_identity_partial_rows_read_as_absent() {
+        let (_tmp, mem) = temp_sqlite();
+        {
+            let conn = mem.connection().lock();
+            conn.execute(
+                "INSERT INTO memory_meta (key, value) VALUES ('embedding_model', 'orphan')",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(mem.stored_embedding_identity().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn invalidate_nulls_vectors_clears_cache_and_stamps_identity() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(FixedEmbedding(4)),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+        )
+        .unwrap();
+        mem.record_embedding_identity(&identity("openai", "old-model", 4))
+            .unwrap();
+
+        mem.store("a", "alpha content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "beta content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            count_scalar(
+                &mem,
+                "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL"
+            ),
+            2
+        );
+        assert_eq!(
+            count_scalar(&mem, "SELECT COUNT(*) FROM embedding_cache"),
+            2
+        );
+
+        let new_id = identity("openai", "new-model", 4);
+        let invalidated = mem
+            .invalidate_embeddings_for_identity_change(&new_id)
+            .unwrap();
+
+        assert_eq!(invalidated, 2);
+        assert_eq!(
+            count_scalar(
+                &mem,
+                "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL"
+            ),
+            0
+        );
+        assert_eq!(
+            count_scalar(&mem, "SELECT COUNT(*) FROM embedding_cache"),
+            0
+        );
+        assert_eq!(mem.stored_embedding_identity().unwrap(), Some(new_id));
+
+        // Content is retained, so the existing reindex path re-embeds losslessly.
+        let reembedded = mem.reindex().await.unwrap();
+        assert_eq!(reembedded, 2);
+        assert_eq!(
+            count_scalar(
+                &mem,
+                "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL"
+            ),
+            2
+        );
     }
 
     // ── Recall limit test ────────────────────────────────────────

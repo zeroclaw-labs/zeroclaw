@@ -123,7 +123,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 keyactions! {
     pub enum GlobalAction ("global") {
         Quit         [Chord::ctrl('c')]                                 => "quit",
-        Help         [Chord::char('?')]                                 => "help",
+        Help         [Chord::char('?'), Chord::key(KeyCode::F(1)), Chord::with(KeyCode::F(1), KeyModifiers::CONTROL)]      => "help",
         PaneNavLeft  [Chord::with(KeyCode::Left, KeyModifiers::ALT), Chord::with(KeyCode::Char('b'), KeyModifiers::ALT)]  => "prev pane",
         PaneNavRight [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "next pane",
         ReloadDaemon [Chord::ctrl('r')]                                 => "reload daemon",
@@ -226,6 +226,7 @@ keyactions! {
         BeginSearch      [Chord::char('/')] => "search",
         CopyDetail       [Chord::char('c')] => "copy detail",
         KillSession      [Chord::char('X')] => "kill session",
+        TriggerCron      [Chord::char('R')] => "run cron job now",
         Refresh          [Chord::char('r')] => "refresh",
         JumpStart        [Chord::char('g'), Chord::key(KeyCode::Home)] => "jump to start",
         JumpEnd          [Chord::char('G'), Chord::key(KeyCode::End)] => "jump to end",

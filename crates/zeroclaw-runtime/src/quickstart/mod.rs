@@ -1214,7 +1214,7 @@ fn apply_memory(
                     return None;
                 }
             };
-            if !section_has_alias(config, "storage", family, alias) {
+            if !storage_has_ref(config, reference) {
                 let path = format!("storage.{family}.{alias}");
                 errors.push(QuickstartError::for_surface(
                     ctx,
@@ -1773,6 +1773,12 @@ fn section_has_alias(config: &Config, prefix: &str, family: &str, alias: &str) -
     false
 }
 
+fn storage_has_ref(config: &Config, reference: &str) -> bool {
+    collect_aliased_refs(&config.storage)
+        .iter()
+        .any(|configured| configured == reference)
+}
+
 /// Live model catalog for a provider type. `(models, pricing, live)`:
 /// `live=true` means surfaces should render a picker; `live=false`
 /// means fall back to free text. Tries `ModelProvider::list_models_with_pricing()`
@@ -1902,6 +1908,56 @@ mod tests {
                 personality_file: None,
                 personality_files: vec![],
             },
+        }
+    }
+
+    #[test]
+    fn existing_postgres_memory_storage_ref_is_accepted() {
+        let mut cfg = Config::default();
+        cfg.storage.postgres.insert(
+            "default".into(),
+            zeroclaw_config::schema::PostgresStorageConfig::default(),
+        );
+        let choice = SelectorChoice::Existing("postgres.default".to_string());
+        let mut errors = Vec::new();
+
+        let applied = apply_memory(&mut cfg, &choice, &mut errors, None);
+
+        assert!(errors.is_empty(), "apply_memory errors: {errors:?}");
+        assert_eq!(applied.as_deref(), Some("postgres.default"));
+        assert_eq!(cfg.memory.backend, "postgres.default");
+    }
+
+    #[test]
+    fn memory_storage_refs_from_snapshot_are_accepted() {
+        let mut cfg = Config::default();
+        cfg.storage.postgres.insert(
+            "default".into(),
+            zeroclaw_config::schema::PostgresStorageConfig::default(),
+        );
+        let snapshot = snapshot_state(&cfg);
+
+        assert!(
+            snapshot
+                .storage
+                .iter()
+                .any(|ref_| ref_ == "postgres.default"),
+            "snapshot should expose configured postgres storage: {:?}",
+            snapshot.storage
+        );
+        for reference in snapshot.storage {
+            let mut candidate = cfg.clone();
+            let choice = SelectorChoice::Existing(reference.clone());
+            let mut errors = Vec::new();
+
+            let applied = apply_memory(&mut candidate, &choice, &mut errors, None);
+
+            assert!(
+                errors.is_empty(),
+                "snapshot storage ref {reference:?} should apply without errors: {errors:?}"
+            );
+            assert_eq!(applied.as_deref(), Some(reference.as_str()));
+            assert_eq!(candidate.memory.backend, reference);
         }
     }
 

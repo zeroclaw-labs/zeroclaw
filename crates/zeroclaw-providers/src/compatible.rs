@@ -1907,8 +1907,12 @@ impl OpenAiCompatibleModelProvider {
             items
                 .iter()
                 .map(|tool| {
+                    // Owned copy is required here: the per-model sanitizer
+                    // (`convert_tool_specs_for_model`) mutates these Value
+                    // trees in place, so they cannot share the registry's
+                    // Arc-backed schema (#8642).
                     let params = zeroclaw_api::schema::SchemaCleanr::clean_for_openai(
-                        tool.parameters.clone(),
+                        (*tool.parameters).clone(),
                     );
                     serde_json::json!({
                         "type": "function",
@@ -4697,7 +4701,8 @@ mod tests {
                     "command": { "type": "string" }
                 },
                 "required": ["command"]
-            }),
+            })
+            .into(),
         }];
 
         let output = OpenAiCompatibleModelProvider::with_prompt_guided_tool_instructions(
