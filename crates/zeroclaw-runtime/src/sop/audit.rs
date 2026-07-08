@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use super::types::{SopRun, SopStepResult};
+use super::engine::now_iso8601;
+use super::types::{SopRun, SopStepResult, SopTriggerSource};
 use zeroclaw_memory::traits::{Memory, MemoryCategory};
 
 const SOP_CATEGORY: &str = "sop";
@@ -42,6 +43,74 @@ impl SopAuditLogger {
         let key = step_key(run_id, result.step_number);
         let content = serde_json::to_string_pretty(result)?;
         self.memory.store(&key, &content, category(), None).await?;
+        Ok(())
+    }
+
+    /// Log a suspicious but allowed untrusted SOP event.
+    pub async fn log_suspicious_untrusted(
+        &self,
+        source: SopTriggerSource,
+        topic: Option<&str>,
+        patterns: &[String],
+        score: f64,
+    ) -> Result<()> {
+        let now = now_iso8601();
+        let key = event_key("suspicious_untrusted", &now);
+        let content = serde_json::to_string_pretty(&serde_json::json!({
+            "kind": "suspicious_untrusted",
+            "source": source,
+            "topic": topic,
+            "patterns": patterns,
+            "score": score,
+            "timestamp": now,
+        }))?;
+        self.memory.store(&key, &content, category(), None).await?;
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "source": source,
+                    "topic": topic,
+                    "patterns": patterns,
+                    "score": score,
+                })),
+            "SOP audit: suspicious untrusted trigger content allowed"
+        );
+        Ok(())
+    }
+
+    /// Log a blocked unsafe SOP event.
+    pub async fn log_blocked_unsafe(
+        &self,
+        sop_name: Option<&str>,
+        source: SopTriggerSource,
+        topic: Option<&str>,
+        reason: &str,
+    ) -> Result<()> {
+        let now = now_iso8601();
+        let key = event_key("blocked_unsafe", &now);
+        let content = serde_json::to_string_pretty(&serde_json::json!({
+            "kind": "blocked_unsafe",
+            "sop_name": sop_name,
+            "source": source,
+            "topic": topic,
+            "reason": reason,
+            "timestamp": now,
+        }))?;
+        self.memory.store(&key, &content, category(), None).await?;
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "sop_name": sop_name,
+                    "source": source,
+                    "topic": topic,
+                    "reason": reason,
+                })),
+            "SOP audit: blocked unsafe untrusted trigger content"
+        );
         Ok(())
     }
 
@@ -115,6 +184,15 @@ fn step_key(run_id: &str, step_number: u32) -> String {
     format!("sop_step_{run_id}_{step_number}")
 }
 
+fn event_key(kind: &str, timestamp: &str) -> String {
+    let safe_timestamp: String = timestamp
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect();
+    let suffix = rand::random::<u32>();
+    format!("sop_event_{kind}_{safe_timestamp}_{suffix:08x}")
+}
+
 fn category() -> MemoryCategory {
     MemoryCategory::Custom(SOP_CATEGORY.into())
 }
@@ -134,6 +212,7 @@ mod tests {
                 payload: None,
                 timestamp: "2026-02-19T12:00:00Z".into(),
             },
+            frame_marker_id: "marker-test".into(),
             status: SopRunStatus::Running,
             current_step: 1,
             total_steps: 3,
