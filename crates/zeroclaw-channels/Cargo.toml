@@ -137,7 +137,8 @@ tokio-socks = "0.5"
 #
 # Commit history:
 # - 9734fb2: MSRV fix for `if let` guard (wacore/src/history_sync.rs:93)
-#            stable only on Rust 1.94+; ZeroClaw CI pins 1.93.0.
+#            stable only on Rust 1.94+; ZeroClaw MSRV is 1.96.1 so this is
+#            well within the supported baseline.
 #            Fixes the post-2026-04-24 WhatsApp Web protocol break (#6246).
 # - cbcdd2a: PR #636 fix for LID namespace conversion. Fixes ACK 400
 #            "server requires all participants to share the same JID
@@ -168,6 +169,17 @@ cbc = { version = "0.1", optional = true }
 ecb = { version = "0.1", optional = true }
 md5 = { version = "0.8", optional = true }
 
+# GitHub App channel - RS256 JWT signing for app authentication. The
+# `aws_lc_rs` backend is required to avoid jsonwebtoken's `rust_crypto`
+# path, which pulls the unmaintained `rsa` crate (RUSTSEC-2023-0071,
+# Marvin Attack, no fixed release) and fails `cargo audit`. aws-lc-rs is
+# already in the workspace lockfile, so this adds no new heavy dependency.
+jsonwebtoken = { version = "10", optional = true, default-features = false, features = [
+  "aws_lc_rs",
+  "use_pem",
+] }
+thiserror = { version = "2.0", optional = true }
+
 [features]
 default = ["default-channels"]
 default-channels = [
@@ -183,6 +195,7 @@ channels-full = [
   "channel-clawdtalk",
   "channel-dingtalk",
   "channel-discord",
+  "channel-git",
   "channel-imessage",
   "channel-irc",
   "channel-lark",
@@ -216,6 +229,12 @@ channel-email = [
 image-normalization = ["dep:image"]
 channel-telegram = ["image-normalization"]
 channel-lark = ["dep:prost"]
+channel-git = ["provider-github", "provider-gitea"]
+# Forge providers for the git channel. `provider-github` (GitHub Apps) and
+# `provider-gitea` (Gitea/Forgejo PAT) are default-on under `channel-git`;
+# future forges (e.g. `provider-gitlab`) add their own sub-feature and deps here.
+provider-github = ["dep:jsonwebtoken", "dep:thiserror"]
+provider-gitea = []
 channel-line = []
 channel-nostr = ["dep:nostr-sdk"]
 whatsapp-web = [

@@ -96,6 +96,20 @@ impl Memory for AgentScopedMemory {
         self.inner.health_check().await
     }
 
+    fn refresh_embedder(
+        &self,
+        model_provider: &str,
+        api_key: Option<&str>,
+        model: &str,
+        dimensions: usize,
+    ) {
+        // Transparent wrapper: forward the embedder refresh to the wrapped
+        // per-agent backend so an active agent's memory stops using a stale
+        // endpoint/key after a provider-profile `config/set` (#8359).
+        self.inner
+            .refresh_embedder(model_provider, api_key, model, dimensions);
+    }
+
     async fn store(
         &self,
         key: &str,
@@ -521,6 +535,31 @@ mod tests {
             uuids.push(inner.ensure_agent_uuid(alias).await.unwrap());
         }
         uuids
+    }
+
+    /// The wrapper must forward `refresh_embedder` to its inner backend so an
+    /// active agent's per-agent memory picks up a provider-profile change
+    /// instead of keeping a stale embedder (#8359).
+    #[test]
+    fn refresh_embedder_forwards_to_inner_backend() {
+        let (_tmp, inner) = fresh_sqlite();
+        let wrapper =
+            AgentScopedMemory::new(as_dyn(inner.clone()), "agent-1", Vec::<String>::new());
+        assert_eq!(inner.embedder_dimensions(), 0);
+
+        Memory::refresh_embedder(
+            &wrapper,
+            "openai",
+            Some("sk-test"),
+            "text-embedding-3-small",
+            1536,
+        );
+
+        assert_eq!(
+            inner.embedder_dimensions(),
+            1536,
+            "AgentScopedMemory must forward refresh_embedder to the wrapped backend"
+        );
     }
 
     #[tokio::test]

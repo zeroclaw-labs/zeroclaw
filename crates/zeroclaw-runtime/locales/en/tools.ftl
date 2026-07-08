@@ -86,7 +86,7 @@ tool-file-download-error-flush = Failed to flush downloaded file: { $err }
 tool-file-download-error-move = Failed to move downloaded file into place: { $err }
 tool-file-download-success = Downloaded { $written } bytes to { $dest_path } ({ $status })
 
-tool-file-read = Read file contents with line numbers. Supports partial reading via offset and limit. Extracts text from PDF; other binary files are read with lossy UTF-8 conversion.
+tool-file-read = Read file contents with line numbers. Supports partial reading via offset and limit. Binary and image files are rejected (use the image_info tool for images). Set encoding="base64" to return raw bytes base64-encoded (for binary files such as .pdf/.xlsx/.docx); offset/limit are ignored in that mode.
 
 tool-file-write = Write contents to a file in the workspace
 
@@ -127,7 +127,6 @@ tool-model-routing-config = Manage default model settings, scenario-based provid
 
 tool-notion = Interact with Notion: query databases, read/create/update pages, and search the workspace.
 
-tool-pdf-read = Extract plain text from a PDF file in the workspace. Returns all readable text. Image-only or encrypted PDFs return an empty result. Requires the 'rag-pdf' build feature.
 
 tool-project-intel = Project delivery intelligence: generate status reports, detect risks, draft client updates, summarize sprints, and estimate effort. Read-only analysis tool.
 

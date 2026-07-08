@@ -9,9 +9,8 @@
 # to both. Simulator runs by default on :8080; use run-zeroclaw.sh for the agent.
 
 # ─── Stage 1: build ────────────────────────────────────────────────────────
-# Rust 1.91 (matches the workspace's actual feature usage — let-chains, etc.;
-# the workspace's rust-version=1.87 in Cargo.toml is an outdated pin).
-FROM rust:1.91-slim-bookworm AS builder
+# Matches the workspace `rust-version = "1.96.1"` MSRV declared in Cargo.toml.
+FROM rust:1.96-slim-bookworm AS builder
 
 WORKDIR /build
 
@@ -22,6 +21,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy the workspace and build. We accept the slow first-build cost in
 # exchange for a cleanly isolated runtime image.
 COPY . .
+
+# `.dockerignore` strips apps/tauri/src and apps/tauri/build.rs; stub them so
+# Cargo's workspace resolution succeeds. (Same trick the production Dockerfile uses.)
+RUN mkdir -p apps/tauri/src \
+    && printf 'fn main() {}\n' > apps/tauri/src/main.rs \
+    && printf 'fn main() {}\n' > apps/tauri/build.rs
 
 # Debug builds (no --release) — faster compile, fine for a demo.
 # Build the simulator example first, then the main binary.

@@ -413,6 +413,23 @@ use zeroclaw_config::schema::{
     XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
 };
 
+/// Get the default API URL for a provider type (matches CompatFamilySpec::DEFAULT_URL).
+/// Returns None if the provider type is not an OpenAI-compatible family with a DEFAULT_URL const.
+pub fn get_default_url(provider_type: &str) -> Option<&'static str> {
+    Some(match provider_type {
+        "groq" => "https://api.groq.com/openai/v1",
+        "together" => <TogetherModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "fireworks" => <FireworksModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "deepinfra" => <DeepinfraModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "hyperbolic" => <HyperbolicModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "anyscale" => <AnyscaleModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "novita" => <NovitaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "nebius" => <NebiusModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        "nvidia" => <NvidiaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+        _ => return None,
+    })
+}
+
 // ── Pure-compat families ───────────────────────────────────────────────
 // `OpenAiCompatibleModelProvider::new(DISPLAY, DEFAULT_URL, key, AUTH)` —
 // no modifiers, no per-alias logic. The blanket impl supplies

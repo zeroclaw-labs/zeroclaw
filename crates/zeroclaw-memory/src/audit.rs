@@ -121,12 +121,31 @@ impl<M: Memory> AuditedMemory<M> {
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         Ok(count as usize)
     }
+
+    /// The wrapped backend (test-only introspection).
+    #[cfg(test)]
+    pub(crate) fn inner(&self) -> &M {
+        &self.inner
+    }
 }
 
 #[async_trait]
 impl<M: Memory> Memory for AuditedMemory<M> {
     fn name(&self) -> &str {
         self.inner.name()
+    }
+
+    fn refresh_embedder(
+        &self,
+        model_provider: &str,
+        api_key: Option<&str>,
+        model: &str,
+        dimensions: usize,
+    ) {
+        // Transparent decorator: forward the embedder refresh to the wrapped
+        // backend like every other method (#8359).
+        self.inner
+            .refresh_embedder(model_provider, api_key, model, dimensions);
     }
 
     async fn store(
@@ -330,6 +349,30 @@ mod tests {
     use super::*;
     use crate::none::NoneMemory;
     use tempfile::TempDir;
+
+    /// The audit decorator must forward `refresh_embedder` to its wrapped
+    /// backend like every other method (#8359).
+    #[test]
+    fn refresh_embedder_forwards_to_inner_backend() {
+        let tmp = TempDir::new().unwrap();
+        let inner = crate::sqlite::SqliteMemory::new("test", tmp.path()).unwrap();
+        let audited = AuditedMemory::new(inner, tmp.path()).unwrap();
+        assert_eq!(audited.inner().embedder_dimensions(), 0);
+
+        Memory::refresh_embedder(
+            &audited,
+            "openai",
+            Some("sk-test"),
+            "text-embedding-3-small",
+            1536,
+        );
+
+        assert_eq!(
+            audited.inner().embedder_dimensions(),
+            1536,
+            "AuditedMemory must forward refresh_embedder to the wrapped backend"
+        );
+    }
 
     #[tokio::test]
     async fn audited_memory_logs_store_operation() {

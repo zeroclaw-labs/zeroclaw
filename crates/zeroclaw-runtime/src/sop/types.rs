@@ -151,6 +151,19 @@ pub enum SopTrigger {
         #[serde(default)]
         calendar_ids: Vec<String>,
     },
+    /// A channel-sourced fan-in event, produced by a channel that routes forge
+    /// or platform events into SOP ingress (the Git forge channel is the first
+    /// producer). Live: emitted by the channel's event router and consumed by
+    /// the orchestrator's channel-SOP dispatch.
+    Channel {
+        /// Exact channel-SOP topic to match, for example
+        /// `git.<alias>:pull_request.opened`.
+        topic: String,
+        /// Optional expression evaluated against the event payload; when set,
+        /// the SOP only fires if it evaluates truthy.
+        #[serde(default)]
+        condition: Option<String>,
+    },
     /// Agent-initiated run via the `sop_execute` tool. Not an external fan-in.
     Manual,
     /// AMQP delivery. Live: delivered by the AMQP consumer in a SOP dispatch mode.
@@ -175,6 +188,7 @@ impl fmt::Display for SopTrigger {
             Self::Calendar {
                 calendar_source, ..
             } => write!(f, "calendar:{calendar_source}"),
+            Self::Channel { topic, .. } => write!(f, "channel:{topic}"),
             Self::Manual => write!(f, "manual"),
             Self::Amqp { routing_key, .. } => write!(f, "amqp:{routing_key}"),
         }
@@ -192,6 +206,8 @@ pub enum SopStepKind {
     Execute,
     /// Checkpoint step — pauses execution and waits for human approval.
     Checkpoint,
+    /// Deterministic capability step - executed by the SOP capability registry.
+    Capability,
 }
 
 impl fmt::Display for SopStepKind {
@@ -199,6 +215,7 @@ impl fmt::Display for SopStepKind {
         match self {
             Self::Execute => write!(f, "execute"),
             Self::Checkpoint => write!(f, "checkpoint"),
+            Self::Capability => write!(f, "capability"),
         }
     }
 }
@@ -224,8 +241,11 @@ pub struct StepSchema {
 /// A single step in an SOP procedure, parsed from SOP.md.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SopStep {
+    #[serde(default)]
     pub number: u32,
+    #[serde(default)]
     pub title: String,
+    #[serde(default)]
     pub body: String,
     #[serde(default)]
     pub suggested_tools: Vec<String>,
@@ -249,6 +269,12 @@ pub struct SopStep {
     /// Optional per-step execution mode override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<SopExecutionMode>,
+    /// Capability identifier used when `kind = "capability"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    /// Capability arguments, serialized as `with` in TOML/JSON definitions.
+    #[serde(default, rename = "with", skip_serializing_if = "Option::is_none")]
+    pub capability_input: Option<serde_json::Value>,
 }
 
 impl Default for SopStep {
@@ -265,11 +291,27 @@ impl Default for SopStep {
             routing: StepRouting::default(),
             on_failure: StepFailure::default(),
             mode: None,
+            capability: None,
+            capability_input: None,
         }
     }
 }
 
 impl SopStep {
+    pub fn capability_id(&self) -> Option<&str> {
+        self.capability.as_deref()
+    }
+
+    pub fn capability_call_input(&self, piped_input: serde_json::Value) -> serde_json::Value {
+        let Some(mut configured) = self.capability_input.clone() else {
+            return piped_input;
+        };
+        if let Some(object) = configured.as_object_mut() {
+            object.entry("input").or_insert(piped_input);
+        }
+        configured
+    }
+
     pub fn effective_tool_scope(&self) -> Option<StepToolScope> {
         let mut scope = self.scope.clone();
         if !self.suggested_tools.is_empty() {
@@ -322,6 +364,8 @@ pub struct SopManifest {
     pub sop: SopMeta,
     #[serde(default)]
     pub triggers: Vec<SopTrigger>,
+    #[serde(default)]
+    pub steps: Vec<SopStep>,
 }
 
 /// The `[sop]` table in SOP.toml.
@@ -360,6 +404,7 @@ pub enum SopTriggerSource {
     Peripheral,
     Filesystem,
     Calendar,
+    Channel,
     Manual,
     Amqp,
 }
@@ -373,6 +418,7 @@ impl fmt::Display for SopTriggerSource {
             Self::Peripheral => write!(f, "peripheral"),
             Self::Filesystem => write!(f, "filesystem"),
             Self::Calendar => write!(f, "calendar"),
+            Self::Channel => write!(f, "channel"),
             Self::Manual => write!(f, "manual"),
             Self::Amqp => write!(f, "amqp"),
         }
@@ -711,6 +757,19 @@ path = "/var/inbox"
     }
 
     #[test]
+    fn trigger_channel_toml() {
+        let toml_str = r#"
+type = "channel"
+topic = "git.main:pull_request.opened"
+condition = "$.repo == \"octo/repo\""
+"#;
+        let trigger: SopTrigger = toml::from_str(toml_str).unwrap();
+        assert!(
+            matches!(trigger, SopTrigger::Channel { ref topic, .. } if topic == "git.main:pull_request.opened")
+        );
+    }
+
+    #[test]
     fn filesystem_event_kind_display_and_serde() {
         assert_eq!(FilesystemEventKind::Created.to_string(), "created");
         assert_eq!(FilesystemEventKind::Renamed.to_string(), "renamed");
@@ -747,6 +806,7 @@ path = "/var/inbox"
     fn step_kind_display() {
         assert_eq!(SopStepKind::Execute.to_string(), "execute");
         assert_eq!(SopStepKind::Checkpoint.to_string(), "checkpoint");
+        assert_eq!(SopStepKind::Capability.to_string(), "capability");
     }
 
     #[test]
@@ -806,6 +866,8 @@ path = "/var/inbox"
                 .unwrap();
         assert!(step.suggested_tools.is_empty());
         assert!(!step.requires_confirmation);
+        assert!(step.capability.is_none());
+        assert!(step.capability_input.is_none());
     }
 
     #[test]
@@ -822,6 +884,8 @@ path = "/var/inbox"
         assert!(value.get("routing").is_none());
         assert!(value.get("on_failure").is_none());
         assert!(value.get("mode").is_none());
+        assert!(value.get("capability").is_none());
+        assert!(value.get("with").is_none());
     }
 
     #[test]
@@ -848,6 +912,7 @@ path = "/sop/test"
     #[test]
     fn trigger_source_display() {
         assert_eq!(SopTriggerSource::Mqtt.to_string(), "mqtt");
+        assert_eq!(SopTriggerSource::Channel.to_string(), "channel");
         assert_eq!(SopTriggerSource::Manual.to_string(), "manual");
     }
 

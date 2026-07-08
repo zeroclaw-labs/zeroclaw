@@ -7,7 +7,7 @@ use async_trait::async_trait;
 
 use crate::mcp_client::McpRegistry;
 use crate::mcp_protocol::McpToolDef;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolResult, ToolSpec};
 
 /// A zeroclaw [`Tool`] backed by an MCP server tool.
 ///
@@ -19,8 +19,10 @@ pub struct McpToolWrapper {
     /// Description extracted from the MCP tool definition. Stored as an owned
     /// String so that `description()` can return `&str` with self's lifetime.
     description: String,
-    /// JSON schema for the tool's input parameters.
-    input_schema: serde_json::Value,
+    /// JSON schema for the tool's input parameters. `Arc`-shared so that
+    /// per-iteration spec assembly and per-request provider conversion hand
+    /// out reference counts instead of deep-cloning the tree (#8642).
+    input_schema: Arc<serde_json::Value>,
     /// Shared registry — used to dispatch actual tool calls.
     registry: Arc<McpRegistry>,
 }
@@ -31,7 +33,7 @@ impl McpToolWrapper {
         Self {
             prefixed_name,
             description,
-            input_schema: def.input_schema,
+            input_schema: Arc::new(def.input_schema),
             registry,
         }
     }
@@ -48,7 +50,21 @@ impl Tool for McpToolWrapper {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        self.input_schema.clone()
+        // Deep copy for legacy callers that need an owned tree; the agent
+        // loop goes through `spec()` below, which shares instead of cloning.
+        (*self.input_schema).clone()
+    }
+
+    /// Override the default: hand out the stored schema by `Arc::clone`
+    /// (pointer copy + refcount increment) instead of deep-cloning it.
+    /// MCP schemas can be tens of KB and specs are rebuilt every agent-loop
+    /// iteration, so this is the hot path of #8642.
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.prefixed_name.clone(),
+            description: self.description.clone(),
+            parameters: Arc::clone(&self.input_schema),
+        }
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -148,7 +164,31 @@ mod tests {
         let spec = wrapper.spec();
         assert_eq!(spec.name, "fs__list_dir");
         assert_eq!(spec.description, "List directory");
-        assert_eq!(spec.parameters, schema);
+        assert_eq!(*spec.parameters, schema);
+    }
+
+    #[tokio::test]
+    async fn spec_shares_stored_schema_without_cloning() {
+        // #8642 regression guard: spec() must hand out the SAME allocation
+        // as the stored schema, not a deep copy. Two consecutive specs must
+        // also share with each other.
+        let registry = empty_registry().await;
+        let schema = json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } }
+        });
+        let def = make_def("read_file", Some("Read"), schema);
+        let wrapper = McpToolWrapper::new("fs__read_file".to_string(), def, registry);
+        let spec_a = wrapper.spec();
+        let spec_b = wrapper.spec();
+        assert!(
+            Arc::ptr_eq(&wrapper.input_schema, &spec_a.parameters),
+            "spec() must share the wrapper's stored schema allocation"
+        );
+        assert!(
+            Arc::ptr_eq(&spec_a.parameters, &spec_b.parameters),
+            "consecutive specs must share one schema allocation"
+        );
     }
 
     // ── execute() error path ───────────────────────────────────────────────
