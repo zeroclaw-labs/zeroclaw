@@ -13,6 +13,8 @@ pub mod util;
 pub mod agent;
 pub mod approval;
 pub mod browse;
+pub mod calendar;
+pub mod control_plane;
 pub mod cost;
 pub mod cron;
 pub mod daemon;

@@ -60,7 +60,7 @@ pub async fn handle_command(
     let workspace_dir = &config.data_dir;
     match command {
         crate::SkillCommands::List => {
-            let skills = load_skills_with_config(workspace_dir, config);
+            let (skills, skipped) = load_skills_with_config_audited(workspace_dir, config);
             if skills.is_empty() {
                 println!("{}", get_required_cli_string("cli-skills-none-installed"));
                 println!();
@@ -104,6 +104,42 @@ pub async fn handle_command(
                                 "cli-skills-tags",
                                 &[("tags", &skill.tags.join(", "))],
                             )
+                        );
+                    }
+                }
+            }
+            if !skipped.is_empty() {
+                println!();
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-skipped-header",
+                        &[("count", &skipped.len().to_string())],
+                    )
+                );
+                println!();
+                for entry in &skipped {
+                    let (reason, scripts_blocked) = match &entry.reason {
+                        SkillDropReason::AuditFindings {
+                            summary,
+                            scripts_blocked,
+                        } => (summary.clone(), *scripts_blocked),
+                        SkillDropReason::AuditError(s) | SkillDropReason::ManifestParseError(s) => {
+                            (s.clone(), false)
+                        }
+                    };
+                    println!("  {}", console::style(&entry.name).yellow().bold());
+                    println!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-skills-skipped-reason",
+                            &[("reason", &reason)],
+                        )
+                    );
+                    if scripts_blocked && !config.skills.allow_scripts {
+                        println!(
+                            "{}",
+                            get_required_cli_string("cli-skills-skipped-scripts-hint")
                         );
                     }
                 }
@@ -188,6 +224,29 @@ pub async fn handle_command(
                     no_tier_banner,
                 )
                 .with_context(|| format!("failed to install skill from registry: {source}"))?
+            } else if is_extra_registry_source(&source) {
+                // `is_extra_registry_source` is `parse_extra_registry_source(..).is_some()`,
+                // so this re-parse always succeeds. `unwrap_or_default` only guards an
+                // unreachable `None` for a cosmetic label rather than panicking in the CLI.
+                let registry_label = parse_extra_registry_source(&source)
+                    .map(|(name, _)| name)
+                    .unwrap_or_default();
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-install-resolving-extra-registry",
+                        &[("source", &source), ("registry", &registry_label)]
+                    )
+                );
+                install_extra_registry_skill_source(
+                    &source,
+                    &skills_path,
+                    config.skills.allow_scripts,
+                    workspace_dir,
+                    &config.skills.extra_registries,
+                    no_tier_banner,
+                )
+                .with_context(|| format!("failed to install skill from extra registry: {source}"))?
             } else {
                 install_local_skill_source(&source, &skills_path, config.skills.allow_scripts)
                     .with_context(|| format!("failed to install local skill source: {source}"))?
@@ -352,6 +411,8 @@ fn handle_add(
         // Scaffold creates a tagless skill; tags (including the `slash` opt-in
         // for #7490 slash commands) are managed in the dashboard skills editor.
         tags: Vec::new(),
+        // Slash options are authored in the dashboard editor, not at scaffold time.
+        slash_options: Vec::new(),
     };
 
     let skill_dir = service.scaffold_skill(

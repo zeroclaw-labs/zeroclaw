@@ -60,6 +60,9 @@ mod tests {
             namespace: "default".into(),
             importance: None,
             superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
             agent_alias: None,
             agent_id: None,
         }
@@ -149,5 +152,18 @@ mod tests {
         )];
         apply_time_decay(&mut entries, 7.0);
         assert_eq!(entries[0].score, Some(0.9));
+    }
+
+    #[test]
+    fn future_timestamp_does_not_boost_or_decay_score() {
+        let mut entries = vec![make_entry(
+            MemoryCategory::Conversation,
+            Some(0.75),
+            "9999-12-31T00:00:00Z",
+        )];
+
+        apply_time_decay(&mut entries, 7.0);
+
+        assert_eq!(entries[0].score, Some(0.75));
     }
 }

@@ -119,62 +119,64 @@ pub fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
 /// non-globally-routable address (SSRF guard).
 ///
 /// Handles both IPv4 and IPv6, as well as `localhost` and `.local` domains.
-pub fn is_private_or_local_host(host: &str) -> bool {
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host)
-        .to_ascii_lowercase();
-
-    if &bare == "localhost" || bare.ends_with(".localhost") {
-        return true;
-    }
-
-    if bare
-        .rsplit('.')
-        .next()
-        .is_some_and(|label| label == "local")
-    {
-        return true;
-    }
-
-    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => is_non_global_v4(v4),
-            std::net::IpAddr::V6(v6) => is_non_global_v6(v6),
-        };
-    }
-
-    false
-}
+pub use zeroclaw_infra::net_guard::is_private_or_local_host;
 
 // ── private IP classification helpers ─────────────────────────────
+// Re-exported from the shared infra primitive so the tool layer and the
+// plugin host share one implementation (see zeroclaw-infra::net_guard).
+pub(crate) use zeroclaw_infra::net_guard::{is_non_global_v4, is_non_global_v6};
 
-pub(crate) fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
-    let [a, b, c, _] = v4.octets();
-    v4.is_loopback()
-        || v4.is_private()
-        || v4.is_link_local()
-        || v4.is_unspecified()
-        || v4.is_broadcast()
-        || v4.is_multicast()
-        || (a == 100 && (64..=127).contains(&b)) // RFC 6598 shared address space
-        || a >= 240 // Reserved
-        || (a == 192 && b == 0 && (c == 0 || c == 2)) // 192.0.0.0/24, 192.0.2.0/24
-        || (a == 198 && b == 51) // Documentation (198.51.100.0/24)
-        || (a == 203 && b == 0) // Documentation (203.0.113.0/24)
-        || (a == 198 && (18..=19).contains(&b)) // Benchmarking (198.18.0.0/15)
+pub(crate) fn is_cloud_metadata_ip(ip: std::net::IpAddr) -> bool {
+    const EC2_IMDS_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(169, 254, 169, 254);
+    const EC2_IMDS_V6: std::net::Ipv6Addr =
+        std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
+
+    match ip {
+        std::net::IpAddr::V4(v4) => v4 == EC2_IMDS_V4,
+        std::net::IpAddr::V6(v6) => v6 == EC2_IMDS_V6,
+    }
 }
 
-pub(crate) fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
-    let segs = v6.segments();
-    v6.is_loopback()
-        || v6.is_unspecified()
-        || v6.is_multicast()
-        || (segs[0] & 0xfe00) == 0xfc00 // Unique-local (fc00::/7)
-        || (segs[0] & 0xffc0) == 0xfe80 // Link-local (fe80::/10)
-        || (segs[0] == 0x2001 && segs[1] == 0x0db8) // Documentation (2001:db8::/32)
-        || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
+pub(crate) fn validate_resolved_ips_are_public(
+    host: &str,
+    ips: &[std::net::IpAddr],
+) -> anyhow::Result<()> {
+    if ips.is_empty() {
+        anyhow::bail!("Failed to resolve host '{host}'");
+    }
+
+    for ip in ips {
+        if is_cloud_metadata_ip(*ip) {
+            anyhow::bail!("Blocked host '{host}' resolved to cloud metadata address {ip}");
+        }
+
+        let non_global = match ip {
+            std::net::IpAddr::V4(v4) => is_non_global_v4(*v4),
+            std::net::IpAddr::V6(v6) => is_non_global_v6(*v6),
+        };
+        if non_global {
+            anyhow::bail!("Blocked host '{host}' resolved to non-global address {ip}");
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_resolved_ips_exclude_metadata(
+    host: &str,
+    ips: &[std::net::IpAddr],
+) -> anyhow::Result<()> {
+    if ips.is_empty() {
+        anyhow::bail!("Failed to resolve host '{host}'");
+    }
+
+    for ip in ips {
+        if is_cloud_metadata_ip(*ip) {
+            anyhow::bail!("Blocked host '{host}' resolved to cloud metadata address {ip}");
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -381,5 +383,57 @@ mod tests {
     #[test]
     fn allows_public_ipv6() {
         assert!(!is_private_or_local_host("2607:f8b0:4004:800::200e"));
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_private_resolution() {
+        let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))];
+        let err = validate_resolved_ips_are_public("example.com", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-global address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_metadata_even_for_private_opt_in() {
+        let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            169, 254, 169, 254,
+        ))];
+        let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_blocks_ec2_ipv6_metadata_even_for_private_opt_in() {
+        let ips = ["fd00:ec2::254".parse().unwrap()];
+        let err = validate_resolved_ips_exclude_metadata("metadata.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_ips_metadata_is_not_reported_as_generic_private() {
+        let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            169, 254, 169, 254,
+        ))];
+        let err = validate_resolved_ips_are_public("metadata.test", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
     }
 }

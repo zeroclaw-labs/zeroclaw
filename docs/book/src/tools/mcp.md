@@ -4,13 +4,37 @@ ZeroClaw is an MCP client: it connects to external [Model Context Protocol](http
 
 ## Configure MCP
 
-MCP support is enabled by default, but no external MCP tools are exposed until at least one server is configured under `mcp.servers`. Configure through the gateway, zerocode, or `zeroclaw config set`:
+MCP support is enabled by default, but no external MCP tools are exposed until at least one server is configured under `mcp.servers` and an agent is granted that server through its `mcp_bundles` (see Per-agent server scoping below). Configure through the gateway, zerocode, or `zeroclaw config set`:
 
 ```sh
 zeroclaw config set mcp.servers.filesystem.command npx
 ```
 
 Set `mcp.enabled = false` to disable MCP tool loading without removing server definitions.
+
+## Per-agent server scoping (`mcp_bundles`)
+
+A `[[mcp.servers]]` entry only *defines* a server. Which servers an agent actually connects to is decided by that agent's `agents.<alias>.mcp_bundles`, and the model is secure by default: omission is not a grant.
+
+- An agent with no `mcp_bundles` connects to **no** MCP servers, even when `mcp.servers` is non-empty.
+- A bundle `[mcp_bundles.<alias>]` names the servers it grants by their `mcp.servers` `name`, with an optional `exclude` list. An agent's grant is the union of the servers across every bundle it references, minus any name excluded by any of those bundles (deny wins).
+- An unknown bundle alias, or a bundle server name that matches no configured server, grants nothing. Both fail closed and are reported as non-fatal warnings by config validation, so a typo narrows an agent's access instead of widening it.
+
+```toml
+[[mcp.servers]]
+name = "filesystem"
+command = "npx"
+
+[mcp_bundles.files]
+servers = ["filesystem"]
+
+[agents.assistant]
+mcp_bundles = ["files"]   # connects to `filesystem`; an agent without this gets no MCP servers
+```
+
+- Bundle changes take effect on **session restart**. The resolver (`Config::mcp_servers_for_agent`) runs at session/agent construction time; editing `[mcp_bundles.*]` or `agents.<alias>.mcp_bundles` while a session is live does not change that session's connected servers. End and restart the affected sessions to pick up new grants.
+
+This is the *connection* boundary (which servers an agent talks to at all). The `allowed_tools` / `excluded_tools` controls below are the per-tool *capability* boundary applied on top of whatever a granted server exposes.
 
 ## Transports
 
@@ -101,3 +125,42 @@ The MCP `__` auto-admit exception is scoped to the **risk profile**'s `allowed_t
 `auto_approve` alone does not hide a tool from the model; it only answers the approval question after the model selects that tool. Use `tool_filter_groups` to reduce prompt noise and `allowed_tools` / `excluded_tools` to enforce a capability boundary.
 
 See [Autonomy levels](../security/autonomy.md) for the full per-profile field surface, and the [Config reference](../reference/config.md#mcp) for every MCP field and default.
+
+## MCP Resources and Prompts
+
+In addition to MCP **tools**, ZeroClaw exposes MCP **resources** and **prompts**
+from connected servers.
+
+### Tools
+
+Two built-in tools are available (subject to your agent's tool access policy):
+
+- `mcp_resources`: `action: "list"` (optional `server`, `cursor`) lists
+  resources; `action: "read"` with `uri` (prefixed `<server>__<uri>`) returns
+  contents.
+- `mcp_prompts`: `action: "list"` lists prompts; `action: "get"` with `name`
+  (prefixed `<server>__<name>`) and optional `arguments` returns the rendered
+  prompt messages.
+
+Servers that do not advertise resource/prompt capabilities are skipped, and calls
+against them return a clear "does not support" error.
+
+### Pinning resources into context
+
+Each MCP server entry accepts an optional `pinned_resources` field: a list of
+resource URIs to read once at startup and inject into the system prompt. Set it
+through the same config surfaces used to define the server (the gateway, zerocode,
+or `zeroclaw config set`, as shown under [Configure MCP](#configure-mcp)), naming
+the resources you want the agent to always have on hand. The field defaults to
+empty, so servers without it are unaffected.
+
+Pinned content is read once per run (no live refresh) and is labeled
+`trust="untrusted-external"` so the model treats it as data, not instructions.
+
+### Security
+
+Resource and prompt content originates from the configured MCP server and is
+treated as **untrusted**: it is provenance-wrapped, secret-scrubbed, and
+length-bounded before entering context. Access to `mcp_resources` / `mcp_prompts`
+and to specific servers is governed by your agent's tool access policy (risk
+profile), and narrows correctly when delegating to subagents.

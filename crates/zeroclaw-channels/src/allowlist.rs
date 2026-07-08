@@ -144,4 +144,13 @@ mod tests {
         assert!(is_user_allowed_by(&list, "+1 555 0100", matcher));
         assert!(!is_user_allowed_by(&list, "+15550101", matcher));
     }
+
+    #[test]
+    fn by_wildcard_short_circuits_matcher() {
+        let list = vec!["*".to_string()];
+
+        assert!(is_user_allowed_by(&list, "alice", |_, _| {
+            panic!("wildcard should short-circuit before custom matcher runs");
+        }));
+    }
 }
