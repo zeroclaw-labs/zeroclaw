@@ -40,7 +40,10 @@ import PersonalityEditor from "../components/sections/PersonalityEditor";
 import SkillsBundleEditor from "../components/sections/SkillsBundleEditor";
 import BindChannelForm from "../components/sections/BindChannelForm";
 import ReloadDaemonButton from "../components/sections/ReloadDaemonButton";
-import SectionPicker from "../components/sections/SectionPicker";
+import SectionPicker, {
+  badgeIsGood,
+  badgeTone,
+} from "../components/sections/SectionPicker";
 import SectionNavigator from "../components/sections/SectionNavigator";
 import AddEntityDialog from "../components/sections/AddEntityDialog";
 import SectionTabs, {
@@ -1615,9 +1618,7 @@ function ConfiguredOnlyPicker({
         .then((resp) => {
           if (cancelled) return;
           setItems(
-            resp.items.filter(
-              (i) => i.badge === "configured" || i.badge === "active",
-            ),
+            resp.items.filter((i) => badgeIsGood(i.badge)),
           );
         })
         .catch((e) => {
@@ -1689,7 +1690,7 @@ function ConfiguredOnlyPicker({
           </div>
           <div className="flex items-center gap-2 flex-shrink-0">
             {item.badge && (
-              <Badge tone={item.badge === "active" ? "ok" : "neutral"}>
+              <Badge tone={badgeTone(item.badge)}>
                 {item.badge}
               </Badge>
             )}

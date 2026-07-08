@@ -363,6 +363,14 @@ pub struct Agent {
     /// (`trust="untrusted-external"`). Empty when no pins are configured or all
     /// were skipped. Appended to the system prompt in `build_system_prompt`.
     mcp_pinned_section: String,
+    /// Pre-rendered deferred-MCP-tools system-prompt section, built once at
+    /// construction when `mcp.deferred_loading` is enabled. It enumerates the
+    /// policy-admitted `<server>__<tool>` stubs and instructs the model to call
+    /// `tool_search` to activate them. Empty when deferred loading is off or no
+    /// stubs are admitted. Appended to the system prompt in
+    /// `build_system_prompt` so TUI Chat sessions surface the same deferred MCP
+    /// affordance the gateway and channel/webhook paths already expose (#8193).
+    mcp_deferred_section: String,
     /// Hook runner for tool-call auditing and lifecycle side effects.
     /// See issue #5462.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
@@ -505,6 +513,7 @@ pub struct AgentBuilder {
     approval_route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     mcp_pinned_section: Option<String>,
+    mcp_deferred_section: Option<String>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     approval_manager: Option<Arc<ApprovalManager>>,
     agent_alias: Option<String>,
@@ -552,6 +561,7 @@ impl AgentBuilder {
             approval_route: None,
             activated_tools: None,
             mcp_pinned_section: None,
+            mcp_deferred_section: None,
             hook_runner: None,
             approval_manager: None,
             agent_alias: None,
@@ -728,6 +738,11 @@ impl AgentBuilder {
 
     pub fn mcp_pinned_section(mut self, section: Option<String>) -> Self {
         self.mcp_pinned_section = section;
+        self
+    }
+
+    pub fn mcp_deferred_section(mut self, section: Option<String>) -> Self {
+        self.mcp_deferred_section = section;
         self
     }
 
@@ -909,6 +924,7 @@ impl AgentBuilder {
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
             mcp_pinned_section: self.mcp_pinned_section.unwrap_or_default(),
+            mcp_deferred_section: self.mcp_deferred_section.unwrap_or_default(),
             hook_runner: self.hook_runner,
             approval_manager: self.approval_manager,
             agent_alias: self.agent_alias.unwrap_or_default(),
@@ -1114,6 +1130,23 @@ impl Agent {
         self.temperature = temperature;
     }
 
+    /// Refresh this agent's memory embedder after a provider-profile
+    /// `config/set`/`config/delete`, so a live session's per-agent memory stops
+    /// embedding against a stale endpoint/key without a daemon restart (#8359).
+    /// Forwards through any memory wrappers (e.g. `AgentScopedMemory`) to the
+    /// embedding backend; a no-op for backends that do not embed. `&self` —
+    /// the swap is interior to the memory handle.
+    pub fn refresh_memory_embedder(
+        &self,
+        model_provider: &str,
+        api_key: Option<&str>,
+        model: &str,
+        dimensions: usize,
+    ) {
+        self.memory
+            .refresh_embedder(model_provider, api_key, model, dimensions);
+    }
+
     #[cfg(test)]
     pub fn temperature_for_test(&self) -> Option<f64> {
         self.temperature
@@ -1153,6 +1186,14 @@ impl Agent {
     #[cfg(test)]
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.iter().map(|t| t.name()).collect()
+    }
+
+    /// Render the current system prompt. Test-only — lets regression tests
+    /// assert on prompt-injected sections (e.g. the deferred-MCP-tools section
+    /// that advertises `tool_search`) without driving a full turn (#8193).
+    #[cfg(test)]
+    pub fn system_prompt_for_test(&self) -> Result<String> {
+        self.build_system_prompt()
     }
 
     /// Hydrate the agent with prior chat messages (e.g. from a session backend).
@@ -1349,12 +1390,20 @@ impl Agent {
         if let Err(e) = tokio::fs::create_dir_all(&agent_workspace).await {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "workspace": agent_workspace.display().to_string(), "e": e.to_string()})), "Failed to create per-agent workspace dir (continuing): ");
         }
-        // Seed the agent's bootstrap files (AGENTS.md / SOUL.md /
-        // IDENTITY.md / USER.md / TOOLS.md / BOOTSTRAP.md) on first
-        // run. Idempotent — never overwrites existing files; only
-        // fills in the gaps so a freshly-created agent has a basic
-        // identity to load.
-        if let Err(e) = zeroclaw_config::schema::ensure_bootstrap_files(&agent_workspace).await {
+        // Seed the agent's personality files (SOUL.md / IDENTITY.md /
+        // USER.md / AGENTS.md / TOOLS.md / HEARTBEAT.md / MEMORY.md) from
+        // the default preset on first run. Idempotent — only missing or
+        // blank files are written, so existing user edits are preserved.
+        // Without this a freshly-created agent loads with empty operating
+        // files, which silently breaks tool use for prompt-guided models
+        // that rely on AGENTS.md/TOOLS.md instead of native tool schemas.
+        if let Err(e) = crate::agent::personality::seed_default_personality(
+            config,
+            agent_alias,
+            &agent_workspace,
+        )
+        .await
+        {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "workspace": agent_workspace.display().to_string(), "e": e.to_string()})), "Failed to ensure per-agent bootstrap files (continuing with whatever exists): ");
         }
         let security = Arc::new({
@@ -1453,183 +1502,50 @@ impl Agent {
             sop_audit,
             None,
         );
-        let mut tools = all_tools_result.tools;
-        let delegate_handle = all_tools_result.delegate_handle;
-        let ask_user_handle = all_tools_result.ask_user_handle;
-        let channel_room_handle = all_tools_result.channel_room_handle;
-        let reaction_handle = all_tools_result.reaction_handle;
-        let poll_handle = all_tools_result.poll_handle;
-        let escalate_handle = all_tools_result.escalate_handle;
-
-        // ── Built-in SecurityPolicy tool gate (parity with agent::run) ──
-        // Apply the agent's allowlist (`allowed_tools`) AND denylist
-        // (`excluded_tools`) to the built-in registry *before* MCP tools and
-        // skill tools are added. `from_config` (ws.rs / daemon) bypasses the
-        // channel orchestrator and previously enforced only the risk-profile
-        // denylist (further below) on this path — never the allowlist — so an
-        // agent allowlisted to e.g. `file_read` still kept raw `shell` /
-        // `file_write`. Filtering here, before skill registration, is also
-        // what lets a scoped elevation wrapper survive: the raw target is
-        // removed while the distinct prefixed `{skill}__{tool}` wrapper is
-        // appended later. MCP tools are initialized after this built-in
-        // filter, then MCP registration and deferred discovery apply the same
-        // SecurityPolicy explicitly so denied MCP tools do not surface.
-        let before_policy_filter = tools.len();
-        crate::agent::loop_::apply_policy_tool_filter(&mut tools, Some(security.as_ref()), None);
-        if tools.len() != before_policy_filter {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({
-                        "before": before_policy_filter,
-                        "retained": tools.len(),
-                        "policy_allowed": security.allowed_tools.as_ref().map(|v| v.len()),
-                        "policy_excluded": security.excluded_tools.as_ref().map(|v| v.len()),
-                    })),
-                "Applied SecurityPolicy built-in tool filter (from_config path)"
-            );
-        }
-
-        // ── Wire MCP tools (non-fatal) ─────────────────────────────
-        // Replicates the same MCP initialization logic used in the CLI
-        // and webhook paths (loop_.rs) so that the WebSocket/daemon UI
-        // path also has access to MCP tools.
-        let mut activated_tools: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>> = None;
-        // Provenance-wrapped MCP pinned-resource system-prompt section, read
-        // once at construction (capability- and policy-gated).
-        let mut mcp_pinned_section = String::new();
-        // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
-        let mut mcp_elevation_arcs: Vec<Arc<dyn tools::Tool>> = Vec::new();
-        // Secure by default: only the MCP servers granted by this agent's
-        // `mcp_bundles` (omission is not a grant). Regression-covered by
-        // `crates/zeroclaw-runtime/src/rpc/dispatch.rs::tests::`
-        // `chat_session_new_omits_mcp_tools_when_agent_has_no_bundles_{deferred,eager}`
-        // - those tests reach this code path via `session/new` -> `Agent::from_config_with_tui_env`.
-        // If you change the call below, update those tests.
-        let agent_mcp_servers = if initialize_mcp && config.mcp.enabled {
-            config.mcp_servers_for_agent(agent_alias)
-        } else {
-            Vec::new()
-        };
-        if !agent_mcp_servers.is_empty() {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                &format!(
-                    "Initializing MCP client - {} server(s) granted via mcp_bundles",
-                    agent_mcp_servers.len()
-                )
-            );
-            match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
-                Ok(registry) => {
-                    let registry = std::sync::Arc::new(registry);
-                    mcp_elevation_arcs = tools::collect_mcp_elevation_arcs(&registry).await;
-                    let mcp_policy =
-                        crate::agent::loop_::mcp_tool_access_policy(security.as_ref(), None);
-                    for tool in tools::build_mcp_capability_tools(&registry, mcp_policy.as_ref()) {
-                        crate::agent::loop_::register_eager_mcp_tool_if_allowed(
-                            tool,
-                            &mut tools,
-                            delegate_handle.as_ref(),
-                            mcp_policy.as_ref(),
-                        );
-                    }
-                    mcp_pinned_section = tools::mcp_context::build_pinned_resources_section(
-                        &registry,
-                        &agent_mcp_servers,
-                        mcp_policy.as_ref(),
-                    )
-                    .await;
-                    if config.mcp.deferred_loading {
-                        let deferred_set = tools::DeferredMcpToolSet::from_registry(
-                            std::sync::Arc::clone(&registry),
-                        )
-                        .await;
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
-                            &format!(
-                                "MCP deferred: {} tool stub(s) from {} server(s)",
-                                deferred_set.len(),
-                                registry.server_count()
-                            )
-                        );
-                        let allowed_stub_count = crate::agent::loop_::mcp_allowed_tool_count(
-                            deferred_set
-                                .stubs
-                                .iter()
-                                .map(|stub| stub.prefixed_name.as_str()),
-                            mcp_policy.as_ref(),
-                        );
-                        if allowed_stub_count > 0 {
-                            let activated =
-                                Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
-                            activated_tools = Some(Arc::clone(&activated));
-                            let mut tool_search =
-                                tools::ToolSearchTool::new(deferred_set, activated);
-                            if let Some(policy) = mcp_policy {
-                                tool_search = tool_search.with_access_policy(policy);
-                            }
-                            tools.push(Box::new(tool_search));
-                        }
-                    } else {
-                        let names = registry.tool_names();
-                        let mut registered = 0usize;
-                        let mut skipped = 0usize;
-                        for name in names {
-                            if !crate::agent::loop_::eager_mcp_tool_allowed(
-                                &name,
-                                mcp_policy.as_ref(),
-                            ) {
-                                skipped += 1;
-                                continue;
-                            }
-                            if let Some(def) = registry.get_tool_def(&name).await {
-                                let wrapper: std::sync::Arc<dyn tools::Tool> =
-                                    std::sync::Arc::new(tools::McpToolWrapper::new(
-                                        name,
-                                        def,
-                                        std::sync::Arc::clone(&registry),
-                                    ));
-                                if crate::agent::loop_::register_eager_mcp_tool_if_allowed(
-                                    wrapper,
-                                    &mut tools,
-                                    delegate_handle.as_ref(),
-                                    mcp_policy.as_ref(),
-                                ) {
-                                    registered += 1;
-                                }
-                            }
-                        }
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
-                            &format!(
-                                "MCP: {} tool(s) registered from {} server(s), {} skipped by policy",
-                                registered,
-                                registry.server_count(),
-                                skipped
-                            )
-                        );
-                    }
-                }
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "MCP registry failed to initialize"
-                    );
-                }
-            }
-        }
+        // Skills are loaded here and handed to `assemble`, which owns skill
+        // registration and resolves builtin/MCP elevation against the pre-filter
+        // arcs internally. Bundle-aware via `[agents.<alias>].skill_bundles`.
+        let skills = crate::skills::load_skills_for_agent_from_config(config, agent_alias);
+        // Route the per-agent tool registry through the one gated seam - the same
+        // `assemble` seam `run()` uses. This replaces the hand-rolled built-in filter,
+        // MCP scoping, and skill registration from_config previously duplicated.
+        // connect_mcp mirrors the old `initialize_mcp && config.mcp.enabled` gate;
+        // connect_peripherals is false because from_config never loaded peripheral
+        // tools (routing them in would be a widening and would open serial hardware).
+        let crate::tools::scoped::ScopedAssembled {
+            registry,
+            delegate_handle: _,
+            ask_user_handle,
+            reaction_handle,
+            poll_handle,
+            escalate_handle,
+            channel_room_handle,
+            // The Agent injects two distinct MCP prompt slots: `mcp_deferred_section`
+            // (the deferred tool-search listing) and `mcp_pinned_section`
+            // (pinned resources). `assemble` surfaces the two atomically, so from_config
+            // threads each into its own slot below - no duplication, and the deferred
+            // advertisement the regression suite asserts is preserved.
+            deferred_section,
+            pinned_section,
+            activated_handle,
+        } = crate::tools::scoped::ScopedToolRegistry::assemble(
+            crate::tools::scoped::ScopedAssembly {
+                config,
+                agent_alias,
+                security: &security,
+                built: all_tools_result,
+                skills: &skills,
+                runtime,
+                caller_allowed: None,
+                connect_mcp: initialize_mcp,
+                connect_peripherals: false,
+                exclude_memory,
+                emit_assembly_logs: true,
+                list_deferred_mcp_specs: false,
+            },
+        )
+        .await;
+        let tools = registry.into_inner();
 
         let model_name = match agent_model_provider
             .and_then(|e| e.model.as_deref())
@@ -1685,36 +1601,6 @@ impl Agent {
             None
         };
 
-        // Filter out tools excluded by this agent's risk profile. The
-        // channel orchestrator applies this for channel-driven runs, but
-        // Agent::from_config (used by ws.rs) doesn't go through that path.
-        let excluded = &risk_profile.excluded_tools;
-        if !excluded.is_empty() {
-            tools.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
-        }
-
-        // Load skills and register them as callable tools so WebSocket/daemon
-        // sessions can execute them (not just describe them in the prompt).
-        // Bundle-aware so `[agents.<alias>].skill_bundles` aliases resolve
-        // through to `[skill_bundles.<alias>].directory` (defaulting to
-        // `<install>/shared/skills/<alias>/`).
-        let skills = crate::skills::load_skills_for_agent_from_config(config, agent_alias);
-        // Resolution registry = built-in arcs + resolution-only MCP wrappers, so
-        // skill elevation (kind = "builtin" / "mcp") can resolve either target.
-        let skill_resolution_registry: Vec<Arc<dyn tools::Tool>> = all_tools_result
-            .unfiltered_tool_arcs
-            .iter()
-            .cloned()
-            .chain(mcp_elevation_arcs.iter().cloned())
-            .collect();
-        tools::register_skill_tools_with_context_and_runtime(
-            &mut tools,
-            &skills,
-            security.clone(),
-            &skill_resolution_registry,
-            runtime,
-        );
-
         let approval_manager = if approval_backchannel {
             ApprovalManager::for_non_interactive_backchannel(risk_profile)
         } else {
@@ -1760,8 +1646,9 @@ impl Agent {
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(risk_profile.level)
             .approval_route(risk_profile.approval_route.clone())
-            .activated_tools(activated_tools)
-            .mcp_pinned_section(Some(mcp_pinned_section))
+            .activated_tools(activated_handle)
+            .mcp_deferred_section(Some(deferred_section))
+            .mcp_pinned_section(Some(pinned_section))
             .hook_runner(if config.hooks.enabled {
                 Some(Arc::new(crate::hooks::HookRunner::from_config(
                     &config.hooks,
@@ -1996,6 +1883,10 @@ impl Agent {
         let receipts = &self.config.resolved.tool_receipts;
         if receipts.enabled && receipts.inject_system_prompt {
             prompt.push_str(crate::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
+        }
+        if !self.mcp_deferred_section.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&self.mcp_deferred_section);
         }
         if !self.mcp_pinned_section.is_empty() {
             prompt.push_str("\n\n");
@@ -3116,6 +3007,12 @@ pub async fn run(
 #[cfg(test)]
 #[path = "safety_net.rs"]
 mod safety_net;
+
+// Agent-policy parity harness: the cross-path matrix + L1/L2 locks,
+// sibling of the safety net so it reuses the same fixtures.
+#[cfg(test)]
+#[path = "parity.rs"]
+mod parity;
 
 #[cfg(test)]
 mod tests {

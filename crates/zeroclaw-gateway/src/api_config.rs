@@ -635,6 +635,11 @@ pub async fn compute_drift(in_memory: &zeroclaw_config::schema::Config) -> Vec<D
         if is_gateway_managed_field(name) {
             continue;
         }
+        // Env overrides (`ZEROCLAW_<path>`) apply in memory but never persist to
+        // disk, so a disk comparison always reports drift the operator can't fix.
+        if in_memory.prop_is_env_overridden(name) {
+            continue;
+        }
         let mem = in_memory_props.get(name);
         let disk = on_disk_props.get(name);
         let mem_display = mem
@@ -1967,6 +1972,103 @@ async fn rename_agent_cascade(
         renamed: true,
         warnings,
     })
+    .into_response()
+}
+
+/// `POST /api/config/model-providers/{type}/{alias}/refresh-context-window`
+/// — fetch and update `context_window` from the provider's /models endpoint.
+///
+/// Returns the updated config value. Only works for providers that expose
+/// `context_length`/`context_window` in their `/models` endpoint
+/// (OpenRouter, Together, Groq, Fireworks, DeepInfra, Hyperbolic, Anyscale, Novita, Nebius).
+///
+/// If the provider doesn't support it or the fetch fails, returns 400 with an error.
+pub async fn handle_refresh_context_window(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path((provider_type, alias)): axum::extract::Path<(String, String)>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let mut working = state.config.read().clone();
+    let path = format!("providers.models.{provider_type}.{alias}");
+
+    // Verify the entry exists
+    if working.get_prop(&format!("{path}.model")).is_err() {
+        return error_response(
+            ConfigApiError::new(
+                ConfigApiCode::PathNotFound,
+                format!("model provider '{provider_type}.{alias}' not found"),
+            )
+            .with_path(&path),
+        );
+    }
+
+    // Build minimal provider config for fetch
+    let model = working
+        .get_prop(&format!("{path}.model"))
+        .ok()
+        .unwrap_or_default();
+    let uri = working.get_prop(&format!("{path}.uri")).ok();
+    // Read api_key via JSON serialization to bypass #[secret] masking in get_prop.
+    let api_key = serde_json::to_value(&working.providers).ok().and_then(|v| {
+        v.pointer(&format!("/models/{provider_type}/{alias}/api_key"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && *s != "<unset>")
+            .map(String::from)
+    });
+
+    let provider_config = zeroclaw_config::schema::ModelProviderConfig {
+        model: Some(model),
+        uri,
+        api_key,
+        ..Default::default()
+    };
+
+    // Fetch context window from provider
+    let context_window = match zeroclaw_providers::fetch_context_window(
+        &provider_type,
+        &provider_config,
+    )
+    .await
+    {
+        Some(ctx) => ctx,
+        None => {
+            return error_response(
+                ConfigApiError::new(
+                    ConfigApiCode::InvalidFormat,
+                    format!("provider '{provider_type}' does not support context window auto-detection or fetch failed"),
+                )
+                .with_path(&path),
+            );
+        }
+    };
+
+    // Update config
+    if let Err(e) = working.set_prop_persistent(
+        &format!("{path}.context_window"),
+        &context_window.to_string(),
+    ) {
+        return error_response(
+            ConfigApiError::new(
+                ConfigApiCode::InternalError,
+                format!("failed to persist context_window: {e}"),
+            )
+            .with_path(&path),
+        );
+    }
+
+    working.mark_dirty(&format!("{path}.context_window"));
+    if let Err(e) = persist_and_swap(&state, working).await {
+        return error_response(e);
+    }
+
+    axum::Json(serde_json::json!({
+        "path": path,
+        "context_window": context_window,
+    }))
     .into_response()
 }
 
@@ -3835,6 +3937,26 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn compute_drift_excludes_env_overridden_secret() {
+        let (_tmp, path) = temp_config_path();
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: path.clone(),
+            ..Default::default()
+        };
+        cfg.save().await.expect("initial save");
+
+        cfg.composio.api_key = Some("injected-via-env".into());
+        cfg.env_overridden_paths =
+            std::collections::HashSet::from(["composio.api_key".to_string()]);
+
+        let drift = compute_drift(&cfg).await;
+        assert!(
+            !drift.iter().any(|d| d.path == "composio.api_key"),
+            "env-overridden secret must never appear in drift, got {drift:?}"
+        );
+    }
+
     /// Guardrail against the original #7156 bug class: a new `#[secret]` field
     /// added under `[gateway]` that the gateway also mints/rotates itself will
     /// reproduce the permanent-banner symptom unless it is explicitly listed
@@ -4102,38 +4224,24 @@ mod tests {
             .or_default()
             .allowed_commands = vec!["echo".into()];
         config.runtime_profiles.entry("default".into()).or_default();
-        // Force the workspace archive `fs::rename` to fail: place a FILE at
-        // the archive-destination path, so the move into `<archive>/workspace`
-        // can't complete. (Archive-dir creation itself succeeds — the partial
-        // failure is at the rename step, which is exactly the case #7941
-        // calls out as currently invisible to the caller.)
-        let archive_root = config.data_dir.join("agents").join("_deleted");
-        std::fs::create_dir_all(&archive_root).unwrap();
-        // We don't know the exact timestamped subdir in advance, so we block
-        // the rename by making the agent's workspace itself unrenamable:
-        // put a file where the workspace dir is supposed to be created, so
-        // `agent_workspace_dir(victim)` points to a path that exists AS A
-        // FILE (not a dir) — `fs::rename` of a file onto a non-existent path
-        // is fine, but the cascade test also exercises the case where the
-        // archive-dir creation has already happened. The simplest reliable
-        // block: replace the workspace dir with a FILE so that when the
-        // handler later does `if workspace.exists()` then
-        // `tokio::fs::rename(&workspace, &dest)`, the source exists but the
-        // rename can still succeed. We need a different tactic — see below.
-        //
-        // Robust tactic: pre-create a FILE at the exact path the timestamped
-        // archive dir WOULD use, so `create_dir_all` for that path fails
-        // (because a non-dir entry already exists at that location). We
-        // can't know the timestamp up front, so instead we block the rename
-        // by making the parent-of-archive non-writable: chown the archive
-        // root to a read-only mode. Cross-platform: just remove write perms
-        // on unix.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&archive_root, std::fs::Permissions::from_mode(0o555))
-                .unwrap();
-        }
+        // Force the archive-dir side-effect to fail deterministically —
+        // regardless of uid — by planting a regular file at
+        // `<data_dir>/agents/_deleted`. `delete_agent_cascade` then calls
+        // `create_dir_all(<data_dir>/agents/_deleted/<alias>-<ts>)`, which
+        // walks name lookup through the file and returns ENOTDIR (os error
+        // 20). This is a filesystem-type error, not a permission check, so
+        // root — which some containerized CI runners execute as — cannot
+        // bypass it. The previous approach cleared the write bit on
+        // `_deleted` (mode 0o555); root ignores the mode and
+        // `create_dir_all` silently succeeded, leaving `warnings` empty of
+        // the archive line the test is asserting on, and the assertion
+        // then latched onto whatever other warning was present
+        // (historically a `MockMemory::purge_agent` "not supported" error,
+        // which we now suppress via a no-op impl in `api.rs`).
+        let agents_dir = config.data_dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let deleted_marker = agents_dir.join("_deleted");
+        std::fs::write(&deleted_marker, b"").expect("seed _deleted blocker file");
         let old_ws = config.agent_workspace_dir("victim");
         std::fs::create_dir_all(&old_ws).unwrap();
         // Drop a real file inside the workspace so the cascade has something
@@ -4144,14 +4252,6 @@ mod tests {
 
         let state = crate::api::test_state(config.clone());
         let resp = delete_agent_cascade(&state, config.clone(), "victim").await;
-
-        // Restore archive-root writability so the test cleans up.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&archive_root, std::fs::Permissions::from_mode(0o755))
-                .unwrap();
-        }
 
         // The HTTP call is still 200 OK — partial failure is not an error
         // response, it is a successful response with `warnings` populated.
@@ -4266,6 +4366,101 @@ mod tests {
                 .channel_external_peers("telegram", "ghost")
                 .is_empty(),
             "a phantom-alias bind must not create a peer group"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_context_window_forwards_api_key() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer test-api-key-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{
+                    "id": "llama-3.1-70b",
+                    "context_length": 4096
+                }]
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let (_tmp, path) = temp_config_path();
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: path.clone(),
+            ..Default::default()
+        };
+        cfg.providers.models.groq.insert(
+            "test".to_string(),
+            zeroclaw_config::schema::GroqModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("llama-3.1-70b".into()),
+                    api_key: Some("test-api-key-123".into()),
+                    uri: Some(mock.uri()),
+                    ..Default::default()
+                },
+            },
+        );
+        cfg.save().await.expect("initial save");
+
+        let state = crate::api::test_state(cfg);
+
+        let app = axum::Router::new()
+            .route(
+                "/api/config/model-providers/{type}/{alias}/refresh-context-window",
+                axum::routing::post(handle_refresh_context_window),
+            )
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/config/model-providers/groq/test/refresh-context-window")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            response.status().is_success(),
+            "expected 200, got {}",
+            response.status()
+        );
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+
+        assert_eq!(json["path"], "providers.models.groq.test");
+        assert_eq!(json["context_window"], 4096);
+        assert!(
+            !body_str.contains("test-api-key-123"),
+            "API key leaked in response body"
+        );
+
+        let requests = mock.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "expected exactly one request to mock");
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer test-api-key-123"
         );
     }
 }
