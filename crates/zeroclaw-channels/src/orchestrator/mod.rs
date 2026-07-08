@@ -24790,6 +24790,59 @@ Done."#;
             "a git-produced internal marker must select SOP ingress"
         );
     }
+
+    /// Pins #7809: the channel tool-loop reads `strict_tool_parsing` and
+    /// `parallel_tools` from `agent_cfg.resolved` (populated), not from
+    /// `prompt_config.agent(alias).resolved` (serde-skipped default).
+    #[test]
+    fn resolved_agent_config_carries_strict_tool_parsing_and_parallel_tools() {
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+
+        prompt_config.runtime_profiles.insert(
+            "strict-parallel".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                strict_tool_parsing: true,
+                parallel_tools: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let agent_alias = "test-agent";
+        prompt_config.agents.insert(
+            agent_alias.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: zeroclaw_config::providers::RuntimeProfileRef::from(
+                    "strict-parallel",
+                ),
+                ..Default::default()
+            },
+        );
+
+        let agent_cfg = prompt_config
+            .resolved_agent_config(agent_alias)
+            .expect("agent must resolve");
+
+        assert!(
+            agent_cfg.resolved.strict_tool_parsing,
+            "resolved.strict_tool_parsing should be true from the runtime profile"
+        );
+        assert!(
+            agent_cfg.resolved.parallel_tools,
+            "resolved.parallel_tools should be true from the runtime profile"
+        );
+
+        let raw_agent = prompt_config
+            .agent(agent_alias)
+            .expect("agent must exist in prompt_config");
+        assert!(
+            !raw_agent.resolved.strict_tool_parsing,
+            "raw agent resolved.strict_tool_parsing should be false (serde-skipped default)"
+        );
+        assert!(
+            !raw_agent.resolved.parallel_tools,
+            "raw agent resolved.parallel_tools should be false (serde-skipped default)"
+        );
+    }
 }
 
 #[cfg(test)]
