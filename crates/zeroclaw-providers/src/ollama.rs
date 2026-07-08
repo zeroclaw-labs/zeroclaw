@@ -1288,7 +1288,8 @@ mod tests {
                     "path": {"type": "string"}
                 },
                 "required": ["path"]
-            }),
+            })
+            .into(),
         }];
 
         let response = provider
