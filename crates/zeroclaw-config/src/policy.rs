@@ -273,11 +273,22 @@ impl SecurityPolicy {
             .allowed_tools
             .as_ref()
             .is_none_or(|list| list.iter().any(|t| t == name));
-        let excluded = self
-            .excluded_tools
+        allowed && !self.is_tool_excluded(name)
+    }
+
+    /// True when `name` is on the `excluded_tools` denylist.
+    ///
+    /// `excluded_tools` always subtracts, independent of the `allowed_tools`
+    /// allowlist. Skill-defined tools are gated by this denylist (not the
+    /// allowlist): they are granted explicitly via skill config, and
+    /// `builtin`-kind skill tools are scoped-elevation wrappers whose whole
+    /// purpose is to remain callable when the raw tool is not on the allowlist -
+    /// so applying the allowlist to them would defeat that mechanism. The
+    /// denylist still applies: excluding a skill tool by name removes it.
+    pub fn is_tool_excluded(&self, name: &str) -> bool {
+        self.excluded_tools
             .as_ref()
-            .is_some_and(|list| list.iter().any(|t| t == name));
-        allowed && !excluded
+            .is_some_and(|list| list.iter().any(|t| t == name))
     }
 }
 
@@ -2818,6 +2829,30 @@ mod tests {
         };
         assert!(p.is_tool_allowed("shell"));
         assert!(!p.is_tool_allowed("spawn_subagent"));
+    }
+
+    #[test]
+    fn is_tool_excluded_reflects_denylist_independent_of_allowlist() {
+        // No denylist → nothing excluded, regardless of allowlist.
+        let none = SecurityPolicy {
+            allowed_tools: Some(vec!["shell".into()]),
+            excluded_tools: None,
+            ..SecurityPolicy::default()
+        };
+        assert!(!none.is_tool_excluded("shell"));
+        assert!(
+            !none.is_tool_excluded("deploy__run"),
+            "a tool omitted from the allowlist is not 'excluded' — the denylist is separate"
+        );
+
+        // Denylist subtracts by name, independent of the allowlist.
+        let denied = SecurityPolicy {
+            allowed_tools: None,
+            excluded_tools: Some(vec!["deploy__status".into()]),
+            ..SecurityPolicy::default()
+        };
+        assert!(denied.is_tool_excluded("deploy__status"));
+        assert!(!denied.is_tool_excluded("deploy__run"));
     }
 
     // ── from_profiles propagation coverage ────────────────────
