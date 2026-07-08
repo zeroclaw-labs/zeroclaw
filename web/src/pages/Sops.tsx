@@ -15,6 +15,7 @@ import {
   decideSop,
   getSop,
   runSop,
+  createSop,
   saveSop,
   deleteSop,
   wireDraft,
@@ -1638,15 +1639,18 @@ export default function Sops() {
     if (!draft) return;
     setSaving(true);
     setSaveError(null);
-    // Save is an upsert: PUT /api/sops/{name} creates the SOP when absent and
-    // overwrites it when present, so a save never 409s on its own name. When an
-    // existing SOP was renamed in the editor (draft.name diverged from the name
-    // the edit started at), the upsert writes the new name; we then delete the
-    // old directory so the rename moves rather than forks. Renumbering and
-    // routing-ref remapping are owned by the daemon's normalize_step_numbers.
+    // A rename (draft.name diverged from the name the edit started at) writes
+    // the new name through create semantics, which 409 if that name already
+    // belongs to a different SOP, so a rename can never silently clobber an
+    // unrelated SOP. Only after the new name lands do we delete the old
+    // directory, turning the rename into a move rather than a fork. A
+    // non-rename stays an upsert (PUT keyed by its own name, never 409s on
+    // itself). Renumbering and routing-ref remapping are owned by the daemon's
+    // normalize_step_numbers.
     const renamedFrom =
       editingName !== null && draft.name !== editingName ? editingName : null;
-    saveSop(draft)
+    const write = renamedFrom ? createSop(draft) : saveSop(draft);
+    write
       .then(() => (renamedFrom ? deleteSop(renamedFrom).catch(() => undefined) : undefined))
       .then(() => {
         setSaving(false);
