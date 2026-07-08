@@ -4143,8 +4143,9 @@ async fn main() -> Result<()> {
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
 
-                // SOPs default-on: engine loads the workspace sops dir when present.
-                let (sop_engine, sop_audit) = {
+                // SOP loading is gated on `[sop] sops_dir`: unset disables all
+                // SOP runtime behavior, matching the documented rollback path.
+                let (sop_engine, sop_audit) = if current_config.sop.sops_dir.is_some() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> =
                         Arc::from(zeroclaw_memory::create_memory(
                             &current_config.memory,
@@ -4157,6 +4158,8 @@ async fn main() -> Result<()> {
                         mem,
                     );
                     (Some(engine), Some(audit))
+                } else {
+                    (None, None)
                 };
 
                 // EPIC A1 + SOP cron: drive periodic maintenance and cron
@@ -4901,7 +4904,7 @@ async fn main() -> Result<()> {
                 }));
 
                 let cancel = tokio_util::sync::CancellationToken::new();
-                let (sop_engine, sop_audit) = {
+                let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
                         zeroclaw_memory::create_memory(&config.memory, &config.data_dir, None)?,
                     );
@@ -4911,6 +4914,8 @@ async fn main() -> Result<()> {
                         mem,
                     );
                     (Some(engine), Some(audit))
+                } else {
+                    (None, None)
                 };
                 // EPIC A1 + SOP cron: same tick as the full daemon path.
                 let sop_maintenance = spawn_sop_maintenance(

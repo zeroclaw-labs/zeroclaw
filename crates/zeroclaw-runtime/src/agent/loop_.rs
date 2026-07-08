@@ -1324,13 +1324,16 @@ pub async fn run(
             (None, None)
         };
 
-        // SOPs default-on: the engine loads the workspace sops dir when present.
-        let (sop_engine, sop_audit) = {
+        // SOP loading is gated on `[sop] sops_dir`: unset disables all SOP
+        // runtime behavior, matching the documented rollback path.
+        let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) =
                 crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem);
             (Some(engine), Some(audit))
+        } else {
+            (None, None)
         };
 
         let all_tools_result = tools::all_tools_with_runtime(
@@ -2879,13 +2882,16 @@ pub async fn process_message(
             (None, None)
         };
 
-        // SOPs default-on: the engine loads the workspace sops dir when present.
-        let (sop_engine, sop_audit) = {
+        // SOP loading is gated on `[sop] sops_dir`: unset disables all SOP
+        // runtime behavior, matching the documented rollback path.
+        let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) =
                 crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem);
             (Some(engine), Some(audit))
+        } else {
+            (None, None)
         };
 
         let all_tools_result_pm = tools::all_tools_with_runtime(

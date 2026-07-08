@@ -2380,6 +2380,14 @@ pub struct SopStep {
     pub on_failure: StepFailure,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calls: Vec<PlannedToolCall>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub schema: serde_json::Value,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub scope: serde_json::Value,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub mode: serde_json::Value,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub agent: serde_json::Value,
     /// Persisted canvas coordinate set by the web Blueprint editor. zerocode
     /// preserves it verbatim on round-trip; its TUI renders from the grid layout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2401,6 +2409,10 @@ impl Default for SopStep {
             routing: StepRouting::default(),
             on_failure: StepFailure::Fail,
             calls: Vec::new(),
+            schema: serde_json::Value::Null,
+            scope: serde_json::Value::Null,
+            mode: serde_json::Value::Null,
+            agent: serde_json::Value::Null,
             pos: None,
             calls_buf: None,
         }
@@ -2419,6 +2431,8 @@ pub struct SopDraft {
     pub cooldown_secs: u64,
     pub max_concurrent: u32,
     pub deterministic: bool,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub agent: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -2490,6 +2504,7 @@ impl Default for SopDraft {
             cooldown_secs: 0,
             max_concurrent: 1,
             deterministic: false,
+            agent: serde_json::Value::Null,
         }
     }
 }

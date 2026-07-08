@@ -4164,6 +4164,18 @@ impl RpcDispatcher {
     fn handle_sops_save(&self, params: &Value) -> RpcResult {
         let req: SopSaveRequest = parse_params(params)?;
         let sop = Self::parse_sop(&req.sop)?;
+        if let Some(original) = req.original_name.as_deref()
+            && !original.is_empty()
+            && original != sop.name
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!(
+                    "rename not supported: SOP '{original}' cannot be saved as '{}'",
+                    sop.name
+                ),
+            ));
+        }
         let (dir, _mode) = self.sops_dir_and_mode();
         crate::sop::save_sop(&dir, &sop).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
         to_result(serde_json::json!({ "saved": sop.name }))

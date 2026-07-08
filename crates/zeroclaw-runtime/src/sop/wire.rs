@@ -9,6 +9,8 @@ use super::graph::FlowRole;
 use super::step_contract::{StepFailure, SwitchRule};
 use super::types::Sop;
 
+const MAX_SWITCH_PORTS: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WireOp {
@@ -99,15 +101,15 @@ pub fn apply_wire(sop: &mut Sop, edit: &WireEdit) -> Result<(), WireError> {
     }
 }
 
-fn step_mut(sop: &mut Sop, number: u32) -> &mut super::types::SopStep {
+fn step_mut(sop: &mut Sop, number: u32) -> Result<&mut super::types::SopStep, WireError> {
     sop.steps
         .iter_mut()
         .find(|s| s.number == number)
-        .expect("caller verified the step exists")
+        .ok_or(WireError::UnknownStep(number))
 }
 
 fn apply_sequence(sop: &mut Sop, edit: &WireEdit) -> Result<(), WireError> {
-    let step = step_mut(sop, edit.from);
+    let step = step_mut(sop, edit.from)?;
     match edit.op {
         WireOp::Connect => {
             step.routing.next = Some(edit.to);
@@ -124,7 +126,7 @@ fn apply_sequence(sop: &mut Sop, edit: &WireEdit) -> Result<(), WireError> {
 }
 
 fn apply_dependency(sop: &mut Sop, edit: &WireEdit) -> Result<(), WireError> {
-    let step = step_mut(sop, edit.to);
+    let step = step_mut(sop, edit.to)?;
     match edit.op {
         WireOp::Connect => {
             if !step.routing.depends_on.contains(&edit.from) {
@@ -137,7 +139,7 @@ fn apply_dependency(sop: &mut Sop, edit: &WireEdit) -> Result<(), WireError> {
 }
 
 fn apply_failure(sop: &mut Sop, edit: &WireEdit) -> Result<(), WireError> {
-    let step = step_mut(sop, edit.from);
+    let step = step_mut(sop, edit.from)?;
     match edit.op {
         WireOp::Connect => step.on_failure = StepFailure::Goto { step: edit.to },
         WireOp::Disconnect => {
@@ -151,7 +153,10 @@ fn apply_failure(sop: &mut Sop, edit: &WireEdit) -> Result<(), WireError> {
 
 fn apply_switch(sop: &mut Sop, edit: &WireEdit) -> Result<(), WireError> {
     let port = edit.port.ok_or(WireError::MissingPort)?;
-    let step = step_mut(sop, edit.from);
+    if port >= MAX_SWITCH_PORTS {
+        return Err(WireError::PortOutOfRange(port));
+    }
+    let step = step_mut(sop, edit.from)?;
     match edit.op {
         WireOp::Connect => {
             while step.routing.switch.len() <= port {

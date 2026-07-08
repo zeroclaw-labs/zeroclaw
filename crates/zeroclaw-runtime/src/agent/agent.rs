@@ -1463,13 +1463,13 @@ impl Agent {
             None
         };
 
-        // Build SOP engine when sops_dir is configured so SOP tools are
-        // available on this path (WebSocket/daemon sessions).
+        // SOP loading is gated on `[sop] sops_dir`: unset disables all SOP
+        // runtime behavior, matching the documented rollback path.
         // If caller provided an engine (daemon path), use it; otherwise
-        // build our own (CLI/standalone path).
+        // build our own (CLI/standalone path) only when the gate is set.
         let (sop_engine, sop_audit) = match (sop_engine, sop_audit) {
             (Some(engine), Some(audit)) => (Some(engine), Some(audit)),
-            (None, None) => {
+            (None, None) if config.sop.sops_dir.is_some() => {
                 let mem: Arc<dyn zeroclaw_memory::Memory> =
                     zeroclaw_memory::create_memory_for_agent(config, agent_alias, None).await?;
                 let (engine, audit) =

@@ -1639,19 +1639,23 @@ export default function Sops() {
     if (!draft) return;
     setSaving(true);
     setSaveError(null);
-    // A rename (draft.name diverged from the name the edit started at) writes
-    // the new name through create semantics, which 409 if that name already
-    // belongs to a different SOP, so a rename can never silently clobber an
-    // unrelated SOP. Only after the new name lands do we delete the old
-    // directory, turning the rename into a move rather than a fork. A
-    // non-rename stays an upsert (PUT keyed by its own name, never 409s on
-    // itself). Renumbering and routing-ref remapping are owned by the daemon's
-    // normalize_step_numbers.
-    const renamedFrom =
-      editingName !== null && draft.name !== editingName ? editingName : null;
-    const write = renamedFrom ? createSop(draft) : saveSop(draft);
+    // Name authority, three cases:
+    //   - new draft (no editing name): create, 409 if the name already exists,
+    //     so a new SOP can never silently overwrite an existing one.
+    //   - edit under the same name: upsert via PUT (never 409s on itself).
+    //   - rename (name diverged from the editing name): rejected. A rename is
+    //     not a save; it must be an explicit operation so it cannot fork or
+    //     clobber an unrelated SOP through a swallowed delete.
+    const isNew = editingName === null;
+    if (!isNew && draft.name !== editingName) {
+      setSaving(false);
+      setSaveError(
+        `rename not supported: '${editingName}' cannot be saved as '${draft.name}'`,
+      );
+      return;
+    }
+    const write = isNew ? createSop(draft) : saveSop(draft);
     write
-      .then(() => (renamedFrom ? deleteSop(renamedFrom).catch(() => undefined) : undefined))
       .then(() => {
         setSaving(false);
         setDraft(null);

@@ -16,6 +16,12 @@ use super::audit::SopAuditLogger;
 use super::engine::SopEngine;
 use super::types::{SopRun, SopRunAction, SopStepResult, StepToolCall};
 
+use crate::agent::history::truncate_tool_result;
+use crate::agent::turn::redact::scrub_credentials;
+
+const MAX_STEP_TOOL_CALLS: usize = 256;
+const MAX_STEP_TOOL_OUTPUT_CHARS: usize = 4096;
+
 /// Live SOP action captured by SOP tools while they run inside an agent turn.
 #[derive(Clone)]
 pub(crate) struct QueuedSopAction {
@@ -74,19 +80,34 @@ pub(crate) fn record_step_tool_call(
         if let Some(sink) = sink
             && let Ok(mut calls) = sink.lock()
         {
+            if calls.len() >= MAX_STEP_TOOL_CALLS {
+                return;
+            }
             let index = u32::try_from(calls.len()).unwrap_or(u32::MAX);
+            let scrubbed_args = scrub_credentials(&args.to_string());
+            let args = serde_json::from_str(&scrubbed_args).unwrap_or(serde_json::Value::Null);
+            let output =
+                truncate_tool_result(&scrub_credentials(&output), MAX_STEP_TOOL_OUTPUT_CHARS);
             calls.push(StepToolCall {
                 index,
                 tool: tool.to_string(),
-                args: args.clone(),
+                args,
                 success,
                 output,
                 output_data,
-                error: error.map(str::to_string),
+                error: error.map(scrub_credentials),
                 duration_ms,
             });
         }
     });
+}
+
+/// True when a live SOP step scope is active on this task, so the turn loop
+/// can skip the argument/output clones the capture would otherwise consume.
+pub(crate) fn step_capture_active() -> bool {
+    LIVE_STEP_CALL_SINK
+        .try_with(|sink| sink.is_some())
+        .unwrap_or(false)
 }
 
 pub(crate) fn drain_step_calls(sink: &StepCallSink) -> Vec<StepToolCall> {
