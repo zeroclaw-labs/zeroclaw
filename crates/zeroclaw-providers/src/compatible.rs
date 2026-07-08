@@ -457,9 +457,13 @@ impl OpenAiCompatibleModelProvider {
         self
     }
 
-    /// Override the HTTP request timeout for LLM API calls.
+    /// Override the HTTP request timeout for LLM API calls. Values of 0
+    /// are ignored (the default 120 s is kept) so a stray `Some(0)` from
+    /// config cannot silently disable the safety timeout.
     pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
-        self.timeout_secs = timeout_secs;
+        if timeout_secs > 0 {
+            self.timeout_secs = timeout_secs;
+        }
         self
     }
 
