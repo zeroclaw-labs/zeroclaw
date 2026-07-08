@@ -442,8 +442,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 crate::agent::history_trim::trim_to_recent_turns(taken, context_token_budget);
             if result.trimmed {
                 let mut trimmed = result.history;
-                let system_count = trimmed.iter().take_while(|m| m.role == "system").count();
-                trimmed.insert(system_count, crate::agent::history_trim::breadcrumb());
+                crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed);
                 *history = trimmed;
                 {
                     let __zc_trim_span = ::zeroclaw_log::info_span!(
@@ -647,6 +646,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             parse_issue_detected,
             protocol_suppressed,
             response_streamed_live,
+            reported_input_tokens,
         ) = match chat_result {
             Ok(resp) => {
                 let interpreted = interpret_chat_response(
@@ -669,6 +669,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     interpreted.parse_issue_detected,
                     streamed_protocol_suppressed,
                     streamed_live_deltas,
+                    interpreted.input_tokens,
                 )
             }
             Err(e) => {
@@ -1100,6 +1101,46 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 agent_alias,
             )
             .await?;
+        }
+
+        if let Some(reported) = reported_input_tokens
+            && context_token_budget > 0
+            && reported as usize > context_token_budget
+        {
+            let taken = std::mem::take(history);
+            let result = crate::agent::history_trim::trim_to_reported_budget(
+                taken,
+                context_token_budget,
+                reported as usize,
+            );
+            if result.trimmed {
+                let mut trimmed = result.history;
+                crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed);
+                *history = trimmed;
+                if let Some(tx) = event_tx.as_ref() {
+                    let _ = tx
+                        .send(TurnEvent::HistoryTrimmed {
+                            dropped_messages: result.dropped_messages,
+                            kept_turns: result.kept_turns,
+                            reason: crate::i18n::get_required_cli_string(
+                                "history-trim-reason-budget",
+                            ),
+                        })
+                        .await;
+                }
+                observer.record_event(
+                    &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                        dropped_messages: result.dropped_messages,
+                        kept_turns: result.kept_turns,
+                        reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                        channel: None,
+                        agent_alias: None,
+                        turn_id: None,
+                    },
+                );
+            } else {
+                *history = result.history;
+            }
         }
     }
 
