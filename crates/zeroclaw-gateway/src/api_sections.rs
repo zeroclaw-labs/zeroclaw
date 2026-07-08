@@ -1122,10 +1122,14 @@ pub async fn handle_section_select(
                         .with_path(section_key),
                     );
                 }
-                if let Err(err) =
-                    zeroclaw_config::schema::ensure_bootstrap_files(&workspace_dir).await
+                if let Err(err) = zeroclaw_runtime::agent::personality::seed_default_personality(
+                    &working,
+                    &key,
+                    &workspace_dir,
+                )
+                .await
                 {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": key, "workspace": workspace_dir.display().to_string(), "err": err.to_string()})), "agent workspace scaffolded but bootstrap files seed failed (continuing)");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": key, "workspace": workspace_dir.display().to_string(), "err": err.to_string()})), "agent workspace scaffolded but personality seed failed (continuing)");
                 }
             }
             (format!("{section_key}.{key}"), created)

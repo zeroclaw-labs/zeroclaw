@@ -2,18 +2,24 @@
 
 The runtime keeps one conversation history per agent session and sends it to
 the model on every turn. Left unbounded that history outgrows the context
-window, so the runtime has exactly one mechanism to bound it: **whole-turn
-trimming**. This page disambiguates that mechanism from the adjacent operations
-people conflate it with, and documents the user-visible signal it emits.
+window, so the runtime has two complementary mechanisms to bound it:
+
+1. **Whole-turn trimming** (the primary mechanism): drops oldest whole turns
+   to fit a token budget.
+2. **Message-count hard cap** (a safety net): enforces a ceiling on the total
+   number of messages after each turn.
+
+This page documents both, disambiguates them from the adjacent operations
+people conflate them with, and describes the user-visible signals they emit.
 
 Everything here is sourced from the runtime code in
 `crates/zeroclaw-runtime/src/agent/`. Where a behavior is named, the function
 that implements it is named with it.
 
-## The one trimmer
+## Whole-turn trimming (primary)
 
-`history_trim::trim_to_recent_turns(history, budget_tokens)` is the whole of the
-trimming logic. Its rule is deliberately small enough to hold in your head:
+`history_trim::trim_to_recent_turns(history, budget_tokens)` is the primary
+trimming mechanism. Its rule is deliberately small enough to hold in your head:
 
 > Keep the most recent whole turns that fit the token budget, drop the rest,
 > never cut a turn in half.
@@ -64,6 +70,34 @@ not a tokenizer.
 > kept structurally). The key idents are scheduled to be renamed at config
 > schema V4 and are intentionally left in place until then.
 
+## Message-count hard cap (safety net)
+
+After the primary whole-turn trim, a second mechanism enforces an absolute
+ceiling on the number of messages in the conversation:
+
+- `history::trim_history(history, max_history)` operates on the interactive
+  (`ChatMessage`) history in `loop_.rs`. It preserves the system prompt, the
+  first user message (the framing anchor that prevents silent-amnesia bugs),
+  and the most recent `max_history` messages, dropping from the middle when
+  the ceiling is exceeded.
+- `Agent::trim_history()` (`agent.rs`) applies an equivalent cap to structured
+  `ConversationMessage` history in the ACP/gateway turn path, with additional
+  orphan-safety cascades that avoid creating dangling `ToolResults` or
+  `AssistantToolCalls` at the head after a drop.
+
+Both emit a log record on every fire so silent message loss is detectable.
+
+The value of `max_history` is set through `max_history_messages` in the
+agent's runtime profile config. Because the hard cap runs *after* every turn,
+it acts as a safety net: even if the whole-turn trim's token budget is
+generous enough to keep many turns, the message-count cap limits the
+structural size of the history.
+
+> The hard cap does **not** inject a breadcrumb or emit a `history_trimmed`
+> event (unlike whole-turn trimming). The only user-visible signal is the log
+> record. The cap is intended as a structural safety net, not a first-line
+> trimming strategy.
+
 ## It is never silent
 
 When `trimmed` is true the caller does two things so the loss is always visible:
@@ -91,11 +125,12 @@ context window") instead of fabricating a result it can no longer see.
 
 ## What trimming is not
 
-These are distinct operations. Only the first one drops conversation history.
+These are distinct operations. Only the first two drop conversation history.
 
 | Operation | What it does | Where |
 |---|---|---|
-| **Trimming** | Drops oldest **whole turns** to fit the token budget. The only thing that removes history. | `history_trim::trim_to_recent_turns` |
+| **Whole-turn trimming** | Drops oldest **whole turns** to fit the token budget. The primary history-removal mechanism. | `history_trim::trim_to_recent_turns` |
+| **Message-count hard cap** | Drops oldest messages when the number of messages exceeds `max_history_messages`. A safety net that preserves the system prompt, first user anchor, and most recent messages. | `history::trim_history` / `Agent::trim_history` |
 | **Orphan sweep** | Removes a `tool_result` whose `tool_use` is gone (or vice versa) so providers do not 400 on a dangling pair. A pairing-safety net, not a size control. | `history_pruner::remove_orphaned_tool_messages` |
 | **System normalization** | Merges and reorders system messages to the front. Changes shape, never drops turns. | `history::normalize_system_messages` |
 | **Tool-result capping** | At collection time, caps a single tool result's length (`max_tool_result_chars`). Bounds one message as it is recorded; does not touch history. | `history::truncate_tool_result` |

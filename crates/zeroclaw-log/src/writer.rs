@@ -68,6 +68,21 @@ pub fn runtime_trace_path() -> Option<PathBuf> {
     current_state().map(|s| s.policy.path.clone())
 }
 
+/// Synchronously wait for all pending log writes to land on disk.
+///
+/// **Currently a no-op** — `record_event` is still synchronous, so any
+/// `record!` call has already hit disk + fsync by the time the macro returns.
+/// A follow-up PR will move disk persistence to a background worker; this
+/// function will then become a real round-trip signal so test code can
+/// keep asserting on the file's contents immediately after `record_event`.
+///
+/// Callers must be in the `zeroclaw-log` crate's own test module (or any
+/// other test code that re-exports this function). Not part of the
+/// production runtime API.
+pub fn flush_for_test() -> Result<()> {
+    Ok(())
+}
+
 /// Resolved LLM-request-payload capture policy + the truncate cap, for the
 /// turn engine's `announce_llm_request`. `None` when no writer is installed
 /// (the policy defaults to `off`, so callers treat "no writer" as "off").
@@ -124,6 +139,21 @@ pub fn record_event(event: LogEvent) {
     }
 }
 
+/// Serialize one event as a single JSONL line (terminated with `\n`) to the
+/// provided buffered writer. Pure helper: does not open, flush, or fsync the
+/// file — the caller owns the [`BufWriter`] lifecycle.
+///
+/// Used by the production append path (`append_line`). The rolling trim path
+/// (`trim_to_last_entries`) writes the original JSONL bytes from the
+/// line-buffered reader directly, so it stays inline rather than going
+/// through this helper (re-serializing would risk non-byte-identical output
+/// for non-canonical input, e.g. reordered keys or whitespace).
+fn write_jsonl_line<W: Write + ?Sized>(writer: &mut W, value: &Value) -> Result<()> {
+    serde_json::to_writer(&mut *writer, value).context("serializing log line")?;
+    writer.write_all(b"\n").context("writing newline")?;
+    Ok(())
+}
+
 fn append_line(state: &Arc<WriterState>, value: &Value) -> Result<()> {
     let _guard = state.write_lock.lock();
 
@@ -153,8 +183,7 @@ fn append_line(state: &Arc<WriterState>, value: &Value) -> Result<()> {
         .open(&state.policy.path)
         .with_context(|| format!("opening log file {}", state.policy.path.display()))?;
     let mut writer = BufWriter::new(file);
-    serde_json::to_writer(&mut writer, value).context("serializing log line")?;
-    writer.write_all(b"\n").context("writing newline")?;
+    write_jsonl_line(&mut writer, value)?;
     writer.flush().context("flushing log line")?;
     let file = writer
         .into_inner()
@@ -577,6 +606,63 @@ mod tests {
         assert!(
             !path.exists(),
             "no file should exist when storage is disabled"
+        );
+    }
+
+    #[test]
+    fn reinit_applies_changed_rotation_policy() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_rotating(tmp.path(), 0, false, 0, 0);
+
+        emit("before-reload");
+
+        let path = runtime_trace_path().unwrap();
+        assert!(
+            list_archives(&path).unwrap().is_empty(),
+            "size rotation should be disabled before re-init"
+        );
+        assert_eq!(total_events(&path), 1);
+
+        install_rotating(tmp.path(), 1, false, 1, 0);
+        emit("after-reload");
+
+        let archives = list_archives(&path).unwrap();
+        assert_eq!(
+            archives.len(),
+            1,
+            "re-init should apply the new byte budget and rotate on the next append"
+        );
+        assert_eq!(
+            total_events(&path),
+            2,
+            "re-init must preserve already-written events while applying the new policy"
+        );
+    }
+
+    #[test]
+    fn reinit_can_disable_persistence_without_restart() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 10);
+
+        emit("persisted-before-disable");
+
+        let path = runtime_trace_path().unwrap();
+        assert_eq!(count_lines(&path), 1);
+
+        let cfg = LogConfig {
+            log_persistence: "none".into(),
+            ..LogConfig::default()
+        };
+        init_from_config(&cfg, tmp.path());
+
+        emit("not-persisted-after-disable");
+
+        assert_eq!(
+            count_lines(&path),
+            1,
+            "disabled persistence after re-init should stop appending without deleting existing logs"
         );
     }
 

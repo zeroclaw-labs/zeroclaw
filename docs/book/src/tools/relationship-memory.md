@@ -136,7 +136,7 @@ Ask for recent interactions:
 
 ## Skill capability example
 
-Relationship memory is not only for client-style tracking. A skill can guide the agent to build a capability graph from installed skill workflows.
+Relationship memory is not only for client-style tracking. A skill can guide the agent to build a capability graph from installed skill workflows. For a complete copyable version with setup and validation steps, see [using relationship memory from skills](./relationship-memory-skill-template.md).
 
 Example `SKILL.md`:
 
@@ -215,4 +215,5 @@ Relationship memory is durable. Treat it like any other public or shared knowled
 
 - [Tools overview](./overview.md)
 - [Skills](./skills.md)
+- [Using relationship memory from skills](./relationship-memory-skill-template.md)
 - [Privacy & PII discipline](../contributing/privacy.md)

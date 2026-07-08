@@ -456,6 +456,8 @@ impl Channel for WebhookChannel {
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+
+                ..Default::default()
             };
 
             if state.tx.send(msg).await.is_err() {
