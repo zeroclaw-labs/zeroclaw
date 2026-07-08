@@ -17,8 +17,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Search, X, Wrench, Terminal } from 'lucide-react';
-import type { ToolSpec, CliTool } from '@/types/api';
-import { getTools, getCliTools } from '@/lib/api';
+import { loadToolCatalog, peekToolCatalog, type CatalogEntry } from '@/lib/toolCatalog';
 import { t } from '@/lib/i18n';
 
 export interface ToolPickerProps {
@@ -36,61 +35,6 @@ export interface ToolPickerProps {
   agent?: string;
 }
 
-/** A flattened, group-tagged catalog entry. */
-interface CatalogEntry {
-  name: string;
-  description: string;
-  group: 'agent' | 'cli';
-}
-
-// Process-wide cache so re-mounting the picker (e.g. reopening the Cron
-// modal, or switching config sections) doesn't re-hit the network. Keyed by
-// agent alias (`'' `= the gateway's default-agent listing): the agent-tools
-// half is `getTools(agent)`, so a picker bound to a specific agent (e.g. a
-// channel's owning agent) caches that agent's real scoped catalog separately
-// from the default. Each per-agent catalog is effectively static for the
-// daemon's lifetime.
-const catalogCache = new Map<string, CatalogEntry[]>();
-const catalogInflight = new Map<string, Promise<CatalogEntry[]>>();
-
-function cliDescription(tool: CliTool): string {
-  // CliTool has no `description`; synthesize a short one from category/path
-  // so the row still says something useful.
-  const parts = [tool.category, tool.version ? `v${tool.version}` : null, tool.path]
-    .filter(Boolean)
-    .join(' · ');
-  return parts || tool.path;
-}
-
-function loadCatalog(agent?: string): Promise<CatalogEntry[]> {
-  const key = agent ?? '';
-  const cached = catalogCache.get(key);
-  if (cached) return Promise.resolve(cached);
-  const inflight = catalogInflight.get(key);
-  if (inflight) return inflight;
-  const promise = Promise.all([getTools(agent), getCliTools()])
-    .then(([tools, cliTools]) => {
-      const agentEntries: CatalogEntry[] = tools.map((tnt: ToolSpec) => ({
-        name: tnt.name,
-        description: tnt.description,
-        group: 'agent' as const,
-      }));
-      const cli: CatalogEntry[] = cliTools.map((c: CliTool) => ({
-        name: c.name,
-        description: cliDescription(c),
-        group: 'cli' as const,
-      }));
-      const entries = [...agentEntries, ...cli];
-      catalogCache.set(key, entries);
-      return entries;
-    })
-    .finally(() => {
-      catalogInflight.delete(key);
-    });
-  catalogInflight.set(key, promise);
-  return promise;
-}
-
 function truncate(text: string, max = 110): string {
   if (text.length <= max) return text;
   return `${text.slice(0, max - 1)}…`;
@@ -105,16 +49,16 @@ export default function ToolPicker({
 }: ToolPickerProps) {
   const cacheKey = agent ?? '';
   const [catalog, setCatalog] = useState<CatalogEntry[] | null>(
-    () => catalogCache.get(cacheKey) ?? null,
+    () => peekToolCatalog(cacheKey),
   );
-  const [loading, setLoading] = useState(() => !catalogCache.has(cacheKey));
+  const [loading, setLoading] = useState(() => peekToolCatalog(cacheKey) === null);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
 
   // Reload when the bound agent changes so the catalog reflects that agent's
   // scoped tools (cached per agent, so switching back is instant).
   useEffect(() => {
-    const cached = catalogCache.get(cacheKey);
+    const cached = peekToolCatalog(cacheKey);
     if (cached) {
       setCatalog(cached);
       setLoading(false);
@@ -125,7 +69,7 @@ export default function ToolPicker({
     setLoading(true);
     setError(null);
     setCatalog(null);
-    loadCatalog(agent)
+    loadToolCatalog(agent)
       .then((entries) => {
         if (!cancelled) {
           setCatalog(entries);
