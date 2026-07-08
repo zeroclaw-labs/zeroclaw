@@ -3321,6 +3321,7 @@ pub struct ResolvedRuntime {
     pub max_tool_result_chars: usize,
     pub keep_tool_context_turns: usize,
     pub tool_receipts: ToolReceiptsConfig,
+    pub prompt_injection_mode: SkillsPromptInjectionMode,
 }
 
 impl ResolvedRuntime {
@@ -3359,6 +3360,7 @@ impl Default for ResolvedRuntime {
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
             tool_receipts: ToolReceiptsConfig::default(),
+            prompt_injection_mode: SkillsPromptInjectionMode::default(),
         }
     }
 }
@@ -3596,6 +3598,14 @@ pub struct AliasedAgentConfig {
     #[serde(default)]
     pub classifier_provider: crate::providers::ModelProviderRef,
 
+    /// Per-agent reply-intent precheck controls. The classifier call reads
+    /// this block at message time; model/provider selection stays on
+    /// `classifier_provider` so there is only one routing source of truth.
+    #[tab(Channels)]
+    #[serde(default)]
+    #[nested]
+    pub precheck: crate::scattered_types::ChannelPrecheckConfig,
+
     /// Per-agent override for the context-compression summarizer provider, as
     /// a `providers.models.<type>.<alias>` reference. Empty (Default) = inherit
     /// the runtime profile's `context_compression.summary_provider`, else the
@@ -3687,6 +3697,7 @@ impl Default for AliasedAgentConfig {
             tts_provider: crate::providers::TtsProviderRef::default(),
             transcription_provider: crate::providers::TranscriptionProviderRef::default(),
             classifier_provider: crate::providers::ModelProviderRef::default(),
+            precheck: crate::scattered_types::ChannelPrecheckConfig::default(),
             summary_provider: crate::providers::ModelProviderRef::default(),
             delegate_same_risk_profile: true,
             delegates: Vec::new(),
@@ -4058,6 +4069,7 @@ impl Config {
             max_system_prompt_chars: self.effective_max_system_prompt_chars(agent_alias),
             max_tool_result_chars: self.effective_max_tool_result_chars(agent_alias),
             keep_tool_context_turns: self.effective_keep_tool_context_turns(agent_alias),
+            prompt_injection_mode: self.effective_skills_prompt_mode(agent_alias),
             ..ResolvedRuntime::default()
         };
         if let Some(profile) = self.runtime_profile_for_agent(agent_alias) {
@@ -4072,6 +4084,24 @@ impl Config {
         }
         out.resolved = resolved;
         Some(out)
+    }
+
+    /// Resolve the effective skills prompt-injection mode for an agent: the
+    /// agent's resolved runtime profile's `prompt_injection_mode` override when
+    /// set, otherwise the global `[skills] prompt_injection_mode`. Agents with
+    /// no runtime profile (or an unknown alias) fall back to the global value.
+    ///
+    /// Keyed on the resolved runtime profile — the sanctioned surface for
+    /// per-agent runtime tunables (#6877) — so agent-inline knobs stay inert.
+    /// Centralizing the fallback here keeps the system-prompt builder and the
+    /// `read_skill` tool-registration gate in lockstep on one effective mode,
+    /// so a compact prompt is never paired with a missing `read_skill` tool
+    /// (or a full prompt with a spurious one).
+    #[must_use]
+    pub fn effective_skills_prompt_mode(&self, agent_alias: &str) -> SkillsPromptInjectionMode {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.prompt_injection_mode)
+            .unwrap_or(self.skills.prompt_injection_mode)
     }
 
     /// Resolve an agent's `model_provider` reference (`"<type>.<alias>"`) to
@@ -7483,6 +7513,13 @@ pub struct TextBrowserConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_text_browser_timeout_secs")]
     pub timeout_secs: u64,
+    /// Private/internal hosts allowed to bypass SSRF protection.
+    /// Exact and subdomain matches are supported; `["*"]` permits **all** private/local
+    /// hosts (RFC 1918, loopback, link-local, `.local`). Default: empty (deny).
+    /// Warning: `["*"]` also reaches link-local addresses, including the cloud metadata
+    /// endpoint (`169.254.169.254`) — list specific hosts unless you accept that exposure.
+    #[serde(default)]
+    pub allowed_private_hosts: Vec<String>,
 }
 
 fn default_text_browser_timeout_secs() -> u64 {
@@ -7495,6 +7532,7 @@ impl Default for TextBrowserConfig {
             enabled: false,
             preferred_browser: None,
             timeout_secs: default_text_browser_timeout_secs(),
+            allowed_private_hosts: vec![],
         }
     }
 }
@@ -10277,12 +10315,15 @@ pub struct MemoryConfig {
     /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
-    /// Embedding model identifier — must match a model your chosen embedding model_provider serves (e.g. `text-embedding-3-small` for OpenAI). Changing this invalidates existing embeddings; you'll need to re-index.
+    /// Embedding model identifier — must match a model your chosen embedding model_provider serves (e.g. `text-embedding-3-small` for OpenAI). Changing this invalidates existing embeddings: the change is detected at startup and stale vectors are cleared automatically; run `zeroclaw memory reindex` to re-embed (or set `auto_reindex_on_identity_change`).
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
     /// Vector width produced by the embedding model — must match the model's native dimension or vectors won't store correctly. Look up the number on the model_provider's model page.
     #[serde(default = "default_embedding_dims")]
     pub embedding_dimensions: usize,
+    /// Automatically re-embed all memories in the background when a change of embedding provider/model/dimensions is detected at startup (after the stale vectors have been cleared). Costs one embedding API call per memory, so it's off by default — leave it off for large stores and run `zeroclaw memory reindex` explicitly instead.
+    #[serde(default)]
+    pub auto_reindex_on_identity_change: bool,
     /// Optional API key for the embedding endpoint. When set, embedding calls use this key instead of inheriting one from the seed model provider — decoupling embeddings from the chat model. Use it when the chat model runs on a provider that carries no usable embedding credential (e.g. an OAuth-only provider) while embeddings keep hitting an `openai`/`custom:` endpoint with their own key. Leave unset to inherit the seed provider's key (backward-compatible default).
     #[secret]
     #[credential_class = "encrypted_secret"]
@@ -10557,6 +10598,7 @@ impl Default for MemoryConfig {
             embedding_provider: default_embedding_provider(),
             embedding_model: default_embedding_model(),
             embedding_dimensions: default_embedding_dims(),
+            auto_reindex_on_identity_change: false,
             embedding_api_key: None,
             vector_weight: default_vector_weight(),
             keyword_weight: default_keyword_weight(),
@@ -11323,6 +11365,14 @@ pub struct RuntimeProfileConfig {
     /// Maximum memory entries injected per turn. `None` inherits global default (5).
     /// Set to `0` for unlimited.
     pub memory_recall_limit: Option<usize>,
+    /// How skills are injected into the system prompt for agents on this
+    /// profile. `None` inherits the global `[skills] prompt_injection_mode`;
+    /// `compact` inlines only compact skill metadata and registers the
+    /// `read_skill` tool, `full` inlines full skill instructions. Resolved
+    /// through [`Config::effective_skills_prompt_mode`], the single point both
+    /// the system-prompt builder and the `read_skill` tool-registration gate
+    /// consult so they always agree on the effective mode.
+    pub prompt_injection_mode: Option<SkillsPromptInjectionMode>,
     pub strict_tool_parsing: bool,
     #[nested]
     pub thinking: crate::scattered_types::ThinkingConfig,
@@ -11360,6 +11410,7 @@ impl Default for RuntimeProfileConfig {
             max_tool_result_chars: None,
             keep_tool_context_turns: None,
             memory_recall_limit: None,
+            prompt_injection_mode: None,
             strict_tool_parsing: false,
             thinking: crate::scattered_types::ThinkingConfig::default(),
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
@@ -15124,6 +15175,12 @@ pub struct SecurityConfig {
     #[nested]
     pub audit: AuditConfig,
 
+    /// Outbound credential leak detection and redaction configuration. See
+    /// `[security.leak_detection]` for the detector controls.
+    #[serde(default)]
+    #[nested]
+    pub leak_detection: LeakDetectionConfig,
+
     /// OTP gating configuration for sensitive actions/domains.
     #[serde(default)]
     #[nested]
@@ -15143,6 +15200,52 @@ pub struct SecurityConfig {
     #[serde(default)]
     #[nested]
     pub webauthn: WebAuthnConfig,
+}
+
+/// Outbound credential leak detection configuration.
+///
+/// These settings control the final guardrail pass over outbound channel
+/// responses before they are delivered. Deterministic credential patterns
+/// include API keys, private keys, database URLs, bot tokens, and related
+/// token syntax. The high-entropy pass is a separate heuristic for standalone
+/// opaque tokens.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "security.leak_detection"]
+pub struct LeakDetectionConfig {
+    /// Enable outbound credential leak detection and redaction.
+    #[serde(default = "default_leak_detection_enabled")]
+    pub enabled: bool,
+
+    /// Detection sensitivity from 0.0 to 1.0; higher is more aggressive.
+    #[serde(default = "default_leak_detection_sensitivity")]
+    pub sensitivity: f64,
+
+    /// Enable high-entropy token redaction; deterministic patterns still run when false.
+    #[serde(default = "default_leak_detection_high_entropy_tokens")]
+    pub high_entropy_tokens: bool,
+}
+
+fn default_leak_detection_enabled() -> bool {
+    true
+}
+
+fn default_leak_detection_sensitivity() -> f64 {
+    0.7
+}
+
+fn default_leak_detection_high_entropy_tokens() -> bool {
+    true
+}
+
+impl Default for LeakDetectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_leak_detection_enabled(),
+            sensitivity: default_leak_detection_sensitivity(),
+            high_entropy_tokens: default_leak_detection_high_entropy_tokens(),
+        }
+    }
 }
 
 /// WebAuthn / FIDO2 hardware key authentication configuration (`[security.webauthn]`).
@@ -18487,6 +18590,15 @@ impl Config {
                 "channels.max_concurrent_per_channel must be greater than 0"
             );
         }
+        for (alias, agent) in &self.agents {
+            if agent.precheck.timeout_secs == 0 {
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("agents.{alias}.precheck.timeout_secs"),
+                    "agents.{alias}.precheck.timeout_secs must be greater than 0"
+                );
+            }
+        }
         // Heartbeat agent: when heartbeat is enabled, the agent field
         // must name a configured agent.
         if self.heartbeat.enabled {
@@ -18744,6 +18856,13 @@ impl Config {
                 RequiredFieldEmpty,
                 "security.estop.state_file",
                 "security.estop.state_file must not be empty"
+            );
+        }
+        if !(0.0..=1.0).contains(&self.security.leak_detection.sensitivity) {
+            validation_bail!(
+                InvalidNumericRange,
+                "security.leak_detection.sensitivity",
+                "security.leak_detection.sensitivity must be between 0.0 and 1.0"
             );
         }
 
@@ -22115,6 +22234,147 @@ api_token = "Bearer test-token"
     }
 
     #[test]
+    async fn runtime_profile_prompt_injection_mode_overrides_global() {
+        let mut config = Config::default();
+        config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Full;
+        // A runtime profile that pins compact, and an agent pointing at it.
+        config.runtime_profiles.insert(
+            "compact_profile".to_string(),
+            RuntimeProfileConfig {
+                prompt_injection_mode: Some(SkillsPromptInjectionMode::Compact),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        // A runtime profile that leaves the mode unset (inherits global).
+        config
+            .runtime_profiles
+            .insert("unset_profile".to_string(), RuntimeProfileConfig::default());
+        config.agents.insert(
+            "override".to_string(),
+            AliasedAgentConfig {
+                runtime_profile: "compact_profile".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "unset".to_string(),
+            AliasedAgentConfig {
+                runtime_profile: "unset_profile".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        // An agent with no runtime profile inherits the global.
+        config
+            .agents
+            .insert("inherit".to_string(), AliasedAgentConfig::default());
+
+        // Profile override beats the global value.
+        assert_eq!(
+            config.effective_skills_prompt_mode("override"),
+            SkillsPromptInjectionMode::Compact
+        );
+        // Profile present but mode unset → inherit the global value.
+        assert_eq!(
+            config.effective_skills_prompt_mode("unset"),
+            SkillsPromptInjectionMode::Full
+        );
+        // No runtime profile → inherit the global value.
+        assert_eq!(
+            config.effective_skills_prompt_mode("inherit"),
+            SkillsPromptInjectionMode::Full
+        );
+        // Unknown alias also falls back to the global value.
+        assert_eq!(
+            config.effective_skills_prompt_mode("missing"),
+            SkillsPromptInjectionMode::Full
+        );
+
+        // Flipping the global moves only the inheriting/unset/unknown agents;
+        // the profile override is unaffected.
+        config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Compact;
+        assert_eq!(
+            config.effective_skills_prompt_mode("unset"),
+            SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            config.effective_skills_prompt_mode("inherit"),
+            SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            config.effective_skills_prompt_mode("missing"),
+            SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            config.effective_skills_prompt_mode("override"),
+            SkillsPromptInjectionMode::Compact
+        );
+    }
+
+    #[test]
+    async fn runtime_profile_prompt_injection_mode_deserializes() {
+        // Absent → None, so a profile that omits the key inherits the global
+        // mode (no migration for existing global-only configs).
+        let inherited: RuntimeProfileConfig = toml::from_str("").unwrap();
+        assert_eq!(inherited.prompt_injection_mode, None);
+
+        // Explicit wire spellings parse to their variants.
+        let compact: RuntimeProfileConfig =
+            toml::from_str("prompt_injection_mode = \"compact\"").unwrap();
+        assert_eq!(
+            compact.prompt_injection_mode,
+            Some(SkillsPromptInjectionMode::Compact)
+        );
+        let full: RuntimeProfileConfig =
+            toml::from_str("prompt_injection_mode = \"full\"").unwrap();
+        assert_eq!(
+            full.prompt_injection_mode,
+            Some(SkillsPromptInjectionMode::Full)
+        );
+    }
+
+    #[test]
+    async fn resolved_agent_config_bakes_prompt_injection_mode_from_profile() {
+        // The documented invariant: a runtime_profile knob must be threaded
+        // through `resolved_agent_config` into `ResolvedRuntime`, consistent
+        // with the `effective_*` helper.
+        let raw = r#"
+[skills]
+prompt_injection_mode = "full"
+
+[runtime_profiles.fast]
+prompt_injection_mode = "compact"
+
+[agents.default]
+runtime_profile = "fast"
+
+[agents.plain]
+"#;
+        let parsed = parse_test_config(raw);
+
+        // Profiled agent: resolved value + effective helper both see compact.
+        let resolved = parsed
+            .resolved_agent_config("default")
+            .expect("agent default resolves");
+        assert_eq!(
+            resolved.resolved.prompt_injection_mode,
+            SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            parsed.effective_skills_prompt_mode("default"),
+            SkillsPromptInjectionMode::Compact
+        );
+
+        // Profile-less agent: resolved value falls back to the global default.
+        let plain = parsed
+            .resolved_agent_config("plain")
+            .expect("agent plain resolves");
+        assert_eq!(
+            plain.resolved.prompt_injection_mode,
+            SkillsPromptInjectionMode::Full
+        );
+    }
+
+    #[test]
     async fn skills_install_suggestions_config_deserializes_enabled() {
         let c = parse_test_config(
             r#"
@@ -23637,6 +23897,51 @@ reasoning_effort = "turbo"
         assert!(!cfg.resolved.parallel_tools);
         assert_eq!(cfg.resolved.tool_dispatcher, "auto");
         assert!(!cfg.resolved.strict_tool_parsing);
+        assert!(cfg.precheck.enabled);
+        assert_eq!(cfg.precheck.timeout_secs, 5);
+    }
+
+    #[test]
+    async fn agent_precheck_config_parses_from_agent_block() {
+        let raw = r#"
+[agents.default]
+model_provider = "custom.default"
+risk_profile = "default"
+runtime_profile = "default"
+
+[agents.default.precheck]
+enabled = false
+timeout_secs = 12
+"#;
+        let parsed = parse_test_config(raw);
+        let agent = parsed
+            .agents
+            .get("default")
+            .expect("[agents.default] parses into agents map");
+        assert!(!agent.precheck.enabled);
+        assert_eq!(agent.precheck.timeout_secs, 12);
+    }
+
+    #[test]
+    async fn validate_rejects_zero_agent_precheck_timeout() {
+        let raw = r#"
+[agents.default]
+model_provider = "custom.default"
+risk_profile = "default"
+runtime_profile = "default"
+
+[agents.default.precheck]
+timeout_secs = 0
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("zero precheck timeout must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("agents.default.precheck.timeout_secs")
+        );
     }
 
     #[test]
@@ -28333,6 +28638,9 @@ default_temperature = 0.7
         assert_eq!(parsed.security.otp.method, OtpMethod::Totp);
         assert!(!parsed.security.estop.enabled);
         assert!(parsed.security.estop.require_otp_to_resume);
+        assert!(parsed.security.leak_detection.enabled);
+        assert_eq!(parsed.security.leak_detection.sensitivity, 0.7);
+        assert!(parsed.security.leak_detection.high_entropy_tokens);
     }
 
     #[test]
@@ -28364,6 +28672,42 @@ require_otp_to_resume = true
         assert_eq!(parsed.security.otp.gated_actions.len(), 2);
         assert_eq!(parsed.security.otp.gated_domains.len(), 2);
         parsed.validate().unwrap();
+    }
+
+    #[test]
+    async fn security_toml_parses_leak_detection_section() {
+        let parsed = parse_test_config(
+            r#"
+default_model_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4.6"
+default_temperature = 0.7
+
+[security.leak_detection]
+enabled = false
+sensitivity = 0.35
+high_entropy_tokens = false
+"#,
+        );
+
+        assert!(!parsed.security.leak_detection.enabled);
+        assert_eq!(parsed.security.leak_detection.sensitivity, 0.35);
+        assert!(!parsed.security.leak_detection.high_entropy_tokens);
+        parsed.validate().unwrap();
+    }
+
+    #[test]
+    async fn security_validation_rejects_out_of_range_leak_detection_sensitivity() {
+        let mut config = Config::default();
+        config.security.leak_detection.sensitivity = 1.5;
+
+        let err = config
+            .validate()
+            .expect_err("expected invalid leak-detection sensitivity");
+        assert!(
+            err.to_string()
+                .contains("security.leak_detection.sensitivity"),
+            "got: {err}"
+        );
     }
 
     #[test]

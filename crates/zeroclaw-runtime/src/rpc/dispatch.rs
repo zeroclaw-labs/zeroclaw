@@ -1557,7 +1557,7 @@ impl RpcDispatcher {
             0
         };
 
-        // Capture attribution fields and max_context_tokens for the turn span.
+        // Capture live attribution fields and max_context_tokens for the turn span.
         let (agent_alias, model_provider, model, max_ctx) = {
             let alias = self
                 .ctx
@@ -1565,16 +1565,16 @@ impl RpcDispatcher {
                 .get_agent_alias(sid)
                 .await
                 .unwrap_or_default();
-            let cfg = self.ctx.config.read().clone();
-            let mp = cfg
-                .agent(&alias)
-                .map(|a| a.model_provider.to_string())
-                .unwrap_or_default();
-            let m = cfg
-                .model_provider_for_agent(&alias)
-                .and_then(|p| p.model.clone())
-                .unwrap_or_default();
-            let max_ctx = Some(cfg.effective_model_context_window(&alias) as u64);
+            let (mp, m) = if let Some(agent) = self.ctx.sessions.get_agent(sid).await {
+                let (_, model_provider, model) = agent.lock().await.attribution_fields();
+                (model_provider, model)
+            } else {
+                (String::new(), String::new())
+            };
+            let max_ctx = {
+                let cfg = self.ctx.config.read();
+                Some(cfg.effective_model_context_window(&alias) as u64)
+            };
             (alias, mp, m, max_ctx)
         };
 
@@ -1884,6 +1884,7 @@ impl RpcDispatcher {
 
     async fn handle_session_configure(&self, params: &Value) -> RpcResult {
         let req: SessionConfigureParams = parse_params(params)?;
+        validate_session_configure_overrides(&req.overrides)?;
 
         let merged = self
             .ctx
@@ -1892,11 +1893,11 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
-        // A model_provider override needs a live provider-box rebuild, which
-        // requires Config — held here, not in the session store. Resolve the
-        // model from the prospective merged override or the configured entry,
-        // build the box, and only then commit the override to the session.
-        let built_model_provider = if let Some(ref model_provider_ref) = merged.model_provider {
+        // Model/model_provider overrides need a live provider-box rebuild,
+        // which requires Config — held here, not in the session store. Resolve
+        // the provider from the prospective merged override or configured
+        // agent, build the box, and only then commit the override.
+        let built_model_provider = if merged.model_provider.is_some() || merged.model.is_some() {
             let agent_alias = self
                 .ctx
                 .sessions
@@ -1914,6 +1915,10 @@ impl RpcDispatcher {
                             format!("Agent `{agent_alias}` is not configured"),
                         )
                     })?;
+                let model_provider_ref = merged
+                    .model_provider
+                    .as_deref()
+                    .unwrap_or_else(|| agent_cfg.model_provider.as_str());
                 let (model_provider, model_provider_name, model_name) =
                     crate::agent::agent::build_session_model_provider(
                         &config,
@@ -1959,10 +1964,6 @@ impl RpcDispatcher {
                 .await
                 .then_some(())
                 .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        } else if let Some(ref model_name) = merged.model
-            && let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await
-        {
-            agent.lock().await.set_model_name(model_name.clone());
         }
 
         to_result(SessionConfigureResult {
@@ -3981,6 +3982,24 @@ fn parse_params<T: DeserializeOwned>(params: &Value) -> Result<T, JsonRpcError> 
     serde_json::from_value(params.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))
 }
 
+fn validate_session_configure_overrides(overrides: &SessionOverrides) -> Result<(), JsonRpcError> {
+    if overrides
+        .model
+        .as_deref()
+        .is_some_and(|model| model.trim().is_empty())
+    {
+        return Err(rpc_err(INVALID_PARAMS, "model must not be blank"));
+    }
+    if overrides
+        .model_provider
+        .as_deref()
+        .is_some_and(|provider| provider.trim().is_empty())
+    {
+        return Err(rpc_err(INVALID_PARAMS, "model_provider must not be blank"));
+    }
+    Ok(())
+}
+
 fn to_result<T: Serialize>(val: T) -> RpcResult {
     serde_json::to_value(val).map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))
 }
@@ -4366,6 +4385,59 @@ mod tests {
         assert!(
             prompt.contains("remote__domains.list"),
             "system prompt must advertise the dotted `<server>__<tool>` stub; prompt: {prompt}"
+        );
+    }
+
+    /// Regression guard for #8193, at the agent layer and *behavioral*.
+    /// `chat_session_new_exposes_tool_search_in_deferred_mcp_mode` proves
+    /// `tool_search` is registered; `chat_session_new_advertises_deferred_mcp_
+    /// section_in_system_prompt` proves it is advertised in the prompt. Neither
+    /// proves that *invoking* `tool_search` returns the granted deferred MCP
+    /// tool — a future regression could register a mis-scoped or empty search
+    /// instance that lists yet resolves nothing ("present but empty"). This
+    /// drives the real `session/new` deferred path, invokes `tool_search`, and
+    /// asserts the granted `<server>__<tool>` stub actually comes back.
+    #[tokio::test]
+    async fn chat_session_new_tool_search_returns_granted_mcp_tool_in_deferred_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let config = make_mcp_granting_config(&tmp, server.uri(), true);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-deferred-search-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-deferred-search-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+
+        let tool_result = agent
+            .execute_tool_for_test("tool_search", json!({ "query": "domains" }))
+            .await
+            .expect("deferred Chat session must expose `tool_search`")
+            .expect("tool_search must execute without error");
+
+        assert!(
+            tool_result.success,
+            "tool_search should succeed; error: {:?}",
+            tool_result.error
+        );
+        assert!(
+            tool_result.output.contains("remote__domains.list"),
+            "tool_search must resolve the granted `<server>__<tool>` stub, not just \
+             be present; output: {}",
+            tool_result.output
         );
     }
 
@@ -6873,6 +6945,75 @@ mod tests {
             "old-model",
             "failed provider switch must leave the live agent unchanged"
         );
+    }
+
+    #[tokio::test]
+    async fn session_configure_blank_model_fields_do_not_commit_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        for model in ["", "   "] {
+            let res = dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": session_id,
+                    "overrides": {
+                        "model": model
+                    }
+                }))
+                .await;
+            let err = res.expect_err("blank model must be rejected");
+            assert_eq!(err.code, INVALID_PARAMS);
+
+            let overrides = dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .expect("session still exists");
+            assert_eq!(
+                overrides.model, None,
+                "failed model switch must not leave a stale override behind"
+            );
+            assert_eq!(
+                model_name_for_session(&dispatcher, &session_id).await,
+                "old-model",
+                "failed model switch must leave the live agent unchanged"
+            );
+        }
+
+        for model_provider in ["", "   "] {
+            let res = dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": session_id,
+                    "overrides": {
+                        "model_provider": model_provider
+                    }
+                }))
+                .await;
+            let err = res.expect_err("blank model_provider must be rejected");
+            assert_eq!(err.code, INVALID_PARAMS);
+
+            let overrides = dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .expect("session still exists");
+            assert_eq!(
+                overrides.model_provider, None,
+                "failed provider switch must not leave a stale override behind"
+            );
+            assert_eq!(
+                model_name_for_session(&dispatcher, &session_id).await,
+                "old-model",
+                "failed provider switch must leave the live agent unchanged"
+            );
+        }
     }
 
     #[tokio::test]
