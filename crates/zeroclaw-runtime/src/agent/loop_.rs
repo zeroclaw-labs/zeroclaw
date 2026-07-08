@@ -302,7 +302,15 @@ pub(crate) fn mcp_allowed_tool_count<'a>(
         .count()
 }
 
-pub(crate) fn append_pinned_mcp_section(deferred_section: &mut String, pinned_section: &str) {
+/// Append a pre-rendered pinned-MCP-resources section onto the system-prompt
+/// MCP accumulator (`deferred_section`).
+///
+/// This MUST be called *after* the `deferred_loading` branch, which reassigns
+/// `deferred_section` with `=` (via `build_deferred_tools_section_filtered`)
+/// and would otherwise clobber any earlier-pushed pinned content. Centralizing
+/// the append keeps both `run()` and `process_message()` consistent and pins
+/// the ordering invariant in one testable place. No-op for an empty section.
+pub fn append_pinned_mcp_section(deferred_section: &mut String, pinned_section: &str) {
     if pinned_section.is_empty() {
         return;
     }
