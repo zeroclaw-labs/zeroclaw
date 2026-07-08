@@ -51,23 +51,7 @@ impl FileReadTool {
             anyhow::bail!("Path not allowed by security policy: {path}");
         }
 
-        let p = std::path::Path::new(path);
-        if p.is_absolute() {
-            return Ok(p.to_path_buf());
-        }
-
-        let workspace_dir = &self.security.workspace_dir;
-        if let Ok(workspace_rootless) = workspace_dir.strip_prefix("/")
-            && let Ok(stripped) = p.strip_prefix(workspace_rootless)
-        {
-            return Ok(if stripped.as_os_str().is_empty() {
-                workspace_dir.clone()
-            } else {
-                workspace_dir.join(stripped)
-            });
-        }
-
-        Ok(workspace_dir.join(p))
+        Ok(self.security.resolve_tool_path(path))
     }
 }
 
@@ -78,7 +62,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read file contents with line numbers. Supports partial reading via offset and limit. Extracts text from PDF; binary and image files are rejected (use the image_info tool for images). Set encoding=\"base64\" to return raw bytes base64-encoded (for binary files such as .xlsx/.docx); offset/limit are ignored in that mode."
+        "Read file contents with line numbers. Supports partial reading via offset and limit. Binary and image files are rejected (use the image_info tool for images). Set encoding=\"base64\" to return raw bytes base64-encoded (for binary files such as .pdf/.xlsx/.docx); offset/limit are ignored in that mode."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -320,13 +304,8 @@ impl FileReadTool {
                     anyhow::Error::msg(format!("Failed to read file: {e}"))
                 })?;
 
-                if let Some(text) = try_extract_pdf_text(&bytes) {
-                    return Ok(ToolResult {
-                        success: true,
-                        output: text,
-                        error: None,
-                    });
-                }
+                // PDF text extraction was removed with the `rag-pdf` feature (#8519).
+                // Bytes still flow to the binary detection below.
 
                 // Reject confident binary instead of returning lossy garbage.
                 // Known image formats: point the agent at the image_info tool.
@@ -367,23 +346,6 @@ impl FileReadTool {
             }
         }
     }
-}
-
-#[cfg(feature = "rag-pdf")]
-fn try_extract_pdf_text(bytes: &[u8]) -> Option<String> {
-    if bytes.len() < 5 || &bytes[..5] != b"%PDF-" {
-        return None;
-    }
-    let text = pdf_extract::extract_text_from_mem(bytes).ok()?;
-    if text.trim().is_empty() {
-        return None;
-    }
-    Some(text)
-}
-
-#[cfg(not(feature = "rag-pdf"))]
-fn try_extract_pdf_text(_bytes: &[u8]) -> Option<String> {
-    None
 }
 
 /// Detect a common raster-image container by its file-header magic bytes.
@@ -485,6 +447,24 @@ mod tests {
             ..SecurityPolicy::default()
         });
         FileReadTool::new_with_persistence(security, false)
+    }
+
+    fn workspace_prefixed_relative_path_for_test(
+        workspace: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let mut relative = std::path::PathBuf::new();
+        for component in workspace.components() {
+            match component {
+                std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    panic!("test workspace path must not contain parent components")
+                }
+                std::path::Component::Normal(part) => relative.push(part),
+            }
+        }
+        relative
     }
 
     #[test]
@@ -805,6 +785,36 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
+    #[tokio::test]
+    async fn file_read_normalizes_workspace_prefixed_relative_path() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_read_workspace_prefixed");
+        let workspace = root.join("workspace");
+        let nested = workspace.join("nested");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&nested).await.unwrap();
+        tokio::fs::write(nested.join("notes.txt"), "prefixed content")
+            .await
+            .unwrap();
+
+        let tool = test_tool(workspace.clone());
+        let workspace_prefixed =
+            workspace_prefixed_relative_path_for_test(&workspace).join("nested/notes.txt");
+        let result = tool
+            .execute(json!({"path": workspace_prefixed.to_string_lossy()}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "workspace-prefixed file_read path should resolve, error: {:?}",
+            result.error
+        );
+        assert!(result.output.contains("1: prefixed content"));
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn file_read_blocks_symlink_escape() {
@@ -997,36 +1007,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// PDF files should be readable via pdf-extract text extraction.
-    #[tokio::test]
-    async fn file_read_extracts_pdf_text() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_pdf");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/test_document.pdf");
-        tokio::fs::copy(&fixture, dir.join("report.pdf"))
-            .await
-            .expect("copy PDF fixture");
-
-        let tool = test_tool(dir.clone());
-        let result = tool.execute(json!({"path": "report.pdf"})).await.unwrap();
-
-        assert!(
-            result.success,
-            "PDF read must succeed, error: {:?}",
-            result.error
-        );
-        assert!(
-            result.output.contains("Hello"),
-            "extracted text must contain 'Hello', got: {}",
-            result.output
-        );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
     /// Confident binary (NUL byte) is rejected, not returned as lossy text.
     #[tokio::test]
     async fn file_read_rejects_binary_file() {
@@ -1061,6 +1041,50 @@ mod tests {
             !result.output.contains('\u{FFFD}'),
             "must not return lossy replacement output, got: {:?}",
             result.output
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// PDF files are now rejected as binary (rag-pdf feature removed in #8519).
+    /// They can still be read raw with encoding="base64".
+    #[tokio::test]
+    async fn file_read_rejects_pdf_without_rag_pdf() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_pdf");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Minimal PDF-looking bytes: valid header followed by invalid UTF-8 and
+        // a NUL byte so the non-UTF-8 path triggers the binary heuristic now
+        // that pdf-extract is gone.
+        let pdf: Vec<u8> =
+            b"%PDF-1.4\n\x80\x00\xFF\xFE\n1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+        tokio::fs::write(dir.join("doc.pdf"), &pdf).await.unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool.execute(json!({"path": "doc.pdf"})).await.unwrap();
+
+        assert!(
+            !result.success,
+            "pdf read must fail without rag-pdf, got output: {:?}",
+            result.output
+        );
+        let err = result.error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("Binary file detected"),
+            "error must indicate binary rejection, got: {:?}",
+            result.error
+        );
+
+        // Base64 path still works.
+        let result = tool
+            .execute(json!({"path": "doc.pdf", "encoding": "base64"}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "base64 pdf read must succeed: {:?}",
+            result.error
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -1305,105 +1329,6 @@ mod tests {
         }
     }
 
-    /// End-to-end test: scripted model_provider calls `file_read` on a real PDF
-    /// fixture, the tool extracts text via pdf-extract, and the extracted
-    /// content reaches the model_provider in the tool result message.
-    #[tokio::test]
-    async fn e2e_agent_file_read_pdf_extraction() {
-        use crate::agent::agent::Agent;
-        use crate::agent::dispatcher::NativeToolDispatcher;
-        use e2e_helpers::*;
-        use zeroclaw_providers::{ChatResponse, ModelProvider, ToolCall};
-
-        // ── Set up workspace with PDF fixture ──
-        let workspace = std::env::temp_dir().join("zeroclaw_test_e2e_file_read_pdf");
-        let _ = tokio::fs::remove_dir_all(&workspace).await;
-        tokio::fs::create_dir_all(&workspace).await.unwrap();
-
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/test_document.pdf");
-        tokio::fs::copy(&fixture, workspace.join("report.pdf"))
-            .await
-            .expect("copy PDF fixture");
-
-        // ── Build real FileReadTool ──
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: workspace.clone(),
-            ..SecurityPolicy::default()
-        });
-        let file_read_tool: Box<dyn Tool> = Box::new(FileReadTool::new(security));
-
-        // ── Script model_provider: call file_read → then answer ──
-        let (model_provider, recorded) = RecordingModelProvider::new(vec![
-            // Turn 1 response: model_provider asks to read the PDF
-            ChatResponse {
-                text: Some(String::new()),
-                tool_calls: vec![ToolCall {
-                    id: "tc1".into(),
-                    name: "file_read".into(),
-                    arguments: r#"{"path": "report.pdf"}"#.into(),
-                    extra_content: None,
-                }],
-                usage: None,
-                reasoning_content: None,
-            },
-            // Turn 1 continued: model_provider sees tool result and answers
-            ChatResponse {
-                text: Some("The PDF contains a greeting: Hello PDF".into()),
-                tool_calls: vec![],
-                usage: None,
-                reasoning_content: None,
-            },
-        ]);
-
-        let mut agent = Agent::builder()
-            .model_provider(Box::new(model_provider) as Box<dyn ModelProvider>)
-            .tools(vec![file_read_tool])
-            .memory(make_memory())
-            .observer(make_observer())
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(workspace.clone())
-            .build()
-            .unwrap();
-
-        // ── Execute ──
-        let response = agent
-            .turn("Read report.pdf and tell me what it says")
-            .await
-            .unwrap();
-
-        // ── Verify final response ──
-        assert!(
-            response.contains("Hello PDF"),
-            "agent response must contain PDF content, got: {response}",
-        );
-
-        // ── Verify model_provider received extracted PDF text in tool result ──
-        {
-            let all_requests = recorded.lock().unwrap();
-            assert!(
-                all_requests.len() >= 2,
-                "expected at least 2 model_provider requests (initial + after tool), got {}",
-                all_requests.len(),
-            );
-
-            let second_request = &all_requests[1];
-            let tool_result_msg = second_request
-                .iter()
-                .find(|m| m.role == "tool")
-                .expect("second request must contain a tool result message");
-
-            assert!(
-                tool_result_msg.content.contains("Hello"),
-                "tool result must contain extracted PDF text 'Hello', got: {}",
-                tool_result_msg.content,
-            );
-        }
-
-        let _ = tokio::fs::remove_dir_all(&workspace).await;
-    }
-
     /// End-to-end test: agent calls `file_read` on a binary file and gets a
     /// binary-rejection error in the tool result (no lossy replacement output).
     #[tokio::test]
@@ -1492,73 +1417,6 @@ mod tests {
                 tool_result_msg.content,
             );
         }
-
-        let _ = tokio::fs::remove_dir_all(&workspace).await;
-    }
-
-    /// Live e2e: real OpenAI Codex model_provider + real FileReadTool + PDF fixture.
-    /// Verifies the model receives extracted PDF text and responds meaningfully.
-    ///
-    /// Requires valid OAuth credentials in `~/.zeroclaw/`.
-    /// Run: `cargo test --lib -- tools::file_read::tests::e2e_live_file_read_pdf --ignored --nocapture`
-    #[tokio::test]
-    #[ignore = "requires valid OpenAI Codex OAuth credentials"]
-    async fn e2e_live_file_read_pdf() {
-        use crate::agent::agent::Agent;
-        use crate::agent::dispatcher::XmlToolDispatcher;
-        use e2e_helpers::*;
-        use zeroclaw_providers::openai_codex::OpenAiCodexModelProvider;
-        use zeroclaw_providers::{ModelProvider, ModelProviderRuntimeOptions};
-
-        // ── Set up workspace with PDF fixture ──
-        let workspace = std::env::temp_dir().join("zeroclaw_test_e2e_live_file_read_pdf");
-        let _ = tokio::fs::remove_dir_all(&workspace).await;
-        tokio::fs::create_dir_all(&workspace).await.unwrap();
-
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/test_document.pdf");
-        tokio::fs::copy(&fixture, workspace.join("report.pdf"))
-            .await
-            .expect("copy PDF fixture");
-
-        // ── Build real FileReadTool ──
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: workspace.clone(),
-            ..SecurityPolicy::default()
-        });
-        let file_read_tool: Box<dyn Tool> = Box::new(FileReadTool::new(security));
-
-        // ── Real model_provider (OpenAI Codex uses XML tool dispatch) ──
-        let model_provider =
-            OpenAiCodexModelProvider::new("test", &ModelProviderRuntimeOptions::default(), None)
-                .expect("model_provider should initialize");
-
-        let mut agent = Agent::builder()
-            .model_provider(Box::new(model_provider) as Box<dyn ModelProvider>)
-            .tools(vec![file_read_tool])
-            .memory(make_memory())
-            .observer(make_observer())
-            .tool_dispatcher(Box::new(XmlToolDispatcher))
-            .workspace_dir(workspace.clone())
-            .model_name("gpt-5.3-codex".to_string())
-            .build()
-            .unwrap();
-
-        // ── Execute ──
-        let response = agent
-            .turn("Use the file_read tool to read report.pdf, then tell me what text it contains. Be concise.")
-            .await
-            .unwrap();
-
-        eprintln!("=== Live e2e response ===\n{response}\n=========================");
-
-        // ── Verify model saw the actual PDF content ("Hello PDF") ──
-        let lower = response.to_lowercase();
-        assert!(
-            lower.contains("hello"),
-            "model response must reference extracted PDF text 'Hello PDF', got: {response}",
-        );
 
         let _ = tokio::fs::remove_dir_all(&workspace).await;
     }

@@ -39,7 +39,7 @@ Name the YOLO posture explicitly on a dedicated risk profile (`yolo` is a good i
 
 YOLO mode doesn't lobotomise the agent:
 
-- **[Tool receipts](../security/tool-receipts.md)** still get written. You can `tail -f` the receipts log and see exactly what ran.
+- **[Tool receipts](../security/tool-receipts.md)** still protect successful tool-result claims when enabled. They are conversation-visible receipts, not a durable receipt log.
 - **[Audit logging](../ops/observability.md)** still works if enabled (`[security.audit] enabled = true`). Strongly recommended in YOLO.
 - **Conversation memory** still persists: there's still a record of what happened.
 
@@ -52,5 +52,5 @@ Delete the YOLO settings from the risk profile, or flip `[risk_profiles.<alias>]
 ## See also
 
 - [Security → Autonomy levels](../security/autonomy.md): the full gradient between YOLO and paranoid
-- [Security → Tool receipts](../security/tool-receipts.md): the audit trail you should keep on even in YOLO
+- [Security → Tool receipts](../security/tool-receipts.md): successful tool-result receipts you should keep on even in YOLO
 - [Philosophy](../philosophy/index.md): why this exists as an escape hatch rather than a default

@@ -33,12 +33,51 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  repo-structure:
+    name: Repository Structure
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Guard declared submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gitlinks="$(mktemp)"
+          declared="$(mktemp)"
+          allowed="$(mktemp)"
+
+          git ls-files -s | awk '$1 == "160000" { print $4 }' | sort > "$gitlinks"
+          { git config --file .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null || true; } \
+            | awk '{ print $2 }' | sort > "$declared"
+          printf '%s\n' 'docs/book/po' > "$allowed"
+
+          if ! cmp -s "$gitlinks" "$declared"; then
+            echo "::error::Gitlink paths must exactly match .gitmodules paths."
+            echo "Index gitlinks:"
+            sed 's/^/  /' "$gitlinks"
+            echo ".gitmodules paths:"
+            sed 's/^/  /' "$declared"
+            exit 1
+          fi
+
+          if ! cmp -s "$gitlinks" "$allowed"; then
+            echo "::error::Unexpected submodule path. Update this guard when adding an intentional submodule."
+            echo "Allowed submodule paths:"
+            sed 's/^/  /' "$allowed"
+            echo "Actual gitlink paths:"
+            sed 's/^/  /' "$gitlinks"
+            exit 1
+          fi
 
   # ── Post-format required quality gate ─────────────────────────────────────
 
@@ -51,9 +90,9 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         id: rust-cache
@@ -61,7 +100,7 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y libudev-dev
+        run: bash scripts/ci/apt_install.sh libudev-dev
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Clippy
@@ -108,6 +147,108 @@ jobs:
       - name: Fluent coverage guard (no bare user-facing strings)
         run: cargo test --test architecture user_facing_strings_route_through_fluent
 
+  windows-clippy-tools-changes:
+    name: Detect Windows Clippy changes
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.changed.outputs.run }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Detect targeted Windows Clippy changes
+        id: changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          changed_files="$(mktemp)"
+
+          case "${{ github.event_name }}" in
+            pull_request)
+              git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
+              ;;
+            push|merge_group)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            *)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          if grep -Eq '^(crates/zeroclaw-tools/|\.github/workflows/(ci|cross-platform-clippy)\.yml$)' "$changed_files"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  windows-clippy-tools:
+    name: Clippy (x86_64-pc-windows-msvc, targeted)
+    needs: [windows-clippy-tools-changes]
+    if: needs.windows-clippy-tools-changes.outputs.run == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.96.1
+          components: clippy
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Ensure web/dist placeholder exists
+        shell: bash
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Clippy
+        shell: bash
+        run: |
+          set +e
+          cargo_log="${RUNNER_TEMP}/cargo-clippy-windows-tools.log"
+          SECONDS=0
+          cargo clippy \
+            -p zeroclaw-tools \
+            --all-targets \
+            --all-features \
+            --target x86_64-pc-windows-msvc \
+            --no-deps \
+            -- -D warnings 2>&1 | tee "$cargo_log"
+          cargo_status=${PIPESTATUS[0]}
+          duration_seconds=$SECONDS
+          set -e
+
+          workspace_path_compiles="$(grep -E -c 'Compiling.*\([^)]*zeroclaw' "$cargo_log" || true)"
+          total_compiles="$(grep -c 'Compiling' "$cargo_log" || true)"
+          downloaded_crates="$(grep -c 'Downloaded' "$cargo_log" || true)"
+          cache_hit="${RUST_CACHE_HIT:-unknown}"
+          summary_file="${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          {
+            echo "### Targeted Windows Clippy diagnostics"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Target | \`x86_64-pc-windows-msvc\` |"
+            echo "| Runner OS | \`${{ runner.os }}\` |"
+            echo "| Rust cache exact hit | \`${cache_hit}\` |"
+            echo "| Clippy duration | \`${duration_seconds}s\` |"
+            echo "| Clippy status | \`${cargo_status}\` |"
+            echo "| Workspace path compile lines | \`${workspace_path_compiles}\` |"
+            echo "| Total compile lines | \`${total_compiles}\` |"
+            echo "| Downloaded crate lines | \`${downloaded_crates}\` |"
+          } >> "$summary_file"
+
+          exit "$cargo_status"
+        env:
+          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+
   # ── Post-format build + check fan-out ─────────────────────────────────────
 
   build:
@@ -133,9 +274,9 @@ jobs:
             label: Check
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         id: rust-cache
@@ -144,11 +285,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install mold linker
         if: runner.os == 'Linux'
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
-            /etc/apt/sources.list.d/azure-cli.list
-          sudo apt-get update -qq
-          sudo apt-get install -y mold
+        run: bash scripts/ci/apt_install.sh mold
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
@@ -207,20 +344,63 @@ jobs:
             sys_deps: ""
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
         if: matrix.sys_deps != ''
-        run: sudo apt-get update -qq && sudo apt-get install -y ${{ matrix.sys_deps }}
+        run: bash scripts/ci/apt_install.sh ${{ matrix.sys_deps }}
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Check
         run: cargo check --locked ${{ matrix.args }}
+
+  check-plugin-backends:
+    name: Check (${{ matrix.name }})
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: plugins cranelift backend
+            features: plugins-wasm-cranelift
+          - name: plugins pulley backend
+            features: plugins-wasm-pulley
+          - name: plugins runtime-only backend
+            features: plugins-wasmtime
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Detect plugin backend changes
+        id: changed
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$base" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if git diff --name-only "$base" HEAD | grep -qE '^crates/zeroclaw-plugins/|^Cargo\.(toml|lock)$'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        if: steps.changed.outputs.run == 'true'
+        with:
+          toolchain: 1.96.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: steps.changed.outputs.run == 'true'
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Check
+        if: steps.changed.outputs.run == 'true'
+        run: cargo check --locked -p zeroclaw-plugins --no-default-features --features ${{ matrix.features }}
 
   check-32bit:
     name: Check (32-bit)
@@ -229,16 +409,17 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
           targets: i686-unknown-linux-gnu
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install 32-bit system libraries
-        run: sudo apt-get update -qq && sudo apt-get install -y gcc-multilib
+        run: bash scripts/ci/apt_install.sh gcc-multilib
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Check (32-bit, no default features)
@@ -251,10 +432,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -272,21 +454,18 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install mold linker
-        run: |
-          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
-            /etc/apt/sources.list.d/azure-cli.list
-          sudo apt-get update -qq
-          sudo apt-get install -y mold
+        run: bash scripts/ci/apt_install.sh mold
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
       - name: Run tests
@@ -304,17 +483,33 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        run: |
+          curl -LsSf https://github.com/EmbarkStudios/cargo-deny/releases/download/0.19.9/cargo-deny-0.19.9-x86_64-unknown-linux-musl.tar.gz \
+            | tar zxf - -C ~/.cargo/bin --strip-components=1
       - name: Check licenses, sources, and advisories
         run: cargo deny check
+      - name: Lockfile integrity
+        run: cargo verify-project && cargo fetch --locked
+
+      - name: Validate YAML workflow syntax
+        run: |
+          pip install pyyaml -q 2>/dev/null || true
+          python3 -c "import sys, yaml; yaml.safe_load(open('.github/workflows/ci.yml')); print('ci.yml: valid')"
+      - name: Install cargo-audit
+        run: |
+          curl -LsSf https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz \
+            | tar zxf - -C ~/.cargo/bin --strip-components=1
+      - name: Run cargo audit (RustSec advisory database)
+        run: cargo audit
 
   nix-eval:
     name: Nix Module Eval
@@ -324,11 +519,52 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install Nix
-        run: sudo apt-get update -qq && sudo apt-get install -y nix-bin nix-setup-systemd
+        run: bash scripts/ci/apt_install.sh nix-bin nix-setup-systemd
       - name: Verify Nix
         run: sudo nix --version
       - name: Evaluate Nix module assertions
         run: sudo nix --extra-experimental-features "nix-command flakes" build .#checks.x86_64-linux.nixos-module-eval --no-link
+
+  nix-hash-drift:
+    name: Nix Hash Drift
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Validate nix/hashes.json matches Cargo.lock git deps
+        run: |
+          set -euo pipefail
+          if [[ ! -f Cargo.lock ]]; then
+            echo "Cargo.lock not found; nothing to check."
+            exit 0
+          fi
+          # Extract git-dep keys from Cargo.lock using the same Python
+          # logic as refresh-nix-hashes.sh.
+          python3 scripts/ci/list_git_dep_keys.py > /tmp/lock_keys.json
+          LOCK_COUNT=$(jq length /tmp/lock_keys.json)
+          echo "Found $LOCK_COUNT git-sourced package(s) in Cargo.lock."
+          if [[ "$LOCK_COUNT" -eq 0 ]]; then
+            echo "No git deps; nothing to check."
+            exit 0
+          fi
+          if [[ ! -f nix/hashes.json ]]; then
+            echo "error: nix/hashes.json not found — git deps present but no hashes file."
+            exit 1
+          fi
+          HASH_KEYS=$(jq 'keys' nix/hashes.json)
+          MISSING=$(jq -n --argjson lock "$(cat /tmp/lock_keys.json)" \
+            --argjson hash "$HASH_KEYS" \
+            '$lock - $hash')
+          MISSING_COUNT=$(echo "$MISSING" | jq length)
+          if [[ "$MISSING_COUNT" -gt 0 ]]; then
+            echo "error: $MISSING_COUNT git-dep hash(es) missing from nix/hashes.json:"
+            echo "$MISSING" | jq -r '.[]'
+            echo ""
+            echo "Run scripts/dev/refresh-nix-hashes.sh and commit the result."
+            exit 1
+          fi
+          echo "All git deps have hashes in nix/hashes.json."
 
   docs-style:
     name: Docs Style
@@ -346,6 +582,10 @@ jobs:
         env:
           BASE_SHA: ${{ steps.base.outputs.sha }}
         run: bash scripts/ci/docs_quality_gate.sh
+      - name: Docs link gate (added links)
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: bash scripts/ci/docs_links_gate.sh
 
   zerocode-rpc-boundary:
     name: Zerocode RPC Boundary
@@ -380,10 +620,16 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - name: Test installer target detection
+        run: bash scripts/ci/install_target_triple_test.sh
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.93.0
+          toolchain: 1.96.1
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check generated install surfaces are in sync with the spec
         run: cargo generate installers --check
 
@@ -394,7 +640,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, lint, build, check, check-32bit, bench, test, security, nix-eval, docs-style, installer-drift, zerocode-rpc-boundary]
+    needs: [fmt, repo-structure, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-32bit, bench, test, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary]
     runs-on: ubuntu-latest
     steps:
       - name: Check results

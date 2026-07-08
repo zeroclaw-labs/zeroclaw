@@ -292,6 +292,16 @@ mod tests {
         FileWriteTool::new_with_persistence(security, false)
     }
 
+    #[cfg(target_os = "windows")]
+    fn absolute_path_outside_workspace() -> &'static str {
+        r"C:\Windows\win.ini"
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn absolute_path_outside_workspace() -> &'static str {
+        "/etc/evil"
+    }
+
     #[test]
     fn file_write_name() {
         let tool = test_tool(std::env::temp_dir());
@@ -360,10 +370,9 @@ mod tests {
         tokio::fs::create_dir_all(&workspace).await.unwrap();
 
         let tool = test_tool(workspace.clone());
-        let workspace_prefixed = workspace
-            .strip_prefix(std::path::Path::new("/"))
-            .unwrap()
-            .join("nested/out.txt");
+        let workspace_prefixed =
+            crate::util_helpers::workspace_prefixed_relative_path_for_test(&workspace)
+                .join("nested/out.txt");
         let result = tool
             .execute(json!({
                 "path": workspace_prefixed.to_string_lossy(),
@@ -431,7 +440,7 @@ mod tests {
     async fn file_write_blocks_absolute_path() {
         let tool = wrapped_tool(std::env::temp_dir());
         let result = tool
-            .execute(json!({"path": "/etc/evil", "content": "bad"}))
+            .execute(json!({"path": absolute_path_outside_workspace(), "content": "bad"}))
             .await
             .unwrap();
         assert!(!result.success);

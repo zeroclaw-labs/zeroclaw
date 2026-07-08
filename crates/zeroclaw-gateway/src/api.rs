@@ -37,7 +37,7 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Verify bearer token against PairingGuard. Returns error response if unauthorized.
-pub(super) fn require_auth(
+pub(crate) fn require_auth(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
@@ -46,6 +46,16 @@ pub(super) fn require_auth(
     }
 
     let token = extract_bearer_token(headers).unwrap_or("");
+    // Defense-in-depth: reject empty tokens explicitly so a future
+    // refactor of is_authenticated cannot accidentally treat "" as valid.
+    if token.is_empty() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            })),
+        ));
+    }
     if state.pairing.is_authenticated(token) {
         Ok(())
     } else {
@@ -121,7 +131,10 @@ pub struct CronAddBody {
 #[derive(Deserialize)]
 pub struct CronPatchBody {
     /// Configured agent alias whose risk profile gates the new shell
-    /// command (when `command` is being patched). Required.
+    /// command. Only consulted when `command` is being patched; optional
+    /// otherwise (e.g. a pure schedule/name change or an enable/disable
+    /// toggle), so non-command patches need not supply it.
+    #[serde(default)]
     pub agent: String,
     pub name: Option<String>,
     pub schedule: Option<String>,
@@ -129,6 +142,9 @@ pub struct CronPatchBody {
     pub clear_tz: Option<bool>,
     pub command: Option<String>,
     pub prompt: Option<String>,
+    /// Toggle the job on/off without deleting it (pause/resume). `None` leaves
+    /// the current state unchanged.
+    pub enabled: Option<bool>,
 }
 
 enum CronTimezonePatch {
@@ -299,17 +315,37 @@ pub async fn handle_api_status(
     Json(body).into_response()
 }
 
-/// GET /api/tools — list registered tool specs
+/// Query parameters for `GET /api/tools`. Pass `?agent=<alias>` to list that
+/// agent's scoped tool set (its built-ins plus the MCP tools granted by its
+/// `mcp_bundles`); omit it for the default listing seeded from the
+/// deterministically smallest enabled agent. An unknown alias falls back to
+/// the default listing rather than erroring, so a stale UI selection still
+/// renders.
+#[derive(Debug, Deserialize)]
+pub struct ToolsQuery {
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+/// GET /api/tools - list registered tool specs, optionally scoped to `?agent=`
 pub async fn handle_api_tools(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ToolsQuery>,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
-    let tools: Vec<serde_json::Value> = state
-        .tools_registry
+    let registry = query
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+        .and_then(|alias| state.tools_registry_by_agent.get(alias).cloned())
+        .unwrap_or_else(|| std::sync::Arc::clone(&state.tools_registry));
+
+    let tools: Vec<serde_json::Value> = registry
         .iter()
         .map(|spec| {
             serde_json::json!({
@@ -535,73 +571,23 @@ pub async fn handle_api_cron_run(
         }
     };
 
-    let started_at = chrono::Utc::now();
-    let (mut success, output) =
-        zeroclaw_runtime::cron::scheduler::execute_job_now(&config, &job).await;
-    let finished_at = chrono::Utc::now();
-    let duration_ms = (finished_at - started_at).num_milliseconds();
-    let outcome = zeroclaw_runtime::cron::scheduler::deliver_and_classify_run_result(
+    let event_tx = Some(state.event_tx.clone());
+    let result = zeroclaw_runtime::cron::scheduler::run_manual_job(
         &config,
         &job,
-        success,
-        output,
         zeroclaw_runtime::cron::scheduler::CronDeliveryContext::GatewayManual,
+        &event_tx,
     )
     .await;
-    success = outcome.success;
-
-    if let Err(e) = zeroclaw_runtime::cron::record_run(
-        &config,
-        &job.id,
-        started_at,
-        finished_at,
-        &outcome.status,
-        Some(&outcome.output),
-        duration_ms,
-    ) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
-            "manual cron trigger: failed to persist run history"
-        );
-    }
-    if let Err(e) = zeroclaw_runtime::cron::record_last_run_with_status(
-        &config,
-        &job.id,
-        finished_at,
-        &outcome.status,
-        &outcome.output,
-    ) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
-            "manual cron trigger: failed to update last_run state"
-        );
-    }
-
-    // Broadcast the result so dashboard/SSE clients refresh in real time,
-    // matching the scheduler's automatic-execution behavior.
-    let _ = state.event_tx.send(serde_json::json!({
-        "type": "cron_result",
-        "job_id": job.id,
-        "success": success,
-        "output": &outcome.output,
-        "manual": true,
-        "timestamp": finished_at.to_rfc3339(),
-    }));
 
     Json(serde_json::json!({
-        "status": &outcome.status,
-        "job_id": job.id,
-        "success": success,
-        "output": &outcome.output,
-        "duration_ms": duration_ms,
-        "started_at": started_at.to_rfc3339(),
-        "finished_at": finished_at.to_rfc3339(),
+        "status": result.status,
+        "job_id": result.job_id,
+        "success": result.success,
+        "output": result.output,
+        "duration_ms": result.duration_ms,
+        "started_at": result.started_at.to_rfc3339(),
+        "finished_at": result.finished_at.to_rfc3339(),
     }))
     .into_response()
 }
@@ -618,16 +604,6 @@ pub async fn handle_api_cron_patch(
     }
 
     let config = state.config.read().clone();
-    if config.agent(&body.agent).is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!(
-                "Unknown agent {a:?} (no [agents.{a}] entry configured)",
-                a = body.agent
-            )})),
-        )
-            .into_response();
-    }
     let agent_alias = body.agent.clone();
     let CronPatchBody {
         agent: _,
@@ -637,6 +613,7 @@ pub async fn handle_api_cron_patch(
         clear_tz,
         command,
         prompt,
+        enabled,
     } = body;
     let timezone_patch = match parse_timezone_patch(tz, clear_tz) {
         Ok(patch) => patch,
@@ -653,6 +630,26 @@ pub async fn handle_api_cron_patch(
                 .into_response();
         }
     };
+    let is_agent = matches!(existing.job_type, zeroclaw_runtime::cron::JobType::Agent);
+    // The agent only gates a shell `command` change (risk profile). For a shell
+    // job the new command can arrive via either `command` OR `prompt` (the
+    // `prompt` field is folded into the command below), so the existence check
+    // must cover both. Skip it for patches that don't set a shell command —
+    // schedule, name, and enable/disable toggles don't need an agent supplied —
+    // and for agent-type jobs, where `prompt` is an LLM prompt, not a shell
+    // command, and so is not agent-gated. This needs `existing.job_type`, hence
+    // it runs after the job is fetched.
+    let setting_shell_command = !is_agent && (command.is_some() || prompt.is_some());
+    if setting_shell_command && config.agent(&agent_alias).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!(
+                "Unknown agent {a:?} (no [agents.{a}] entry configured)",
+                a = agent_alias
+            )})),
+        )
+            .into_response();
+    }
     let new_expr = schedule_expr
         .as_deref()
         .map(str::trim)
@@ -687,7 +684,6 @@ pub async fn handle_api_cron_patch(
     } else {
         None
     };
-    let is_agent = matches!(existing.job_type, zeroclaw_runtime::cron::JobType::Agent);
     let (patch_command, patch_prompt) = if is_agent {
         (None, command.or(prompt))
     } else {
@@ -699,6 +695,7 @@ pub async fn handle_api_cron_patch(
         schedule,
         command: patch_command,
         prompt: patch_prompt,
+        enabled,
         ..zeroclaw_runtime::cron::CronJobPatch::default()
     };
 
@@ -1910,6 +1907,12 @@ pub async fn handle_claude_code_hook(
     Json(serde_json::json!({ "ok": true }))
 }
 
+// Shared test helper: `api_config` tests reuse this AppState builder for the
+// agent rename/delete cascade handlers (#7907 / #7941 regression coverage).
+
+#[cfg(test)]
+pub(crate) use tests::test_state;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2012,6 +2015,15 @@ mod tests {
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
+
+        // Override the trait default (which returns an "unsupported" Err) so
+        // tests that trigger the delete_agent cascade don't have their
+        // `warnings` array polluted with a memory-backend error that has
+        // nothing to do with what they're actually asserting. Mirrors the
+        // behavior of a real backend on a delete-of-a-never-stored agent.
+        async fn purge_agent(&self, _agent_alias: &str) -> anyhow::Result<usize> {
+            Ok(0)
+        }
     }
     impl ::zeroclaw_api::attribution::Attributable for MockMemory {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -2075,7 +2087,7 @@ mod tests {
         config
     }
 
-    fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
+    pub(crate) fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
         AppState {
             config: Arc::new(RwLock::new(config)),
             model_provider: Arc::new(MockModelProvider),
@@ -2114,6 +2126,7 @@ mod tests {
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(crate::sse::EventBuffer::new(16)),
@@ -2185,6 +2198,9 @@ mod tests {
             namespace: "default".into(),
             importance: Some(0.5),
             superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
             agent_alias: None,
             agent_id: None,
         }
@@ -2269,6 +2285,66 @@ mod tests {
         assert_eq!(content.chars().count(), MEMORY_API_CONTENT_MAX_CHARS);
         assert!(content.ends_with("..."));
         assert_ne!(content, huge);
+    }
+
+    #[tokio::test]
+    async fn handle_api_tools_scopes_listing_by_agent_query() {
+        use zeroclaw_api::tool::ToolSpec;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        let mut state = test_state(config);
+
+        let spec = |name: &str| ToolSpec {
+            name: name.to_string(),
+            description: format!("{name} desc"),
+            parameters: serde_json::json!({}).into(),
+        };
+        state.tools_registry = Arc::new(vec![spec("default_tool")]);
+        let mut by_agent: std::collections::HashMap<String, Arc<Vec<ToolSpec>>> =
+            std::collections::HashMap::new();
+        by_agent.insert("alpha".to_string(), Arc::new(vec![spec("alpha_tool")]));
+        by_agent.insert("beta".to_string(), Arc::new(vec![spec("beta_tool")]));
+        state.tools_registry_by_agent = Arc::new(by_agent);
+
+        async fn tool_names(state: AppState, agent: Option<&str>) -> Vec<String> {
+            let response = handle_api_tools(
+                State(state),
+                HeaderMap::new(),
+                Query(ToolsQuery {
+                    agent: agent.map(str::to_string),
+                }),
+            )
+            .await
+            .into_response();
+            response_json(response).await["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        }
+
+        // A known agent gets its own scoped listing.
+        assert_eq!(
+            tool_names(state.clone(), Some("beta")).await,
+            vec!["beta_tool".to_string()]
+        );
+        // Omitted agent falls back to the default seed listing.
+        assert_eq!(
+            tool_names(state.clone(), None).await,
+            vec!["default_tool".to_string()]
+        );
+        // Unknown and blank aliases fall back to the default rather than error,
+        // so a stale UI selection still renders something.
+        assert_eq!(
+            tool_names(state.clone(), Some("ghost")).await,
+            vec!["default_tool".to_string()]
+        );
+        assert_eq!(
+            tool_names(state.clone(), Some("   ")).await,
+            vec!["default_tool".to_string()]
+        );
     }
 
     #[test]
@@ -2603,6 +2679,24 @@ mod tests {
                 .iter()
                 .any(|item| item.contains("Bind this channel"))
         );
+    }
+
+    #[test]
+    fn require_auth_rejects_empty_bearer_token() {
+        let config = zeroclaw_config::schema::Config::default();
+        let mut state = test_state(config);
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer ".parse().unwrap(), // empty token after prefix
+        );
+
+        let result = require_auth(&state, &headers);
+        assert!(result.is_err(), "empty bearer token must be rejected");
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -3242,6 +3336,280 @@ mod tests {
         );
     }
 
+    // --- PATCH agent-requirement boundary (#7666) ---------------------------
+    // These pin the relaxed `agent` rule: it is required only when a patch sets a
+    // *shell command* (the risk-profile gate), and not for enable/disable,
+    // metadata-only patches, or agent-type jobs. Regression coverage for the
+    // `#[serde(default)] agent` + `setting_shell_command` scoping so a future
+    // refactor can't silently reopen the gate or re-require agent where it isn't.
+
+    #[tokio::test]
+    async fn cron_api_patch_enabled_without_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("toggle-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        // No `agent` field at all — pause/resume must not require one.
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(serde_json::json!({ "enabled": false }))
+                    .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "enable/disable toggle must not require an agent"
+        );
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
+            .expect("updated job");
+        assert!(!updated.enabled, "job should be disabled after the patch");
+    }
+
+    #[tokio::test]
+    async fn cron_api_patch_name_and_schedule_without_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("old-name".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        // Metadata-only patch (no command/prompt) — agent must be optional.
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(serde_json::json!({
+                    "name": "new-name",
+                    "schedule": "30 9 * * *"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "name/schedule patch must not require an agent"
+        );
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
+            .expect("updated job");
+        assert_eq!(updated.name.as_deref(), Some("new-name"));
+        assert_eq!(
+            updated.schedule,
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "30 9 * * *".to_string(),
+                tz: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_patch_shell_command_requires_known_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("shell-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        // Setting a shell `command` still hits the risk gate: a missing agent
+        // must be a clean 400, not a fall-through.
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(
+                    serde_json::json!({ "command": "echo bye" }),
+                )
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "shell command patch with no agent must be rejected at the risk gate"
+        );
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Unknown agent"),
+            "error should name the unknown agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_patch_shell_prompt_unknown_agent_is_bad_request_not_500() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("shell-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        // For a shell job a new command can arrive via `prompt`; it still routes
+        // through the command-risk gate, so an unknown agent is a 400 — not the
+        // 500 that an unguarded path would surface.
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(serde_json::json!({
+                    "agent": "ghost",
+                    "prompt": "echo bye"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "shell-job prompt with unknown agent must be 400, not 500"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_patch_agent_prompt_without_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let add_response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "agent-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "command": "ignored",
+                    "prompt": "old prompt"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(add_response.status(), StatusCode::OK);
+        let id = zeroclaw_runtime::cron::list_jobs(&state.config.read().clone()).unwrap()[0]
+            .id
+            .clone();
+
+        // For an agent-type job `prompt` is an LLM prompt, not a shell command,
+        // so it is not agent-gated and may omit `agent`.
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(
+                    serde_json::json!({ "prompt": "new prompt" }),
+                )
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "agent-type prompt patch must not require an agent"
+        );
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &id)
+            .expect("updated job");
+        assert_eq!(updated.prompt.as_deref(), Some("new prompt"));
+    }
+
     #[tokio::test]
     async fn cron_api_rejects_announce_delivery_without_target() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3474,18 +3842,20 @@ mod tests {
 
         let registry = Arc::new(DeviceRegistry::new(&data_dir));
         let device_id = "dev-1".to_string();
-        registry.register(
-            token_hash,
-            DeviceInfo {
-                id: device_id.clone(),
-                name: None,
-                device_type: None,
-                paired_at: Utc::now(),
-                last_seen: Utc::now(),
-                ip_address: None,
-                capabilities: None,
-            },
-        );
+        registry
+            .register(
+                token_hash,
+                DeviceInfo {
+                    id: device_id.clone(),
+                    name: None,
+                    device_type: None,
+                    paired_at: Utc::now(),
+                    last_seen: Utc::now(),
+                    ip_address: None,
+                    capabilities: None,
+                },
+            )
+            .expect("test device registry insert");
 
         let mut state = test_state(config);
         state.pairing = pairing;
@@ -3500,6 +3870,105 @@ mod tests {
             format!("Bearer {token}").parse().unwrap(),
         );
         h
+    }
+
+    /// The backfill inserts a placeholder row for every paired-token hash that
+    /// has no device entry, skips hashes that already have one (without
+    /// clobbering their metadata), and is idempotent across restarts.
+    #[tokio::test]
+    async fn reconcile_backfills_orphan_token_hashes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let registry = DeviceRegistry::new(tmp.path());
+
+        // A real, already-registered device with a name.
+        let known_hash = "a".repeat(64);
+        registry
+            .register(
+                known_hash.clone(),
+                DeviceInfo {
+                    id: "known".into(),
+                    name: Some("My Laptop".into()),
+                    device_type: Some("desktop".into()),
+                    paired_at: Utc::now(),
+                    last_seen: Utc::now(),
+                    ip_address: None,
+                    capabilities: None,
+                },
+            )
+            .expect("test device registry insert");
+
+        let orphan_a = "b".repeat(64);
+        let orphan_b = "c".repeat(64);
+        let inserted = registry
+            .reconcile_from_token_hashes(&[known_hash.clone(), orphan_a.clone(), orphan_b.clone()])
+            .unwrap();
+        assert_eq!(inserted, 2, "only the two orphan hashes should be inserted");
+        assert_eq!(registry.device_count(), 3);
+
+        // Existing metadata is preserved, not clobbered.
+        let known = registry
+            .list()
+            .expect("test device registry list")
+            .into_iter()
+            .find(|d| d.id == "known")
+            .expect("known device still present");
+        assert_eq!(known.name.as_deref(), Some("My Laptop"));
+
+        // Re-running is a no-op (idempotent).
+        let again = registry
+            .reconcile_from_token_hashes(&[known_hash, orphan_a, orphan_b])
+            .unwrap();
+        assert_eq!(again, 0);
+        assert_eq!(registry.device_count(), 3);
+    }
+
+    /// Security-management contract: a token paired through the legacy `/pair`
+    /// route is an orphan (authenticates, but absent from the registry). After
+    /// backfill it is keyed by the SAME `token_hash` the auth gate uses, so the
+    /// revoke-by-device path (`revoke` → `PairingGuard::revoke_token_hash`)
+    /// invalidates exactly that bearer token.
+    #[tokio::test]
+    async fn backfilled_orphan_is_revocable_by_its_real_hash() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let pairing = PairingGuard::new(true, &[]);
+        let code = pairing.pairing_code().unwrap();
+        let token = pairing
+            .try_pair(&code, "legacy-client")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pairing.is_authenticated(&token));
+
+        // Simulate the `/pair` orphan: token is paired but never registered.
+        let registry = DeviceRegistry::new(&data_dir);
+        assert_eq!(registry.device_count(), 0);
+
+        let inserted = registry
+            .reconcile_from_token_hashes(&pairing.tokens())
+            .unwrap();
+        assert_eq!(inserted, 1);
+
+        // The backfilled row is keyed by the auth hash, so revoke returns it and
+        // revoking that hash from the guard actually de-authenticates the token.
+        let device = registry
+            .list()
+            .expect("test device registry list")
+            .into_iter()
+            .next()
+            .expect("one backfilled device");
+        let revoked_hash = registry
+            .revoke(&device.id)
+            .unwrap()
+            .expect("device existed");
+        assert_eq!(revoked_hash, PairingGuard::token_hash(&token));
+        assert!(pairing.revoke_token_hash(&revoked_hash));
+        assert!(
+            !pairing.is_authenticated(&token),
+            "token must not authenticate after revoke"
+        );
     }
 
     /// Regression: `POST /api/devices/{id}/token/rotate` MUST invalidate the
@@ -3712,18 +4181,20 @@ mod tests {
                 .generate_new_pairing_code()
                 .expect("pairing enabled");
             let tok = pairing.try_pair(&code, id).await.unwrap().unwrap();
-            registry.register(
-                PairingGuard::token_hash(&tok),
-                DeviceInfo {
-                    id: id.to_string(),
-                    name: None,
-                    device_type: None,
-                    paired_at: Utc::now(),
-                    last_seen: Utc::now(),
-                    ip_address: None,
-                    capabilities: None,
-                },
-            );
+            registry
+                .register(
+                    PairingGuard::token_hash(&tok),
+                    DeviceInfo {
+                        id: id.to_string(),
+                        name: None,
+                        device_type: None,
+                        paired_at: Utc::now(),
+                        last_seen: Utc::now(),
+                        ip_address: None,
+                        capabilities: None,
+                    },
+                )
+                .expect("test device registry insert");
         }
 
         let mut state = test_state(config);
@@ -3758,5 +4229,84 @@ mod tests {
             "exactly one of two racing rotates must win the pairing slot, \
              got {codes_issued} (j1={j1}, j2={j2})"
         );
+    }
+
+    #[cfg(feature = "a2a")]
+    mod a2a_auth {
+        use super::*;
+        use tower::ServiceExt;
+
+        const TOKEN: &str = "a2a-test-token";
+
+        fn paired_state() -> AppState {
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.a2a.server.enabled = true;
+            let agent = zeroclaw_config::schema::AliasedAgentConfig {
+                a2a: zeroclaw_config::multi_agent::AgentA2aConfig {
+                    published: true,
+                    exposed_skills: Vec::new(),
+                },
+                ..Default::default()
+            };
+            config.agents.insert("maker".to_string(), agent);
+            let mut state = test_state(config);
+            state.pairing = Arc::new(PairingGuard::new(true, &[TOKEN.to_string()]));
+            state
+        }
+
+        async fn status_of(
+            router: axum::Router,
+            req: axum::http::Request<axum::body::Body>,
+        ) -> StatusCode {
+            router.oneshot(req).await.expect("router response").status()
+        }
+
+        #[tokio::test]
+        async fn task_endpoint_rejects_unauthenticated_request() {
+            let router = crate::a2a::a2a_task_route().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/a2a/maker")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"parts":[{"kind":"text","text":"hi"}]}}}"#,
+                ))
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn catalog_card_serves_unauthenticated_request() {
+            let router = crate::a2a::a2a_routes().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/.well-known/agents-card.json")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn alias_card_serves_unauthenticated_request() {
+            let router = crate::a2a::a2a_routes().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/a2a/maker/.well-known/agent-card.json")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn alias_card_serves_with_valid_token() {
+            let router = crate::a2a::a2a_routes().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/a2a/maker/.well-known/agent-card.json")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::OK);
+        }
     }
 }

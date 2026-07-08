@@ -5,6 +5,7 @@ pub enum WebSearchProviderRoute {
     SearXNG,
     Tavily,
     Jina,
+    Bocha,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +20,7 @@ const BRAVE_PROVIDER: &str = "brave";
 const SEARXNG_PROVIDER: &str = "searxng";
 const TAVILY_PROVIDER: &str = "tavily";
 const JINA_PROVIDER: &str = "jina";
+const BOCHA_PROVIDER: &str = "bocha";
 
 pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProviderResolution {
     let normalized = raw_model_provider.trim().to_ascii_lowercase();
@@ -50,8 +52,15 @@ pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProvide
             canonical_provider: JINA_PROVIDER,
             used_fallback: false,
         },
+        "bocha" | "bochaai" | "bocha-ai" | "bocha_ai" | "bocha-search" | "bocha_search" => {
+            WebSearchProviderResolution {
+                route: WebSearchProviderRoute::Bocha,
+                canonical_provider: BOCHA_PROVIDER,
+                used_fallback: false,
+            }
+        }
         // Warns for unknown model_providers, falls back to default.
-        // Known non-default model_providers: Brave, SearXNG, Tavily, Jina.
+        // Known non-default model_providers: Brave, SearXNG, Tavily, Jina, Bocha.
         _ => WebSearchProviderResolution {
             route: WebSearchProviderRoute::DuckDuckGo,
             canonical_provider: DEFAULT_WEB_SEARCH_PROVIDER,
@@ -120,6 +129,24 @@ mod tests {
     }
 
     #[test]
+    fn resolve_aliases_to_bocha() {
+        let bocha_aliases = [
+            "bocha",
+            "bochaai",
+            "bocha-ai",
+            "bocha_ai",
+            "bocha-search",
+            "bocha_search",
+        ];
+        for alias in bocha_aliases {
+            let resolved = resolve_web_search_provider(alias);
+            assert_eq!(resolved.route, WebSearchProviderRoute::Bocha);
+            assert_eq!(resolved.canonical_provider, BOCHA_PROVIDER);
+            assert!(!resolved.used_fallback);
+        }
+    }
+
+    #[test]
     fn resolve_unknown_provider_falls_back_to_default() {
         let resolved = resolve_web_search_provider("bing");
         assert_eq!(resolved.route, WebSearchProviderRoute::DuckDuckGo);
@@ -130,5 +157,28 @@ mod tests {
         assert_eq!(resolved2.route, WebSearchProviderRoute::DuckDuckGo);
         assert_eq!(resolved2.canonical_provider, DEFAULT_WEB_SEARCH_PROVIDER);
         assert!(resolved2.used_fallback);
+    }
+
+    #[test]
+    fn empty_and_default_route_to_duckduckgo_without_fallback() {
+        for alias in ["", "default"] {
+            let r = resolve_web_search_provider(alias);
+            assert_eq!(r.route, WebSearchProviderRoute::DuckDuckGo);
+            assert_eq!(r.canonical_provider, DEFAULT_WEB_SEARCH_PROVIDER);
+            // An explicit empty / "default" is the configured default, not an
+            // unknown-provider fallback (so it must not set used_fallback).
+            assert!(!r.used_fallback);
+        }
+    }
+
+    #[test]
+    fn resolution_trims_whitespace_and_ignores_case() {
+        let r = resolve_web_search_provider("  BRAVE  ");
+        assert_eq!(r.route, WebSearchProviderRoute::Brave);
+        assert!(!r.used_fallback);
+
+        let r = resolve_web_search_provider("Tavily-Search");
+        assert_eq!(r.route, WebSearchProviderRoute::Tavily);
+        assert!(!r.used_fallback);
     }
 }
