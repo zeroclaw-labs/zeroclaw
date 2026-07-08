@@ -2850,6 +2850,158 @@ mod registry_tests {
         assert!(err.to_string().contains("bare skill name"), "got: {err}");
     }
 
+    /// Build a local git repository that acts as a skill catalog: a real commit
+    /// containing `skills/<name>/SKILL.md` for each requested skill. Returns the
+    /// repo path, which doubles as the clone URL for
+    /// `install_git_catalog_skill_source` (git clones local paths directly, so
+    /// the test stays hermetic — no network).
+    fn init_git_skill_catalog(root: &Path, skills: &[&str]) -> std::path::PathBuf {
+        let repo = root.join("catalog");
+        for name in skills {
+            let skill_dir = repo.join("skills").join(name);
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!(
+                    "---\nname: {name}\ndescription: hermetic git-catalog fixture\n---\n\n# {name}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("git must be available to build the catalog fixture");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["add", "-A"]);
+        // Pass identity/signing inline so the commit does not depend on the
+        // runner's global git config.
+        run(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        repo
+    }
+
+    #[test]
+    fn install_git_catalog_skill_source_installs_selected_skill_through_audit() {
+        // Happy path for the `--skill` replacement: clone a local git catalog,
+        // resolve `skills/<name>/`, and install it through the shared
+        // clone → local-copy → security-audit path. Skipped if git is absent.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = init_git_skill_catalog(tmp.path(), &["demo-skill", "other-skill"]);
+        let skills_path = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let (dest, files_scanned) = install_git_catalog_skill_source(
+            catalog.to_str().unwrap(),
+            "demo-skill",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect("happy-path git-catalog install should succeed");
+
+        // Installed at the expected destination, with the catalog's SKILL.md.
+        assert_eq!(dest, skills_path.join("demo-skill"));
+        assert!(
+            dest.join("SKILL.md").is_file(),
+            "the selected skill's SKILL.md must be installed"
+        );
+        // A non-zero scan count proves the security-audit path was entered.
+        assert!(
+            files_scanned >= 1,
+            "install must run through the audit path; files_scanned = {files_scanned}"
+        );
+        // Only the requested skill is installed, not its sibling.
+        assert!(!skills_path.join("other-skill").exists());
+        // The transient clone scratch dir is cleaned up afterwards.
+        let leftover = std::fs::read_dir(&workspace)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-catalog-")
+            });
+        assert!(!leftover, "clone scratch dir must be removed after install");
+    }
+
+    #[test]
+    fn install_git_catalog_skill_source_reports_missing_skill_after_clone() {
+        // The main post-clone failure mode: the requested skill is not in the
+        // catalog. The error must name it and list what *is* available, and must
+        // not install anything.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = init_git_skill_catalog(tmp.path(), &["present-skill"]);
+        let skills_path = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let err = install_git_catalog_skill_source(
+            catalog.to_str().unwrap(),
+            "absent-skill",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect_err("a skill missing from the catalog must error after clone");
+        let msg = err.to_string();
+        assert!(msg.contains("not found"), "got: {msg}");
+        assert!(
+            msg.contains("present-skill"),
+            "error should list the available skills; got: {msg}"
+        );
+        // Nothing installed, and the clone scratch dir is cleaned up.
+        assert!(!skills_path.join("absent-skill").exists());
+        let leftover = std::fs::read_dir(&workspace)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-catalog-")
+            });
+        assert!(!leftover, "clone scratch dir must be removed after failure");
+    }
+
     #[test]
     fn tier_from_tags_recognizes_official() {
         assert_eq!(
