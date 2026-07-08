@@ -2039,7 +2039,7 @@ pub async fn run_gateway(
         .unwrap_or("")
         .trim_end_matches('/');
     let mut inner = inner;
-    for (alias, cfg) in config.channels.openai.iter().filter(|(_, c)| c.enabled) {
+    for (alias, _) in config.channels.openai.iter().filter(|(_, c)| c.enabled) {
         let public_url = format!(
             "http://{}:{}{}/openai/{}/v1",
             config.gateway.host, config.gateway.port, prefix_str, alias
@@ -2050,17 +2050,6 @@ pub async fn run_gateway(
                 .with_attrs(::serde_json::json!({"alias": alias, "endpoint": public_url})),
             "OpenAI bridge enabled"
         );
-        // Validate system_prompt_mode at startup to catch typos early.
-        const VALID_MODES: &[&str] = &["zeroclaw", "merge", "caller"];
-        if !VALID_MODES.contains(&cfg.system_prompt_mode.as_str()) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"alias": alias, "mode": cfg.system_prompt_mode, "valid": VALID_MODES})),
-                "channels.openai.<alias>.system_prompt_mode is invalid, falling back to 'zeroclaw'"
-            );
-        }
         let openai_router: Router<AppState> = Router::new()
             .route(
                 &format!("/openai/{alias}/v1/models"),

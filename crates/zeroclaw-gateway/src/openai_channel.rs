@@ -345,6 +345,21 @@ pub async fn handle_openai_chat_completion_stream(
         agent.set_memory_session_id(Some(sid.clone()));
     }
 
+    // Merge any caller-supplied system message(s) into ZeroClaw's own
+    // built-in prompt (identity/SOUL.md/USER.md + safety + tools) as a
+    // distinct section — never replacing it. If the client sends no system
+    // message (or only whitespace), behavior is unchanged from today.
+    let caller_system_prompt = req
+        .messages
+        .iter()
+        .filter(|m| m.role == "system")
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !caller_system_prompt.trim().is_empty() {
+        agent.set_caller_system_prompt(Some(caller_system_prompt));
+    }
+
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
 
     zeroclaw_spawn::spawn!(async move {

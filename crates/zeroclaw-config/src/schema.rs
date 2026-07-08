@@ -13784,13 +13784,7 @@ impl ChannelConfig for WebhookConfig {
 }
 
 /// OpenAI-compatible bridge channel configuration (`[channels.openai.<alias>]`).
-///
-/// `#[serde(default)]` lets `create_map_key` / `ensure_map_key_for_path`
-/// default-construct this struct; the manual `Default` impl below must stay
-/// consistent with every `#[serde(default = "...")]` override so the
-/// in-memory default matches the on-disk parsed default. Mismatches cause
-/// spurious `compute_drift` hits for newly-created channel entries.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[display_name = "OpenAI Bridge"]
 #[description = "OpenAI-compatible HTTP endpoint (/openai/{alias}/v1)"]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -13799,42 +13793,6 @@ pub struct OpenaiChannelConfig {
     /// Whether this channel is active. Default: false.
     #[serde(default)]
     pub enabled: bool,
-    /// How to handle a system prompt supplied by the API caller.
-    ///
-    /// - `"zeroclaw"` (default) — always use ZeroClaw soul/identity;
-    ///   replace or insert, ignoring any caller-supplied system prompt.
-    /// - `"merge"` — prepend ZeroClaw soul to the caller's system prompt
-    ///   (or insert if the caller sent none).
-    /// - `"caller"` — pass the caller's system prompt through unchanged;
-    ///   skip ZeroClaw soul entirely.
-    #[serde(
-        default = "default_system_prompt_mode",
-        skip_serializing_if = "is_default_system_prompt_mode"
-    )]
-    pub system_prompt_mode: String,
-}
-
-// Manual Default so `system_prompt_mode` starts as "zeroclaw" — matching the
-// serde default — rather than "" (String::default). A mismatch causes
-// `prop_fields()` to emit display_value="" for the in-memory entry while the
-// on-disk re-parsed entry (serde default "zeroclaw" + skip_serializing_if)
-// emits UNSET_DISPLAY, producing a spurious drift hit on the very first PATCH
-// after `create_map_key` / `ensure_map_key_for_path`.
-impl Default for OpenaiChannelConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            system_prompt_mode: default_system_prompt_mode(),
-        }
-    }
-}
-
-fn default_system_prompt_mode() -> String {
-    "zeroclaw".to_string()
-}
-
-fn is_default_system_prompt_mode(v: &String) -> bool {
-    v == "zeroclaw"
 }
 
 impl ChannelConfig for OpenaiChannelConfig {
@@ -34211,52 +34169,5 @@ model_provider = \"ollama.default\"
         let from_empty: BuiltinHooksConfig = toml::from_str("").unwrap();
         let default = BuiltinHooksConfig::default();
         assert_eq!(from_empty.command_logger, default.command_logger);
-    }
-
-    // Regression test: channels.openai.<alias>.system_prompt_mode at its
-    // default value ("zeroclaw") must show UNSET_DISPLAY in prop_fields() so
-    // compute_drift never reports spurious drift for this field.
-    #[test]
-    async fn openai_channel_default_system_prompt_mode_shows_unset_in_prop_fields() {
-        use crate::traits::UNSET_DISPLAY;
-
-        let mut config = Config::default();
-        config
-            .channels
-            .openai
-            .insert("default".to_string(), OpenaiChannelConfig::default());
-
-        // Default system_prompt_mode = "zeroclaw" must be UNSET_DISPLAY.
-        let field = config
-            .prop_fields()
-            .into_iter()
-            .find(|f| f.name == "channels.openai.default.system_prompt_mode")
-            .expect("field must be present");
-        assert_eq!(
-            field.display_value, UNSET_DISPLAY,
-            "system_prompt_mode at default value must show UNSET_DISPLAY to avoid drift"
-        );
-
-        // Non-default value "merge" must be visible.
-        let mut config2 = Config::default();
-        let entry = OpenaiChannelConfig {
-            system_prompt_mode: "merge".to_string(),
-            ..Default::default()
-        };
-        config2.channels.openai.insert("default".to_string(), entry);
-        let field2 = config2
-            .prop_fields()
-            .into_iter()
-            .find(|f| f.name == "channels.openai.default.system_prompt_mode")
-            .expect("field must be present");
-        assert_eq!(field2.display_value, "merge");
-
-        // The skip_serializing_if predicate must prevent "zeroclaw" from
-        // appearing in the TOML serialization.
-        let toml_str = toml::to_string(&OpenaiChannelConfig::default()).expect("must serialize");
-        assert!(
-            !toml_str.contains("system_prompt_mode"),
-            "default system_prompt_mode must not be written to TOML: {toml_str}"
-        );
     }
 }

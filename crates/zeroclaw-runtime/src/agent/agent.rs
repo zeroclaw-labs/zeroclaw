@@ -350,6 +350,14 @@ pub struct Agent {
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     auto_save: bool,
     memory_session_id: Option<String>,
+    /// Caller-supplied system prompt content (e.g. from an OpenAI-compatible
+    /// bridge client's `messages[].role == "system"` entries), appended as a
+    /// distinct section after ZeroClaw's own built-in prompt (identity/
+    /// SOUL.md/USER.md + safety + tools) in `build_system_prompt_with_dispatcher`.
+    /// `None` reproduces today's behavior exactly (no caller content, no
+    /// extra section) — ZeroClaw's own prompt is never replaced, only
+    /// extended when the caller sends a non-empty system message.
+    caller_system_prompt: Option<String>,
     history: Vec<ConversationMessage>,
     classification_config: zeroclaw_config::schema::QueryClassificationConfig,
     available_hints: Vec<String>,
@@ -941,6 +949,7 @@ impl AgentBuilder {
                 self.auto_save.unwrap_or(false)
             },
             memory_session_id: self.memory_session_id,
+            caller_system_prompt: None,
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
@@ -1179,6 +1188,23 @@ impl Agent {
 
     pub fn set_memory_session_id(&mut self, session_id: Option<String>) {
         self.memory_session_id = session_id;
+    }
+
+    /// Sets (or clears) the caller-supplied system prompt content that gets
+    /// merged into ZeroClaw's own built-in system prompt (identity/SOUL.md/
+    /// USER.md + safety + tools) — see `build_system_prompt_with_dispatcher`.
+    /// Empty/whitespace-only content is treated as `None` so an absent
+    /// client-side prompt never appends an empty section. Refreshes
+    /// `history[0]` immediately so the change is visible even before the
+    /// next turn's automatic rebuild.
+    pub fn set_caller_system_prompt(&mut self, prompt: Option<String>) {
+        self.caller_system_prompt = prompt.filter(|p| !p.trim().is_empty());
+        self.refresh_system_prompt();
+    }
+
+    #[cfg(test)]
+    pub fn caller_system_prompt_for_test(&self) -> Option<&str> {
+        self.caller_system_prompt.as_deref()
     }
 
     pub fn set_temperature(&mut self, temperature: Option<f64>) {
@@ -1967,6 +1993,15 @@ impl Agent {
         if !self.mcp_pinned_section.is_empty() {
             prompt.push_str("\n\n");
             prompt.push_str(&self.mcp_pinned_section);
+        }
+        // Merge the caller-supplied system prompt (e.g. an OpenAI-bridge
+        // client's `role == "system"` message) as a distinct, clearly-
+        // labeled section. ZeroClaw's own identity/safety/tool instructions
+        // above are never replaced, only extended — the caller cannot
+        // override them, only add to them.
+        if let Some(caller_prompt) = &self.caller_system_prompt {
+            prompt.push_str("\n\n## Caller-Provided Instructions\n\n");
+            prompt.push_str(caller_prompt);
         }
         Ok(prompt)
     }
@@ -4117,6 +4152,42 @@ mod tests {
                 xml_prompt.contains(XML_TOOLS_MARKER),
                 "xml dispatcher must emit XML tool listing"
             );
+        }
+
+        #[test]
+        fn set_caller_system_prompt_appends_distinct_section_without_dropping_own_prompt() {
+            let (provider, _) = capturing_provider(true);
+            let mut agent = test_agent_with_provider(provider, vec![]);
+
+            let base_prompt = agent.build_system_prompt().unwrap();
+            assert!(
+                !base_prompt.contains("Caller-Provided Instructions"),
+                "no caller section should exist before set_caller_system_prompt"
+            );
+
+            agent.set_caller_system_prompt(Some("Always answer in French.".to_string()));
+            let merged_prompt = agent.build_system_prompt().unwrap();
+            assert!(
+                merged_prompt.starts_with(&base_prompt),
+                "ZeroClaw's own prompt must remain first and unmodified"
+            );
+            assert!(merged_prompt.contains("## Caller-Provided Instructions"));
+            assert!(merged_prompt.contains("Always answer in French."));
+        }
+
+        #[test]
+        fn set_caller_system_prompt_ignores_empty_or_whitespace_only_content() {
+            let (provider, _) = capturing_provider(true);
+            let mut agent = test_agent_with_provider(provider, vec![]);
+            let base_prompt = agent.build_system_prompt().unwrap();
+
+            agent.set_caller_system_prompt(Some("   \n  ".to_string()));
+            assert_eq!(agent.caller_system_prompt_for_test(), None);
+            assert_eq!(agent.build_system_prompt().unwrap(), base_prompt);
+
+            agent.set_caller_system_prompt(None);
+            assert_eq!(agent.caller_system_prompt_for_test(), None);
+            assert_eq!(agent.build_system_prompt().unwrap(), base_prompt);
         }
 
         #[test]
