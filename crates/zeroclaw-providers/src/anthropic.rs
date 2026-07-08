@@ -239,24 +239,27 @@ struct NativeContentIn {
 }
 
 impl AnthropicModelProvider {
+    /// Construct a Anthropic provider talking to the default public
+    /// endpoint. Chain [`Self::with_base_url`] to point at a custom
+    /// endpoint (self-hosted proxy, staging environment, VCR mock).
     pub fn new(alias: &str, credential: Option<&str>) -> Self {
-        Self::with_base_url(alias, credential, None)
-    }
-
-    pub fn with_base_url(alias: &str, credential: Option<&str>, base_url: Option<&str>) -> Self {
-        let base_url = base_url
-            .map(|u| u.trim_end_matches('/'))
-            .unwrap_or(BASE_URL)
-            .to_string();
         Self {
             alias: alias.to_string(),
             credential: credential
                 .map(str::trim)
                 .filter(|k| !k.is_empty())
                 .map(ToString::to_string),
-            base_url,
+            base_url: BASE_URL.to_string(),
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
         }
+    }
+
+    /// Override the API endpoint. Trailing slashes are stripped so callers
+    /// need not care whether config supplied them.
+    #[must_use]
+    pub fn with_base_url(mut self, base_url: &str) -> Self {
+        self.base_url = base_url.trim_end_matches('/').to_string();
+        self
     }
 
     /// Override the maximum output tokens for API requests.
@@ -2031,25 +2034,21 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn creates_with_custom_base_url() {
-        let p = AnthropicModelProvider::with_base_url(
-            "test",
-            Some("anthropic-credential"),
-            Some("https://api.example.com"),
-        );
+        let p = AnthropicModelProvider::new("test", Some("anthropic-credential"))
+            .with_base_url("https://api.example.com");
         assert_eq!(p.base_url, "https://api.example.com");
         assert_eq!(p.credential.as_deref(), Some("anthropic-credential"));
     }
 
     #[test]
     fn custom_base_url_trims_trailing_slash() {
-        let p =
-            AnthropicModelProvider::with_base_url("test", None, Some("https://api.example.com/"));
+        let p = AnthropicModelProvider::new("test", None).with_base_url("https://api.example.com/");
         assert_eq!(p.base_url, "https://api.example.com");
     }
 
     #[test]
     fn no_base_url_uses_published_endpoint() {
-        let p = AnthropicModelProvider::with_base_url("test", None, None);
+        let p = AnthropicModelProvider::new("test", None);
         assert_eq!(p.base_url, "https://api.anthropic.com");
     }
 

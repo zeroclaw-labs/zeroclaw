@@ -59,11 +59,6 @@ impl TelnyxModelProvider {
                 .unwrap_or_else(|_| Client::new()),
         }
     }
-    /// Create a model_provider with a custom base URL (for testing or proxies).
-    pub fn with_base_url(alias: &str, api_key: Option<&str>, _base_url: &str) -> Self {
-        // Note: custom base URL support for testing
-        Self::new(alias, api_key)
-    }
 
     /// List available models from Telnyx AI.
     ///

@@ -806,14 +806,14 @@ impl BedrockModelProvider {
         }
     }
 
-    /// Create a model_provider using a Bearer token for authentication.
-    pub fn with_bearer_token(alias: &str, token: &str) -> Self {
-        Self {
-            alias: alias.to_string(),
-            auth: Some(BedrockAuth::BearerToken(token.to_string())),
-            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
-            cred_cache: Mutex::new(None),
-        }
+    /// Override the resolved auth with an explicit Bearer token. Use
+    /// when config already resolved a Bedrock API key and there's no
+    /// point probing `BEDROCK_API_KEY` / SigV4 chains at construction
+    /// time.
+    #[must_use]
+    pub fn with_bearer_token(mut self, token: &str) -> Self {
+        self.auth = Some(BedrockAuth::BearerToken(token.to_string()));
+        self
     }
     /// Override the maximum output tokens for API requests.
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
@@ -1931,7 +1931,7 @@ mod tests {
 
     #[test]
     fn creates_with_bearer_token() {
-        let model_provider = BedrockModelProvider::with_bearer_token("test", "test-api-key");
+        let model_provider = BedrockModelProvider::new("test").with_bearer_token("test-api-key");
         assert!(model_provider.auth.is_some());
         assert!(
             matches!(model_provider.auth, Some(BedrockAuth::BearerToken(ref t)) if t == "test-api-key")

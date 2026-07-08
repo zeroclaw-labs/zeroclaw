@@ -990,7 +990,10 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let mut p = crate::anthropic::AnthropicModelProvider::with_base_url(alias, key, api_url);
+        let mut p = crate::anthropic::AnthropicModelProvider::new(alias, key);
+        if let Some(url) = api_url {
+            p = p.with_base_url(url);
+        }
         if let Some(mt) = opts.provider_max_tokens {
             p = p.with_max_tokens(mt);
         }
@@ -1019,7 +1022,10 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
             return Ok(p);
         }
         // Default: chat_completions wire with standard API key.
-        let mut p = crate::openai::OpenAiModelProvider::with_base_url(alias, api_url, key);
+        let mut p = crate::openai::OpenAiModelProvider::new(alias, key);
+        if let Some(url) = api_url {
+            p = p.with_base_url(url);
+        }
         if let Some(t) = opts.provider_timeout_secs {
             p = p.with_timeout_secs(t);
         }
@@ -1209,7 +1215,7 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         let mut p = if let Some(api_key) = key {
-            crate::bedrock::BedrockModelProvider::with_bearer_token(alias, api_key)
+            crate::bedrock::BedrockModelProvider::new(alias).with_bearer_token(api_key)
         } else {
             crate::bedrock::BedrockModelProvider::new(alias)
         };
@@ -1514,11 +1520,10 @@ impl FamilyProviderFactory for OvhModelProviderConfig {
         _api_url: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        Ok(Box::new(crate::openai::OpenAiModelProvider::with_base_url(
-            alias,
-            Some("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"),
-            key,
-        )))
+        Ok(Box::new(
+            crate::openai::OpenAiModelProvider::new(alias, key)
+                .with_base_url("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"),
+        ))
     }
 }
 

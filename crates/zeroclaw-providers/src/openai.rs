@@ -203,22 +203,24 @@ impl NativeResponseMessage {
 }
 
 impl OpenAiModelProvider {
+    /// Construct an OpenAI provider talking to the default public endpoint.
+    /// Chain [`Self::with_base_url`] to point at a custom endpoint.
     pub fn new(alias: &str, credential: Option<&str>) -> Self {
-        Self::with_base_url(alias, None, credential)
-    }
-
-    /// Create a model_provider with an optional custom base URL.
-    /// Falls back to `https://api.openai.com/v1` when `base_url` is `None`.
-    pub fn with_base_url(alias: &str, base_url: Option<&str>, credential: Option<&str>) -> Self {
         Self {
             alias: alias.to_string(),
-            base_url: base_url
-                .map(|u| u.trim_end_matches('/').to_string())
-                .unwrap_or_else(|| BASE_URL.to_string()),
+            base_url: BASE_URL.to_string(),
             credential: credential.map(ToString::to_string),
             max_tokens: None,
             timeout_secs: 120,
         }
+    }
+
+    /// Override the API endpoint. Trailing slashes are stripped so callers
+    /// need not care whether config supplied them.
+    #[must_use]
+    pub fn with_base_url(mut self, base_url: &str) -> Self {
+        self.base_url = base_url.trim_end_matches('/').to_string();
+        self
     }
 
     /// Override the HTTP request timeout for LLM API calls.
