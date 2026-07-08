@@ -1558,6 +1558,10 @@ impl RpcDispatcher {
         };
 
         // Capture live attribution fields and max_context_tokens for the turn span.
+        // Zerocode's context meter field is named `max_context_tokens` and must
+        // reflect the runtime-profile budget (`[runtime_profiles.<name>]
+        // max_context_tokens`), not the provider model-window helper (which
+        // falls back to 32_000 when `context_window` is unset).
         let (agent_alias, model_provider, model, max_ctx) = {
             let alias = self
                 .ctx
@@ -1573,7 +1577,7 @@ impl RpcDispatcher {
             };
             let max_ctx = {
                 let cfg = self.ctx.config.read();
-                Some(cfg.effective_model_context_window(&alias) as u64)
+                Some(context_usage_max_tokens(&cfg, &alias))
             };
             (alias, mp, m, max_ctx)
         };
@@ -4036,6 +4040,18 @@ fn truncate_memory_previews(
     entries
 }
 
+/// Resolve the max-token ceiling shown on Zerocode's context usage meter.
+///
+/// The wire field is named `max_context_tokens` and must track the operator's
+/// runtime-profile budget (`[runtime_profiles.<name>] max_context_tokens`),
+/// which is also the preemptive history-trim budget. Using the provider
+/// model-window helper here is wrong: that path ignores the runtime profile
+/// and falls back to 32_000 when `providers.models.*.context_window` is unset,
+/// so the meter freezes at the default even when the profile is set higher.
+fn context_usage_max_tokens(cfg: &zeroclaw_config::schema::Config, agent_alias: &str) -> u64 {
+    cfg.effective_max_context_tokens(agent_alias) as u64
+}
+
 fn notification_for_turn_event(
     session_id: &str,
     event: &TurnEvent,
@@ -5120,6 +5136,54 @@ mod tests {
         // TokenUsage contract and must NOT be added (double-counts).
         assert_eq!(v["params"]["input_tokens"], 100);
         assert_eq!(v["params"]["max_context_tokens"], 32_000);
+    }
+
+    /// Regression: Zerocode's context meter must read the runtime-profile
+    /// `max_context_tokens` budget, not the provider model-window helper.
+    /// The model-window path falls back to 32_000 when `context_window` is
+    /// unset, which made the meter ignore a profile set to e.g. 128_000.
+    #[test]
+    fn context_usage_max_tokens_uses_runtime_profile_budget() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "coding".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(128_000),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "coding".into(),
+                // No provider context_window configured — the broken path
+                // would fall back to 32_000 here.
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let cfg = Config {
+            agents,
+            runtime_profiles,
+            ..Config::default()
+        };
+
+        assert_eq!(
+            context_usage_max_tokens(&cfg, "coder"),
+            128_000,
+            "context meter must use runtime_profiles.<name>.max_context_tokens"
+        );
+        assert_eq!(
+            cfg.effective_model_context_window("coder"),
+            32_000,
+            "sanity: model-window helper still defaults to 32k without provider context_window"
+        );
     }
 
     #[test]
