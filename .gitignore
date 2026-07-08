@@ -21,6 +21,9 @@
 /docs/book/src/_snippets/hardware-release-targets.md
 /docs/book/src/_snippets/hardware-pi-targets.md
 /docs/book/src/_snippets/hardware-lowmem-lto.md
+/docs/book/src/_snippets/feature-matrix-channels.md
+/docs/book/src/_snippets/feature-matrix-providers.md
+/docs/book/src/_snippets/feature-matrix-tools.md
 /docs/book/src/_snippets/plugin-channel-flag-count.md
 /docs/book/src/_snippets/plugin-channel-func-count.md
 /docs/book/src/_snippets/plugin-channel-required-count.md

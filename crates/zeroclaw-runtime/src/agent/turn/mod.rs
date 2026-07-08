@@ -187,10 +187,15 @@ pub struct ToolLoop<'a> {
     /// The ingress envelope stamped by the entry layer (RFC #6971). Travels
     /// with the turn into the engine, where the universal SOP policy layer
     /// dispositions it at P1 (turn entry) and P2 (each steering injection).
-    /// Phase-1 callers stamp [`IngressContext::internal`]; real per-transport
+    /// Phase-1 callers stamp a per-origin envelope; real per-transport
     /// stamping is phase 2. Owned (not borrowed) — the envelope is small and
     /// consumed by the policy front door for the turn's lifetime.
     pub ingress: IngressContext,
+    /// The per-turn memory half for unified memory-context injection: the
+    /// handle, raw recall query, session scopes, and spawn-site suppression.
+    /// `None` for nested sub-turn sites and paths without a memory backend;
+    /// the injection decision itself is keyed on `ingress.origin`.
+    pub memory: Option<crate::agent::memory_inject::TurnMemory<'a>>,
     /// Observer metadata: agent alias and turn id, stamped onto every
     /// turn-level observer event so OTel spans correlate across the loop.
     pub agent_alias: Option<&'a str>,
@@ -213,6 +218,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         mut new_messages_out,
         mut image_cache,
         ingress,
+        memory,
         agent_alias,
         turn_id,
     } = p;
@@ -275,6 +281,46 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 "turn-ingress-dropped",
                 &[("reason", reason.as_str())],
             ));
+        }
+    }
+
+    // ── Memory-context injection (unified) ──────────────────────────────────
+    // The ONE injection point for the memory preamble, replacing the per-path
+    // inline renderers. The decision is keyed on the ingress origin (sub-turns
+    // never inject; scheduled origins exclude Conversation entries); the
+    // pipeline and its documented uniform behavior live in
+    // `agent::memory_inject`. Injection prepends to the trailing user message
+    // AFTER the P1 policy scan, so policy always sees the caller's own text.
+    if let Some(turn_memory) = &memory {
+        let has_session = turn_memory.sessions.iter().any(Option::is_some);
+        if let crate::agent::memory_inject::InjectPolicy::Inject {
+            exclude_conversation,
+        } = crate::agent::memory_inject::resolve_inject_policy(
+            ingress.origin,
+            has_session,
+            turn_memory.suppress,
+        ) && let Some(last_user_idx) = history.iter().rposition(|m| m.role == "user")
+            // Idempotence: a model-switch retry re-enters the engine with the
+            // same history; the preamble must not stack.
+            && !history[last_user_idx]
+                .content
+                .starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN)
+        {
+            let scopes: Vec<Option<&str>> =
+                turn_memory.sessions.iter().map(|s| s.as_deref()).collect();
+            let context = crate::agent::memory_inject::render_memory_context(
+                turn_memory.handle,
+                observer,
+                &turn_memory.query,
+                &scopes,
+                &turn_memory.cfg,
+                exclude_conversation,
+            )
+            .await;
+            if !context.is_empty() {
+                let existing = &history[last_user_idx].content;
+                history[last_user_idx].content = format!("{context}{existing}");
+            }
         }
     }
 
@@ -1272,7 +1318,8 @@ async fn drive_live_sop_actions(
                             steering: None,
                             new_messages_out: new_messages_out.as_deref_mut(),
                             image_cache: image_cache.as_deref_mut(),
-                            ingress: IngressContext::internal(),
+                            memory: None,
+                            ingress: IngressContext::sub_turn(),
                             agent_alias,
                             turn_id: &nested_turn_id,
                         })),

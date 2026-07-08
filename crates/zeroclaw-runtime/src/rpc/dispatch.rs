@@ -4640,6 +4640,67 @@ mod tests {
         );
     }
 
+    /// `excluded_tools` ALWAYS subtracts (documented contract:
+    /// docs/book/src/tools/mcp.md, tools/overview.md), including the deferred-MCP
+    /// `tool_search` meta-tool, which is registered AFTER the built-in policy filter.
+    /// Routing `from_config` through `ScopedToolRegistry::assemble` enforces this via
+    /// the final denylist sweep, so an operator who excludes `tool_search` disables
+    /// deferred-MCP discovery even though bundles are granted and deferred loading is on.
+    #[tokio::test]
+    async fn chat_session_new_excluded_tool_search_is_dropped_in_deferred_mcp_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let mut config = make_mcp_granting_config(&tmp, server.uri(), true);
+        // Deny the deferred-MCP discovery tool by name.
+        config
+            .risk_profiles
+            .get_mut("test-profile")
+            .expect("test-profile must exist")
+            .excluded_tools = vec!["tool_search".into()];
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-deferred-excl-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-deferred-excl-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let names = agent.tool_names();
+        assert!(
+            !names.contains(&"tool_search"),
+            "excluded_tools = [\"tool_search\"] must drop the deferred tool_search \
+             wrapper (excluded_tools always subtracts); tools: {names:?}"
+        );
+        // The registry and prompt surfaces must move together: the system prompt
+        // must not instruct the model to call a tool the policy just removed.
+        let prompt = agent
+            .system_prompt_for_test()
+            .expect("system prompt must render");
+        assert!(
+            !prompt.contains("tool_search"),
+            "excluded tool_search must not be advertised in the system prompt; prompt: {prompt}"
+        );
+        assert!(
+            !prompt.contains("## Deferred Tools"),
+            "excluded tool_search must suppress the deferred-tools section entirely; prompt: {prompt}"
+        );
+        assert!(
+            !prompt.contains("remote__domains.list"),
+            "excluded tool_search must not leak the deferred stub it would have activated; prompt: {prompt}"
+        );
+    }
+
     /// Regression for #8193. Registering `tool_search` is not enough: the TUI
     /// Chat `session/new` agent must also *advertise* the deferred MCP tools in
     /// its system prompt so the model knows they exist and to call

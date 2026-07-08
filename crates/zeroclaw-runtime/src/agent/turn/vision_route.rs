@@ -131,6 +131,24 @@ pub(crate) async fn prepare_messages_for_iteration(
     degrade_strip_images: bool,
     image_cache: Option<&mut multimodal::LocalImageCache>,
 ) -> Result<multimodal::PreparedMessages> {
+    // Enforce the universal leading-turn-order invariant before any provider
+    // sees the history: strict providers reject a first non-system turn that is
+    // not `user`, which context trims and session restores can produce.
+    let mut sanitized = history.to_vec();
+    ChatMessage::sanitize_leading_turn_order(&mut sanitized);
+    // Fail closed before any provider sees the history. A no-user history
+    // (session-only, or a leading assistant/tool block with no anchoring user
+    // turn) sanitizes down to system-only, which every strict provider rejects
+    // and which silently discards the only surviving non-system context.
+    // Refuse to build a provider payload with zero user turns rather than
+    // trade one strict-provider failure shape for another.
+    if !sanitized.iter().any(ChatMessage::is_user) {
+        anyhow::bail!(
+            "refusing to dispatch to provider: prepared history has no user turn \
+             (system-only after leading-turn-order sanitize)"
+        );
+    }
+    let history = sanitized.as_slice();
     if degrade_strip_images {
         // Text-only fallback: replace every media marker with a
         // `[media attachment]` placeholder so no filesystem path or data
@@ -205,5 +223,67 @@ mod tests {
             .await
             .unwrap();
         assert!(uncached.contains_images);
+    }
+
+    /// Regression: a history whose first non-system turn is an assistant
+    /// tool-call (context trim / restore decapitated the anchoring user turn)
+    /// must be sanitized before any provider sees it, so strict providers no
+    /// longer reject the leading tool-call turn.
+    #[tokio::test]
+    async fn prepare_strips_leading_assistant_tool_call() {
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant("[tool_call] fire"),
+            ChatMessage::tool("result"),
+            ChatMessage::user("actual user"),
+        ];
+        let cfg = MultimodalConfig::default();
+        let prepared = prepare_messages_for_iteration(&history, &cfg, false, None)
+            .await
+            .unwrap();
+        let first_non_system = prepared
+            .messages
+            .iter()
+            .find(|m| m.role != "system")
+            .expect("a non-system turn survives");
+        assert_eq!(
+            first_non_system.role, "user",
+            "leading non-user turns must be dropped before dispatch"
+        );
+    }
+
+    /// Fail-closed regression (#6302, "NO USER TURN AT ALL"): a history that
+    /// sanitizes down to system-only must NOT produce a provider payload. The
+    /// prep boundary returns an error before dispatch instead of sending a
+    /// user-less request (or silently discarding the surviving context).
+    #[tokio::test]
+    async fn prepare_fails_closed_when_no_user_turn_survives() {
+        let cfg = MultimodalConfig::default();
+
+        // Pure system history.
+        let system_only = vec![ChatMessage::system("sys")];
+        let err = prepare_messages_for_iteration(&system_only, &cfg, false, None)
+            .await
+            .expect_err("system-only history must not reach the provider");
+        assert!(
+            err.to_string().contains("no user turn"),
+            "expected a no-user-turn fail-closed error, got: {err}"
+        );
+
+        // Leading assistant/tool block with no anchoring user turn: sanitize
+        // drains every non-system turn, leaving system-only, which must fail
+        // closed rather than dispatch.
+        let no_user = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant("[tool_call] fire"),
+            ChatMessage::tool("result"),
+        ];
+        let err = prepare_messages_for_iteration(&no_user, &cfg, false, None)
+            .await
+            .expect_err("no-user history must not reach the provider");
+        assert!(
+            err.to_string().contains("no user turn"),
+            "expected a no-user-turn fail-closed error, got: {err}"
+        );
     }
 }

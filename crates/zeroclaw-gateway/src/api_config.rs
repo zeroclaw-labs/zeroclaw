@@ -4124,38 +4124,24 @@ mod tests {
             .or_default()
             .allowed_commands = vec!["echo".into()];
         config.runtime_profiles.entry("default".into()).or_default();
-        // Force the workspace archive `fs::rename` to fail: place a FILE at
-        // the archive-destination path, so the move into `<archive>/workspace`
-        // can't complete. (Archive-dir creation itself succeeds — the partial
-        // failure is at the rename step, which is exactly the case #7941
-        // calls out as currently invisible to the caller.)
-        let archive_root = config.data_dir.join("agents").join("_deleted");
-        std::fs::create_dir_all(&archive_root).unwrap();
-        // We don't know the exact timestamped subdir in advance, so we block
-        // the rename by making the agent's workspace itself unrenamable:
-        // put a file where the workspace dir is supposed to be created, so
-        // `agent_workspace_dir(victim)` points to a path that exists AS A
-        // FILE (not a dir) — `fs::rename` of a file onto a non-existent path
-        // is fine, but the cascade test also exercises the case where the
-        // archive-dir creation has already happened. The simplest reliable
-        // block: replace the workspace dir with a FILE so that when the
-        // handler later does `if workspace.exists()` then
-        // `tokio::fs::rename(&workspace, &dest)`, the source exists but the
-        // rename can still succeed. We need a different tactic — see below.
-        //
-        // Robust tactic: pre-create a FILE at the exact path the timestamped
-        // archive dir WOULD use, so `create_dir_all` for that path fails
-        // (because a non-dir entry already exists at that location). We
-        // can't know the timestamp up front, so instead we block the rename
-        // by making the parent-of-archive non-writable: chown the archive
-        // root to a read-only mode. Cross-platform: just remove write perms
-        // on unix.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&archive_root, std::fs::Permissions::from_mode(0o555))
-                .unwrap();
-        }
+        // Force the archive-dir side-effect to fail deterministically —
+        // regardless of uid — by planting a regular file at
+        // `<data_dir>/agents/_deleted`. `delete_agent_cascade` then calls
+        // `create_dir_all(<data_dir>/agents/_deleted/<alias>-<ts>)`, which
+        // walks name lookup through the file and returns ENOTDIR (os error
+        // 20). This is a filesystem-type error, not a permission check, so
+        // root — which some containerized CI runners execute as — cannot
+        // bypass it. The previous approach cleared the write bit on
+        // `_deleted` (mode 0o555); root ignores the mode and
+        // `create_dir_all` silently succeeded, leaving `warnings` empty of
+        // the archive line the test is asserting on, and the assertion
+        // then latched onto whatever other warning was present
+        // (historically a `MockMemory::purge_agent` "not supported" error,
+        // which we now suppress via a no-op impl in `api.rs`).
+        let agents_dir = config.data_dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let deleted_marker = agents_dir.join("_deleted");
+        std::fs::write(&deleted_marker, b"").expect("seed _deleted blocker file");
         let old_ws = config.agent_workspace_dir("victim");
         std::fs::create_dir_all(&old_ws).unwrap();
         // Drop a real file inside the workspace so the cascade has something
@@ -4166,14 +4152,6 @@ mod tests {
 
         let state = crate::api::test_state(config.clone());
         let resp = delete_agent_cascade(&state, config.clone(), "victim").await;
-
-        // Restore archive-root writability so the test cleans up.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&archive_root, std::fs::Permissions::from_mode(0o755))
-                .unwrap();
-        }
 
         // The HTTP call is still 200 OK — partial failure is not an error
         // response, it is a successful response with `warnings` populated.

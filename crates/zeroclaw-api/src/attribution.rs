@@ -396,6 +396,7 @@ impl Role {
             Self::Mcp => Some("mcp_bundle"),
             Self::Sop => Some("sop_name"),
             Self::Session => Some("session_key"),
+            Self::System => Some("system_alias"),
             _ => None,
         }
     }
@@ -495,5 +496,6 @@ mod tests {
                 .attribution_field()
                 .is_none()
         );
+        assert_eq!(Role::System.attribution_field(), Some("system_alias"));
     }
 }

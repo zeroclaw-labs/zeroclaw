@@ -126,7 +126,9 @@ use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
 use zeroclaw_config::schema::Config;
-use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
+#[cfg(test)]
+use zeroclaw_memory::MEMORY_CONTEXT_OPEN;
+use zeroclaw_memory::{self, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
@@ -263,9 +265,6 @@ const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
-const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
-const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
-const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
 /// Proactive context-window budget in estimated characters (~4 chars/token).
@@ -1205,23 +1204,18 @@ fn build_channel_turn_context_preamble(
     preamble
 }
 
-/// Compose the outgoing user-turn content from the volatile preamble, the
-/// per-turn memory recall block, and the raw (timestamped) user content.
+/// Compose the outgoing user-turn content from the volatile preamble and
+/// the raw (timestamped) user content. The per-turn memory block is no
+/// longer composed here: the turn engine injects it above the whole user
+/// turn (agent::memory_inject), so the wire order is memory -> preamble ->
+/// raw content, matching the CLI shape.
 ///
-/// Order on the wire: preamble → memory_context → raw user content, joined
-/// by blank lines. When `preamble` is empty (CLI-style / no `reply_target`)
-/// and `memory_context` is empty, returns the raw content unchanged.
-fn compose_outgoing_user_turn_with_context(
-    preamble: &str,
-    memory_context: &str,
-    raw_user_content: &str,
-) -> String {
-    let mut parts: Vec<&str> = Vec::with_capacity(3);
+/// When `preamble` is empty (CLI-style / no `reply_target`), returns the
+/// raw content unchanged.
+fn compose_outgoing_user_turn_with_context(preamble: &str, raw_user_content: &str) -> String {
+    let mut parts: Vec<&str> = Vec::with_capacity(2);
     if !preamble.is_empty() {
         parts.push(preamble);
-    }
-    if !memory_context.is_empty() {
-        parts.push(memory_context);
     }
     parts.push(raw_user_content);
     parts.join("\n\n")
@@ -2257,45 +2251,6 @@ fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
     zeroclaw_providers::reliable::is_non_retryable(error)
 }
 
-fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
-    if zeroclaw_memory::is_assistant_autosave_key(key) {
-        return true;
-    }
-
-    // Skip raw per-turn user messages: re-injecting them causes each
-    // recalled entry to embed all prior generations, growing exponentially.
-    // Consolidated knowledge is already promoted to Core/Daily entries.
-    if zeroclaw_memory::is_user_autosave_key(key) {
-        return true;
-    }
-
-    if zeroclaw_memory::should_skip_autosave_content(content) {
-        return true;
-    }
-
-    if key.trim().to_ascii_lowercase().ends_with("_history") {
-        return true;
-    }
-
-    // Skip entries containing image markers to prevent duplication.
-    // When auto_save stores a photo message to memory, a subsequent
-    // memory recall on the same turn would surface the marker again,
-    // causing two identical image blocks in the model_provider request.
-    if content.contains("[IMAGE:") {
-        return true;
-    }
-
-    // Skip entries containing tool_result blocks. After a daemon restart
-    // these can be recalled from SQLite and injected as memory context,
-    // presenting the LLM with a `<tool_result>` without a preceding
-    // `<tool_call>` and triggering hallucinated output.
-    if content.contains("<tool_result") {
-        return true;
-    }
-
-    content.chars().count() > MEMORY_CONTEXT_MAX_CHARS
-}
-
 fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     [
@@ -2968,114 +2923,6 @@ async fn handle_runtime_command_if_needed(
     }
 
     true
-}
-
-async fn build_memory_context(
-    mem: &dyn Memory,
-    user_msg: &str,
-    min_relevance_score: f64,
-    session_id: Option<&str>,
-) -> String {
-    build_memory_context_for_sessions(mem, user_msg, min_relevance_score, &[session_id]).await
-}
-
-async fn build_memory_context_for_sessions(
-    mem: &dyn Memory,
-    user_msg: &str,
-    min_relevance_score: f64,
-    session_ids: &[Option<&str>],
-) -> String {
-    let mut entries = Vec::new();
-    let mut seen_keys = HashSet::new();
-
-    match session_ids {
-        [] => {}
-        [session_id] => {
-            let recalled = mem.recall(user_msg, 5, *session_id, None, None).await;
-            append_recalled_memory_entries(&mut entries, &mut seen_keys, recalled);
-        }
-        [first_session_id, second_session_id] => {
-            let (first_entries, second_entries) = tokio::join!(
-                mem.recall(user_msg, 5, *first_session_id, None, None),
-                mem.recall(user_msg, 5, *second_session_id, None, None)
-            );
-            append_recalled_memory_entries(&mut entries, &mut seen_keys, first_entries);
-            append_recalled_memory_entries(&mut entries, &mut seen_keys, second_entries);
-        }
-        _ => {
-            for session_id in session_ids {
-                let recalled = mem.recall(user_msg, 5, *session_id, None, None).await;
-                append_recalled_memory_entries(&mut entries, &mut seen_keys, recalled);
-            }
-        }
-    }
-
-    format_memory_context(&entries, min_relevance_score)
-}
-
-fn append_recalled_memory_entries(
-    entries: &mut Vec<zeroclaw_memory::MemoryEntry>,
-    seen_keys: &mut HashSet<String>,
-    recalled: Result<Vec<zeroclaw_memory::MemoryEntry>>,
-) {
-    if let Ok(recalled) = recalled {
-        for entry in recalled {
-            if seen_keys.insert(entry.key.clone()) {
-                entries.push(entry);
-            }
-        }
-    }
-}
-
-fn format_memory_context(
-    entries: &[zeroclaw_memory::MemoryEntry],
-    min_relevance_score: f64,
-) -> String {
-    let mut context = String::new();
-
-    let mut included = 0usize;
-    let mut used_chars = 0usize;
-
-    for entry in entries.iter().filter(|e| match e.score {
-        Some(score) => score >= min_relevance_score,
-        None => true, // keep entries without a score (e.g. non-vector backends)
-    }) {
-        if included >= MEMORY_CONTEXT_MAX_ENTRIES {
-            break;
-        }
-
-        if should_skip_memory_context_entry(&entry.key, &entry.content) {
-            continue;
-        }
-
-        let content = if entry.content.chars().count() > MEMORY_CONTEXT_ENTRY_MAX_CHARS {
-            truncate_with_ellipsis(&entry.content, MEMORY_CONTEXT_ENTRY_MAX_CHARS)
-        } else {
-            entry.content.clone()
-        };
-
-        let line = format!("- {}: {}\n", entry.key, content);
-        let line_chars = line.chars().count();
-        if used_chars + line_chars > MEMORY_CONTEXT_MAX_CHARS {
-            break;
-        }
-
-        if included == 0 {
-            context.push_str(MEMORY_CONTEXT_OPEN);
-            context.push('\n');
-        }
-
-        context.push_str(&line);
-        used_chars += line_chars;
-        included += 1;
-    }
-
-    if included > 0 {
-        context.push_str(MEMORY_CONTEXT_CLOSE);
-        context.push_str("\n\n");
-    }
-
-    context
 }
 
 fn is_group_reply_target(reply_target: &str) -> bool {
@@ -4749,48 +4596,19 @@ async fn process_channel_message_body(
     // within the context budget (#3460).
     collapse_inline_image_payloads(&mut prior_turns);
 
-    // ── Dual-scope memory recall ──────────────────────────────────
-    // Always recall before each LLM call (not just first turn).
-    // For group chats: merge sender-scope + group-scope memories.
-    // For DMs: recall from the current conversation scope plus sender scope.
+    // ── Dual-scope memory recall (engine-injected) ───────────────
+    // Memory context is injected once in the turn engine, keyed on the
+    // ingress origin (agent::memory_inject). This site only assembles the
+    // session scopes: sender scope(s) always; the group/history scope is
+    // added for group chats so both are recalled (key-deduped, one block).
     let is_group_chat = is_group_reply_target(&msg.reply_target);
-
-    let mem_recall_start = Instant::now();
-    let sender_session_ids = sender_memory_session_ids(&msg, &history_key);
-    let sender_session_id_refs: Vec<Option<&str>> = sender_session_ids
-        .iter()
-        .map(|s| Some(s.as_str()))
+    let mut memory_sessions: Vec<Option<String>> = sender_memory_session_ids(&msg, &history_key)
+        .into_iter()
+        .map(Some)
         .collect();
-    let sender_memory_fut = build_memory_context_for_sessions(
-        ctx.memory.as_ref(),
-        &msg.content,
-        ctx.min_relevance_score,
-        sender_session_id_refs.as_slice(),
-    );
-
-    let (sender_memory, group_memory) = if is_group_chat {
-        let group_memory_fut = build_memory_context(
-            ctx.memory.as_ref(),
-            &msg.content,
-            ctx.min_relevance_score,
-            Some(&history_key),
-        );
-        tokio::join!(sender_memory_fut, group_memory_fut)
-    } else {
-        (sender_memory_fut.await, String::new())
-    };
-    #[allow(clippy::cast_possible_truncation)]
-    let mem_recall_ms = mem_recall_start.elapsed().as_millis() as u64;
-    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"mem_recall_ms": mem_recall_ms, "sender_empty": sender_memory.is_empty(), "group_empty": group_memory.is_empty()})), "memory recall completed");
-
-    // Merge sender and group memory context blocks.
-    let memory_context = if group_memory.is_empty() {
-        sender_memory
-    } else if sender_memory.is_empty() {
-        group_memory
-    } else {
-        format!("{sender_memory}\n{group_memory}")
-    };
+    if is_group_chat {
+        memory_sessions.push(Some(history_key.clone()));
+    }
 
     // Build the byte-stable system prompt for the cached prefix.
     // Note: memory recall is NOT injected here (it used to be, but the
@@ -4875,8 +4693,7 @@ async fn process_channel_message_body(
         && last_turn.role == "user"
     {
         let raw_content = last_turn.content.clone();
-        last_turn.content =
-            compose_outgoing_user_turn_with_context(&preamble, &memory_context, &raw_content);
+        last_turn.content = compose_outgoing_user_turn_with_context(&preamble, &raw_content);
     }
 
     // ── Reply-intent precheck ────────────────────────────────────────
@@ -5291,9 +5108,19 @@ async fn process_channel_message_body(
                 steering: None,
                 new_messages_out: None,
                 image_cache: None,
-                // Phase 1: stamp Internal/Trusted. Real per-transport
-                // stamping is PR C (RFC #6971 §4).
-                ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                // Channel-orchestrator dispatch; source/transport/trust stay
+                // placeholders, not yet stamped at the edge.
+                memory: Some(zeroclaw_runtime::agent::memory_inject::TurnMemory {
+                    handle: ctx.memory.as_ref(),
+                    query: msg.content.clone(),
+                    sessions: memory_sessions.clone(),
+                    suppress: false,
+                    cfg: zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
+                        min_relevance_score: ctx.min_relevance_score,
+                        ..Default::default()
+                    },
+                }),
+                ingress: zeroclaw_api::ingress::IngressContext::channel(),
                 agent_alias: Some(ctx.agent_alias.as_str()),
                 turn_id: &turn_id,
             });
@@ -11914,62 +11741,6 @@ temperature = 0.3
         let other_err =
             anyhow::Error::msg("OpenAI Codex API error (502 Bad Gateway): error code: 502");
         assert!(!is_context_window_overflow_error(&other_err));
-    }
-
-    #[test]
-    fn memory_context_skip_rules_exclude_history_blobs() {
-        assert!(should_skip_memory_context_entry(
-            "telegram_123_history",
-            r#"[{"role":"user"}]"#
-        ));
-        assert!(should_skip_memory_context_entry(
-            "assistant_resp_legacy",
-            "fabricated memory"
-        ));
-        assert!(!should_skip_memory_context_entry("telegram_123_45", "hi"));
-
-        // Entries containing image markers must be skipped to prevent
-        // auto-saved photo messages from duplicating image blocks.
-        assert!(should_skip_memory_context_entry(
-            "telegram_user_msg_99",
-            "[IMAGE:/tmp/workspace/photo_1_2.jpg]"
-        ));
-        assert!(should_skip_memory_context_entry(
-            "telegram_user_msg_100",
-            "[IMAGE:/tmp/workspace/photo_1_2.jpg]\n\nCheck this screenshot"
-        ));
-        // Plain text without image markers should not be skipped.
-        assert!(!should_skip_memory_context_entry(
-            "telegram_user_msg_101",
-            "Please describe the image"
-        ));
-
-        // Entries containing tool_result blocks must be skipped.
-        assert!(should_skip_memory_context_entry(
-            "telegram_user_msg_200",
-            r#"[Tool results]
-<tool_result name="shell">Mon Feb 20</tool_result>"#
-        ));
-        assert!(!should_skip_memory_context_entry(
-            "telegram_user_msg_201",
-            "plain text without tool results"
-        ));
-
-        // Per-turn user auto-save keys must be skipped to prevent exponential
-        // context bloat from re-injected conversation history.
-        assert!(should_skip_memory_context_entry(
-            "user_msg",
-            "original user message text"
-        ));
-        assert!(should_skip_memory_context_entry(
-            "user_msg_a1b2c3d4e5f6",
-            "follow-up message embedding prior context"
-        ));
-        // Channel-scoped keys (e.g. telegram_*) must NOT be affected.
-        assert!(!should_skip_memory_context_entry(
-            "telegram_user_msg_101",
-            "Please describe the image"
-        ));
     }
 
     fn channel_runtime_context_for_defaults_test(
@@ -19224,17 +18995,26 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 
-    #[tokio::test]
-    async fn build_memory_context_includes_recalled_entries() {
-        let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-        mem.store("age_fact", "Age is 45", MemoryCategory::Conversation, None)
-            .await
-            .unwrap();
-
-        let context = build_memory_context(&mem, "age", 0.0, None).await;
-        assert!(context.contains(MEMORY_CONTEXT_OPEN));
-        assert!(context.contains("Age is 45"));
+    /// Test shim: the old per-orchestrator renderer call shape, routed
+    /// through the unified engine pipeline (agent::memory_inject).
+    async fn render_for_sessions(
+        mem: &dyn zeroclaw_memory::Memory,
+        user_msg: &str,
+        min_relevance_score: f64,
+        session_ids: &[Option<&str>],
+    ) -> String {
+        zeroclaw_runtime::agent::memory_inject::render_memory_context(
+            mem,
+            &zeroclaw_runtime::observability::NoopObserver,
+            user_msg,
+            session_ids,
+            &zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
+                min_relevance_score,
+                ..Default::default()
+            },
+            false,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -19270,8 +19050,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let session_ids = sender_memory_session_ids(&msg, &history_key);
         let session_id_refs: Vec<Option<&str>> =
             session_ids.iter().map(|s| Some(s.as_str())).collect();
-        let context =
-            build_memory_context_for_sessions(&mem, "quartz", 0.0, &session_id_refs).await;
+        let context = render_for_sessions(&mem, "quartz", 0.0, &session_id_refs).await;
 
         assert!(
             context.contains("Project codename is quartz"),
@@ -19334,12 +19113,11 @@ BTC is currently around $65,000 based on latest tool output."#
             .map(|s| Some(s.as_str()))
             .collect();
         let sender_context =
-            build_memory_context_for_sessions(&mem, "quartz", 0.0, &group_b_sender_session_id_refs)
-                .await;
+            render_for_sessions(&mem, "quartz", 0.0, &group_b_sender_session_id_refs).await;
         let group_context =
-            build_memory_context(&mem, "quartz", 0.0, Some(&group_b_history_key)).await;
+            render_for_sessions(&mem, "quartz", 0.0, &[Some(&group_b_history_key)]).await;
         let source_group_context =
-            build_memory_context(&mem, "quartz", 0.0, Some(&group_a_history_key)).await;
+            render_for_sessions(&mem, "quartz", 0.0, &[Some(&group_a_history_key)]).await;
 
         assert!(
             sender_context.is_empty(),
@@ -19395,52 +19173,10 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         let session_id_refs: Vec<Option<&str>> =
             session_ids.iter().map(|s| Some(s.as_str())).collect();
-        let context =
-            build_memory_context_for_sessions(&mem, "coffee", 0.0, &session_id_refs).await;
+        let context = render_for_sessions(&mem, "coffee", 0.0, &session_id_refs).await;
         assert!(
             context.contains("Alice favors filtered coffee"),
             "sender recall must find migrated row stored under sanitized sender, got: {context}"
-        );
-    }
-
-    /// Auto-saved photo messages must not surface through memory context,
-    /// otherwise the image marker gets duplicated in the model_provider request.
-    #[tokio::test]
-    async fn build_memory_context_excludes_image_marker_entries() {
-        let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-
-        // Simulate auto-save of a photo message containing an [IMAGE:] marker.
-        mem.store(
-            "telegram_user_msg_photo",
-            "[IMAGE:/tmp/workspace/photo_1_2.jpg]\n\nDescribe this screenshot",
-            MemoryCategory::Conversation,
-            None,
-        )
-        .await
-        .unwrap();
-        // Also store a plain text entry that shares a word with the query
-        // so the FTS recall returns both entries.
-        mem.store(
-            "screenshot_preference",
-            "User prefers screenshot descriptions to be concise",
-            MemoryCategory::Conversation,
-            None,
-        )
-        .await
-        .unwrap();
-
-        let context = build_memory_context(&mem, "screenshot", 0.0, None).await;
-
-        // The image-marker entry must be excluded to prevent duplication.
-        assert!(
-            !context.contains("[IMAGE:"),
-            "memory context must not contain image markers, got: {context}"
-        );
-        // Plain text entries should still be included.
-        assert!(
-            context.contains("screenshot descriptions"),
-            "plain text entry should remain in context, got: {context}"
         );
     }
 
@@ -24587,25 +24323,17 @@ Done."#;
     }
 
     #[test]
-    fn compose_outgoing_user_turn_with_context_orders_preamble_memory_content() {
-        // Order on the wire: preamble → memory_context → raw user content,
-        // joined by blank lines. Empty preamble and empty memory leave the
-        // raw content untouched (CLI-style path).
+    fn compose_outgoing_user_turn_with_context_orders_preamble_content() {
+        // Order on the wire: preamble -> raw user content, joined by blank
+        // lines (the memory block is engine-injected ABOVE the whole turn).
+        // Empty preamble leaves the raw content untouched (CLI-style path).
         assert_eq!(
-            compose_outgoing_user_turn_with_context("", "", "hello"),
+            compose_outgoing_user_turn_with_context("", "hello"),
             "hello"
         );
         assert_eq!(
-            compose_outgoing_user_turn_with_context("[turn-context] x\n\n", "", "hello"),
+            compose_outgoing_user_turn_with_context("[turn-context] x\n\n", "hello"),
             "[turn-context] x\n\n\n\nhello"
-        );
-        assert_eq!(
-            compose_outgoing_user_turn_with_context("", "[memory] y", "hello"),
-            "[memory] y\n\nhello"
-        );
-        assert_eq!(
-            compose_outgoing_user_turn_with_context("[turn-context] x\n\n", "[memory] y", "hello"),
-            "[turn-context] x\n\n\n\n[memory] y\n\nhello"
         );
     }
 
