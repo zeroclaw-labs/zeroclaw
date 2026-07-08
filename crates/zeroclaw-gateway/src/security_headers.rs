@@ -10,10 +10,18 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
     ("referrer-policy", "no-referrer"),
     (
         "content-security-policy",
-        "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+        "default-src 'self'; \
+         script-src 'self' 'unsafe-inline'; \
+         style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data:; \
+         font-src 'self'; \
+         connect-src 'self' ws: wss:; \
+         object-src 'none'; \
+         frame-ancestors 'none'; \
+         base-uri 'none'; \
+         form-action 'self'",
     ),
     ("cross-origin-opener-policy", "same-origin"),
-    ("cross-origin-embedder-policy", "require-corp"),
     ("cross-origin-resource-policy", "same-origin"),
     ("x-permitted-cross-domain-policies", "none"),
     (
@@ -66,8 +74,22 @@ mod tests {
         inject(&mut headers, false);
         assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
         assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
-        assert!(headers.get("content-security-policy").is_some());
         assert!(headers.get("strict-transport-security").is_none());
+    }
+
+    #[test]
+    fn csp_permits_same_origin_dashboard_assets() {
+        let mut headers = HeaderMap::new();
+        inject(&mut headers, false);
+        let csp = headers
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'self'"));
+        assert!(csp.contains("script-src 'self'"));
+        assert!(csp.contains("connect-src 'self' ws: wss:"));
+        assert!(csp.contains("frame-ancestors 'none'"));
     }
 
     #[test]
