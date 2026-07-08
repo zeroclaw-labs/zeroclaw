@@ -114,7 +114,9 @@ struct NativeToolSpec {
 struct NativeToolFunctionSpec {
     name: String,
     description: String,
-    parameters: serde_json::Value,
+    /// `Arc`-shared with the tool registry's stored schema — serialized
+    /// transparently, never deep-cloned per request (#8642).
+    parameters: std::sync::Arc<serde_json::Value>,
 }
 
 fn parse_native_tool_spec(value: serde_json::Value) -> anyhow::Result<NativeToolSpec> {
@@ -276,7 +278,7 @@ impl OpenAiModelProvider {
                     function: NativeToolFunctionSpec {
                         name: tool.name.clone(),
                         description: tool.description.clone(),
-                        parameters: tool.parameters.clone(),
+                        parameters: std::sync::Arc::clone(&tool.parameters),
                     },
                 })
                 .collect()
@@ -703,6 +705,10 @@ struct ResponsesApiReasoning {
     effort: String,
 }
 
+fn has_responses_tools(tools: Option<&[ResponsesToolSpec]>) -> bool {
+    tools.is_some_and(|tools| !tools.is_empty())
+}
+
 /// Non-streaming response body from `/v1/responses`.
 #[derive(Debug, Deserialize)]
 struct ResponsesApiBody {
@@ -877,7 +883,12 @@ pub(crate) async fn run_responses_sse(
         let _ = tx.send(Ok(StreamEvent::TextDelta(chunk))).await;
     }
 
-    let _ = tx.send(Ok(StreamEvent::Final)).await;
+    crate::stream_guard::finish_sse_stream(
+        tx,
+        state.saw_completion,
+        "response.completed or [DONE]",
+    )
+    .await;
 }
 
 pub struct OpenAiResponsesModelProvider {
@@ -928,7 +939,7 @@ impl OpenAiResponsesModelProvider {
         temperature: Option<f64>,
         stream: bool,
     ) -> ResponsesApiRequest {
-        let has_tools = tools.is_some();
+        let has_tools = has_responses_tools(tools.as_deref());
         let reasoning = self
             .reasoning_effort
             .as_deref()
@@ -1119,7 +1130,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             };
             let tools = convert_tools(tools_owned.as_deref());
             let tools_count = tools.as_ref().map_or(0, Vec::len);
-            let has_tools = tools.is_some();
+            let has_tools = has_responses_tools(tools.as_deref());
             let reasoning = reasoning_effort
                 .as_deref()
                 .map(|effort| ResponsesApiReasoning {
@@ -1935,7 +1946,8 @@ mod tests {
                 "type": "object",
                 "properties": {"city": {"type": "string"}},
                 "required": ["city"],
-            }),
+            })
+            .into(),
             strict: true,
         }]);
         let req = provider.build_request(
@@ -1996,6 +2008,44 @@ mod tests {
                     .and_then(serde_json::Value::as_null)
                     .is_some(),
             "no tools → parallel_tool_calls must be omitted (skipped via skip_serializing_if)"
+        );
+    }
+
+    #[test]
+    fn responses_request_omits_tool_choice_and_parallel_when_tools_empty() {
+        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        let req = provider.build_request(
+            None,
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            Some(Vec::new()),
+            "gpt-5",
+            None,
+            false,
+        );
+        let json = serde_json::to_value(&req).expect("ResponsesApiRequest must serialize");
+        assert!(
+            json.get("tool_choice").is_none()
+                || json
+                    .get("tool_choice")
+                    .and_then(serde_json::Value::as_null)
+                    .is_some(),
+            "empty tools list → tool_choice must be omitted (vLLM rejects tool_choice without non-empty tools)"
+        );
+        assert!(
+            json.get("parallel_tool_calls").is_none()
+                || json
+                    .get("parallel_tool_calls")
+                    .and_then(serde_json::Value::as_null)
+                    .is_some(),
+            "empty tools list → parallel_tool_calls must be omitted with tool_choice"
+        );
+        let wire_tools = json
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .expect("tools must be a JSON array on the wire body");
+        assert!(
+            wire_tools.is_empty(),
+            "empty tools should remain an empty tools array; only tool_choice and parallel_tool_calls are suppressed"
         );
     }
 }

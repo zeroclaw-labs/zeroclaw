@@ -68,6 +68,7 @@ The `[sop]` config controls enforcement:
 | `untrusted_guard_sensitivity` | `0.7` | Sensitivity used by prompt-guard screening and outbound redaction. |
 | `untrusted_frame_warning` | `true` | Include explanatory warning text in the untrusted-content frame. Frame boundaries remain enabled. |
 | `untrusted_outbound_redact` | `true` | Enable shared outbound redaction for SOP content-safety consumers. |
+| `procedural_memory_enabled` | `false` | Register the `sop_workshop` tool for proposal capture, review, and explicit SOP write-back. |
 
 Schema enforcement fails closed: invalid step input prevents the step from
 starting, and invalid step output is routed through the step's `on_failure`
@@ -79,6 +80,11 @@ Untrusted trigger topic and payload text is capped, normalized, screened, and
 framed before it reaches step context. Framing is always on; the warning text can
 be hidden, but raw external trigger text is not interpolated into the model
 context.
+
+Procedural memory is opt-in. When enabled, `sop_workshop` can create and inspect
+stored SOP proposals, capture completed run context into a candidate procedure,
+and apply an approved proposal to `SOP.toml`/`SOP.md`. Write-back only happens
+through the explicit `apply` action.
 
 ## 4. Trigger Types
 
