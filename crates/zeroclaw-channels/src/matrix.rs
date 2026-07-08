@@ -5809,7 +5809,7 @@ mod tests {
 
             match tokio::time::timeout(
                 Duration::from_secs(5),
-                channel.finalize_draft(room_id, draft_id.as_str(), "final answer"),
+                channel.finalize_draft(room_id, draft_id.as_str(), "final answer", false),
             )
             .await
             {
@@ -6018,7 +6018,7 @@ mod tests {
 
             match tokio::time::timeout(
                 Duration::from_secs(5),
-                channel.finalize_draft(room_id, draft_id.as_str(), "final answer"),
+                channel.finalize_draft(room_id, draft_id.as_str(), "final answer", false),
             )
             .await
             {
