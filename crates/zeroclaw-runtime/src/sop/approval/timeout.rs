@@ -61,7 +61,7 @@ pub fn apply_timeout_action(
                 ApprovalDecision::Approve,
                 ApprovalPrincipal::system(),
             ) {
-                Ok(ResolveOutcome::Resumed(a)) => Some(a),
+                Ok(ResolveOutcome::Resumed(a)) => Some(*a),
                 _ => None,
             }
         }

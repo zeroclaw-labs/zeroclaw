@@ -99,6 +99,8 @@ Before you write a single line of review, name out loud:
 - What's settled (resolved by author, dismissed by reviewer, addressed in a later commit).
 - What's still live (open blockers, unresolved questions, things the author committed to but didn't ship).
 - Who holds active blocks, and whether the diff addresses them.
+- Whether any obvious PR-template, public metadata, or body-claim gaps affect
+  the verdict. Run the full template/truthfulness check before approving.
 
 The take-stock pass is what stops you from re-raising settled points and what surfaces who's actually waiting on what.
 
@@ -108,11 +110,45 @@ Labels are maintainer metadata, not a contributor blocker. If the right label is
 
 Ask the author about labels only when the right label choice is ambiguous or nobody with label permissions is available. Do not request changes or hold merge solely because an author cannot edit labels.
 
+## Template and public artifact checks
+
+Before approving, compare the live PR body against the current
+`.github/pull_request_template.md`. The template is the source of truth: check
+every required and applicable prompt, including conditional sections. Custom
+narrative is fine only when it still satisfies that template contract.
+
+Missing required substance is a review finding. If the content is present but
+the heading or placement needs mechanical cleanup, and a maintainer can safely
+repair it, fix or propose the exact cleanup instead of making the author do
+metadata work. When acting through an assistant, show the exact PR-body or
+metadata diff and get human reviewer approval before mutating GitHub. If the
+missing section is substantive, unsupported, or changes reviewer confidence, do
+not approve until it is filled.
+
+Also run a truthfulness scrub on the public artifacts before choosing a
+verdict:
+
+- Live labels match the PR body's label snapshot and the diff's real risk,
+  size, and type.
+- Linked issue verbs are accurate: use `Closes` / `Fixes` / `Resolves` only
+  when the PR fully resolves the issue; otherwise use `Related`, `Depends on`,
+  or `Supersedes`.
+- Validation evidence names commands that actually ran, includes relevant
+  output or an honest skip reason, and does not treat pending CI as local
+  validation.
+- Security/privacy, compatibility, rollback, and scope-boundary claims match
+  the diff and current behavior.
+- Public text does not include bot/AI attribution footers, local workflow
+  mechanics, private paths, unredacted sensitive logs, excessive raw logs,
+  irrelevant dumps, or stale lifecycle wording. Concise, relevant command
+  output tails in Validation Evidence are expected when the template asks for
+  them.
+
 ## Verdict decision tree
 
 | Situation | Verdict flag |
 |---|---|
-| Your review is approving and no other reviewer holds an active block | `--approve` |
+| Your review is approving, the template/truthfulness checks are satisfied, and no other reviewer holds an active block | `--approve` |
 | Your review is rejecting on substantive grounds you'd block on personally | `--request-changes` |
 | You have nothing new to block on but other reviewers hold active blocks | `--comment` |
 | You have specific findings but they're all 🔵 suggestions or non-blocking clarification questions | `--comment` |

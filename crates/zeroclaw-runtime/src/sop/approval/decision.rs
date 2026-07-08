@@ -20,7 +20,7 @@ pub enum ApprovalDecision {
 #[derive(Debug, Clone)]
 pub enum ResolveOutcome {
     /// Approved: the next `ExecuteStep` action (the cleared gate).
-    Resumed(SopRunAction),
+    Resumed(Box<SopRunAction>),
     /// Denied: the run is Cancelled; no further action.
     Denied,
     /// Idempotent: the run was already resolved within the grace window (a late
@@ -74,10 +74,10 @@ mod tests {
     #[test]
     fn outcome_labels_and_is_resumed() {
         assert!(
-            ResolveOutcome::Resumed(SopRunAction::Completed {
+            ResolveOutcome::Resumed(Box::new(SopRunAction::Completed {
                 run_id: "r".into(),
                 sop_name: "s".into(),
-            })
+            }))
             .is_resumed()
         );
         assert!(!ResolveOutcome::Denied.is_resumed());

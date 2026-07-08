@@ -125,6 +125,17 @@ mod tests {
     }
 
     #[test]
+    fn postgres_backend_hides_sqlite_and_qdrant_subsections() {
+        // postgres active → hide sqlite-only knobs and qdrant subsection,
+        // keep postgres subsection visible
+        let ex = memory_backend_excludes("postgres");
+        assert!(ex.contains(&"sqlite-open-timeout-secs"));
+        assert!(ex.contains(&"conversation-retention-days"));
+        assert!(ex.contains(&"qdrant."));
+        assert!(!ex.contains(&"postgres."));
+    }
+
+    #[test]
     fn path_matches_prefix_requires_segment_boundary() {
         // Exact match and children.
         assert!(path_matches_prefix("agents.aaa", "agents.aaa"));

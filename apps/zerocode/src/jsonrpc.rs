@@ -160,6 +160,27 @@ impl RpcOutbound {
         self.writer_tx.send(json).await.is_ok()
     }
 
+    /// Write a JSON-RPC response (success or error) keyed to a
+    /// server-originated request id. Used by the TUI when the daemon
+    /// invokes a method on us (e.g. `elicitation/create`) and we need
+    /// to ship back an `Accept` / `Decline` / `Cancel`.
+    pub async fn respond(
+        &self,
+        id: Value,
+        result: std::result::Result<Value, JsonRpcError>,
+    ) -> bool {
+        let resp = JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: result.as_ref().ok().cloned(),
+            error: result.err(),
+            id,
+        };
+        match serde_json::to_string(&resp) {
+            Ok(s) => self.writer_tx.send(s).await.is_ok(),
+            Err(_) => false,
+        }
+    }
+
     pub async fn notify(&self, method: &'static str, params: Value) {
         let n = JsonRpcNotification::new(method, params);
         if let Ok(s) = serde_json::to_string(&n) {
