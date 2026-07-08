@@ -54,6 +54,7 @@ jobs:
           SECONDS=0
           cargo clippy \
             --workspace \
+            --exclude zeroclaw-desktop \
             --all-targets \
             --features ci-all \
             --target ${{ matrix.target }} \

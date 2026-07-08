@@ -1,3 +1,4 @@
+use crate::budget;
 use crate::policy::PolicyEnforcer;
 use anyhow::Result;
 use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
@@ -67,7 +68,7 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
         config.core_retention_days,
     );
 
-    let report = HygieneReport {
+    let mut report = HygieneReport {
         archived_memory_files: archive_daily_memory_files(
             workspace_dir,
             config.archive_after_days,
@@ -84,6 +85,9 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
         pruned_daily_rows: prune_category_rows(workspace_dir, daily_retention, "daily", false)?,
         pruned_core_rows: prune_category_rows(workspace_dir, core_retention, "core", true)?,
     };
+    let budget_report = compact_budget_rows(workspace_dir, config)?;
+    report.pruned_daily_rows += budget_report.daily_rows;
+    report.pruned_core_rows += budget_report.core_rows;
 
     // Prune audit entries if audit is enabled.
     if config.audit_enabled
@@ -383,12 +387,37 @@ fn prune_category_rows(
         "updated_at"
     };
     let sql = format!(
-        "DELETE FROM memories WHERE category = ?1 AND {} < ?2",
-        timestamp_col
+        "DELETE FROM memories WHERE category = ?1 AND {timestamp_col} < ?2 AND pinned = 0",
     );
     let affected = conn.execute(&sql, params![category, cutoff])?;
 
     Ok(u64::try_from(affected).unwrap_or(0))
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BudgetRows {
+    core_rows: u64,
+    daily_rows: u64,
+}
+
+fn compact_budget_rows(workspace_dir: &Path, config: &MemoryConfig) -> Result<BudgetRows> {
+    if config.core_max_rows == 0 && config.core_max_bytes == 0 && config.daily_max_rows == 0 {
+        return Ok(BudgetRows::default());
+    }
+
+    let db_path = workspace_dir.join("memory").join("brain.db");
+    if !db_path.exists() {
+        return Ok(BudgetRows::default());
+    }
+
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+    let core = budget::compact_category_to_budget(&conn, "core", config)?;
+    let daily = budget::compact_category_to_budget(&conn, "daily", config)?;
+    Ok(BudgetRows {
+        core_rows: core.evicted_by_count + core.evicted_by_bytes,
+        daily_rows: daily.evicted_by_count + daily.evicted_by_bytes,
+    })
 }
 
 fn prune_audit_entries(workspace_dir: &Path, retention_days: u32) -> Result<()> {

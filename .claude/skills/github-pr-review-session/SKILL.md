@@ -23,7 +23,8 @@ Read these files at the start of every session. They are authoritative.
 
 - `AGENTS.md` — risk tiers, high-risk paths, anti-patterns, commands
 - `docs/book/src/contributing/pr-review-protocol.md` — **the full review protocol**;
-  follow it exactly for every PR, including the review-body Markdown format
+  follow it exactly for every PR, including template completeness,
+  public-artifact truthfulness, and the review-body Markdown format
 - `.github/pull_request_template.md` — required PR body sections; used to
   check template completeness
 - `docs/book/src/foundations/fnd-003-governance.md` — label taxonomy, tracking
@@ -81,6 +82,37 @@ is 1234 ready to merge
 4. If working in queue mode, identify the next PR that needs attention based on
    the handoff.
 
+### Phase 1.5 — Read the architecture review, then verify it (if available)
+
+Check whether `tmp/arch-review-<number>.md` exists for the target PR. If it
+does, read it — the `pr-architecture-check` skill has already run an advisory
+architecture analysis. Treat that artifact as an **unverified lead**, not as
+review text. It is generated output and must not flow into your public review
+unchecked.
+
+If the file exists:
+
+1. **Read every finding** in the artifact.
+2. **Verify each one against the PR diff and the local source.** Confirm the
+   claim is real, is in scope for this PR, and actually matters. Discard
+   anything you cannot substantiate, anything stale, and anything off-topic.
+3. **Summarize only the verified, relevant points in your own reviewer voice**,
+   folded into the normal review body and feedback taxonomy like any finding
+   you raised yourself. Do not paste the artifact verbatim, and do not emit a
+   default mechanical `<details>` dump of the raw arch-review output.
+4. If you choose to keep a collapsible section, it must be **your own summary of
+   the findings you checked** — reviewer-authored, clearly advisory, and scoped
+   to what you confirmed. An unverified copy of the artifact is never
+   acceptable.
+
+The architecture review never speaks for you and never gates the PR: it is
+advisory input you have personally vetted. If the file does not exist, do not
+auto-invoke `pr-architecture-check`.
+
+> **Tip:** If the PR touches core crates (`zeroclaw-api`, `zeroclaw-runtime`,
+> `zeroclaw-gateway`, `zeroclaw-plugins`), consider running `arch-check #<N>`
+> first to get an architecture analysis before starting your review.
+
 ### Phase 2 — Execute the protocol
 
 Follow `docs/book/src/contributing/pr-review-protocol.md` exactly for every PR.
@@ -96,6 +128,8 @@ The protocol specifies:
 - **Label hygiene** — fix obvious label mismatches yourself when the active
   reviewer has label permissions, after approval for the public-state mutation;
   do not ask authors to update labels they may not be allowed to edit
+- **Template and public-artifact checks** — run the checks defined in the
+  protocol before approving
 - **The verdict decision tree** — which flag to use based on review state
 - **The feedback taxonomy** (🔴 / 🟡 / ✅ / 🔵 / 🟢), including the required
   H3 review-body heading format that starts each formal finding with the
