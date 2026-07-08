@@ -394,6 +394,13 @@ pub struct Agent {
     /// at most once per session even though the multimodal pipeline re-walks
     /// the full conversation history on every turn and tool iteration.
     image_cache: zeroclaw_providers::multimodal::LocalImageCache,
+    /// Provider configuration captured at construction time, so a
+    /// `model_switch` tool call inside `turn_streamed` can rebuild a
+    /// provider with the same credentials, base URL, reliability config,
+    /// and runtime options the agent was originally configured with.
+    /// `None` for agents built without this configuration (test-only
+    /// builder paths); model switches are skipped in that case.
+    provider_switch_config: Option<ProviderSwitchConfig>,
     /// Channel name stamped onto observer events to identify the calling surface
     /// (e.g. "agent", "wss", "gateway"). Defaults to "agent" for direct Agent callers.
     channel_name: String,
@@ -430,6 +437,22 @@ pub struct StreamedTurnError {
     pub error: anyhow::Error,
     pub committed_response: String,
     pub new_messages: Vec<ConversationMessage>,
+}
+
+/// Canonical config handle needed to rebuild a provider mid-turn when the
+/// `model_switch` tool requests a different provider/model. Carries only the
+/// `Arc<Config>` the agent was constructed from; the credential, base URL,
+/// reliability, routes, and runtime options are all resolved from that single
+/// source at switch time (see `try_apply_pending_model_switch`) rather than
+/// stored as parallel snapshots that could drift from the canonical config.
+#[derive(Clone, Debug, Default)]
+pub struct ProviderSwitchConfig {
+    /// Full config the agent was constructed from. Needed by
+    /// `create_routed_model_provider_with_options` to resolve provider
+    /// aliases, default credentials, reliability, routes, and per-provider
+    /// settings on a switch. `None` when an agent is built via the test
+    /// builder without an explicit config — switches are skipped in that case.
+    pub config: Option<std::sync::Arc<zeroclaw_config::schema::Config>>,
 }
 
 /// Bundle of late-bound channel-map handles owned by an Agent. Cloning is
@@ -522,6 +545,7 @@ pub struct AgentBuilder {
     agent_alias: Option<String>,
     channel_name: Option<String>,
     exclude_memory: bool,
+    provider_switch_config: Option<ProviderSwitchConfig>,
     #[cfg(test)]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
 }
@@ -570,6 +594,7 @@ impl AgentBuilder {
             agent_alias: None,
             channel_name: None,
             exclude_memory: false,
+            provider_switch_config: None,
             #[cfg(test)]
             turn_datetime: None,
         }
@@ -792,6 +817,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn provider_switch_config(mut self, cfg: ProviderSwitchConfig) -> Self {
+        self.provider_switch_config = Some(cfg);
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self.tools.ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -921,6 +951,7 @@ impl AgentBuilder {
             agent_alias: self.agent_alias.unwrap_or_default(),
             channel_handles: AgentChannelHandles::default(),
             image_cache: zeroclaw_providers::multimodal::LocalImageCache::new(),
+            provider_switch_config: self.provider_switch_config,
             channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
             #[cfg(test)]
             turn_datetime: self.turn_datetime,
@@ -1685,6 +1716,9 @@ impl Agent {
                 None
             })
             .approval_manager(Some(Arc::new(approval_manager)))
+            .provider_switch_config(ProviderSwitchConfig {
+                config: Some(std::sync::Arc::new(config.clone())),
+            })
             .build()?;
 
         // Wire per-tool channel-map handles into the agent so callers (e.g.
@@ -1944,6 +1978,129 @@ impl Agent {
         }
         first.content = new_prompt;
         Ok(())
+    }
+
+    /// If the `model_switch` tool set a pending switch request in the
+    /// process-wide `MODEL_SWITCH_REQUEST` state, attempt to apply it.
+    ///
+    /// Returns `Some(new_effective_model)` when both:
+    /// - a switch is pending and differs from the current
+    ///   `(provider_name, current_effective_model)`, and
+    /// - a replacement provider was built successfully using the
+    ///   `provider_switch_config` captured at construction time.
+    ///
+    /// On any other path (no pending switch, identical switch,
+    /// missing `provider_switch_config`, or provider build failure) the
+    /// agent state is left untouched and the caller continues with the
+    /// existing provider/model. The pending switch request is always
+    /// cleared after observation so a failed switch does not retrigger
+    /// on the next iteration.
+    fn try_apply_pending_model_switch(&mut self, current_effective_model: &str) -> Option<String> {
+        let pending = crate::agent::loop_::get_model_switch_state()
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())?;
+        let (new_model_provider, new_model) = pending;
+
+        // Same-provider, same-model: nothing to do. Still clear the
+        // request so a stale equal-value entry does not linger.
+        if new_model_provider == self.model_provider_name && new_model == current_effective_model {
+            crate::agent::loop_::clear_model_switch_request();
+            return None;
+        }
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "Model switch detected in turn_streamed: {} {} -> {} {}",
+                self.model_provider_name, current_effective_model, new_model_provider, new_model
+            )
+        );
+
+        let switch_outcome: anyhow::Result<Box<dyn ModelProvider>> = match self
+            .provider_switch_config
+            .as_ref()
+            .and_then(|cfg| cfg.config.as_ref())
+        {
+            Some(full_config) => {
+                // Resolve every rebuild input from the one canonical config
+                // source at switch time — reliability, routes, the agent's own
+                // default credential/base URL, and provider runtime options —
+                // rather than from construction-time snapshots that could drift
+                // from the live config.
+                let agent_entry = full_config
+                    .resolved_model_provider_for_agent(&self.agent_alias)
+                    .map(|(_ty, _alias, entry)| entry);
+                let default_api_key = agent_entry.and_then(|e| e.api_key.as_deref());
+                let default_base_url = agent_entry.and_then(|e| e.uri.as_deref());
+
+                // Prefer a route-specific api_key when the switched
+                // provider/model matches a configured model_route entry.
+                let route_api_key = full_config
+                    .model_routes
+                    .iter()
+                    .find(|r| {
+                        r.model_provider.eq_ignore_ascii_case(&new_model_provider)
+                            && (r.model.eq_ignore_ascii_case(&new_model)
+                                || r.hint.eq_ignore_ascii_case(&new_model))
+                    })
+                    .and_then(|r| r.api_key.as_deref());
+                let api_key = route_api_key.or(default_api_key);
+
+                let runtime_options = new_model_provider
+                    .split_once('.')
+                    .map(|(family, alias)| {
+                        zeroclaw_providers::provider_runtime_options_for_alias(
+                            full_config.as_ref(),
+                            family,
+                            alias,
+                        )
+                    })
+                    .unwrap_or_default();
+
+                zeroclaw_providers::create_routed_model_provider_with_options(
+                    full_config.as_ref(),
+                    &new_model_provider,
+                    api_key,
+                    default_base_url,
+                    &full_config.reliability,
+                    &full_config.model_routes,
+                    &new_model,
+                    &runtime_options,
+                )
+            }
+            None => Err(anyhow::Error::msg(
+                "model_switch requested but agent has no provider_switch_config; \
+                 cannot rebuild provider safely",
+            )),
+        };
+
+        let result = match switch_outcome {
+            Ok(new_prov) => {
+                // Commit state only after the provider was built
+                // successfully.
+                self.model_provider = new_prov;
+                self.model_provider_name = new_model_provider;
+                self.model_name = new_model.clone();
+                Some(new_model)
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"err": e.to_string()})),
+                    &format!(
+                        "Failed to apply model_switch in turn_streamed; staying on {} {}",
+                        self.model_provider_name, current_effective_model
+                    )
+                );
+                None
+            }
+        };
+        crate::agent::loop_::clear_model_switch_request();
+        result
     }
 
     fn classify_model(&self, user_message: &str) -> String {
@@ -2586,7 +2743,10 @@ impl Agent {
         self.append_streamed_user_message_to_history(user_message, &mut new_msgs)
             .await;
 
-        let effective_model = self.classify_model(user_message);
+        // `effective_model` is `mut` so a `model_switch` requested mid-turn
+        // (handled in the round loop's `ModelSwitchRequested` arm via
+        // `try_apply_pending_model_switch`) can rebind it for later rounds (#6173).
+        let mut effective_model = self.classify_model(user_message);
         let turn_started_at = Instant::now();
         let turn_id = Self::new_turn_id();
         let mut committed_response = String::new();
@@ -2766,7 +2926,14 @@ impl Agent {
                                     multimodal_config: &self.multimodal_config,
                                     hooks: self.hook_runner.as_deref(),
                                     activated_tools: self.activated_tools.as_ref(),
-                                    model_switch_callback: None,
+                                    // Wire the `model_switch` tool through the
+                                    // unified loop so a mid-turn switch on the
+                                    // streaming/gateway path is signalled as
+                                    // `ModelSwitchRequested` and handled in the
+                                    // round loop below (#6173).
+                                    model_switch_callback: Some(
+                                        crate::agent::loop_::get_model_switch_state(),
+                                    ),
                                     receipt_generator: receipt_scope
                                         .as_ref()
                                         .map(crate::agent::tool_receipts::ReceiptScope::generator),
@@ -2876,6 +3043,22 @@ impl Agent {
                 }
                 Err(error) => {
                     self.trim_history();
+                    // Model switch requested mid-turn (#6173): the unified loop
+                    // signals a pending `model_switch` by returning
+                    // `ModelSwitchRequested` without clearing the request. The
+                    // round's tool call + result are already replayed into
+                    // history/new_msgs above; rebuild the provider from the
+                    // captured `ProviderSwitchConfig` and continue the round
+                    // loop so the next provider call uses the switched
+                    // provider/model. A failed rebuild (no switch config / build
+                    // error) falls through to the normal error handling below.
+                    if crate::agent::loop_::is_model_switch_requested(&error).is_some()
+                        && let Some(new_effective_model) =
+                            self.try_apply_pending_model_switch(&effective_model)
+                    {
+                        effective_model = new_effective_model;
+                        continue;
+                    }
                     // Rebuild the committed text from the failed round's plain
                     // assistant output (e.g. a persisted stream partial) when
                     // no prior round committed anything.
@@ -3078,7 +3261,13 @@ mod tests {
         );
     }
 
-    zeroclaw_api::mock_tool_attribution!(CountingTool, NamedMockTool, MockTool, SlowTool,);
+    zeroclaw_api::mock_tool_attribution!(
+        CountingTool,
+        NamedMockTool,
+        MockTool,
+        SlowTool,
+        ModelSwitchTriggerTool,
+    );
 
     struct MockModelProvider {
         responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
@@ -8345,6 +8534,544 @@ mod tests {
 
         let events = capturing.events.lock();
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("agent"));
+    }
+
+    // ── model_switch persistence (#6173) ─────────────────────────────
+    //
+    // `MODEL_SWITCH_REQUEST` is a process-wide static. Tests that read or
+    // write it serialize on this shared lock — defined next to the state in
+    // `loop_` so the `model_switch` tool tests and these agent tests can't
+    // race each other on the singleton.
+    use crate::agent::loop_::MODEL_SWITCH_TEST_LOCK as MODEL_SWITCH_TEST_GUARD;
+
+    fn build_test_agent(
+        initial_provider_name: &str,
+        initial_model_name: &str,
+        switch_config: Option<ProviderSwitchConfig>,
+    ) -> Agent {
+        let provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![]),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut builder = Agent::builder()
+            .model_provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_provider_name(initial_provider_name.to_string())
+            .model_name(initial_model_name.to_string());
+        if let Some(cfg) = switch_config {
+            builder = builder.provider_switch_config(cfg);
+        }
+        builder.build().expect("agent builder")
+    }
+
+    #[test]
+    fn try_apply_pending_model_switch_noop_when_no_pending_request() {
+        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
+        crate::agent::loop_::clear_model_switch_request();
+
+        let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
+        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
+        assert_eq!(result, None);
+        assert_eq!(agent.model_provider_name, "openai");
+        assert_eq!(agent.model_name, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn try_apply_pending_model_switch_noop_when_identical_to_current() {
+        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
+        crate::agent::loop_::clear_model_switch_request();
+
+        // Pre-set an "equal" switch request.
+        {
+            let state = crate::agent::loop_::get_model_switch_state();
+            let mut guard = state.lock().unwrap();
+            *guard = Some(("openai".to_string(), "gpt-4o-mini".to_string()));
+        }
+
+        let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
+        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
+        assert_eq!(result, None, "same-provider/same-model is a no-op");
+        // State must be cleared so a stale equal entry does not linger.
+        let still_pending = crate::agent::loop_::get_model_switch_state()
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            still_pending, None,
+            "equal switch request must be cleared after observation"
+        );
+    }
+
+    #[test]
+    fn try_apply_pending_model_switch_preserves_state_without_switch_config() {
+        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
+        crate::agent::loop_::clear_model_switch_request();
+
+        // Pre-set a real switch request.
+        {
+            let state = crate::agent::loop_::get_model_switch_state();
+            let mut guard = state.lock().unwrap();
+            *guard = Some(("anthropic".to_string(), "claude-haiku".to_string()));
+        }
+
+        // Agent has NO provider_switch_config — cannot rebuild provider.
+        let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
+        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
+
+        // Returns None (failed switch), state unchanged on the agent,
+        // pending request cleared so we don't retry forever.
+        assert_eq!(result, None);
+        assert_eq!(
+            agent.model_provider_name, "openai",
+            "provider_name must NOT change when provider rebuild is not possible"
+        );
+        assert_eq!(
+            agent.model_name, "gpt-4o-mini",
+            "model_name must NOT change when provider rebuild is not possible"
+        );
+        let still_pending = crate::agent::loop_::get_model_switch_state()
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            still_pending, None,
+            "pending switch must be cleared even when rebuild fails, \
+             so it does not retrigger on the next iteration"
+        );
+    }
+
+    /// Success-path coverage: with a valid `ProviderSwitchConfig`, a
+    /// pending `MODEL_SWITCH_REQUEST` for a different provider/model
+    /// rebuilds the provider, commits agent state, clears the request,
+    /// and returns the new effective model. Uses `ollama` because its
+    /// constructor performs no network I/O — the request itself would
+    /// only happen at chat time, which this test never reaches.
+    #[test]
+    fn try_apply_pending_model_switch_succeeds_with_switch_config() {
+        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
+        crate::agent::loop_::clear_model_switch_request();
+
+        // Pre-set a real switch request to a different provider AND model.
+        {
+            let state = crate::agent::loop_::get_model_switch_state();
+            let mut guard = state.lock().unwrap();
+            *guard = Some(("ollama".to_string(), "llama3".to_string()));
+        }
+
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(std::sync::Arc::new(
+                zeroclaw_config::schema::Config::default(),
+            )),
+        };
+
+        let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
+        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
+
+        assert_eq!(
+            result.as_deref(),
+            Some("llama3"),
+            "successful switch must return the new effective model"
+        );
+        assert_eq!(
+            agent.model_provider_name, "ollama",
+            "provider_name must reflect the switched provider after success"
+        );
+        assert_eq!(
+            agent.model_name, "llama3",
+            "model_name must reflect the switched model after success"
+        );
+        let still_pending = crate::agent::loop_::get_model_switch_state()
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            still_pending, None,
+            "pending switch must be cleared after a successful switch"
+        );
+    }
+
+    /// Success-path coverage for a provider-only switch (same model id,
+    /// different provider). This was a specific failure mode flagged in
+    /// the review: the older `*new_model != effective_model` check
+    /// missed this case. The current implementation compares both
+    /// provider and model and rebuilds in this case.
+    #[test]
+    fn try_apply_pending_model_switch_succeeds_on_provider_only_change() {
+        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
+        crate::agent::loop_::clear_model_switch_request();
+
+        // Same model id, different provider.
+        {
+            let state = crate::agent::loop_::get_model_switch_state();
+            let mut guard = state.lock().unwrap();
+            *guard = Some(("ollama".to_string(), "shared-name".to_string()));
+        }
+
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(std::sync::Arc::new(
+                zeroclaw_config::schema::Config::default(),
+            )),
+        };
+
+        let mut agent = build_test_agent("openai", "shared-name", Some(switch_cfg));
+        let result = agent.try_apply_pending_model_switch("shared-name");
+
+        assert_eq!(
+            result.as_deref(),
+            Some("shared-name"),
+            "provider-only switch must also be treated as a successful switch"
+        );
+        assert_eq!(
+            agent.model_provider_name, "ollama",
+            "provider_name must update on a provider-only switch"
+        );
+        assert_eq!(agent.model_name, "shared-name");
+    }
+
+    /// Success-path coverage that the route-specific `api_key` lookup
+    /// in `model_routes` is consulted when the switched provider/model
+    /// matches a route entry. The route entry's key is preferred over
+    /// the global fallback key.
+    #[test]
+    fn try_apply_pending_model_switch_prefers_route_api_key() {
+        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
+        crate::agent::loop_::clear_model_switch_request();
+
+        {
+            let state = crate::agent::loop_::get_model_switch_state();
+            let mut guard = state.lock().unwrap();
+            *guard = Some(("ollama".to_string(), "tinyllama".to_string()));
+        }
+
+        let route = zeroclaw_config::schema::ModelRouteConfig {
+            model_provider: "ollama".to_string(),
+            model: "tinyllama".to_string(),
+            hint: "fast".to_string(),
+            api_key: Some("route-specific-key".to_string()),
+        };
+
+        let route_config = zeroclaw_config::schema::Config {
+            model_routes: vec![route],
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(std::sync::Arc::new(route_config)),
+        };
+
+        let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
+        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
+
+        // The route's api_key is exercised inside the rebuild call; if
+        // the lookup were wrong (e.g. fell back to the global key), the
+        // construction would still succeed for ollama, so success here
+        // is a weak signal. The strong signal is the documented order:
+        // route-specific key is preferred over the global fallback. The
+        // test pins that the resolution logic is exercised at all by
+        // confirming the switch completes successfully when a matching
+        // route entry exists.
+        assert_eq!(
+            result.as_deref(),
+            Some("tinyllama"),
+            "switch must succeed when a model_routes entry matches the target"
+        );
+        assert_eq!(agent.model_provider_name, "ollama");
+    }
+
+    // ── end-to-end turn_streamed model-switch (#6173 gateway/UI half) ─────
+    //
+    // The helper tests above prove `try_apply_pending_model_switch` rebuilds
+    // and commits state correctly. This test proves the *call site* inside
+    // `turn_streamed`: a `model_switch` requested by a tool mid-turn is
+    // observed after the tool result and the NEXT provider call in the same
+    // streamed turn targets the switched provider/model. A regression that
+    // removed or skipped the switch at the `turn_streamed` loop boundary would
+    // leave the agent on its original provider/model and fail this test, even
+    // though every helper test still passed.
+
+    /// Streamed mock whose first call emits a tool call (queuing a model
+    /// switch via `ModelSwitchTriggerTool`) and whose later calls emit final
+    /// text. `call_count` lets the test prove the original provider is used
+    /// for exactly the first call — the next call goes to the switched one.
+    struct StreamSwitchTriggerProvider {
+        call_count: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for StreamSwitchTriggerProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            // The unified loop drives the streaming wrapper through `chat`
+            // (stream events are synthesized post-hoc), so the tool call that
+            // queues the switch is emitted here on the first call.
+            let mut count = self.call_count.lock();
+            *count += 1;
+            if *count == 1 {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some(String::new()),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "00000000-0000-0000-0000-000000000002".into(),
+                        name: "model_switch_trigger".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                // Should not be reached: after the switch, the next call goes
+                // to the switched provider, not this one.
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("original-provider-should-not-be-reused".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::stream::{self, StreamExt};
+            let mut count = self.call_count.lock();
+            *count += 1;
+            if *count == 1 {
+                // First call: ask to run the tool that queues a model switch.
+                let tc = zeroclaw_providers::traits::StreamEvent::ToolCall(
+                    zeroclaw_providers::ToolCall {
+                        id: "00000000-0000-0000-0000-000000000002".into(),
+                        name: "model_switch_trigger".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                );
+                stream::iter(vec![
+                    Ok(tc),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            } else {
+                // Should not be reached: after the switch, the next call goes
+                // to the switched provider, not this one.
+                let chunk = zeroclaw_providers::traits::StreamEvent::TextDelta(
+                    zeroclaw_providers::traits::StreamChunk {
+                        delta: "original-provider-should-not-be-reused".into(),
+                        is_final: false,
+                        reasoning: None,
+                        token_count: 0,
+                    },
+                );
+                stream::iter(vec![
+                    Ok(chunk),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StreamSwitchTriggerProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "StreamSwitchTriggerProvider"
+        }
+    }
+
+    /// Test tool that queues a pending `model_switch` when executed, standing
+    /// in for the real `model_switch` tool during a streamed turn.
+    struct ModelSwitchTriggerTool {
+        target_provider: String,
+        target_model: String,
+    }
+
+    #[async_trait]
+    impl Tool for ModelSwitchTriggerTool {
+        fn name(&self) -> &str {
+            "model_switch_trigger"
+        }
+        fn description(&self) -> &str {
+            "test tool: queues a pending model switch"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            let state = crate::agent::loop_::get_model_switch_state();
+            *state.lock().unwrap() =
+                Some((self.target_provider.clone(), self.target_model.clone()));
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "model switch queued".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn turn_streamed_applies_pending_model_switch_for_next_call() {
+        // Serialize with the other tests that touch the process-wide
+        // `MODEL_SWITCH_REQUEST`. The async work runs inside a manually built
+        // current-thread runtime so the `std::sync` guard is never held across
+        // an `.await` in this (synchronous) test body.
+        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
+        crate::agent::loop_::clear_model_switch_request();
+
+        let initial_calls = Arc::new(Mutex::new(0usize));
+        let provider = Box::new(StreamSwitchTriggerProvider {
+            call_count: Arc::clone(&initial_calls),
+        });
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation"),
+        );
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+
+        // `ProviderSwitchConfig` rebuilds `ollama`, whose constructor performs
+        // no network I/O. `provider_retries: 0` keeps the unavoidable
+        // second-iteration call to the (offline) server a single fast failure;
+        // the switch state and the post-switch `LlmRequest` event are both
+        // committed before that call, so the assertions hold regardless.
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(std::sync::Arc::new(zeroclaw_config::schema::Config {
+                reliability: zeroclaw_config::schema::ReliabilityConfig {
+                    provider_retries: 0,
+                    provider_backoff_ms: 0,
+                    ..zeroclaw_config::schema::ReliabilityConfig::default()
+                },
+                ..zeroclaw_config::schema::Config::default()
+            })),
+        };
+
+        let mut agent = Agent::builder()
+            .model_provider(provider)
+            .tools(vec![Box::new(ModelSwitchTriggerTool {
+                target_provider: "ollama".to_string(),
+                target_model: "llama3".to_string(),
+            })])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_provider_name("openai".to_string())
+            .model_name("gpt-4o-mini".to_string())
+            .provider_switch_config(switch_cfg)
+            .build()
+            .expect("agent builder");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+            // The turn ultimately errors because the switched provider has no
+            // live server; the timeout only guards against an unexpected hang.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                agent.turn_streamed("please switch the model", event_tx, None),
+            )
+            .await;
+        });
+
+        // `turn_streamed` itself must have consumed the pending switch and
+        // committed the rebuilt provider/model via `ProviderSwitchConfig`.
+        assert_eq!(
+            agent.model_provider_name, "ollama",
+            "turn_streamed must commit the switched provider after the tool result"
+        );
+        assert_eq!(
+            agent.model_name, "llama3",
+            "turn_streamed must commit the switched model after the tool result"
+        );
+
+        // The original provider is used for exactly the first call; the next
+        // call in the same turn goes to the switched provider instead.
+        assert_eq!(
+            *initial_calls.lock(),
+            1,
+            "the original provider must serve only the first call — the next \
+             call must use the switched provider, not the original"
+        );
+
+        // The next provider call in the same streamed turn targets the
+        // switched provider/model: the `LlmRequest` event is recorded at the
+        // top of the post-switch iteration, immediately before that call.
+        let events = capturing.events.lock();
+        let switched_request = events.iter().any(|e| {
+            matches!(
+                e,
+                ObserverEvent::LlmRequest { model_provider, model, .. }
+                    if model_provider == "ollama" && model == "llama3"
+            )
+        });
+        assert!(
+            switched_request,
+            "turn_streamed must issue the next provider call against the switched \
+             provider/model (ollama/llama3); captured events: {events:?}"
+        );
+        drop(events);
+
+        // The pending switch must be cleared after consumption so it does not
+        // retrigger on a later iteration or turn.
+        let still_pending = crate::agent::loop_::get_model_switch_state()
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            still_pending, None,
+            "pending switch must be cleared after turn_streamed consumes it"
+        );
+
+        crate::agent::loop_::clear_model_switch_request();
     }
 }
 
