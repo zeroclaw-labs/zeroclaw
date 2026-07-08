@@ -4520,7 +4520,8 @@ mod tests {
                 "properties": {
                     "command": { "type": "string" }
                 }
-            }),
+            })
+            .into(),
         }];
         let mut stream = model_provider.stream_chat(
             ChatRequest {
@@ -4603,7 +4604,7 @@ mod tests {
         let tools = vec![ToolSpec {
             name: "shell".to_string(),
             description: "run shell".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
+            parameters: serde_json::json!({"type": "object"}).into(),
         }];
         let mut stream = model_provider.stream_chat(
             ChatRequest {

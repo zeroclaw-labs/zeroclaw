@@ -1339,6 +1339,28 @@ pub fn create_resilient_model_provider_for_alias(
     reliability: &zeroclaw_config::schema::ReliabilityConfig,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
+    create_resilient_model_provider_for_alias_with_model_override(
+        config,
+        family,
+        alias,
+        api_key,
+        api_url,
+        reliability,
+        options,
+        None,
+    )
+}
+
+fn create_resilient_model_provider_for_alias_with_model_override(
+    config: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    options: &ModelProviderRuntimeOptions,
+    primary_model_override: Option<&str>,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
     let primary_model_provider =
         create_model_provider_inner(Some(config), family, alias, api_key, api_url, options)?;
 
@@ -1349,6 +1371,7 @@ pub fn create_resilient_model_provider_for_alias(
         family,
         alias,
         primary_model_provider,
+        primary_model_override,
     );
 
     let mut visited: Vec<String> = vec![format!("{family}.{alias}")];
@@ -1384,9 +1407,15 @@ fn push_pinned_entries(
     family: &str,
     alias: &str,
     built: Box<dyn ModelProvider>,
+    primary_model_override: Option<&str>,
 ) {
     let entry = config.providers.models.find(family, alias);
-    let primary_model = entry.and_then(|e| e.model.as_deref());
+    let primary_model = primary_model_override
+        .and_then(|model| {
+            let trimmed = model.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+        .or_else(|| entry.and_then(|e| e.model.as_deref()));
     let extra_models: &[String] = entry.map(|e| e.fallback_models.as_slice()).unwrap_or(&[]);
     let cooldown_key = format!("{family}.{alias}");
 
@@ -1494,7 +1523,7 @@ fn append_fallback_chain(
             entry.uri.as_deref(),
             &opts,
         ) {
-            Ok(built) => push_pinned_entries(out, config, family, &alias, built),
+            Ok(built) => push_pinned_entries(out, config, family, &alias, built, None),
             Err(e) => {
                 let profile = format!("[providers.models.{family}.{alias}]");
                 anyhow::bail!(
@@ -1524,8 +1553,28 @@ pub fn create_resilient_model_provider_from_ref(
     reliability: &zeroclaw_config::schema::ReliabilityConfig,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
+    create_resilient_model_provider_from_ref_with_model_override(
+        config,
+        name,
+        api_key,
+        api_url,
+        reliability,
+        options,
+        None,
+    )
+}
+
+fn create_resilient_model_provider_from_ref_with_model_override(
+    config: &zeroclaw_config::schema::Config,
+    name: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    options: &ModelProviderRuntimeOptions,
+    primary_model_override: Option<&str>,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
     match name.split_once('.') {
-        Some((family, alias)) => create_resilient_model_provider_for_alias(
+        Some((family, alias)) => create_resilient_model_provider_for_alias_with_model_override(
             config,
             family,
             alias,
@@ -1533,6 +1582,7 @@ pub fn create_resilient_model_provider_from_ref(
             api_url,
             reliability,
             options,
+            primary_model_override,
         ),
         None => create_resilient_model_provider_with_options(
             name,
@@ -1560,13 +1610,14 @@ pub fn create_routed_model_provider_with_options(
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     if model_routes.is_empty() {
-        return create_resilient_model_provider_from_ref(
+        return create_resilient_model_provider_from_ref_with_model_override(
             config,
             primary_name,
             api_key,
             api_url,
             reliability,
             options,
+            Some(default_model),
         );
     }
 
@@ -1617,13 +1668,14 @@ pub fn create_routed_model_provider_with_options(
             options_for_provider_ref(config, name, options)
         };
 
-        match create_resilient_model_provider_from_ref(
+        match create_resilient_model_provider_from_ref_with_model_override(
             config,
             name,
             key,
             url,
             reliability,
             &entry_options,
+            is_primary.then_some(default_model),
         ) {
             Ok(model_provider) => model_providers.push((name.clone(), model_provider)),
             Err(e) => {
@@ -2608,6 +2660,90 @@ mod tests {
             options.provider_api_url.as_deref(),
             Some("http://primary.example/v1")
         );
+    }
+
+    #[tokio::test]
+    async fn routed_alias_uses_call_model_instead_of_configured_pin() {
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+
+        type Capture = Arc<Mutex<Option<String>>>;
+
+        async fn capture_chat_request(
+            State(capture): State<Capture>,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let model = body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            *capture.lock().expect("capture lock poisoned") = Some(model);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "choices": [{"message": {"content": "ok"}}]
+                })),
+            )
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_chat_request))
+            .with_state(capture.clone());
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("sk-test".to_string()),
+                    uri: Some(format!("http://{addr}/v1")),
+                    model: Some("old-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let provider = create_routed_model_provider_with_options(
+            &config,
+            "openai.primary",
+            Some("sk-test"),
+            Some(&format!("http://{addr}/v1")),
+            &config.reliability,
+            &[],
+            "new-model",
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("provider should build");
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+
+        let response = provider
+            .chat(request, "new-model", None)
+            .await
+            .expect("chat should succeed");
+
+        assert_eq!(response.text.as_deref(), Some("ok"));
+        let model = capture
+            .lock()
+            .expect("capture lock poisoned")
+            .take()
+            .expect("server should capture request");
+        assert_eq!(model, "new-model");
+        server.abort();
     }
 
     #[test]

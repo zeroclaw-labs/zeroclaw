@@ -117,6 +117,7 @@ Every workspace crate carries a stability tier per the Microkernel Architecture 
 | `zeroclaw-providers` | Beta | — |
 | `zeroclaw-memory` | Beta | — |
 | `zeroclaw-infra` | Beta | — |
+| `zeroclaw-commands` | Experimental | Built-in command catalogue and metadata |
 | `zeroclaw-tool-call-parser` | Beta | Stable at v0.8.0 |
 | `zeroclaw-channels` | Experimental | Plugin migration at v1.0.0 |
 | `zeroclaw-tools` | Experimental | Plugin migration at v1.0.0 |
