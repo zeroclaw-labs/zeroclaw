@@ -548,7 +548,13 @@ impl Channel for VoiceCallChannel {
         Ok(())
     }
 
-    async fn finalize_draft(&self, _recipient: &str, _message_id: &str, _text: &str) -> Result<()> {
+    async fn finalize_draft(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+        _suppress_voice: bool,
+    ) -> Result<()> {
         Ok(())
     }
 

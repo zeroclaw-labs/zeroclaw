@@ -687,6 +687,13 @@ impl TelegramChannel {
         self
     }
 
+    /// Returns `true` if `recipient` is in a peer group configured with
+    /// `output_modality = "voice"` for this channel. Resolved live from config
+    /// via `voice_peer_resolver` so it stays correct across hot-reloads.
+    pub(crate) fn is_voice_peer(&self, recipient: &str) -> bool {
+        (self.voice_peer_resolver)().iter().any(|p| p == recipient)
+    }
+
     /// Set a per-channel proxy URL that overrides the global proxy config.
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
@@ -1132,8 +1139,8 @@ impl TelegramChannel {
             || (self.voice_peer_resolver)().iter().any(|p| p == recipient)
     }
 
-    fn try_queue_voice_reply(&self, recipient: &str, content: &str, immediate: bool) {
-        if !self.is_voice_chat(recipient) || self.tts_manager.is_none() {
+    fn try_queue_voice_reply(&self, recipient: &str, content: &str, immediate: bool, force: bool) {
+        if (!force && !self.is_voice_chat(recipient)) || self.tts_manager.is_none() {
             return;
         }
 
@@ -1154,6 +1161,7 @@ impl TelegramChannel {
 
         let (chat_id, thread_id) = Self::parse_reply_target(recipient);
         let voice_chats = self.voice_chats.clone();
+        let voice_peer_resolver = self.voice_peer_resolver.clone();
         let api_base = self.api_base.clone();
         let bot_token = self.bot_token.clone();
         let tts_manager = self.tts_manager.clone().unwrap();
@@ -1163,7 +1171,8 @@ impl TelegramChannel {
             let text = content.to_string();
             let recipient = recipient.to_string();
             zeroclaw_spawn::spawn!(async move {
-                if let Ok(mut vc) = voice_chats.lock() {
+                let is_config_voice_peer = voice_peer_resolver().contains(&recipient);
+                if !is_config_voice_peer && let Ok(mut vc) = voice_chats.lock() {
                     vc.remove(&recipient);
                 }
                 match Self::synthesize_and_send_voice(
@@ -1229,7 +1238,8 @@ impl TelegramChannel {
             });
 
             if let Some(text) = to_voice {
-                if let Ok(mut vc) = voice_chats.lock() {
+                let is_config_voice_peer = voice_peer_resolver().contains(&recipient);
+                if !is_config_voice_peer && let Ok(mut vc) = voice_chats.lock() {
                     vc.remove(&recipient);
                 }
                 match Self::synthesize_and_send_voice(
@@ -2410,8 +2420,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             content
         };
 
-        // Exit voice-chat mode when user switches back to typing
-        if let Ok(mut vc) = self.voice_chats.lock() {
+        // Exit input-driven voice mode when user switches back to typing.
+        // Config-mandated voice peers (output_modality = "voice") stay in
+        // voice mode regardless of whether they send text or voice.
+        if !self.is_voice_peer(&reply_target)
+            && let Ok(mut vc) = self.voice_chats.lock()
+        {
             vc.remove(&reply_target);
         }
 
@@ -3438,15 +3452,36 @@ impl Channel for TelegramChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        suppress_voice: bool,
     ) -> anyhow::Result<()> {
         let text = &strip_tool_call_tags(text);
         let (chat_id, thread_id) = Self::parse_reply_target(recipient);
 
-        // Queue TTS voice reply — immediate mode since text is already final
-        self.try_queue_voice_reply(recipient, text, true);
+        // Queue TTS voice reply — immediate mode since text is already final.
+        // Skipped when suppress_voice is set (explicit text-only routing override).
+        if !suppress_voice {
+            self.try_queue_voice_reply(recipient, text, true, false);
+        }
 
         // Clean up rate-limit tracking for this chat
         self.last_draft_edit.lock().remove(&chat_id);
+
+        // Voice-only peers: delete the draft placeholder and let the voice
+        // bubble be the sole reply. Bypassed when suppress_voice forces text.
+        if !suppress_voice && self.is_voice_peer(recipient) {
+            if let Ok(id) = message_id.parse::<i64>() {
+                let _ = self
+                    .client
+                    .post(self.api_url("deleteMessage"))
+                    .json(&serde_json::json!({
+                        "chat_id": chat_id,
+                        "message_id": id,
+                    }))
+                    .send()
+                    .await;
+            }
+            return Ok(());
+        }
 
         // Parse attachments before processing
         let (text_without_markers, attachments) = parse_attachment_markers(text);
@@ -3670,14 +3705,19 @@ impl Channel for TelegramChannel {
             None => (message.recipient.as_str(), None),
         };
 
-        // Voice chat mode: send text normally AND queue a voice note of the
-        // final answer. Text in → text out. Voice in → text + voice out.
-        // Suppressed messages (errors, system notices) are never voiced.
+        // Voice chat mode: queue a voice note. Suppressed messages (errors,
+        // system notices) are never voiced.
         if !message.suppress_voice {
-            self.try_queue_voice_reply(&message.recipient, &content, false);
+            self.try_queue_voice_reply(&message.recipient, &content, false, message.force_voice);
         }
 
-        // Always send text reply (voice chat gets both text and voice)
+        // Voice-only peers (or explicit force_voice): the voice note is the sole reply — skip text.
+        if !message.suppress_voice
+            && (self.is_voice_peer(&message.recipient) || message.force_voice)
+        {
+            return Ok(());
+        }
+
         let (text_without_markers, attachments) = parse_attachment_markers(&content);
 
         if !attachments.is_empty() {
@@ -4664,7 +4704,9 @@ mod tests {
 
         // For oversized text + invalid draft message_id, finalize_draft should
         // fall back to chunked send instead of returning early.
-        let result = ch.finalize_draft("123", "not-a-number", &long_text).await;
+        let result = ch
+            .finalize_draft("123", "not-a-number", &long_text, false)
+            .await;
         assert!(result.is_err());
     }
 

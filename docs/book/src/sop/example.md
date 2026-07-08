@@ -2,7 +2,7 @@
 
 [stagehand](https://codeberg.org/singlerider/stagehand) is a production ZeroClaw bot. It watches the upstream release feed, bumps a [StageX](https://codeberg.org/stagex/stagex) package, builds it, verifies it reproduces by digest, pushes the change, opens a draft pull request, and announces the result. No human touches it until the PR exists.
 
-It is the reference SOP deployment: the pipeline is a deterministic SOP, the release feed arrives over an AMQP channel, and the agent fires the SOP with the `sop_execute` tool. AMQP is a transport, not a native SOP trigger; only MQTT is wired to a live SOP listener (see [Connectivity](./connectivity.md)). The channel lifts each release into the agent loop, and the agent starts the run. That separation is what makes the pattern reusable.
+It is the reference SOP deployment: the pipeline is a deterministic SOP, the release feed arrives over an AMQP channel, and the agent fires the SOP with the `sop_execute` tool. AMQP can also drive the SOP engine directly as a live [fan-in](./fan-in/amqp.md); this example uses the agent-fires-it pattern by choice, where the channel lifts each release into the agent loop and the agent starts the run. That separation is what makes the pattern reusable.
 
 Every command, config key, tool name, status value, and audit key below maps to a concrete definition in the codebase.
 
