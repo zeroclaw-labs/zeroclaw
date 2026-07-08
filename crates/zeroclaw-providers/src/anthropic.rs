@@ -241,24 +241,73 @@ struct NativeContentIn {
     input: Option<serde_json::Value>,
 }
 
+/// Typed builder for [`AnthropicModelProvider`].
+///
+/// `alias` is the only positional argument. Everything else has a
+/// sensible default: the base URL falls back to Anthropic's published
+/// endpoint, no credential leaves the provider unauthenticated (fine
+/// for local mocks), and `max_tokens` uses the workspace baseline.
+#[must_use]
+pub struct AnthropicBuilder {
+    alias: String,
+    credential: Option<String>,
+    base_url: Option<String>,
+    max_tokens: Option<u32>,
+}
+
+impl AnthropicBuilder {
+    /// Explicit API credential. Whitespace-only inputs are normalized
+    /// to `None` so a stray `Some("   ")` from config cannot produce a
+    /// bogus `Bearer    ` header.
+    pub fn credential(mut self, credential: Option<&str>) -> Self {
+        self.credential = credential
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(ToString::to_string);
+        self
+    }
+
+    /// Override the API endpoint. Trailing slashes are stripped so
+    /// callers need not care whether config supplied them.
+    pub fn base_url(mut self, base_url: &str) -> Self {
+        self.base_url = Some(base_url.trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Override the maximum output tokens for API requests. Defaults to
+    /// [`zeroclaw_api::model_provider::BASELINE_MAX_TOKENS`] when unset.
+    pub fn max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    pub fn build(self) -> AnthropicModelProvider {
+        AnthropicModelProvider {
+            alias: self.alias,
+            credential: self.credential,
+            base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
+            max_tokens: self
+                .max_tokens
+                .unwrap_or(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS),
+        }
+    }
+}
+
 impl AnthropicModelProvider {
-    /// Construct a Anthropic provider talking to the default public
-    /// endpoint. Chain [`Self::with_base_url`] to point at a custom
-    /// endpoint (self-hosted proxy, staging environment, VCR mock).
-    pub fn new(alias: &str, credential: Option<&str>) -> Self {
-        Self {
+    /// Entry point. Only `alias` is required; every other field is set
+    /// via a labelled chain method on the returned [`AnthropicBuilder`].
+    pub fn builder(alias: &str) -> AnthropicBuilder {
+        AnthropicBuilder {
             alias: alias.to_string(),
-            credential: credential
-                .map(str::trim)
-                .filter(|k| !k.is_empty())
-                .map(ToString::to_string),
-            base_url: BASE_URL.to_string(),
-            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            credential: None,
+            base_url: None,
+            max_tokens: None,
         }
     }
 
-    /// Override the API endpoint. Trailing slashes are stripped so callers
-    /// need not care whether config supplied them.
+    /// Override the API endpoint on an already-built provider. Trailing
+    /// slashes are stripped so callers need not care whether config
+    /// supplied them.
     #[must_use]
     pub fn with_base_url(mut self, base_url: &str) -> Self {
         self.base_url = base_url.trim_end_matches('/').to_string();
@@ -2011,7 +2060,9 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn creates_with_key() {
-        let p = AnthropicModelProvider::new("test", Some("anthropic-test-credential"));
+        let p = AnthropicModelProvider::builder("test")
+            .credential(Some("anthropic-test-credential"))
+            .build();
         assert!(p.credential.is_some());
         assert_eq!(p.credential.as_deref(), Some("anthropic-test-credential"));
         assert_eq!(p.base_url, "https://api.anthropic.com");
@@ -2019,27 +2070,33 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn creates_without_key() {
-        let p = AnthropicModelProvider::new("test", None);
+        let p = AnthropicModelProvider::builder("test").build();
         assert!(p.credential.is_none());
         assert_eq!(p.base_url, "https://api.anthropic.com");
     }
 
     #[test]
     fn creates_with_empty_key() {
-        let p = AnthropicModelProvider::new("test", Some(""));
+        let p = AnthropicModelProvider::builder("test")
+            .credential(Some(""))
+            .build();
         assert!(p.credential.is_none());
     }
 
     #[test]
     fn creates_with_whitespace_key() {
-        let p = AnthropicModelProvider::new("test", Some("  anthropic-test-credential  "));
+        let p = AnthropicModelProvider::builder("test")
+            .credential(Some("  anthropic-test-credential  "))
+            .build();
         assert!(p.credential.is_some());
         assert_eq!(p.credential.as_deref(), Some("anthropic-test-credential"));
     }
 
     #[test]
     fn creates_with_custom_base_url() {
-        let p = AnthropicModelProvider::new("test", Some("anthropic-credential"))
+        let p = AnthropicModelProvider::builder("test")
+            .credential(Some("anthropic-credential"))
+            .build()
             .with_base_url("https://api.example.com");
         assert_eq!(p.base_url, "https://api.example.com");
         assert_eq!(p.credential.as_deref(), Some("anthropic-credential"));
@@ -2047,19 +2104,21 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn custom_base_url_trims_trailing_slash() {
-        let p = AnthropicModelProvider::new("test", None).with_base_url("https://api.example.com/");
+        let p = AnthropicModelProvider::builder("test")
+            .build()
+            .with_base_url("https://api.example.com/");
         assert_eq!(p.base_url, "https://api.example.com");
     }
 
     #[test]
     fn no_base_url_uses_published_endpoint() {
-        let p = AnthropicModelProvider::new("test", None);
+        let p = AnthropicModelProvider::builder("test").build();
         assert_eq!(p.base_url, "https://api.anthropic.com");
     }
 
     #[tokio::test]
     async fn chat_fails_without_key() {
-        let p = AnthropicModelProvider::new("test", None);
+        let p = AnthropicModelProvider::builder("test").build();
         let result = p
             .chat_with_system(None, "hello", "claude-3-opus", Some(0.7))
             .await;
@@ -2081,7 +2140,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn apply_auth_uses_bearer_and_beta_for_setup_tokens() {
-        let model_provider = AnthropicModelProvider::new("test", None);
+        let model_provider = AnthropicModelProvider::builder("test").build();
         let request = model_provider
             .apply_auth(
                 model_provider
@@ -2118,7 +2177,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn apply_auth_uses_x_api_key_for_regular_tokens() {
-        let model_provider = AnthropicModelProvider::new("test", None);
+        let model_provider = AnthropicModelProvider::builder("test").build();
         let request = model_provider
             .apply_auth(
                 model_provider
@@ -2142,7 +2201,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn chat_with_system_fails_without_key() {
-        let p = AnthropicModelProvider::new("test", None);
+        let p = AnthropicModelProvider::builder("test").build();
         let result = p
             .chat_with_system(
                 Some("You are ZeroClaw"),
@@ -2252,7 +2311,9 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn resolve_thinking_drops_native_for_opus_4_7() {
-        let provider = AnthropicModelProvider::new("test", Some("test-key"));
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: 10_000,
         };
@@ -2270,7 +2331,9 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn resolve_thinking_keeps_native_for_supported_models() {
-        let provider = AnthropicModelProvider::new("test", Some("test-key"));
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: 10_000,
         };
@@ -2807,7 +2870,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn warmup_without_key_is_noop() {
-        let model_provider = AnthropicModelProvider::new("test", None);
+        let model_provider = AnthropicModelProvider::builder("test").build();
         let result = model_provider.warmup().await;
         assert!(result.is_ok());
     }
@@ -3080,7 +3143,9 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn capabilities_returns_vision_and_native_tools() {
-        let model_provider = AnthropicModelProvider::new("test", Some("test-key"));
+        let model_provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
         let caps = model_provider.capabilities();
         assert!(
             caps.native_tool_calling,

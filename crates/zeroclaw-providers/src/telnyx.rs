@@ -33,7 +33,7 @@ pub(crate) const BASE_URL: &str = "https://api.telnyx.com/v2/ai";
 /// use zeroclaw::providers::telnyx::TelnyxModelProvider;
 /// use zeroclaw::providers::ModelProvider;
 ///
-/// let model_provider = TelnyxModelProvider::new("test", Some("your-api-key"));
+/// let model_provider = TelnyxModelProvider::builder("test").api_key(Some("your-api-key")).build();
 /// let response = model_provider.chat("Hello!", "openai/gpt-4o", 0.7).await?;
 /// ```
 pub struct TelnyxModelProvider {
@@ -45,7 +45,39 @@ pub struct TelnyxModelProvider {
     client: Client,
 }
 
+/// Typed builder for [`TelnyxModelProvider`].
+///
+/// Only `alias` is required; `api_key` falls back to the same
+/// `TELNYX_API_KEY` env lookup the pre-builder ctor used.
+#[must_use]
+pub struct TelnyxBuilder {
+    alias: String,
+    api_key: Option<String>,
+}
+
+impl TelnyxBuilder {
+    /// Set an explicit Telnyx API key. When unset, `build()` reads
+    /// `TELNYX_API_KEY` from the environment via `resolve_telnyx_api_key`.
+    pub fn api_key(mut self, api_key: Option<&str>) -> Self {
+        self.api_key = api_key.map(str::to_string);
+        self
+    }
+
+    pub fn build(self) -> TelnyxModelProvider {
+        TelnyxModelProvider::new(&self.alias, self.api_key.as_deref())
+    }
+}
+
 impl TelnyxModelProvider {
+    /// Entry point. Only `alias` is required; every other field is set
+    /// via a labelled chain method on the returned [`TelnyxBuilder`].
+    pub fn builder(alias: &str) -> TelnyxBuilder {
+        TelnyxBuilder {
+            alias: alias.to_string(),
+            api_key: None,
+        }
+    }
+
     /// Create a new Telnyx AI model_provider.
     pub fn new(alias: &str, api_key: Option<&str>) -> Self {
         let resolved_key = resolve_telnyx_api_key(api_key);
@@ -340,13 +372,15 @@ mod tests {
 
     #[test]
     fn creates_provider_with_key() {
-        let model_provider = TelnyxModelProvider::new("test", Some("test-key"));
+        let model_provider = TelnyxModelProvider::builder("test")
+            .api_key(Some("test-key"))
+            .build();
         assert!(model_provider.api_key.is_some());
     }
 
     #[test]
     fn creates_provider_without_key() {
-        let _provider = TelnyxModelProvider::new("test", None);
+        let _provider = TelnyxModelProvider::builder("test").api_key(None).build();
         // Will be None if env vars not set
     }
 

@@ -238,7 +238,11 @@ fn build_responses_provider_if_requested(
     if wire_api != Some(zeroclaw_config::schema::WireApi::Responses) {
         return None;
     }
-    let mut p = crate::openai::OpenAiResponsesModelProvider::new(alias, base_url, key);
+    let mut builder = crate::openai::OpenAiResponsesModelProvider::builder(alias);
+    if let Some(url) = base_url {
+        builder = builder.api_url(url);
+    }
+    let mut p = builder.credential(key).build();
     if let Some(mt) = opts.provider_max_tokens {
         p = p.with_max_tokens(Some(mt));
     }
@@ -958,7 +962,9 @@ impl FamilyProviderFactory for OpenRouterModelProviderConfig {
         _api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let mut p = crate::openrouter::OpenRouterModelProvider::new(alias, key)
+        let mut p = crate::openrouter::OpenRouterModelProvider::builder(alias)
+            .credential(key)
+            .build()
             .with_max_tokens(opts.provider_max_tokens);
         if let Some(t) = opts.provider_timeout_secs {
             p = p.with_timeout_secs(t);
@@ -978,7 +984,9 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let mut p = crate::anthropic::AnthropicModelProvider::new(alias, key);
+        let mut p = crate::anthropic::AnthropicModelProvider::builder(alias)
+            .credential(key)
+            .build();
         if let Some(url) = api_url {
             p = p.with_base_url(url);
         }
@@ -1010,7 +1018,9 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
             return Ok(p);
         }
         // Default: chat_completions wire with standard API key.
-        let mut p = crate::openai::OpenAiModelProvider::new(alias, key);
+        let mut p = crate::openai::OpenAiModelProvider::builder(alias)
+            .credential(key)
+            .build();
         if let Some(url) = api_url {
             p = p.with_base_url(url);
         }
@@ -1130,9 +1140,11 @@ impl FamilyProviderFactory for TelnyxModelProviderConfig {
         _api_url: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        Ok(Box::new(crate::telnyx::TelnyxModelProvider::new(
-            alias, key,
-        )))
+        Ok(Box::new(
+            crate::telnyx::TelnyxModelProvider::builder(alias)
+                .api_key(key)
+                .build(),
+        ))
     }
 }
 
@@ -1341,9 +1353,11 @@ impl FamilyProviderFactory for CopilotModelProviderConfig {
         _api_url: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        Ok(Box::new(crate::copilot::CopilotModelProvider::new(
-            alias, key,
-        )))
+        Ok(Box::new(
+            crate::copilot::CopilotModelProvider::builder(alias)
+                .github_token(key)
+                .build(),
+        ))
     }
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
@@ -1359,10 +1373,11 @@ impl FamilyProviderFactory for GeminiCliModelProviderConfig {
         _api_url: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        Ok(Box::new(crate::gemini_cli::GeminiCliModelProvider::new(
-            alias,
-            self.binary_path.as_deref(),
-        )))
+        Ok(Box::new(
+            crate::gemini_cli::GeminiCliModelProvider::builder(alias)
+                .binary_path(self.binary_path.as_deref())
+                .build(),
+        ))
     }
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
@@ -1378,10 +1393,11 @@ impl FamilyProviderFactory for KiloCliModelProviderConfig {
         _api_url: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        Ok(Box::new(crate::kilocli::KiloCliModelProvider::new(
-            alias,
-            self.binary_path.as_deref(),
-        )))
+        Ok(Box::new(
+            crate::kilocli::KiloCliModelProvider::builder(alias)
+                .binary_path(self.binary_path.as_deref())
+                .build(),
+        ))
     }
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
@@ -1504,7 +1520,9 @@ impl FamilyProviderFactory for OvhModelProviderConfig {
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         Ok(Box::new(
-            crate::openai::OpenAiModelProvider::new(alias, key)
+            crate::openai::OpenAiModelProvider::builder(alias)
+                .credential(key)
+                .build()
                 .with_base_url("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"),
         ))
     }

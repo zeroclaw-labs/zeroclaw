@@ -198,8 +198,48 @@ pub struct CopilotModelProvider {
     token_dir: PathBuf,
 }
 
+/// Typed builder for [`CopilotModelProvider`].
+///
+/// Only `alias` is required. The GitHub token is optional at build time;
+/// when unset, the provider will run the device-flow OAuth prompt on
+/// first use.
+#[must_use]
+pub struct CopilotBuilder {
+    alias: String,
+    github_token: Option<String>,
+}
+
+impl CopilotBuilder {
+    /// Set an explicit GitHub OAuth token. Empty strings are treated
+    /// as missing (mirrors the pre-builder ctor's `filter(!empty)`).
+    pub fn github_token(mut self, token: Option<&str>) -> Self {
+        self.github_token = token.filter(|t| !t.is_empty()).map(String::from);
+        self
+    }
+
+    pub fn build(self) -> CopilotModelProvider {
+        CopilotModelProvider::new_impl(self.alias, self.github_token)
+    }
+}
+
 impl CopilotModelProvider {
+    /// Entry point. Only `alias` is required; every other field is set
+    /// via a labelled chain method on the returned [`CopilotBuilder`].
+    pub fn builder(alias: &str) -> CopilotBuilder {
+        CopilotBuilder {
+            alias: alias.to_string(),
+            github_token: None,
+        }
+    }
+
     pub fn new(alias: &str, github_token: Option<&str>) -> Self {
+        Self::new_impl(
+            alias.to_string(),
+            github_token.filter(|t| !t.is_empty()).map(String::from),
+        )
+    }
+
+    fn new_impl(alias: String, github_token: Option<String>) -> Self {
         let token_dir = directories::ProjectDirs::from("", "", "zeroclaw")
             .map(|dir| dir.config_dir().join("copilot"))
             .unwrap_or_else(|| {
@@ -243,10 +283,8 @@ impl CopilotModelProvider {
         }
 
         Self {
-            alias: alias.to_string(),
-            github_token: github_token
-                .filter(|token| !token.is_empty())
-                .map(String::from),
+            alias,
+            github_token,
             refresh_lock: Arc::new(Mutex::new(None)),
             token_dir,
         }
@@ -771,25 +809,33 @@ mod tests {
 
     #[test]
     fn new_without_token() {
-        let model_provider = CopilotModelProvider::new("test", None);
+        let model_provider = CopilotModelProvider::builder("test")
+            .github_token(None)
+            .build();
         assert!(model_provider.github_token.is_none());
     }
 
     #[test]
     fn new_with_token() {
-        let model_provider = CopilotModelProvider::new("test", Some("ghp_test"));
+        let model_provider = CopilotModelProvider::builder("test")
+            .github_token(Some("ghp_test"))
+            .build();
         assert_eq!(model_provider.github_token.as_deref(), Some("ghp_test"));
     }
 
     #[test]
     fn empty_token_treated_as_none() {
-        let model_provider = CopilotModelProvider::new("test", Some(""));
+        let model_provider = CopilotModelProvider::builder("test")
+            .github_token(Some(""))
+            .build();
         assert!(model_provider.github_token.is_none());
     }
 
     #[tokio::test]
     async fn cache_starts_empty() {
-        let model_provider = CopilotModelProvider::new("test", None);
+        let model_provider = CopilotModelProvider::builder("test")
+            .github_token(None)
+            .build();
         let cached = model_provider.refresh_lock.lock().await;
         assert!(cached.is_none());
     }
@@ -818,7 +864,9 @@ mod tests {
 
     #[test]
     fn supports_native_tools() {
-        let model_provider = CopilotModelProvider::new("test", None);
+        let model_provider = CopilotModelProvider::builder("test")
+            .github_token(None)
+            .build();
         assert!(model_provider.supports_native_tools());
     }
 

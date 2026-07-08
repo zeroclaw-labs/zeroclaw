@@ -204,24 +204,80 @@ impl NativeResponseMessage {
     }
 }
 
+/// Typed builder for [`OpenAiModelProvider`].
+///
+/// Only `alias` is required. `base_url` defaults to the module-level
+/// `BASE_URL` constant, `credential` treats whitespace-only inputs as
+/// missing, and `timeout_secs` uses the 120 s workspace default.
+#[must_use]
+pub struct OpenAiBuilder {
+    alias: String,
+    credential: Option<String>,
+    base_url: Option<String>,
+    max_tokens: Option<u32>,
+    timeout_secs: Option<u64>,
+}
+
+impl OpenAiBuilder {
+    /// Explicit API credential. Whitespace-only inputs collapse to
+    /// `None`.
+    pub fn credential(mut self, credential: Option<&str>) -> Self {
+        self.credential = credential
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(ToString::to_string);
+        self
+    }
+
+    /// Override the API endpoint. Trailing slashes are stripped.
+    pub fn base_url(mut self, base_url: &str) -> Self {
+        self.base_url = Some(base_url.trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Set the maximum output tokens for API requests.
+    pub fn max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Override the HTTP request timeout for LLM API calls. Values of 0
+    /// are ignored (the default 120 s is kept) so a stray `Some(0)` from
+    /// config cannot silently disable the safety timeout.
+    pub fn timeout_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.timeout_secs = Some(secs);
+        }
+        self
+    }
+
+    pub fn build(self) -> OpenAiModelProvider {
+        OpenAiModelProvider {
+            alias: self.alias,
+            base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
+            credential: self.credential,
+            max_tokens: self.max_tokens,
+            timeout_secs: self.timeout_secs.unwrap_or(120),
+        }
+    }
+}
+
 impl OpenAiModelProvider {
-    /// Construct an OpenAI provider talking to the default public endpoint.
-    /// Chain [`Self::with_base_url`] to point at a custom endpoint.
-    pub fn new(alias: &str, credential: Option<&str>) -> Self {
-        Self {
+    /// Entry point. Only `alias` is required; every other field is set
+    /// via a labelled chain method on the returned [`OpenAiBuilder`].
+    pub fn builder(alias: &str) -> OpenAiBuilder {
+        OpenAiBuilder {
             alias: alias.to_string(),
-            base_url: BASE_URL.to_string(),
-            credential: credential
-                .map(str::trim)
-                .filter(|k| !k.is_empty())
-                .map(ToString::to_string),
+            credential: None,
+            base_url: None,
             max_tokens: None,
-            timeout_secs: 120,
+            timeout_secs: None,
         }
     }
 
-    /// Override the API endpoint. Trailing slashes are stripped so callers
-    /// need not care whether config supplied them.
+    /// Override the API endpoint on an already-built provider. Trailing
+    /// slashes are stripped so callers need not care whether config
+    /// supplied them.
     #[must_use]
     pub fn with_base_url(mut self, base_url: &str) -> Self {
         self.base_url = base_url.trim_end_matches('/').to_string();
@@ -908,9 +964,52 @@ pub struct OpenAiResponsesModelProvider {
     reasoning_effort: Option<String>,
 }
 
-impl OpenAiResponsesModelProvider {
-    pub fn new(alias: &str, api_url: Option<&str>, credential: Option<&str>) -> Self {
-        let responses_url = api_url
+/// Typed builder for [`OpenAiResponsesModelProvider`].
+///
+/// Only `alias` is required. `api_url` defaults to the OpenAI Responses
+/// endpoint; if a custom URL is supplied, `/responses` is appended when
+/// not already present so callers can pass either shape.
+#[must_use]
+pub struct OpenAiResponsesBuilder {
+    alias: String,
+    api_url: Option<String>,
+    credential: Option<String>,
+    max_tokens: Option<u32>,
+    reasoning_effort: Option<String>,
+}
+
+impl OpenAiResponsesBuilder {
+    /// Override the API endpoint. The `/responses` suffix is appended
+    /// automatically if the input does not already end in it.
+    pub fn api_url(mut self, api_url: &str) -> Self {
+        self.api_url = Some(api_url.to_string());
+        self
+    }
+
+    /// Explicit API credential. Whitespace-only inputs collapse to
+    /// `None`.
+    pub fn credential(mut self, credential: Option<&str>) -> Self {
+        self.credential = credential
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(ToString::to_string);
+        self
+    }
+
+    pub fn max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    pub fn reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
+        self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    pub fn build(self) -> OpenAiResponsesModelProvider {
+        let responses_url = self
+            .api_url
+            .as_deref()
             .map(|url| {
                 let trimmed = url.trim_end_matches('/');
                 if trimmed.ends_with("/responses") {
@@ -920,10 +1019,24 @@ impl OpenAiResponsesModelProvider {
                 }
             })
             .unwrap_or_else(|| RESPONSES_URL.to_string());
-        Self {
-            alias: alias.to_string(),
+        OpenAiResponsesModelProvider {
+            alias: self.alias,
             responses_url,
-            credential: credential.map(ToString::to_string),
+            credential: self.credential,
+            max_tokens: self.max_tokens,
+            reasoning_effort: self.reasoning_effort,
+        }
+    }
+}
+
+impl OpenAiResponsesModelProvider {
+    /// Entry point. Only `alias` is required; every other field is set
+    /// via a labelled chain method on the returned [`OpenAiResponsesBuilder`].
+    pub fn builder(alias: &str) -> OpenAiResponsesBuilder {
+        OpenAiResponsesBuilder {
+            alias: alias.to_string(),
+            api_url: None,
+            credential: None,
             max_tokens: None,
             reasoning_effort: None,
         }
@@ -1211,26 +1324,34 @@ mod tests {
 
     #[test]
     fn creates_with_key() {
-        let p = OpenAiModelProvider::new("test", Some("openai-test-credential"));
+        let p = OpenAiModelProvider::builder("test")
+            .credential(Some("openai-test-credential"))
+            .build();
         assert_eq!(p.credential.as_deref(), Some("openai-test-credential"));
     }
 
     #[test]
     fn creates_without_key() {
-        let p = OpenAiModelProvider::new("test", None);
+        let p = OpenAiModelProvider::builder("test")
+            .credential(None)
+            .build();
         assert!(p.credential.is_none());
     }
 
     #[test]
     fn responses_url_appends_responses_to_custom_base() {
-        let p =
-            OpenAiResponsesModelProvider::new("opencode", Some("https://opencode.ai/zen/v1"), None);
+        let p = OpenAiResponsesModelProvider::builder("opencode")
+            .api_url("https://opencode.ai/zen/v1")
+            .credential(None)
+            .build();
         assert_eq!(p.responses_url, "https://opencode.ai/zen/v1/responses");
     }
 
     #[test]
     fn responses_url_defaults_to_openai_when_base_absent() {
-        let p = OpenAiResponsesModelProvider::new("test", None, None);
+        let p = OpenAiResponsesModelProvider::builder("test")
+            .credential(None)
+            .build();
         assert_eq!(p.responses_url, RESPONSES_URL);
     }
 
@@ -1240,16 +1361,22 @@ mod tests {
         // "" from config cannot produce a bogus `Bearer ` header. Matches
         // the trim-then-filter contract shared with anthropic/openrouter/
         // azure/compat.
-        let p = OpenAiModelProvider::new("test", Some(""));
+        let p = OpenAiModelProvider::builder("test")
+            .credential(Some(""))
+            .build();
         assert!(p.credential.is_none());
 
-        let p = OpenAiModelProvider::new("test", Some("  \t  "));
+        let p = OpenAiModelProvider::builder("test")
+            .credential(Some("  \t  "))
+            .build();
         assert!(p.credential.is_none());
     }
 
     #[tokio::test]
     async fn chat_fails_without_key() {
-        let p = OpenAiModelProvider::new("test", None);
+        let p = OpenAiModelProvider::builder("test")
+            .credential(None)
+            .build();
         let result = p.chat_with_system(None, "hello", "gpt-4o", Some(0.7)).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key not set"));
@@ -1257,7 +1384,9 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_system_fails_without_key() {
-        let p = OpenAiModelProvider::new("test", None);
+        let p = OpenAiModelProvider::builder("test")
+            .credential(None)
+            .build();
         let result = p
             .chat_with_system(Some("You are ZeroClaw"), "test", "gpt-4o", Some(0.5))
             .await;
@@ -1349,7 +1478,9 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_without_key_is_noop() {
-        let model_provider = OpenAiModelProvider::new("test", None);
+        let model_provider = OpenAiModelProvider::builder("test")
+            .credential(None)
+            .build();
         let result = model_provider.warmup().await;
         assert!(result.is_ok());
     }
@@ -1400,7 +1531,9 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_tools_fails_without_key() {
-        let p = OpenAiModelProvider::new("test", None);
+        let p = OpenAiModelProvider::builder("test")
+            .credential(None)
+            .build();
         let messages = vec![ChatMessage::user("hello".to_string())];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -1425,7 +1558,9 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_tools_rejects_invalid_tool_shape() {
-        let p = OpenAiModelProvider::new("test", Some("openai-test-credential"));
+        let p = OpenAiModelProvider::builder("test")
+            .credential(Some("openai-test-credential"))
+            .build();
         let messages = vec![ChatMessage::user("hello".to_string())];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -1821,8 +1956,10 @@ mod tests {
 
     #[test]
     fn responses_request_propagates_max_tokens_when_set() {
-        let provider =
-            OpenAiResponsesModelProvider::new("openai", None, None).with_max_tokens(Some(2048));
+        let provider = OpenAiResponsesModelProvider::builder("openai")
+            .credential(None)
+            .build()
+            .with_max_tokens(Some(2048));
         let req = provider.build_request(
             None,
             vec![serde_json::json!({"role": "user", "content": "hi"})],
@@ -1842,7 +1979,9 @@ mod tests {
 
     #[test]
     fn responses_request_omits_max_tokens_when_unset() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        let provider = OpenAiResponsesModelProvider::builder("openai")
+            .credential(None)
+            .build();
         assert!(
             provider.max_tokens.is_none(),
             "fresh provider must default max_tokens to None"
@@ -1868,7 +2007,9 @@ mod tests {
 
     #[test]
     fn responses_request_propagates_reasoning_effort_when_set() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None)
+        let provider = OpenAiResponsesModelProvider::builder("openai")
+            .credential(None)
+            .build()
             .with_reasoning_effort(Some("high".to_string()));
         let req = provider.build_request(
             None,
@@ -1891,7 +2032,9 @@ mod tests {
 
     #[test]
     fn responses_request_omits_reasoning_when_unset() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        let provider = OpenAiResponsesModelProvider::builder("openai")
+            .credential(None)
+            .build();
         assert!(
             provider.reasoning_effort.is_none(),
             "fresh provider must default reasoning_effort to None"
@@ -1917,8 +2060,10 @@ mod tests {
 
     #[test]
     fn responses_request_propagates_instructions_and_temperature_and_model() {
-        let provider =
-            OpenAiResponsesModelProvider::new("openai", Some("https://api.example.test/v1"), None);
+        let provider = OpenAiResponsesModelProvider::builder("openai")
+            .api_url("https://api.example.test/v1")
+            .credential(None)
+            .build();
         let req = provider.build_request(
             Some("You are a careful assistant.".to_string()),
             vec![serde_json::json!({"role": "user", "content": "summarize"})],
@@ -1952,8 +2097,10 @@ mod tests {
 
     #[test]
     fn responses_request_propagates_tool_choice_and_parallel_when_tools_present() {
-        let provider =
-            OpenAiResponsesModelProvider::new("openai", None, None).with_max_tokens(Some(1024));
+        let provider = OpenAiResponsesModelProvider::builder("openai")
+            .credential(None)
+            .build()
+            .with_max_tokens(Some(1024));
         let tools = Some(vec![ResponsesToolSpec {
             kind: "function".to_string(),
             name: "lookup_weather".to_string(),
@@ -1999,7 +2146,9 @@ mod tests {
 
     #[test]
     fn responses_request_omits_tool_choice_and_parallel_when_tools_absent() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        let provider = OpenAiResponsesModelProvider::builder("openai")
+            .credential(None)
+            .build();
         let req = provider.build_request(
             None,
             vec![serde_json::json!({"role": "user", "content": "hi"})],
@@ -2029,7 +2178,9 @@ mod tests {
 
     #[test]
     fn responses_request_omits_tool_choice_and_parallel_when_tools_empty() {
-        let provider = OpenAiResponsesModelProvider::new("openai", None, None);
+        let provider = OpenAiResponsesModelProvider::builder("openai")
+            .credential(None)
+            .build();
         let req = provider.build_request(
             None,
             vec![serde_json::json!({"role": "user", "content": "hi"})],
