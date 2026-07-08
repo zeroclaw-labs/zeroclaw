@@ -50,7 +50,11 @@ pub type SharedReconnectState = Arc<Mutex<CrossReconnectState>>;
 const TICK: Duration = Duration::from_millis(200);
 
 /// Mode bar entries. Shared between drawing and click detection.
-const MODES: [Mode; 8] = [
+/// SOP authoring is gated behind the `sop-authoring` feature (off by default)
+/// while the web surface ships as the first experimental release; when the
+/// feature is absent the pane is compiled but never reachable from navigation.
+#[cfg(feature = "sop-authoring")]
+const MODES: &[Mode] = &[
     Mode::Dashboard,
     Mode::Config,
     Mode::Acp,
@@ -59,6 +63,17 @@ const MODES: [Mode; 8] = [
     Mode::Doctor,
     Mode::Quickstart,
     Mode::Sop,
+];
+
+#[cfg(not(feature = "sop-authoring"))]
+const MODES: &[Mode] = &[
+    Mode::Dashboard,
+    Mode::Config,
+    Mode::Acp,
+    Mode::Chat,
+    Mode::Logs,
+    Mode::Doctor,
+    Mode::Quickstart,
 ];
 
 // ── Mode enum ────────────────────────────────────────────────────
@@ -72,6 +87,7 @@ enum Mode {
     Chat,
     Logs,
     Quickstart,
+    #[cfg_attr(not(feature = "sop-authoring"), allow(dead_code))]
     Sop,
 }
 

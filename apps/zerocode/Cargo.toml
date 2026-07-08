@@ -6,6 +6,12 @@ license.workspace = true
 description = "Interactive TUI config manager for ZeroClaw."
 publish = false
 
+[features]
+# SOP authoring in the TUI is still experimental; the web surface ships first.
+# Off by default: the SOP pane compiles but is unreachable from navigation.
+default = []
+sop-authoring = []
+
 [[bin]]
 name = "zerocode"
 path = "src/main.rs"
