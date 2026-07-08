@@ -114,6 +114,7 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 - Registry-driven pane help, themed code-fence syntax highlighting, per-fence copy, and unified split-pane config navigation (#8282).
 - Daemon version mismatch detection (#8192).
 - MCP initialized for Chat TUI sessions (#8199).
+- Deferred MCP tools are now advertised in the Chat TUI system prompt so the agent knows `tool_search` exists and can discover MCP tools (#8193).
 - Active config directory surfaced in the Config header (#7999).
 - Approval overlay background filled (#7823).
 - Queue-paused hint skipped when the backlog is empty (#7857).
@@ -169,6 +170,7 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 | web_fetch | `allowed_private_hosts = ["*"]` covers DNS-resolved private hosts (#7412) |
 | skills | Correct the "ClawhHub" typo in skill installer messages (#8262) |
 | docker | Keep Node base policy in container TOML (#8112); correct Node 24 digest pins (#7932); drop stale aardvark-sys build.rs COPY (#8092) |
+| zerocode/elicitation | Fix intermittent `ask_user`/`poll` failures under ACP elicitation: defer (rather than immediately cancel) an inbound `elicitation/create` whose session is mid resume/reset/switch, and surface — instead of silently dropping — a lagged inbound-request broadcast so a prompt can no longer hang the daemon's tool call until the session timeout |
 
 ## Docs
 

@@ -23,8 +23,12 @@ pub struct ToolCallSnapshot {
 /// credential-scrubbed at the agent-loop boundary so the OTel exporter can emit
 /// `gen_ai.input.messages` / `gen_ai.output.messages` / `gen_ai.system_instructions`.
 ///
-/// Populated at the agent-loop capture boundary when the `observability-otel`
-/// feature is active; `None` otherwise (other observers and non-OTel builds leave it `None`).
+/// Populated at the agent-loop capture boundary whenever the `observability-otel`
+/// feature is active; `None` otherwise (other observers and non-OTel builds leave
+/// it `None`). Capture is policy-agnostic: whether the snapshot is actually
+/// exported — and at which privacy level (`off` / `redacted` / `full`) — is
+/// decided by the owning `OtelObserver`'s instance content config at the OTel
+/// export boundary, not by the capture path.
 #[derive(Debug, Clone)]
 pub struct LlmMessageSnapshot {
     /// Non-system input messages, in send order.
@@ -91,8 +95,10 @@ pub enum ObserverEvent {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         /// Credential-scrubbed prompt/completion content for OTel GenAI export.
-        /// `None` unless the `observability-otel` feature is active. See
-        /// [`LlmMessageSnapshot`].
+        /// `None` unless the `observability-otel` feature is active. When
+        /// populated, whether the content is exported (and at which privacy
+        /// level) is gated by the receiving `OtelObserver`'s instance content
+        /// policy, not by the capture path. See [`LlmMessageSnapshot`].
         messages: Option<LlmMessageSnapshot>,
         channel: Option<String>,
         agent_alias: Option<String>,
