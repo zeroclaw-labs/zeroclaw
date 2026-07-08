@@ -1783,7 +1783,10 @@ impl ModelProvider for ReliableModelProvider {
                 continue;
             }
 
-            if needs_tool_events && !model_provider.supports_streaming_tool_events() {
+            if needs_tool_events
+                && !model_provider.supports_streaming_tool_events()
+                && !model_provider.streams_text_with_tools()
+            {
                 continue;
             }
 
@@ -4002,6 +4005,7 @@ mod tests {
     struct StreamingToolEventMock {
         stream_calls: Arc<AtomicUsize>,
         supports_tool_events: bool,
+        streams_text_with_tools: bool,
     }
 
     impl StreamingToolEventMock {
@@ -4009,6 +4013,15 @@ mod tests {
             Self {
                 stream_calls: Arc::new(AtomicUsize::new(0)),
                 supports_tool_events,
+                streams_text_with_tools: false,
+            }
+        }
+
+        fn text_with_tools() -> Self {
+            Self {
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+                supports_tool_events: false,
+                streams_text_with_tools: true,
             }
         }
     }
@@ -4033,6 +4046,10 @@ mod tests {
             self.supports_tool_events
         }
 
+        fn streams_text_with_tools(&self) -> bool {
+            self.streams_text_with_tools
+        }
+
         fn stream_chat(
             &self,
             _request: ChatRequest<'_>,
@@ -4041,6 +4058,13 @@ mod tests {
             _options: StreamOptions,
         ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if self.streams_text_with_tools && !self.supports_tool_events {
+                return stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta("answer"))),
+                    Ok(StreamEvent::Final),
+                ])
+                .boxed();
+            }
             stream::iter(vec![
                 Ok(StreamEvent::ToolCall(super::super::traits::ToolCall {
                     id: "call_1".to_string(),
@@ -4162,6 +4186,48 @@ mod tests {
         );
         assert!(stream.next().await.is_none());
         assert_eq!(primary.stream_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_accepts_text_with_tools_provider() {
+        let provider = Arc::new(StreamingToolEventMock::text_with_tools());
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(Arc::clone(&provider)) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![ToolSpec {
+            name: "shell".to_string(),
+            description: "run shell".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let mut stream = model_provider.stream_chat(
+            ChatRequest {
+                messages: &messages,
+                tools: Some(&tools),
+                thinking: None,
+            },
+            "model",
+            Some(0.0),
+            StreamOptions::new(true),
+        );
+
+        let first = stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+
+        match first {
+            StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "answer"),
+            other => panic!("expected text delta from text-with-tools provider, got {other:?}"),
+        }
+        assert!(matches!(second, StreamEvent::Final));
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
     }
 
     // ── stream_chat_with_history failover tests ──────────────────────
