@@ -27,6 +27,7 @@ pub async fn migrate_openclaw_memory(
     config: &Config,
     source_workspace: Option<PathBuf>,
     dry_run: bool,
+    reindex: bool,
 ) -> Result<()> {
     let source_workspace = resolve_openclaw_workspace(source_workspace)?;
     if !source_workspace.exists() {
@@ -60,6 +61,9 @@ pub async fn migrate_openclaw_memory(
         println!("    - from sqlite:   {}", stats.from_sqlite);
         println!("    - from markdown: {}", stats.from_markdown);
         println!();
+        if reindex {
+            println!("Reindex requested: indexes would be rebuilt after import.");
+        }
         println!("Run without --dry-run to import these entries.");
         return Ok(());
     }
@@ -101,6 +105,10 @@ pub async fn migrate_openclaw_memory(
     println!("  Renamed conflicts:{}", stats.renamed_conflicts);
     println!("  Source sqlite rows:{}", stats.from_sqlite);
     println!("  Source markdown:   {}", stats.from_markdown);
+    if reindex {
+        let reembedded = memory.reindex().await?;
+        println!("  Reindexed:         yes ({reembedded} embeddings backfilled; FTS rebuilt)");
+    }
 
     Ok(())
 }
@@ -500,7 +508,7 @@ mod tests {
         .unwrap();
 
         let config = test_config(target.path());
-        migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), false)
+        migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), false, false)
             .await
             .unwrap();
 
@@ -530,12 +538,43 @@ mod tests {
         .unwrap();
 
         let config = test_config(target.path());
-        migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), true)
+        migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), true, false)
             .await
             .unwrap();
 
         let target_mem = SqliteMemory::new("test", target.path()).unwrap();
         assert_eq!(target_mem.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn migration_reindex_flag_preserves_imported_rows() {
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let source_db_dir = source.path().join("memory");
+        fs::create_dir_all(&source_db_dir).unwrap();
+
+        let source_db = source_db_dir.join("brain.db");
+        let conn = Connection::open(&source_db).unwrap();
+        conn.execute_batch("CREATE TABLE memories (key TEXT, content TEXT, category TEXT);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO memories (key, content, category) VALUES (?1, ?2, ?3)",
+            params!["reindex_key", "reindex searchable content", "core"],
+        )
+        .unwrap();
+
+        let config = test_config(target.path());
+        migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), false, true)
+            .await
+            .unwrap();
+
+        let target_mem = SqliteMemory::new("test", target.path()).unwrap();
+        let results = target_mem
+            .recall("searchable", 10, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "reindex_key");
     }
 
     #[test]
