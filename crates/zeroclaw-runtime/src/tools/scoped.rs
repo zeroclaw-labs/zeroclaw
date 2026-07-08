@@ -124,6 +124,16 @@ pub struct ScopedAssembly<'a> {
     /// `/api/tools`, ACP) pass `false` so a registry no turn runs against does not
     /// emit spurious "MCP: N registered" / "Peripheral tools added" lines.
     pub emit_assembly_logs: bool,
+    /// Pre-built MCP registry supplied by the caller. The daemon heartbeat
+    /// worker constructs this once at worker start and shares it across
+    /// every tick so that stdio MCP children live for the daemon's
+    /// lifetime rather than being orphaned and re-spawned per
+    /// `agent::run` call (#5903). When `Some`, `assemble` MUST use this
+    /// `Arc<McpRegistry>` and MUST NOT call `McpRegistry::connect_all`
+    /// itself. `None` preserves the legacy per-call connect path
+    /// (CLI / one-shot / process_message), which is correct for
+    /// callers that have no cross-turn reuse contract.
+    pub mcp_registry: Option<Arc<crate::tools::McpRegistry>>,
 }
 
 /// Output of [`ScopedToolRegistry::assemble`]: the scoped registry plus the
@@ -172,6 +182,7 @@ impl ScopedToolRegistry {
             exclude_memory,
             list_deferred_mcp_specs,
             emit_assembly_logs,
+            mcp_registry: overrides_mcp_registry,
         } = spec;
 
         let AllToolsResult {
@@ -256,166 +267,175 @@ impl ScopedToolRegistry {
                     )
                 );
             }
-            match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
-                Ok(registry) => {
-                    let registry = Arc::new(registry);
-                    // Elevation arcs exist only to resolve skill-declared MCP
-                    // elevation in step 5; skip the collection when no skills are
-                    // registered through this assembly.
-                    if !skills.is_empty() {
-                        mcp_elevation_arcs = tools::collect_mcp_elevation_arcs(&registry).await;
-                    }
-                    let mcp_policy = mcp_tool_access_policy(security.as_ref(), caller_allowed);
-                    // Generic MCP resource/prompt capability tools (policy-gated in
-                    // deferred-loading and eager modes) - parity with run/process_message.
-                    for tool in tools::build_mcp_capability_tools(&registry, mcp_policy.as_ref()) {
-                        register_eager_mcp_tool_if_allowed(
-                            tool,
-                            &mut tools_registry,
-                            delegate_handle.as_ref(),
-                            mcp_policy.as_ref(),
-                        );
-                    }
-                    pinned_section = tools::mcp_context::build_pinned_resources_section(
-                        &registry,
-                        &agent_mcp_servers,
-                        mcp_policy.as_ref(),
-                    )
-                    .await;
-                    if config.mcp.deferred_loading {
-                        let deferred_set =
-                            tools::DeferredMcpToolSet::from_registry(Arc::clone(&registry)).await;
-                        if emit_assembly_logs {
+            // Caller-supplied registry wins: the daemon heartbeat worker
+            // constructs the registry once and reuses it across every
+            // tick so stdio MCP children live for the daemon lifetime
+            // (#5903). Falling back to per-call `connect_all` keeps the
+            // legacy CLI / one-shot / process_message path intact.
+            let shared_registry: Option<Arc<tools::McpRegistry>> =
+                if let Some(shared) = overrides_mcp_registry.as_ref() {
+                    Some(Arc::clone(shared))
+                } else {
+                    match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
+                        Ok(registry) => Some(Arc::new(registry)),
+                        Err(err) => {
+                            // Non-fatal (the assembly proceeds without MCP), but an ERROR
+                            // with structured attrs - parity with the run/process_message
+                            // connect-failure logging.
                             ::zeroclaw_log::record!(
-                                INFO,
+                                ERROR,
                                 ::zeroclaw_log::Event::new(
                                     module_path!(),
-                                    ::zeroclaw_log::Action::Load
+                                    ::zeroclaw_log::Action::Fail
                                 )
-                                .with_category(::zeroclaw_log::EventCategory::Tool),
-                                &format!(
-                                    "MCP deferred: {} tool stub(s) from {} server(s)",
-                                    deferred_set.len(),
-                                    registry.server_count()
-                                )
+                                .with_category(::zeroclaw_log::EventCategory::Tool)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "agent_alias": agent_alias,
+                                    "error": format!("{err}"),
+                                })),
+                                "MCP registry failed to initialize (assembly proceeds without MCP)"
                             );
+                            None
                         }
-                        if list_deferred_mcp_specs {
-                            for stub in &deferred_set.stubs {
-                                if !eager_mcp_tool_allowed(&stub.prefixed_name, mcp_policy.as_ref())
-                                {
-                                    continue;
-                                }
-                                let wrapper: Arc<dyn Tool> =
-                                    Arc::new(stub.activate(Arc::clone(&registry)));
-                                register_eager_mcp_tool_if_allowed(
-                                    wrapper,
-                                    &mut tools_registry,
-                                    delegate_handle.as_ref(),
-                                    mcp_policy.as_ref(),
-                                );
-                            }
-                        }
-                        let allowed_stub_count = mcp_allowed_tool_count(
-                            deferred_set
-                                .stubs
-                                .iter()
-                                .map(|stub| stub.prefixed_name.as_str()),
-                            mcp_policy.as_ref(),
+                    }
+                };
+            if let Some(registry) = shared_registry {
+                // Elevation arcs exist only to resolve skill-declared MCP
+                // elevation in step 5; skip the collection when no skills are
+                // registered through this assembly.
+                if !skills.is_empty() {
+                    mcp_elevation_arcs = tools::collect_mcp_elevation_arcs(&registry).await;
+                }
+                let mcp_policy = mcp_tool_access_policy(security.as_ref(), caller_allowed);
+                // Generic MCP resource/prompt capability tools (policy-gated in
+                // deferred-loading and eager modes) - parity with run/process_message.
+                for tool in tools::build_mcp_capability_tools(&registry, mcp_policy.as_ref()) {
+                    register_eager_mcp_tool_if_allowed(
+                        tool,
+                        &mut tools_registry,
+                        delegate_handle.as_ref(),
+                        mcp_policy.as_ref(),
+                    );
+                }
+                pinned_section = tools::mcp_context::build_pinned_resources_section(
+                    &registry,
+                    &agent_mcp_servers,
+                    mcp_policy.as_ref(),
+                )
+                .await;
+                if config.mcp.deferred_loading {
+                    let deferred_set =
+                        tools::DeferredMcpToolSet::from_registry(Arc::clone(&registry)).await;
+                    if emit_assembly_logs {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Load
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Tool),
+                            &format!(
+                                "MCP deferred: {} tool stub(s) from {} server(s)",
+                                deferred_set.len(),
+                                registry.server_count()
+                            )
                         );
-                        deferred_section = tools::build_deferred_tools_section_filtered(
-                            &deferred_set,
-                            mcp_policy.as_ref(),
-                        );
-                        // Listing registries expose the real deferred MCP tools as
-                        // eager wrappers above and never consume the deferred prompt
-                        // section, the activation handle, or invoke tools. Skip
-                        // `tool_search` there so `/api/tools` matches eager-mode
-                        // listing (real MCP tools, no deferral-internal helper).
-                        if allowed_stub_count > 0 && !list_deferred_mcp_specs {
-                            let activated =
-                                Arc::new(std::sync::Mutex::new(ActivatedToolSet::new()));
-                            activated_handle = Some(Arc::clone(&activated));
-                            let mut tool_search =
-                                tools::ToolSearchTool::new(deferred_set, activated);
-                            if let Some(policy) = mcp_policy {
-                                tool_search = tool_search.with_access_policy(policy);
-                            }
-                            // Newly-activated deferred tools are also exposed to the
-                            // delegate parent set, matching the run/process_message paths.
-                            if let Some(ref handle) = delegate_handle {
-                                let delegate_tools = Arc::clone(handle);
-                                tool_search =
-                                    tool_search.with_activation_hook(Arc::new(move |tool| {
-                                        let mut tools = delegate_tools.write();
-                                        let already = tools
-                                            .iter()
-                                            .any(|existing| existing.name() == tool.name());
-                                        if !already {
-                                            tools.push(tool);
-                                        }
-                                    }));
-                            }
-                            tools_registry.push(Box::new(tool_search));
-                        }
-                    } else {
-                        let names = registry.tool_names();
-                        let mut registered = 0usize;
-                        let mut skipped = 0usize;
-                        for name in names {
-                            if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
-                                skipped += 1;
+                    }
+                    if list_deferred_mcp_specs {
+                        for stub in &deferred_set.stubs {
+                            if !eager_mcp_tool_allowed(&stub.prefixed_name, mcp_policy.as_ref()) {
                                 continue;
                             }
-                            if let Some(def) = registry.get_tool_def(&name).await {
-                                let wrapper: Arc<dyn Tool> = Arc::new(tools::McpToolWrapper::new(
-                                    name,
-                                    def,
-                                    Arc::clone(&registry),
-                                ));
-                                if register_eager_mcp_tool_if_allowed(
-                                    wrapper,
-                                    &mut tools_registry,
-                                    delegate_handle.as_ref(),
-                                    mcp_policy.as_ref(),
-                                ) {
-                                    registered += 1;
-                                }
-                            }
-                        }
-                        if emit_assembly_logs {
-                            ::zeroclaw_log::record!(
-                                INFO,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Register
-                                )
-                                .with_category(::zeroclaw_log::EventCategory::Tool),
-                                &format!(
-                                    "MCP: {} tool(s) registered from {} server(s), {} skipped by policy",
-                                    registered,
-                                    registry.server_count(),
-                                    skipped
-                                )
+                            let wrapper: Arc<dyn Tool> =
+                                Arc::new(stub.activate(Arc::clone(&registry)));
+                            register_eager_mcp_tool_if_allowed(
+                                wrapper,
+                                &mut tools_registry,
+                                delegate_handle.as_ref(),
+                                mcp_policy.as_ref(),
                             );
                         }
                     }
-                }
-                Err(err) => {
-                    // Non-fatal (the assembly proceeds without MCP), but an ERROR
-                    // with structured attrs - parity with the run/process_message
-                    // connect-failure logging.
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_category(::zeroclaw_log::EventCategory::Tool)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "agent_alias": agent_alias,
-                                "error": format!("{err}"),
-                            })),
-                        "MCP registry failed to initialize (assembly proceeds without MCP)"
+                    let allowed_stub_count = mcp_allowed_tool_count(
+                        deferred_set
+                            .stubs
+                            .iter()
+                            .map(|stub| stub.prefixed_name.as_str()),
+                        mcp_policy.as_ref(),
                     );
+                    deferred_section = tools::build_deferred_tools_section_filtered(
+                        &deferred_set,
+                        mcp_policy.as_ref(),
+                    );
+                    // Listing registries expose the real deferred MCP tools as
+                    // eager wrappers above and never consume the deferred prompt
+                    // section, the activation handle, or invoke tools. Skip
+                    // `tool_search` there so `/api/tools` matches eager-mode
+                    // listing (real MCP tools, no deferral-internal helper).
+                    if allowed_stub_count > 0 && !list_deferred_mcp_specs {
+                        let activated = Arc::new(std::sync::Mutex::new(ActivatedToolSet::new()));
+                        activated_handle = Some(Arc::clone(&activated));
+                        let mut tool_search = tools::ToolSearchTool::new(deferred_set, activated);
+                        if let Some(policy) = mcp_policy {
+                            tool_search = tool_search.with_access_policy(policy);
+                        }
+                        // Newly-activated deferred tools are also exposed to the
+                        // delegate parent set, matching the run/process_message paths.
+                        if let Some(ref handle) = delegate_handle {
+                            let delegate_tools = Arc::clone(handle);
+                            tool_search = tool_search.with_activation_hook(Arc::new(move |tool| {
+                                let mut tools = delegate_tools.write();
+                                let already =
+                                    tools.iter().any(|existing| existing.name() == tool.name());
+                                if !already {
+                                    tools.push(tool);
+                                }
+                            }));
+                        }
+                        tools_registry.push(Box::new(tool_search));
+                    }
+                } else {
+                    let names = registry.tool_names();
+                    let mut registered = 0usize;
+                    let mut skipped = 0usize;
+                    for name in names {
+                        if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
+                            skipped += 1;
+                            continue;
+                        }
+                        if let Some(def) = registry.get_tool_def(&name).await {
+                            let wrapper: Arc<dyn Tool> = Arc::new(tools::McpToolWrapper::new(
+                                name,
+                                def,
+                                Arc::clone(&registry),
+                            ));
+                            if register_eager_mcp_tool_if_allowed(
+                                wrapper,
+                                &mut tools_registry,
+                                delegate_handle.as_ref(),
+                                mcp_policy.as_ref(),
+                            ) {
+                                registered += 1;
+                            }
+                        }
+                    }
+                    if emit_assembly_logs {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Register
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Tool),
+                            &format!(
+                                "MCP: {} tool(s) registered from {} server(s), {} skipped by policy",
+                                registered,
+                                registry.server_count(),
+                                skipped
+                            )
+                        );
+                    }
                 }
             }
         }
@@ -540,6 +560,7 @@ mod tests {
             exclude_memory: false,
             list_deferred_mcp_specs: false,
             emit_assembly_logs: false,
+            mcp_registry: None,
         })
         .await;
         out.registry.iter().map(|t| t.name().to_string()).collect()
@@ -635,6 +656,7 @@ mod tests {
                 exclude_memory: false,
                 list_deferred_mcp_specs: false,
                 emit_assembly_logs: false,
+                mcp_registry: None,
             }),
         )
         .await
@@ -766,6 +788,7 @@ mod tests {
                 exclude_memory: false,
                 list_deferred_mcp_specs: true,
                 emit_assembly_logs: false,
+                mcp_registry: None,
             }),
         )
         .await
