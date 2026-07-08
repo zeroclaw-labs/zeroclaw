@@ -779,7 +779,7 @@ const MODEL_PROVIDER_ESSENTIALS: &[&str] = &[
     "requires_openai_auth",
     "wire_api",
 ];
-const CHANNEL_ESSENTIALS: &[&str] = &["bot_token", "token", "webhook_url", "allowed_users"];
+const CHANNEL_ESSENTIALS: &[&str] = &["bot_token", "token", "webhook_url", "allowed_users", "port"];
 const PEER_GROUP_ESSENTIALS: &[&str] = &["channel", "external_peers", "agents", "ignore"];
 
 /// Runtime profile the Quickstart silently installs. The Runtime Profile
@@ -1377,7 +1377,7 @@ fn apply_channels(
                         continue;
                     }
                 } else {
-                    // No creds — still need to materialize the entry so the agent
+                    // No creds. Still need to materialize the entry so the agent
                     // record can reference it. Set `enabled = true` as the minimum
                     // schema-recognised field; channels without creds will fail
                     // their own bootstrap loudly, which is the desired behaviour.
@@ -1387,6 +1387,17 @@ fn apply_channels(
                         errors.push(QuickstartError::new(
                             QuickstartStep::Channels,
                             format!("channels[{idx}]"),
+                            err.to_string(),
+                        ));
+                        continue;
+                    }
+                }
+                if let Some(port) = entry.port {
+                    let port_path = format!("channels.{}.{}.port", entry.channel_type, entry.alias);
+                    if let Err(err) = config.set_prop_persistent(&port_path, &port.to_string()) {
+                        errors.push(QuickstartError::new(
+                            QuickstartStep::Channels,
+                            format!("channels[{idx}].port"),
                             err.to_string(),
                         ));
                         continue;
@@ -2235,11 +2246,13 @@ mod tests {
                 channel_type: "telegram".into(),
                 alias: "tg".into(),
                 token: Some("tok-a".into()),
+                port: None,
             }),
             SelectorChoice::Fresh(ChannelQuickStart {
                 channel_type: "discord".into(),
                 alias: "dc".into(),
                 token: Some("tok-b".into()),
+                port: None,
             }),
         ];
         let (dir, _applied) = apply_to_temp(submission).await;
@@ -2264,6 +2277,7 @@ mod tests {
             channel_type: "telegram".into(),
             alias: "tg".into(),
             token: Some("tok-a".into()),
+            port: None,
         })];
         submission.peer_groups = vec![zeroclaw_config::presets::QuickstartPeerGroup {
             name: "team".into(),
@@ -2290,5 +2304,30 @@ mod tests {
             .expect("peer group persisted");
         assert_eq!(group.channel, "telegram.tg");
         assert_eq!(group.external_peers, vec!["*".to_string()]);
+    }
+
+    /// Pins #7173: a fresh webhook quickstart submission carrying
+    /// `port: Some(8080)` must persist `channels.webhook.<alias>.port = 8080`,
+    /// not drop the value at apply time.
+    #[tokio::test]
+    async fn webhook_quickstart_persists_port_to_config() {
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(ChannelQuickStart {
+            channel_type: "webhook".into(),
+            alias: "wh".into(),
+            token: None,
+            port: Some(8080),
+        })];
+        let (dir, _applied) = apply_to_temp(submission).await;
+        let reloaded = reload(&dir);
+        let entry = reloaded
+            .channels
+            .webhook
+            .get("wh")
+            .expect("webhook alias persisted");
+        assert_eq!(
+            entry.port, 8080,
+            "webhook quickstart port must reach the on-disk config"
+        );
     }
 }
