@@ -3,9 +3,10 @@ import type { ApprovalDecision, PendingApproval, WsMessage } from '@/types/api';
 import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
-import { getProp, putProp, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
+import { getProp, putProp, listProps, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
+import { resolveToolResultIndex } from '@/lib/toolCardMatch';
 import {
   loadChatHistory,
   mapServerMessagesToPersisted,
@@ -22,6 +23,19 @@ export interface ChatMessage {
   markdown?: boolean;
   toolCall?: ToolCallInfo;
   timestamp: Date;
+  /** True for messages composed locally in the web UI (verbatim user input).
+   *  Such content never carries the gateway's `[timestamp]` prefix, so the
+   *  bubble must NOT run stripServerTimestamp on it — otherwise a user message
+   *  that happens to start with a bracketed datetime would be clipped. Only
+   *  server-sourced messages (live stream + hydrated history) can be prefixed. */
+  local?: boolean;
+  /**
+   * Locally-generated info/system message produced by web slash-command
+   * handlers (`/help`, `/model`, unknown-command notices). Excluded from
+   * persistence so command output does not pollute localStorage and reappear
+   * as fake assistant replies on reload. See #7137.
+   */
+  ephemeral?: boolean;
 }
 
 interface AgentContextValue {
@@ -40,6 +54,13 @@ interface AgentContextValue {
   refreshModels: () => void;
   deleteMessage: (id: string) => void;
   clearAllMessages: () => void;
+  /**
+   * Append a locally-generated info/system message to the transcript without
+   * sending anything to the gateway. Used by web slash-command handlers
+   * (`/help`, `/model`, unknown-command notices) to surface feedback inline.
+   * See #7137.
+   */
+  addLocalMessage: (content: string) => void;
   abortSession: () => Promise<void>;
   /**
    * Pending supervised-mode tool-approval prompt, or null. Populated when the
@@ -48,6 +69,9 @@ interface AgentContextValue {
    */
   pendingApproval: PendingApproval | null;
   respondToApproval: (decision: ApprovalDecision) => void;
+  // Context window tracking (from "done" WS frames). See #7311.
+  contextMaxTokens: number | null;
+  contextInputTokens: number | null;
 }
 
 const AgentContext = createContext<AgentContextValue | null>(null);
@@ -99,6 +123,9 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const [modelLoading, setModelLoading] = useState(false);
   const [modelInfoVersion, setModelInfoVersion] = useState(0);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
+  // Context window tracking (from "done" WS frames). See #7311.
+  const [contextMaxTokens, setContextMaxTokens] = useState<number | null>(null);
+  const [contextInputTokens, setContextInputTokens] = useState<number | null>(null);
 
   const wsRef = useRef<WebSocketClient | null>(null);
   const pendingContentRef = useRef('');
@@ -231,6 +258,19 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
             },
           ]);
         }
+        // Extract context window info from "done" frame (sent by gateway). See #7311.
+        if (msg.type === 'done') {
+          if (typeof msg.max_context_tokens === 'number') {
+            setContextMaxTokens(msg.max_context_tokens);
+          }
+          // Prefer last_input_tokens (accurate per-turn prompt size) over
+          // accumulated input_tokens for context-bar rendering.
+          if (typeof msg.last_input_tokens === 'number') {
+            setContextInputTokens(msg.last_input_tokens);
+          } else if (typeof msg.input_tokens === 'number') {
+            setContextInputTokens(msg.input_tokens);
+          }
+        }
         pendingContentRef.current = '';
         pendingThinkingRef.current = '';
         capturedThinkingRef.current = '';
@@ -272,7 +312,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
               id: generateUUID(),
               role: 'agent' as const,
               content: `${t('agent.tool_call_prefix')} ${toolName}(${argsKey})`,
-              toolCall: { name: toolName, args: toolArgs },
+              toolCall: { name: toolName, args: toolArgs, id: msg.id },
               timestamp: new Date(),
             },
           ];
@@ -288,9 +328,13 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
           break;
         }
         const toolName = msg.name;
+        const resultId = msg.id;
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => {
-          const idx = prev.findIndex((m) => m.toolCall && m.toolCall.output === undefined);
+          // Correlate the result to its pending card by gateway tool_call_id so
+          // out-of-order parallel results land on the right card; see
+          // resolveToolResultIndex for the id-less fallback.
+          const idx = resolveToolResultIndex(prev, resultId);
           if (idx !== -1) {
             const updated = [...prev];
             const existing = prev[idx]!;
@@ -471,40 +515,54 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
 
     async function loadModelInfo() {
       try {
-        const status = await getStatus();
+        // Agent-scoped status: `/api/status?agent=<alias>` runs the same
+        // `resolved_model_provider_for_agent` logic the gateway uses to build
+        // the Agent, so the fallback `status.model` is correct for THIS agent
+        // rather than the install-wide default. (Ported from
+        // zeroclaw-labs/zeroclaw#7191.)
+        const status = await getStatus(agentAlias);
         if (cancelled) return;
 
         let activeModel = status.model;
 
-        // Prefer the model written to config over the startup status value.
+        // Per-agent model (multi-agent / schema V3). The old global `model` /
+        // `default_model` keys were removed in V3, so the source of truth is THIS
+        // agent's own `agents.<alias>.model_provider` — a ref into
+        // `providers.models.<family>.<alias>`. (Previously this read the global
+        // keys, which now 404, so the button fell back to the daemon's global
+        // status model — the wrong model on every agent page.)
+        let activeRef: string | null = null;
         try {
-          const modelProp = await getProp('model');
-          if (modelProp.populated && typeof modelProp.value === 'string') {
-            activeModel = modelProp.value;
-          } else {
-            const defaultModelProp = await getProp('default_model');
-            if (defaultModelProp.populated && typeof defaultModelProp.value === 'string') {
-              activeModel = defaultModelProp.value;
-            }
+          const refProp = await getProp(`agents.${agentAlias}.model_provider`);
+          // NOTE: GET /api/config/prop returns only `{ path, value }` — it has
+          // no `populated` field (that exists only on /api/config/list). A set
+          // prop has a string value; an unset one returns the "<unset>"
+          // sentinel; a missing path throws. So gate on the value, not
+          // `populated` (which would be undefined here and silently fail).
+          if (typeof refProp.value === 'string' && refProp.value !== '<unset>') {
+            activeRef = refProp.value;
           }
         } catch {
-          // ignore
+          // ignore — fall back to the status value below
         }
-        setCurrentModel(activeModel);
+        if (cancelled) return;
+        // Show the agent's configured provider ref (e.g. "kilo.minimax_m3"),
+        // falling back to the daemon status model only if unset.
+        setCurrentModel(activeRef ?? activeModel);
 
-        // Fetch model_routes from config
+        // Available switch targets = every configured provider ref
+        // (`providers.models.<family>.<alias>`), discovered via config/list.
         try {
-          const routesProp = await getProp('model_routes');
-          if (routesProp.populated && Array.isArray(routesProp.value)) {
-            const models = routesProp.value
-              .map((r) => (r as Record<string, unknown>).model)
-              .filter((m): m is string => typeof m === 'string');
-            setAvailableModels(models.length > 0 ? models : [activeModel]);
-          } else {
-            setAvailableModels([activeModel]);
-          }
+          const list = await listProps('providers.models');
+          if (cancelled) return;
+          const refs = (list.entries ?? [])
+            .map((e) => e.path)
+            .filter((p) => /^providers\.models\.[^.]+\.[^.]+\.model$/.test(p))
+            .map((p) => p.replace(/^providers\.models\./, '').replace(/\.model$/, ''));
+          const unique = Array.from(new Set(refs));
+          setAvailableModels(unique.length > 0 ? unique : activeRef ? [activeRef] : []);
         } catch {
-          setAvailableModels([activeModel]);
+          setAvailableModels(activeRef ? [activeRef] : []);
         }
       } catch {
         // Ignore errors — dropdown will just show current model once loaded
@@ -516,7 +574,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     return () => {
       cancelled = true;
     };
-  }, [modelInfoVersion]);
+  }, [modelInfoVersion, agentAlias]);
 
   const sendMessage = useCallback((content: string) => {
     if (!wsRef.current?.connected) return;
@@ -533,6 +591,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
           role: 'user',
           content,
           timestamp: new Date(),
+          local: true,
         },
       ]);
     } catch {
@@ -545,21 +604,41 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     setModelLoading(true);
     pendingModelSwitchRef.current = model;
 
-    // Safety net: if the reconnect never succeeds, clear the loading state.
-    if (switchTimeoutRef.current) clearTimeout(switchTimeoutRef.current);
-    switchTimeoutRef.current = setTimeout(() => {
-      if (pendingModelSwitchRef.current) {
-        pendingModelSwitchRef.current = null;
-        setModelLoading(false);
-        setError(t('agent.model_switch_timeout'));
-      }
-    }, MODEL_SWITCH_TIMEOUT_MS);
+    // Watchdog so the UI can never get stuck on the loading spinner. It is
+    // armed once per phase — for the config write, then again for the socket
+    // reconnect — so each phase gets its own full budget. A single timer armed
+    // at the top had to cover *both* phases: a slow daemon write could consume
+    // the whole budget and fire "model switch timed out" while the switch was
+    // still progressing (and, because it nulled the pending ref, the later
+    // onOpen would skip updating currentModel — a timeout error for a switch
+    // that actually succeeded). Splitting the budget keeps the spinner bounded
+    // against a hung request *and* a reconnect that never opens, without the
+    // false positive. The `=== model` identity check stops a fired watchdog
+    // from clobbering a newer switch. (Ported from zeroclaw-labs/zeroclaw#7191.)
+    const armWatchdog = () => {
+      if (switchTimeoutRef.current) clearTimeout(switchTimeoutRef.current);
+      switchTimeoutRef.current = setTimeout(() => {
+        // The timer has fired; null its ref so it honestly reflects
+        // "no watchdog armed" (a later clearTimeout on the dead id is a no-op).
+        switchTimeoutRef.current = null;
+        if (pendingModelSwitchRef.current === model) {
+          pendingModelSwitchRef.current = null;
+          setModelLoading(false);
+          setError(t('agent.model_switch_timeout'));
+        }
+      }, MODEL_SWITCH_TIMEOUT_MS);
+    };
+    armWatchdog();
 
     try {
-      // Determine whether 'model' or 'default_model' is the active key, then write to it.
-      const modelProp = await getProp('model');
-      const targetKey = modelProp.populated ? 'model' : 'default_model';
-      await putProp(targetKey, model);
+      // Per-agent switch: write THIS agent's own model_provider ref (multi-agent
+      // / schema V3). `model` here is a provider ref (e.g. "kilo.minimax_m3").
+      // The global `model`/`default_model` keys were removed in V3.
+      await putProp(`agents.${agentAlias}.model_provider`, model);
+      // The write-phase watchdog may have fired (or a newer switch may have
+      // superseded this one) while the request was in flight. Bail before
+      // touching the live socket so we never tear it down after giving up.
+      if (pendingModelSwitchRef.current !== model) return;
 
       // If a turn is actively streaming, abort it on the backend before we tear
       // down the socket. This prevents the old model from continuing to execute
@@ -591,6 +670,12 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       // old socket's callbacks below, so its onClose will not fire to do it.
       setPendingApproval(null);
 
+      // Re-arm the watchdog with a fresh budget for the reconnect phase — the
+      // one step no awaited promise covers. Bail first if the write phase
+      // already timed out (or a newer switch superseded this one).
+      if (pendingModelSwitchRef.current !== model) return;
+      armWatchdog();
+
       // Tear down the old socket and create a fresh one.
       // The backend will read the updated config when the new socket opens
       // and construct a new Agent with the selected model.
@@ -604,10 +689,20 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       const ws = new WebSocketClient({ agentAlias });
+      // Point wsRef at the NEW client before connect(), so a synchronous
+      // connect() throw (e.g. an invalid WebSocket URL/protocol token) still
+      // leaves a live, reconnect-capable socket in the ref instead of the old
+      // intentionally-closed one — otherwise the page strands offline with no
+      // reconnect path until reload.
+      wsRef.current = ws;
       attachSocketCallbacks(ws);
       ws.connect();
-      wsRef.current = ws;
     } catch (err) {
+      // If the per-phase watchdog already fired (timed out) and nulled the
+      // pending ref while this request was in flight, bail so a late rejection
+      // doesn't overwrite the timeout state. (The `if (modelLoading) return`
+      // debounce above prevents truly concurrent switches.)
+      if (pendingModelSwitchRef.current !== model) return;
       if (switchTimeoutRef.current) {
         clearTimeout(switchTimeoutRef.current);
         switchTimeoutRef.current = null;
@@ -672,12 +767,29 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         oldWs.disconnect();
 
         const ws = new WebSocketClient({ agentAlias });
+        // Assign wsRef before connect() so a synchronous throw can't strand the
+        // page on the old intentionally-closed socket (see switchModel).
+        wsRef.current = ws;
         attachSocketCallbacks(ws);
         ws.connect();
-        wsRef.current = ws;
       }
     })();
   }, [agentAlias, attachSocketCallbacks]);
+
+  const addLocalMessage = useCallback((content: string) => {
+    localMessageMutationVersionRef.current += 1;
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: generateUUID(),
+        role: 'agent',
+        content,
+        markdown: true,
+        timestamp: new Date(),
+        ephemeral: true,
+      },
+    ]);
+  }, []);
 
   const respondToApproval = useCallback((decision: ApprovalDecision) => {
     setPendingApproval((current) => {
@@ -706,6 +818,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     refreshModels: () => setModelInfoVersion((v) => v + 1),
     deleteMessage,
     clearAllMessages,
+    addLocalMessage,
     abortSession: async () => {
       // Clear local approval state immediately — the in-flight request_id
       // belongs to the turn we're cancelling and will be rejected by the
@@ -720,6 +833,9 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     },
     pendingApproval,
     respondToApproval,
+    // Context window tracking (from "done" WS frames). See #7311.
+    contextMaxTokens,
+    contextInputTokens,
   };
 
   return <AgentContext.Provider value={value}>{children}</AgentContext.Provider>;

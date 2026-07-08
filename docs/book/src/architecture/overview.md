@@ -16,7 +16,7 @@ flowchart TB
         CH["zeroclaw-channels<br/>30+ messaging integrations"]
         GW["zeroclaw-gateway<br/>REST · WebSocket · dashboard"]
         PR["zeroclaw-providers<br/>LLM clients · retry · routing"]
-        TL["zeroclaw-tools<br/>browser · HTTP · PDF · hardware"]
+        TL["zeroclaw-tools<br/>browser · HTTP · hardware"]
     end
 
     subgraph Core["Core"]
@@ -43,14 +43,14 @@ flowchart TB
 |---|---|
 | `zeroclaw-runtime` | Agent loop, security policy enforcement, SOP engine, cron scheduler, SubAgents, RPC layer for zerocode |
 | `zeroclaw-config` | TOML schema, secrets encryption, autonomy levels, workspace resolution |
-| `zeroclaw-api` | Public traits: `ModelProvider`, `Channel`, `Tool`, `Memory`, `Observer`. The kernel ABI |
+| `zeroclaw-api` | Public traits: `ModelProvider`, `Channel`, `Tool`, `Memory`, `Observer`, `RuntimeAdapter`, and `Peripheral`. The kernel ABI |
 | `zeroclaw-providers` | All LLM client impls (Anthropic, OpenAI, Ollama, …) plus the hint-based router and same-provider retry wrapper |
 | `zeroclaw-channels` | 30+ messaging integrations (Discord, Slack, Telegram, Matrix, email, voice, …) |
 | `zeroclaw-gateway` | HTTP / WebSocket gateway, web dashboard, webhook ingress |
-| `zeroclaw-tools` | Callable tool implementations the agent invokes (browser, HTTP, PDF, hardware probes) |
+| `zeroclaw-tools` | Callable tool implementations the agent invokes (browser, HTTP, hardware probes) |
 | `zeroclaw-tool-call-parser` | Model-side tool-call syntax parsing and normalisation |
 | `zeroclaw-memory` | Conversation memory, embeddings, vector retrieval |
-| `zeroclaw-plugins` | Dynamic plugin loading |
+| `zeroclaw-plugins` | Sandboxed WASM plugin host (WIT component model) |
 | `zeroclaw-hardware` | Hardware abstraction layer (GPIO, I2C, SPI, USB) |
 | `zeroclaw-infra` | Process-level support: SQLite session backend, debouncers, stall watchdog |
 | `zeroclaw-log` | The single log-emission surface: JSONL schema, attribution, `record!`/`scope!` macros, `/api/logs` reader, `Observer` bridge |
@@ -88,15 +88,19 @@ sequenceDiagram
 
 Full detail: [Request lifecycle](./request-lifecycle.md).
 
-## Extension points
+## Core traits
 
-Three trait-based extension points live in `zeroclaw-api`:
+Trait contracts live in `zeroclaw-api`; the trait definitions in `crates/zeroclaw-api/src/` are the source of truth for built-in providers, channels, tools, memory backends, and peripherals. For capabilities that should live outside the core binary, start with the [plugin guides](../plugins/index.md). The bullets below point to the closest adjacent docs.
 
-- **`ModelProvider`**: implement for a new LLM endpoint. See [Custom providers](../providers/custom.md).
-- **`Channel`**: implement for a new messaging platform. Inbound and outbound are separate hooks.
-- **`Tool`**: implement for a new capability the agent can invoke. See [Developing → Plugin protocol](../developing/plugin-protocol.md).
+- **`ModelProvider`**: use `custom` or an existing provider family for OpenAI-compatible endpoints; implement this trait when adding a new provider family, auth model, capability declaration, or wire protocol. See [Custom providers](../providers/custom.md).
+- **`Channel`**: implement for a new messaging platform. Inbound and outbound are separate hooks. See [Channels overview](../channels/overview.md).
+- **`Tool`**: implement for a new built-in agent capability. See [Tools overview](../tools/overview.md).
+- **`Memory`**: implement for a memory backend that preserves agent/session scoping.
+- **`Peripheral`**: implement for hardware boards and device surfaces. See [Hardware overview](../hardware/index.md).
 
-All three are registered at startup via factory functions; the kernel doesn't know the concrete types. Compile-time feature flags decide which implementations ship in a given binary.
+Other public traits, including `Observer` and `RuntimeAdapter`, are lower-level contracts. Use the [architecture map](../contributing/architecture-map.md) and [RFC process](../contributing/rfcs.md) before changing them.
+
+New implementations should stay behind the `zeroclaw-api` trait contracts and wire through the owning factory, registry, or feature gate for that surface. RFC #5574 continues shrinking runtime implementation dependencies, so avoid adding new concrete runtime dependencies unless the design requires them.
 
 ## Where to read next
 

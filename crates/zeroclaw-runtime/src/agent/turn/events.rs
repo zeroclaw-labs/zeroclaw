@@ -2,6 +2,7 @@
 //! loop's `TurnEvent` emission helpers (#7415 consolidation).
 
 use super::outcome::ToolLoopCancelled;
+use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use anyhow::Result;
 use tokio::sync::mpsc::Sender;
@@ -59,37 +60,67 @@ pub(crate) async fn stream_text_posthoc_chunks(
     Ok(())
 }
 
-/// Emit the `TurnEvent::ToolCall`/`ToolResult` pair for one executed tool
-/// call (upstream E2 parity: per-outcome emission after execution).
+/// Resolve the stable correlation id for a parsed call. Native calls carry
+/// their own `tool_call_id`; text-protocol calls are id-less, so a fresh UUID
+/// is synthesized. Callers that emit the pending `ToolCall` and the later
+/// `ToolResult` separately must resolve the id once and reuse it so both
+/// halves correlate (ACP/WS clients key on it).
+pub(crate) fn resolve_tool_call_id(call: &ParsedToolCall) -> String {
+    call.tool_call_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+/// Emit the pending `TurnEvent::ToolCall` for a call that is about to execute.
 ///
-/// Text-protocol parsed calls carry `tool_call_id: None`; the TurnEvent
-/// contract documents `id` as a stable correlation id shared by the pair
-/// (ACP/WS clients key on it), so a fresh UUID is synthesized per pair —
-/// the old streaming engine pre-assigned UUIDs to id-less calls for the
-/// same reason. Distinct calls in one batch must never collapse to `""`.
+/// This is the event ACP/WS clients render as the live "tool running" card.
+/// It must be sent BEFORE the tool blocks so a long-running tool surfaces in
+/// the window immediately instead of leaving the turn visibly idle until the
+/// result lands. `id` must equal the value passed to the matching
+/// [`emit_tool_result`] so the result updates the same card.
+pub(crate) async fn emit_tool_call_pending(
+    event_tx: &Sender<TurnEvent>,
+    id: &str,
+    call: &ParsedToolCall,
+) {
+    let _ = event_tx
+        .send(TurnEvent::ToolCall {
+            id: id.to_string(),
+            name: call.name.clone(),
+            args: call.arguments.clone(),
+        })
+        .await;
+}
+
+/// Emit the `TurnEvent::ToolResult` that completes a previously-pending call.
+/// `id` must match the [`emit_tool_call_pending`] that opened the card.
+pub(crate) async fn emit_tool_result(
+    event_tx: &Sender<TurnEvent>,
+    id: &str,
+    name: &str,
+    outcome: &ToolExecutionOutcome,
+) {
+    let _ = event_tx
+        .send(TurnEvent::ToolResult {
+            id: id.to_string(),
+            name: name.to_string(),
+            output: scrub_credentials(&outcome.output),
+        })
+        .await;
+}
+
+/// Emit a pending `ToolCall` immediately followed by its `ToolResult` for a
+/// call that never reached execution (hook-cancelled, denied, replaced,
+/// deduplicated). These have no live window between the two halves, so a
+/// single resolved id keeps the pair correlated without a pre-exec emit.
 pub(crate) async fn emit_tool_call_pair(
     event_tx: &Sender<TurnEvent>,
     call: &ParsedToolCall,
     outcome: &ToolExecutionOutcome,
 ) {
-    let call_id = call
-        .tool_call_id
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let _ = event_tx
-        .send(TurnEvent::ToolCall {
-            id: call_id.clone(),
-            name: call.name.clone(),
-            args: call.arguments.clone(),
-        })
-        .await;
-    let _ = event_tx
-        .send(TurnEvent::ToolResult {
-            id: call_id,
-            name: call.name.clone(),
-            output: outcome.output.clone(),
-        })
-        .await;
+    let call_id = resolve_tool_call_id(call);
+    emit_tool_call_pending(event_tx, &call_id, call).await;
+    emit_tool_result(event_tx, &call_id, &call.name, outcome).await;
 }
 
 /// `TurnEvent` variant of [`stream_text_posthoc_chunks`]: when the final
@@ -170,5 +201,59 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    /// Split emit: a pending ToolCall sent before execution and a ToolResult
+    /// sent after must correlate via the resolved id so the client updates the
+    /// same card. This is the load-bearing contract for the live tool card.
+    #[tokio::test]
+    async fn split_pending_then_result_share_resolved_id() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let call = parsed_call(None);
+        let id = resolve_tool_call_id(&call);
+        emit_tool_call_pending(&tx, &id, &call).await;
+        emit_tool_result(&tx, &id, &call.name, &ok_outcome()).await;
+        drop(tx);
+
+        let pending = rx.recv().await.expect("pending event");
+        let result = rx.recv().await.expect("result event");
+        let pending_id = match pending {
+            TurnEvent::ToolCall { id, .. } => id,
+            other => panic!("expected ToolCall first, got {other:?}"),
+        };
+        let result_id = match result {
+            TurnEvent::ToolResult { id, .. } => id,
+            other => panic!("expected ToolResult second, got {other:?}"),
+        };
+        assert!(!pending_id.is_empty(), "resolved id must be non-empty");
+        assert_eq!(
+            pending_id, result_id,
+            "pending card and its result must share the id"
+        );
+    }
+
+    /// The UI-facing `ToolResult` event is scrubbed at the rendering boundary,
+    /// even though the source outcome carries raw bytes on the data path.
+    #[tokio::test]
+    async fn tool_result_event_is_scrubbed_for_rendering() {
+        let outcome = ToolExecutionOutcome {
+            output: "api_key = \"sk-live-abcd1234efgh5678\"".into(),
+            success: true,
+            error_reason: None,
+            duration: Duration::ZERO,
+            receipt: None,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        emit_tool_call_pair(&tx, &parsed_call(Some("c1")), &outcome).await;
+        drop(tx);
+        let mut saw_result = false;
+        while let Some(ev) = rx.recv().await {
+            if let TurnEvent::ToolResult { output, .. } = ev {
+                saw_result = true;
+                assert!(output.contains("[REDACTED]"));
+                assert!(!output.contains("abcd1234efgh5678"));
+            }
+        }
+        assert!(saw_result, "a ToolResult event must be emitted");
     }
 }

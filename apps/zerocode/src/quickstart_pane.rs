@@ -50,7 +50,7 @@ use crate::client::{
     QuickstartFieldSection, QuickstartStateResult, QuickstartStep, QuickstartSurface, RpcClient,
 };
 use crate::theme;
-use crate::widgets::{HelpEntry, HelpNode};
+use crate::widgets::HelpNode;
 use crate::wire::{
     AgentIdentity, BuilderSubmission, ChannelQuickStart, MemoryBackendKind as MemoryKind,
     ModelProviderChoice, SelectorChoice,
@@ -198,7 +198,7 @@ fn in_rect(col: u16, row: u16, r: Rect) -> bool {
 }
 
 fn synth_enter() -> KeyEvent {
-    KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE)
+    KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE) // keyguard: bridges a mouse click to the canonical submit key for replay
 }
 
 fn queue_apply_handoff(
@@ -936,18 +936,14 @@ impl QuickstartPane {
     }
 
     pub fn help_context(&self) -> HelpNode {
-        HelpNode::entries(vec![
-            HelpEntry::new(
-                vec!["j", "k", "↑/↓"],
-                crate::i18n::t("zc-quickstart-help-move"),
-            ),
-            HelpEntry::new(vec!["Enter"], crate::i18n::t("zc-quickstart-help-open")),
-            HelpEntry::key(
-                "c",
-                crate::i18n::t_args("zc-quickstart-help-create", &[("enter", "Enter")]),
-            ),
-            HelpEntry::new(vec!["q", "Esc"], crate::i18n::t("zc-quickstart-help-leave")),
-        ])
+        use crate::keymap::QuickstartTabAction as Q;
+        HelpNode::entries(crate::help::entries_for([
+            Q::Up,
+            Q::Down,
+            Q::Enter,
+            Q::Create,
+            Q::Back,
+        ]))
     }
 
     pub fn wants_text_input(&self) -> bool {
@@ -1955,9 +1951,7 @@ impl QuickstartPane {
         self.model_catalog_rx = Some(rx);
         tokio::spawn(async move {
             let models = match rpc.catalog_models(&type_key).await {
-                Ok(res) if res.live && !res.models.is_empty() => {
-                    sort_quickstart_models(&type_key, res.models)
-                }
+                Ok(res) if res.live && !res.models.is_empty() => Some(res.models),
                 _ => None,
             };
             let _ = tx.send(ModelCatalogFetchResult { type_key, models });
@@ -2307,10 +2301,6 @@ fn apply_model_catalog_to_rows(rows: &mut [FieldFormRow], model_catalog: Option<
 
 fn is_model_field(field: &QuickstartFieldDescriptor) -> bool {
     field.key.eq_ignore_ascii_case("model") || field.label.eq_ignore_ascii_case("model")
-}
-
-fn sort_quickstart_models(provider: &str, models: Vec<String>) -> Option<Vec<String>> {
-    zeroclaw_providers::catalog::sort_model_catalog_for_chat(provider, models)
 }
 
 fn build_field_form_rows(
@@ -3313,50 +3303,6 @@ mod tests {
             Some(["false".to_string(), "true".to_string()].as_slice())
         );
         assert_eq!(row.buf, "false");
-    }
-
-    #[test]
-    fn quickstart_model_sort_prefers_chat_and_coding_models() {
-        let sorted = sort_quickstart_models(
-            "openai",
-            vec![
-                "chatgpt-image-latest".into(),
-                "text-embedding-ada-002".into(),
-                "gpt-3.5-turbo".into(),
-                "gpt-5".into(),
-                "tts-1".into(),
-            ],
-        )
-        .expect("chat model catalog");
-
-        assert_eq!(sorted[0], "gpt-5");
-        assert!(!sorted.iter().any(|m| m == "chatgpt-image-latest"));
-        assert!(!sorted.iter().any(|m| m == "text-embedding-ada-002"));
-        assert!(!sorted.iter().any(|m| m == "tts-1"));
-
-        let sorted = sort_quickstart_models(
-            "openrouter",
-            vec![
-                "ai21/jamba-mini".into(),
-                "openai/gpt-4.1".into(),
-                "some/image-model".into(),
-                "anthropic/claude-sonnet-4".into(),
-            ],
-        )
-        .expect("chat model catalog");
-        assert_eq!(sorted[0], "anthropic/claude-sonnet-4");
-        assert_eq!(sorted[1], "openai/gpt-4.1");
-        assert!(!sorted.iter().any(|m| m == "some/image-model"));
-    }
-
-    #[test]
-    fn quickstart_model_sort_returns_none_when_only_non_chat_models_exist() {
-        let sorted = sort_quickstart_models(
-            "openai",
-            vec!["gpt-image-1.5".into(), "text-embedding-ada-002".into()],
-        );
-
-        assert!(sorted.is_none());
     }
 
     #[test]

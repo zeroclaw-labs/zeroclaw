@@ -1,383 +1,157 @@
-import type { ReactNode, ComponentType } from 'react';
-import { Link } from 'react-router-dom';
 import {
-  BookOpen,
   Bot,
   Brain,
-  Clock,
-  Database,
+  ChevronRight,
   DollarSign,
   MessageSquare,
-  Pencil,
-  Plug,
   Power,
-  Shield,
-  Sparkles,
-  Users,
   Wifi,
-  Zap,
 } from 'lucide-react';
-import type { LucideProps } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import type { AgentSummary } from '@/lib/agents';
-import EntityLink from './EntityLink';
-
-function ChipRow({
-  icon: Icon,
-  children,
-}: {
-  icon: ComponentType<LucideProps>;
-  children: ReactNode;
-}) {
-  return (
-    <div
-      className="flex items-start gap-1.5 flex-wrap text-xs"
-      style={{ color: 'var(--pc-text-muted)' }}
-    >
-      <Icon className="h-3 w-3 mt-0.5 flex-shrink-0" />
-      <div className="flex flex-wrap gap-1 min-w-0">{children}</div>
-    </div>
-  );
-}
+import { Badge } from '@/components/ui';
+import { formatUsd } from '@/lib/format';
+import { t } from '@/lib/i18n';
 
 export interface AgentCardProps {
   agent: AgentSummary;
-  toggling: boolean;
-  onToggle: () => void;
+  /** Open the detail drawer for this agent. */
+  onSelect: () => void;
+  /** Highlight when this row's agent is the one shown in the drawer. */
+  selected?: boolean;
 }
 
-function formatRelative(iso: string | null): string {
-  if (!iso) return 'no sessions yet';
-  const ts = Date.parse(iso);
-  if (Number.isNaN(ts)) return 'no sessions yet';
-  const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
-  if (diffSec < 60) return 'just now';
-  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
-  if (diffSec < 86_400) return `${Math.floor(diffSec / 3600)}h ago`;
-  return `${Math.floor(diffSec / 86_400)}d ago`;
-}
-
-function formatUsd(value: number | null): string {
-  if (value === null) return '—';
-  if (value < 0.01) return '<$0.01';
-  return `$${value.toFixed(2)}`;
-}
-
-const CHIP_CLASS =
-  'font-mono text-[10px] px-1.5 py-0.5 rounded-full hover:underline';
-const CHIP_STYLE = {
-  background: 'rgba(var(--pc-accent-rgb), 0.08)',
-  color: 'var(--pc-text-secondary)',
-};
-
-export default function AgentCard({ agent, toggling, onToggle }: AgentCardProps) {
-  const channelCount = agent.channels.length;
-  const skillCount = agent.skillBundles.length;
-  const knowledgeCount = agent.knowledgeBundles.length;
-  const mcpCount = agent.mcpBundles.length;
-  const cronCount = agent.cronJobs.length;
-  const peerCount = agent.peerGroups.length;
+// A compact inline fact: icon + value, with a muted caption that collapses on
+// the narrowest rows. Keeps the row dense but scannable.
+function RowFact({
+  icon: Icon,
+  value,
+  label,
+  title,
+}: {
+  icon: typeof Wifi;
+  value: string | number;
+  label: string;
+  title?: string;
+}) {
   return (
-    <div
-      className="rounded-2xl border p-5 transition-colors"
-      style={{
-        background: 'var(--pc-bg-surface)',
-        borderColor: 'var(--pc-border)',
-      }}
+    <span
+      className="flex items-center gap-1 text-xs text-pc-text-secondary tabular-nums"
+      title={title}
     >
-      <div className="flex items-start justify-between mb-3">
+      <Icon className="h-3.5 w-3.5 flex-shrink-0 text-pc-text-faint" />
+      <span className="font-medium text-pc-text">{value}</span>
+      <span className="hidden lg:inline text-pc-text-muted">{label}</span>
+    </span>
+  );
+}
+
+/**
+ * Dense, scannable list row for one agent. A keyboard-focusable button: the
+ * whole row opens the detail drawer. Shows identity, enabled state, and a few
+ * inline facts (channels / sessions / memories / spend). Full detail + actions
+ * (Open chat, Edit, the per-entity config links) live in the drawer.
+ */
+export default function AgentCard({ agent, onSelect, selected = false }: AgentCardProps) {
+  const navigate = useNavigate();
+  const channelCount = agent.channels.length;
+  const chatHref = `/agent/${encodeURIComponent(agent.alias)}`;
+  const openChat = (e: { stopPropagation: () => void; preventDefault: () => void }) => {
+    e.stopPropagation();
+    e.preventDefault();
+    navigate(chatHref);
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      aria-haspopup="dialog"
+      aria-label={`${t('agentcard.open_detail_prefix')} ${agent.alias} ${t('agentcard.open_detail_suffix')}`}
+      className={[
+        'group w-full flex items-center gap-3 px-4 py-3 text-left',
+        'border-b border-pc-border last:border-b-0',
+        'transition-colors duration-150 cursor-pointer',
+        'hover:bg-[var(--pc-hover)]',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--pc-focus)]',
+        selected ? 'bg-pc-elevated' : '',
+      ]
+        .filter(Boolean)
+        .join(' ')}
+    >
+      {/* Identity */}
+      <div className="h-8 w-8 rounded-[var(--radius-md)] flex-shrink-0 flex items-center justify-center bg-pc-accent/10">
+        <Bot className="h-4 w-4 text-pc-accent" />
+      </div>
+      <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2 min-w-0">
-          <div
-            className="h-9 w-9 rounded-xl flex-shrink-0 flex items-center justify-center"
-            style={{ background: 'var(--pc-accent-glow)' }}
-          >
-            <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
-          </div>
-          <div className="min-w-0">
-            <EntityLink
-              kind="agent"
-              id={agent.alias}
-              className="text-sm font-semibold truncate hover:underline"
-              title={`Open agents.${agent.alias} config`}
-            >
-              <span style={{ color: 'var(--pc-text-primary)' }}>{agent.alias}</span>
-            </EntityLink>
-            {agent.modelProvider ? (
-              <EntityLink
-                kind="model-provider"
-                id={agent.modelProvider}
-                className="text-xs truncate font-mono block hover:underline"
-                title={`Open providers.models.${agent.modelProvider} config`}
-              >
-                <span style={{ color: 'var(--pc-text-muted)' }}>
-                  {agent.modelProvider}
-                </span>
-              </EntityLink>
-            ) : (
-              <p className="text-xs truncate" style={{ color: 'var(--pc-text-muted)' }}>
-                no model_provider set
-              </p>
-            )}
-          </div>
+          <span className="text-sm font-semibold truncate text-pc-text">
+            {agent.alias}
+          </span>
+          <Badge tone={agent.enabled ? 'ok' : 'neutral'} className="flex-shrink-0">
+            <Power className="h-3 w-3" />
+            {agent.enabled ? t('agent.enabled') : t('agent.disabled')}
+          </Badge>
         </div>
-        <button
-          type="button"
-          onClick={onToggle}
-          disabled={toggling}
-          className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-medium transition-colors disabled:opacity-50"
-          style={{
-            background: agent.enabled
-              ? 'var(--color-status-success-alpha-08)'
-              : 'var(--pc-bg-elevated)',
-            color: agent.enabled
-              ? 'var(--color-status-success)'
-              : 'var(--pc-text-muted)',
-            border: '1px solid',
-            borderColor: agent.enabled
-              ? 'var(--color-status-success-alpha-20)'
-              : 'var(--pc-border)',
-          }}
-          aria-pressed={agent.enabled}
-          aria-label={agent.enabled ? 'Disable agent' : 'Enable agent'}
-        >
-          <Power className="h-3 w-3" />
-          {agent.enabled ? 'enabled' : 'disabled'}
-        </button>
+        <span className="block text-xs truncate font-mono text-pc-text-muted">
+          {agent.modelProvider || t('agent.no_model_provider')}
+        </span>
       </div>
 
-      <div className="flex flex-col gap-1.5 mb-4">
-        {channelCount === 0 ? (
-          <ChipRow icon={Wifi}>
-            <span>No channels bound</span>
-          </ChipRow>
-        ) : (
-          <ChipRow icon={Wifi}>
-            {agent.channels.map((ch) => (
-              <EntityLink
-                key={ch}
-                kind="channel"
-                id={ch}
-                className={CHIP_CLASS}
-                title={`Open channels.${ch} config`}
-              >
-                <span style={CHIP_STYLE} className="inline-block px-1.5 py-0.5 rounded-full">
-                  {ch}
-                </span>
-              </EntityLink>
-            ))}
-          </ChipRow>
-        )}
-
-        <div
-          className="flex items-center gap-3 text-xs flex-wrap"
-          style={{ color: 'var(--pc-text-muted)' }}
-        >
-          {agent.riskProfile ? (
-            <EntityLink
-              kind="risk-profile"
-              id={agent.riskProfile}
-              className="inline-flex items-center gap-1 hover:underline"
-              title="Risk profile (autonomy/sandbox tier)"
-            >
-              <Shield className="h-3 w-3" />
-              {agent.riskProfile}
-            </EntityLink>
-          ) : (
-            <span className="inline-flex items-center gap-1" title="Risk profile (autonomy/sandbox tier)">
-              <Shield className="h-3 w-3" />
-              no risk profile
-            </span>
-          )}
-          <EntityLink
-            kind="memory-backend"
-            id=""
-            className="inline-flex items-center gap-1 hover:underline"
-            title={
-              agent.memoryBackend
-                ? `Memory backend: ${agent.memoryBackend}`
-                : 'No per-agent override. Inherits the default backend (sqlite) from [memory].'
-            }
-          >
-            <Database className="h-3 w-3" />
-            {agent.memoryBackend || 'sqlite (default)'}
-          </EntityLink>
-          {agent.runtimeProfile && (
-            <EntityLink
-              kind="runtime-profile"
-              id={agent.runtimeProfile}
-              className="inline-flex items-center gap-1 hover:underline"
-              title="Runtime profile (loop, token limits, retries)"
-            >
-              <Zap className="h-3 w-3" />
-              {agent.runtimeProfile}
-            </EntityLink>
-          )}
-        </div>
-
-        {skillCount > 0 && (
-          <ChipRow icon={Sparkles}>
-            {agent.skillBundles.map((s) => (
-              <EntityLink
-                key={s}
-                kind="skill-bundle"
-                id={s}
-                className={CHIP_CLASS}
-                title={`Open skill-bundles.${s} config`}
-              >
-                <span style={CHIP_STYLE} className="inline-block px-1.5 py-0.5 rounded-full">
-                  {s}
-                </span>
-              </EntityLink>
-            ))}
-          </ChipRow>
-        )}
-
-        {knowledgeCount > 0 && (
-          <ChipRow icon={BookOpen}>
-            {agent.knowledgeBundles.map((k) => (
-              <EntityLink
-                key={k}
-                kind="knowledge-bundle"
-                id={k}
-                className={CHIP_CLASS}
-                title={`Open knowledge-bundles.${k} config`}
-              >
-                <span style={CHIP_STYLE} className="inline-block px-1.5 py-0.5 rounded-full">
-                  {k}
-                </span>
-              </EntityLink>
-            ))}
-          </ChipRow>
-        )}
-
-        {mcpCount > 0 && (
-          <ChipRow icon={Plug}>
-            {agent.mcpBundles.map((m) => (
-              <EntityLink
-                key={m}
-                kind="mcp-bundle"
-                id={m}
-                className={CHIP_CLASS}
-                title={`Open mcp-bundles.${m} config`}
-              >
-                <span style={CHIP_STYLE} className="inline-block px-1.5 py-0.5 rounded-full">
-                  {m}
-                </span>
-              </EntityLink>
-            ))}
-          </ChipRow>
-        )}
-
-        {peerCount > 0 && (
-          <ChipRow icon={Users}>
-            {agent.peerGroups.map((pg) => (
-              <EntityLink
-                key={pg}
-                kind="peer-group"
-                id={pg}
-                className={CHIP_CLASS}
-                title={`Open peer_groups.${pg} config`}
-              >
-                <span style={CHIP_STYLE} className="inline-block px-1.5 py-0.5 rounded-full">
-                  {pg}
-                </span>
-              </EntityLink>
-            ))}
-          </ChipRow>
-        )}
-
-        {cronCount > 0 && (
-          <ChipRow icon={Clock}>
-            {agent.cronJobs.map((c) => (
-              <EntityLink
-                key={c}
-                kind="cron"
-                id={c}
-                className={CHIP_CLASS}
-                title={`Open cron.${c} config`}
-              >
-                <span style={CHIP_STYLE} className="inline-block px-1.5 py-0.5 rounded-full">
-                  {c}
-                </span>
-              </EntityLink>
-            ))}
-          </ChipRow>
-        )}
-
-        <p
-          className="text-xs flex items-center gap-1.5"
-          style={{ color: 'var(--pc-text-muted)' }}
-        >
-          <MessageSquare className="h-3 w-3" />
-          {agent.sessionCount === 0 ? (
-            <span>No sessions</span>
-          ) : (
-            <Link
-              to={`/?tab=sessions&agent=${encodeURIComponent(agent.alias)}`}
-              className="hover:underline"
-              title={`Show sessions for ${agent.alias}`}
-            >
-              {agent.sessionCount === 1
-                ? '1 session'
-                : `${agent.sessionCount} sessions`}
-            </Link>
-          )}
-          <span
-            className="inline-flex items-center gap-1 ml-2"
-            style={{ color: 'var(--pc-text-faint)' }}
-          >
-            <Clock className="h-3 w-3" />
-            {formatRelative(agent.lastActivity)}
-          </span>
-        </p>
-        <p
-          className="text-xs flex items-center gap-1.5"
-          style={{ color: 'var(--pc-text-muted)' }}
-        >
-          <Brain className="h-3 w-3" />
-          {agent.memoryCount === 0 ? (
-            <span>No memories</span>
-          ) : (
-            <Link
-              to={`/?tab=memories&agent=${encodeURIComponent(agent.alias)}`}
-              className="hover:underline"
-              title={`Show memories for ${agent.alias}`}
-            >
-              {agent.memoryCount === 1
-                ? '1 memory'
-                : `${agent.memoryCount} memories`}
-            </Link>
-          )}
-        </p>
-        <p
-          className="text-xs flex items-center gap-1.5"
-          style={{ color: 'var(--pc-text-muted)' }}
+      {/* Inline facts — hidden on the narrowest viewports to keep the row clean */}
+      <div className="hidden sm:flex items-center gap-4 flex-shrink-0">
+        <RowFact
+          icon={Wifi}
+          value={channelCount}
+          label={channelCount === 1 ? t('agentcard.channel') : t('agentcard.channels')}
+          title={
+            channelCount === 0
+              ? t('agentcard.no_channels_bound')
+              : `${t('agentcard.channels_title')}: ${agent.channels.join(', ')}`
+          }
+        />
+        <RowFact
+          icon={MessageSquare}
+          value={agent.sessionCount}
+          label={agent.sessionCount === 1 ? t('agentcard.session') : t('agentcard.sessions')}
+          title={t('agentcard.active_sessions')}
+        />
+        <RowFact
+          icon={Brain}
+          value={agent.memoryCount}
+          label={agent.memoryCount === 1 ? t('agentcard.memory') : t('agentcard.memories')}
+          title={t('agentcard.stored_memories')}
+        />
+        <RowFact
+          icon={DollarSign}
+          value={formatUsd(agent.monthCostUsd)}
+          label={t('agentcard.this_month')}
           title={
             agent.monthCostUsd === null
-              ? 'Per-agent tracking disabled in [cost].track_per_agent'
-              : 'Month-to-date spend attributed to this agent'
+              ? t('agent.cost_untracked_title')
+              : t('agent.cost_tracked_title')
           }
-        >
-          <DollarSign className="h-3 w-3" />
-          {formatUsd(agent.monthCostUsd)} this month
-        </p>
+        />
       </div>
 
-      <div className="flex items-center gap-2">
-        <Link
-          to={`/agent/${encodeURIComponent(agent.alias)}`}
-          className="btn-electric flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-xl text-xs"
-        >
-          <MessageSquare className="h-3.5 w-3.5" />
-          Open chat
-        </Link>
-        <Link
-          to={`/config/agents/${encodeURIComponent(agent.alias)}`}
-          className="btn-secondary flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-xl text-xs"
-        >
-          <Pencil className="h-3.5 w-3.5" />
-          Edit
-        </Link>
-      </div>
-    </div>
+      {/* Primary action: one-click into the chat. The row itself opens the
+          detail drawer; this jumps straight to the conversation. */}
+      <span
+        role="button"
+        tabIndex={0}
+        aria-label={`${t('agent.open_chat')} · ${agent.alias}`}
+        title={t('agent.open_chat')}
+        onClick={openChat}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') openChat(e);
+        }}
+        className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-[var(--radius-md)] flex-shrink-0 text-xs font-medium cursor-pointer bg-pc-accent/10 text-pc-accent hover:bg-pc-accent/20 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+      >
+        <MessageSquare className="h-3.5 w-3.5" />
+        <span className="hidden sm:inline">{t('agent.open_chat')}</span>
+      </span>
+
+      <ChevronRight className="h-4 w-4 flex-shrink-0 text-pc-text-faint transition-colors group-hover:text-pc-text-muted" />
+    </button>
   );
 }

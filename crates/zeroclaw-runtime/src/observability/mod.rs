@@ -4,6 +4,8 @@ pub mod multi;
 pub mod noop;
 #[cfg(feature = "observability-otel")]
 pub mod otel;
+#[cfg(feature = "observability-otel")]
+pub mod otel_config;
 #[cfg(feature = "observability-prometheus")]
 pub mod prometheus;
 pub mod runtime_trace;
@@ -14,6 +16,8 @@ pub mod verbose;
 pub use self::log::LogObserver;
 #[allow(unused_imports)]
 pub use self::multi::MultiObserver;
+#[cfg(feature = "observability-otel")]
+use self::otel_config::OtelContentConfig;
 pub use noop::NoopObserver;
 #[cfg(feature = "observability-otel")]
 pub use otel::OtelObserver;
@@ -28,7 +32,7 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
 use traits::ObserverMetric;
-use zeroclaw_config::schema::ObservabilityConfig;
+use zeroclaw_config::schema::{ObservabilityBackend, ObservabilityConfig};
 
 /// Process-wide broadcast hook installed by long-running subsystems (today: the
 /// gateway) so that events emitted by observers built in *other* subsystems —
@@ -114,6 +118,54 @@ fn current_broadcast_hook() -> Option<Arc<dyn Observer>> {
     broadcast_hook_slot().read().current()
 }
 
+/// Guard that flushes its observer on drop — the telemetry analogue of
+/// `agent::TurnGuard`. Held for the lifetime of a short-lived agent
+/// invocation (today: the CLI one-shot, `zeroclaw agent -m ...`), whose
+/// process exits before the OTLP batch exporter / metric
+/// `PeriodicReader`'s background interval fires. Without this flush all
+/// buffered telemetry — including the never-ended `gen_ai.agent.invoke`
+/// span, which is only `.end()`'d inside [`Observer::flush`] — is lost
+/// when the runtime is torn down.
+///
+/// Long-lived callers (daemon heartbeat/cron, channel `process_message`,
+/// subagent spawns) pass `interactive = false` and skip this guard: they
+/// rely on the periodic export firing on its own cadence, and a flush
+/// per turn would add a synchronous OTLP HTTP POST to every invocation.
+///
+/// Backend-agnostic: calls `Observer::flush()`, which is a no-op for
+/// synchronous backends (`Log`/`Verbose`/`Noop`) and meaningless-but-
+/// harmless for pull backends (`Prometheus` — see startup warning).
+#[must_use = "hold the guard for the lifetime of the agent invocation; dropping it flushes"]
+pub struct FlushGuard {
+    observer: Arc<dyn Observer>,
+    done: bool,
+}
+
+impl FlushGuard {
+    /// Construct a guard that will flush `observer` when dropped.
+    pub fn new(observer: Arc<dyn Observer>) -> Self {
+        Self {
+            observer,
+            done: false,
+        }
+    }
+
+    /// Flush immediately and mark the guard spent so a later `Drop` is a no-op.
+    pub fn fire(&mut self) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        self.observer.flush();
+    }
+}
+
+impl Drop for FlushGuard {
+    fn drop(&mut self) {
+        self.fire();
+    }
+}
+
 /// Wrapper that forwards every event to a primary observer plus the
 /// process-wide broadcast hook (when set). Metrics flow only to the primary.
 struct TeeObserver {
@@ -149,6 +201,49 @@ impl Observer for TeeObserver {
     }
 }
 
+/// Emit startup warnings for any non-`Off` OTel content policy. Behavior is
+/// unchanged from the pre-isolation inline block: a non-`Off` GenAI or tool
+/// I/O policy surfaces a privacy reminder at observer construction time.
+#[cfg(feature = "observability-otel")]
+fn warn_otel_content_policy(config: OtelContentConfig) {
+    use zeroclaw_config::schema::OtelContentPolicy;
+
+    if config.genai_policy != OtelContentPolicy::Off {
+        let msg = match config.genai_policy {
+            OtelContentPolicy::Redacted => {
+                "otel_genai_content=redacted: OTel GenAI input/output will be captured with sensitive-content processing and per-field truncation. Processed content may still contain information that could lead to leakage. Enable only when necessary."
+            }
+            OtelContentPolicy::Full => {
+                "otel_genai_content=full: OTel GenAI input/output will be captured with sensitive-content processing but WITHOUT truncation. Use only in controlled environments."
+            }
+            _ => unreachable!(),
+        };
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            msg
+        );
+    }
+    if config.tool_io_policy != OtelContentPolicy::Off {
+        let msg = match config.tool_io_policy {
+            OtelContentPolicy::Redacted => {
+                "otel_tool_io=redacted: OTel tool input/output will be captured with sensitive-content processing and per-field truncation. Processed content may still contain information that could lead to leakage. Enable only when necessary."
+            }
+            OtelContentPolicy::Full => {
+                "otel_tool_io=full: OTel tool input/output will be captured with sensitive-content processing but WITHOUT truncation. Use only in controlled environments."
+            }
+            _ => unreachable!(),
+        };
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            msg
+        );
+    }
+}
+
 /// Factory: create the right observer from config
 pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     Box::new(TeeObserver {
@@ -157,10 +252,10 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
 }
 
 fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
-    match config.backend.as_str() {
-        "log" => Box::new(LogObserver::new()),
-        "verbose" => Box::new(VerboseObserver::new()),
-        "prometheus" => {
+    match config.backend {
+        ObservabilityBackend::Log => Box::new(LogObserver::new()),
+        ObservabilityBackend::Verbose => Box::new(VerboseObserver::new()),
+        ObservabilityBackend::Prometheus => {
             #[cfg(feature = "observability-prometheus")]
             {
                 Box::new(PrometheusObserver::shared())
@@ -176,34 +271,55 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
                 Box::new(NoopObserver)
             }
         }
-        "otel" | "opentelemetry" | "otlp" => {
+        ObservabilityBackend::Otel => {
             #[cfg(feature = "observability-otel")]
-            match OtelObserver::new(
-                config.otel_endpoint.as_deref(),
-                config.otel_service_name.as_deref(),
-                config.otel_headers.clone(),
-            ) {
-                Ok(obs) => {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"endpoint": config
-                            .otel_endpoint
-                            .as_deref()
-                            .unwrap_or("http://localhost:4318")})),
-                        "OpenTelemetry observer initialized"
-                    );
-                    Box::new(obs)
-                }
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            {
+                // Derive the per-observer content policy once, at the observer
+                // construction boundary. `ObservabilityConfig` remains the source
+                // of truth; this immutable snapshot is owned by the `OtelObserver`
+                // and consulted at the OTel export boundary. There is no
+                // process-global mutable content policy, so concurrently live
+                // observers with different policies never drift into each other.
+                let content_config = OtelContentConfig::from_observability_config(config);
+
+                match OtelObserver::new(
+                    config.otel_endpoint.as_deref(),
+                    config.otel_service_name.as_deref(),
+                    config.otel_headers.clone(),
+                    content_config,
+                ) {
+                    Ok(obs) => {
+                        warn_otel_content_policy(content_config);
+
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(
+                                ::serde_json::json!({"endpoint": config
+                                .otel_endpoint
+                                .as_deref()
+                                .unwrap_or("http://localhost:4318")})
+                            ),
+                            "OpenTelemetry observer initialized"
+                        );
+                        Box::new(obs)
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "Failed to create OTel observer. Falling back to noop."
-                    );
-                    Box::new(NoopObserver)
+                            "Failed to create OTel observer. Falling back to noop."
+                        );
+                        Box::new(NoopObserver)
+                    }
                 }
             }
             #[cfg(not(feature = "observability-otel"))]
@@ -217,19 +333,7 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
                 Box::new(NoopObserver)
             }
         }
-        "none" | "noop" => Box::new(NoopObserver),
-        _ => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!(
-                    "Unknown observability backend '{}', falling back to noop",
-                    config.backend
-                )
-            );
-            Box::new(NoopObserver)
-        }
+        ObservabilityBackend::None => Box::new(NoopObserver),
     }
 }
 
@@ -240,7 +344,7 @@ mod tests {
     #[test]
     fn factory_none_returns_noop() {
         let cfg = ObservabilityConfig {
-            backend: "none".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
         assert_eq!(create_observer(&cfg).name(), "noop");
@@ -249,7 +353,7 @@ mod tests {
     #[test]
     fn factory_noop_returns_noop() {
         let cfg = ObservabilityConfig {
-            backend: "noop".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
         assert_eq!(create_observer(&cfg).name(), "noop");
@@ -258,7 +362,7 @@ mod tests {
     #[test]
     fn factory_log_returns_log() {
         let cfg = ObservabilityConfig {
-            backend: "log".into(),
+            backend: ObservabilityBackend::Log,
             ..ObservabilityConfig::default()
         };
         assert_eq!(create_observer(&cfg).name(), "log");
@@ -267,7 +371,7 @@ mod tests {
     #[test]
     fn factory_verbose_returns_verbose() {
         let cfg = ObservabilityConfig {
-            backend: "verbose".into(),
+            backend: ObservabilityBackend::Verbose,
             ..ObservabilityConfig::default()
         };
         assert_eq!(create_observer(&cfg).name(), "verbose");
@@ -276,7 +380,7 @@ mod tests {
     #[test]
     fn factory_prometheus_returns_prometheus() {
         let cfg = ObservabilityConfig {
-            backend: "prometheus".into(),
+            backend: ObservabilityBackend::Prometheus,
             ..ObservabilityConfig::default()
         };
         let expected = if cfg!(feature = "observability-prometheus") {
@@ -290,7 +394,7 @@ mod tests {
     #[test]
     fn factory_otel_returns_otel() {
         let cfg = ObservabilityConfig {
-            backend: "otel".into(),
+            backend: ObservabilityBackend::Otel,
             otel_endpoint: Some("http://127.0.0.1:19999".into()),
             otel_service_name: Some("test".into()),
             ..ObservabilityConfig::default()
@@ -306,7 +410,7 @@ mod tests {
     #[test]
     fn factory_opentelemetry_alias() {
         let cfg = ObservabilityConfig {
-            backend: "opentelemetry".into(),
+            backend: ObservabilityBackend::Otel,
             otel_endpoint: Some("http://127.0.0.1:19999".into()),
             otel_service_name: Some("test".into()),
             ..ObservabilityConfig::default()
@@ -322,7 +426,7 @@ mod tests {
     #[test]
     fn factory_otlp_alias() {
         let cfg = ObservabilityConfig {
-            backend: "otlp".into(),
+            backend: ObservabilityBackend::Otel,
             otel_endpoint: Some("http://127.0.0.1:19999".into()),
             otel_service_name: Some("test".into()),
             ..ObservabilityConfig::default()
@@ -336,41 +440,25 @@ mod tests {
     }
 
     #[test]
-    fn factory_unknown_falls_back_to_noop() {
-        let cfg = ObservabilityConfig {
-            backend: "xyzzy_unknown".into(),
-            ..ObservabilityConfig::default()
-        };
-        assert_eq!(create_observer(&cfg).name(), "noop");
-    }
-
-    #[test]
-    fn factory_empty_string_falls_back_to_noop() {
-        let cfg = ObservabilityConfig {
-            backend: String::new(),
-            ..ObservabilityConfig::default()
-        };
-        assert_eq!(create_observer(&cfg).name(), "noop");
-    }
-
-    #[test]
-    fn factory_garbage_falls_back_to_noop() {
-        let cfg = ObservabilityConfig {
-            backend: "xyzzy_garbage_123".into(),
-            ..ObservabilityConfig::default()
-        };
-        assert_eq!(create_observer(&cfg).name(), "noop");
+    fn unknown_backend_falls_back_to_noop_at_load() {
+        let bad: ObservabilityConfig = toml::from_str("backend = \"xyzzy_unknown\"").unwrap();
+        assert_eq!(bad.backend, ObservabilityBackend::None);
+        let empty: ObservabilityConfig = toml::from_str("backend = \"\"").unwrap();
+        assert_eq!(empty.backend, ObservabilityBackend::None);
+        assert_eq!(create_observer(&bad).name(), "noop");
     }
 
     use parking_lot::Mutex as PlMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Test observer that counts events and metrics, used to verify the
-    /// broadcast hook fan-out and that downcasts pass through `TeeObserver`.
+    /// Test observer that counts events, metrics, and flushes, used to
+    /// verify the broadcast hook fan-out, that downcasts pass through
+    /// `TeeObserver`, and that `FlushGuard` drives `Observer::flush`.
     #[derive(Default)]
     struct CountingObserver {
         events: AtomicUsize,
         metrics: AtomicUsize,
+        flushes: AtomicUsize,
     }
 
     impl Observer for CountingObserver {
@@ -380,6 +468,10 @@ mod tests {
 
         fn record_metric(&self, _metric: &ObserverMetric) {
             self.metrics.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn flush(&self) {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
         }
 
         fn name(&self) -> &str {
@@ -404,7 +496,7 @@ mod tests {
         set_broadcast_hook(hook.clone());
 
         let cfg = ObservabilityConfig {
-            backend: "noop".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
         let observer = create_observer(&cfg);
@@ -429,7 +521,7 @@ mod tests {
         set_broadcast_hook(hook.clone());
 
         let cfg = ObservabilityConfig {
-            backend: "noop".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
         let observer = create_observer(&cfg);
@@ -449,7 +541,7 @@ mod tests {
         clear_broadcast_hook();
 
         let cfg = ObservabilityConfig {
-            backend: "noop".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
         let observer = create_observer(&cfg);
@@ -468,7 +560,7 @@ mod tests {
         let broadcast_guard = set_scoped_broadcast_hook(hook.clone());
 
         let cfg = ObservabilityConfig {
-            backend: "noop".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
         let observer = create_observer(&cfg);
@@ -495,7 +587,7 @@ mod tests {
         drop(old_guard);
 
         let cfg = ObservabilityConfig {
-            backend: "noop".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
         let observer = create_observer(&cfg);
@@ -519,7 +611,7 @@ mod tests {
         let new_guard = set_scoped_broadcast_hook(new_hook.clone());
 
         let cfg = ObservabilityConfig {
-            backend: "noop".into(),
+            backend: ObservabilityBackend::None,
             ..ObservabilityConfig::default()
         };
         let observer = create_observer(&cfg);
@@ -546,7 +638,7 @@ mod tests {
         clear_broadcast_hook();
 
         let cfg = ObservabilityConfig {
-            backend: "log".into(),
+            backend: ObservabilityBackend::Log,
             ..ObservabilityConfig::default()
         };
         let observer = create_observer(&cfg);
@@ -554,5 +646,28 @@ mod tests {
         // `as_any` must surface the primary observer so existing downcasts
         // (e.g. PrometheusObserver in /metrics) keep working through the tee.
         assert!(observer.as_any().downcast_ref::<LogObserver>().is_some());
+    }
+
+    #[test]
+    fn flush_guard_flushes_on_drop() {
+        let observer = Arc::new(CountingObserver::default());
+        let guard = FlushGuard::new(observer.clone());
+        assert_eq!(observer.flushes.load(Ordering::SeqCst), 0);
+        drop(guard);
+        assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn flush_guard_fire_is_idempotent() {
+        let observer = Arc::new(CountingObserver::default());
+        let mut guard = FlushGuard::new(observer.clone());
+        guard.fire();
+        assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
+        // Second explicit fire is a no-op.
+        guard.fire();
+        assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
+        // Dropping after fire must not flush again.
+        drop(guard);
+        assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
     }
 }

@@ -1,4 +1,5 @@
 use super::ModelProvider;
+use super::dispatch::ProviderDispatch;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
@@ -68,11 +69,11 @@ impl ModelProvider for ModelPinnedProvider {
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        self.inner.list_models().await
+        ProviderDispatch::from_ref(&*self.inner).list_models().await
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        self.inner.warmup().await
+        ProviderDispatch::from_ref(&*self.inner).warmup().await
     }
 
     async fn chat_with_system(
@@ -82,7 +83,7 @@ impl ModelProvider for ModelPinnedProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        self.inner
+        ProviderDispatch::from_ref(&*self.inner)
             .chat_with_system(system_prompt, message, &self.pinned_model, temperature)
             .await
     }
@@ -93,7 +94,7 @@ impl ModelProvider for ModelPinnedProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        self.inner
+        ProviderDispatch::from_ref(&*self.inner)
             .chat_with_history(messages, &self.pinned_model, temperature)
             .await
     }
@@ -104,7 +105,7 @@ impl ModelProvider for ModelPinnedProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
-        self.inner
+        ProviderDispatch::from_ref(&*self.inner)
             .chat(request, &self.pinned_model, temperature)
             .await
     }
@@ -116,7 +117,7 @@ impl ModelProvider for ModelPinnedProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
-        self.inner
+        ProviderDispatch::from_ref(&*self.inner)
             .chat_with_tools(messages, tools, &self.pinned_model, temperature)
             .await
     }
@@ -129,6 +130,8 @@ impl ModelProvider for ModelPinnedProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        // stream_chat_with_system is not on ProviderDispatch's protected
+        // surface — the dispatcher only wraps stream_chat. Pass through.
         self.inner.stream_chat_with_system(
             system_prompt,
             message,
@@ -145,6 +148,7 @@ impl ModelProvider for ModelPinnedProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        // Same passthrough rationale as stream_chat_with_system.
         self.inner
             .stream_chat_with_history(messages, &self.pinned_model, temperature, options)
     }
@@ -156,8 +160,12 @@ impl ModelProvider for ModelPinnedProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-        self.inner
-            .stream_chat(request, &self.pinned_model, temperature, options)
+        ProviderDispatch::from_ref(&*self.inner).stream_chat(
+            request,
+            &self.pinned_model,
+            temperature,
+            options,
+        )
     }
 }
 

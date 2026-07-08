@@ -81,8 +81,18 @@ impl NotionChannel {
                 anyhow::Error::msg(format!("Invalid Notion API key header value: {e}"))
             })?,
         );
-        headers.insert("Notion-Version", NOTION_VERSION.parse().unwrap());
-        headers.insert("Content-Type", "application/json".parse().unwrap());
+        headers.insert(
+            "Notion-Version",
+            NOTION_VERSION.parse().map_err(|e| {
+                anyhow::Error::msg(format!("Invalid Notion-Version header value: {e}"))
+            })?,
+        );
+        headers.insert(
+            "Content-Type",
+            "application/json".parse().map_err(|e| {
+                anyhow::Error::msg(format!("Invalid Content-Type header value: {e}"))
+            })?,
+        );
         Ok(headers)
     }
 
@@ -472,6 +482,8 @@ impl Channel for NotionChannel {
                                 interruption_scope_id: None,
                                 attachments: vec![],
                                 subject: None,
+
+                                ..Default::default()
                             })
                             .await
                             .is_err()
@@ -508,6 +520,15 @@ impl Channel for NotionChannel {
         self.api_call(reqwest::Method::GET, &url, None)
             .await
             .is_ok()
+    }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator concept in the Notion API.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 

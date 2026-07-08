@@ -492,7 +492,14 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             );
             Ok(())
         }
-        crate::CronCommands::Remove { id } => remove_job(config, &id),
+        crate::CronCommands::Remove { id } => {
+            remove_job(config, &id)?;
+            println!(
+                "{}",
+                get_required_cli_string_with_args("cli-cron-removed", &[("id", &id)])
+            );
+            Ok(())
+        }
         crate::CronCommands::Pause { id } => {
             pause_job(config, &id)?;
             println!(
@@ -540,8 +547,8 @@ mod tests {
         config.agents.entry("test-agent".to_string()).or_insert(
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.test-agent".into(),
-                risk_profile: "test-agent".to_string(),
-                runtime_profile: "test-agent".to_string(),
+                risk_profile: "test-agent".into(),
+                runtime_profile: "test-agent".into(),
                 ..Default::default()
             },
         );

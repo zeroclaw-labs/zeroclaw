@@ -37,6 +37,14 @@ pub fn t(key: &str) -> String {
     format!("{{{key}}}")
 }
 
+/// Optional lookup for keys that legitimately may not exist (e.g. derived
+/// override keys with a code-side fallback). Returns `None` on miss without
+/// recording it as a missing-translation warning.
+pub fn try_t(key: &str) -> Option<String> {
+    let map = STRINGS.get_or_init(|| load_strings(active_locale()));
+    map.get(key).cloned()
+}
+
 pub fn t_args(key: &str, args: &[(&str, &str)]) -> String {
     let sources = FTL_SOURCES.get_or_init(|| load_ftl_sources(active_locale()));
     if let Some(disk) = sources.disk.as_deref()
@@ -223,6 +231,15 @@ mod tests {
         let map = format_ftl_messages(EN_FTL, "en");
         assert!(map.contains_key("zc-pane-dashboard"));
         assert!(map.contains_key("zc-pane-chat"));
+        let mismatch = format_ftl_message(
+            EN_FTL,
+            "en",
+            "zc-error-daemon-version-mismatch",
+            &[("client_version", "0.8.1"), ("server_version", "0.8.0")],
+        )
+        .unwrap();
+        assert!(mismatch.contains("0.8.1"));
+        assert!(mismatch.contains("0.8.0"));
     }
 
     #[test]
