@@ -569,7 +569,7 @@ impl Tool for DeviceExecTool {
                 Ok(ToolResult {
                     success: true,
                     output: if output.is_empty() {
-                        format!("Code executed on {alias} — no output produced.").into()
+                        format!("Code executed on {alias}: no output produced.").into()
                     } else {
                         format!("Output from {alias}:\n{output}").into()
                     },

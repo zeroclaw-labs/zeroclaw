@@ -1813,7 +1813,7 @@ impl SopPane {
             ));
             if on_step && ed.field == StepField::Switch {
                 lines.push(
-                    "      (name>when>goto; ... — makes this an if-this-then-that node)".into(),
+                    "      (name>when>goto; ... makes this an if-this-then-that node)".into(),
                 );
             }
             let (m, cur) = marker(StepField::Calls);

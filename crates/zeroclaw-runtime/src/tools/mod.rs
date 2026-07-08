@@ -1271,7 +1271,7 @@ pub fn all_tools_with_runtime(
     let reaction_tool = ReactionTool::new(security.clone(), Arc::clone(&reaction_handle));
     tool_arcs.push(Arc::new(reaction_tool));
 
-    // Unified forge operations tool — routes through the git channel via the
+    // Unified forge operations tool, routes through the git channel via the
     // same late-bound channel map as the reaction tool. Resource/action grid
     // plus a raw catch-all over the channel's single forge_request transport.
     let git_forge_tool = GitForgeTool::new(security.clone(), Arc::clone(&reaction_handle));

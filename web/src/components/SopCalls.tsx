@@ -176,7 +176,7 @@ function ToolSelect({
 // A planned call's args are shaped by the selected tool's JSON Schema, so the
 // editor renders one typed field per schema property instead of a raw JSON
 // blob. Any field may instead hold a `{{steps.N.path}}` / `{{calls.K.path}}`
-// binding — a whole-string binding is passed through verbatim and keeps its
+// binding: a whole-string binding is passed through verbatim and keeps its
 // runtime type. Tools with no usable object schema (unknown tool, or a schema
 // without `properties`) fall back to the JSON textarea so nothing is lost.
 

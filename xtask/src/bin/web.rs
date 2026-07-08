@@ -166,7 +166,7 @@ fn bin(tool: &str) -> String {
 /// frontend renders tooltips from the Rust `///` docs at runtime. TypeScript
 /// `@description` JSDoc is erased at build time and unreadable at runtime; this
 /// projects the same spec into a real data module. The Rust doc comments remain
-/// the single source of truth — nothing is retyped on the frontend.
+/// the single source of truth, nothing is retyped on the frontend.
 fn render_descriptions(spec: &serde_json::Value) -> String {
     use std::collections::BTreeMap;
 

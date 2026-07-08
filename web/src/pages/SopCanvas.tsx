@@ -343,7 +343,7 @@ export default function SopCanvas({
       )}
       {linkFrom !== null ? (
         <div className="absolute left-2 top-2 z-10 rounded bg-pc-elevated px-2 py-1 text-xs text-pc-text">
-          {t('sops.linking')}: {linkKind} — {t('sops.link_hint')}
+          {t('sops.linking')}: {linkKind}. {t('sops.link_hint')}
           <button
             type="button"
             onClick={() => {

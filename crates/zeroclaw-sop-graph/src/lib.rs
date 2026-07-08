@@ -137,8 +137,8 @@ pub struct NodePosition {
 /// Canonical canvas geometry: the pixel box and inter-slot pitch every
 /// surface renders a node with, plus the seed origin a grid slot maps to.
 /// This is the single registry both the web canvas and the zerocode TUI read
-/// from — the web off `GraphLayout.geometry`, zerocode off [`LayoutGeometry::CANONICAL`]
-/// — so neither surface hardcodes its own drifting copy. A slot at
+/// from (the web off `GraphLayout.geometry`, zerocode off [`LayoutGeometry::CANONICAL`])
+/// so neither surface hardcodes its own drifting copy. A slot at
 /// `(col, row)` seeds to `(origin + col*(node_w+col_gap), origin + row*(node_h+row_gap))`,
 /// and a persisted `NodePosition.x`/`y` lives in that same pixel space.
 pub const LAYOUT_NODE_W: f64 = 210.0;

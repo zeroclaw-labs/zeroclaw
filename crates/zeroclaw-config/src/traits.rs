@@ -396,7 +396,7 @@ pub struct PropFieldInfo {
     pub tab: ConfigTab,
     /// Alias namespace for `PropKind::AliasRef` fields; `None` otherwise.
     pub alias_source: Option<AliasSource>,
-    /// Whether this field is marked `#[multiline]` — a hint that surfaces
+    /// Whether this field is marked `#[multiline]`, a hint that surfaces
     /// should render a multi-line text area (e.g. a PEM key body) rather
     /// than a single-line input.
     pub multiline: bool,

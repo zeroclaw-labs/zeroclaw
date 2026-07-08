@@ -1,6 +1,6 @@
-//! Live SOP-runs WebSocket — pushes run summaries as the engine transitions.
+//! Live SOP-runs WebSocket: pushes run summaries as the engine transitions.
 //!
-//! - `WS /ws/sops/runs` — initial snapshot then a live run-change feed.
+//! - `WS /ws/sops/runs`: initial snapshot then a live run-change feed.
 //!
 //! The snapshot and every subsequent frame come from the engine directly (its
 //! in-memory active set plus retained terminal runs and its run-change
@@ -22,7 +22,7 @@ use zeroclaw_runtime::sop::SopRunSummary;
 
 const WS_PROTOCOL: &str = "zeroclaw.v1";
 
-/// WS /ws/sops/runs — real-time SOP run summaries.
+/// WS /ws/sops/runs, real-time SOP run summaries.
 pub async fn handle_ws_sop_runs(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -49,7 +49,7 @@ pub async fn handle_ws_sop_runs(
         if !state.pairing.is_authenticated(token) {
             return (
                 StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide Authorization header or Sec-WebSocket-Protocol bearer",
+                "Unauthorized: provide Authorization header or Sec-WebSocket-Protocol bearer",
             )
                 .into_response();
         }

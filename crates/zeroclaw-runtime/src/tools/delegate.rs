@@ -2404,7 +2404,7 @@ impl DelegateTool {
         Ok(ToolResult {
             success: true,
             output: if aborted {
-                format!("Task '{task_id}' cancelled — the running task was aborted.").into()
+                format!("Task '{task_id}' cancelled: the running task was aborted.").into()
             } else {
                 format!("Task '{task_id}' marked cancelled (it had already settled).").into()
             },
