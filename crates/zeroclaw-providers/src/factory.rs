@@ -1189,14 +1189,11 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
         })?;
         let api_version = self.api_version.as_deref();
         Ok(Box::new(
-            crate::azure_openai::AzureOpenAiModelProvider::new(
-                alias,
-                key,
-                resource,
-                deployment,
-                api_version,
-                opts.reasoning_effort.clone(),
-            ),
+            crate::azure_openai::AzureOpenAiModelProvider::builder(alias, resource, deployment)
+                .credential(key)
+                .api_version(api_version)
+                .reasoning_effort(opts.reasoning_effort.clone())
+                .build(),
         ))
     }
 }
