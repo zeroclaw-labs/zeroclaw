@@ -136,17 +136,18 @@ enum ClipboardTool {
 }
 
 /// Image MIME targets we accept from the clipboard, in preference order.
-/// PNG first (lossless, universally supported by vision models), then common
-/// screenshot-tool alternatives. Selection is intersected with what the
-/// clipboard actually advertises.
+/// PNG first (lossless, universally supported by vision models), then the other
+/// formats the vision pipeline accepts. This set is intentionally kept in sync
+/// with `ALLOWED_IMAGE_MIME_TYPES` in `zeroclaw-providers::multimodal`: reading
+/// a target the loader later rejects (e.g. BMP/TIFF) would convert a paste into
+/// a hard `UnsupportedMime` error, so we never offer one. `image/jpg` is a
+/// common non-standard alias for JPEG and is normalized on read.
 const ACCEPTED_IMAGE_TARGETS: &[&str] = &[
     "image/png",
     "image/webp",
     "image/jpeg",
     "image/jpg",
     "image/gif",
-    "image/bmp",
-    "image/tiff",
 ];
 
 /// Resolve the servable image targets for this tool, in preference order.
@@ -484,5 +485,21 @@ mod tests {
         assert_eq!(mime_for_target("image/jpg"), "image/jpeg");
         assert_eq!(mime_for_target("IMAGE/PNG"), "image/png");
         assert_eq!(mime_for_target("image/webp"), "image/webp");
+    }
+
+    #[test]
+    fn accepted_targets_stay_within_vision_pipeline_allowlist() {
+        // Mirror of zeroclaw-providers::multimodal::ALLOWED_IMAGE_MIME_TYPES.
+        // Offering a target the loader rejects turns a paste into an
+        // UnsupportedMime error, so every accepted target must normalize into
+        // this set. image/jpg is the one alias, normalized to image/jpeg.
+        const PIPELINE_ALLOWED: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
+        for target in ACCEPTED_IMAGE_TARGETS {
+            let normalized = mime_for_target(target);
+            assert!(
+                PIPELINE_ALLOWED.contains(&normalized.as_str()),
+                "clipboard offers {target} -> {normalized}, which the vision pipeline rejects"
+            );
+        }
     }
 }
