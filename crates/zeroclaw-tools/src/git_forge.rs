@@ -30,7 +30,7 @@ fn ferr_args(key: &str, args: &[(&str, &str)]) -> String {
     crate::i18n::get_required_tool_string_with_args(key, args)
 }
 
-/// `resource.action requires 'field'` — the common missing-arg error family.
+/// `resource.action requires 'field'`, the missing-arg error family.
 fn req_field(resource: &str, action: &str, field: &str) -> String {
     ferr_args(
         "tool-git-forge-error-requires-field",
@@ -722,9 +722,20 @@ impl GitForgeTool {
         }
     }
 
-    /// Resolve a `{resource, action}` pair plus args into a planned forge call.
-    /// Returns an error string when the pair is unknown or required args are
-    /// missing — the model gets a precise reason, never a silent misfire.
+    /// Distinct values of one [`Cell`] field across the whole grid, in first-seen
+    /// order, joined by `sep`. Lets the schema advertise the exact typed
+    /// vocabulary `CELLS` owns instead of a hand-kept parallel list.
+    fn cell_vocab(field: fn(&Cell) -> &'static str, sep: &str) -> String {
+        let mut seen: Vec<&'static str> = Vec::new();
+        for cell in CELLS {
+            let value = field(cell);
+            if !seen.contains(&value) {
+                seen.push(value);
+            }
+        }
+        seen.join(sep)
+    }
+
     /// Resolve a `{resource, action}` pair plus args into a planned forge call
     /// by finding the matching row in [`CELLS`] and running its builder. Returns
     /// a precise error when the pair is unknown or a required arg is missing.
@@ -758,16 +769,24 @@ impl Tool for GitForgeTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        let action_desc = format!(
+            "'describe', 'raw', or a resource action ({})",
+            Self::cell_vocab(|c| c.action, "/")
+        );
+        let resource_desc = format!(
+            "Resource for a typed call: {}",
+            Self::cell_vocab(|c| c.resource, "|")
+        );
         json!({
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "'describe', 'raw', or a resource action (list/read/create/update/close/merge/add/remove/request/delete)"
+                    "description": action_desc
                 },
                 "resource": {
                     "type": "string",
-                    "description": "Resource for a typed call: milestone|label|issue|pull|review|reviewer|comment"
+                    "description": resource_desc
                 },
                 "channel": {
                     "type": "string",
@@ -992,7 +1011,7 @@ impl Tool for GitForgeTool {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(format!(
-                            "{label} failed: HTTP {} — {}",
+                            "{label} failed: HTTP {}: {}",
                             resp.status, resp.body
                         )),
                     })
@@ -1305,5 +1324,24 @@ mod tests {
                 .iter()
                 .any(|v| v == "action")
         );
+
+        let action_desc = schema["properties"]["action"]["description"]
+            .as_str()
+            .unwrap();
+        let resource_desc = schema["properties"]["resource"]["description"]
+            .as_str()
+            .unwrap();
+        for cell in CELLS {
+            assert!(
+                action_desc.contains(cell.action),
+                "schema action vocab dropped '{}'",
+                cell.action
+            );
+            assert!(
+                resource_desc.contains(cell.resource),
+                "schema resource vocab dropped '{}'",
+                cell.resource
+            );
+        }
     }
 }
