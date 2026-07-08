@@ -1110,15 +1110,17 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
             )
         });
         let auth_service = crate::auth::AuthService::new(&state_dir, opts.secrets_encrypt);
-        Ok(Box::new(crate::gemini::GeminiModelProvider::new_with_auth(
-            alias,
-            key,
-            auth_service,
-            opts.auth_profile_override.clone(),
-            self.oauth_project.clone(),
-            self.oauth_client_id.clone(),
-            self.oauth_client_secret.clone(),
-        )))
+        Ok(Box::new(
+            crate::gemini::GeminiModelProvider::builder(alias)
+                .api_key(key)
+                .managed_auth(auth_service, opts.auth_profile_override.clone())
+                .oauth_project_seed(self.oauth_project.clone())
+                .oauth_client(
+                    self.oauth_client_id.clone(),
+                    self.oauth_client_secret.clone(),
+                )
+                .build(),
+        ))
     }
 
     fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
