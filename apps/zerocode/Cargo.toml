@@ -7,8 +7,10 @@ description = "Interactive TUI config manager for ZeroClaw."
 publish = false
 
 [features]
-# SOP authoring in the TUI is still experimental; the web surface ships first.
-# Off by default: the SOP pane compiles but is unreachable from navigation.
+# Reserved for future SOP-authoring exposure work. The SOP pane is currently
+# unreachable from navigation in every build (`Mode::Sop` is absent from the
+# mode bar); the web dashboard ships as the first experimental release. This
+# flag gates no exposure today and is kept as the seam for re-enabling later.
 default = []
 sop-authoring = []
 
