@@ -362,7 +362,10 @@ jobs:
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Check
-        run: cargo check --locked ${{ matrix.args }}
+        # Pin to the root package. This workspace has a root package, so bare
+        # `cargo check` built only `zeroclawlabs` until `default-members`
+        # (see Cargo.toml) was added; pin so that key can't change CI scope.
+        run: cargo check --locked -p zeroclawlabs ${{ matrix.args }}
 
   check-plugin-backends:
     name: Check (${{ matrix.name }})
@@ -427,7 +430,9 @@ jobs:
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Check (32-bit, no default features)
-        run: cargo check --locked --target i686-unknown-linux-gnu --no-default-features
+        # Pin to the shippable binary's package; `default-members` (see Cargo.toml)
+        # would otherwise widen this to dev/tooling crates that aren't 32-bit-clean.
+        run: cargo check --locked --target i686-unknown-linux-gnu -p zeroclawlabs --no-default-features
 
   bench:
     name: Benchmarks Compile
@@ -447,7 +452,8 @@ jobs:
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Verify benchmarks compile
-        run: cargo bench --no-run --locked
+        # Benches live in the root package; pin so `default-members` (see Cargo.toml) can't widen scope.
+        run: cargo bench --no-run --locked -p zeroclawlabs
 
   # ── Post-format tests ─────────────────────────────────────────────────────
 
