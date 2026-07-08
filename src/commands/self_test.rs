@@ -66,13 +66,13 @@ pub async fn run_quick(config: &crate::config::Config) -> Result<Vec<CheckResult
 pub async fn run_full(config: &crate::config::Config) -> Result<Vec<CheckResult>> {
     let mut results = run_quick(config).await?;
 
-    // 9. Gateway health endpoint
+    // 10. Gateway health endpoint
     results.push(check_gateway_health(config).await);
 
-    // 10. Memory write/read round-trip
+    // 11. Memory write/read round-trip
     results.push(check_memory_roundtrip(config).await);
 
-    // 11. WebSocket handshake
+    // 12. WebSocket handshake
     #[cfg(feature = "gateway")]
     results.push(check_websocket_handshake(config).await);
 
@@ -480,10 +480,10 @@ async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResul
 
     let request = match probe_url.as_str().into_client_request() {
         Ok(mut req) => {
-            if let Some(token) = token {
-                if let Ok(value) = header::HeaderValue::from_str(&format!("Bearer {token}")) {
-                    req.headers_mut().insert(header::AUTHORIZATION, value);
-                }
+            if let Some(token) = token
+                && let Ok(value) = header::HeaderValue::from_str(&format!("Bearer {token}"))
+            {
+                req.headers_mut().insert(header::AUTHORIZATION, value);
             }
             req
         }
@@ -524,13 +524,11 @@ fn build_websocket_probe_url(
         Some(alias) => format!("ws://{probe_host}:{port}/ws/chat?agent={alias}"),
         None => format!("ws://{probe_host}:{port}/ws/chat"),
     };
-    if require_pairing {
-        if let Some(token) = token {
-            let sep = if url.contains('?') { '&' } else { '?' };
-            url.push(sep);
-            url.push_str("token=");
-            url.push_str(token);
-        }
+    if require_pairing && let Some(token) = token {
+        let sep = if url.contains('?') { '&' } else { '?' };
+        url.push(sep);
+        url.push_str("token=");
+        url.push_str(token);
     }
     url
 }

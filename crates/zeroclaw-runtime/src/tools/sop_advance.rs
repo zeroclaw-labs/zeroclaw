@@ -204,6 +204,14 @@ impl Tool for SopAdvanceTool {
             collector.record_run_complete(run);
         }
 
+        if let Ok(ref action) = action {
+            crate::sop::executor::enqueue_live_action(
+                Arc::clone(&self.engine),
+                self.audit.clone(),
+                action,
+            );
+        }
+
         match action {
             Ok(action) => {
                 let result_output = match action {
@@ -240,6 +248,14 @@ impl Tool for SopAdvanceTool {
                             "Step recorded. Run {run_id} paused at checkpoint: {}",
                             step.title
                         )
+                    }
+                    SopRunAction::Pending {
+                        run_id,
+                        step,
+                        reason,
+                        ..
+                    } => {
+                        format!("Step recorded. Run {run_id} pending before step {step}: {reason}")
                     }
                 };
                 Ok(ToolResult {
@@ -284,6 +300,7 @@ mod tests {
                     requires_confirmation: false,
                     kind: SopStepKind::default(),
                     schema: None,
+                    ..SopStep::default()
                 },
                 SopStep {
                     number: 2,
@@ -293,6 +310,7 @@ mod tests {
                     requires_confirmation: false,
                     kind: SopStepKind::default(),
                     schema: None,
+                    ..SopStep::default()
                 },
             ],
             cooldown_secs: 0,

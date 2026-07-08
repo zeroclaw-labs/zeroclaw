@@ -45,7 +45,7 @@ if [ "${ZEROCLAW_DOCS_LINKS:-0}" = "1" ]; then
 fi
 
 echo "==> pre-push: running tests..."
-cargo test --locked || {
+cargo test --locked --workspace --exclude zeroclaw-desktop || {
     echo "FAIL: some tests did not pass."
     exit 1
 }

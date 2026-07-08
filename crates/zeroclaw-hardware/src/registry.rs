@@ -99,4 +99,44 @@ mod tests {
     fn known_boards_not_empty() {
         assert!(!known_boards().is_empty());
     }
+
+    #[test]
+    fn lookup_requires_both_vid_and_pid_to_match() {
+        // A known VID with an unknown PID must not match (not a VID-only lookup).
+        assert!(lookup_board(0x0483, 0xffff).is_none());
+        // A known PID under the wrong VID must not match either.
+        assert!(lookup_board(0x0000, 0x374b).is_none());
+    }
+
+    #[test]
+    fn lookup_distinguishes_multiple_pids_for_same_board_name() {
+        // arduino-uno is registered under two distinct PIDs; both resolve.
+        assert_eq!(lookup_board(0x2341, 0x0043).unwrap().name, "arduino-uno");
+        assert_eq!(lookup_board(0x2341, 0x0078).unwrap().name, "arduino-uno");
+        // arduino-mega shares the Arduino VID but a different PID.
+        assert_eq!(lookup_board(0x2341, 0x0042).unwrap().name, "arduino-mega");
+    }
+
+    #[test]
+    fn known_boards_have_unique_vid_pid_pairs() {
+        let mut seen = std::collections::HashSet::new();
+        for b in known_boards() {
+            assert!(
+                seen.insert((b.vid, b.pid)),
+                "duplicate (vid, pid) entry: {:#06x}:{:#06x} ({})",
+                b.vid,
+                b.pid,
+                b.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_known_board_resolves_to_itself() {
+        for b in known_boards() {
+            let found = lookup_board(b.vid, b.pid).unwrap();
+            assert_eq!(found.name, b.name);
+            assert_eq!(found.architecture, b.architecture);
+        }
+    }
 }
