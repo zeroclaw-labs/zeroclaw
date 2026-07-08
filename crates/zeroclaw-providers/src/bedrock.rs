@@ -16,7 +16,7 @@ use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use zeroclaw_api::tool::ToolSpec;
 #[cfg(windows)]
 use zeroclaw_config::platform::native::windows_std_cmd_shell_command;
@@ -671,7 +671,9 @@ struct ToolSpecDef {
 
 #[derive(Debug, Serialize)]
 struct InputSchema {
-    json: serde_json::Value,
+    /// `Arc`-shared with the tool registry's stored schema — serialized
+    /// transparently, never deep-cloned per request (#8642).
+    json: Arc<serde_json::Value>,
 }
 
 // ── Converse API Types (Response) ───────────────────────────────
@@ -1342,7 +1344,7 @@ impl BedrockModelProvider {
                     name: tool.name.clone(),
                     description: tool.description.clone(),
                     input_schema: InputSchema {
-                        json: tool.parameters.clone(),
+                        json: Arc::clone(&tool.parameters),
                     },
                 },
             })
@@ -2163,7 +2165,9 @@ mod tests {
         let tools = vec![ToolSpec {
             name: "shell".to_string(),
             description: "Run commands".to_string(),
-            parameters: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+            parameters:
+                serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}})
+                    .into(),
         }];
         let config = BedrockModelProvider::convert_tools_to_converse(Some(&tools));
         assert!(config.is_some());

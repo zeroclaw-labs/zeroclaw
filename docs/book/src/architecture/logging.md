@@ -221,7 +221,7 @@ The on-disk JSON shape (`LogEvent` in `event.rs`):
 
 ## `LogConfig` vs `ObservabilityConfig`
 
-`zeroclaw-log` defines its own minimal `LogConfig` (in `crates/zeroclaw-log/src/config.rs`): `log_persistence`, `log_persistence_path`, `log_persistence_max_entries`, `log_persistence_max_bytes`, `log_persistence_rotate_daily`, `log_persistence_retention_max_files`, `log_persistence_retention_max_age_days`, `log_tool_io`, `log_tool_io_truncate_bytes`, `log_tool_io_denylist`. This breaks what would otherwise be a dep cycle: `zeroclaw-config::ObservabilityConfig` carries the full schema (with TOML deserialization and validation), and the runtime converts to `LogConfig` at startup via `crates/zeroclaw-runtime/src/observability/runtime_trace.rs::to_log_config`. The result: `zeroclaw-config` can `record!` without inverting the dep tree.
+`zeroclaw-log` defines its own minimal `LogConfig` (in `crates/zeroclaw-log/src/config.rs`): `log_persistence`, `log_persistence_path`, `log_persistence_max_entries`, `log_persistence_max_bytes`, `log_persistence_rotate_daily`, `log_persistence_retention_max_files`, `log_persistence_retention_max_age_days`, `log_tool_io`, `log_tool_io_truncate_bytes`, `log_tool_io_denylist`. This breaks what would otherwise be a dep cycle: `zeroclaw-config::ObservabilityConfig` carries the full schema (with TOML deserialization and validation), and the runtime converts to `LogConfig` at startup and after daemon config reload via `crates/zeroclaw-runtime/src/observability/runtime_trace.rs::to_log_config`. The result: `zeroclaw-config` can `record!` without inverting the dep tree, while log persistence and rotation policy changes still take effect on the next daemon reload.
 
 ## Subscriber installation
 

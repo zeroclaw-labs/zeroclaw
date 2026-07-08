@@ -68,7 +68,8 @@ fn gemini_convert_tools_returns_prompt_guided() {
                 "value": {"type": "string"}
             },
             "required": ["key", "value"]
-        }),
+        })
+        .into(),
     }];
 
     let payload = model_provider.convert_tools(&tools);
