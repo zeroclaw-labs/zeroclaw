@@ -165,6 +165,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn factory_native_default_shell_is_sh() {
         let cfg = RuntimeConfig {
             kind: RuntimeKind::Native,
@@ -176,7 +177,6 @@ mod tests {
             .build_shell_command("echo hi", &std::env::temp_dir())
             .unwrap();
         let debug = format!("{cmd:?}");
-        #[cfg(not(target_os = "windows"))]
         assert!(
             debug.contains("\"sh\""),
             "default shell should be 'sh', got: {debug}"

@@ -60,7 +60,7 @@ pub async fn handle_command(
     let workspace_dir = &config.data_dir;
     match command {
         crate::SkillCommands::List => {
-            let skills = load_skills_with_config(workspace_dir, config);
+            let (skills, skipped) = load_skills_with_config_audited(workspace_dir, config);
             if skills.is_empty() {
                 println!("{}", get_required_cli_string("cli-skills-none-installed"));
                 println!();
@@ -104,6 +104,42 @@ pub async fn handle_command(
                                 "cli-skills-tags",
                                 &[("tags", &skill.tags.join(", "))],
                             )
+                        );
+                    }
+                }
+            }
+            if !skipped.is_empty() {
+                println!();
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-skipped-header",
+                        &[("count", &skipped.len().to_string())],
+                    )
+                );
+                println!();
+                for entry in &skipped {
+                    let (reason, scripts_blocked) = match &entry.reason {
+                        SkillDropReason::AuditFindings {
+                            summary,
+                            scripts_blocked,
+                        } => (summary.clone(), *scripts_blocked),
+                        SkillDropReason::AuditError(s) | SkillDropReason::ManifestParseError(s) => {
+                            (s.clone(), false)
+                        }
+                    };
+                    println!("  {}", console::style(&entry.name).yellow().bold());
+                    println!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-skills-skipped-reason",
+                            &[("reason", &reason)],
+                        )
+                    );
+                    if scripts_blocked && !config.skills.allow_scripts {
+                        println!(
+                            "{}",
+                            get_required_cli_string("cli-skills-skipped-scripts-hint")
                         );
                     }
                 }

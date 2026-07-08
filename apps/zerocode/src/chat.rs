@@ -1538,6 +1538,24 @@ impl Chat {
             Some(ChatTabAction::FastScrollDown) => {
                 state.scroll_down(5);
             }
+            Some(ChatTabAction::ScrollUp) => {
+                state.scroll_up(1);
+            }
+            Some(ChatTabAction::ScrollDown) => {
+                state.scroll_down(1);
+            }
+            Some(ChatTabAction::PageUp) => {
+                state.page_up();
+            }
+            Some(ChatTabAction::PageDown) => {
+                state.page_down();
+            }
+            Some(ChatTabAction::JumpStart) => {
+                state.scroll_to_top();
+            }
+            Some(ChatTabAction::JumpEnd) => {
+                state.scroll_to_bottom();
+            }
             Some(ChatTabAction::BrowseUpVim)
                 if state.in_browse_mode()
                     && state.pending_approval().is_none()
@@ -1845,6 +1863,47 @@ impl Chat {
         }
     }
 
+    async fn open_agent_picker(&mut self, current_alias: String) {
+        let agents = match self.rpc.agents_status().await {
+            Ok(result) => result
+                .agents
+                .into_iter()
+                .filter(|agent| agent.enabled)
+                .map(|agent| agent.alias)
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                if let ChatPhase::Active(state) = &mut self.phase {
+                    state.info_message =
+                        Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
+                            "zc-chat-error-fetch-agents",
+                            &[("error", &e.to_string())],
+                        )));
+                    state.mark_dirty_full();
+                }
+                return;
+            }
+        };
+
+        if agents.len() <= 1 {
+            return;
+        }
+
+        let selected = agents
+            .iter()
+            .position(|agent| agent == &current_alias)
+            .unwrap_or(0);
+        let mut list_state = ListState::default();
+        list_state.select(Some(selected));
+
+        self.resume_session_id = None;
+        self.resume_agent_alias = None;
+        self.phase = ChatPhase::PickAgent {
+            agents,
+            list_state,
+            loading: false,
+        };
+    }
+
     pub(crate) async fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
         // Dir-picker explorer handles its own mouse events.
         if let ChatPhase::PickCwd { explorer, .. } = &mut self.phase {
@@ -1886,6 +1945,19 @@ impl Chat {
             if let Some(alias) = confirm_alias {
                 self.pick_or_start_session(&alias).await;
             }
+            return;
+        }
+
+        if let ChatPhase::Active(state) = &self.phase
+            && let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+            && !state.turn_in_flight
+            && !state.input_bar.has_file_explorer()
+            && matches!(state.session_overlay, SessionOverlay::None)
+            && !state.model_picker.is_open()
+            && state.title_hit_target_at(mouse.column, mouse.row) == Some(TitleHitTarget::Agent)
+        {
+            let current_alias = state.agent_alias.clone();
+            self.open_agent_picker(current_alias).await;
             return;
         }
 
@@ -1951,6 +2023,7 @@ impl Chat {
                 && let Some(target) = state.title_hit_target_at(col, row)
             {
                 match target {
+                    TitleHitTarget::Agent => {}
                     TitleHitTarget::ModelProvider => {
                         let rpc = self.rpc.clone();
                         Self::open_provider_picker(&rpc, state).await;
@@ -2208,6 +2281,15 @@ impl Chat {
         }
     }
 
+    pub(crate) fn wants_quit_chord(&self) -> bool {
+        match &self.phase {
+            ChatPhase::Active(s) => {
+                s.turn_in_flight && !matches!(s.turn_status, TurnStatus::Cancelling)
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn wants_text_input(&self) -> bool {
         match &self.phase {
             // CWD picker always captures text input.
@@ -2426,10 +2508,6 @@ impl crate::widgets::HelpContext for Chat {
                         crate::i18n::t("zc-chat-help-scroll-conversation"),
                     ),
                     E::key("t", crate::i18n::t("zc-chat-help-toggle-thoughts")),
-                    E::key(
-                        "/toggle-thinking",
-                        crate::i18n::t("zc-chat-help-toggle-thinking-cmd"),
-                    ),
                     E::spacer(),
                     E::key(
                         chord_label(ChatTabAction::NewSession),
@@ -2437,7 +2515,7 @@ impl crate::widgets::HelpContext for Chat {
                     ),
                     E::key(
                         chord_label(ChatTabAction::SwitchSession),
-                        crate::i18n::t("zc-chat-help-session-list"),
+                        crate::i18n::t("zc-chat-help-switch-session"),
                     ),
                     E::spacer(),
                     E::key(
@@ -2595,7 +2673,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let turn_status = state.turn_status.clone();
     let turn_started_at = state.turn_started_at;
 
-    let _live_input_tokens = state.context_input_tokens;
+    let _live_input_tokens: Option<u64> = state.context_input_tokens;
 
     // Transient info-bar messages (queue/attach notices, model-switch notes)
     // render at the app level via InfoBar from `state.info_message`. The paused
@@ -4307,6 +4385,7 @@ struct ScrollbarDrag {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TitleHitTarget {
+    Agent,
     ModelProvider,
     Model,
 }
@@ -4956,6 +5035,25 @@ impl ChatState {
         }
     }
 
+    pub fn page_up(&mut self) {
+        self.scroll_up(self.last_inner_height.max(1));
+    }
+
+    pub fn page_down(&mut self) {
+        self.scroll_down(self.last_inner_height.max(1));
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.pinned_to_bottom = false;
+        self.scroll_offset = 0;
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        let max = self.last_total_rows.saturating_sub(self.last_inner_height);
+        self.scroll_offset = max;
+        self.pinned_to_bottom = true;
+    }
+
     pub fn title(&self) -> String {
         self.title_parts()
             .into_iter()
@@ -4967,7 +5065,7 @@ impl ChatState {
     fn title_parts(&self) -> Vec<(Option<TitleHitTarget>, String)> {
         let short = self.session_id.get(..7).unwrap_or(self.session_id.as_str());
         let mut parts: Vec<(Option<TitleHitTarget>, String)> = Vec::with_capacity(5);
-        parts.push((None, self.agent_alias.clone()));
+        parts.push((Some(TitleHitTarget::Agent), self.agent_alias.clone()));
         if let Some(ref name) = self.session_name {
             parts.push((None, format!("— {name}")));
         }
@@ -5881,18 +5979,19 @@ mod tests {
             Some(TitleHitTarget::ModelProvider)
         );
         assert_eq!(s.title_hit_target_at(38, 4), Some(TitleHitTarget::Model));
-        assert_eq!(s.title_hit_target_at(12, 4), None);
+        assert_eq!(s.title_hit_target_at(12, 4), Some(TitleHitTarget::Agent));
         assert_eq!(s.title_hit_target_at(25, 5), None);
     }
 
     #[test]
-    fn title_hit_rects_are_empty_before_model_identity_resolves() {
+    fn title_hit_rects_target_agent_before_model_identity_resolves() {
         let mut s = ChatState::new("abcdef1234".to_string(), "ag".to_string());
 
         s.refresh_title_hit_rects(Rect::new(10, 4, 80, 20));
 
-        assert!(s.title_hit_rects.is_empty());
-        assert_eq!(s.title_hit_target_at(12, 4), None);
+        assert_eq!(s.title_hit_rects.len(), 1);
+        assert_eq!(s.title_hit_target_at(12, 4), Some(TitleHitTarget::Agent));
+        assert_eq!(s.title_hit_target_at(16, 4), None);
     }
 
     #[test]
@@ -5993,6 +6092,36 @@ mod tests {
         assert!(
             chat.wants_text_input(),
             "an active pending elicitation must claim modal focus"
+        );
+    }
+
+    #[tokio::test]
+    async fn wants_quit_chord_tracks_in_flight_turn_state() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Active(Box::new(state()));
+
+        assert!(
+            !chat.wants_quit_chord(),
+            "idle pane must leave Ctrl+C to the quit modal"
+        );
+
+        if let ChatPhase::Active(s) = &mut chat.phase {
+            s.turn_in_flight = true;
+        }
+        assert!(
+            chat.wants_quit_chord(),
+            "an in-flight turn must consume Ctrl+C to cancel before quit"
+        );
+
+        if let ChatPhase::Active(s) = &mut chat.phase {
+            s.enter_cancelling();
+        }
+        assert!(
+            !chat.wants_quit_chord(),
+            "an already-cancelling turn must not re-consume Ctrl+C"
         );
     }
 
@@ -6133,6 +6262,97 @@ mod tests {
         } else {
             panic!("expected PickAgent phase");
         }
+    }
+
+    #[tokio::test]
+    async fn active_agent_title_click_opens_agent_picker() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let area = Rect::new(10, 4, 80, 20);
+        let mut state = ChatState::new("abcdef1234".to_string(), "beta".to_string());
+        state.refresh_title_hit_rects(area);
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        let switch = tokio::spawn(async move {
+            chat.handle_mouse(click, area).await;
+            chat
+        });
+
+        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("agent title click should request the agent list")
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        let id = request["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0},
+                    {"alias": "beta", "enabled": true, "live_sessions": 1},
+                    {"alias": "disabled", "enabled": false, "live_sessions": 0}
+                ]
+            })),
+            None,
+        );
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), switch)
+            .await
+            .expect("agent picker should open after agents/status response")
+            .unwrap();
+        let ChatPhase::PickAgent {
+            agents, list_state, ..
+        } = chat.phase
+        else {
+            panic!("expected PickAgent phase");
+        };
+        assert_eq!(agents, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(list_state.selected(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn active_agent_title_click_ignored_while_turn_in_flight() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let area = Rect::new(10, 4, 80, 20);
+        let mut state = ChatState::new("abcdef1234".to_string(), "beta".to_string());
+        state.turn_in_flight = true;
+        state.refresh_title_hit_rects(area);
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        chat.handle_mouse(click, area).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "in-flight agent title click must not call agents/status"
+        );
+        assert!(
+            matches!(chat.phase, ChatPhase::Active(_)),
+            "in-flight agent title click must leave the active session visible"
+        );
     }
 
     #[tokio::test]
@@ -7435,6 +7655,32 @@ mod tests {
             s.enqueue_message("overflow".to_string(), Vec::new())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn page_and_jump_scroll_move_the_viewport() {
+        let mut s = state();
+        s.last_total_rows = 100;
+        s.last_inner_height = 10;
+        s.scroll_to_bottom();
+        let bottom = s.scroll_offset;
+        assert_eq!(bottom, 90);
+        assert!(s.pinned_to_bottom);
+
+        s.page_up();
+        assert_eq!(s.scroll_offset, 80);
+        assert!(!s.pinned_to_bottom);
+
+        s.scroll_to_top();
+        assert_eq!(s.scroll_offset, 0);
+        assert!(!s.pinned_to_bottom);
+
+        s.page_down();
+        assert_eq!(s.scroll_offset, 10);
+
+        s.scroll_to_bottom();
+        assert_eq!(s.scroll_offset, bottom);
+        assert!(s.pinned_to_bottom);
     }
 
     #[test]
