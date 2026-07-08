@@ -1,0 +1,28 @@
+# Standalone crate (own [workspace]): built for wasm32-wasip2 as a test fixture,
+# NOT part of the host workspace. Mirrors the published reference-plugin setup.
+#
+# Build:  rustup target add wasm32-wasip2
+#         cargo build --target wasm32-wasip2 --release
+# then copy target/wasm32-wasip2/release/channel_fixture.wasm to
+# crates/zeroclaw-plugins/tests/fixtures/channel-fixture.wasm
+[package]
+name = "channel-fixture"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "ZeroClaw WIT channel plugin test fixture: a minimal echo channel."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.46"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+
+[workspace]
