@@ -47,7 +47,7 @@ pub async fn apply_with_hsts(request: Request, next: Next) -> Response {
     response
 }
 
-fn inject(headers: &mut HeaderMap, hsts: bool) {
+pub(crate) fn inject(headers: &mut HeaderMap, hsts: bool) {
     for (name, value) in SECURITY_HEADERS {
         set_if_absent(headers, name, value);
     }
