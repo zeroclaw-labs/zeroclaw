@@ -203,7 +203,10 @@ impl OpenRouterModelProvider {
     pub fn new(alias: &str, credential: Option<&str>) -> Self {
         Self {
             alias: alias.to_string(),
-            credential: credential.map(ToString::to_string),
+            credential: credential
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .map(ToString::to_string),
             timeout_secs: zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS,
             max_tokens: None,
             extra_body: None,

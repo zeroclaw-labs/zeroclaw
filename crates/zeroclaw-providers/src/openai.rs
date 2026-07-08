@@ -209,7 +209,10 @@ impl OpenAiModelProvider {
         Self {
             alias: alias.to_string(),
             base_url: BASE_URL.to_string(),
-            credential: credential.map(ToString::to_string),
+            credential: credential
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .map(ToString::to_string),
             max_tokens: None,
             timeout_secs: 120,
         }
@@ -1226,9 +1229,16 @@ mod tests {
     }
 
     #[test]
-    fn creates_with_empty_key() {
+    fn empty_key_is_treated_as_missing() {
+        // Whitespace-only / empty credentials collapse to None so a stray
+        // "" from config cannot produce a bogus `Bearer ` header. Matches
+        // the trim-then-filter contract shared with anthropic/openrouter/
+        // azure/compat.
         let p = OpenAiModelProvider::new("test", Some(""));
-        assert_eq!(p.credential.as_deref(), Some(""));
+        assert!(p.credential.is_none());
+
+        let p = OpenAiModelProvider::new("test", Some("  \t  "));
+        assert!(p.credential.is_none());
     }
 
     #[tokio::test]

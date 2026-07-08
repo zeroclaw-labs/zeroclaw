@@ -256,9 +256,14 @@ impl OpenAiCompatibleBuilder {
 
     /// Explicit API credential. `None` (the default) leaves this provider
     /// unauthenticated, which is how local LLM servers (Ollama,
-    /// llama.cpp) are constructed.
+    /// llama.cpp) are constructed. Whitespace-only inputs are normalized
+    /// to `None` so a stray `Some("   ")` from config cannot produce a
+    /// bogus `Bearer    ` header.
     pub fn credential(mut self, credential: Option<&str>) -> Self {
-        self.credential = credential.map(ToString::to_string);
+        self.credential = credential
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
         self
     }
 
