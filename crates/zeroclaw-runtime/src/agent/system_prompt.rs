@@ -74,7 +74,7 @@ pub fn build_system_prompt(
         identity_config,
         bootstrap_max_chars,
         false,
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
         AutonomyLevel::default(),
     )
 }

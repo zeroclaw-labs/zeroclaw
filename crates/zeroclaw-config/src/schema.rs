@@ -3321,6 +3321,7 @@ pub struct ResolvedRuntime {
     pub max_tool_result_chars: usize,
     pub keep_tool_context_turns: usize,
     pub tool_receipts: ToolReceiptsConfig,
+    pub prompt_injection_mode: SkillsPromptInjectionMode,
 }
 
 impl ResolvedRuntime {
@@ -3359,6 +3360,7 @@ impl Default for ResolvedRuntime {
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
             tool_receipts: ToolReceiptsConfig::default(),
+            prompt_injection_mode: SkillsPromptInjectionMode::default(),
         }
     }
 }
@@ -4058,6 +4060,7 @@ impl Config {
             max_system_prompt_chars: self.effective_max_system_prompt_chars(agent_alias),
             max_tool_result_chars: self.effective_max_tool_result_chars(agent_alias),
             keep_tool_context_turns: self.effective_keep_tool_context_turns(agent_alias),
+            prompt_injection_mode: self.effective_skills_prompt_mode(agent_alias),
             ..ResolvedRuntime::default()
         };
         if let Some(profile) = self.runtime_profile_for_agent(agent_alias) {
@@ -4072,6 +4075,27 @@ impl Config {
         }
         out.resolved = resolved;
         Some(out)
+    }
+
+    /// Resolve the effective skills prompt-injection mode for an agent: the
+    /// agent's resolved runtime profile's `prompt_injection_mode` override when
+    /// set, otherwise the global `[skills] prompt_injection_mode`. Agents with
+    /// no runtime profile (or an unknown alias) fall back to the global value.
+    ///
+    /// Keyed on the resolved runtime profile — the sanctioned surface for
+    /// per-agent runtime tunables (#6877) — so agent-inline knobs stay inert.
+    /// Centralizing the fallback here keeps the system-prompt builder and the
+    /// `read_skill` tool-registration gate in lockstep on one effective mode,
+    /// so a compact prompt is never paired with a missing `read_skill` tool
+    /// (or a full prompt with a spurious one).
+    #[must_use]
+    pub fn effective_skills_prompt_mode(&self, agent_alias: &str) -> SkillsPromptInjectionMode {
+        // Global `full` is deprecated and inert: it resolves to `Compact` so
+        // skills render as on-demand summaries. A runtime profile that
+        // explicitly pins `full` is honored (#8235) and still inlines eagerly.
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.prompt_injection_mode)
+            .unwrap_or(SkillsPromptInjectionMode::Compact)
     }
 
     /// Resolve an agent's `model_provider` reference (`"<type>.<alias>"`) to
@@ -11331,6 +11355,14 @@ pub struct RuntimeProfileConfig {
     /// Maximum memory entries injected per turn. `None` inherits global default (5).
     /// Set to `0` for unlimited.
     pub memory_recall_limit: Option<usize>,
+    /// How skills are injected into the system prompt for agents on this
+    /// profile. `None` inherits the global `[skills] prompt_injection_mode`;
+    /// `compact` inlines only compact skill metadata and registers the
+    /// `read_skill` tool, `full` inlines full skill instructions. Resolved
+    /// through [`Config::effective_skills_prompt_mode`], the single point both
+    /// the system-prompt builder and the `read_skill` tool-registration gate
+    /// consult so they always agree on the effective mode.
+    pub prompt_injection_mode: Option<SkillsPromptInjectionMode>,
     pub strict_tool_parsing: bool,
     #[nested]
     pub thinking: crate::scattered_types::ThinkingConfig,
@@ -11368,6 +11400,7 @@ impl Default for RuntimeProfileConfig {
             max_tool_result_chars: None,
             keep_tool_context_turns: None,
             memory_recall_limit: None,
+            prompt_injection_mode: None,
             strict_tool_parsing: false,
             thinking: crate::scattered_types::ThinkingConfig::default(),
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
@@ -22138,6 +22171,177 @@ api_token = "Bearer test-token"
         );
         assert!(c.data_dir.to_string_lossy().contains("data"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
+    }
+
+    #[test]
+    async fn runtime_profile_prompt_injection_mode_overrides_global() {
+        let mut config = Config::default();
+        config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Full;
+        // A runtime profile that pins compact, and an agent pointing at it.
+        config.runtime_profiles.insert(
+            "compact_profile".to_string(),
+            RuntimeProfileConfig {
+                prompt_injection_mode: Some(SkillsPromptInjectionMode::Compact),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        // A runtime profile that leaves the mode unset (inherits global).
+        config
+            .runtime_profiles
+            .insert("unset_profile".to_string(), RuntimeProfileConfig::default());
+        config.agents.insert(
+            "override".to_string(),
+            AliasedAgentConfig {
+                runtime_profile: "compact_profile".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "unset".to_string(),
+            AliasedAgentConfig {
+                runtime_profile: "unset_profile".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        // An agent with no runtime profile inherits the global.
+        config
+            .agents
+            .insert("inherit".to_string(), AliasedAgentConfig::default());
+
+        // Profile override to Compact beats the (deprecated) global value.
+        assert_eq!(
+            config.effective_skills_prompt_mode("override"),
+            SkillsPromptInjectionMode::Compact
+        );
+        // Global `full` is deprecated and inert: a profile that leaves the mode
+        // unset, an agent with no profile, and an unknown alias all coerce to
+        // Compact rather than inheriting the global `full`.
+        assert_eq!(
+            config.effective_skills_prompt_mode("unset"),
+            SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            config.effective_skills_prompt_mode("inherit"),
+            SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            config.effective_skills_prompt_mode("missing"),
+            SkillsPromptInjectionMode::Compact
+        );
+
+        // A runtime profile that explicitly pins Full is still honored (#8235),
+        // even though global Full is inert.
+        config.runtime_profiles.insert(
+            "full_profile".to_string(),
+            RuntimeProfileConfig {
+                prompt_injection_mode: Some(SkillsPromptInjectionMode::Full),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "pinned_full".to_string(),
+            AliasedAgentConfig {
+                runtime_profile: "full_profile".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        assert_eq!(
+            config.effective_skills_prompt_mode("pinned_full"),
+            SkillsPromptInjectionMode::Full
+        );
+
+        // Flipping the global to Compact changes nothing: the coerced agents
+        // stay Compact and the explicit Full pin stays Full.
+        config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Compact;
+        assert_eq!(
+            config.effective_skills_prompt_mode("unset"),
+            SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            config.effective_skills_prompt_mode("inherit"),
+            SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            config.effective_skills_prompt_mode("missing"),
+            SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            config.effective_skills_prompt_mode("override"),
+            SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            config.effective_skills_prompt_mode("pinned_full"),
+            SkillsPromptInjectionMode::Full
+        );
+    }
+
+    #[test]
+    async fn runtime_profile_prompt_injection_mode_deserializes() {
+        // Absent → None, so a profile that omits the key inherits the global
+        // mode (no migration for existing global-only configs).
+        let inherited: RuntimeProfileConfig = toml::from_str("").unwrap();
+        assert_eq!(inherited.prompt_injection_mode, None);
+
+        // Explicit wire spellings parse to their variants.
+        let compact: RuntimeProfileConfig =
+            toml::from_str("prompt_injection_mode = \"compact\"").unwrap();
+        assert_eq!(
+            compact.prompt_injection_mode,
+            Some(SkillsPromptInjectionMode::Compact)
+        );
+        let full: RuntimeProfileConfig =
+            toml::from_str("prompt_injection_mode = \"full\"").unwrap();
+        assert_eq!(
+            full.prompt_injection_mode,
+            Some(SkillsPromptInjectionMode::Full)
+        );
+    }
+
+    #[test]
+    async fn resolved_agent_config_bakes_prompt_injection_mode_from_profile() {
+        // The documented invariant: a runtime_profile knob must be threaded
+        // through `resolved_agent_config` into `ResolvedRuntime`, consistent
+        // with the `effective_*` helper.
+        let raw = r#"
+[skills]
+prompt_injection_mode = "full"
+
+[runtime_profiles.fast]
+prompt_injection_mode = "compact"
+
+[agents.default]
+runtime_profile = "fast"
+
+[agents.plain]
+"#;
+        let parsed = parse_test_config(raw);
+
+        // Profiled agent: resolved value + effective helper both see compact.
+        let resolved = parsed
+            .resolved_agent_config("default")
+            .expect("agent default resolves");
+        assert_eq!(
+            resolved.resolved.prompt_injection_mode,
+            SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            parsed.effective_skills_prompt_mode("default"),
+            SkillsPromptInjectionMode::Compact
+        );
+
+        // Profile-less agent: global `full` is deprecated and inert, so both
+        // the resolved value and the effective helper coerce to compact.
+        let plain = parsed
+            .resolved_agent_config("plain")
+            .expect("agent plain resolves");
+        assert_eq!(
+            plain.resolved.prompt_injection_mode,
+            SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(
+            parsed.effective_skills_prompt_mode("plain"),
+            SkillsPromptInjectionMode::Compact
+        );
     }
 
     #[test]

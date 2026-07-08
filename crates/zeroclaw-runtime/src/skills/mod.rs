@@ -1722,13 +1722,12 @@ fn skill_tool_is_prompt_callable(tool: &SkillTool) -> bool {
 pub fn skills_to_prompt_with_mode(
     skills: &[Skill],
     workspace_dir: &Path,
-    // DEPRECATED: the injection mode is ignored — skills now always render as
+    // A per-agent runtime profile can pin `Full` to inline skill instructions
+    // eagerly (#8235). Global `full` is deprecated and inert: it resolves to
+    // `Compact` before reaching here, so an agent gets full inlining only when
+    // its runtime profile explicitly pins `Full`, otherwise skills render as
     // compact summaries whose instructions load on demand via `read_skill`.
-    // `Full` was removed because inlining every skill body blows up the context
-    // window and diverges from the progressive-disclosure model used by Claude
-    // Code and OpenClaw. This parameter is retained only so existing call sites
-    // keep compiling during the deprecation window.
-    _mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+    mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
 ) -> String {
     use std::fmt::Write;
 
@@ -1736,23 +1735,46 @@ pub fn skills_to_prompt_with_mode(
         return String::new();
     }
 
-    let mut prompt = String::from(
-        "## Available Skills\n\n\
-         Skill summaries are preloaded below to keep context compact.\n\
-         Skill instructions are loaded on demand: call `read_skill(name)` with the skill's `<name>` when you need the full skill file.\n\
-         The `location` field is included for reference.\n\n\
-         <available_skills>\n",
+    let is_full = matches!(
+        mode,
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Full
     );
+
+    let mut prompt = if is_full {
+        String::from(
+            "## Available Skills\n\n\
+             Skill instructions and tool metadata are preloaded below.\n\
+             Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\n\
+             <available_skills>\n",
+        )
+    } else {
+        String::from(
+            "## Available Skills\n\n\
+             Skill summaries are preloaded below to keep context compact.\n\
+             Skill instructions are loaded on demand: call `read_skill(name)` with the skill's `<name>` when you need the full skill file.\n\
+             The `location` field is included for reference.\n\n\
+             <available_skills>\n",
+        )
+    };
 
     for skill in skills {
         let _ = writeln!(prompt, "  <skill>");
         write_xml_text_element(&mut prompt, 4, "name", &skill.name);
         write_xml_text_element(&mut prompt, 4, "description", &skill.description);
-        let location = render_skill_location(skill, workspace_dir, true);
+        let location = render_skill_location(skill, workspace_dir, !is_full);
         write_xml_text_element(&mut prompt, 4, "location", &location);
 
-        // Skill instructions are always loaded on demand via `read_skill`; only
-        // tool metadata is inlined so the LLM knows which skill tools exist.
+        // Full mode inlines instructions eagerly. Compact mode skips them
+        // (loaded on demand via `read_skill`) and inlines only tool metadata so
+        // the LLM knows which skill tools exist.
+        if is_full && !skill.prompts.is_empty() {
+            let _ = writeln!(prompt, "    <instructions>");
+            for instruction in &skill.prompts {
+                write_xml_text_element(&mut prompt, 6, "instruction", instruction);
+            }
+            let _ = writeln!(prompt, "    </instructions>");
+        }
+
         if !skill.tools.is_empty() {
             // Callable (registered as a callable tool spec, invocable directly via
             // function calling) vs prompt-only is decided by

@@ -862,6 +862,10 @@ turn-stream-interrupted = [stream interrupted]
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 # Reason carried on every history_trimmed event (WS, SSE, ACP).
 history-trim-reason-budget = context token budget exceeded
+# Remediation surfaced when the system prompt + inlined tool definitions alone
+# meet or exceed the context budget, so no amount of conversation trimming can
+# fit the request (#5808).
+history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 # Refusal returned when the ingress policy layer (RFC #6971) drops an inbound
 # turn before it reaches the model. Unreachable under the default `Loop` policy
 # (phase 1); becomes live when non-`Loop` policy is configured (phase 3).

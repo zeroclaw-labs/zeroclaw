@@ -744,6 +744,7 @@ turn-cancelled-client-rpc = [クライアント経由でターンがキャンセ
 turn-stream-interrupted = [ストリームが中断されました]
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
+history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 turn-ingress-dropped = このリクエストは処理されませんでした: { $reason }
 turn-tool-interrupted-before-result = [このツールが結果を生成する前にユーザーによって中断されました]
 channel-runtime-malformed-tool-output = 内部ツール呼び出し形式のエラーが発生し、このリクエストを完了できませんでした。もう一度お試しください。

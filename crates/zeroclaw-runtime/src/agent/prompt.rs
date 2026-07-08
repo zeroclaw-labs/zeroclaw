@@ -466,9 +466,10 @@ mod tests {
     }
 
     #[test]
-    fn skills_section_ignores_deprecated_full_mode() {
-        // `Full` is deprecated and inert: instructions are never inlined,
-        // regardless of the requested mode. Only tool metadata is rendered.
+    fn skills_section_renders_compact_for_coerced_global_full() {
+        // Global `full` is deprecated and coerced to Compact upstream, so the
+        // section receives Compact for the global path: instructions are not
+        // inlined, only tool metadata is rendered.
         let tools: Vec<Box<dyn Tool>> = vec![];
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
@@ -498,8 +499,8 @@ mod tests {
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
-            // Explicitly request the deprecated mode to prove it is ignored.
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            // Coerced global path: the section receives Compact.
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
             identity_config: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
