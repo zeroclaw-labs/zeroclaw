@@ -17,6 +17,8 @@ use tokio::sync::{broadcast, mpsc};
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
 use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
 
+const CRON_TRIGGER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 // ── Platform local-stream shim ──────────────────────────────────
 
 #[cfg(unix)]
@@ -98,6 +100,8 @@ pub mod method {
     pub const SESSION_LIST_ACP: &str = "session/list-acp";
     pub const AGENTS_STATUS: &str = "agents/status";
     pub const CRON_LIST: &str = "cron/list";
+    pub const CRON_RUNS: &str = "cron/runs";
+    pub const CRON_TRIGGER: &str = "cron/trigger";
     pub const MEMORY_LIST: &str = "memory/list";
     pub const MEMORY_SEARCH: &str = "memory/search";
     pub const SESSION_MESSAGES: &str = "session/messages";
@@ -1382,6 +1386,23 @@ impl RpcClient {
         self.call(method::CRON_LIST, serde_json::json!({})).await
     }
 
+    pub async fn cron_runs(&self, id: &str, limit: Option<u32>) -> Result<CronRunsResult> {
+        self.call(
+            method::CRON_RUNS,
+            serde_json::json!({ "id": id, "limit": limit }),
+        )
+        .await
+    }
+
+    pub async fn cron_trigger(&self, id: &str) -> Result<CronTriggerResult> {
+        self.call_with_timeout(
+            method::CRON_TRIGGER,
+            serde_json::json!({ "id": id }),
+            CRON_TRIGGER_TIMEOUT,
+        )
+        .await
+    }
+
     pub async fn memory_list(&self, category: Option<&str>) -> Result<MemoryListResult> {
         self.call(
             method::MEMORY_LIST,
@@ -2215,6 +2236,31 @@ pub struct CronListResult {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+pub struct CronRunEntry {
+    pub id: i64,
+    pub job_id: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub status: String,
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(default)]
+    pub duration_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CronRunsResult {
+    pub runs: Vec<CronRunEntry>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CronTriggerResult {
+    pub id: String,
+    pub success: bool,
+    pub output: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct MemoryEntryResult {
     pub key: String,
     pub content: String,
@@ -2386,6 +2432,81 @@ mod session_method_tests {
             .expect("client.session_cancel must resolve after the response is dispatched")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cron_runs_sends_job_id_and_limit() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move { client.cron_runs("job-1", Some(3)).await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.cron_runs must send a wire request; a hang here wedges the TTY")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "cron/runs");
+        assert_eq!(req["params"]["id"], "job-1");
+        assert_eq!(req["params"]["limit"], 3);
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({
+                "runs": [{
+                    "id": 7,
+                    "job_id": "job-1",
+                    "started_at": "2026-06-18T00:00:00Z",
+                    "finished_at": "2026-06-18T00:00:02Z",
+                    "status": "ok",
+                    "output": "done",
+                    "duration_ms": 2000
+                }]
+            })),
+            None,
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.cron_runs must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.runs.len(), 1);
+        assert_eq!(result.runs[0].job_id, "job-1");
+        assert_eq!(result.runs[0].duration_ms, Some(2000));
+    }
+
+    #[tokio::test]
+    async fn cron_trigger_sends_job_id() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move { client.cron_trigger("job-1").await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.cron_trigger must send a wire request; a hang here wedges the TTY")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "cron/trigger");
+        assert_eq!(req["params"]["id"], "job-1");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({"id": "job-1", "success": true, "output": "done"})),
+            None,
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.cron_trigger must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.id, "job-1");
+        assert!(result.success);
+        assert_eq!(result.output, "done");
     }
 
     #[tokio::test]
