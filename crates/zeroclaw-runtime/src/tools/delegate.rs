@@ -892,7 +892,6 @@ impl DelegateTool {
                 exclude_memory: false,
                 list_deferred_mcp_specs: false,
                 emit_assembly_logs: true,
-                list_deferred_mcp_specs: false,
             },
         )
         .await;
