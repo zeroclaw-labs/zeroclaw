@@ -2496,9 +2496,19 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
         return Ok(false);
     };
 
-    let created = config
-        .create_map_key(section_path, key)
-        .map_err(anyhow::Error::msg)?;
+    // Route through the shared `create_map_key_checked` (not raw
+    // `create_map_key`) so this CLI path inherits the reserved `default`
+    // agent guard from the one place it's defined, rather than re-deriving
+    // `section == "agents" && is_reserved_agent_alias(key)` here too. Without
+    // this, widening past `providers.*` would let `config set
+    // agents.default.enabled ...` auto-create the reserved runtime-fallback
+    // agent alias, which the rename guard then refuses to ever rename.
+    let created =
+        match zeroclaw_config::alias_refs::create_map_key_checked(config, section_path, key) {
+            Ok(created) => created,
+            Err(zeroclaw_config::alias_refs::CreateError::Reserved(_)) => return Ok(false),
+            Err(e) => return Err(anyhow::Error::msg(e.to_string())),
+        };
     if created {
         // The section matched and the alias was newly materialized, but the
         // requested prop path might still not resolve (typo'd trailing field
@@ -8778,6 +8788,33 @@ mod tests {
                 "{path} must be settable after map-key materialization"
             );
         }
+    }
+
+    #[test]
+    fn ensure_map_key_for_prop_path_refuses_reserved_default_agent() {
+        let mut config = Config::default();
+
+        let created = ensure_map_key_for_prop_path(&mut config, "agents.default.enabled")
+            .expect("agents is a known map-keyed section; refusal is not an error");
+        assert!(
+            !created,
+            "must refuse to auto-create the reserved `default` agent alias"
+        );
+        assert!(
+            config.agents.is_empty(),
+            "no `agents.default` entry should have been left behind by the refused create"
+        );
+
+        let created = ensure_map_key_for_prop_path(&mut config, "agents.researcher.enabled")
+            .expect("non-reserved agent aliases should still materialize");
+        assert!(
+            created,
+            "agents.<non-default> must still auto-materialize like every other widened section"
+        );
+        assert!(
+            config.agents.contains_key("researcher"),
+            "researcher alias should have been created"
+        );
     }
 
     #[test]
