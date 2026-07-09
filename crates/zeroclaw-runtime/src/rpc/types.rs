@@ -1381,6 +1381,13 @@ pub enum SessionUpdateEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_context_tokens: Option<u64>,
     },
+    /// Emitted when the TodoWrite tool produces a plan. The `entries` array
+    /// carries the normalized `PlanEntry` values (content, status, priority,
+    /// optional activeForm) so the client can render the live tracker.
+    Plan {
+        session_id: String,
+        entries: Vec<zeroclaw_api::plan::PlanEntry>,
+    },
     /// Terminal event for a turn. Replaces the response of `session/prompt`.
     /// `outcome` distinguishes a clean finish from a user-initiated cancel.
     TurnComplete {
