@@ -1069,6 +1069,26 @@ impl RpcDispatcher {
                             .sessions
                             .seed_conversation_history(&session_id, data.messages)
                             .await;
+                        // Restore the durable TodoWrite plan into the fresh
+                        // in-memory session and re-emit it so the resuming /
+                        // reconnecting client's tracker repopulates without a
+                        // model round-trip. Robust against tmux detach, socket
+                        // drop, suspend/resume, and daemon restart.
+                        if let Some(ref store) = self.ctx.acp_session_store {
+                            let store = store.clone();
+                            let sid = session_id.clone();
+                            let plan = tokio::task::spawn_blocking(move || {
+                                store.get_plan(&sid).unwrap_or_default()
+                            })
+                            .await
+                            .unwrap_or_default();
+                            if !plan.is_empty() {
+                                self.ctx.sessions.set_plan(&session_id, plan.clone()).await;
+                                if let Some(n) = plan_replay_notification(&session_id, &plan) {
+                                    let _ = self.rpc.send_raw(n).await;
+                                }
+                            }
+                        }
                     }
                     Ok(Ok(AcpSessionNewLoad::Created)) => {}
                     Ok(Ok(AcpSessionNewLoad::Killed)) => {
@@ -1580,6 +1600,10 @@ impl RpcDispatcher {
 
         let rpc = self.rpc.clone();
         let sid_owned = sid.to_string();
+        // Clone of the session store so the turn-event closure can persist
+        // the latest TodoWrite plan (store-then-emit) before the plan
+        // notification goes out. See `persist_plan_if_any`.
+        let sessions_for_plan = self.ctx.sessions.clone();
         let acp_token_store = if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
             self.ctx.acp_session_store.clone()
         } else {
@@ -1617,6 +1641,7 @@ impl RpcDispatcher {
                 let rpc = rpc.clone();
                 let sid = sid_owned.clone();
                 let acp_token_store = acp_token_store.clone();
+                let sessions_for_plan = sessions_for_plan.clone();
                 async move {
                     if let (
                         Some(store),
@@ -1633,6 +1658,13 @@ impl RpcDispatcher {
                             tokio::task::spawn_blocking(move || store.set_token_count(&sid, it))
                                 .await;
                     }
+                    // Store-then-emit: persist a TodoWrite plan (both the
+                    // in-memory live cache and, for ACP sessions, the durable
+                    // store) before its notification goes out, so a racing
+                    // reconnect — or a later resume — reads a consistent list.
+                    // No-op for every other event.
+                    persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
+                        .await;
                     if let Some(n) = notification_for_turn_event(&sid, &event, max_ctx) {
                         let _ = rpc.send_raw(n).await;
                     }
@@ -4031,6 +4063,63 @@ fn truncate_memory_previews(
     entries
 }
 
+/// Persist a `TurnEvent::Plan` before it is emitted, so a racing
+/// reconnect — or a later `session/resume` — reads a consistent plan.
+/// Writes both the in-memory live cache (`sessions`) and, when an ACP
+/// durable store is present, the on-disk `plan_json` column (via
+/// `spawn_blocking`, since SQLite is synchronous). No-op for every
+/// other event. Durable-write failures are logged-and-swallowed: the
+/// in-memory cache is still authoritative for the live session.
+async fn persist_plan_if_any(
+    sessions: &crate::rpc::session::SessionStore,
+    acp_store: Option<&std::sync::Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
+    session_id: &str,
+    event: &TurnEvent,
+) {
+    let TurnEvent::Plan { entries } = event else {
+        return;
+    };
+    sessions.set_plan(session_id, entries.clone()).await;
+    if let Some(store) = acp_store {
+        let store = store.clone();
+        let sid = session_id.to_string();
+        let entries = entries.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) = store.set_plan(&sid, &entries) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": sid,
+                            "error": e.to_string(),
+                        })),
+                    "Failed to persist TodoWrite plan to ACP session store"
+                );
+            }
+        })
+        .await;
+    }
+}
+
+/// Build the `session/update` `plan` notification used to repopulate a
+/// resuming/reconnecting client's tracker from stored state. Returns
+/// `None` when the plan is empty (nothing to show). Reuses the same
+/// `TurnEvent::Plan` → notification mapping as the live path so the wire
+/// shape can never drift between live and replay.
+fn plan_replay_notification(
+    session_id: &str,
+    entries: &[zeroclaw_api::plan::PlanEntry],
+) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let event = TurnEvent::Plan {
+        entries: entries.to_vec(),
+    };
+    notification_for_turn_event(session_id, &event, None)
+}
+
 fn notification_for_turn_event(
     session_id: &str,
     event: &TurnEvent,
@@ -4096,6 +4185,10 @@ fn notification_for_turn_event(
                 max_context_tokens,
             }
         }
+        TurnEvent::Plan { entries } => SessionUpdateEvent::Plan {
+            session_id: session_id.to_string(),
+            entries: entries.clone(),
+        },
     };
 
     let params = serde_json::to_value(update).ok()?;
@@ -5062,6 +5155,144 @@ mod tests {
         assert_eq!(v["params"]["type"], "tool_result");
         assert_eq!(v["params"]["tool_call_id"], "tc_1");
         assert_eq!(v["params"]["raw_output"], "file.txt");
+    }
+
+    #[test]
+    fn plan_turn_event_maps_to_plan_notification() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+
+        let event = TurnEvent::Plan {
+            entries: vec![PlanEntry {
+                content: "Analyze codebase".to_string(),
+                status: PlanStatus::InProgress,
+                priority: PlanPriority::High,
+                active_form: Some("Analyzing codebase".to_string()),
+            }],
+        };
+        let json = notification_for_turn_event("sess-1", &event, None)
+            .expect("plan yields a notification");
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "plan");
+        assert_eq!(v["params"]["session_id"], "sess-1");
+        assert_eq!(v["params"]["entries"][0]["content"], "Analyze codebase");
+        assert_eq!(v["params"]["entries"][0]["status"], "in_progress");
+        assert_eq!(v["params"]["entries"][0]["priority"], "high");
+        assert_eq!(
+            v["params"]["entries"][0]["activeForm"],
+            "Analyzing codebase"
+        );
+    }
+
+    #[test]
+    fn empty_plan_turn_event_maps_to_empty_entries() {
+        let event = TurnEvent::Plan { entries: vec![] };
+        let json =
+            notification_for_turn_event("sess-2", &event, None).expect("empty plan still notifies");
+        let v = parse(&json);
+        assert_eq!(v["params"]["type"], "plan");
+        assert!(v["params"]["entries"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resume_plan_notification_built_for_nonempty_plan() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+        let entries = vec![PlanEntry {
+            content: "Resume me".to_string(),
+            status: PlanStatus::Pending,
+            priority: PlanPriority::Medium,
+            active_form: None,
+        }];
+        let json = plan_replay_notification("sess-9", &entries).expect("nonempty plan replays");
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "plan");
+        assert_eq!(v["params"]["session_id"], "sess-9");
+        assert_eq!(v["params"]["entries"][0]["content"], "Resume me");
+    }
+
+    #[test]
+    fn resume_plan_notification_absent_for_empty_plan() {
+        assert!(plan_replay_notification("sess-9", &[]).is_none());
+    }
+
+    async fn store_with_one_session(sid: &str) -> Arc<crate::rpc::session::SessionStore> {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(DummyModelProvider))
+            .tools(vec![])
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .build()
+            .expect("minimal Agent should build");
+        let rpc_session = crate::rpc::session::RpcSession::new(
+            agent,
+            "test-agent",
+            std::env::temp_dir().to_str().unwrap(),
+            crate::rpc::types::ChatMode::Chat,
+        );
+        sessions.insert(sid.to_string(), rpc_session).await.unwrap();
+        sessions
+    }
+
+    #[tokio::test]
+    async fn plan_event_is_stored_before_emitting() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+        let sid = "persist-plan-sess";
+        let store = store_with_one_session(sid).await;
+
+        let entries = vec![PlanEntry {
+            content: "A".to_string(),
+            status: PlanStatus::InProgress,
+            priority: PlanPriority::High,
+            active_form: None,
+        }];
+        let event = TurnEvent::Plan {
+            entries: entries.clone(),
+        };
+        persist_plan_if_any(&store, None, sid, &event).await;
+        assert_eq!(store.get_plan(sid).await.unwrap(), entries);
+    }
+
+    #[tokio::test]
+    async fn non_plan_event_does_not_touch_stored_plan() {
+        let sid = "no-touch-sess";
+        let store = store_with_one_session(sid).await;
+        persist_plan_if_any(&store, None, sid, &TurnEvent::Chunk { delta: "hi".into() }).await;
+        assert!(store.get_plan(sid).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_event_persists_to_durable_acp_store() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+        let sid = "durable-plan-sess";
+        let sessions = store_with_one_session(sid).await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let acp =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        acp.create_session(sid, "alpha", tmp.path().to_str().unwrap())
+            .unwrap();
+
+        let entries = vec![PlanEntry {
+            content: "Durable".to_string(),
+            status: PlanStatus::Pending,
+            priority: PlanPriority::Low,
+            active_form: None,
+        }];
+        let event = TurnEvent::Plan {
+            entries: entries.clone(),
+        };
+        persist_plan_if_any(&sessions, Some(&acp), sid, &event).await;
+
+        // In-memory cache updated…
+        assert_eq!(sessions.get_plan(sid).await.unwrap(), entries);
+        // …and durable store updated (survives daemon restart / eviction).
+        assert_eq!(acp.get_plan(sid).unwrap(), entries);
     }
 
     #[test]
