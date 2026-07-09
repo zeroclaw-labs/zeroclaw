@@ -213,6 +213,7 @@ pub struct OllamaBuilder {
     base_url: Option<String>,
     api_key: Option<String>,
     reasoning_enabled: Option<bool>,
+    tuning: Option<OllamaTuning>,
 }
 
 impl OllamaBuilder {
@@ -247,6 +248,15 @@ impl OllamaBuilder {
         self
     }
 
+    /// Override the per-deployment tuning knobs (`num_ctx`, `num_predict`,
+    /// `temperature_override`). Mirrors
+    /// [`OllamaModelProvider::with_tuning`]. When unset, defaults to
+    /// [`OllamaTuning::default`].
+    pub fn tuning(mut self, tuning: OllamaTuning) -> Self {
+        self.tuning = Some(tuning);
+        self
+    }
+
     pub fn build(self) -> OllamaModelProvider {
         OllamaModelProvider {
             alias: self.alias,
@@ -255,7 +265,7 @@ impl OllamaBuilder {
             ),
             api_key: self.api_key,
             reasoning_enabled: self.reasoning_enabled,
-            tuning: OllamaTuning::default(),
+            tuning: self.tuning.unwrap_or_default(),
         }
     }
 }
@@ -281,6 +291,7 @@ impl OllamaModelProvider {
             base_url: None,
             api_key: None,
             reasoning_enabled: None,
+            tuning: None,
         }
     }
 

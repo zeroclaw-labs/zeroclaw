@@ -235,7 +235,37 @@ pub struct OpenAiCompatibleBuilder {
     auth_style: Option<AuthStyle>,
     supports_vision: bool,
     user_agent: Option<String>,
+    /// Set via [`OpenAiCompatibleBuilder::merge_system_into_user`] — the
+    /// combined "merge + drop native tool calling" preset. Distinct from
+    /// [`OpenAiCompatibleBuilder::merge_system_into_user_preserving_native`]
+    /// (which mirrors [`OpenAiCompatibleModelProvider::with_merge_system_into_user`]
+    /// and keeps native tools on).
     merge_system_into_user: bool,
+    /// Mirror of [`OpenAiCompatibleModelProvider::with_merge_system_into_user`]:
+    /// enables the merge behaviour without disabling native tool calling.
+    merge_system_into_user_preserve_native: bool,
+    /// When `Some(false)`, mirrors
+    /// [`OpenAiCompatibleModelProvider::without_native_tools`]. `None`
+    /// preserves the default derived from `merge_system_into_user`.
+    native_tool_calling_override: Option<bool>,
+    timeout_secs: Option<u64>,
+    extra_headers: std::collections::HashMap<String, String>,
+    reasoning_effort: Option<String>,
+    /// `Some(false)` mirrors
+    /// [`OpenAiCompatibleModelProvider::without_assistant_reasoning_replay`].
+    /// `None` preserves the default (replay enabled).
+    replay_assistant_reasoning_override: Option<bool>,
+    api_path: Option<String>,
+    max_tokens: Option<u32>,
+    models_dev_key: Option<String>,
+    openrouter_vendor_prefix: Option<String>,
+    local_model_tool_sanitize: bool,
+    public_model_listing: bool,
+    tls_ca_cert_path: Option<String>,
+    extra_body: Option<serde_json::Value>,
+    auth_model_provider: Option<String>,
+    auth_service: Option<AuthService>,
+    auth_profile_override: Option<String>,
 }
 
 impl OpenAiCompatibleBuilder {
@@ -293,11 +323,135 @@ impl OpenAiCompatibleBuilder {
     /// user message; also disables native tool calling because such providers
     /// generally reject OpenAI-style `tools` payloads as well.
     ///
-    /// Prefer [`OpenAiCompatibleModelProvider::with_merge_system_into_user`]
-    /// on the built provider when you want the merge behaviour but still want
+    /// Prefer [`OpenAiCompatibleBuilder::merge_system_into_user_preserving_native`]
+    /// (or [`OpenAiCompatibleModelProvider::with_merge_system_into_user`] on
+    /// the built provider) when you want the merge behaviour but still want
     /// native tool calling (e.g. Bedrock).
     pub fn merge_system_into_user(mut self) -> Self {
         self.merge_system_into_user = true;
+        self
+    }
+
+    /// Merge all system messages into the first user message before sending,
+    /// preserving native tool calling. Mirrors
+    /// [`OpenAiCompatibleModelProvider::with_merge_system_into_user`]. Use
+    /// when the upstream rejects `role: system` but still accepts
+    /// OpenAI-style `tools` payloads (e.g. Bedrock's Anthropic pass-through).
+    pub fn merge_system_into_user_preserving_native(mut self) -> Self {
+        self.merge_system_into_user_preserve_native = true;
+        self
+    }
+
+    /// Disable native tool calling, forcing prompt-guided tool use instead.
+    /// Mirrors [`OpenAiCompatibleModelProvider::without_native_tools`].
+    pub fn without_native_tools(mut self) -> Self {
+        self.native_tool_calling_override = Some(false);
+        self
+    }
+
+    /// Override the HTTP request timeout for LLM API calls. Values of 0
+    /// are ignored (the default 120 s is kept) so a stray `Some(0)` from
+    /// config cannot silently disable the safety timeout. Mirrors
+    /// [`OpenAiCompatibleModelProvider::with_timeout_secs`].
+    pub fn timeout_secs(mut self, timeout_secs: u64) -> Self {
+        if timeout_secs > 0 {
+            self.timeout_secs = Some(timeout_secs);
+        }
+        self
+    }
+
+    /// Set extra HTTP headers to include in all API requests. Mirrors
+    /// [`OpenAiCompatibleModelProvider::with_extra_headers`].
+    pub fn extra_headers(mut self, headers: std::collections::HashMap<String, String>) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
+    /// Set reasoning effort for GPT-5/Codex-compatible chat-completions APIs.
+    /// Mirrors [`OpenAiCompatibleModelProvider::with_reasoning_effort`].
+    pub fn reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
+        self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    /// Disable replay of stored assistant reasoning on outbound assistant
+    /// history messages. Mirrors
+    /// [`OpenAiCompatibleModelProvider::without_assistant_reasoning_replay`].
+    pub fn without_assistant_reasoning_replay(mut self) -> Self {
+        self.replay_assistant_reasoning_override = Some(false);
+        self
+    }
+
+    /// Set a custom API path suffix for this model_provider. Mirrors
+    /// [`OpenAiCompatibleModelProvider::with_api_path`].
+    pub fn api_path(mut self, api_path: Option<String>) -> Self {
+        self.api_path = api_path;
+        self
+    }
+
+    /// Set the maximum output tokens for API requests. Mirrors
+    /// [`OpenAiCompatibleModelProvider::with_max_tokens`].
+    pub fn max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Set the models.dev catalog key for this model_provider. Mirrors
+    /// [`OpenAiCompatibleModelProvider::with_models_dev_key`].
+    pub fn models_dev_key(mut self, key: &str) -> Self {
+        self.models_dev_key = Some(key.to_string());
+        self
+    }
+
+    /// Set the OpenRouter vendor prefix for this model_provider. Mirrors
+    /// [`OpenAiCompatibleModelProvider::with_openrouter_vendor_prefix`].
+    pub fn openrouter_vendor_prefix(mut self, prefix: &str) -> Self {
+        self.openrouter_vendor_prefix = Some(prefix.to_string());
+        self
+    }
+
+    /// Opt into per-model conservative tool-schema sanitization. Mirrors
+    /// [`OpenAiCompatibleModelProvider::with_local_model_tool_sanitize`].
+    pub fn local_model_tool_sanitize(mut self) -> Self {
+        self.local_model_tool_sanitize = true;
+        self
+    }
+
+    /// Treat the `/models` endpoint as publicly accessible. Mirrors
+    /// [`OpenAiCompatibleModelProvider::with_public_model_listing`].
+    pub fn public_model_listing(mut self) -> Self {
+        self.public_model_listing = true;
+        self
+    }
+
+    /// Path to a PEM-encoded custom CA certificate for TLS connections.
+    /// The file is read once at [`Self::build`] time; failures are logged
+    /// at WARN and TLS falls back to the system trust store. Mirrors
+    /// [`OpenAiCompatibleModelProvider::with_tls_ca_cert_path`].
+    pub fn tls_ca_cert_path(mut self, path: &str) -> Self {
+        self.tls_ca_cert_path = Some(path.to_string());
+        self
+    }
+
+    /// Inject extra JSON fields into every API request body. Mirrors
+    /// [`OpenAiCompatibleModelProvider::with_extra_body`].
+    pub fn extra_body(mut self, extra: serde_json::Value) -> Self {
+        self.extra_body = Some(extra);
+        self
+    }
+
+    /// Use a stored auth profile as a bearer credential when no explicit
+    /// `api_key` was configured on this provider entry. Mirrors
+    /// [`OpenAiCompatibleModelProvider::with_auth_profile`].
+    pub fn auth_profile(
+        mut self,
+        model_provider: &str,
+        auth_service: AuthService,
+        profile_override: Option<String>,
+    ) -> Self {
+        self.auth_model_provider = Some(model_provider.to_string());
+        self.auth_service = Some(auth_service);
+        self.auth_profile_override = profile_override;
         self
     }
 
@@ -319,31 +473,66 @@ impl OpenAiCompatibleBuilder {
         let auth_style = self
             .auth_style
             .expect("OpenAiCompatibleBuilder: auth_style() is required");
+        // Merge flag: either the "combined preset" builder setter or the
+        // "preserve-native" setter (or the post-build `with_*` method) can
+        // enable it.
+        let merge_system_into_user =
+            self.merge_system_into_user || self.merge_system_into_user_preserve_native;
+        // Default `native_tool_calling` is `!merge_system_into_user_disable_native`,
+        // i.e. only the "combined preset" builder setter disables it. The
+        // explicit `without_native_tools()` override wins if present.
+        let native_tool_calling = self
+            .native_tool_calling_override
+            .unwrap_or(!self.merge_system_into_user);
+        // Read the PEM bytes now so later HTTP clients incur no per-request I/O.
+        // A read error is logged at WARN and TLS falls back to system roots —
+        // preserving the previous `with_tls_ca_cert_path` semantics.
+        let tls_ca_cert_pem =
+            self.tls_ca_cert_path
+                .as_deref()
+                .and_then(|path| match std::fs::read(path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"path": path, "error": format!("{}", e)})
+                            ),
+                            "Failed to read CA certificate file — TLS will use system roots"
+                        );
+                        None
+                    }
+                });
         OpenAiCompatibleModelProvider {
             alias: self.alias,
             name,
             base_url,
             credential: self.credential,
-            auth_service: None,
-            auth_model_provider: None,
-            auth_profile_override: None,
+            auth_service: self.auth_service,
+            auth_model_provider: self.auth_model_provider,
+            auth_profile_override: self.auth_profile_override,
             auth_header: auth_style,
             supports_vision: self.supports_vision,
             user_agent: self.user_agent,
-            native_tool_calling: !self.merge_system_into_user,
-            merge_system_into_user: self.merge_system_into_user,
-            timeout_secs: 120,
-            extra_headers: std::collections::HashMap::new(),
-            reasoning_effort: None,
-            replay_assistant_reasoning: true,
-            api_path: None,
-            max_tokens: None,
-            models_dev_key: None,
-            openrouter_vendor_prefix: None,
-            local_model_tool_sanitize: false,
-            public_model_listing: false,
-            tls_ca_cert_pem: None,
-            extra_body: None,
+            native_tool_calling,
+            merge_system_into_user,
+            timeout_secs: self.timeout_secs.unwrap_or(120),
+            extra_headers: self.extra_headers,
+            reasoning_effort: self.reasoning_effort,
+            replay_assistant_reasoning: self.replay_assistant_reasoning_override.unwrap_or(true),
+            api_path: self.api_path,
+            max_tokens: self.max_tokens,
+            models_dev_key: self.models_dev_key,
+            openrouter_vendor_prefix: self.openrouter_vendor_prefix,
+            local_model_tool_sanitize: self.local_model_tool_sanitize,
+            public_model_listing: self.public_model_listing,
+            tls_ca_cert_pem,
+            extra_body: self.extra_body,
         }
     }
 }
@@ -366,6 +555,23 @@ impl OpenAiCompatibleModelProvider {
             supports_vision: false,
             user_agent: None,
             merge_system_into_user: false,
+            merge_system_into_user_preserve_native: false,
+            native_tool_calling_override: None,
+            timeout_secs: None,
+            extra_headers: std::collections::HashMap::new(),
+            reasoning_effort: None,
+            replay_assistant_reasoning_override: None,
+            api_path: None,
+            max_tokens: None,
+            models_dev_key: None,
+            openrouter_vendor_prefix: None,
+            local_model_tool_sanitize: false,
+            public_model_listing: false,
+            tls_ca_cert_path: None,
+            extra_body: None,
+            auth_model_provider: None,
+            auth_service: None,
+            auth_profile_override: None,
         }
     }
     /// Inject extra JSON fields into every API request body.
