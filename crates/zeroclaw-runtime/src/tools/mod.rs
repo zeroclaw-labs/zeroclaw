@@ -92,7 +92,7 @@ pub use zeroclaw_tools::mcp_client::McpRegistry;
 pub use zeroclaw_tools::mcp_context;
 pub use zeroclaw_tools::mcp_deferred::{
     ActivatedToolSet, DeferredMcpToolSet, build_deferred_tools_section,
-    build_deferred_tools_section_filtered,
+    build_deferred_tools_section_excluding, build_deferred_tools_section_filtered,
 };
 pub use zeroclaw_tools::mcp_prompts_tool::McpPromptsTool;
 pub use zeroclaw_tools::mcp_resources_tool::McpResourcesTool;
