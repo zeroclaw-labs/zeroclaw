@@ -308,9 +308,10 @@ pub async fn handle_sop_run_overlay(
     }
 }
 
-/// Resolve a paused checkpoint on a live run. Body carries the raw
-/// `ApprovalDecision` wire value; `Approve` follows the success edge, `Deny`
-/// the step's `on_failure` failure path. Returns the refreshed overlay.
+/// Resolve a gated live run. Body carries the raw `ApprovalDecision` wire
+/// value. A `WaitingApproval` run resolves through the audited `resolve_gate`
+/// chokepoint with an HTTP principal; a deterministic `PausedCheckpoint` run
+/// resolves through `decide_checkpoint`. Returns the refreshed overlay.
 pub async fn handle_sop_decide(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -373,12 +374,52 @@ pub async fn handle_sop_decide(
                     .into_response();
             }
         };
-        if let Err(e) = guard.decide_checkpoint(&run_id, decision) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
+        let status = guard.get_run(&run_id).map(|r| r.status);
+        match status {
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval) => {
+                use zeroclaw_runtime::sop::approval::{ApprovalPrincipal, ResolveOutcome};
+                match guard.resolve_gate(&run_id, decision, ApprovalPrincipal::http(None)) {
+                    Ok(
+                        ResolveOutcome::Resumed(_)
+                        | ResolveOutcome::Denied
+                        | ResolveOutcome::AlreadyResolved,
+                    ) => {}
+                    Ok(ResolveOutcome::NotWaiting) => {
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({
+                                "error": format!("Run {run_id} is not waiting for approval")
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Ok(ResolveOutcome::RejectedSelfApproval) => {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "approval_mode forbids this principal from clearing the gate"
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({ "error": e.to_string() })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            _ => {
+                if let Err(e) = guard.decide_checkpoint(&run_id, decision) {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": e.to_string() })),
+                    )
+                        .into_response();
+                }
+            }
         }
     }
 

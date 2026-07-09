@@ -1463,6 +1463,9 @@ export default function Sops() {
   const [overlay, setOverlay] = useState<RunOverlay | null>(null);
   const [deciding, setDeciding] = useState(false);
   const [overlayError, setOverlayError] = useState<string | null>(null);
+  // True while a ?run= deep link is being applied, so the selected-SOP reset
+  // effect does not clobber the deep-linked run id on first render.
+  const deepRunRef = useRef(false);
   const [draft, setDraft] = useState<Sop | null>(loadStoredDraft);
   const [editingName, setEditingName] = useState<string | null>(loadStoredEditingName);
   const [draftGraph, setDraftGraph] = useState<SopGraph | null>(null);
@@ -1692,6 +1695,7 @@ export default function Sops() {
         if (!active) return;
         setSops(list);
         const target = deepSop && list.some((s) => s.name === deepSop) ? deepSop : list[0]?.name;
+        if (deepRun && target && target === deepSop) deepRunRef.current = true;
         if (target) setSelected(target);
         if (deepRun) setRunId(deepRun);
         setLoading(false);
@@ -1729,6 +1733,10 @@ export default function Sops() {
   }, [selected, loadGraph]);
 
   useEffect(() => {
+    if (deepRunRef.current) {
+      deepRunRef.current = false;
+      return;
+    }
     setRunId('');
     setOverlay(null);
     setOverlayError(null);

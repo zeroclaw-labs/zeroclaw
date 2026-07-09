@@ -458,7 +458,7 @@ export default function SopCanvas({
                   stroke="transparent"
                   strokeWidth={14}
                   pointerEvents="stroke"
-                  className={kind === 'trigger' ? '' : 'cursor-pointer'}
+                  className={readOnly || kind === 'trigger' ? '' : 'cursor-pointer'}
                   onPointerEnter={() => setHoverWire(i)}
                   onPointerLeave={() => setHoverWire((h) => (h === i ? null : h))}
                   onPointerDown={(e) => {
@@ -469,15 +469,15 @@ export default function SopCanvas({
                     onDisconnect(w.from_step, w.to_step, kind, portIndex);
                   }}
                 >
-                  {kind !== 'trigger' ? <title>{t('sops.wire_delete_hint')}</title> : null}
+                  {!readOnly && kind !== 'trigger' ? <title>{t('sops.wire_delete_hint')}</title> : null}
                 </path>
                 <path
                   d={d}
                   fill="none"
-                  stroke={hovered && kind !== 'trigger' ? 'var(--color-status-error)' : wireStroke(kind)}
+                  stroke={hovered && !readOnly && kind !== 'trigger' ? 'var(--color-status-error)' : wireStroke(kind)}
                   strokeWidth={active ? 3 : hovered ? 2.5 : 1.75}
                   strokeDasharray={
-                    hovered && kind !== 'trigger'
+                    hovered && !readOnly && kind !== 'trigger'
                       ? '6 3'
                       : kind === 'dependency'
                         ? '5 4'
@@ -499,7 +499,7 @@ export default function SopCanvas({
                     />
                   ) : null}
                 </path>
-                {hovered && kind !== 'trigger' ? (
+                {hovered && !readOnly && kind !== 'trigger' ? (
                   <g pointerEvents="none">
                     <circle cx={(a.x + NODE_W + b.x) / 2} cy={(a.y + b.y) / 2 + NODE_H / 2} r={8} fill="var(--color-status-error)" />
                     <text
@@ -583,16 +583,16 @@ export default function SopCanvas({
                     onDisconnectData(w.to_step, w.to_pin);
                   }}
                 >
-                  <title>{t('sops.data_wire_delete_hint')}</title>
+                  {readOnly ? null : <title>{t('sops.data_wire_delete_hint')}</title>}
                 </path>
                 <path
                   d={d}
                   fill="none"
-                  stroke={hovered ? 'var(--color-status-error)' : WIRE_STROKE.data}
-                  strokeWidth={hovered ? 2.5 : 1.75}
+                  stroke={hovered && !readOnly ? 'var(--color-status-error)' : WIRE_STROKE.data}
+                  strokeWidth={hovered && !readOnly ? 2.5 : 1.75}
                   strokeDasharray="2 3"
                   markerEnd="url(#sop-arrow)"
-                  opacity={hovered ? 1 : 0.8}
+                  opacity={hovered && !readOnly ? 1 : 0.8}
                   pointerEvents="none"
                 />
               </g>
@@ -770,7 +770,7 @@ export default function SopCanvas({
                     e.stopPropagation();
                     if (!readOnly) startLink(node.step, 'switch', ri);
                   }}
-                  className="cursor-crosshair"
+                  className={readOnly ? '' : 'cursor-crosshair'}
                 >
                   <title>
                     {t('sops.handle_switch')}: {rule.name}
@@ -790,7 +790,7 @@ export default function SopCanvas({
                 e.stopPropagation();
                 if (!readOnly) startLink(node.step, 'sequence');
               }}
-              className="cursor-crosshair"
+              className={readOnly ? '' : 'cursor-crosshair'}
             >
               <title>{t('sops.handle_sequence')}</title>
             </circle>
@@ -803,7 +803,7 @@ export default function SopCanvas({
                 e.stopPropagation();
                 if (!readOnly) startLink(node.step, 'failure');
               }}
-              className="cursor-crosshair"
+              className={readOnly ? '' : 'cursor-crosshair'}
             >
               <title>{t('sops.handle_failure')}</title>
             </circle>
@@ -832,7 +832,7 @@ export default function SopCanvas({
                     completeDataLink(node.step, pin.name, pin.data_type ?? null);
                   }
                 }}
-                className="cursor-crosshair"
+                className={readOnly ? '' : 'cursor-crosshair'}
               >
                 <title>
                   {pin.name}: {pin.data_type ?? t('sops.pin_any')}
@@ -856,7 +856,7 @@ export default function SopCanvas({
                 e.stopPropagation();
                 if (!readOnly) startDataLink(node.step, pin.name, pin.data_type ?? null);
               }}
-              className="cursor-crosshair"
+              className={readOnly ? '' : 'cursor-crosshair'}
             >
               <title>
                 {pin.name}: {pin.data_type ?? t('sops.pin_any')}
