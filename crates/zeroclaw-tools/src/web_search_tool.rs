@@ -416,7 +416,7 @@ impl WebSearchTool {
             .await?;
 
         if !response.status().is_success() {
-            anyhow::bail!("Tavily search failed with status: {}", response.status());
+            return Err(http_search_failure("tavily", response.status()));
         }
 
         let json: serde_json::Value = response.json().await?;
@@ -570,7 +570,7 @@ impl WebSearchTool {
             .await?;
 
         if !response.status().is_success() {
-            anyhow::bail!("Jina AI search failed with status: {}", response.status());
+            return Err(http_search_failure("jina", response.status()));
         }
 
         let json: serde_json::Value = response.json().await?;
@@ -724,7 +724,7 @@ impl WebSearchTool {
 
         let status = response.status();
         if !status.is_success() {
-            anyhow::bail!("Bocha AI search failed with status: {}", status);
+            return Err(http_search_failure("bocha", status));
         }
 
         let json: serde_json::Value = response.json().await?;
@@ -941,7 +941,7 @@ impl WebSearchTool {
             .await?;
 
         if !response.status().is_success() {
-            anyhow::bail!("SearXNG search failed with status: {}", response.status());
+            return Err(http_search_failure("searxng", response.status()));
         }
 
         let json: serde_json::Value = response.json().await?;
