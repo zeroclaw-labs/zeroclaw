@@ -101,6 +101,12 @@ export async function listSops(): Promise<SopSummary[]> {
   return body.sops ?? [];
 }
 
+export async function listRuns(sop?: string): Promise<SopRunSummary[]> {
+  const qs = sop ? `?sop=${encodeURIComponent(sop)}` : '';
+  const body = await apiFetch<{ runs: SopRunSummary[] }>(`/api/sops/runs${qs}`);
+  return body.runs ?? [];
+}
+
 export function getSopGraph(name: string): Promise<SopGraph> {
   return apiFetch<SopGraph>(`/api/sops/${encodeURIComponent(name)}/graph`);
 }
@@ -292,6 +298,26 @@ export function overlayCallsByStep(
 /// (Tailwind class, SVG stroke, badge variant) without re-deciding which
 /// state means what.
 export type RunStateTone = 'accent' | 'success' | 'error' | 'warning' | 'neutral';
+
+/// The one tone-to-badge binding. Every surface that renders a run state or
+/// run status as a badge goes through this map; nothing re-declares it.
+export const RUN_TONE_BADGE = {
+  accent: 'neutral',
+  success: 'ok',
+  error: 'error',
+  warning: 'warn',
+  neutral: 'neutral',
+} as const satisfies Record<RunStateTone, string>;
+
+export type RunToneBadge = (typeof RUN_TONE_BADGE)[RunStateTone];
+
+export function runStateBadge(state: NodeRunState | undefined): RunToneBadge {
+  return RUN_TONE_BADGE[runStateTone(state)];
+}
+
+export function runStatusBadge(status: SopRunStatus | undefined): RunToneBadge {
+  return RUN_TONE_BADGE[runStatusTone(status)];
+}
 
 export function runStateTone(state: NodeRunState | undefined): RunStateTone {
   switch (state) {

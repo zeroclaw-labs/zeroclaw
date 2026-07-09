@@ -1,18 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { AlertTriangle, XCircle, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
-import { Link, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { Badge, Card, PageHeader, HelpTip } from '@/components/ui';
 import SopCanvas from './SopCanvas';
 import MarkdownEditor from '@/components/MarkdownEditor';
 import ToolPicker from '@/components/ToolPicker';
-import { PlannedCallsEditor, CapturedCallList } from '@/components/SopCalls';
+import { PlannedCallsEditor } from '@/components/SopCalls';
+import SopStepList from '@/components/SopStepList';
 import { t } from '@/lib/i18n';
 import { loadAgentPickerSummaries } from '@/lib/agents';
 import {
   listSops,
+  listRuns,
   getSopGraph,
   getRunOverlay,
-  decideSop,
   getSop,
   runSop,
   createSop,
@@ -24,20 +25,15 @@ import {
   sopFieldHelp,
   overlayStateByStep,
   overlayCallsByStep,
-  runStateTone,
   parseCondition,
   buildCondition,
   sopPriorities,
   sopExecutionModes,
   sopStepKinds,
-  isTerminalRunStatus,
-  type RunStateTone,
   type WireRole,
   type SopSummary,
   type SopGraph,
-  type GraphPin,
   type RunOverlay,
-  type NodeRunState,
   type Sop,
   type SopStep,
   type SopTrigger,
@@ -154,76 +150,6 @@ function blankSop(name: string): Sop {
     max_concurrent: 1,
     deterministic: false,
   };
-}
-
-const BADGE_TONE: Record<RunStateTone, 'ok' | 'error' | 'warn' | 'neutral'> = {
-  accent: 'neutral',
-  success: 'ok',
-  error: 'error',
-  warning: 'warn',
-  neutral: 'neutral',
-};
-
-function nodeStateBadgeTone(state: NodeRunState): 'ok' | 'error' | 'warn' | 'neutral' {
-  return BADGE_TONE[runStateTone(state)];
-}
-
-function pinTypeLabel(pin: GraphPin): string {
-  if (pin.class === 'flow') return 'flow';
-  return pin.data_type ?? 'any';
-}
-
-function SopFieldList({
-  graph,
-  overlay,
-}: {
-  graph: SopGraph;
-  overlay?: RunOverlay | null;
-}) {
-  const stateByStep = overlayStateByStep(overlay);
-  const callsByStep = overlayCallsByStep(overlay);
-  return (
-    <div className="divide-y divide-pc-border rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface text-sm">
-      {graph.nodes.map((node) => {
-        const state = stateByStep.get(node.step);
-        const calls = callsByStep.get(node.step);
-        return (
-          <div key={node.step} className="flex items-start gap-3 px-3 py-2">
-            <span className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded bg-pc-accent text-xs font-semibold text-[#0b1220]">
-              {node.step}
-            </span>
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <span className="font-medium text-pc-text">{node.title}</span>
-                {state ? (
-                  <Badge tone={nodeStateBadgeTone(state)}>{t(`sops.run_state.${state}`)}</Badge>
-                ) : null}
-              </div>
-              <div className="mt-0.5 text-xs text-pc-text-muted">
-                {t('sops.inputs')}:{' '}
-                {node.inputs.length === 0
-                  ? '—'
-                  : node.inputs.map((p) => `${p.name}:${pinTypeLabel(p)}`).join(', ')}
-                {'  ·  '}
-                {t('sops.outputs')}:{' '}
-                {node.outputs.length === 0
-                  ? '—'
-                  : node.outputs.map((p) => `${p.name}:${pinTypeLabel(p)}`).join(', ')}
-              </div>
-              {calls ? (
-                <div className="mt-2">
-                  <div className="mb-1 text-xs font-medium text-pc-text">
-                    {t('sops.captured_calls')}
-                  </div>
-                  <CapturedCallList calls={calls} />
-                </div>
-              ) : null}
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
 }
 
 function DiagnosticsPanel({ graph }: { graph: SopGraph }) {
@@ -1455,17 +1381,11 @@ export default function Sops() {
   const [loading, setLoading] = useState(true);
   const [graphLoading, setGraphLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [runId, setRunId] = useState('');
+  const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const [runPayload, setRunPayload] = useState('');
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
-  const [overlay, setOverlay] = useState<RunOverlay | null>(null);
-  const [deciding, setDeciding] = useState(false);
-  const [overlayError, setOverlayError] = useState<string | null>(null);
-  // True while a ?run= deep link is being applied, so the selected-SOP reset
-  // effect does not clobber the deep-linked run id on first render.
-  const deepRunRef = useRef(false);
   const [draft, setDraft] = useState<Sop | null>(loadStoredDraft);
   const [editingName, setEditingName] = useState<string | null>(loadStoredEditingName);
   const [draftGraph, setDraftGraph] = useState<SopGraph | null>(null);
@@ -1690,14 +1610,20 @@ export default function Sops() {
     let active = true;
     const deepSop = searchParams.get('sop');
     const deepRun = searchParams.get('run');
+    // Legacy deep link: a ?run= now lives on the run detail page.
+    if (deepSop && deepRun) {
+      navigate(
+        `/runs/${encodeURIComponent(deepSop)}/${encodeURIComponent(deepRun)}`,
+        { replace: true },
+      );
+      return;
+    }
     listSops()
       .then((list) => {
         if (!active) return;
         setSops(list);
         const target = deepSop && list.some((s) => s.name === deepSop) ? deepSop : list[0]?.name;
-        if (deepRun && target && target === deepSop) deepRunRef.current = true;
         if (target) setSelected(target);
-        if (deepRun) setRunId(deepRun);
         setLoading(false);
       })
       .catch((e: unknown) => {
@@ -1732,53 +1658,35 @@ export default function Sops() {
     if (selected) loadGraph(selected);
   }, [selected, loadGraph]);
 
+  // Latest-run tint for the read-only canvas and captured calls for the
+  // editor's pin-from-run flow. Single-sourced: latest run comes from the
+  // same runs listing the Runs page uses, projected through the same overlay
+  // endpoint the run detail page polls. One-shot per selection; live watching
+  // is the run detail page's job.
+  const [latestOverlay, setLatestOverlay] = useState<RunOverlay | null>(null);
   useEffect(() => {
-    if (deepRunRef.current) {
-      deepRunRef.current = false;
-      return;
-    }
-    setRunId('');
-    setOverlay(null);
-    setOverlayError(null);
-  }, [selected]);
-
-  useEffect(() => {
-    if (!selected || !runId) {
-      setOverlay(null);
-      return;
-    }
+    setLatestOverlay(null);
+    if (!selected) return;
     let active = true;
-    let id = 0;
-    const stop = () => {
-      if (id) {
-        window.clearInterval(id);
-        id = 0;
-      }
-    };
-    const poll = () => {
-      getRunOverlay(selected, runId)
-        .then((o) => {
-          if (!active) return;
-          setOverlay(o);
-          setOverlayError(null);
-          if (isTerminalRunStatus(o.status)) stop();
-        })
-        .catch((e: unknown) => {
-          if (!active) return;
-          setOverlay(null);
-          setOverlayError(e instanceof Error ? e.message : String(e));
-        });
-    };
-    poll();
-    id = window.setInterval(poll, 2000);
+    listRuns(selected)
+      .then((runs) => {
+        const latest = runs.sort((a, b) => b.started_at.localeCompare(a.started_at))[0];
+        if (!latest) return null;
+        return getRunOverlay(selected, latest.run_id);
+      })
+      .then((o) => {
+        if (active && o) setLatestOverlay(o);
+      })
+      .catch(() => {
+        // Overlay is decoration on this page; absence just renders untinted.
+      });
     return () => {
       active = false;
-      stop();
     };
-  }, [selected, runId]);
+  }, [selected]);
 
-  const runStateByStep = useMemo(() => overlayStateByStep(overlay), [overlay]);
-  const runCallsByStep = useMemo(() => overlayCallsByStep(overlay), [overlay]);
+  const runStateByStep = useMemo(() => overlayStateByStep(latestOverlay), [latestOverlay]);
+  const runCallsByStep = useMemo(() => overlayCallsByStep(latestOverlay), [latestOverlay]);
 
   // A Manual run is only offered when the SOP actually declares a manual
   // trigger; the payload field and prefill key off this, never a per-SOP check.
@@ -1813,28 +1721,11 @@ export default function Sops() {
     setRunError(null);
     runSop(selected, payload || undefined)
       .then(({ run_id }) => {
-        setRunId(run_id);
-        setOverlayError(null);
+        navigate(`/runs/${encodeURIComponent(selected)}/${encodeURIComponent(run_id)}`);
       })
       .catch((e) => setRunError(`${t('sops.run_error')}: ${String(e)}`))
       .finally(() => setRunning(false));
-  }, [selected, runPayload]);
-
-  const handleDecide = useCallback(
-    (approve: boolean) => {
-      if (!selected || !overlay) return;
-      setDeciding(true);
-      setOverlayError(null);
-      decideSop(selected, overlay.run_id, approve ? 'approve' : { deny: {} })
-        .then((o) => {
-          setOverlay(o);
-          setOverlayError(null);
-        })
-        .catch((e) => setOverlayError(e instanceof Error ? e.message : String(e)))
-        .finally(() => setDeciding(false));
-    },
-    [selected, overlay],
-  );
+  }, [selected, runPayload, navigate]);
 
   // Keep the inspector pointed at a real step: select the first step when a
   // draft opens and drop the selection when its step is removed.
@@ -2072,42 +1963,6 @@ export default function Sops() {
                 </div>
               </div>
             ) : null}
-            <div className="mb-3 flex flex-wrap items-center gap-2">
-              <input
-                type="text"
-                value={runId}
-                onChange={(e) => setRunId(e.target.value.trim())}
-                placeholder={t('sops.run_id_placeholder')}
-                className="w-full rounded border border-pc-border bg-pc-surface px-2 py-1 text-sm text-pc-text sm:w-64"
-              />
-              {overlay ? (
-                <Badge tone={overlay.status === 'failed' ? 'error' : 'ok'}>
-                  {t(`sops.run_status.${overlay.status}`)} · {overlay.current_step}/
-                  {overlay.total_steps}
-                </Badge>
-              ) : null}
-              {overlay && (overlay.waiting || overlay.paused) ? (
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={deciding}
-                    onClick={() => handleDecide(true)}
-                    className="rounded border border-pc-border bg-pc-surface px-2 py-1 text-xs text-status-ok hover:bg-pc-surface-hover disabled:opacity-50"
-                  >
-                    {t('sops.approve')}
-                  </button>
-                  <button
-                    type="button"
-                    disabled={deciding}
-                    onClick={() => handleDecide(false)}
-                    className="rounded border border-pc-border bg-pc-surface px-2 py-1 text-xs text-status-error hover:bg-pc-surface-hover disabled:opacity-50"
-                  >
-                    {t('sops.deny')}
-                  </button>
-                </div>
-              ) : null}
-              {overlayError ? <span className="text-xs text-status-error">{overlayError}</span> : null}
-            </div>
             {graphLoading ? (
               <Loader2 className="h-5 w-5 animate-spin text-pc-text-muted" aria-hidden />
             ) : graph ? (
@@ -2128,7 +1983,7 @@ export default function Sops() {
                     onDisconnectData={noop}
                   />
                 ) : (
-                  <SopFieldList graph={graph} overlay={overlay} />
+                  <SopStepList graph={graph} overlay={latestOverlay} />
                 )}
                 <DiagnosticsPanel graph={graph} />
               </>

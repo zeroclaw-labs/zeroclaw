@@ -15,6 +15,7 @@ import {
   Logs,
   Pairing,
   Quickstart,
+  RunDetail,
   Runs,
   Skills,
   Sops,
@@ -46,6 +47,7 @@ export const Router = () => (
         <Route path="/skills" element={<Skills />} />
         <Route path="/sops" element={<Sops />} />
         <Route path="/runs" element={<Runs />} />
+        <Route path="/runs/:sop/:runId" element={<RunDetail />} />
         <Route path="/integrations" element={<Integrations />} />
         <Route path="/memory" element={<Navigate to="/?tab=memories" replace />} />
         <Route path="/config" element={<Config />} />

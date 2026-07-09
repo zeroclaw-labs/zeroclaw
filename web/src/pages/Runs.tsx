@@ -1,13 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Activity, ExternalLink, Loader2 } from 'lucide-react';
-import { runStatusTone, type SopRunSummary, type RunStateTone } from '@/lib/sops';
+import { runStatusBadge, type SopRunSummary } from '@/lib/sops';
 import { basePath } from '@/lib/basePath';
 import { getToken } from '@/lib/auth';
 import { formatRelative } from '@/lib/format';
 import { t } from '@/lib/i18n';
 import { Badge, Card, PageHeader } from '@/components/ui';
-import type { BadgeTone } from '@/components/ui';
 
 type RunsFrame =
   | { type: 'snapshot'; runs: SopRunSummary[] }
@@ -15,19 +14,6 @@ type RunsFrame =
   | { type: 'disabled' }
   | { type: 'lagged'; missed: number }
   | { type: 'error'; error: string };
-
-function badgeTone(tone: RunStateTone): BadgeTone {
-  switch (tone) {
-    case 'success':
-      return 'ok';
-    case 'error':
-      return 'error';
-    case 'warning':
-      return 'warn';
-    default:
-      return 'neutral';
-  }
-}
 
 function count(n: number): string {
   return (n === 1 ? t('runs.count_one') : t('runs.count_other')).replace('{n}', String(n));
@@ -160,7 +146,7 @@ export default function Runs() {
                 <tr key={r.run_id} className="hover:bg-pc-elevated/50">
                   <td className="px-4 py-2.5 font-medium text-pc-text">{r.sop_name}</td>
                   <td className="px-4 py-2.5">
-                    <Badge tone={badgeTone(runStatusTone(r.status))}>
+                    <Badge tone={runStatusBadge(r.status)}>
                       {t(`sops.run_status.${r.status}`)}
                     </Badge>
                   </td>
@@ -177,7 +163,7 @@ export default function Runs() {
                   </td>
                   <td className="px-4 py-2.5 text-right">
                     <Link
-                      to={`/sops?sop=${encodeURIComponent(r.sop_name)}&run=${encodeURIComponent(r.run_id)}`}
+                      to={`/runs/${encodeURIComponent(r.sop_name)}/${encodeURIComponent(r.run_id)}`}
                       className="inline-flex items-center gap-1 text-xs text-pc-accent hover:underline"
                     >
                       {t('runs.open')}
