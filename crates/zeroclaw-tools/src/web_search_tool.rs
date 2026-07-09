@@ -285,7 +285,7 @@ impl WebSearchTool {
             .await?;
 
         if !response.status().is_success() {
-            anyhow::bail!("Brave search failed with status: {}", response.status());
+            return Err(http_search_failure("brave", response.status()));
         }
 
         let json: serde_json::Value = response.json().await?;
@@ -1026,10 +1026,6 @@ fn duckduckgo_block_message(
 /// The runtime (`tool_execution.rs`) forwards the `Err` returned by `execute`
 /// to the agent as readable text, so placing actionable hints in the message
 /// makes them visible to the agent.
-//
-// Callers land in the follow-up provider-wiring tasks; allow dead code until
-// they are wired in.
-#[allow(dead_code)]
 fn http_search_failure(provider: &str, status: reqwest::StatusCode) -> anyhow::Error {
     ::zeroclaw_log::record!(
         WARN,
