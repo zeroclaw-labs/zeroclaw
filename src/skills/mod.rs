@@ -1418,6 +1418,7 @@ mod install_location_tests {
                 agent: None,
                 bundle: None,
                 no_tier_banner: true,
+                skill: None,
             },
             &c,
         )
