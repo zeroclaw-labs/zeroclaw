@@ -1809,8 +1809,10 @@ mod tests {
 
     #[test]
     fn degraded_sections_reported_as_warning() {
-        let mut config = Config::default();
-        config.degraded_sections = vec!["channels.telegram.default".to_string()];
+        let config = Config {
+            degraded_sections: vec!["channels.telegram.default".to_string()],
+            ..Default::default()
+        };
         let mut items = Vec::new();
         check_degraded_sections(&config, &mut items);
         let item = items
@@ -1826,8 +1828,10 @@ mod tests {
 
     #[test]
     fn degraded_security_reported_as_error() {
-        let mut config = Config::default();
-        config.degraded_security = vec!["security".to_string()];
+        let config = Config {
+            degraded_security: vec!["security".to_string()],
+            ..Default::default()
+        };
         let mut items = Vec::new();
         check_degraded_sections(&config, &mut items);
         let item = items
