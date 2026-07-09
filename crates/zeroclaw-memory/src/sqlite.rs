@@ -526,6 +526,24 @@ impl SqliteMemory {
         }
     }
 
+    /// The categories whose session-NULL rows are durable global knowledge
+    /// (see [`Self::is_durable_global_row`]). Single source of truth for
+    /// the carve-out: the SQL predicate in [`Self::vector_search`] derives
+    /// its bind parameters from this slice via `category_to_str`, so the
+    /// set is never spelled twice.
+    const DURABLE_GLOBAL_CATEGORIES: [MemoryCategory; 2] =
+        [MemoryCategory::Core, MemoryCategory::Daily];
+
+    /// Whether a row is durable global knowledge: a `core`/`daily` row with
+    /// no session binding is long-term knowledge meant to be recallable
+    /// from any session, not a per-session artifact. Rows that DO carry a
+    /// session binding (consolidation keeps a survivor's `session_id` even
+    /// on `core` rows) stay session-scoped, as do `conversation` and custom
+    /// categories.
+    fn is_durable_global_row(category: &MemoryCategory, session_id: Option<&str>) -> bool {
+        session_id.is_none() && Self::DURABLE_GLOBAL_CATEGORIES.contains(category)
+    }
+
     fn decode_kind(raw: Option<String>) -> Option<super::traits::MemoryKind> {
         raw.and_then(|kind| serde_json::from_str(&kind).ok())
     }
@@ -808,6 +826,11 @@ impl SqliteMemory {
     ///
     /// Optional `category` and `session_id` filters reduce full-table scans
     /// when the caller already knows the scope of relevant memories.
+    ///
+    /// A `session_id` filter still admits durable global rows (see
+    /// [`Self::is_durable_global_row`]): global `core`/`daily` facts must be
+    /// semantically recallable from sessions that did not write them, while
+    /// session-bound rows from other sessions stay excluded.
     pub fn vector_search(
         conn: &Connection,
         query_embedding: &[f32],
@@ -825,8 +848,20 @@ impl SqliteMemory {
             idx += 1;
         }
         if let Some(sid) = session_id {
-            let _ = write!(sql, " AND session_id = ?{idx}");
+            let category_placeholders = Self::DURABLE_GLOBAL_CATEGORIES
+                .iter()
+                .enumerate()
+                .map(|(offset, _)| format!("?{}", idx + 1 + offset))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(
+                sql,
+                " AND (session_id = ?{idx} OR (session_id IS NULL AND category IN ({category_placeholders})))"
+            );
             param_values.push(Box::new(sid.to_string()));
+            for category in &Self::DURABLE_GLOBAL_CATEGORIES {
+                param_values.push(Box::new(Self::category_to_str(category)));
+            }
         }
 
         let mut stmt = conn.prepare(&sql)?;
@@ -1040,6 +1075,12 @@ impl Memory for SqliteMemory {
             let session_ref = sid.as_deref();
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
+            // The vector stage is live only when an embedder produced a
+            // query vector. The BM25-only path (stock
+            // `embedding_provider = "none"` => Noop embedder, and explicit
+            // `search_mode = "bm25"`) must keep its exact legacy behavior:
+            // raw keyword scores and a strict session filter.
+            let vector_live = query_embedding.is_some();
 
             // FTS5 BM25 keyword search (skip for embedding-only mode)
             let keyword_results = if search_mode == SearchMode::Embedding {
@@ -1059,15 +1100,33 @@ impl Memory for SqliteMemory {
 
             // Merge results based on search mode
             let merged = if vector_results.is_empty() {
-                keyword_results
-                    .iter()
-                    .map(|(id, score)| vector::ScoredResult {
-                        id: id.clone(),
-                        vector_score: None,
-                        keyword_score: Some(*score),
-                        final_score: *score,
-                    })
-                    .collect::<Vec<_>>()
+                if vector_live {
+                    // FTS-only survivors under a live vector stage are
+                    // thresholded downstream against a cosine-tuned
+                    // relevance floor; map raw BM25 onto the same [0, 1]
+                    // axis (matching hybrid_merge's internal keyword
+                    // normalization). Raw scores pass through untouched
+                    // when the vector stage is off.
+                    crate::normalize::bm25_to_unit(&keyword_results)
+                        .into_iter()
+                        .map(|(id, score)| vector::ScoredResult {
+                            id,
+                            vector_score: None,
+                            keyword_score: Some(score),
+                            final_score: score,
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    keyword_results
+                        .iter()
+                        .map(|(id, score)| vector::ScoredResult {
+                            id: id.clone(),
+                            vector_score: None,
+                            keyword_score: Some(*score),
+                            final_score: *score,
+                        })
+                        .collect::<Vec<_>>()
+                }
             } else if keyword_results.is_empty() {
                 vector_results
                     .iter()
@@ -1196,10 +1255,21 @@ impl Memory for SqliteMemory {
                             agent_alias: alias,
                             agent_id: aid,
                         };
+                        // Session filter for the hybrid stage. With a live
+                        // vector stage, durable global rows are exempt so
+                        // they reach recall from any session, whichever
+                        // stage (vector or keyword) surfaced them; the
+                        // BM25-only path keeps the strict legacy filter.
                         if let Some(filter_sid) = session_ref
-                            && entry.session_id.as_deref() != Some(filter_sid) {
-                                continue;
-                            }
+                            && entry.session_id.as_deref() != Some(filter_sid)
+                            && !(vector_live
+                                && Self::is_durable_global_row(
+                                    &entry.category,
+                                    entry.session_id.as_deref(),
+                                ))
+                        {
+                            continue;
+                        }
                         results.push(entry);
                     }
                 }
@@ -3008,6 +3078,314 @@ mod tests {
             mem.embedder_dimensions(),
             1536,
             "refresh_embedder must install the resolved provider's embedder"
+        );
+    }
+
+    // --- Durable-global recall across sessions (vector scope) ---
+
+    /// Marker token routed to its own embedding axis by [`KeyedEmbedding`].
+    const KEYED_MARKER: &str = "orbital";
+
+    /// Deterministic content-keyed embedder: texts containing
+    /// [`KEYED_MARKER`] map to one axis, everything else to an orthogonal
+    /// axis, so vector-stage relevance is controllable without a network.
+    struct KeyedEmbedding;
+
+    #[async_trait::async_trait]
+    impl super::super::embeddings::EmbeddingProvider for KeyedEmbedding {
+        fn name(&self) -> &str {
+            "keyed"
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    if text.contains(KEYED_MARKER) {
+                        vec![1.0, 0.0, 0.0, 0.0]
+                    } else {
+                        vec![0.0, 1.0, 0.0, 0.0]
+                    }
+                })
+                .collect())
+        }
+    }
+
+    fn temp_sqlite_keyed() -> (TempDir, SqliteMemory) {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(KeyedEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+        )
+        .unwrap();
+        (tmp, mem)
+    }
+
+    /// Repro shape from the 2026-07-09 injection-scope finding: with
+    /// embeddings live, a session-scoped recall (what per-turn injection
+    /// issues) must surface a global core fact written outside the session,
+    /// while other sessions' bound rows stay excluded.
+    #[tokio::test]
+    async fn session_scoped_recall_includes_durable_global_rows_when_vector_live() {
+        let (_tmp, mem) = temp_sqlite_keyed();
+        mem.store(
+            "vault_fact",
+            "the orbital vault passphrase is quokka-vellum",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "daily_note",
+            "orbital vault rotation happens daily",
+            MemoryCategory::Daily,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "other_chat",
+            "we discussed the orbital vault in another chat",
+            MemoryCategory::Conversation,
+            Some("other-session"),
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "bound_core",
+            "orbital vault detail bound to its origin session",
+            MemoryCategory::Core,
+            Some("other-session"),
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "custom_global",
+            "orbital vault note in a custom bucket",
+            MemoryCategory::Custom("notes".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "this_chat",
+            "current chat about the orbital vault",
+            MemoryCategory::Conversation,
+            Some("sess-1"),
+        )
+        .await
+        .unwrap();
+
+        let hits = mem
+            .recall("orbital vault", 10, Some("sess-1"), None, None)
+            .await
+            .unwrap();
+        let keys: Vec<&str> = hits.iter().map(|e| e.key.as_str()).collect();
+        assert!(
+            keys.contains(&"vault_fact"),
+            "global core row must reach session-scoped vector recall, got {keys:?}"
+        );
+        assert!(
+            keys.contains(&"daily_note"),
+            "global daily row must reach session-scoped vector recall, got {keys:?}"
+        );
+        assert!(
+            keys.contains(&"this_chat"),
+            "current-session rows must keep working, got {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"other_chat"),
+            "other sessions' conversation rows must stay excluded, got {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"bound_core"),
+            "session-bound core rows must stay session-scoped, got {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"custom_global"),
+            "custom categories are outside the durable-global carve-out, got {keys:?}"
+        );
+    }
+
+    /// The vector stage's SQL predicate itself: a session filter admits
+    /// session-NULL core/daily rows and nothing else beyond the session.
+    #[tokio::test]
+    async fn vector_search_session_filter_admits_durable_global_rows_only() {
+        let (_tmp, mem) = temp_sqlite_keyed();
+        for (key, category, session) in [
+            ("global_core", MemoryCategory::Core, None),
+            ("global_daily", MemoryCategory::Daily, None),
+            ("bound_core", MemoryCategory::Core, Some("other-session")),
+            ("session_row", MemoryCategory::Conversation, Some("sess-1")),
+            (
+                "global_custom",
+                MemoryCategory::Custom("notes".into()),
+                None,
+            ),
+        ] {
+            mem.store(key, "orbital telemetry", category, session)
+                .await
+                .unwrap();
+        }
+        let mut id_to_key = std::collections::HashMap::new();
+        for key in [
+            "global_core",
+            "global_daily",
+            "bound_core",
+            "session_row",
+            "global_custom",
+        ] {
+            let entry = mem.get(key).await.unwrap().unwrap();
+            id_to_key.insert(entry.id, key);
+        }
+        let query_embedding = mem
+            .get_or_compute_embedding("orbital telemetry")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let conn = mem.conn.lock();
+        let hits =
+            SqliteMemory::vector_search(&conn, &query_embedding, 10, None, Some("sess-1")).unwrap();
+        let mut keys: Vec<&str> = hits
+            .iter()
+            .map(|(id, _)| *id_to_key.get(id).unwrap())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["global_core", "global_daily", "session_row"],
+            "session filter must admit exactly the session's rows plus session-NULL core/daily"
+        );
+    }
+
+    /// Neutrality bar: with the stock Noop embedder (vector stage never
+    /// runs), session-scoped recall keeps the strict legacy filter (global
+    /// core rows stay out) and keyword scores pass through as raw negated
+    /// BM25, bit-identical to `fts5_search`.
+    #[tokio::test]
+    async fn noop_embedder_session_recall_keeps_strict_filter_and_raw_scores() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store(
+            "vault_fact",
+            "the orbital vault passphrase is quokka-vellum",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "this_chat",
+            "current chat about the orbital vault",
+            MemoryCategory::Conversation,
+            Some("sess-1"),
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "this_chat_2",
+            "second orbital note: the vault door code rotated again in the orbital bay",
+            MemoryCategory::Conversation,
+            Some("sess-1"),
+        )
+        .await
+        .unwrap();
+
+        let hits = mem
+            .recall("orbital vault", 10, Some("sess-1"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "strict session filter must hold on the BM25-only path"
+        );
+        let mut keys: Vec<&str> = hits.iter().map(|e| e.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["this_chat", "this_chat_2"]);
+
+        // Multi-entry raw passthrough: every surviving row's score must be
+        // bit-identical to the raw negated BM25 that `fts5_search` produced.
+        // A batch normalization slipping into this path would remap at
+        // least one of two distinct raw scores (the batch max becomes 1.0).
+        let raw = {
+            let conn = mem.conn.lock();
+            SqliteMemory::fts5_search(&conn, "orbital vault", 20).unwrap()
+        };
+        assert!(
+            hits.len() > 1,
+            "raw-passthrough assertion needs multiple surviving entries"
+        );
+        for hit in &hits {
+            let (_, raw_score) = raw
+                .iter()
+                .find(|(id, _)| *id == hit.id)
+                .expect("recalled row must come from the FTS stage");
+            assert_eq!(
+                hit.score,
+                Some(f64::from(*raw_score)),
+                "BM25-only scores must pass through unnormalized for {}",
+                hit.key
+            );
+        }
+    }
+
+    /// Threshold-scale seam: when the vector stage is live but returns
+    /// nothing (query vector orthogonal to every stored row), FTS-only
+    /// survivors must be scored on the [0, 1] axis the downstream
+    /// cosine-tuned relevance floor expects, not raw BM25.
+    #[tokio::test]
+    async fn fts_only_survivors_are_normalized_when_vector_stage_is_live() {
+        let (_tmp, mem) = temp_sqlite_keyed();
+        // No KEYED_MARKER in the stored rows: their embeddings sit on the
+        // other axis, so cosine similarity with the query is 0 and the
+        // vector stage yields nothing.
+        mem.store(
+            "kw_one",
+            "vault passphrase quokka vellum",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "kw_two",
+            "vault door maintenance log",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let hits = mem
+            .recall("orbital vault passphrase", 10, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "both rows must survive via the keyword stage"
+        );
+        let top = hits
+            .iter()
+            .map(|e| e.score.unwrap())
+            .fold(f64::MIN, f64::max);
+        assert!(
+            (top - 1.0).abs() < 1e-6,
+            "best FTS-only survivor must map to 1.0 on the unit axis, got {top}"
+        );
+        assert!(
+            hits.iter().all(|e| (0.0..=1.0).contains(&e.score.unwrap())),
+            "normalized keyword scores must stay on the [0, 1] axis"
         );
     }
 
