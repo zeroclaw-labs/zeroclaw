@@ -729,6 +729,27 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_ref_decodes_json_pointer_escapes() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "slash": { "$ref": "#/$defs/Foo~1Bar" },
+                "tilde": { "$ref": "#/$defs/Tilde~0Name" }
+            },
+            "$defs": {
+                "Foo/Bar": { "type": "string" },
+                "Tilde~Name": { "type": "integer" }
+            }
+        });
+
+        let cleaned = SchemaCleanr::clean_for_anthropic(schema);
+
+        assert_eq!(cleaned["properties"]["slash"]["type"], "string");
+        assert_eq!(cleaned["properties"]["tilde"]["type"], "integer");
+        assert!(cleaned.get("$defs").is_none());
+    }
+
+    #[test]
     fn test_flatten_literal_union() {
         let schema = json!({
             "anyOf": [
