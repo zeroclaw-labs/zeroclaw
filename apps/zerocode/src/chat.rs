@@ -5310,16 +5310,11 @@ impl ChatState {
     }
 
     fn message_copy_region(&self, body: Rect) -> Option<CopyHitRegion> {
-        let Some(idx) = self.highlighted_entry else {
-            return None;
-        };
-        let Some((_, rect)) = self
+        let idx = self.highlighted_entry?;
+        let (_, rect) = self
             .entry_rects
             .iter()
-            .find(|(entry_idx, _)| *entry_idx == idx)
-        else {
-            return None;
-        };
+            .find(|(entry_idx, _)| *entry_idx == idx)?;
         if rect.height == 0 {
             return None;
         }
