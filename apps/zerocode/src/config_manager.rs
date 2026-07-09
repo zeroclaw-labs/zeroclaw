@@ -4858,8 +4858,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn prepare_edit_seeds_unset_field_empty() {
+    #[tokio::test]
+    async fn prepare_edit_seeds_unset_field_empty() {
         // Regression for #8648: opening an unset field for edit must NOT
         // seed the buffer with the `<unset>` display sentinel. Before the
         // fix the scalar branch copied it verbatim, so typing appended
