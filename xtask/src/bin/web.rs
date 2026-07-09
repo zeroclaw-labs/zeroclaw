@@ -1,17 +1,4 @@
 //! `cargo xtask web` — drive the web dashboard build from cargo.
-//!
-//! Subcommands:
-//!   gen-api  — render the gateway's OpenAPI 3.1 spec in-process, write
-//!              it to `target/openapi.json` (gitignored), and feed it to
-//!              `npx openapi-typescript` to produce
-//!              `web/src/lib/api-generated.ts`. Neither file is
-//!              committed; both are derived artifacts.
-//!   install  — `npm install` in `web/`.
-//!   build    — gen-api + `npm run build` (vite production bundle).
-//!   dev      — gen-api + `npm run dev` (vite dev server).
-//!   check    — gen-api + `npx tsc -b` (typecheck without bundling).
-//!
-//!
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -70,11 +57,6 @@ fn npm_install(web_dir: &Path) -> Result<()> {
     run_cmd(Command::new(bin("npm")).current_dir(web_dir).arg("install"))
 }
 
-/// Whether `web/node_modules` is missing or stale relative to `package-lock.json`.
-///
-/// npm writes a `node_modules/.package-lock.json` sentinel after every successful
-/// install. If it's absent, or if the checked-in `package-lock.json` is newer
-/// (a pull or merge updated dependencies), the install needs to re-run.
 fn node_modules_needs_install(web_dir: &Path) -> bool {
     let node_modules = web_dir.join("node_modules");
     if !node_modules.exists() {

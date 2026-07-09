@@ -2,8 +2,6 @@
 //! spec reproduces it and every surface (install.sh, setup.bat, ...) renders
 //! from it. Dry-run is intrinsic: each step pairs a `narration` (the dry-run
 //! line) with its `action` (the real op), and the rendered script chooses
-//! between them at runtime via its dry-run flag. Nothing is hardcoded in a
-//! surface; values flow from `Cargo.toml` and the resolver.
 
 use std::path::Path;
 
@@ -182,11 +180,6 @@ pub struct Resolved {
     pub cargo_flags: String,
 }
 
-/// Meta/aggregate features that are not user-selectable rows. This bit is not
-/// derivable from the feature graph, so it lives in the canonical registry at
-/// `[package.metadata.zeroclaw] non_row_features` in Cargo.toml. Read from
-/// there via `cargo_metadata`; never shadowed by a literal list here or in any
-/// surface.
 pub fn non_row_features(
     meta: &cargo_metadata::Metadata,
     pkg: &cargo_metadata::Package,
@@ -609,11 +602,6 @@ impl FeatureCtx<'_> {
     }
 }
 
-/// The web/dist path EXPRESSION each surface emits - resolved on the END
-/// USER's machine at install time, never baked to the generator host. The
-/// expression mirrors `BaseDirs::data_local_dir` semantics (LOCALAPPDATA on
-/// Windows, XDG_DATA_HOME/.local/share on Linux) so the rendered path matches
-/// the gateway's runtime auto-detect.
 pub fn web_data_dir_expr(platform: Platform) -> &'static str {
     match platform {
         // Unix renderer's else-arm (Linux). The macOS arm is emitted by the

@@ -2,7 +2,6 @@
 //! Containerfile, Dockerfiles, packaging, ...) from the canonical spec.
 //! install.sh@HEAD is the behavioral reference. The spec is the single source
 //! of truth; surfaces are derived and drift-checked. Surfaces are registered in
-//! one table so adding one is data, not control flow.
 
 pub mod container;
 pub mod container_base;
