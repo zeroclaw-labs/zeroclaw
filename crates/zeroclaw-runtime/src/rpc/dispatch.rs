@@ -22,9 +22,9 @@ use tokio::sync::mpsc;
 
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
-    JSONRPC_VERSION, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    RpcOutbound, SopDecideRequest, SopRunOverlayRequest, SopRunRequest, SopRunResponse,
-    SopRunsRequest, SopSaveRequest, SopSelectRequest,
+    JSONRPC_VERSION, JsonRpcError, JsonRpcFrame, JsonRpcNotification, JsonRpcRequest,
+    JsonRpcResponse, RpcOutbound, SopDecideRequest, SopRunOverlayRequest, SopRunRequest,
+    SopRunResponse, SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ChatMessage;
 
@@ -563,34 +563,110 @@ impl RpcDispatcher {
     }
 
     async fn process_line(&mut self, line: &str) {
-        let req: JsonRpcRequest = match serde_json::from_str(line) {
-            Ok(r) => r,
+        // Log incoming frame for debugging response routing issues
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_attrs(serde_json::json!({
+                    "line_len": line.len(),
+                    "preview": &line[..line.len().min(200)],
+                })),
+            "Incoming RPC frame"
+        );
+
+        // First, try to parse as a generic frame to handle both requests and responses.
+        let frame: JsonRpcFrame = match serde_json::from_str(line) {
+            Ok(f) => f,
             Err(e) => {
+                // Try parsing as plain Value to see what we actually got
+                if let Ok(value) = serde_json::from_str::<Value>(line) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(serde_json::json!({
+                                "raw_value": value,
+                                "has_method": value.get("method").is_some(),
+                                "has_result": value.get("result").is_some(),
+                                "has_error": value.get("error").is_some(),
+                                "id": value.get("id"),
+                            })),
+                        "Failed to parse as JsonRpcFrame - raw contents logged"
+                    );
+                }
                 self.send_error(Value::Null, PARSE_ERROR, &format!("Parse error: {e}"))
                     .await;
                 return;
             }
         };
 
-        // Bidirectional RPC: responses to our outbound requests.
-        if req.method.is_empty() {
-            if let Some(id) = req.id.as_ref().and_then(Value::as_str) {
-                self.rpc.dispatch_response(id, Some(req.params), None);
-            }
+        // Check if this is a response to our outbound request (method absent, has result/error).
+        if frame.is_response() {
+            // Convert ID to string regardless of type (string or number) for lookup.
+            let Some(id_value) = frame.id.as_ref() else {
+                // Response with no ID - log and drop it (may be unrelated or malformed).
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "Received response frame with no ID - dropping"
+                );
+                return;
+            };
+            let id_str = match id_value {
+                Value::String(s) => s.clone(),
+                _ => id_value.to_string(),
+            };
+
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_attrs(serde_json::json!({
+                        "id": id_str,
+                        "has_result": frame.result.is_some(),
+                        "has_error": frame.error.is_some(),
+                    })),
+                "Dispatching response to pending request"
+            );
+
+            self.rpc.dispatch_response(
+                &id_str,
+                frame.response_result().cloned(),
+                frame.error.clone(),
+            );
             return;
         }
 
-        let id = req.id.clone().unwrap_or(Value::Null);
-        let is_notification = req.id.is_none();
+        // Not a response - must be an incoming client request.
+        let Some(method_str) = frame.request_method() else {
+            // No method and not a response (e.g., notification with no id). Ignore.
+            return;
+        };
 
-        let method = match Method::from_wire(&req.method) {
+        let req_id = frame.id.clone().unwrap_or(Value::Null);
+        let is_notification = frame.id.is_none();
+        let params = frame.request_params().cloned().unwrap_or_default();
+
+        // Reconstruct a JsonRpcRequest for the existing dispatch logic.
+        let req = JsonRpcRequest {
+            jsonrpc: frame.jsonrpc.clone(),
+            method: method_str.to_string(),
+            params,
+            id: frame.id.clone(),
+        };
+
+        let method = match Method::from_wire(method_str) {
             Some(m) => m,
             None => {
                 if !is_notification {
                     self.send_error(
-                        id,
+                        req_id,
                         METHOD_NOT_FOUND,
-                        &format!("Unknown method: {}", req.method),
+                        &format!("Unknown method: {}", method_str),
                     )
                     .await;
                 }
@@ -600,7 +676,7 @@ impl RpcDispatcher {
 
         if !self.authenticated && method != Method::Initialize {
             if !is_notification {
-                self.send_error(id, AUTH_REQUIRED, "First call must be 'initialize'")
+                self.send_error(req_id, AUTH_REQUIRED, "First call must be 'initialize'")
                     .await;
             }
             return;
@@ -623,7 +699,7 @@ impl RpcDispatcher {
                 // The response (empty {} or error) is kept only so legacy
                 // request-form callers don't park forever.
                 let handle = self.spawn_handle();
-                let id_clone = id;
+                let id_clone = req_id.clone();
                 let params_clone = req.params.clone();
                 let is_notif = is_notification;
                 zeroclaw_spawn::spawn!(async move {
@@ -755,8 +831,8 @@ impl RpcDispatcher {
         }
 
         match result {
-            Ok(v) => self.send_result(id, v).await,
-            Err(e) => self.send_error(id, e.code, &e.message).await,
+            Ok(v) => self.send_result(req_id, v).await,
+            Err(e) => self.send_error(req_id, e.code, &e.message).await,
         }
     }
 
