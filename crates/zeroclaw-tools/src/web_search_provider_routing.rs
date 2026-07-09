@@ -199,8 +199,9 @@ mod tests {
 
     #[test]
     fn search_status_variants_exist() {
-        // 首切片主要用 Blocked；其余变体为后续切片（Empty 检测、timeout 归类）预留，
-        // 但必须在首个 PR 就定义，避免后续改 enum 破坏 match。
+        // First slice uses Blocked primarily; the remaining variants are reserved
+        // for later slices (Empty detection, timeout classification) but must be
+        // defined in the first PR so later enum changes don't break match sites.
         let _ = SearchStatus::Ok;
         let _ = SearchStatus::Blocked;
         let _ = SearchStatus::Timeout;
