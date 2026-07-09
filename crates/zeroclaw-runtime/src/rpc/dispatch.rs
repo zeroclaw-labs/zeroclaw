@@ -8,6 +8,7 @@ use super::types::*;
 const RPC_RELOAD_REPLY_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 const RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY: std::time::Duration =
     std::time::Duration::from_millis(200);
+const PROBE_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 use crate::agent::agent::TurnEvent;
 use crate::sop::SopGraphExt;
 use serde::Serialize;
@@ -977,7 +978,8 @@ impl RpcDispatcher {
 
     async fn handle_doctor_run(&self) -> RpcResult {
         let config = self.ctx.config.read().clone();
-        let results = crate::doctor::run_structured(&config).await;
+        let (results, timed_out_phase) =
+            crate::doctor::run_structured_with_timeout(&config, PROBE_MODEL_TIMEOUT).await;
         let summary = doctor_summary(&results);
         let log_path = if config.observability.log_persistence
             != zeroclaw_config::schema::LogPersistence::None
@@ -990,6 +992,7 @@ impl RpcDispatcher {
             results,
             summary,
             log_path,
+            timed_out_phase,
         })
     }
 
