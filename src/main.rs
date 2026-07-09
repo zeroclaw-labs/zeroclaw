@@ -8763,8 +8763,8 @@ mod tests {
                 .get("default")
                 .unwrap()
                 .bot_token
-                .as_deref(),
-            Some("test-token")
+                .as_str(),
+            "test-token"
         );
     }
 
