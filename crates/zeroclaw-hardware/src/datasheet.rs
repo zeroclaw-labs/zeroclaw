@@ -1,17 +1,4 @@
 //! Datasheet management for industry devices connected via Aardvark.
-//!
-//! When a user identifies a new device (e.g. "I have an LM75 temperature
-//! sensor"), the [`DatasheetTool`] calls [`DatasheetManager`] to:
-//!
-//! 1. **search** — query the web for the device datasheet PDF URL.
-//! 2. **download** — fetch the PDF and save it to
-//!    `~/.zeroclaw/hardware/datasheets/<device>.pdf`.
-//! 3. **list** — enumerate all locally cached datasheets.
-//! 4. **read** — return the local path of a cached datasheet so the LLM can
-//!    reference it with the `read_file` tool or a future RAG pipeline.
-//!
-//! Datasheets must be `.md` or `.txt`. PDF datasheet parsing is no longer
-//! supported as of #8519; convert PDFs to `.md` or `.txt` before indexing.
 
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -39,7 +26,6 @@ impl DatasheetManager {
     }
 
     /// Check if a datasheet for `device_name` already exists locally.
-    ///
     /// Searches for `<device_name_lower>.pdf` (case-insensitive stem match).
     pub fn find_local(&self, device_name: &str) -> Option<PathBuf> {
         let target = format!("{}.pdf", device_name.to_lowercase().replace(' ', "_"));
@@ -62,7 +48,6 @@ impl DatasheetManager {
     }
 
     /// Download a datasheet PDF from `url` and save it locally.
-    ///
     /// The file is saved as `~/.zeroclaw/hardware/datasheets/<device_name>.pdf`.
     /// Returns the path to the saved file.
     pub async fn download_datasheet(
@@ -115,7 +100,6 @@ impl DatasheetManager {
     }
 
     /// Build a web search query for a device datasheet.
-    ///
     /// Returns a suggested search query string the LLM (or a search tool) can
     /// use to find the datasheet.
     pub fn search_query(device_name: &str) -> String {
@@ -136,7 +120,6 @@ impl Default for DatasheetManager {
 // ── DatasheetTool ─────────────────────────────────────────────────────────────
 
 /// Tool: search for, download, and manage device datasheets.
-///
 /// Invoked by the LLM when a user identifies a new device connected via
 /// Aardvark (e.g. "I have an LM75 temperature sensor on the I2C bus").
 pub struct DatasheetTool;

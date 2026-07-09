@@ -1,13 +1,4 @@
 //! `pico_flash` tool — flash ZeroClaw firmware to a Pico in BOOTSEL mode.
-//!
-//! # Happy path
-//! 1. User holds BOOTSEL while plugging in Pico → RPI-RP2 drive appears.
-//! 2. User asks "flash my pico".
-//! 3. LLM calls `pico_flash(confirm=true)`.
-//! 4. Tool copies UF2 to RPI-RP2 drive; Pico reboots into the firmware.
-//! 5. Tool waits up to 20 s for `/dev/cu.usbmodem*` to appear.
-//! 6. Tool reconnects the serial transport in the DeviceRegistry.
-//! 7. Tool returns success; user restarts ZeroClaw to get `pico0`.
 
 use super::device::DeviceRegistry;
 use super::uf2;
@@ -29,12 +20,6 @@ const PORT_POLL_MS: u64 = 500;
 
 // ── PicoFlashTool ─────────────────────────────────────────────────────────────
 
-/// Tool: flash ZeroClaw firmware to a Pico in BOOTSEL mode.
-///
-/// The Pico must be connected with BOOTSEL held so it mounts as `RPI-RP2`.
-/// After flashing, the tool reconnects the serial transport in the
-/// [`DeviceRegistry`] so subsequent `gpio_write` calls work immediately
-/// without restarting ZeroClaw.
 pub struct PicoFlashTool {
     registry: Arc<RwLock<DeviceRegistry>>,
 }
@@ -169,7 +154,6 @@ impl Tool for PicoFlashTool {
         let final_port = Some(port);
 
         // ── 6. Reconnect serial transport in DeviceRegistry ──────────────
-        //
         // The old transport still points at a stale port handle from before
         // the flash. Reconnect so gpio_write works immediately.
         let reconnect_result = match &final_port {

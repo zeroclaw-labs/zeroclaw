@@ -1,8 +1,4 @@
 //! Serial peripheral — STM32 and similar boards over USB CDC/serial.
-//!
-//! Protocol: newline-delimited JSON.
-//! Request:  {"id":"1","cmd":"gpio_write","args":{"pin":13,"value":1}}
-//! Response: {"id":"1","ok":true,"result":"done"}
 
 use crate::peripherals::Peripheral;
 #[cfg(unix)]
