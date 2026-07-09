@@ -123,7 +123,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 keyactions! {
     pub enum GlobalAction ("global") {
         Quit         [Chord::ctrl('c')]                                 => "quit",
-        Help         [Chord::char('?')]                                 => "help",
+        Help         [Chord::char('?'), Chord::key(KeyCode::F(1)), Chord::with(KeyCode::F(1), KeyModifiers::CONTROL)]      => "help",
         PaneNavLeft  [Chord::with(KeyCode::Left, KeyModifiers::ALT), Chord::with(KeyCode::Char('b'), KeyModifiers::ALT)]  => "prev pane",
         PaneNavRight [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "next pane",
         ReloadDaemon [Chord::ctrl('r')]                                 => "reload daemon",
@@ -156,6 +156,7 @@ keyactions! {
         CopySelection           [Chord::char('y')] => "copy selection",
         CopyAllVisible          [Chord::with(KeyCode::Char('C'), KeyModifiers::CONTROL.union(KeyModifiers::SHIFT))] => "copy all visible",
         ToggleThoughts          [Chord::char('t')] => "toggle thoughts",
+        TodoToggle              [Chord::ctrl('p')] => "toggle todo tracker",
         NewSession              [Chord::ctrl('n')] => "new session",
         SwitchSession           [Chord::ctrl('s')] => "switch session",
         DeleteSession           [] => "delete session",
@@ -225,6 +226,7 @@ keyactions! {
         BeginSearch      [Chord::char('/')] => "search",
         CopyDetail       [Chord::char('c')] => "copy detail",
         KillSession      [Chord::char('X')] => "kill session",
+        TriggerCron      [Chord::char('R')] => "run cron job now",
         Refresh          [Chord::char('r')] => "refresh",
         JumpStart        [Chord::char('g'), Chord::key(KeyCode::Home)] => "jump to start",
         JumpEnd          [Chord::char('G'), Chord::key(KeyCode::End)] => "jump to end",
@@ -289,6 +291,7 @@ keyactions! {
         CursorEnd          [Chord::key(KeyCode::End), Chord::ctrl('e')] => "line end",
         OpenFileBrowser    [Chord::ctrl('a')] => "browse files",
         Backspace          [Chord::key(KeyCode::Backspace)] => "backspace",
+        DeletePreviousWord [Chord::ctrl('w')] => "delete previous word",
         ClearInput         [Chord::ctrl('u')] => "clear input",
         SelectAll          [] => "select all",
         Paste              [Chord::ctrl('v')] => "paste",

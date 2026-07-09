@@ -87,7 +87,7 @@ case "$1" in
     ;;
 
   test)
-    run_in_ci "cargo test --locked --verbose"
+    run_in_ci "cargo test --locked --workspace --exclude zeroclaw-desktop --verbose"
     ;;
 
   test-component)
@@ -134,7 +134,7 @@ case "$1" in
 
   all)
     run_in_ci "./scripts/ci/rust_quality_gate.sh"
-    run_in_ci "cargo test --locked --verbose"
+    run_in_ci "cargo test --locked --workspace --exclude zeroclaw-desktop --verbose"
     run_in_ci "bash tests/manual/test_dockerignore.sh"
     run_in_ci "cargo build --release --locked --verbose"
     run_in_ci "cargo deny check licenses sources"
