@@ -112,15 +112,18 @@ pub use zeroclaw_infra::stall_watchdog::StallWatchdog;
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use portable_atomic::{AtomicU64, Ordering};
+use pulldown_cmark::{Event, Options as MarkdownOptions, Parser as MarkdownParser, Tag};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
@@ -902,6 +905,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
             "When responding on WhatsApp Web:\n\
              - Be concise and direct\n\
              - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
+             - To send a native location pin, use marker: [LOCATION:<latitude>,<longitude>,<name>,<address>] where name and address are optional. Double-quote the name if it contains commas; the trailing address may contain commas without quoting.\n\
              - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
              - Do not use http://, https://, data:, file:, or any other URL scheme in WhatsApp Web media markers.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
@@ -3388,7 +3392,52 @@ fn should_suppress_top_level_tool_protocol_response(
     zeroclaw_tool_call_parser::looks_like_tool_protocol_envelope(response)
 }
 
+#[cfg(test)]
 fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+    sanitize_channel_response_with_leak_detection(
+        response,
+        tools,
+        &zeroclaw_config::schema::LeakDetectionConfig::default(),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundContentFormat {
+    Markdown,
+    PlainText,
+}
+
+fn outbound_content_format_for_channel(channel: &str) -> OutboundContentFormat {
+    let channel_type = channel
+        .split_once('.')
+        .map_or(channel, |(channel_type, _)| channel_type);
+    if channel_type.eq_ignore_ascii_case("irc") || channel_type.eq_ignore_ascii_case("twitch") {
+        OutboundContentFormat::PlainText
+    } else {
+        OutboundContentFormat::Markdown
+    }
+}
+
+#[cfg(test)]
+fn sanitize_channel_response_with_leak_detection(
+    response: &str,
+    tools: &[Box<dyn Tool>],
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+) -> String {
+    sanitize_channel_response_for_format_with_leak_detection(
+        response,
+        tools,
+        leak_detection,
+        OutboundContentFormat::Markdown,
+    )
+}
+
+fn sanitize_channel_response_for_format_with_leak_detection(
+    response: &str,
+    tools: &[Box<dyn Tool>],
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    content_format: OutboundContentFormat,
+) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
@@ -3417,9 +3466,25 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     // Strip leading narration lines that announce tool usage
     let sanitized = strip_tool_narration(&stripped_json);
 
-    // Scan for credential leaks before returning to caller
-    match zeroclaw_runtime::security::LeakDetector::new().scan(&sanitized) {
-        zeroclaw_runtime::security::LeakResult::Clean => sanitized,
+    redact_channel_outbound_leaks(&sanitized, leak_detection, content_format)
+}
+
+fn redact_channel_outbound_leaks(
+    content: &str,
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    content_format: OutboundContentFormat,
+) -> String {
+    if !leak_detection.enabled {
+        return content.to_string();
+    }
+    // Scan for credential leaks before returning to caller. Format-specific
+    // outbound layers identify parsed destinations that must remain intact and
+    // pass only byte ranges to the format-agnostic detector.
+    let protected_spans = channel_outbound_protected_spans(content, content_format);
+    match zeroclaw_runtime::security::LeakDetector::with_config(leak_detection)
+        .scan_with_protected_spans(content, &protected_spans)
+    {
+        zeroclaw_runtime::security::LeakResult::Clean => content.to_string(),
         zeroclaw_runtime::security::LeakResult::Detected { patterns, redacted } => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -3430,6 +3495,201 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
             );
             redacted
         }
+    }
+}
+
+fn channel_outbound_protected_spans(
+    content: &str,
+    content_format: OutboundContentFormat,
+) -> Vec<Range<usize>> {
+    let mut spans = Vec::new();
+    // A file URI is a file reference even when punctuation inside it looks
+    // like query syntax; protect it for every outbound text format.
+    if content
+        .as_bytes()
+        .windows(b"file:".len())
+        .any(|window| window.eq_ignore_ascii_case(b"file:"))
+    {
+        collect_raw_file_uri_spans(content, &mut spans);
+    }
+    match content_format {
+        OutboundContentFormat::Markdown => {
+            if content.contains("](")
+                || content.contains("]:")
+                || (content.contains('<') && content.contains("://"))
+            {
+                collect_markdown_link_destination_spans(content, &mut spans);
+            }
+        }
+        OutboundContentFormat::PlainText => {}
+    }
+    spans
+}
+
+fn collect_markdown_link_destination_spans(content: &str, spans: &mut Vec<Range<usize>>) {
+    let parser = MarkdownParser::new_ext(content, MarkdownOptions::empty());
+
+    for (_, link_def) in parser.reference_definitions().iter() {
+        if let Some(span) =
+            parsed_destination_span(content, link_def.span.clone(), link_def.dest.as_ref())
+        {
+            spans.push(span);
+        }
+    }
+
+    for (event, range) in parser.into_offset_iter() {
+        if let Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. }) = event
+            && let Some(span) = parsed_destination_span(content, range, dest_url.as_ref())
+        {
+            spans.push(span);
+        }
+    }
+}
+
+fn parsed_destination_span(
+    content: &str,
+    source_range: Range<usize>,
+    parsed_destination: &str,
+) -> Option<Range<usize>> {
+    if parsed_destination.is_empty() {
+        return None;
+    }
+    let source = content.get(source_range.clone())?;
+    let search_start = destination_search_start(source);
+    decoded_destination_span(source, search_start, parsed_destination)
+        .map(|span| source_range.start + span.start..source_range.start + span.end)
+}
+
+fn destination_search_start(source: &str) -> usize {
+    source
+        .find("](")
+        .map(|idx| idx + 2)
+        .or_else(|| source.find("]:").map(|idx| idx + 2))
+        .unwrap_or(0)
+}
+
+fn decoded_destination_span(
+    source: &str,
+    search_start: usize,
+    parsed_destination: &str,
+) -> Option<Range<usize>> {
+    for (offset, _) in source[search_start..].char_indices() {
+        let start = search_start + offset;
+        if let Some(end) = decoded_match_end(&source[start..], parsed_destination) {
+            return Some(start..start + end);
+        }
+    }
+    None
+}
+
+fn decoded_match_end(raw: &str, parsed: &str) -> Option<usize> {
+    let mut raw_idx = 0;
+
+    for expected in parsed.chars() {
+        let ch = raw[raw_idx..].chars().next()?;
+        let (decoded, end) = if ch == '\\' {
+            let escaped_idx = raw_idx + ch.len_utf8();
+            let next_ch = raw[escaped_idx..].chars().next()?;
+            if !next_ch.is_ascii_punctuation() {
+                return None;
+            }
+            (next_ch, escaped_idx + next_ch.len_utf8())
+        } else if ch == '&' {
+            decode_markdown_entity(raw, raw_idx)?
+        } else {
+            (ch, raw_idx + ch.len_utf8())
+        };
+
+        if decoded != expected {
+            return None;
+        }
+        raw_idx = end;
+    }
+
+    Some(raw_idx)
+}
+
+fn decode_markdown_entity(raw: &str, amp_idx: usize) -> Option<(char, usize)> {
+    let entity_end = raw[amp_idx..].find(';')? + amp_idx + 1;
+    let entity = &raw[amp_idx + 1..entity_end - 1];
+    let decoded = match entity {
+        "amp" | "AMP" => '&',
+        "lt" | "LT" => '<',
+        "gt" | "GT" => '>',
+        "quot" | "QUOT" => '"',
+        "apos" | "APOS" => '\'',
+        "colon" | "COLON" => ':',
+        "sol" | "SOL" => '/',
+        _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+            let value = u32::from_str_radix(&entity[2..], 16).ok()?;
+            char::from_u32(value)?
+        }
+        _ if entity.starts_with('#') => {
+            let value = entity[1..].parse::<u32>().ok()?;
+            char::from_u32(value)?
+        }
+        _ => return None,
+    };
+    Some((decoded, entity_end))
+}
+
+fn collect_raw_file_uri_spans(content: &str, spans: &mut Vec<Range<usize>>) {
+    let mut token_start = None;
+
+    for (idx, ch) in content.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(start) = token_start.take() {
+                collect_file_uri_token_span(content, start, idx, spans);
+            }
+        } else {
+            token_start.get_or_insert(idx);
+        }
+    }
+
+    if let Some(start) = token_start {
+        collect_file_uri_token_span(content, start, content.len(), spans);
+    }
+}
+
+fn collect_file_uri_token_span(
+    content: &str,
+    token_start: usize,
+    token_end: usize,
+    spans: &mut Vec<Range<usize>>,
+) {
+    let token = &content[token_start..token_end];
+    let trimmed_start = token
+        .char_indices()
+        .find(|(_, ch)| !matches!(ch, '<' | '(' | '[' | '{' | '"' | '\''))
+        .map_or(token.len(), |(idx, _)| idx);
+    let trimmed_end = token
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| {
+            !matches!(
+                ch,
+                '>' | ')' | ']' | '}' | '"' | '\'' | '.' | ',' | ';' | ':'
+            )
+        })
+        .map_or(trimmed_start, |(idx, ch)| idx + ch.len_utf8());
+
+    if trimmed_start >= trimmed_end {
+        return;
+    }
+
+    let trimmed = &token[trimmed_start..trimmed_end];
+    let Some(scheme_offset) = trimmed
+        .as_bytes()
+        .windows(b"file:".len())
+        .position(|window| window.eq_ignore_ascii_case(b"file:"))
+    else {
+        return;
+    };
+    let uri_start = trimmed_start + scheme_offset;
+    let candidate = &token[uri_start..trimmed_end];
+
+    if Url::parse(candidate).is_ok_and(|url| url.scheme().eq_ignore_ascii_case("file")) {
+        spans.push(token_start + uri_start..token_start + trimmed_end);
     }
 }
 
@@ -5462,8 +5722,12 @@ async fn process_channel_message_body(
                 }
             }
 
-            let sanitized_response =
-                sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
+            let sanitized_response = sanitize_channel_response_for_format_with_leak_detection(
+                &outbound_response,
+                ctx.tools_registry.as_ref(),
+                &ctx.prompt_config.security.leak_detection,
+                outbound_content_format_for_channel(&msg.channel),
+            );
             let mut delivered_response = if sanitized_response.is_empty()
                 && !outbound_response.trim().is_empty()
             {
@@ -10434,14 +10698,13 @@ pub async fn deliver_announcement(
     output: &str,
 ) -> anyhow::Result<()> {
     use zeroclaw_api::channel::SendMessage;
-    let _ = config;
 
-    // Scan for credential leaks before delivering
-    let leak_detector = zeroclaw_runtime::security::LeakDetector::new();
-    let safe_output = match leak_detector.scan(output) {
-        zeroclaw_runtime::security::LeakResult::Detected { redacted, .. } => redacted,
-        zeroclaw_runtime::security::LeakResult::Clean => output.to_string(),
-    };
+    let safe_output = redact_channel_outbound_leaks(
+        output,
+        &config.security.leak_detection,
+        outbound_content_format_for_channel(channel),
+    );
+    let safe_output = ensure_nonempty_channel_reply(safe_output, output, channel, target);
 
     let make_msg = |s: &str| SendMessage::new(s, target).in_thread(thread_id.clone());
 
@@ -21044,6 +21307,10 @@ BTC is currently around $65,000 based on latest tool output."#
             "whatsapp block must identify itself"
         );
         assert!(
+            block.contains("[LOCATION:"),
+            "whatsapp block must include location pin instructions"
+        );
+        assert!(
             block.contains("[IMAGE:<path>]"),
             "whatsapp block must describe marker syntax"
         );
@@ -24041,6 +24308,277 @@ This is an example JSON object for profile settings."#;
 
         assert!(!result.contains("AKIAABCDEFGHIJKLMNOP")); // gitleaks:allow
         assert!(result.contains("[REDACTED"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_markdown_link_destination_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "https://example.invalid/callback?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let result = sanitize_channel_response(&format!("[callback]({target})"), &tools);
+
+        assert!(result.contains(target), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_markdown_reference_destination_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "https://example.invalid/callback?api_key=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let response = format!("See [callback][cb]\n\n[cb]: {target}");
+
+        let result = sanitize_channel_response(&response, &tools);
+
+        assert!(result.contains(target), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_entity_escaped_markdown_destination_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target =
+            "https://example.invalid/callback?x=1&amp;token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let result = sanitize_channel_response(&format!("[callback]({target})"), &tools);
+
+        assert!(result.contains(target), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_protects_entity_destination_before_title_copy() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target =
+            "https://example.invalid/callback?x=1&amp;token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let title = "https://example.invalid/callback?x=1&token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let result =
+            sanitize_channel_response(&format!("[callback]({target} \"{title}\")"), &tools);
+
+        assert!(result.contains(target), "result: {result}");
+        assert!(!result.contains(title), "result: {result}");
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_protects_reference_destination_before_title_copy() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target =
+            "https://example.invalid/callback?x=1&amp;token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let title = "https://example.invalid/callback?x=1&token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let response = format!("See [callback][cb]\n\n[cb]: {target} \"{title}\"");
+
+        let result = sanitize_channel_response(&response, &tools);
+
+        assert!(result.contains(target), "result: {result}");
+        assert!(!result.contains(title), "result: {result}");
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_protects_url_entity_destination_before_title_copy() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target =
+            "https&colon;&sol;&sol;example.invalid/callback?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let title = "https://example.invalid/callback?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let result =
+            sanitize_channel_response(&format!("[callback]({target} \"{title}\")"), &tools);
+
+        assert!(result.contains(target), "result: {result}");
+        assert!(!result.contains(title), "result: {result}");
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_markdown_autolink_destination_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "https://api.telegram.org/bot123456:ABC-def_GHI/getUpdates";
+
+        let result = sanitize_channel_response(&format!("<{target}>"), &tools);
+
+        assert!(result.contains(target), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_still_scans_markdown_link_text() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let token = "aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let target = "https://example.invalid/callback?ticket=public-id";
+
+        let result = sanitize_channel_response(&format!("[token={token}]({target})"), &tools);
+
+        assert!(!result.contains(token));
+        assert!(result.contains(target), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_scans_link_text_secret_when_match_overlaps_destination() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "file:///tmp/report.md";
+
+        let result =
+            sanitize_channel_response(&format!("[password=longsecretvalue]({target})"), &tools);
+
+        assert!(!result.contains("longsecretvalue"));
+        assert!(result.contains(target), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_scans_link_text_when_label_matches_destination() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let result = sanitize_channel_response(&format!("[{target}]({target})"), &tools);
+
+        assert!(
+            !result.starts_with(&format!("[{target}]")),
+            "result: {result}"
+        );
+        assert!(result.contains(&format!("]({target})")), "result: {result}");
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_escaped_markdown_destination_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "file:///tmp/report\\(1\\).md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let result = sanitize_channel_response(&format!("[report]({target})"), &tools);
+
+        assert!(result.contains(target), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_raw_file_uri_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let outbound = format!("Recorded {target}.");
+
+        let spans = channel_outbound_protected_spans(&outbound, OutboundContentFormat::Markdown);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| &outbound[span.start..span.end])
+                .collect::<Vec<_>>(),
+            vec![target],
+        );
+        let result = sanitize_channel_response(&outbound, &tools);
+
+        assert!(result.contains(target), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_keyed_raw_file_uri_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let outbound = format!("Recorded path={target}.");
+
+        let spans = channel_outbound_protected_spans(&outbound, OutboundContentFormat::Markdown);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| &outbound[span.start..span.end])
+                .collect::<Vec<_>>(),
+            vec![target],
+        );
+        let result = sanitize_channel_response(&outbound, &tools);
+
+        assert!(
+            result.contains(&format!("path={target}")),
+            "result: {result}"
+        );
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_json_keyed_raw_file_uri_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let outbound = format!(r#"{{"uri":"{target}"}}"#);
+
+        let spans = channel_outbound_protected_spans(&outbound, OutboundContentFormat::Markdown);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| &outbound[span.start..span.end])
+                .collect::<Vec<_>>(),
+            vec![target],
+        );
+        let result = sanitize_channel_response(&outbound, &tools);
+
+        assert!(result.contains(target), "result: {result}");
+    }
+
+    #[test]
+    fn plain_text_leak_guard_preserves_raw_file_uri_filenames() {
+        let target = "file:///home/zeroclaw/.zeroclaw/agents/mission-orchestrator/workspace/tasks/inbox/2026-07-02-11-26-plan-b-for-something-useful.md";
+        let outbound = format!("Recorded {target}.");
+
+        let result = redact_channel_outbound_leaks(
+            &outbound,
+            &zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::PlainText,
+        );
+
+        assert_eq!(result, outbound);
+    }
+
+    #[test]
+    fn irc_family_outbound_format_is_plain_text() {
+        assert_eq!(
+            outbound_content_format_for_channel("irc.default"),
+            OutboundContentFormat::PlainText
+        );
+        assert_eq!(
+            outbound_content_format_for_channel("twitch.default"),
+            OutboundContentFormat::PlainText
+        );
+        assert_eq!(
+            outbound_content_format_for_channel("twitch"),
+            OutboundContentFormat::PlainText
+        );
+        assert_eq!(
+            outbound_content_format_for_channel("telegram.default"),
+            OutboundContentFormat::Markdown
+        );
+    }
+
+    #[test]
+    fn sanitize_channel_response_respects_disabled_leak_detection() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let leaked = "Temporary key: AKIAABCDEFGHIJKLMNOP"; // gitleaks:allow
+        let leak_detection = zeroclaw_config::schema::LeakDetectionConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        let result = sanitize_channel_response_with_leak_detection(leaked, &tools, &leak_detection);
+
+        assert_eq!(result, leaked);
+    }
+
+    #[test]
+    fn leak_only_guard_preserves_protocol_looking_announcement_text() {
+        let input = "[Used tools: shell]\n\nCron output completed.";
+
+        let result = redact_channel_outbound_leaks(
+            input,
+            &zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+        );
+
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn leak_only_guard_preserves_raw_file_uri_credentials() {
+        let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let input = format!("Cron output: {target}");
+
+        let result = redact_channel_outbound_leaks(
+            &input,
+            &zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+        );
+
+        assert!(result.contains(target), "result: {result}");
     }
 
     #[test]
