@@ -2326,14 +2326,10 @@ impl Chat {
                         .entry_rects
                         .iter()
                         .find(|(_, r)| mouse::in_rect(col, row, *r))
-                        .map(|(idx, rect)| (*idx, *rect));
+                        .map(|(idx, _)| *idx);
                     let shift = mouse.modifiers.contains(KM::SHIFT);
                     let ctrl = mouse.modifiers.contains(KM::CONTROL);
-                    if let Some((idx, rect)) = hit {
-                        if !state.entry_has_content_at(idx, col, row, rect) {
-                            state.clear_transcript_selection();
-                            return;
-                        }
+                    if let Some(idx) = hit {
                         if ctrl {
                             if state.in_browse_mode() {
                                 if !state.browse_multi.remove(&idx) {
@@ -3390,17 +3386,10 @@ fn render_tool_entry(
 fn render_entry_into(
     entry: &ChatEntry,
     is_selected: bool,
-    show_copy_action: bool,
     show_thoughts: bool,
     width: u16,
     lines: &mut Vec<Line<'static>>,
 ) {
-    if show_copy_action {
-        lines.push(Line::from(Span::styled(
-            message_copy_label(),
-            theme::accent_style().add_modifier(Modifier::BOLD),
-        )));
-    }
     let sel_mod = if is_selected {
         Modifier::REVERSED
     } else {
@@ -3515,14 +3504,6 @@ fn message_copy_label() -> String {
     crate::i18n::t("zc-chat-copy-message")
 }
 
-fn line_display_width(line: &Line<'static>) -> u16 {
-    use unicode_width::UnicodeWidthStr;
-    line.spans
-        .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .sum::<usize>() as u16
-}
-
 /// Recover the fence language token from a code-fence header bar line. The
 /// header's first span is `┌─ lang ─────`; the ` code ` fallback label and an
 /// empty info string both yield `None` so the rebuilt fence stays unlabelled.
@@ -3568,6 +3549,27 @@ fn copy_region(
         rect: Rect::new(body.x + col, body.y + (global_row - scroll), cells, 1),
         text: text.to_string(),
     })
+}
+
+fn centered_message_copy_rect(label: &str, anchor: Rect, body: Rect) -> Option<Rect> {
+    use unicode_width::UnicodeWidthStr;
+
+    if anchor.height == 0 || body.height == 0 || body.width == 0 {
+        return None;
+    }
+    let cells = UnicodeWidthStr::width(label) as u16;
+    if cells == 0 || cells > body.width {
+        return None;
+    }
+    let row = anchor.y;
+    if row < body.y || row >= body.y.saturating_add(body.height) {
+        return None;
+    }
+
+    let x = body
+        .x
+        .saturating_add(body.width.saturating_sub(cells) / 2);
+    Some(Rect::new(x, row, cells, 1))
 }
 
 fn borrow_line<'a>(line: &'a Line<'static>) -> Line<'a> {
@@ -3721,6 +3723,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let body_rect = Rect::new(body_x, body_y, body_w, body_h);
     state.rebuild_copy_regions(inner_width, scroll, body_rect);
     state.rebuild_message_copy_region(body_rect);
+    render_message_copy_overlay(f, state, body_rect);
     let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
         .position(scroll as usize)
         .viewport_content_length(inner_height as usize);
@@ -3742,6 +3745,21 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     } else {
         state.scrollbar_track_rect = None;
     }
+}
+
+fn render_message_copy_overlay(f: &mut Frame, state: &ChatState, body: Rect) {
+    let Some(region) = state.message_copy_region(body) else {
+        return;
+    };
+    f.render_widget(Clear, region.rect);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            message_copy_label(),
+            theme::accent_style().add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center),
+        region.rect,
+    );
 }
 
 fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
@@ -5108,7 +5126,6 @@ impl ChatState {
                 render_entry_into(
                     entry,
                     self.is_entry_highlighted(abs_idx),
-                    self.highlighted_entry == Some(abs_idx),
                     show_thoughts,
                     width,
                     &mut new_lines,
@@ -5142,7 +5159,6 @@ impl ChatState {
             render_entry_into(
                 entry,
                 self.is_entry_highlighted(abs_idx),
-                self.highlighted_entry == Some(abs_idx),
                 show_thoughts,
                 width,
                 &mut lines,
@@ -5293,73 +5309,35 @@ impl ChatState {
         self.copy_hit_regions = regions;
     }
 
-    fn rebuild_message_copy_region(&mut self, body: Rect) {
+    fn message_copy_region(&self, body: Rect) -> Option<CopyHitRegion> {
         let Some(idx) = self.highlighted_entry else {
-            return;
+            return None;
         };
         let Some((_, rect)) = self
             .entry_rects
             .iter()
             .find(|(entry_idx, _)| *entry_idx == idx)
         else {
-            return;
+            return None;
         };
         if rect.height == 0 {
-            return;
+            return None;
         }
         let text = self.yank_single_entry(idx);
         if text.is_empty() {
-            return;
+            return None;
         }
         let label = message_copy_label();
-        let line = Line::from(Span::raw(label.clone()));
-        let Some((col, cells)) = label_cells(&line, &label) else {
-            return;
-        };
-        let row = rect.y;
-        if row < body.y || row >= body.y.saturating_add(body.height) {
-            return;
-        }
-        self.copy_hit_regions.push(CopyHitRegion {
-            rect: Rect::new(rect.x + col, row, cells, 1),
+        Some(CopyHitRegion {
+            rect: centered_message_copy_rect(&label, *rect, body)?,
             text,
-        });
+        })
     }
 
-    fn entry_has_content_at(&self, idx: usize, col: u16, row: u16, rect: Rect) -> bool {
-        if !mouse::in_rect(col, row, rect) {
-            return false;
+    fn rebuild_message_copy_region(&mut self, body: Rect) {
+        if let Some(region) = self.message_copy_region(body) {
+            self.copy_hit_regions.push(region);
         }
-        let Some(&(_, line_lo, line_hi)) = self
-            .cached_line_ranges
-            .iter()
-            .find(|(entry_idx, _, _)| *entry_idx == idx)
-        else {
-            return true;
-        };
-        let Some(&(_, screen_lo, _)) = self
-            .cached_screen_ranges
-            .iter()
-            .find(|(entry_idx, _, _)| *entry_idx == idx)
-        else {
-            return true;
-        };
-        let visible_lo = screen_lo.max(self.scroll_offset);
-        let target_row = visible_lo.saturating_add(row.saturating_sub(rect.y));
-        let local_col = col.saturating_sub(rect.x);
-        let width = self.cached_render_width.max(1);
-        let mut row_cursor = screen_lo;
-        for line in &self.cached_lines[line_lo..line_hi] {
-            let rows = wrapped_rows(line, width);
-            if target_row < row_cursor.saturating_add(rows) {
-                if rows > 1 {
-                    return true;
-                }
-                return local_col < line_display_width(line).min(width);
-            }
-            row_cursor = row_cursor.saturating_add(rows);
-        }
-        true
     }
 
     fn compute_cached_rows(&self, width: u16) -> u16 {
@@ -7477,6 +7455,7 @@ mod tests {
             .first()
             .expect("entry region should be rendered")
             .1;
+        let rows_before = state.cached_total_rows;
         state.dirty = LinesDirty::Clean;
         chat.phase = ChatPhase::Active(Box::new(state));
 
@@ -7506,6 +7485,19 @@ mod tests {
                 render(frame, state, area);
             })
             .expect("redraw selected chat");
+        let selected_entry_rect = state
+            .entry_rects
+            .first()
+            .expect("selected entry region should still be rendered")
+            .1;
+        assert_eq!(
+            state.cached_total_rows, rows_before,
+            "message copy affordance must overlay the transcript without adding rows"
+        );
+        assert_eq!(
+            selected_entry_rect.y, entry_rect.y,
+            "revealing message copy must not push earlier transcript rows"
+        );
 
         let copy_rect = state
             .copy_hit_regions
@@ -7513,6 +7505,17 @@ mod tests {
             .find(|region| region.text == "hello")
             .expect("selected message copy action should be rendered")
             .rect;
+        assert_eq!(
+            copy_rect.y, selected_entry_rect.y,
+            "message copy action should overlay the selected row"
+        );
+        let body_x = area.x + 1;
+        let body_width = area.width.saturating_sub(2);
+        let expected_x = body_x + body_width.saturating_sub(copy_rect.width) / 2;
+        assert_eq!(
+            copy_rect.x, expected_x,
+            "message copy action should be horizontally centered in the chat body"
+        );
         let copy_click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: copy_rect.x,
