@@ -5417,6 +5417,64 @@ mod tests {
         );
     }
 
+    /// Boundary regression: prove the corrected ceiling survives the *wire*
+    /// path, not just the config helper. This threads
+    /// `context_usage_max_tokens(&cfg, alias)` through the exact
+    /// `notification_for_turn_event` serialization the RPC dispatch emits, and
+    /// asserts the on-the-wire `context_usage.max_context_tokens` reads the
+    /// runtime-profile budget (128_000) rather than the model-window fallback
+    /// (32_000). This closes the "helper is right but does the emitted payload
+    /// carry it?" gap without needing a live daemon smoke.
+    #[test]
+    fn context_usage_notification_wire_reports_runtime_profile_budget() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "coding".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(128_000),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "coding".into(),
+                // No provider context_window: the broken path would emit 32_000.
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let cfg = Config {
+            agents,
+            runtime_profiles,
+            ..Config::default()
+        };
+
+        // Resolve the ceiling exactly as RPC dispatch does, then emit it
+        // through the real wire serializer.
+        let max_ctx = context_usage_max_tokens(&cfg, "coder");
+        let event = TurnEvent::Usage {
+            input_tokens: Some(100),
+            cached_input_tokens: None,
+            output_tokens: Some(50),
+            cost_usd: Some(0.01),
+        };
+        let json = notification_for_turn_event("s1", &event, Some(max_ctx)).unwrap();
+        let v = parse(&json);
+
+        assert_eq!(v["params"]["type"], "context_usage");
+        assert_eq!(
+            v["params"]["max_context_tokens"], 128_000,
+            "emitted context_usage must carry the runtime-profile budget, not the 32k model-window fallback"
+        );
+    }
+
     #[test]
     fn usage_event_without_input_tokens_emits_null() {
         let event = TurnEvent::Usage {
