@@ -1,4 +1,4 @@
-//! Alias reference discovery for typed delete-with-cascade (#7175).
+//! Alias reference discovery for typed delete-with-cascade
 
 use crate::schema::Config;
 

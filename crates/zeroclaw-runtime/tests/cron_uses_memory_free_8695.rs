@@ -1,4 +1,4 @@
-//! Integration test for #8695: a cron job with `uses_memory = false` must be
+//! Integration test a cron job with `uses_memory = false` must be
 //! memory-free end to end, not merely opted out of the context preamble.
 
 use std::collections::HashMap;

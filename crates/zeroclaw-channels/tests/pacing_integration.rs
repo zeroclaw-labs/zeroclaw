@@ -1,6 +1,6 @@
 //! Integration coverage for `reply_min_interval_secs` + bounded queue
 //! against the recipient shapes used by Telegram and WhatsApp Web — the
-//! two channels #6345 calls out by name.
+//! two channelscalls out by name.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

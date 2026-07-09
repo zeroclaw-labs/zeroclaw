@@ -1,4 +1,4 @@
-//! RFC #7141 inbound authentication seam: the [`AuthProvider`] trait + a
+//! RFCinbound authentication seam: the [`AuthProvider`] trait + a
 //! default-deny [`ProviderRegistry`].
 
 use std::sync::Arc;

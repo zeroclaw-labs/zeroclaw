@@ -1,4 +1,4 @@
-//! Universal ingress policy contract types (RFC #6971, phase 1).
+//! Universal ingress policy contract types (RFC phase 1).
 
 use serde::{Deserialize, Serialize};
 

@@ -1,4 +1,4 @@
-//! #7415 safety net — pins the turn-engine behaviors the existing suite is
+//! safety net — pins the turn-engine behaviors the existing suite is
 //! known NOT to cover (spec: the eight seams in the consolidation plan).
 
 use super::*;

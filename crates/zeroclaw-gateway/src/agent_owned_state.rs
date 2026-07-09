@@ -1,4 +1,4 @@
-//! Agent-deletion **owned-state** cascade (#7175) — the non-config half of
+//! Agent-deletion **owned-state** cascade— the non-config half of
 //! deleting an agent.
 
 use std::path::Path;

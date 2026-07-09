@@ -1,4 +1,4 @@
-//! Universal ingress policy front door (RFC #6971, phase 1).
+//! Universal ingress policy front door (RFC phase 1).
 
 use zeroclaw_api::ingress::{IngressContext, IngressDecision};
 

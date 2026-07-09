@@ -1,4 +1,4 @@
-//! Regression coverage for #7733 at the channels-orchestrator MCP
+//! Regression coverageat the channels-orchestrator MCP
 //! connection site (`crates/zeroclaw-channels/src/orchestrator/mod.rs`,
 //! search for `mcp_servers_for_agent`).
 

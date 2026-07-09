@@ -1,5 +1,5 @@
 //! CLI for alias CRUD — `zeroclaw {agents,providers,channels} {create,list,
-//! rename,delete}` (#7468 / #7175).
+//! rename,delete}`/
 
 use anyhow::{Context, Result, bail};
 use zeroclaw::{AgentsCommands, ChannelsCommands, ProvidersCommands};

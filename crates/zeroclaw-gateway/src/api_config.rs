@@ -3709,13 +3709,6 @@ mod tests {
         );
     }
 
-    /// #7941 partial-failure surface: the response body must carry a
-    /// `warnings` array that aggregates (a) archive dir creation failures,
-    /// (b) workspace archive `fs::rename` failures, and (c) per-store failures
-    /// from the owned-state cascade. Pre-fix, `MapKeyResponse` had no
-    /// `warnings` field at all and every side-effect failure was WARN-logged
-    /// only — the operator got a clean 200 OK and had to scrape server logs
-    /// to learn that part of the cascade had silently failed.
     #[tokio::test]
     async fn agent_delete_response_carries_partial_failure_warnings() {
         use axum::body::to_bytes;

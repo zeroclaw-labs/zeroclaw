@@ -1,4 +1,4 @@
-//! Per-alias webhook routing helpers (#6312).
+//! Per-alias webhook routing helpers
 
 use std::collections::HashMap;
 

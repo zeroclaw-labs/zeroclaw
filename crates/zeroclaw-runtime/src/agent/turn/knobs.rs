@@ -1,4 +1,4 @@
-//! Per-caller loop behaviour knobs (#7415 consolidation).
+//! Per-caller loop behaviour knobsconsolidation).
 
 /// How to handle max-tool-iteration exhaustion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
