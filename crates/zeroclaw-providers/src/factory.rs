@@ -243,10 +243,10 @@ fn build_responses_provider_if_requested(
     if let Some(url) = base_url {
         builder = builder.api_url(url);
     }
-    if let Some(t) = opts.provider_timeout_secs {
-        builder = builder.timeout_secs(t);
-    }
     let mut p = builder.credential(key).build();
+    if let Some(t) = opts.provider_timeout_secs {
+        p = p.with_timeout_secs(t);
+    }
     if let Some(mt) = opts.provider_max_tokens {
         p = p.with_max_tokens(Some(mt));
     }

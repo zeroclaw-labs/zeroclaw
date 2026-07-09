@@ -992,7 +992,10 @@ pub struct OpenAiResponsesModelProvider {
 ///
 /// Only `alias` is required. `api_url` defaults to the OpenAI Responses
 /// endpoint; if a custom URL is supplied, `/responses` is appended when
-/// not already present so callers can pass either shape.
+/// not already present so callers can pass either shape. `timeout_secs`
+/// and `extra_headers` are set post-build via the `with_*` methods on
+/// the built provider, matching the config-driven override pattern used
+/// by the other provider factories.
 #[must_use]
 pub struct OpenAiResponsesBuilder {
     alias: String,
@@ -1000,8 +1003,6 @@ pub struct OpenAiResponsesBuilder {
     credential: Option<String>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
-    timeout_secs: Option<u64>,
-    extra_headers: std::collections::HashMap<String, String>,
 }
 
 impl OpenAiResponsesBuilder {
@@ -1032,24 +1033,6 @@ impl OpenAiResponsesBuilder {
         self
     }
 
-    /// Override the HTTP request timeout (non-streaming path). Values of
-    /// 0 are ignored (the default 120 s is kept) so a stray `Some(0)`
-    /// from config cannot silently disable the safety timeout.
-    pub fn timeout_secs(mut self, secs: u64) -> Self {
-        if secs > 0 {
-            self.timeout_secs = Some(secs);
-        }
-        self
-    }
-
-    /// Set extra HTTP headers to include in every API request. Reserved
-    /// keys (e.g. `Authorization`) are dropped at request-build time —
-    /// see [`OpenAiResponsesModelProvider`] for details.
-    pub fn extra_headers(mut self, headers: std::collections::HashMap<String, String>) -> Self {
-        self.extra_headers = headers;
-        self
-    }
-
     pub fn build(self) -> OpenAiResponsesModelProvider {
         let responses_url = self
             .api_url
@@ -1069,8 +1052,8 @@ impl OpenAiResponsesBuilder {
             credential: self.credential,
             max_tokens: self.max_tokens,
             reasoning_effort: self.reasoning_effort,
-            timeout_secs: self.timeout_secs.unwrap_or(120),
-            extra_headers: self.extra_headers,
+            timeout_secs: 120,
+            extra_headers: std::collections::HashMap::new(),
         }
     }
 }
@@ -1085,8 +1068,6 @@ impl OpenAiResponsesModelProvider {
             credential: None,
             max_tokens: None,
             reasoning_effort: None,
-            timeout_secs: None,
-            extra_headers: std::collections::HashMap::new(),
         }
     }
 
