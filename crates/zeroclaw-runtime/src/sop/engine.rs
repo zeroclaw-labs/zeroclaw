@@ -1485,10 +1485,35 @@ impl SopEngine {
         // closed).
         if parked_for_approval {
             self.persist_parked_snapshot_then_release_claim(run_id);
+            // EPIC G route delivery: if the parked step's policy names a
+            // `request_route`, deliver the approval request out-of-band (e.g. to a
+            // Discord ops channel) so an approver can act without watching the
+            // originating surface. Best-effort - the gate is already parked and
+            // durable; a delivery failure never affects it, and the approval still
+            // comes back through the normal HTTP/WS/tool -> broker path.
+            self.notify_park_request(run_id);
         } else {
             self.persist_active(run_id);
         }
         Ok(action)
+    }
+
+    /// Deliver the initial approval-request notice for a run that just parked at a
+    /// policied gate, if that policy names a `request_route`. Best-effort: a run
+    /// with no policy, a policy with no request route, or a delivery error all leave
+    /// the (already-parked, already-durable) gate untouched.
+    fn notify_park_request(&self, run_id: &str) {
+        let (sop_name, step) = match self.get_run(run_id) {
+            Some(r) => (r.sop_name.clone(), r.current_step),
+            None => return,
+        };
+        let Some(policy_name) = self.current_step_policy_name(run_id) else {
+            return;
+        };
+        let broker = self.approval_broker();
+        if let Some(route) = broker.request_route(self.approval_config(), &policy_name) {
+            broker.deliver_request(&route, run_id, &sop_name, step);
+        }
     }
 
     fn dispatch_deterministic_step(
@@ -5378,6 +5403,103 @@ mod tests {
         )]);
         let action = engine.start_run("s1", manual_event()).unwrap();
         assert!(matches!(action, SopRunAction::WaitApproval { .. }));
+    }
+
+    /// A recorded `deliver` call: `(route, run_id, sop_name, step)`.
+    type RecordedRouteCall = (String, String, String, u32);
+
+    /// A route adapter that records every `deliver` call, so a test can assert the
+    /// engine fired an out-of-band approval-request notice on park.
+    #[derive(Default)]
+    struct RecordingRouteAdapter {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<RecordedRouteCall>>>,
+    }
+
+    impl crate::sop::approval::ApprovalRouteAdapter for RecordingRouteAdapter {
+        fn deliver(
+            &self,
+            route: &str,
+            run_id: &str,
+            sop_name: &str,
+            step: u32,
+        ) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push((
+                route.to_string(),
+                run_id.to_string(),
+                sop_name.to_string(),
+                step,
+            ));
+            Ok(())
+        }
+    }
+
+    fn policied_supervised_engine(
+        request_route: Option<&str>,
+        adapter: std::sync::Arc<dyn crate::sop::approval::ApprovalRouteAdapter>,
+    ) -> SopEngine {
+        use zeroclaw_config::schema::ApprovalPolicyConfig;
+        let mut config = SopConfig::default();
+        config.approval.policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: None,
+                quorum: 0,
+                request_route: request_route.map(String::from),
+                escalation_route: None,
+            },
+        );
+        // A supervised SOP whose first step names the `prod` policy, so starting it
+        // parks at a policied approval gate.
+        let mut sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
+        sop.steps[0].policy = Some("prod".to_string());
+        engine_with_config_sops(config, vec![sop]).with_approval_broker(std::sync::Arc::new(
+            crate::sop::approval::ApprovalBroker::with_route(adapter),
+        ))
+    }
+
+    #[test]
+    fn parking_at_a_policied_gate_delivers_the_request_route() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = std::sync::Arc::new(RecordingRouteAdapter {
+            calls: calls.clone(),
+        });
+        let mut engine = policied_supervised_engine(Some("discord.ops:123456789"), adapter);
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert!(
+            matches!(action, SopRunAction::WaitApproval { .. }),
+            "supervised policied step parks for approval"
+        );
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "exactly one out-of-band request-route delivery fired on park"
+        );
+        let (route, delivered_run, sop_name, step) = &recorded[0];
+        assert_eq!(route, "discord.ops:123456789", "the policy's request_route");
+        assert_eq!(delivered_run, &run_id, "carries the parked run id");
+        assert_eq!(sop_name, "s1", "carries the SOP name");
+        assert_eq!(*step, 1, "carries the parked step number");
+    }
+
+    #[test]
+    fn parking_at_a_policied_gate_without_a_request_route_delivers_nothing() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = std::sync::Arc::new(RecordingRouteAdapter {
+            calls: calls.clone(),
+        });
+        // Same policied gate, but the policy names NO request_route.
+        let mut engine = policied_supervised_engine(None, adapter);
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        assert!(matches!(action, SopRunAction::WaitApproval { .. }));
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "no request_route configured means no out-of-band delivery"
+        );
     }
 
     #[test]

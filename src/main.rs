@@ -4226,10 +4226,12 @@ async fn main() -> Result<()> {
                             &current_config.data_dir,
                             None,
                         )?);
+                    let route_adapter = build_sop_route_adapter(&current_config);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         current_config.sop.clone(),
                         &current_config.data_dir,
                         mem,
+                        route_adapter,
                     );
                     (Some(engine), Some(audit))
                 } else {
@@ -4987,10 +4989,12 @@ async fn main() -> Result<()> {
                     let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
                         zeroclaw_memory::create_memory(&config.memory, &config.data_dir, None)?,
                     );
+                    let route_adapter = build_sop_route_adapter(&config);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         config.sop.clone(),
                         &config.data_dir,
                         mem,
+                        route_adapter,
                     );
                     (Some(engine), Some(audit))
                 } else {
@@ -7724,6 +7728,29 @@ fn gate_security_posture(
         }
     });
     Ok(Some(handle))
+}
+
+/// Build the SOP approval route adapter from the configured channel map, so a SOP
+/// that parks at a policied gate (or later times out) can deliver its approval
+/// request / escalation notice to a real channel (Discord, Slack, ...). Returns
+/// `None` when no channels are configured, in which case `build_sop_engine` falls
+/// back to the log-only no-op adapter (unchanged behavior). MUST be called from
+/// within the tokio runtime: it captures `Handle::current()` so the sync,
+/// under-the-engine-lock `deliver` can fire-and-forget the async channel `send`.
+#[cfg(feature = "agent-runtime")]
+fn build_sop_route_adapter(
+    config: &Config,
+) -> Option<std::sync::Arc<dyn zeroclaw_runtime::sop::approval::ApprovalRouteAdapter>> {
+    let channels = zeroclaw_channels::orchestrator::build_channel_map(config);
+    if channels.is_empty() {
+        return None;
+    }
+    Some(std::sync::Arc::new(
+        zeroclaw_runtime::sop::approval::ChannelRouteAdapter::new(
+            channels,
+            tokio::runtime::Handle::current(),
+        ),
+    ))
 }
 
 /// Spawn the periodic SOP maintenance tick (EPIC A1 + SOP cron): on each interval it

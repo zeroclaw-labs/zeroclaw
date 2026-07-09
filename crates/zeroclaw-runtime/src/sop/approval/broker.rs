@@ -164,6 +164,36 @@ impl ApprovalBroker {
         }
     }
 
+    /// The request route for a named policy: the channel the INITIAL approval
+    /// request is delivered to when a run parks at a gate this policy governs. Read
+    /// from live config; an empty string is treated as `None` (no out-of-band
+    /// request notice), matching the config contract. This is a DISTINCT lifecycle
+    /// event from [`escalation_route`](Self::escalation_route) - the request fires on
+    /// park, the escalation only if the gate later times out.
+    pub fn request_route(&self, cfg: &SopApprovalConfig, policy_name: &str) -> Option<String> {
+        cfg.policies
+            .get(policy_name)
+            .and_then(|p| p.request_route.clone())
+            .filter(|r| !r.is_empty())
+    }
+
+    /// Deliver the initial approval-request notice to a route (best-effort). Fired
+    /// when a run parks at a policied gate; a delivery failure never blocks or clears
+    /// the gate (the gate is the source of truth, this is only a notice).
+    pub fn deliver_request(&self, route: &str, run_id: &str, sop_name: &str, step: u32) {
+        if let Err(e) = self.route.deliver(route, run_id, sop_name, step) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "route": route, "run_id": run_id, "error": e.to_string()
+                    })),
+                "approval request route delivery failed (gate unaffected)"
+            );
+        }
+    }
+
     /// The approval policy that applies to the run's currently-waiting step, resolved
     /// from the engine's live config. Three-state so a NAMED-but-absent policy is
     /// distinguished from no policy at all - the caller fails closed on the former.
@@ -432,6 +462,7 @@ mod tests {
             ApprovalPolicyConfig {
                 required_group: Some("release".into()),
                 quorum,
+                request_route: None,
                 escalation_route: None,
             },
         );
@@ -1092,6 +1123,7 @@ mod tests {
             ApprovalPolicyConfig {
                 required_group: Some(String::new()),
                 quorum: 1,
+                request_route: None,
                 escalation_route: None,
             },
         );
@@ -1139,6 +1171,7 @@ mod tests {
             ApprovalPolicyConfig {
                 required_group: None,
                 quorum: 1,
+                request_route: None,
                 escalation_route: Some(String::new()),
             },
         );
@@ -1151,6 +1184,49 @@ mod tests {
             broker.escalation_route(&cfg, "prod"),
             None,
             "an empty escalation_route must resolve to None, not Some(\"\")"
+        );
+    }
+
+    #[test]
+    fn request_route_reads_the_policy_and_treats_empty_as_none() {
+        let mut policies = HashMap::new();
+        policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: None,
+                quorum: 1,
+                request_route: Some("discord.ops:123".to_string()),
+                escalation_route: None,
+            },
+        );
+        policies.insert(
+            "blank".to_string(),
+            ApprovalPolicyConfig {
+                required_group: None,
+                quorum: 1,
+                request_route: Some(String::new()),
+                escalation_route: None,
+            },
+        );
+        let cfg = SopApprovalConfig {
+            groups: HashMap::new(),
+            policies,
+        };
+        let broker = ApprovalBroker::disabled();
+        assert_eq!(
+            broker.request_route(&cfg, "prod").as_deref(),
+            Some("discord.ops:123"),
+            "a configured request_route is returned verbatim"
+        );
+        assert_eq!(
+            broker.request_route(&cfg, "blank"),
+            None,
+            "an empty request_route resolves to None (no out-of-band notice)"
+        );
+        assert_eq!(
+            broker.request_route(&cfg, "absent"),
+            None,
+            "an unknown policy has no request_route"
         );
     }
 
@@ -1217,6 +1293,7 @@ mod tests {
             ApprovalPolicyConfig {
                 required_group: Some("release".into()),
                 quorum: 2,
+                request_route: None,
                 escalation_route: None,
             },
         );
@@ -1272,7 +1349,8 @@ members = ["http:abc123", "cli:test_user"]
 [policies.prod]
 required_group = "release"
 quorum = 2
-escalation_route = "oncall"
+request_route = "discord.ops:111222333"
+escalation_route = "discord.oncall:444555666"
 "#;
         let cfg: SopApprovalConfig = toml::from_str(toml).expect("parse [sop.approval]");
         let group = cfg.groups.get("release").expect("release group");
@@ -1283,6 +1361,15 @@ escalation_route = "oncall"
         let policy = cfg.policies.get("prod").expect("prod policy");
         assert_eq!(policy.required_group.as_deref(), Some("release"));
         assert_eq!(policy.quorum, 2);
-        assert_eq!(policy.escalation_route.as_deref(), Some("oncall"));
+        // Route values are `channel:recipient` (what the real ChannelRouteAdapter
+        // parses), not a bare channel name.
+        assert_eq!(
+            policy.request_route.as_deref(),
+            Some("discord.ops:111222333")
+        );
+        assert_eq!(
+            policy.escalation_route.as_deref(),
+            Some("discord.oncall:444555666")
+        );
     }
 }

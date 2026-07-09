@@ -313,6 +313,7 @@ pub(crate) mod tests {
             ApprovalPolicyConfig {
                 required_group: Some("release".into()),
                 quorum: 1,
+                request_route: None,
                 escalation_route: None,
             },
         );

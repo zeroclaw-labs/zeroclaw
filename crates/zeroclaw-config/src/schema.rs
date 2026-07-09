@@ -21514,8 +21514,22 @@ pub struct ApprovalPolicyConfig {
     /// single approval; `>= 2` requires a quorum of distinct approver identities.
     #[serde(default)]
     pub quorum: u32,
+    /// Channel to deliver the INITIAL approval request to when a run parks at a
+    /// gate this policy governs, formatted `channel[:recipient]` (e.g.
+    /// `discord.ops:123456789012345678`). The `channel` names a configured channel
+    /// (the `<channel>.<alias>` / bare-`<channel>` key from the channel map); the
+    /// `recipient` is that channel's addressee (a Discord channel id, a chat id,
+    /// etc.). Delivery is best-effort - the gate is the source of truth and a
+    /// delivery failure never blocks or clears it; approvals still come back
+    /// through the normal HTTP/WS/tool surfaces. `None`/empty = no out-of-band
+    /// request notice (today's behavior: only the originating surface is notified).
+    /// This is a DISTINCT lifecycle event from `escalation_route`: the request goes
+    /// out when the run parks; the escalation goes out only if it later times out.
+    #[serde(default)]
+    pub request_route: Option<String>,
     /// Route to escalate to on timeout (the distinct "second route"). `None`/empty
-    /// re-surfaces to the same route (today's `Escalate` behavior).
+    /// re-surfaces to the same route (today's `Escalate` behavior). Same
+    /// `channel[:recipient]` format as `request_route`.
     #[serde(default)]
     pub escalation_route: Option<String>,
 }
