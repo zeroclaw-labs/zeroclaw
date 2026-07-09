@@ -1461,6 +1461,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: std::sync::Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: std::sync::Arc::new(Vec::new()),
             tools_registry_by_agent: std::sync::Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,

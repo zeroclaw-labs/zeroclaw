@@ -295,6 +295,10 @@ pub async fn handle_api_status(
 
     let process = zeroclaw_runtime::process_stats::sample();
 
+    // Per-agent in-flight turn counts from the shared registry.
+    let in_flight_by_agent = state.in_flight.snapshot();
+    let in_flight_total: i64 = in_flight_by_agent.values().sum();
+
     let body = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "model_provider": model_provider,
@@ -310,6 +314,8 @@ pub async fn handle_api_status(
         "health": health,
         "agent_alias": agent_alias,
         "process": process,
+        "in_flight_by_agent": in_flight_by_agent,
+        "in_flight_total": in_flight_total,
     });
 
     Json(body).into_response()
@@ -2125,6 +2131,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,

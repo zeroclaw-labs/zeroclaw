@@ -1195,6 +1195,51 @@ fn api_key_and_uri_for_provider(
     )
 }
 
+/// RAII guard that ensures an `AgentEnd` observability event fires on every
+/// exit path from the `run()` agent loop. Created immediately after the main
+/// `AgentStart`; dropped automatically on early returns (`?`, `return Ok`,
+/// `return Err`) so the in-flight counter never leaks.
+///
+/// For model-switch retries, the caller emits a short-lived `AgentEnd` *before*
+/// each nested `AgentStart`; the main guard then fires the final `AgentEnd`
+/// with the last model name and accumulated token usage.
+struct LoopTurnGuard {
+    observer: Arc<dyn Observer>,
+    model_provider: String,
+    model: String,
+    channel_name: String,
+    agent_alias: String,
+    turn_id: String,
+    turn_started_at: Instant,
+    done: bool,
+}
+
+impl LoopTurnGuard {
+    fn fire(&mut self) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        let duration = self.turn_started_at.elapsed();
+        self.observer.record_event(&ObserverEvent::AgentEnd {
+            model_provider: self.model_provider.clone(),
+            model: self.model.clone(),
+            duration,
+            tokens_used: None,
+            cost_usd: None,
+            channel: Some(self.channel_name.clone()),
+            agent_alias: Some(self.agent_alias.clone()),
+            turn_id: Some(self.turn_id.clone()),
+        });
+    }
+}
+
+impl Drop for LoopTurnGuard {
+    fn drop(&mut self) {
+        self.fire();
+    }
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run(
     config: Config,
@@ -1524,6 +1569,20 @@ pub async fn run(
             agent_alias: Some(agent_alias.to_string()),
             turn_id: Some(turn_id.clone()),
         });
+
+        // RAII guard: fires AgentEnd on every exit path so the in-flight
+        // counter never leaks when early returns (`?`, `return Ok`, `return Err`)
+        // skip the normal AgentEnd at the bottom of the function.
+        let mut _turn_guard = LoopTurnGuard {
+            observer: observer.clone(),
+            model_provider: provider_name.clone(),
+            model: model_name.clone(),
+            channel_name: channel_name.to_string(),
+            agent_alias: agent_alias.to_string(),
+            turn_id: turn_id.clone(),
+            turn_started_at: Instant::now(),
+            done: false,
+        };
 
         // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
         let hardware_rag: Option<crate::rag::HardwareRag> = config
@@ -2010,6 +2069,19 @@ pub async fn run(
                                     provider_name, model_name, new_model_provider, new_model
                                 )
                             );
+
+                            // Close the previous AgentStart before re-starting with
+                            // a new model so the in-flight counter stays balanced.
+                            observer.record_event(&ObserverEvent::AgentEnd {
+                                model_provider: provider_name.to_string(),
+                                model: model_name.to_string(),
+                                duration: std::time::Duration::ZERO,
+                                tokens_used: None,
+                                cost_usd: None,
+                                channel: Some(channel_name.to_string()),
+                                agent_alias: Some(agent_alias.to_string()),
+                                turn_id: Some(turn_id.clone()),
+                            });
 
                             let (switch_api_key, switch_uri) = api_key_and_uri_for_provider(
                                 &config,
@@ -2606,6 +2678,17 @@ pub async fn run(
 
                                 clear_model_switch_request();
 
+                                observer.record_event(&ObserverEvent::AgentEnd {
+                                    model_provider: provider_name.to_string(),
+                                    model: model_name.to_string(),
+                                    duration: std::time::Duration::ZERO,
+                                    tokens_used: None,
+                                    cost_usd: None,
+                                    channel: Some(channel_name.to_string()),
+                                    agent_alias: Some(agent_alias.to_string()),
+                                    turn_id: Some(turn_id.clone()),
+                                });
+
                                 observer.record_event(&ObserverEvent::AgentStart {
                                     model_provider: provider_name.to_string(),
                                     model: model_name.to_string(),
@@ -2853,6 +2936,10 @@ pub async fn run(
                 },
             )
         });
+        // Mark the RAII guard as done so its Drop doesn't emit a duplicate
+        // AgentEnd with tokens_used: None — the event below carries the real
+        // token counts from the cost-tracking context.
+        _turn_guard.done = true;
         observer.record_event(&ObserverEvent::AgentEnd {
             model_provider: provider_name.to_string(),
             model: model_name.to_string(),

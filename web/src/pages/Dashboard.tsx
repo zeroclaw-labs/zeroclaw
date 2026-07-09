@@ -2906,7 +2906,7 @@ function AgentsSection() {
   // Keying off the alias keeps the open drawer in sync with live toggles.
   const [selectedAlias, setSelectedAlias] = useState<string | null>(null);
 
-  useEffect(() => {
+  const refreshAgents = useCallback(() => {
     loadAgentSummaries()
       .then(setAgents)
       .catch((err: unknown) =>
@@ -2915,6 +2915,8 @@ function AgentsSection() {
         ),
       );
   }, []);
+
+  usePolling(refreshAgents, 5000);
 
   useEffect(() => {
     getQuickstartState()

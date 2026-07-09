@@ -6,6 +6,7 @@ import {
   MessageSquare,
   Power,
   Wifi,
+  Zap,
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import type { AgentSummary } from '@/lib/agents';
@@ -100,6 +101,18 @@ export default function AgentCard({ agent, onSelect, selected = false }: AgentCa
 
       {/* Inline facts — hidden on the narrowest viewports to keep the row clean */}
       <div className="hidden sm:flex items-center gap-4 flex-shrink-0">
+        {agent.inFlightCount > 0 && (
+          <RowFact
+            icon={Zap}
+            value={agent.inFlightCount}
+            label={
+              agent.inFlightCount === 1
+                ? t('agentcard.processing_turn')
+                : t('agentcard.processing_turns')
+            }
+            title={t('agentcard.processing_title')}
+          />
+        )}
         <RowFact
           icon={Wifi}
           value={channelCount}

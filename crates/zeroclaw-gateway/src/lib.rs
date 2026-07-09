@@ -574,6 +574,8 @@ pub struct AppState {
     pub sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     /// Shared SOP audit logger from the daemon (for WS agent sessions).
     pub sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    /// Per-agent in-flight turn counter for the dashboard.
+    pub in_flight: zeroclaw_runtime::observability::InFlightRegistry,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -1538,6 +1540,13 @@ pub async fn run_gateway(
     let broadcast_hook_guard =
         zeroclaw_runtime::observability::set_scoped_broadcast_hook(broadcast_layer);
 
+    // Install the in-flight turn counter observer as a broadcast hook so
+    // that every AgentStart / AgentEnd event — regardless of which observer
+    // emits it — updates the per-agent in-flight count.
+    let _inflight_guard = zeroclaw_runtime::observability::set_scoped_broadcast_hook(Arc::new(
+        zeroclaw_runtime::observability::InFlightObserver::new(),
+    ));
+
     // Install the same broadcast sender as zeroclaw-log's canonical
     // hook so that every event emitted through `record!` / `record_event`
     // also reaches `/api/events`. The Observer-trait hook above stays
@@ -1646,6 +1655,7 @@ pub async fn run_gateway(
         tui_registry,
         sop_engine,
         sop_audit,
+        in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -4649,6 +4659,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -5308,6 +5319,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -5989,6 +6001,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -6094,6 +6107,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -6315,6 +6329,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -6434,6 +6449,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -6519,6 +6535,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -6609,6 +6626,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -6706,6 +6724,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -6799,6 +6818,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -6944,6 +6964,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -7779,6 +7800,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -7865,6 +7887,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -8025,6 +8048,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,

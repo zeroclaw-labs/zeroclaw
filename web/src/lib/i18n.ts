@@ -1232,6 +1232,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'agentcard.memories': 'memories',
     'agentcard.stored_memories': 'Stored memories',
     'agentcard.this_month': 'this month',
+    'agentcard.processing_turn': 'processing',
+    'agentcard.processing_turns': 'processing',
+    'agentcard.processing_title': 'Currently processing',
 
     // Tools
     'tools.title': 'Available Tools',
