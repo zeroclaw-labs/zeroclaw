@@ -1,24 +1,3 @@
-// Encrypted secret store — defense-in-depth for API keys and tokens.
-//
-// Secrets are encrypted using ChaCha20-Poly1305 AEAD with a random key stored
-// in `~/.zeroclaw/.secret_key` with restrictive file permissions (0600). The
-// config file stores only hex-encoded ciphertext, never plaintext keys.
-//
-// Each encryption generates a fresh random 12-byte nonce, prepended to the
-// ciphertext. The Poly1305 authentication tag prevents tampering.
-//
-// This prevents:
-//   - Plaintext exposure in config files
-//   - Casual `grep` or `git log` leaks
-//   - Accidental commit of raw API keys
-//   - Known-plaintext attacks (unlike the previous XOR cipher)
-//   - Ciphertext tampering (authenticated encryption)
-//
-// For sovereign users who prefer plaintext, `secrets.encrypt = false` disables this.
-//
-// Migration: values with the legacy `enc:` prefix (XOR cipher) are decrypted
-// using the old algorithm for backward compatibility. New encryptions always
-// produce `enc2:` (ChaCha20-Poly1305).
 
 use anyhow::{Context, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
@@ -27,7 +6,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Length of the random encryption key in bytes (256-bit, matches `ChaCha20`).
 #[cfg(test)]
 const KEY_LEN: usize = 32;
 
@@ -86,14 +64,6 @@ impl SecretStore {
         Ok(format!("enc2:{}", hex_encode(&blob)))
     }
 
-    /// Decrypt a secret.
-    /// - `enc2:` prefix → ChaCha20-Poly1305 (current format)
-    /// - `enc:` prefix → legacy XOR cipher (backward compatibility for migration)
-    /// - `op://` prefix → resolved via 1Password CLI (`op read`)
-    /// - No prefix → returned as-is (plaintext config)
-    ///
-    /// **Warning**: Legacy `enc:` values are insecure. Use `decrypt_and_migrate` to
-    /// automatically upgrade them to the secure `enc2:` format.
     pub fn decrypt(&self, value: &str) -> Result<String> {
         if let Some(hex_str) = value.strip_prefix("enc2:") {
             self.decrypt_chacha20(hex_str)
@@ -106,12 +76,6 @@ impl SecretStore {
         }
     }
 
-    /// Decrypt a secret and return a migrated `enc2:` value if the input used legacy `enc:` format.
-    ///
-    /// Returns `(plaintext, Some(new_enc2_value))` if migration occurred, or
-    /// `(plaintext, None)` if no migration was needed.
-    ///
-    /// This allows callers to persist the upgraded value back to config.
     pub fn decrypt_and_migrate(&self, value: &str) -> Result<(String, Option<String>)> {
         if let Some(hex_str) = value.strip_prefix("enc2:") {
             // Already using secure format — no migration needed
@@ -244,7 +208,7 @@ impl SecretStore {
 
                 // First, ensure the current user owns the file. Without this,
                 // Windows may assign an invalid SID as owner, making the file
-                // unreadable for subsequent commands. (See issue #4532.)
+                // unreadable for subsequent commands. (See)
                 match std::process::Command::new("takeown")
                     .arg("/F")
                     .arg(&self.key_path)
@@ -350,7 +314,6 @@ fn xor_cipher(data: &[u8], key: &[u8]) -> Vec<u8> {
 }
 
 /// Generate a random 256-bit key using the OS CSPRNG.
-///
 /// Uses `OsRng` (via `getrandom`) directly, providing full 256-bit entropy
 /// without the fixed version/variant bits that UUID v4 introduces.
 fn generate_random_key() -> Vec<u8> {
@@ -777,11 +740,6 @@ exit 65
 
     #[test]
     fn decrypt_error_message_mentions_secret_key() {
-        // Operators hitting a missing or mismatched `.secret_key` (volume wipe,
-        // container migration, backup-restore without the key file) need the
-        // error message to point at the root cause. Otherwise the failure
-        // cascades into a misleading "All providers/models failed" message
-        // with no diagnostic for the underlying decrypt failure.
         let tmp1 = TempDir::new().unwrap();
         let tmp2 = TempDir::new().unwrap();
         let store1 = SecretStore::new(tmp1.path(), true);
@@ -1205,11 +1163,6 @@ exit 65
         );
     }
 
-    /// Document the expected ordering on Windows: `takeown` runs before `icacls`.
-    ///
-    /// Without `takeown`, the file owner may be an invalid SID, causing `icacls`
-    /// grants to succeed against an unowned file that later becomes unreadable.
-    /// This test verifies the code structure expectation.
     #[test]
     fn takeown_runs_before_icacls_on_windows() {
         // Read the source to confirm `takeown` appears before `icacls` in the
