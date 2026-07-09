@@ -223,7 +223,8 @@ async fn parity_l1_engine_honors_excluded_tools() {
         steering: None,
         new_messages_out: None,
         image_cache: None,
-        ingress: IngressContext::internal(),
+        ingress: IngressContext::sub_turn(),
+        memory: None,
         agent_alias: None,
         turn_id: &turn_id,
     })
@@ -315,6 +316,7 @@ async fn parity_l2_builtin_filter_semantic_parity() {
         connect_mcp: false,
         connect_peripherals: false,
         exclude_memory: false,
+        list_deferred_mcp_specs: false,
         emit_assembly_logs: false,
         list_deferred_mcp_specs: false,
     })

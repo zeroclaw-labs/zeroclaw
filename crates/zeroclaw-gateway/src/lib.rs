@@ -2553,7 +2553,13 @@ pub(crate) async fn run_gateway_chat_with_tools(
             turn_usage.clone(),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
-                zeroclaw_runtime::agent::process_message(config, &agent_alias, message, session_id),
+                zeroclaw_runtime::agent::process_message(
+                    config,
+                    &agent_alias,
+                    message,
+                    session_id,
+                    zeroclaw_api::ingress::TurnOrigin::Interactive,
+                ),
             ),
         ))
         .await?;

@@ -2298,7 +2298,7 @@ mod tests {
         let spec = |name: &str| ToolSpec {
             name: name.to_string(),
             description: format!("{name} desc"),
-            parameters: serde_json::json!({}),
+            parameters: serde_json::json!({}).into(),
         };
         state.tools_registry = Arc::new(vec![spec("default_tool")]);
         let mut by_agent: std::collections::HashMap<String, Arc<Vec<ToolSpec>>> =
