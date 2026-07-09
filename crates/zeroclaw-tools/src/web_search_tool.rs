@@ -198,6 +198,17 @@ impl WebSearchTool {
             contains_ascii_case_insensitive(response.url().as_str(), "/wr.do?");
 
         if !status.is_success() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "search_provider": "duckduckgo",
+                        "search_status": "blocked",
+                        "http_status": status.as_u16(),
+                    })),
+                format!("web_search: DuckDuckGo request blocked (http {status})")
+            );
             if let Some(message) = duckduckgo_block_message(status, final_url_is_block, false) {
                 anyhow::bail!(message);
             }
