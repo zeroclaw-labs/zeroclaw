@@ -88,6 +88,7 @@ New or manual applications should use the canonical no-space labels below when t
 | `type:dependencies` | Dependency or lockfile maintenance |
 | `type:docs` | Documentation-only or docs-primary work |
 | `type:rfc` | RFC issue or proposal; protected from stale closure while active |
+| `type:refactor` | Code-structure cleanup or internal reorganization intended to preserve user-visible behavior |
 | `type:test` | Test-only or test-primary work |
 | `type:tracker` | Active parent coordination issue for a release, roadmap, RFC/design thread, implementation batch, cleanup, or audit. Issue-only marker; does not by itself create stale protection, assignment, acceptance, or contributor-ready scope. |
 

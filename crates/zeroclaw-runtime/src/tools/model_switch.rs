@@ -411,9 +411,9 @@ fn hardcoded_models_for(provider_family: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::loop_::{clear_model_switch_request, get_model_switch_state};
-
-    static MODEL_SWITCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::agent::loop_::{
+        MODEL_SWITCH_TEST_LOCK, clear_model_switch_request, get_model_switch_state,
+    };
 
     fn test_config() -> Config {
         let mut config = Config::default();
