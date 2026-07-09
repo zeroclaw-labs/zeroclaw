@@ -65,7 +65,9 @@ const MAX_TYPED_FACTS_PER_TURN: usize = 5;
 /// Run two-phase LLM-driven consolidation on a conversation turn.
 ///
 /// Phase 1: Write a history entry to the Daily memory category.
-/// Phase 2: Write a memory update to the Core category (if the LLM identified new facts).
+/// Phase 2: Store atomic typed facts as Core memories (only when
+/// `consolidation_extract_facts` is enabled; default off).
+/// Phase 3: Write a memory update to the Core category (if the LLM identified new facts).
 ///
 /// This function is designed to be called fire-and-forget via `zeroclaw_spawn::spawn!`.
 /// Strip channel media markers (e.g. `[IMAGE:/local/path]`, `[DOCUMENT:...]`)
@@ -153,7 +155,15 @@ pub async fn consolidate_turn(
             .await?;
     }
 
-    // Phase 2: Write memory update to Core category (if present).
+    // Phase 2: extract atomic typed facts (gated; default off). Runs before
+    // the primary Core update because that path exits early when the update
+    // dedups or merges into a survivor, and a duplicate primary update must
+    // not silently suppress this turn's fact writes.
+    if memory_config.consolidation_extract_facts {
+        store_typed_facts(memory, memory_config, &result).await?;
+    }
+
+    // Phase 3: Write memory update to Core category (if present).
     if let Some(ref update) = result.memory_update
         && !update.trim().is_empty()
     {
@@ -264,11 +274,6 @@ pub async fn consolidate_turn(
                 "memory supersede skipped"
             );
         }
-    }
-
-    // Phase 3: extract atomic typed facts (gated; default off).
-    if memory_config.consolidation_extract_facts {
-        store_typed_facts(memory, memory_config, &result).await?;
     }
 
     Ok(())
@@ -515,6 +520,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingMemory {
         writes: Mutex<Vec<RecordedWrite>>,
+        /// Entries returned from every `recall` call (empty by default).
+        recall_entries: Mutex<Vec<MemoryEntry>>,
     }
 
     #[async_trait]
@@ -581,7 +588,7 @@ mod tests {
             _since: Option<&str>,
             _until: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
-            Ok(Vec::new())
+            Ok(self.recall_entries.lock().clone())
         }
 
         async fn recall_for_agents(
@@ -903,6 +910,57 @@ mod tests {
         let writes = memory.writes.lock();
         assert_eq!(writes.len(), 1);
         assert!(writes[0].key().starts_with("daily_"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_core_update_does_not_suppress_fact_writes() {
+        // Regression for phase ordering: the primary Core update path exits
+        // early when the update dedup-rejects against an existing row. Fact
+        // extraction runs before that path, so a duplicate primary update
+        // must not silently drop this turn's fact writes.
+        let provider = ScriptedProvider::new(TYPED_RESPONSE);
+        let memory = RecordingMemory::default();
+        memory.recall_entries.lock().push(MemoryEntry {
+            id: "existing".into(),
+            key: "core_existing".into(),
+            // Exact duplicate of TYPED_RESPONSE's memory_update.
+            content: "Use staged rollout for deploys.".into(),
+            category: MemoryCategory::Core,
+            timestamp: "now".into(),
+            session_id: None,
+            score: None,
+            namespace: "default".into(),
+            importance: Some(0.7),
+            superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            agent_alias: None,
+            agent_id: None,
+        });
+        let config = MemoryConfig {
+            consolidation_extract_facts: true,
+            dedup_on_write: true,
+            ..MemoryConfig::default()
+        };
+
+        run_consolidation(&provider, &memory, &config)
+            .await
+            .unwrap();
+
+        let writes = memory.writes.lock();
+        // Both facts still land even though the primary update was rejected
+        // as a duplicate; no plain core_ update row is written.
+        let fact_count = writes
+            .iter()
+            .filter(|w| w.key().starts_with("core_fact_"))
+            .count();
+        assert_eq!(fact_count, 2);
+        assert!(
+            !writes
+                .iter()
+                .any(|w| w.key().starts_with("core_") && !w.key().starts_with("core_fact_"))
+        );
     }
 
     #[tokio::test]
