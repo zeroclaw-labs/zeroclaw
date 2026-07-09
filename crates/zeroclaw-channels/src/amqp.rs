@@ -20,13 +20,6 @@ use zeroclaw_runtime::sop::types::{SopEvent, SopTriggerSource};
 
 static MSG_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Generic AMQP 0-9-1 topic consumer as a chat-loop `Channel`.
-///
-/// Binds a queue to an exchange, consumes deliveries, and lifts each JSON
-/// body into a `ChannelMessage` driving the agent loop. The body-to-message
-/// mapping is config-driven so a new publisher is onboarded by configuration.
-/// When `dispatch` selects a SOP mode, each delivery also (or instead) becomes
-/// an `amqp` `SopEvent` routed to the SOP engine by routing key.
 pub struct AmqpChannel {
     amqp_url: String,
     exchange: String,
@@ -134,12 +127,6 @@ impl AmqpChannel {
         (content, thread_ts)
     }
 
-    /// Route a single consumed delivery. For combined `sop_and_agent_loop`
-    /// the agent-loop handoff is attempted first and the SOP side only runs
-    /// once the runtime receiver has accepted the delivery, so a closed
-    /// receiver (reload/shutdown/supervisor restart) fails closed before any
-    /// SOP side effect rather than running a SOP and then leaving the broker
-    /// to redeliver the same logical work.
     async fn route_delivery(
         &self,
         routing_key: &str,
@@ -197,14 +184,6 @@ impl AmqpChannel {
         DeliveryOutcome::Processed
     }
 
-    /// Establish a lapin connection on the existing tokio runtime, declaring
-    /// the executor and reactor adapters so lapin does not spin its own
-    /// `async-global-executor`. The Tokio reactor adapter is Unix-only, so
-    /// non-Unix targets use lapin's cross-platform async-io reactor adapter.
-    /// A configured `ca_cert` is supplied as the custom certificate chain for
-    /// `amqps://` server verification, and a configured
-    /// `client_cert`/`client_key` pair is presented as the client identity for
-    /// broker mutual-TLS auth (Fedora Messaging requires this).
     async fn connect(&self) -> anyhow::Result<Connection> {
         let props = amqp_connection_properties();
 
@@ -227,15 +206,6 @@ impl AmqpChannel {
         .map_err(Into::into)
     }
 
-    /// Build the client-auth identity for mutual TLS from the configured PEM
-    /// `client_cert` and `client_key`. tcp-stream's rustls path consumes the
-    /// identity as a PKCS#12 DER bundle, so we parse the PEM cert chain and
-    /// private key to DER and assemble an in-memory PKCS#12 keystore protected
-    /// by an ephemeral password (the bundle never leaves this process).
-    ///
-    /// Returns `Ok(None)` when no client cert/key is configured (server-auth
-    /// only). Both must be supplied together; supplying one without the other
-    /// is a configuration error.
     fn build_client_identity(&self) -> anyhow::Result<Option<OwnedIdentity>> {
         let (cert_path, key_path) = match (&self.client_cert, &self.client_key) {
             (Some(cert), Some(key)) => (cert, key),
@@ -325,12 +295,12 @@ fn amqp_connection_properties() -> ConnectionProperties {
     }
 }
 
-/// Ephemeral password protecting the in-memory PKCS#12 identity. The bundle is
+/// Ephemeral password protecting the in-memory PKCSidentity. The bundle is
 /// built and consumed within a single connect call and never persisted, so the
-/// password only has to round-trip through tcp-stream's PKCS#12 reader.
+/// password only has to round-trip through tcp-stream's PKCSreader.
 const PKCS12_PASSWORD: &str = "zeroclaw-amqp";
 
-/// Convert a PEM client certificate chain and private key into a PKCS#12 DER
+/// Convert a PEM client certificate chain and private key into a PKCSDER
 /// bundle suitable for tcp-stream's rustls client-auth path.
 fn pem_to_pkcs12_der(cert_pem: &[u8], key_pem: &[u8], alias: &str) -> anyhow::Result<Vec<u8>> {
     use p12_keystore::{Certificate, KeyStore, KeyStoreEntry, PrivateKeyChain};
@@ -662,7 +632,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
     fn pem_to_pkcs12_der_roundtrips() {
         let der = pem_to_pkcs12_der(TEST_CERT_PEM.as_bytes(), TEST_KEY_PEM.as_bytes(), "stagex")
             .expect("PEM cert+key should convert to a PKCS#12 bundle");
-        // The same PKCS#12 reader tcp-stream uses must be able to parse it back
+        // The same PKCSreader tcp-stream uses must be able to parse it back
         // and recover a private key chain.
         let store = p12_keystore::KeyStore::from_pkcs12(&der, PKCS12_PASSWORD)
             .expect("generated PKCS#12 should parse");

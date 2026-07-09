@@ -280,12 +280,6 @@ impl MediaDecryptor {
 
 // ── WeComWsChannel struct ────────────────────────────────────────────
 
-/// WeCom (企业微信) channel — WebSocket long-connection mode.
-///
-/// Connects to `wss://openws.work.weixin.qq.com`, subscribes with bot_id + secret.
-/// Inbound messages arrive as plaintext JSON frames (no encryption).
-/// Outbound replies are pushed directly via WS frames (streaming supported).
-/// Media attachments are encrypted per-URL with individual AES keys.
 #[derive(Clone)]
 pub struct WeComWsChannel {
     bot_id: String,

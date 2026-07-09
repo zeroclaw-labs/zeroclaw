@@ -1,9 +1,5 @@
 //! Authenticates as the GitHub App: private-key loading, RS256 JWT
 //! minting, and the installation-token cache.
-//!
-//! This is the only module that touches key material; keep it that way.
-//! No HTTP here: the token-exchange *request* lives in `api`, and the
-//! provider wires the two together.
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::Serialize;
@@ -119,9 +115,6 @@ fn warn_on_loose_permissions(path: &str) {
 #[cfg(not(unix))]
 fn warn_on_loose_permissions(_path: &str) {}
 
-/// Throwaway 2048-bit RSA key generated for unit tests only, never
-/// registered with any real GitHub App. Shared with the channel-level
-/// mock-server tests.
 #[cfg(test)]
 pub(crate) const TEST_KEY_PEM: &str = concat!(
     "-----BEGIN ",

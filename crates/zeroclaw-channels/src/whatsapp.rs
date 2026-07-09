@@ -8,30 +8,10 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 
-/// Module-level `pending_approvals` map shared across every
-/// `Arc<WhatsAppChannel>` regardless of who constructs it.
-///
-/// WhatsApp uses webhooks, so `request_approval()` (called by the runtime's
-/// channel pool) and the reply intercept (in the gateway's
-/// `handle_whatsapp_message`) can run on *different* `Arc<WhatsAppChannel>`
-/// instances — the orchestrator constructs one, the gateway constructs
-/// another. An instance-local pending-approvals map would leave one side
-/// registering tokens the other side can never find, silently timing out
-/// every approval request.
-///
-/// Hoisting the map to a process-wide static sidesteps the Arc-sharing
-/// problem entirely: whoever calls `request_approval()` inserts; whoever
-/// receives the webhook reply looks up; both hit the same `HashMap`.
 type PendingApprovalsMap = Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>;
 static PENDING_APPROVALS: LazyLock<Arc<PendingApprovalsMap>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
-/// `WhatsApp` channel — uses `WhatsApp` Business Cloud API
-///
-/// This channel operates in webhook mode (push-based) rather than polling.
-/// Messages are received via the gateway's `/whatsapp` webhook endpoint.
-/// The `listen` method here is a no-op placeholder; actual message handling
-/// happens in the gateway when Meta sends webhook events.
 fn ensure_https(url: &str) -> anyhow::Result<()> {
     if !url.starts_with("https://") {
         anyhow::bail!(
@@ -41,11 +21,6 @@ fn ensure_https(url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-///
-/// # Runtime Negotiation
-///
-/// This Cloud API channel is automatically selected when `phone_number_id` is set in the config.
-/// Use `WhatsAppWebChannel` (with `session_path`) for native Web mode.
 pub struct WhatsAppChannel {
     access_token: String,
     endpoint_id: String,
@@ -169,12 +144,6 @@ impl WhatsAppChannel {
         patterns.iter().any(|re| re.is_match(text))
     }
 
-    /// Apply mention-pattern gating for a message.
-    ///
-    /// Selects the appropriate pattern set based on `is_group`. When the
-    /// pattern set is non-empty, messages that do not match any pattern are
-    /// dropped (`None`); matched messages pass through unchanged. Empty
-    /// pattern sets always admit.
     pub fn apply_mention_gating(
         dm_patterns: &[Regex],
         group_patterns: &[Regex],
@@ -196,7 +165,6 @@ impl WhatsAppChannel {
     }
 
     /// Detect group messages in the WhatsApp Cloud API webhook payload.
-    ///
     /// A message is considered a group message when it carries a `context`
     /// object containing a non-empty `group_id` field.
     fn is_group_message(msg: &serde_json::Value) -> bool {

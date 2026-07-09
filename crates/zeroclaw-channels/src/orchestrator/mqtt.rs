@@ -1,5 +1,4 @@
 //! MQTT → SOP event fan-in listener.
-//!
 //! This is NOT a `Channel` trait implementor — it routes MQTT messages
 //! to the SOP engine via `dispatch_sop_event`, not to the chat loop.
 
@@ -16,7 +15,6 @@ use zeroclaw_runtime::sop::engine::{SopEngine, now_iso8601};
 use zeroclaw_runtime::sop::types::{SopEvent, SopTriggerSource};
 
 /// Run the MQTT SOP listener loop.
-///
 /// Subscribes to configured topics and dispatches incoming publishes
 /// to the SOP engine. Blocks until disconnected or cancelled.
 pub async fn run_mqtt_sop_listener(

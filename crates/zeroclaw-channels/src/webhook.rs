@@ -102,7 +102,6 @@ impl WebhookChannel {
         Duration::from_millis(capped)
     }
 
-    /// Verify an incoming request's signature if a secret is configured.
     #[cfg(test)]
     fn verify_signature(&self, body: &[u8], signature: Option<&str>) -> bool {
         let Some(ref secret) = self.secret else {
@@ -164,11 +163,6 @@ impl WebhookChannel {
             .and_then(|v| v.to_str().ok())
             .and_then(parse_retry_after_ms);
 
-        // 429 and 503 may include Retry-After; honor it if present. 429 appears here
-        // *and* in the branch below: here we take the server-supplied delay, below we
-        // fall back to exponential backoff when no Retry-After header was sent.
-        // Reading the body is deferred until after this early-return so hot 429 loops
-        // against large pages don't pay the I/O cost.
         if (code == 429 || code == 503)
             && let Some(ms) = retry_after
         {

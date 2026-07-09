@@ -1,8 +1,4 @@
 //! WeChat personal iLink Bot channel.
-//!
-//! Note: the iLink consent screen ("Connect X to Weixin") shows the bot name
-//! from the iLink developer portal, not from ZeroClaw config. Users who
-//! register their own iLink bot will see their own name there.
 
 use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyInit, block_padding::Pkcs7};
 use anyhow::Context;
@@ -454,9 +450,6 @@ pub struct WeChatChannel {
     /// Resolves inbound external peers from canonical state at message-time.
     /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    /// Optional pairing-persist handle. `None` in tests; `Some` in the
-    /// long-running daemon, wired via `.with_persistence(config)`. RwLock so
-    /// concurrent peer reads from sibling channels don't serialize.
     persist: Option<Arc<parking_lot::RwLock<Config>>>,
     /// Pairing guard for /bind flow.
     pairing: Option<PairingGuard>,
@@ -974,18 +967,6 @@ impl WeChatChannel {
         )
     }
 
-    /// Resolve `candidate` (already lexically inside `workspace_dir`) to its
-    /// real on-disk path and verify that the canonical target still lives
-    /// under the canonical workspace. Closes the symlink-escape hole that a
-    /// purely-lexical `resolve_under` leaves open: a workspace entry such as
-    /// `outside -> /etc` would otherwise pass lexical containment and let an
-    /// incoming marker like `[DOCUMENT:/workspace/outside/passwd]` read
-    /// `/etc/passwd` once `tokio::fs::read` follows the link.
-    ///
-    /// When `candidate` does not exist (and therefore cannot be canonicalized),
-    /// the lexical result is returned unchanged: a non-existent path cannot
-    /// resolve through a symlink. The lexical check is the safety net for
-    /// non-existent targets.
     fn canonicalize_within_workspace(
         candidate: &Path,
         workspace_dir: &Path,
@@ -2452,7 +2433,6 @@ impl Channel for WeChatChannel {
 
     async fn send_draft(&self, _msg: &SendMessage) -> anyhow::Result<Option<String>> {
         // TODO: Re-enable placeholder if WeChat adds message edit/revoke support.
-        //
         // Current behavior: Return draft_id without sending placeholder.
         // The final response will be sent in finalize_draft().
         let draft_id = format!("draft_{}", uuid::Uuid::new_v4());
@@ -2853,12 +2833,6 @@ mod tests {
     // lexical-only containment path is still exercised by the
     // other tests in this module.
     fn resolve_local_attachment_path_rejects_symlink_escaping_workspace() {
-        // Workspace contains `outside -> /tmp/.../outside-target`, where the
-        // target dir lives outside the workspace. Lexical normalization
-        // (which `resolve_under` does) is not enough — the symlink must be
-        // resolved and the canonical target must be re-checked against the
-        // canonical workspace, otherwise `[DOCUMENT:outside/file.txt]` would
-        // read the file the symlink points at.
         let temp = tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -2942,11 +2916,6 @@ mod tests {
         assert_eq!(parse_aes_key(&hex_key).unwrap(), raw);
         assert_eq!(parse_aes_key(&base64_key).unwrap(), raw);
 
-        // Outbound CDNMedia `aes_key` must be base64(hex(key)), matching the
-        // official @tencent-weixin/openclaw-weixin client (base64-decode then
-        // hex-decode back to 16 bytes). Encoding raw bytes directly is
-        // undecryptable by the client ("image expired"), so it must NOT equal
-        // base64(raw) and must round-trip through the same parser.
         let outbound = base64::engine::general_purpose::STANDARD.encode(hex::encode(raw));
         assert_ne!(outbound, base64_key);
         assert_eq!(parse_aes_key(&outbound).unwrap(), raw);
