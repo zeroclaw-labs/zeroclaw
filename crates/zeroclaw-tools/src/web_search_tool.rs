@@ -1018,6 +1018,36 @@ fn duckduckgo_block_message(
     }
 }
 
+/// Build a provider HTTP-failure error tagged with `search_status=blocked` and
+/// emit a structured log record. Used when a provider returns a non-2xx status
+/// code — the status is already in hand, so we can classify it directly as
+/// `Blocked` without inferring from an `anyhow::Error`.
+///
+/// The runtime (`tool_execution.rs`) forwards the `Err` returned by `execute`
+/// to the agent as readable text, so placing actionable hints in the message
+/// makes them visible to the agent.
+//
+// Callers land in the follow-up provider-wiring tasks; allow dead code until
+// they are wired in.
+#[allow(dead_code)]
+fn http_search_failure(provider: &str, status: reqwest::StatusCode) -> anyhow::Error {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "search_provider": provider,
+                "search_status": "blocked",
+                "http_status": status.as_u16(),
+            })),
+        format!("web_search: {provider} request blocked (http {status})")
+    );
+    anyhow::Error::msg(format!(
+        "{provider} search failed (search_status=blocked, http={status}). \
+         Try a different provider (SearXNG, Brave, or Tavily)."
+    ))
+}
+
 fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
     haystack
         .as_bytes()
@@ -1209,6 +1239,34 @@ mod tests {
             r#"<form action="/WR.DO?u=https%3A%2F%2Fhtml.duckduckgo.com%2Fhtml%2F"></form>"#,
             "/wr.do?"
         ));
+    }
+
+    #[test]
+    fn http_search_failure_marks_status_blocked_and_lists_alternatives() {
+        // 403 is a typical signal of active provider blocking.
+        let err = http_search_failure("brave", reqwest::StatusCode::FORBIDDEN);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("search_status=blocked"),
+            "message must tag search_status=blocked for agent routing, got: {msg}"
+        );
+        assert!(
+            msg.contains("http=403"),
+            "message must include the HTTP status code, got: {msg}"
+        );
+        assert!(
+            msg.contains("SearXNG") && msg.contains("Tavily"),
+            "message must suggest alternative providers, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn http_search_failure_tags_server_errors_as_blocked() {
+        // 5xx is also classified as Blocked (provider unavailable; switching
+        // provider is the right suggestion).
+        let err = http_search_failure("searxng", reqwest::StatusCode::BAD_GATEWAY);
+        assert!(format!("{err}").contains("search_status=blocked"));
+        assert!(format!("{err}").contains("http=502"));
     }
 
     #[tokio::test]
