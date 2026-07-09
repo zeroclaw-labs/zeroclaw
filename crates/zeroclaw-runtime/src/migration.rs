@@ -106,7 +106,14 @@ pub async fn migrate_openclaw_memory(
     println!("  Source sqlite rows:{}", stats.from_sqlite);
     println!("  Source markdown:   {}", stats.from_markdown);
     if reindex {
-        let reembedded = memory.reindex().await?;
+        // The import above deliberately goes through a NoopEmbedding-backed
+        // handle for speed, so reindex through a second handle with the
+        // configured embedder wired in - the same construction `zeroclaw
+        // memory reindex` uses - otherwise the backfill could never compute
+        // an embedding regardless of the operator's embedding config.
+        drop(memory);
+        let reindex_memory = reindex_memory_backend(config)?;
+        let reembedded = reindex_memory.reindex().await?;
         println!("  Reindexed:         yes ({reembedded} embeddings backfilled; FTS rebuilt)");
     }
 
@@ -115,6 +122,22 @@ pub async fn migrate_openclaw_memory(
 
 fn target_memory_backend(config: &Config) -> Result<Box<dyn Memory>> {
     zeroclaw_memory::create_memory_for_migration(&config.memory.backend, &config.data_dir)
+}
+
+/// Memory handle for the post-import `--reindex` pass, with the configured
+/// embedder resolved and wired in. Mirrors `zeroclaw memory reindex`
+/// (`create_memory_with_embedder` in the CLI): same storage resolution, same
+/// embedding-route handling, so `migrate openclaw --reindex` is equivalent to
+/// running the standalone reindex command right after the import.
+fn reindex_memory_backend(config: &Config) -> Result<Box<dyn Memory>> {
+    zeroclaw_memory::create_memory_with_storage_and_routes(
+        &config.memory,
+        &config.embedding_routes,
+        config.resolve_active_storage(),
+        &config.data_dir,
+        None,
+        Some(&config.providers.models),
+    )
 }
 
 fn collect_source_entries(
