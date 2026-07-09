@@ -422,7 +422,16 @@ pub enum ChannelsCommands {
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillCommands {
     /// List all installed skills
-    List,
+    List {
+        /// Show exactly what this agent loads at runtime (its workspace +
+        /// open-skills + plugins + assigned bundles). --bundle takes precedence
+        /// when both are passed.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Restrict to a single bundle. Omit to list across all bundles.
+        #[arg(long)]
+        bundle: Option<String>,
+    },
     /// Scaffold a new skill from scratch (canonical SKILL.md + optional subdirs)
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
@@ -487,6 +496,13 @@ Examples:
     Install {
         /// Source URL or local path
         source: String,
+        /// Install into this agent's assigned bundle (defaults to the active
+        /// agent). When the agent has no bundle, falls back to the global dir.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Install into this bundle directly. Takes precedence over --agent.
+        #[arg(long)]
+        bundle: Option<String>,
         /// Suppress only the install-time tier banner; other install
         /// progress output (resolving, installed, audited) is unaffected.
         #[arg(long)]
@@ -496,6 +512,12 @@ Examples:
     Remove {
         /// Skill name to remove
         name: String,
+        /// Limit the search to this agent's assigned bundles.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Remove from this bundle directly (disambiguates duplicates).
+        #[arg(long)]
+        bundle: Option<String>,
     },
     /// Run TEST.sh validation for a skill (or all skills)
     Test {
