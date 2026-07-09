@@ -23,6 +23,7 @@
 //! what onboarding and the web rates editor display. Merging at snapshot
 //! assembly scopes live prices to cost tracking only.
 
+use crate::dispatch::ProviderDispatch;
 use crate::traits::{ModelInfo, ModelPricing};
 use futures_util::future::join_all;
 use parking_lot::RwLock;
@@ -525,11 +526,14 @@ async fn refresh_once(groups: &[GatewayGroup], total_aliases_per_family: &HashMa
     // gateway; first-fill latency is bounded by the slowest gateway, not the
     // sum of all of them) ──
     let mut any_ok = false;
-    let catalogs = join_all(
-        groups
-            .iter()
-            .map(|group| group.handle.list_models_with_pricing()),
-    )
+    let catalogs = join_all(groups.iter().map(|group| {
+        let handle = Arc::clone(&group.handle);
+        async move {
+            ProviderDispatch::new(handle)
+                .list_models_with_pricing()
+                .await
+        }
+    }))
     .await;
     let mut gateway_results: Vec<(&[WantedModel], HashMap<String, ModelRates>)> =
         Vec::with_capacity(groups.len());
