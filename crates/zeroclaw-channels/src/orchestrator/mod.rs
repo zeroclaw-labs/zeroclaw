@@ -5352,6 +5352,14 @@ async fn process_channel_message_body(
     });
     let loop_knobs = LoopKnobs::default();
     let turn_id = uuid::Uuid::new_v4().to_string();
+    let turn_start = Instant::now();
+    notify_observer.record_event(&ObserverEvent::AgentStart {
+        model_provider: route.model_provider.clone(),
+        model: route.model.clone(),
+        channel: Some(msg.channel.to_string()),
+        agent_alias: Some(ctx.agent_alias.to_string()),
+        turn_id: Some(turn_id.clone()),
+    });
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
             let thread_scope_id = msg
@@ -5547,13 +5555,17 @@ async fn process_channel_message_body(
                             &runtime_defaults,
                         );
 
-                        ctx.observer.record_event(&ObserverEvent::AgentStart {
-                            model_provider: route.model_provider.clone(),
-                            model: route.model.clone(),
-                            channel: Some(msg.channel.to_string()),
-                            agent_alias: Some(ctx.agent_alias.to_string()),
-                            turn_id: Some(turn_id.clone()),
-                        });
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            &format!(
+                                "Model switched to {} {} for agent {}",
+                                route.model_provider, route.model, ctx.agent_alias
+                            )
+                        );
 
                         continue;
                     }
@@ -5580,6 +5592,17 @@ async fn process_channel_message_body(
         (llm_result, fb)
     })
     .await;
+
+    notify_observer.record_event(&ObserverEvent::AgentEnd {
+        model_provider: route.model_provider.clone(),
+        model: route.model.clone(),
+        duration: turn_start.elapsed(),
+        tokens_used: None,
+        cost_usd: None,
+        channel: Some(msg.channel.to_string()),
+        agent_alias: Some(ctx.agent_alias.to_string()),
+        turn_id: Some(turn_id.clone()),
+    });
 
     // Drop all senders so updater tasks can exit (rx.recv() returns None).
     ::zeroclaw_log::record!(

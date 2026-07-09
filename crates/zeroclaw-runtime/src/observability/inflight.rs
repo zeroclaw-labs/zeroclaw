@@ -225,6 +225,8 @@ mod tests {
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_event(&ObserverEvent::TurnComplete);
         assert_eq!(reg.get("z"), 1);
+
+        reset_in_flight_registry();
     }
 
     #[test]
