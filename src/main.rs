@@ -5445,8 +5445,22 @@ async fn main() -> Result<()> {
                     // hand. Falls back to free text on `live=false`
                     // (unknown provider, fetch failed, catalog empty).
                     use dialoguer::{FuzzySelect, Input};
+                    // Resolve the alias from the config path so the catalog can
+                    // look up the configured api_key and reach the native
+                    // /models endpoint. Path shape is validated by
+                    // `model_path_provider_type`:
+                    // providers.models.<type>.<alias>.model
+                    let provider_ref = path
+                        .split('.')
+                        .nth(3)
+                        .map(|alias| format!("{provider_type}.{alias}"));
+                    let catalog_selector = provider_ref.as_deref().unwrap_or(provider_type);
                     let (models, _pricing, live) =
-                        zeroclaw_runtime::quickstart::model_catalog(provider_type).await;
+                        zeroclaw_runtime::quickstart::model_catalog_with_config(
+                            Some(&config),
+                            catalog_selector,
+                        )
+                        .await;
                     if live && !models.is_empty() {
                         let current = config.get_prop(&path).unwrap_or_default();
                         let default = models.iter().position(|m| m == &current).unwrap_or(0);

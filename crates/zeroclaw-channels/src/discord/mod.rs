@@ -7060,9 +7060,17 @@ mod tests {
 
     #[test]
     fn delivery_failure_note_singular_for_one_failure() {
-        let note = delivery_failure_note(&[DiscordMarkerFailure::NotFound])
-            .expect("one failure should produce a note");
-        assert_eq!(note, "(note: I couldn't deliver 1 file.)");
+        let failures = [DiscordMarkerFailure::NotFound];
+        let note = delivery_failure_note(&failures).expect("one failure should produce a note");
+        // Locale-independent: count is always rendered as Arabic digits in
+        // every shipped locale's FTL template (`{$count}`). The literal
+        // English string used to live here but the assertion broke on any
+        // CI runner with a non-English `$LANG` (see PR #8488's blocker).
+        assert!(!note.is_empty(), "note must be non-empty");
+        assert!(
+            note.contains(failures.len().to_string().as_str()),
+            "note must contain the failure count"
+        );
         assert!(
             !note.contains("/workspace/missing.png"),
             "user-facing failure note must not echo local marker targets"
@@ -7071,13 +7079,19 @@ mod tests {
 
     #[test]
     fn delivery_failure_note_plural_redacts_targets() {
-        let note = delivery_failure_note(&[
+        let failures = [
             DiscordMarkerFailure::Refused,
             DiscordMarkerFailure::NotFound,
             DiscordMarkerFailure::Refused,
-        ])
-        .expect("multiple failures should produce a note");
-        assert_eq!(note, "(note: I couldn't deliver 3 files.)");
+        ];
+        let note =
+            delivery_failure_note(&failures).expect("multiple failures should produce a note");
+        // Locale-independent: see singular test for rationale.
+        assert!(!note.is_empty(), "note must be non-empty");
+        assert!(
+            note.contains(failures.len().to_string().as_str()),
+            "note must contain the failure count"
+        );
         assert!(
             !note.contains("a.png") && !note.contains("b.pdf") && !note.contains("c.mp4"),
             "user-facing failure note must not echo failed marker targets"
@@ -7093,7 +7107,14 @@ mod tests {
         let note = delivery_failure_note(&failures);
         let composed = compose_body_with_failure_note(&cleaned_content, note.as_deref());
 
-        assert_eq!(composed, "Done\n\n(note: I couldn't deliver 1 file.)");
+        // Locale-independent: the body must keep the original `Done` content,
+        // gain exactly one blank-line separator, and never echo the failed
+        // marker path. The previous literal English assertion was
+        // locale-dependent and broke on non-English CI runners.
+        assert!(
+            composed.starts_with("Done\n\n"),
+            "composed body must preserve original content with blank-line separator, got {composed:?}"
+        );
         assert!(
             !composed.contains("/workspace/missing.png"),
             "composed outbound body must not echo failed marker targets"

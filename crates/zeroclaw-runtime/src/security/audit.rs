@@ -252,24 +252,42 @@ impl AuditLogger {
     pub fn new(config: AuditConfig, zeroclaw_dir: PathBuf) -> Result<Self> {
         // Load and validate signing key if sign_events enabled
         let signing_key = if config.sign_events {
-            let key_hex = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY").map_err(|_| {
+            let key_hex = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY").map_err(|e| {
+                // Do not format the VarError: VarError::NotUnicode includes the
+                // raw env-var value in its Display/Debug text, which would leak
+                // signing-key material into logs and error output.
+                let reason = match e {
+                    std::env::VarError::NotPresent => "missing",
+                    std::env::VarError::NotUnicode(_) => "not_valid_unicode",
+                };
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    "audit log: sign_events=true but ZEROCLAW_AUDIT_SIGNING_KEY env var not set"
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"reason": reason})),
+                    "audit log: sign_events=true but ZEROCLAW_AUDIT_SIGNING_KEY env var is not usable"
                 );
-                anyhow::Error::msg("sign_events enabled but ZEROCLAW_AUDIT_SIGNING_KEY not set")
+                match e {
+                    std::env::VarError::NotPresent => anyhow::Error::msg(
+                        "sign_events enabled but ZEROCLAW_AUDIT_SIGNING_KEY not set",
+                    ),
+                    std::env::VarError::NotUnicode(_) => anyhow::Error::msg(
+                        "ZEROCLAW_AUDIT_SIGNING_KEY env var is not valid UTF-8",
+                    ),
+                }
             })?;
 
-            let key_bytes = hex::decode(&key_hex).map_err(|_| {
+            let key_bytes = hex::decode(&key_hex).map_err(|e| {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
                     "audit log: ZEROCLAW_AUDIT_SIGNING_KEY env var must be hex-encoded"
                 );
-                anyhow::Error::msg("ZEROCLAW_AUDIT_SIGNING_KEY must be hex-encoded")
+                anyhow::Error::msg(format!(
+                    "ZEROCLAW_AUDIT_SIGNING_KEY must be hex-encoded: {e}"
+                ))
             })?;
 
             if key_bytes.len() != 32 {
@@ -301,14 +319,15 @@ impl AuditLogger {
             use hmac::{Hmac, Mac};
             use sha2::Sha256;
 
-            let mut mac = Hmac::<Sha256>::new_from_slice(key_bytes).map_err(|_| {
+            let mut mac = Hmac::<Sha256>::new_from_slice(key_bytes).map_err(|e| {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
                     "audit log: HMAC-SHA256 init rejected key length"
                 );
-                anyhow::Error::msg("Invalid HMAC key length")
+                anyhow::Error::msg(format!("Invalid HMAC key length: {e}"))
             })?;
             mac.update(entry_hash.as_bytes());
 
@@ -522,14 +541,15 @@ pub fn verify_chain(log_path: &Path) -> Result<u64> {
             use hmac::{Hmac, Mac};
             use sha2::Sha256;
 
-            let mut mac = Hmac::<Sha256>::new_from_slice(key_bytes).map_err(|_| {
+            let mut mac = Hmac::<Sha256>::new_from_slice(key_bytes).map_err(|e| {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
                     "audit log: HMAC-SHA256 verify rejected key length"
                 );
-                anyhow::Error::msg("Invalid HMAC key length during verification")
+                anyhow::Error::msg(format!("Invalid HMAC key length during verification: {e}"))
             })?;
             mac.update(entry.entry_hash.as_bytes());
             let expected_sig = hex::encode(mac.finalize().into_bytes());
@@ -1090,6 +1110,53 @@ mod tests {
             assert!(
                 err_msg.contains("must be hex-encoded"),
                 "error: {}",
+                err_msg
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Regression: a non-UTF-8 signing key must be rejected without echoing the
+    /// raw value back to the operator or into structured logs (#8591).
+    #[cfg(unix)]
+    #[test]
+    fn constructor_fails_if_signing_key_not_unicode_and_does_not_leak_value() -> Result<()> {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let old_key = std::env::var_os("ZEROCLAW_AUDIT_SIGNING_KEY");
+        defer! {
+            if let Some(key) = old_key {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key) };
+            } else {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
+            }
+        }
+
+        let secret_bytes: &[u8] = b"ab\xFFc";
+        let bad_value = OsStr::from_bytes(secret_bytes);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", bad_value) };
+
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            sign_events: true,
+            ..Default::default()
+        };
+
+        let result = AuditLogger::new(config, tmp.path().to_path_buf());
+        assert!(result.is_err());
+        if let Err(e) = result {
+            let err_msg = e.to_string();
+            assert!(err_msg.contains("not valid UTF-8"), "error: {}", err_msg);
+            assert!(
+                !err_msg.contains("ab"),
+                "error message must not contain the raw signing-key value: {}",
                 err_msg
             );
         }

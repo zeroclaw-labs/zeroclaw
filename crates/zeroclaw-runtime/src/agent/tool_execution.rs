@@ -20,6 +20,22 @@ use super::turn::TurnMeta;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
+/// If a just-completed tool call was a successful `TodoWrite`, build the
+/// corresponding `TurnEvent::Plan` from its arguments. Returns `None`
+/// for any other tool, a failed call, or arguments that fail to parse
+/// (defensive — a real failure would already have `success == false`).
+fn maybe_plan_event(
+    call_name: &str,
+    success: bool,
+    call_arguments: &serde_json::Value,
+) -> Option<zeroclaw_api::agent::TurnEvent> {
+    if call_name != "TodoWrite" || !success {
+        return None;
+    }
+    let entries = crate::tools::todo_write::parse_entries(call_arguments).ok()?;
+    Some(zeroclaw_api::agent::TurnEvent::Plan { entries })
+}
+
 /// Look up a tool by name in a slice of boxed `dyn Tool` values.
 pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
@@ -403,6 +419,16 @@ pub(crate) async fn execute_one_tool(
                 output: scrub_credentials(&out.output),
             })
             .await;
+    }
+
+    // After the ToolResult card closes, publish the plan if this was a
+    // successful TodoWrite. Whole-list replace; parse failures are
+    // swallowed (the ToolResult already conveyed success/failure).
+    if let Some(tx) = event_tx
+        && let Ok(out) = &outcome
+        && let Some(plan_event) = maybe_plan_event(call_name, out.success, &call_arguments)
+    {
+        let _ = tx.send(plan_event).await;
     }
 
     outcome
@@ -915,5 +941,55 @@ mod tests {
             should_execute_tools_in_parallel(&batch, None),
             "no approval manager + non-tool_search batch must run in parallel"
         );
+    }
+
+    // ── Plan emission tests ────────────────────────────────────────────────
+
+    #[cfg(test)]
+    mod plan_emission_tests {
+        use super::super::maybe_plan_event;
+        use serde_json::json;
+
+        #[test]
+        fn plan_event_built_for_successful_todowrite() {
+            let args = json!({ "todos": [ { "content": "A", "status": "pending" } ] });
+            let ev = maybe_plan_event("TodoWrite", true, &args);
+            match ev {
+                Some(zeroclaw_api::agent::TurnEvent::Plan { entries }) => {
+                    assert_eq!(entries.len(), 1);
+                    assert_eq!(entries[0].content, "A");
+                }
+                _ => panic!("expected a Plan event"),
+            }
+        }
+
+        #[test]
+        fn no_plan_event_for_other_tools() {
+            let args = json!({ "todos": [ { "content": "A", "status": "pending" } ] });
+            assert!(maybe_plan_event("shell", true, &args).is_none());
+        }
+
+        #[test]
+        fn no_plan_event_for_failed_todowrite() {
+            let args = json!({ "todos": [ { "content": "A", "status": "pending" } ] });
+            assert!(maybe_plan_event("TodoWrite", false, &args).is_none());
+        }
+
+        #[test]
+        fn no_plan_event_for_unparseable_todowrite_args() {
+            let args = json!({ "todos": [ { "status": "pending" } ] });
+            assert!(maybe_plan_event("TodoWrite", true, &args).is_none());
+        }
+
+        #[test]
+        fn empty_list_produces_clear_plan_event() {
+            let args = json!({ "todos": [] });
+            match maybe_plan_event("TodoWrite", true, &args) {
+                Some(zeroclaw_api::agent::TurnEvent::Plan { entries }) => {
+                    assert!(entries.is_empty());
+                }
+                _ => panic!("expected an empty Plan event (clear)"),
+            }
+        }
     }
 }
