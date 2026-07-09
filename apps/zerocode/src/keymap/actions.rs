@@ -156,6 +156,7 @@ keyactions! {
         CopySelection           [Chord::char('y')] => "copy selection",
         CopyAllVisible          [Chord::with(KeyCode::Char('C'), KeyModifiers::CONTROL.union(KeyModifiers::SHIFT))] => "copy all visible",
         ToggleThoughts          [Chord::char('t')] => "toggle thoughts",
+        TodoToggle              [Chord::ctrl('p')] => "toggle todo tracker",
         NewSession              [Chord::ctrl('n')] => "new session",
         SwitchSession           [Chord::ctrl('s')] => "switch session",
         DeleteSession           [] => "delete session",
