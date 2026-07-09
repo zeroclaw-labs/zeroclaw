@@ -13,7 +13,7 @@ permissions:
   issues: read
 
 concurrency:
-  group: project-dashboard-plan-${{ github.event.issue.number || inputs.issue_number }}
+  group: project-dashboard-plan-${{ inputs.issue_number }}
   cancel-in-progress: true
 
 jobs:
@@ -30,14 +30,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
         run: gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER" > "$RUNNER_TEMP/issue.json"
-
-      - name: Plan from issue event
-        if: github.event_name == 'issues'
-        run: |
-          python3 scripts/github/project_dashboard_plan.py \
-            --event-path "$GITHUB_EVENT_PATH" \
-            --format markdown \
-            --output "$GITHUB_STEP_SUMMARY"
 
       - name: Plan from manual issue
         if: github.event_name == 'workflow_dispatch'
