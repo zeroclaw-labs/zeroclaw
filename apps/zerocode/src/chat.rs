@@ -2309,15 +2309,18 @@ impl Chat {
                         }
                         return;
                     }
-                    if let Some(text) = state
+                    if let Some(region) = state
                         .copy_hit_regions
                         .iter()
                         .find(|r| mouse::in_rect(col, row, r.rect))
-                        .map(|r| r.text.clone())
+                        .cloned()
                     {
                         state.clear_transcript_selection();
-                        if !text.is_empty() {
-                            crate::mouse::copy_osc52(&text);
+                        if !region.text.is_empty() {
+                            crate::mouse::copy_osc52(&region.text);
+                            if region.kind == CopyHitKind::Code {
+                                state.set_code_copy_feedback(region.rect);
+                            }
                             state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
                         }
                         return;
@@ -2476,7 +2479,7 @@ impl Chat {
     pub(crate) fn info_message(&mut self) -> Option<&crate::widgets::InfoMessage> {
         if let ChatPhase::Active(s) = &mut self.phase {
             if s.info_message.as_ref().is_some_and(|m| m.is_expired()) {
-                s.info_message = None;
+                s.clear_info_notice();
             }
             return s.info_message.as_ref();
         }
@@ -3504,6 +3507,10 @@ fn message_copy_label() -> String {
     crate::i18n::t("zc-chat-copy-message")
 }
 
+fn code_copied_label() -> String {
+    crate::i18n::t("zc-chat-copy-code-copied")
+}
+
 /// Recover the fence language token from a code-fence header bar line. The
 /// header's first span is `┌─ lang ─────`; the ` code ` fallback label and an
 /// empty info string both yield `None` so the rebuilt fence stays unlabelled.
@@ -3548,6 +3555,7 @@ fn copy_region(
     Some(CopyHitRegion {
         rect: Rect::new(body.x + col, body.y + (global_row - scroll), cells, 1),
         text: text.to_string(),
+        kind: CopyHitKind::Code,
     })
 }
 
@@ -3570,6 +3578,18 @@ fn centered_message_copy_rect(label: &str, anchor: Rect, body: Rect) -> Option<R
         .x
         .saturating_add(body.width.saturating_sub(cells) / 2);
     Some(Rect::new(x, row, cells, 1))
+}
+
+fn code_copy_feedback_rect(label: &str, anchor: Rect) -> Option<Rect> {
+    use unicode_width::UnicodeWidthStr;
+
+    let cells = UnicodeWidthStr::width(label) as u16;
+    if cells == 0 || anchor.height == 0 {
+        return None;
+    }
+    let center = anchor.x.saturating_add(anchor.width / 2);
+    let x = center.saturating_sub(cells / 2);
+    Some(Rect::new(x, anchor.y, cells, 1))
 }
 
 fn borrow_line<'a>(line: &'a Line<'static>) -> Line<'a> {
@@ -3723,6 +3743,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let body_rect = Rect::new(body_x, body_y, body_w, body_h);
     state.rebuild_copy_regions(inner_width, scroll, body_rect);
     state.rebuild_message_copy_region(body_rect);
+    render_code_copy_feedback(f, state);
     render_message_copy_overlay(f, state, body_rect);
     let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
         .position(scroll as usize)
@@ -3759,6 +3780,21 @@ fn render_message_copy_overlay(f: &mut Frame, state: &ChatState, body: Rect) {
         )))
         .alignment(Alignment::Center),
         region.rect,
+    );
+}
+
+fn render_code_copy_feedback(f: &mut Frame, state: &ChatState) {
+    let Some(rect) = state.code_copy_feedback_rect else {
+        return;
+    };
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            code_copied_label(),
+            theme::success_style().add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center),
+        rect,
     );
 }
 
@@ -4673,12 +4709,18 @@ struct TitleHitRect {
     rect: Rect,
 }
 
-/// A clickable `[Copy]` label on a code-fence header bar. `text` is the exact
-/// fence contents; `rect` is the label's screen cells from the last draw.
+/// A clickable copy affordance from the last draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyHitKind {
+    Code,
+    Message,
+}
+
 #[derive(Debug, Clone)]
 struct CopyHitRegion {
     rect: Rect,
     text: String,
+    kind: CopyHitKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4752,6 +4794,10 @@ pub struct ChatState {
     entry_rects: Vec<(usize, ratatui::layout::Rect)>,
     /// Clickable `[Copy]` code-fence labels from the last draw.
     copy_hit_regions: Vec<CopyHitRegion>,
+    /// Temporary `[Copied]` overlay for code-fence copy labels. Message-copy
+    /// feedback is visible because its transient overlay disappears; code-copy
+    /// labels are persistent, so they need their own clicked-state cue.
+    code_copy_feedback_rect: Option<ratatui::layout::Rect>,
     /// Clickable provider/model title spans from the last draw.
     title_hit_rects: Vec<TitleHitRect>,
     /// Scrollbar track rect from the last draw.
@@ -4858,6 +4904,7 @@ impl ChatState {
             mouse_down_entry: None,
             entry_rects: Vec::new(),
             copy_hit_regions: Vec::new(),
+            code_copy_feedback_rect: None,
             title_hit_rects: Vec::new(),
             scrollbar_track_rect: None,
             scrollbar_drag: None,
@@ -5326,6 +5373,7 @@ impl ChatState {
         Some(CopyHitRegion {
             rect: centered_message_copy_rect(&label, *rect, body)?,
             text,
+            kind: CopyHitKind::Message,
         })
     }
 
@@ -5832,9 +5880,14 @@ impl ChatState {
         self.mark_dirty_full();
     }
 
+    fn set_code_copy_feedback(&mut self, anchor: Rect) {
+        self.code_copy_feedback_rect = code_copy_feedback_rect(&code_copied_label(), anchor);
+        self.mark_dirty_full();
+    }
+
     /// Drop the active info-bar message (on submit, inject, or turn start).
     pub fn clear_info_notice(&mut self) {
-        if self.info_message.take().is_some() {
+        if self.info_message.take().is_some() || self.code_copy_feedback_rect.take().is_some() {
             self.mark_dirty_full();
         }
     }
@@ -7589,6 +7642,10 @@ mod tests {
         assert_eq!(
             state.info_message.as_ref().map(|m| m.text.as_str()),
             Some(crate::i18n::t("zc-chat-copied-clipboard").as_str())
+        );
+        assert!(
+            state.code_copy_feedback_rect.is_some(),
+            "code copy should render an in-place copied-state cue"
         );
     }
 
