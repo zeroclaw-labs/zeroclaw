@@ -1291,12 +1291,9 @@ async fn install_web_dist(staged_dist: &Path, current_exe: &Path) -> Result<Path
     // genuinely a *replace*, not an overlay. Missing target is fine — we just
     // skip straight to the rename.
     let had_existing = tokio::fs::metadata(&target).await.is_ok();
-    if had_existing {
-        if let Err(e) = tokio::fs::rename(&target, &sidelined).await {
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            return Err(e)
-                .with_context(|| format!("failed to move old {} aside", target.display()));
-        }
+    if had_existing && let Err(e) = tokio::fs::rename(&target, &sidelined).await {
+        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        return Err(e).with_context(|| format!("failed to move old {} aside", target.display()));
     }
 
     if let Err(e) = tokio::fs::rename(&staging_dir, &target).await {
