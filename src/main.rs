@@ -90,6 +90,16 @@ fn read_capped_line<R: std::io::BufRead>(reader: R, cap: usize) -> std::io::Resu
     Ok(CappedLine::Line(String::from_utf8_lossy(&raw).into_owned()))
 }
 
+/// Truncate `line` in place to at most `cap` bytes, rounding the cut down to a
+/// UTF-8 char boundary. `String::truncate` panics when the byte index lands
+/// inside a multi-byte character, so a raw `line.truncate(cap)` on piped input
+/// is a latent panic (#7828). No-op when the string already fits.
+fn cap_line_utf8_safe(line: &mut String, cap: usize) {
+    if line.len() > cap {
+        line.truncate(line.floor_char_boundary(cap));
+    }
+}
+
 /// Discard bytes from `reader` until the next `\n` or EOF, using only
 /// `BufRead::fill_buf` / `consume`. This avoids the unbounded allocation
 /// that `read_until(..., &mut Vec::new())` would incur on an oversized
@@ -311,7 +321,10 @@ fn pause_after_no_command_help() {
         .take((STDIN_LINE_CAP + 1) as u64)
         .read_line(&mut line);
     if line.len() > STDIN_LINE_CAP {
-        line.truncate(STDIN_LINE_CAP);
+        // Round down to a UTF-8 char boundary before truncating: a piped
+        // multi-byte payload can land the byte cap inside a character, and
+        // `String::truncate` panics on a non-boundary index (#7828).
+        cap_line_utf8_safe(&mut line, STDIN_LINE_CAP);
     }
 }
 
@@ -7855,6 +7868,44 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[test]
+    fn cap_line_utf8_safe_no_panic_on_multibyte_boundary() {
+        // Neutral multi-byte placeholder text; each CJK char is 3 bytes, so a
+        // byte cap can land inside a character. Pre-fix this panicked via the
+        // raw `String::truncate(cap)` (#7828).
+        let mut line = "语言".repeat(64); // 128 chars, 384 bytes, all 3-byte
+        let cap = 10; // byte index 10 is mid-character (10 % 3 != 0)
+        assert!(
+            !line.is_char_boundary(cap),
+            "precondition: cap splits a char"
+        );
+        cap_line_utf8_safe(&mut line, cap);
+        assert!(line.len() <= cap, "must not exceed the byte cap");
+        assert!(
+            line.is_char_boundary(line.len()),
+            "result must end on a valid UTF-8 char boundary"
+        );
+        // cap 10 floors to byte 9 = three whole 3-byte chars.
+        assert_eq!(
+            line, "语言语",
+            "should keep whole chars up to the floored cap"
+        );
+    }
+
+    #[test]
+    fn cap_line_utf8_safe_is_noop_when_within_cap() {
+        let mut line = String::from("héllo"); // 6 bytes
+        cap_line_utf8_safe(&mut line, 1024);
+        assert_eq!(line, "héllo");
+    }
+
+    #[test]
+    fn cap_line_utf8_safe_ascii_exact_cap() {
+        let mut line = String::from("abcdefgh");
+        cap_line_utf8_safe(&mut line, 4);
+        assert_eq!(line, "abcd");
+    }
 
     #[test]
     #[cfg(feature = "agent-runtime")]
