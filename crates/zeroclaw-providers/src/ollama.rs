@@ -295,15 +295,6 @@ impl OllamaModelProvider {
         }
     }
 
-    /// Override the per-deployment tuning knobs (`num_ctx`, `num_predict`,
-    /// `temperature_override`) on this provider. Returns `self` for
-    /// chained construction.
-    #[must_use]
-    pub fn with_tuning(mut self, tuning: OllamaTuning) -> Self {
-        self.tuning = tuning;
-        self
-    }
-
     #[cfg(test)]
     pub(crate) fn tuning(&self) -> OllamaTuning {
         self.tuning
@@ -1554,12 +1545,12 @@ mod tests {
     #[test]
     fn request_includes_overridden_tuning() {
         let provider = OllamaModelProvider::builder("test")
-            .build()
-            .with_tuning(OllamaTuning {
+            .tuning(OllamaTuning {
                 num_ctx: 4096,
                 num_predict: 1024,
                 temperature_override: None,
-            });
+            })
+            .build();
         let request = provider.build_chat_request(
             vec![Message {
                 role: "user".to_string(),
@@ -1582,12 +1573,12 @@ mod tests {
     #[test]
     fn temperature_override_replaces_per_call_temperature() {
         let provider = OllamaModelProvider::builder("test")
-            .build()
-            .with_tuning(OllamaTuning {
+            .tuning(OllamaTuning {
                 num_ctx: 8192,
                 num_predict: 2048,
                 temperature_override: Some(0.1),
-            });
+            })
+            .build();
         let request = provider.build_chat_request(
             vec![Message {
                 role: "user".to_string(),
@@ -1634,12 +1625,12 @@ mod tests {
         // the builder produces identical option fields when only `think` differs.
         let provider = OllamaModelProvider::builder("test")
             .reasoning_enabled(Some(true))
-            .build()
-            .with_tuning(OllamaTuning {
+            .tuning(OllamaTuning {
                 num_ctx: 16384,
                 num_predict: 4096,
                 temperature_override: None,
-            });
+            })
+            .build();
 
         let messages = vec![Message {
             role: "user".to_string(),

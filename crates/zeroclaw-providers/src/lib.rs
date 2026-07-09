@@ -3655,8 +3655,8 @@ mod tests {
         assert_eq!(tuning.temperature_override, Some(0.5));
 
         let provider = ollama::OllamaModelProvider::builder("test")
-            .build()
-            .with_tuning(tuning);
+            .tuning(tuning)
+            .build();
         assert_eq!(provider.tuning(), tuning);
     }
 

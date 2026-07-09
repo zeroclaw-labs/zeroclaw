@@ -276,31 +276,6 @@ impl OpenAiModelProvider {
         }
     }
 
-    /// Override the API endpoint on an already-built provider. Trailing
-    /// slashes are stripped so callers need not care whether config
-    /// supplied them.
-    #[must_use]
-    pub fn with_base_url(mut self, base_url: &str) -> Self {
-        self.base_url = base_url.trim_end_matches('/').to_string();
-        self
-    }
-
-    /// Override the HTTP request timeout for LLM API calls. Values of 0
-    /// are ignored (the default 120 s is kept) so a stray `Some(0)` from
-    /// config cannot silently disable the safety timeout.
-    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
-        if secs > 0 {
-            self.timeout_secs = secs;
-        }
-        self
-    }
-
-    /// Set the maximum output tokens for API requests.
-    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
-        self.max_tokens = max_tokens;
-        self
-    }
-
     /// Adjust temperature for models that have specific requirements.
     /// Some OpenAI models (like gpt-5-mini, o1, o3, etc) only accept temperature=1.0.
     fn adjust_temperature_for_model(model: &str, requested_temperature: f64) -> f64 {
@@ -1098,44 +1073,6 @@ impl OpenAiResponsesModelProvider {
         }
     }
 
-    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
-        self.max_tokens = max_tokens;
-        self
-    }
-
-    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
-        self.reasoning_effort = effort;
-        self
-    }
-
-    /// Override the non-streaming HTTP request timeout in seconds.
-    /// Streaming SSE calls are unaffected; they use the connect-timeout-only
-    /// `streaming_client` so long responses aren't killed by a total timeout.
-    ///
-    /// Values of 0 are ignored (the default 120 s is kept) so a stray
-    /// `Some(0)` from config cannot silently disable the safety timeout.
-    /// Matches the guard on `OpenAiModelProvider::with_timeout_secs`,
-    /// `OpenAiCompatibleModelProvider::with_timeout_secs`, and
-    /// `OpenRouterModelProvider::with_timeout_secs`.
-    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
-        if secs > 0 {
-            self.timeout_secs = secs;
-        }
-        self
-    }
-
-    /// Set the extra HTTP headers to include on every request issued through
-    /// this provider. Invalid header names / values are logged at WARN and
-    /// skipped at client-construction time (see `http_client` /
-    /// `streaming_client`).
-    pub fn with_extra_headers(
-        mut self,
-        headers: std::collections::HashMap<String, String>,
-    ) -> Self {
-        self.extra_headers = headers;
-        self
-    }
-
     fn build_request(
         &self,
         instructions: Option<String>,
@@ -1552,8 +1489,8 @@ mod tests {
     #[test]
     fn with_timeout_secs_overrides_default() {
         let p = OpenAiResponsesModelProvider::builder("test")
-            .build()
-            .with_timeout_secs(45);
+            .timeout_secs(45)
+            .build();
         assert_eq!(
             p.timeout_secs, 45,
             "with_timeout_secs must override the 120 default"
@@ -1569,8 +1506,8 @@ mod tests {
             "https://example.com".to_string(),
         );
         let p = OpenAiResponsesModelProvider::builder("test")
-            .build()
-            .with_extra_headers(headers);
+            .extra_headers(headers)
+            .build();
         assert_eq!(
             p.extra_headers.len(),
             2,
@@ -1607,8 +1544,8 @@ mod tests {
             "https://example.com".to_string(),
         );
         let p = OpenAiResponsesModelProvider::builder("test")
-            .build()
-            .with_extra_headers(headers);
+            .extra_headers(headers)
+            .build();
         let default_headers = p.build_default_headers();
         assert_eq!(
             default_headers.len(),
@@ -1638,8 +1575,8 @@ mod tests {
         headers.insert("X Valid".to_string(), "ok".to_string()); // space → invalid
         headers.insert("X-Also-Valid".to_string(), "ok".to_string());
         let p = OpenAiResponsesModelProvider::builder("test")
-            .build()
-            .with_extra_headers(headers);
+            .extra_headers(headers)
+            .build();
         let default_headers = p.build_default_headers();
         assert_eq!(
             default_headers.len(),
@@ -1661,8 +1598,8 @@ mod tests {
         headers.insert("X-Bad-Value".to_string(), "has\0nul".to_string()); // NUL → invalid
         headers.insert("X-Good-Value".to_string(), "ok".to_string());
         let p = OpenAiResponsesModelProvider::builder("test")
-            .build()
-            .with_extra_headers(headers);
+            .extra_headers(headers)
+            .build();
         let default_headers = p.build_default_headers();
         assert_eq!(
             default_headers.len(),
@@ -1707,8 +1644,8 @@ mod tests {
         );
         let p = OpenAiResponsesModelProvider::builder("test")
             .api_url("sk-builtin")
-            .build()
-            .with_extra_headers(headers);
+            .extra_headers(headers)
+            .build();
         let default_headers = p.build_default_headers();
         assert!(
             default_headers.get("Authorization").is_none(),
@@ -1736,8 +1673,8 @@ mod tests {
             headers.insert(variant.to_string(), "Bearer x".to_string());
             let p = OpenAiResponsesModelProvider::builder("test")
                 .api_url("sk-builtin")
-                .build()
-                .with_extra_headers(headers);
+                .extra_headers(headers)
+                .build();
             let default_headers = p.build_default_headers();
             assert!(
                 default_headers.get("Authorization").is_none(),
@@ -1771,8 +1708,8 @@ mod tests {
         headers.insert("X-Trace-Id".to_string(), "trace-123".to_string());
         let p = OpenAiResponsesModelProvider::builder("test")
             .api_url("sk-builtin")
-            .build()
-            .with_extra_headers(headers);
+            .extra_headers(headers)
+            .build();
         let default_headers = p.build_default_headers();
         assert_eq!(
             default_headers.len(),
@@ -2397,8 +2334,8 @@ mod tests {
     fn responses_request_propagates_max_tokens_when_set() {
         let provider = OpenAiResponsesModelProvider::builder("openai")
             .credential(None)
-            .build()
-            .with_max_tokens(Some(2048));
+            .max_tokens(Some(2048))
+            .build();
         let req = provider.build_request(
             None,
             vec![serde_json::json!({"role": "user", "content": "hi"})],
@@ -2448,8 +2385,8 @@ mod tests {
     fn responses_request_propagates_reasoning_effort_when_set() {
         let provider = OpenAiResponsesModelProvider::builder("openai")
             .credential(None)
-            .build()
-            .with_reasoning_effort(Some("high".to_string()));
+            .reasoning_effort(Some("high".to_string()))
+            .build();
         let req = provider.build_request(
             None,
             vec![serde_json::json!({"role": "user", "content": "hi"})],
@@ -2538,8 +2475,8 @@ mod tests {
     fn responses_request_propagates_tool_choice_and_parallel_when_tools_present() {
         let provider = OpenAiResponsesModelProvider::builder("openai")
             .credential(None)
-            .build()
-            .with_max_tokens(Some(1024));
+            .max_tokens(Some(1024))
+            .build();
         let tools = Some(vec![ResponsesToolSpec {
             kind: "function".to_string(),
             name: "lookup_weather".to_string(),

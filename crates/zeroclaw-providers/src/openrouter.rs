@@ -272,30 +272,6 @@ impl OpenRouterModelProvider {
             extra_body: None,
         }
     }
-    /// Override the HTTP request timeout for LLM API calls. Values of 0
-    /// are ignored (the default timeout is kept) so a stray `Some(0)`
-    /// from config cannot disable the safety timeout.
-    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
-        if secs > 0 {
-            self.timeout_secs = secs;
-        }
-        self
-    }
-
-    /// Set the maximum output tokens for API requests.
-    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
-        self.max_tokens = max_tokens;
-        self
-    }
-
-    /// Set extra JSON parameters to merge into every API request body.
-    /// Keys in `extra` are inserted at the top level of the serialized request,
-    /// overriding any existing keys with the same name.
-    pub fn with_extra_body(mut self, extra: serde_json::Value) -> Self {
-        self.extra_body = Some(extra);
-        self
-    }
-
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
         let items = tools?;
         if items.is_empty() {
@@ -1266,8 +1242,8 @@ mod tests {
     fn uses_configured_timeout_when_provided() {
         let model_provider = OpenRouterModelProvider::builder("test")
             .credential(Some("openrouter-test-credential"))
-            .build()
-            .with_timeout_secs(1200);
+            .timeout_secs(1200)
+            .build();
         assert_eq!(model_provider.timeout_secs, 1200);
     }
 
@@ -1275,8 +1251,8 @@ mod tests {
     fn falls_back_to_default_timeout_for_zero() {
         let model_provider = OpenRouterModelProvider::builder("test")
             .credential(Some("openrouter-test-credential"))
-            .build()
-            .with_timeout_secs(0);
+            .timeout_secs(0)
+            .build();
         assert_eq!(
             model_provider.timeout_secs,
             zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS
@@ -1952,8 +1928,8 @@ mod tests {
     fn with_timeout_secs_overrides_default() {
         let model_provider = OpenRouterModelProvider::builder("test")
             .credential(Some("key"))
-            .build()
-            .with_timeout_secs(300);
+            .timeout_secs(300)
+            .build();
         assert_eq!(model_provider.timeout_secs, 300);
     }
 
@@ -2066,8 +2042,8 @@ mod tests {
         let extra = serde_json::json!({"model_provider": {"only": ["Anthropic"]}});
         let model_provider = OpenRouterModelProvider::builder("test")
             .credential(Some("key"))
-            .build()
-            .with_extra_body(extra.clone());
+            .extra_body(extra.clone())
+            .build();
         assert_eq!(model_provider.extra_body, Some(extra));
     }
 
@@ -2092,8 +2068,8 @@ mod tests {
     fn extra_body_empty_object_produces_unchanged_request() {
         let model_provider = OpenRouterModelProvider::builder("test")
             .credential(Some("key"))
-            .build()
-            .with_extra_body(serde_json::json!({}));
+            .extra_body(serde_json::json!({}))
+            .build();
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
@@ -2110,8 +2086,8 @@ mod tests {
     fn extra_body_adds_new_top_level_keys() {
         let model_provider = OpenRouterModelProvider::builder("test")
             .credential(Some("key"))
-            .build()
-            .with_extra_body(serde_json::json!({"model_provider": {"only": ["Anthropic"]}}));
+            .extra_body(serde_json::json!({"model_provider": {"only": ["Anthropic"]}}))
+            .build();
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
@@ -2133,8 +2109,8 @@ mod tests {
     fn extra_body_overrides_existing_keys() {
         let model_provider = OpenRouterModelProvider::builder("test")
             .credential(Some("key"))
-            .build()
-            .with_extra_body(serde_json::json!({"temperature": 0.9}));
+            .extra_body(serde_json::json!({"temperature": 0.9}))
+            .build();
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
@@ -2151,8 +2127,8 @@ mod tests {
     fn extra_body_merges_at_top_level_not_nested() {
         let model_provider = OpenRouterModelProvider::builder("test")
             .credential(Some("key"))
-            .build()
-            .with_extra_body(serde_json::json!({"transforms": ["middle-out"]}));
+            .extra_body(serde_json::json!({"transforms": ["middle-out"]}))
+            .build();
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
@@ -2171,9 +2147,9 @@ mod tests {
 
     #[test]
     fn extra_body_with_nested_provider_routing() {
-        let model_provider = OpenRouterModelProvider::builder("test").credential(Some("key")).build().with_extra_body(
+        let model_provider = OpenRouterModelProvider::builder("test").credential(Some("key")).extra_body(
             serde_json::json!({"model_provider": {"only": ["Anthropic"], "allow_fallbacks": false}}),
-        );
+        ).build();
         let request = NativeChatRequest {
             model: "anthropic/claude-sonnet-4".into(),
             messages: vec![],

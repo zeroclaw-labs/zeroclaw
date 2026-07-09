@@ -305,21 +305,6 @@ impl AnthropicModelProvider {
         }
     }
 
-    /// Override the API endpoint on an already-built provider. Trailing
-    /// slashes are stripped so callers need not care whether config
-    /// supplied them.
-    #[must_use]
-    pub fn with_base_url(mut self, base_url: &str) -> Self {
-        self.base_url = base_url.trim_end_matches('/').to_string();
-        self
-    }
-
-    /// Override the maximum output tokens for API requests.
-    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
-        self.max_tokens = max_tokens;
-        self
-    }
-
     fn is_setup_token(token: &str) -> bool {
         token.starts_with("sk-ant-oat01-")
     }
@@ -2096,8 +2081,8 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn creates_with_custom_base_url() {
         let p = AnthropicModelProvider::builder("test")
             .credential(Some("anthropic-credential"))
-            .build()
-            .with_base_url("https://api.example.com");
+            .base_url("https://api.example.com")
+            .build();
         assert_eq!(p.base_url, "https://api.example.com");
         assert_eq!(p.credential.as_deref(), Some("anthropic-credential"));
     }
@@ -2105,8 +2090,8 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn custom_base_url_trims_trailing_slash() {
         let p = AnthropicModelProvider::builder("test")
-            .build()
-            .with_base_url("https://api.example.com/");
+            .base_url("https://api.example.com/")
+            .build();
         assert_eq!(p.base_url, "https://api.example.com");
     }
 
