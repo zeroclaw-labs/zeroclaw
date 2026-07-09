@@ -140,18 +140,13 @@ for wf in \
     "(e.g. v${VERSION})"
 done
 
-# ── Docs book examples + matching i18n catalogs ────────────────────
-# Two surgical patterns, both anchored enough to skip release-runbook
-# history lines like "Last verified: May 2026 (v0.7.4 cycle)" or
-# "scheduled for deletion in v0.7.4 (#5915)" which intentionally pin
-# to the version they were written for:
-#   - container image tags    `zeroclawlabs/zeroclaw:vX.Y.Z`
-#   - /health response example `"version": "X.Y.Z"`
-#   - RPC initialize example     `"serverVersion": "X.Y.Z"`
-# Sweeping `docs/book/src/**/*.md` keeps user-facing examples in step
-# with the release. The translation catalogues (`docs/book/po`) live in the
-# zeroclaw-docs-translations submodule and own their own version-literal swaps,
-# so they are not touched here; refresh-translations.sh tags and pins them.
+# Docs book examples + matching i18n catalogs.
+# Only sweep surgical patterns anchored to release version literals:
+#   - container image tags: zeroclawlabs/zeroclaw:vX.Y.Z
+#   - /health response example: "version": "X.Y.Z"
+#   - RPC initialize example: "serverVersion": "X.Y.Z"
+# Translations live in the zeroclaw-docs-translations submodule and are
+# swept by refresh-translations.sh.
 echo "Docs book examples..."
 docs_files=()
 while IFS= read -r -d '' f; do
