@@ -1,5 +1,4 @@
 //! REST API handlers for the web dashboard.
-//!
 //! All `/api/*` routes require bearer token authentication (PairingGuard).
 
 use super::AppState;
@@ -315,12 +314,6 @@ pub async fn handle_api_status(
     Json(body).into_response()
 }
 
-/// Query parameters for `GET /api/tools`. Pass `?agent=<alias>` to list that
-/// agent's scoped tool set (its built-ins plus the MCP tools granted by its
-/// `mcp_bundles`); omit it for the default listing seeded from the
-/// deterministically smallest enabled agent. An unknown alias falls back to
-/// the default listing rather than erroring, so a stale UI selection still
-/// renders.
 #[derive(Debug, Deserialize)]
 pub struct ToolsQuery {
     #[serde(default)]
@@ -631,14 +624,6 @@ pub async fn handle_api_cron_patch(
         }
     };
     let is_agent = matches!(existing.job_type, zeroclaw_runtime::cron::JobType::Agent);
-    // The agent only gates a shell `command` change (risk profile). For a shell
-    // job the new command can arrive via either `command` OR `prompt` (the
-    // `prompt` field is folded into the command below), so the existence check
-    // must cover both. Skip it for patches that don't set a shell command —
-    // schedule, name, and enable/disable toggles don't need an agent supplied —
-    // and for agent-type jobs, where `prompt` is an LLM prompt, not a shell
-    // command, and so is not agent-gated. This needs `existing.job_type`, hence
-    // it runs after the job is fetched.
     let setting_shell_command = !is_agent && (command.is_some() || prompt.is_some());
     if setting_shell_command && config.agent(&agent_alias).is_none() {
         return (
@@ -882,12 +867,6 @@ pub async fn handle_api_doctor(
     .into_response()
 }
 
-/// Resolve a memory handle for the request. When `agent` names a
-/// configured `[agents.<alias>]` entry the handle is built via
-/// `zeroclaw_memory::create_memory_for_agent` so SQL backends filter by
-/// the agent's UUID, Markdown reads only that agent's directory, etc.
-/// Otherwise the install-wide `state.mem` handle is returned (the
-/// dashboard's legacy cross-agent view).
 async fn resolve_memory_handle(
     state: &AppState,
     agent_alias: Option<&str>,
@@ -940,11 +919,6 @@ pub async fn handle_api_memory_list(
         let query = params.query.as_deref().unwrap_or("");
         let since = params.since.as_deref();
         let until = params.until.as_deref();
-        // The Memory::recall trait has no category parameter — every backend
-        // (Markdown, SQLite, Qdrant, …) implements it the same way. To keep
-        // search + category composable across all of them, post-filter here
-        // on the entries `recall()` returned rather than threading category
-        // into the trait surface.
         match mem.recall(query, 50, None, since, until).await {
             Ok(entries) => {
                 let entries = match params.category.as_deref() {
@@ -1672,12 +1646,6 @@ pub async fn handle_api_session_delete(
         format!("gw_{id}")
     };
 
-    // If a turn is in flight for this session, cancel it and evict the entry
-    // from `cancel_tokens` here rather than leaving the WebSocket handler's
-    // post-`tokio::join!` cleanup (`ws.rs:535`) as the only path. Without
-    // this, deleting a session mid-turn leaks the map entry until the
-    // streaming task happens to wake up — and on a process crash the
-    // entry is lost entirely.
     let token = state
         .cancel_tokens
         .lock()
@@ -1840,17 +1808,6 @@ pub async fn handle_api_session_state(
 
 // ── Session abort endpoint ────────────────────────────────────────
 
-/// POST /api/sessions/{id}/abort — cancel an in-flight agent response.
-///
-/// Looks up the cancellation token for the given session. If a turn is
-/// currently running the token is cancelled, which causes the agent's
-/// streaming loop and tool-call loop to exit early. The WebSocket handler
-/// is responsible for cleaning up partial state and sending the abort
-/// frame to the client.
-///
-/// Returns 200 with `{"status": "aborted"}` if a running turn was found,
-/// or `{"status": "no_active_response"}` if the session was idle (no
-/// token present). Both are success — abort is idempotent.
 pub async fn handle_api_session_abort(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1887,12 +1844,6 @@ pub async fn handle_api_session_abort(
 
 // ── Claude Code hook endpoint ────────────────────────────────────
 
-/// POST /hooks/claude-code — receives HTTP hook events from Claude Code
-/// sessions spawned by `ClaudeCodeRunnerTool`.
-///
-/// Claude Code posts structured JSON describing tool executions, completions,
-/// and errors. This handler logs the event and (when a Slack channel is
-/// configured) could be wired to update a Slack message in-place.
 pub async fn handle_claude_code_hook(
     State(state): State<AppState>,
     Json(payload): Json<zeroclaw_tools::claude_code_runner::ClaudeCodeHookEvent>,
@@ -1908,7 +1859,7 @@ pub async fn handle_claude_code_hook(
 }
 
 // Shared test helper: `api_config` tests reuse this AppState builder for the
-// agent rename/delete cascade handlers (#7907 / #7941 regression coverage).
+// agent rename/delete cascade handlers/coverage).
 
 #[cfg(test)]
 pub(crate) use tests::test_state;
@@ -2016,11 +1967,6 @@ mod tests {
             Ok(Vec::new())
         }
 
-        // Override the trait default (which returns an "unsupported" Err) so
-        // tests that trigger the delete_agent cascade don't have their
-        // `warnings` array polluted with a memory-backend error that has
-        // nothing to do with what they're actually asserting. Mirrors the
-        // behavior of a real backend on a delete-of-a-never-stored agent.
         async fn purge_agent(&self, _agent_alias: &str) -> anyhow::Result<usize> {
             Ok(0)
         }
@@ -3336,13 +3282,6 @@ mod tests {
         );
     }
 
-    // --- PATCH agent-requirement boundary (#7666) ---------------------------
-    // These pin the relaxed `agent` rule: it is required only when a patch sets a
-    // *shell command* (the risk-profile gate), and not for enable/disable,
-    // metadata-only patches, or agent-type jobs. Regression coverage for the
-    // `#[serde(default)] agent` + `setting_shell_command` scoping so a future
-    // refactor can't silently reopen the gate or re-require agent where it isn't.
-
     #[tokio::test]
     async fn cron_api_patch_enabled_without_agent() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3814,12 +3753,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    // ── Token rotation / device revocation security tests ────────────────────
-    //
-    // GHSA-f385-f6h2-3gqj follow-up (#6984): `POST /api/devices/{id}/token/rotate`
-    // and `DELETE /api/devices/{id}` must both invalidate the bearer token
-    // associated with the device, not just rotate a code or delete the row.
-
     use crate::api_pairing::{
         DeviceInfo, DeviceRegistry, revoke_device, rotate_token as rotate_device_token,
         submit_pairing_enhanced,
@@ -3872,9 +3805,6 @@ mod tests {
         h
     }
 
-    /// The backfill inserts a placeholder row for every paired-token hash that
-    /// has no device entry, skips hashes that already have one (without
-    /// clobbering their metadata), and is idempotent across restarts.
     #[tokio::test]
     async fn reconcile_backfills_orphan_token_hashes() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3922,11 +3852,6 @@ mod tests {
         assert_eq!(registry.device_count(), 3);
     }
 
-    /// Security-management contract: a token paired through the legacy `/pair`
-    /// route is an orphan (authenticates, but absent from the registry). After
-    /// backfill it is keyed by the SAME `token_hash` the auth gate uses, so the
-    /// revoke-by-device path (`revoke` → `PairingGuard::revoke_token_hash`)
-    /// invalidates exactly that bearer token.
     #[tokio::test]
     async fn backfilled_orphan_is_revocable_by_its_real_hash() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3971,10 +3896,6 @@ mod tests {
         );
     }
 
-    /// Regression: `POST /api/devices/{id}/token/rotate` MUST invalidate the
-    /// old bearer token. The pre-fix handler only issued a new pairing code
-    /// and left the leaked token authenticating (GHSA-f385-f6h2-3gqj
-    /// incident-response gap).
     #[tokio::test]
     async fn rotate_token_invalidates_old_bearer_token() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4000,9 +3921,6 @@ mod tests {
         assert!(json["pairing_code"].is_string());
     }
 
-    /// Enforcement: after rotate, the on-disk `gateway.paired_tokens` field
-    /// must not still contain the revoked token, so a daemon restart cannot
-    /// resurrect it.
     #[tokio::test]
     async fn rotate_token_persists_revocation_to_config() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4025,11 +3943,6 @@ mod tests {
         );
     }
 
-    /// Regression: `POST /api/pair` MUST persist the newly issued token to
-    /// `gateway.paired_tokens` before reporting success. The pre-fix handler
-    /// registered the device and returned "Pairing successful" but left the
-    /// token only in memory, so a restart after rotate/re-pair silently
-    /// dropped the replacement credential (GHSA-f385-f6h2-3gqj §5).
     #[tokio::test]
     async fn submit_pairing_enhanced_persists_new_token() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4064,8 +3977,6 @@ mod tests {
         );
     }
 
-    /// Enforcement: `DELETE /api/devices/{id}` must also invalidate the
-    /// device's bearer token, not just the SQLite row.
     #[tokio::test]
     async fn revoke_device_invalidates_bearer_token() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4115,11 +4026,6 @@ mod tests {
         );
     }
 
-    /// Enforcement: when a pairing code is already pending, rotate still
-    /// revokes the bearer token (that is the load-bearing security effect)
-    /// but does not issue a new code; the pending code from the other flow
-    /// is preserved. The check + write must be atomic — see
-    /// `concurrent_rotates_do_not_both_issue_a_pairing_code` below.
     #[tokio::test]
     async fn rotate_with_pending_code_revokes_but_returns_null_code() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4154,11 +4060,6 @@ mod tests {
         assert_eq!(json["device_id"], device_id);
     }
 
-    /// Enforcement: two rotates that race must not both succeed in issuing
-    /// a pairing code. The first one wins the slot; the second observes the
-    /// occupied slot atomically and returns `pairing_code: null`. Both
-    /// rotates revoke the bearer token they target, because revocation is
-    /// the load-bearing action and must not depend on the slot.
     #[tokio::test]
     async fn concurrent_rotates_do_not_both_issue_a_pairing_code() {
         let tmp = tempfile::TempDir::new().unwrap();

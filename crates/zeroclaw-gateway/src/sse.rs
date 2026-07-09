@@ -1,5 +1,4 @@
 //! Server-Sent Events (SSE) stream for real-time event delivery.
-//!
 //! Wraps the broadcast channel in AppState to deliver events to web dashboard clients.
 
 use super::AppState;
@@ -110,13 +109,6 @@ fn history_events_payload(buffer: &EventBuffer) -> serde_json::Value {
     serde_json::json!({ "events": events })
 }
 
-/// Returns true for events that should be visible on the global SSE stream.
-///
-/// Contract: broadcast events must not include `session_id` unless they are
-/// intentionally scoped to that session and hidden from global `/api/events`.
-/// Observability telemetry (events tagged `source: "observability"`) is
-/// explicitly public — it is global monitoring data intended for the
-/// dashboard SSE stream even though it never carries a chat `session_id`.
 fn is_public_sse_event(event: &serde_json::Value) -> bool {
     if event.get("source").and_then(serde_json::Value::as_str) == Some("observability") {
         return true;
@@ -127,16 +119,6 @@ fn is_public_sse_event(event: &serde_json::Value) -> bool {
         .is_none()
 }
 
-/// Broadcast observer that fans events out to SSE subscribers.
-///
-/// Installed as the process-wide broadcast hook by [`crate::run_gateway`] so
-/// that events recorded by *any* observer built through
-/// `observability::create_observer` — including the per-call observer the
-/// agent loop creates inside `process_message` — also reach `/api/events`
-/// clients.
-///
-/// Crate-private: the constructor signature is intentionally not part of any
-/// stable surface, since it is wired directly into `run_gateway`.
 pub(crate) struct BroadcastObserver {
     tx: tokio::sync::broadcast::Sender<serde_json::Value>,
     buffer: Arc<EventBuffer>,
@@ -471,7 +453,7 @@ mod tests {
 
     #[test]
     fn observability_tagged_events_are_public_even_without_session_id() {
-        // After #7151, observability frames keep the SSE pathway open even
+        // After observability frames keep the SSE pathway open even
         // though they would not otherwise carry a session_id discriminator.
         let obs = serde_json::json!({
             "type": "tool_call",
@@ -577,13 +559,6 @@ mod tests {
         }
     }
 
-    /// End-to-end coverage of the wiring `run_gateway` performs at startup:
-    /// installing `BroadcastObserver` as the process-wide broadcast hook and
-    /// then building an observer through `create_observer` (the path the
-    /// agent loop takes inside `process_message`) must surface events on the
-    /// SSE broadcast channel. Codifies the load-bearing ordering so that
-    /// reordering or dropping `set_scoped_broadcast_hook` in `run_gateway` is caught
-    /// by `cargo test`, not by a silent regression in production.
     #[test]
     fn factory_observer_events_reach_broadcast_hook() {
         // The broadcast hook is process-wide; serialize hook-touching tests
