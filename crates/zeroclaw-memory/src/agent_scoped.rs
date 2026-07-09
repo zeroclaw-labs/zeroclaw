@@ -1,24 +1,3 @@
-//! Runtime memory wrapper bound to one agent.
-//!
-//! Each agent holds its own per-agent backend instance (selected at
-//! agent creation via `[agents.<alias>.memory.backend]`, immutable
-//! thereafter). The wrapper sits directly on top of that instance and:
-//!
-//! - Stamps the bound agent's UUID on every store via the inner
-//!   backend's `store_with_agent` trait method (real implementations
-//!   on every backend; the agent_id is never silently dropped at the
-//!   trait boundary).
-//! - Filters every recall through the inner backend's
-//!   `recall_for_agents` with the resolved allowlist (own UUID + the
-//!   `read_memory_from` allowlist from
-//!   `[agents.<alias>.workspace.read_memory_from]`).
-//! - Intersects caller-supplied per-call allowlists with the bound
-//!   allowlist so a caller can never widen scope past what the agent's
-//!   config permits.
-//!
-//! Cross-backend allowlist entries are rejected at config load. The
-//! wrapper only ever sees same-backend sibling UUIDs in its
-//! `allowed_agent_ids` set.
 
 use super::traits::{ExportFilter, Memory, MemoryCategory, MemoryEntry, ProceduralMessage};
 use anyhow::Result;
@@ -26,13 +5,6 @@ use async_trait::async_trait;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// A `Memory` impl that scopes every read and write to a bound agent's
-/// UUID + a resolved cross-agent allowlist.
-///
-/// Construct via [`AgentScopedMemory::new`] at agent-loop entry. The
-/// runtime holds one per agent. Non-generic over the inner backend
-/// (holds `Arc<dyn Memory>`) so the per-agent factory can hand back a
-/// single concrete type regardless of the agent's chosen backend kind.
 pub struct AgentScopedMemory {
     /// The wrapped backend. `Arc<dyn Memory>` to slot into the existing
     /// per-install plumbing while the runtime factory hands out one
@@ -49,14 +21,6 @@ pub struct AgentScopedMemory {
 }
 
 impl AgentScopedMemory {
-    /// Build a new agent-scoped wrapper around `inner`.
-    ///
-    /// `agent_id` is the bound agent's UUID (looked up from the
-    /// `agents` table by alias at construction time in the runtime
-    /// factory). `allowed_sibling_agent_ids` is the resolved
-    /// `read_memory_from` allowlist; the bound `agent_id` is added
-    /// automatically to the in-memory `allowed_agent_ids` set so
-    /// callers do not need to remember to include themselves.
     #[must_use]
     pub fn new(
         inner: Arc<dyn Memory>,
@@ -105,7 +69,7 @@ impl Memory for AgentScopedMemory {
     ) {
         // Transparent wrapper: forward the embedder refresh to the wrapped
         // per-agent backend so an active agent's memory stops using a stale
-        // endpoint/key after a provider-profile `config/set` (#8359).
+        // endpoint/key after a provider-profile `config/set`
         self.inner
             .refresh_embedder(model_provider, api_key, model, dimensions);
     }
@@ -117,12 +81,6 @@ impl Memory for AgentScopedMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> Result<()> {
-        // Every store routes through `store_with_agent` so the bound
-        // agent's UUID is persisted. Backends with native agent_id
-        // columns (Sqlite, Postgres, Lucid) write the column; Qdrant
-        // writes the payload field; Markdown attributes via the on-
-        // disk path; None drops it. Each backend's behavior is
-        // explicit at the trait boundary.
         self.inner
             .store_with_agent(
                 key,
@@ -168,11 +126,6 @@ impl Memory for AgentScopedMemory {
         importance: Option<f64>,
         agent_id: Option<&str>,
     ) -> Result<()> {
-        // The wrapper's whole purpose is to make every persisted row
-        // attributable to its bound agent. A caller passing an
-        // explicit `agent_id` that does not match is a bug; refuse
-        // loudly so the misuse is debuggable rather than silently
-        // misattributed.
         if let Some(requested) = agent_id
             && requested != self.agent_id
         {
@@ -227,14 +180,6 @@ impl Memory for AgentScopedMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        // Intersect the caller-supplied allowlist with the bound
-        // allowlist so a caller cannot widen scope past what the
-        // agent's config permits. Empty caller allowlist means "no
-        // extra restriction"; the bound allowlist still applies.
-        // A non-empty caller allowlist whose intersection with the
-        // bound allowlist is empty means "no rows match" — return
-        // early so the empty-allowlist sentinel ("no filter") on the
-        // inner backend does not silently widen scope.
         if caller_allowed.is_empty() {
             let bound: Vec<&str> = self.allowed_agent_ids.iter().map(String::as_str).collect();
             return self
@@ -257,11 +202,6 @@ impl Memory for AgentScopedMemory {
     }
 
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
-        // Bound agent's row wins; fall back to allowlisted siblings.
-        // Each lookup is `inner.get_for_agent(key, agent_id)` so
-        // composite-uniqueness backends return the right row per agent
-        // (a single `inner.get(key)` could return any one of the
-        // colliding-key rows).
         if let Some(own) = self.inner.get_for_agent(key, &self.agent_id).await? {
             return Ok(Some(own));
         }
@@ -288,10 +228,6 @@ impl Memory for AgentScopedMemory {
         category: Option<&MemoryCategory>,
         session_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        // Inner.list returns rows across every agent on the install;
-        // post-filter by the bound + allowlisted set so a wrapper-using
-        // caller cannot inspect sibling rows it did not opt into via
-        // `read_memory_from`.
         let entries = self.inner.list(category, session_id).await?;
         Ok(entries
             .into_iter()
@@ -304,16 +240,6 @@ impl Memory for AgentScopedMemory {
     }
 
     async fn forget(&self, key: &str) -> Result<bool> {
-        // Only the bound agent's own row may be deleted. Sibling rows
-        // visible via `read_memory_from` are read-only by design — the
-        // allowlist grants recall, never delete. A composite delete on
-        // (key, agent_id) leaves sibling rows untouched and refuses
-        // cross-agent deletion by construction (no row matches).
-        //
-        // When the composite delete finds nothing and `inner.get(key)`
-        // (no agent filter) surfaces a row belonging to another agent,
-        // emit a structured refusal so the operator sees `key`,
-        // `row_agent`, and `bound_agent` as attribution-bound fields.
         if self.inner.forget_for_agent(key, &self.agent_id).await? {
             return Ok(true);
         }
@@ -445,12 +371,6 @@ impl Memory for AgentScopedMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        // Recall through the agent-scoped recall path so the bound +
-        // allowlisted UUIDs filter at the SQL boundary, then
-        // post-filter for the namespace match. The default trait impl
-        // would route through `recall` which the wrapper has already
-        // overridden, but routing explicitly here keeps the read shape
-        // visible to anyone tracing the call chain.
         let entries = self
             .recall(query, limit * 2, session_id, since, until)
             .await?;
@@ -462,11 +382,6 @@ impl Memory for AgentScopedMemory {
     }
 
     async fn export(&self, filter: &ExportFilter) -> Result<Vec<MemoryEntry>> {
-        // Export is the GDPR data-portability path. An agent-scoped
-        // export sees only the bound + allowlisted agents' rows. The
-        // wrapper's `list` already does the per-agent filtering;
-        // delegate to it and apply the rest of the export filter
-        // post-fetch.
         let entries = self
             .list(filter.category.as_ref(), filter.session_id.as_deref())
             .await?;
@@ -525,10 +440,6 @@ mod tests {
         inner
     }
 
-    /// Insert real agent rows for the supplied aliases and return their
-    /// UUIDs. The NOT NULL FK on `memories.agent_id` means tests that
-    /// attribute rows to a sibling must use UUIDs that actually exist
-    /// in the agents table.
     async fn provision_agents(inner: &Arc<SqliteMemory>, aliases: &[&str]) -> Vec<String> {
         let mut uuids = Vec::with_capacity(aliases.len());
         for alias in aliases {
@@ -537,9 +448,6 @@ mod tests {
         uuids
     }
 
-    /// The wrapper must forward `refresh_embedder` to its inner backend so an
-    /// active agent's per-agent memory picks up a provider-profile change
-    /// instead of keeping a stale embedder (#8359).
     #[test]
     fn refresh_embedder_forwards_to_inner_backend() {
         let (_tmp, inner) = fresh_sqlite();
