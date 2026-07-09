@@ -36,39 +36,96 @@ pub mod field {
 /// A JSON-RPC 2.0 frame that can represent either a request or response.
 /// Used for deserializing bidirectional RPC traffic where incoming frames
 /// may be responses to our outbound requests.
-#[derive(Debug, Deserialize)]
+///
+/// `result_present`/`error_present` track raw field presence so an explicit
+/// `result: null` success response still classifies as a response, which the
+/// default `Option<Value>` folding would erase.
+#[derive(Debug)]
 pub struct JsonRpcFrame {
     pub jsonrpc: String,
-    #[serde(default)]
     pub method: Option<String>,
-    #[serde(default)]
     pub params: Option<Value>,
     pub id: Option<Value>,
-    /// Present in responses (success case)
-    #[serde(default)]
     pub result: Option<Value>,
-    /// Present in responses (error case)
-    #[serde(default)]
+    pub result_present: bool,
     pub error: Option<JsonRpcError>,
+    pub error_present: bool,
+}
+
+impl<'de> Deserialize<'de> for JsonRpcFrame {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let mut value = Value::deserialize(deserializer)?;
+        let obj = value
+            .as_object_mut()
+            .ok_or_else(|| D::Error::custom("JsonRpcFrame must be a JSON object"))?;
+
+        let jsonrpc = match obj.remove(field::JSONRPC) {
+            Some(Value::String(s)) => s,
+            Some(_) => return Err(D::Error::custom("jsonrpc field must be a string")),
+            None => return Err(D::Error::missing_field(field::JSONRPC)),
+        };
+
+        let method = match obj.remove(field::METHOD) {
+            Some(Value::String(s)) => Some(s),
+            Some(Value::Null) | None => None,
+            Some(_) => return Err(D::Error::custom("method field must be a string")),
+        };
+
+        let params = obj.remove(field::PARAMS);
+        let id = obj.remove(field::ID);
+
+        let (result, result_present) = match obj.remove(field::RESULT) {
+            Some(v) => (Some(v), true),
+            None => (None, false),
+        };
+        let (error, error_present) = match obj.remove(field::ERROR) {
+            Some(v) => {
+                let err: JsonRpcError = serde_json::from_value(v).map_err(D::Error::custom)?;
+                (Some(err), true)
+            }
+            None => (None, false),
+        };
+
+        Ok(JsonRpcFrame {
+            jsonrpc,
+            method,
+            params,
+            id,
+            result,
+            result_present,
+            error,
+            error_present,
+        })
+    }
 }
 
 impl JsonRpcFrame {
-    /// Check if this frame represents a response to an outbound request.
+    /// Whether this frame is a response to an outbound request: no method,
+    /// and a `result` or `error` field was present (even if `result` is null).
     pub fn is_response(&self) -> bool {
-        self.method.is_none() && (self.result.is_some() || self.error.is_some())
+        self.method.is_none() && (self.result_present || self.error_present)
     }
 
-    /// Get the response result, or None if this is not a response or has error.
+    /// The response result value when present (including explicit null),
+    /// otherwise None.
     pub fn response_result(&self) -> Option<&Value> {
-        self.result.as_ref()
+        if self.result_present {
+            self.result.as_ref()
+        } else {
+            None
+        }
     }
 
-    /// Get the request method (for incoming client requests).
+    /// The request method (for incoming client requests).
     pub fn request_method(&self) -> Option<&str> {
         self.method.as_deref()
     }
 
-    /// Get the request params (for incoming client requests).
+    /// The request params (for incoming client requests).
     pub fn request_params(&self) -> Option<&Value> {
         self.params.as_ref()
     }
@@ -475,7 +532,8 @@ mod tests {
 
     #[test]
     fn frame_parses_error_response() {
-        let json = r#"{"jsonrpc":"2.0","id":"zc-out-3","error":{"code":-32601,"message":"not found"}}"#;
+        let json =
+            r#"{"jsonrpc":"2.0","id":"zc-out-3","error":{"code":-32601,"message":"not found"}}"#;
         let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
 
         assert!(frame.is_response());
@@ -527,16 +585,14 @@ mod tests {
     }
 
     #[test]
-    fn frame_explicit_null_result_treated_as_absent_by_serde() {
-        // With #[serde(default)] on Option<Value>, JSON null is treated as absent,
-        // so the field becomes None. This means a response with result:null is NOT
-        // detected as a response by is_response(). In practice our tools never
-        // return null results so this edge case doesn't matter operationally.
+    fn frame_explicit_null_result_is_valid_response() {
         let json = r#"{"jsonrpc":"2.0","id":"x","result":null}"#;
         let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
 
-        assert!(frame.result.is_none());  // null -> default(None)
-        assert!(!frame.is_response());     // no Some(result), no error => not response
+        assert!(frame.result_present);
+        assert_eq!(frame.result, Some(Value::Null));
+        assert!(frame.is_response());
+        assert_eq!(frame.response_result(), Some(&Value::Null));
     }
 
     #[test]
@@ -591,14 +647,14 @@ mod tests {
     }
 
     #[test]
-    fn frame_result_null_not_detected_as_response() {
-        // With #[serde(default)] on Option<Value>, explicit JSON null becomes None,
-        // so a response with result:null is NOT recognized as a response.
+    fn frame_result_null_is_detected_as_response() {
         let json = r#"{"jsonrpc":"2.0","id":"k","result":null}"#;
         let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
 
-        assert!(!frame.is_response());
-        assert!(frame.result.is_none());
+        assert!(frame.is_response());
+        assert!(frame.result_present);
+        assert_eq!(frame.result, Some(Value::Null));
+        assert_eq!(frame.response_result(), Some(&Value::Null));
     }
 
     #[test]

@@ -477,6 +477,11 @@ impl RpcDispatcher {
         self.tui_id = tui_id;
     }
 
+    #[cfg(test)]
+    pub fn rpc_for_test(&self) -> Arc<RpcOutbound> {
+        Arc::clone(&self.rpc)
+    }
+
     /// Construct a pre-authenticated dispatcher sharing the same context and
     /// RPC outbound as `self`. Used to run long-lived methods (e.g.
     /// `session/prompt`) in a spawned task so the read loop remains live.
@@ -563,23 +568,10 @@ impl RpcDispatcher {
     }
 
     async fn process_line(&mut self, line: &str) {
-        // Log incoming frame for debugging response routing issues
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_category(::zeroclaw_log::EventCategory::Agent)
-                .with_attrs(serde_json::json!({
-                    "line_len": line.len(),
-                    "preview": &line[..line.len().min(200)],
-                })),
-            "Incoming RPC frame"
-        );
-
         // First, try to parse as a generic frame to handle both requests and responses.
         let frame: JsonRpcFrame = match serde_json::from_str(line) {
             Ok(f) => f,
             Err(e) => {
-                // Try parsing as plain Value to see what we actually got
                 if let Ok(value) = serde_json::from_str::<Value>(line) {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -587,13 +579,13 @@ impl RpcDispatcher {
                             .with_category(::zeroclaw_log::EventCategory::Agent)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(serde_json::json!({
-                                "raw_value": value,
+                                "line_len": line.len(),
                                 "has_method": value.get("method").is_some(),
                                 "has_result": value.get("result").is_some(),
                                 "has_error": value.get("error").is_some(),
-                                "id": value.get("id"),
+                                "has_id": value.get("id").is_some(),
                             })),
-                        "Failed to parse as JsonRpcFrame - raw contents logged"
+                        "Failed to parse as JsonRpcFrame"
                     );
                 }
                 self.send_error(Value::Null, PARSE_ERROR, &format!("Parse error: {e}"))
@@ -620,18 +612,6 @@ impl RpcDispatcher {
                 Value::String(s) => s.clone(),
                 _ => id_value.to_string(),
             };
-
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_attrs(serde_json::json!({
-                        "id": id_str,
-                        "has_result": frame.result.is_some(),
-                        "has_error": frame.error.is_some(),
-                    })),
-                "Dispatching response to pending request"
-            );
 
             self.rpc.dispatch_response(
                 &id_str,
@@ -8553,5 +8533,75 @@ mod tests {
             1,
             "session_end must fire when a real session is closed"
         );
+    }
+
+    fn make_bidi_test_dispatcher() -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(zeroclaw_config::schema::Config::default(), sessions);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-bidi:pid=1".into());
+        dispatcher.authenticated = true;
+        (dispatcher, rx)
+    }
+
+    #[tokio::test]
+    async fn process_line_routes_success_response_to_pending_caller() {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        let rpc = dispatcher.rpc_for_test();
+
+        let waiter =
+            zeroclaw_spawn::spawn!(async move { rpc.request("ask_user", json!({"q": "?"})).await });
+
+        let _sent = rx.recv().await.expect("outbound request sent");
+        let expected_id = format!("{}0", zeroclaw_api::jsonrpc::OUTBOUND_ID_PREFIX);
+        let frame =
+            format!(r#"{{"jsonrpc":"2.0","id":"{expected_id}","result":{{"answer":"blue"}}}}"#);
+        dispatcher.process_line_for_test(&frame).await;
+
+        let out = waiter.await.expect("waiter task join").expect("rpc result");
+        assert_eq!(out, json!({"answer": "blue"}));
+    }
+
+    #[tokio::test]
+    async fn process_line_routes_error_response_to_pending_caller() {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        let rpc = dispatcher.rpc_for_test();
+
+        let waiter = zeroclaw_spawn::spawn!(async move { rpc.request("poll", json!({})).await });
+
+        let _sent = rx.recv().await.expect("outbound request sent");
+        let expected_id = format!("{}0", zeroclaw_api::jsonrpc::OUTBOUND_ID_PREFIX);
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":"{expected_id}","error":{{"code":-32601,"message":"nope"}}}}"#
+        );
+        dispatcher.process_line_for_test(&frame).await;
+
+        let err = waiter
+            .await
+            .expect("waiter task join")
+            .expect_err("rpc error");
+        assert_eq!(err.code, -32601);
+        assert_eq!(err.message, "nope");
+    }
+
+    #[tokio::test]
+    async fn process_line_routes_explicit_null_result_response() {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        let rpc = dispatcher.rpc_for_test();
+
+        let waiter =
+            zeroclaw_spawn::spawn!(
+                async move { rpc.request("ask_user", json!({"q": "skip"})).await }
+            );
+
+        let _sent = rx.recv().await.expect("outbound request sent");
+        let expected_id = format!("{}0", zeroclaw_api::jsonrpc::OUTBOUND_ID_PREFIX);
+        let frame = format!(r#"{{"jsonrpc":"2.0","id":"{expected_id}","result":null}}"#);
+        dispatcher.process_line_for_test(&frame).await;
+
+        let out = waiter.await.expect("waiter task join").expect("rpc result");
+        assert_eq!(out, Value::Null);
     }
 }
