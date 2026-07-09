@@ -8,6 +8,21 @@ pub enum WebSearchProviderRoute {
     Bocha,
 }
 
+/// Structured search status: distinguishes "provider failure" from "no results".
+///
+/// The first slice (issue #5316) only fills `Blocked` on the HTTP failure
+/// path; `Timeout`/`Empty`/`ParseError` are reserved for later slices. The
+/// enum is defined once with all variants so later tasks can use it without
+/// changing every match site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchStatus {
+    Ok,
+    Blocked,
+    Timeout,
+    Empty,
+    ParseError,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WebSearchProviderResolution {
     pub route: WebSearchProviderRoute,
@@ -180,5 +195,16 @@ mod tests {
         let r = resolve_web_search_provider("Tavily-Search");
         assert_eq!(r.route, WebSearchProviderRoute::Tavily);
         assert!(!r.used_fallback);
+    }
+
+    #[test]
+    fn search_status_variants_exist() {
+        // 首切片主要用 Blocked；其余变体为后续切片（Empty 检测、timeout 归类）预留，
+        // 但必须在首个 PR 就定义，避免后续改 enum 破坏 match。
+        let _ = SearchStatus::Ok;
+        let _ = SearchStatus::Blocked;
+        let _ = SearchStatus::Timeout;
+        let _ = SearchStatus::Empty;
+        let _ = SearchStatus::ParseError;
     }
 }
