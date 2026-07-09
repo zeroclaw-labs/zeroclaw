@@ -36,6 +36,7 @@ const APPROVAL_OVERLAY_HEIGHT: u16 = 7;
 /// How often the cwd line re-polls the daemon for the current git branch.
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const CANCEL_WATCHDOG: Duration = Duration::from_secs(30);
+const COPY_FEEDBACK_TTL: Duration = Duration::from_secs(1);
 
 // ── Chat pane (tab mode) ─────────────────────────────────────────
 
@@ -2318,8 +2319,11 @@ impl Chat {
                         state.clear_transcript_selection();
                         if !region.text.is_empty() {
                             crate::mouse::copy_osc52(&region.text);
-                            if region.kind == CopyHitKind::Code {
-                                state.set_code_copy_feedback(region.rect);
+                            match region.kind {
+                                CopyHitKind::Code => state.set_code_copy_feedback(region.group),
+                                CopyHitKind::Message => {
+                                    state.set_message_copy_feedback(region.rect);
+                                }
                             }
                             state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
                         }
@@ -3507,6 +3511,10 @@ fn message_copy_label() -> String {
     crate::i18n::t("zc-chat-copy-message")
 }
 
+fn message_copied_label() -> String {
+    crate::i18n::t("zc-chat-copy-message-copied")
+}
+
 fn code_copied_label() -> String {
     crate::i18n::t("zc-chat-copy-code-copied")
 }
@@ -3548,6 +3556,7 @@ fn copy_region(
     scroll: u16,
     body: Rect,
     text: &str,
+    group: usize,
 ) -> Option<CopyHitRegion> {
     if global_row < scroll || global_row >= scroll + body.height {
         return None;
@@ -3556,6 +3565,7 @@ fn copy_region(
         rect: Rect::new(body.x + col, body.y + (global_row - scroll), cells, 1),
         text: text.to_string(),
         kind: CopyHitKind::Code,
+        group,
     })
 }
 
@@ -3592,6 +3602,18 @@ fn code_copy_feedback_rect(label: &str, anchor: Rect) -> Option<Rect> {
     Some(Rect::new(x, anchor.y, cells, 1))
 }
 
+fn message_copy_feedback_rect(label: &str, anchor: Rect) -> Option<Rect> {
+    use unicode_width::UnicodeWidthStr;
+
+    let cells = UnicodeWidthStr::width(label) as u16;
+    if cells == 0 || anchor.height == 0 {
+        return None;
+    }
+    let center = anchor.x.saturating_add(anchor.width / 2);
+    let x = center.saturating_sub(cells / 2);
+    Some(Rect::new(x, anchor.y, cells, 1))
+}
+
 fn borrow_line<'a>(line: &'a Line<'static>) -> Line<'a> {
     let spans: Vec<Span<'a>> = line
         .spans
@@ -3607,6 +3629,7 @@ fn borrow_line<'a>(line: &'a Line<'static>) -> Line<'a> {
 
 fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     state.refresh_title_hit_rects(area);
+    state.expire_copy_feedback();
 
     // Width must be computed before cache rebuild — table column budgets
     // depend on it, and a width change invalidates cached layouts.
@@ -3769,6 +3792,19 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
 }
 
 fn render_message_copy_overlay(f: &mut Frame, state: &ChatState, body: Rect) {
+    if let Some(CopyFeedback::Message { rect, .. }) = state.copy_feedback {
+        f.render_widget(Clear, rect);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                message_copied_label(),
+                theme::success_style().add_modifier(Modifier::BOLD),
+            )))
+            .alignment(Alignment::Center),
+            rect,
+        );
+        return;
+    }
+
     let Some(region) = state.message_copy_region(body) else {
         return;
     };
@@ -3784,18 +3820,27 @@ fn render_message_copy_overlay(f: &mut Frame, state: &ChatState, body: Rect) {
 }
 
 fn render_code_copy_feedback(f: &mut Frame, state: &ChatState) {
-    let Some(rect) = state.code_copy_feedback_rect else {
+    let Some(CopyFeedback::Code { group, .. }) = state.copy_feedback else {
         return;
     };
-    f.render_widget(Clear, rect);
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            code_copied_label(),
-            theme::success_style().add_modifier(Modifier::BOLD),
-        )))
-        .alignment(Alignment::Center),
-        rect,
-    );
+    for region in state
+        .copy_hit_regions
+        .iter()
+        .filter(|r| r.kind == CopyHitKind::Code && r.group == group)
+    {
+        let Some(rect) = code_copy_feedback_rect(&code_copied_label(), region.rect) else {
+            continue;
+        };
+        f.render_widget(Clear, rect);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                code_copied_label(),
+                theme::success_style().add_modifier(Modifier::BOLD),
+            )))
+            .alignment(Alignment::Center),
+            rect,
+        );
+    }
 }
 
 fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
@@ -4721,6 +4766,13 @@ struct CopyHitRegion {
     rect: Rect,
     text: String,
     kind: CopyHitKind,
+    group: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyFeedback {
+    Code { group: usize, shown_at: Instant },
+    Message { rect: Rect, shown_at: Instant },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4792,12 +4844,10 @@ pub struct ChatState {
     mouse_down_entry: Option<usize>,
     /// Per-entry hit rects from the last draw.
     entry_rects: Vec<(usize, ratatui::layout::Rect)>,
-    /// Clickable `[Copy]` code-fence labels from the last draw.
+    /// Clickable `[Copy]` labels from the last draw.
     copy_hit_regions: Vec<CopyHitRegion>,
-    /// Temporary `[Copied]` overlay for code-fence copy labels. Message-copy
-    /// feedback is visible because its transient overlay disappears; code-copy
-    /// labels are persistent, so they need their own clicked-state cue.
-    code_copy_feedback_rect: Option<ratatui::layout::Rect>,
+    /// Temporary `[Copied]` overlay for copy labels.
+    copy_feedback: Option<CopyFeedback>,
     /// Clickable provider/model title spans from the last draw.
     title_hit_rects: Vec<TitleHitRect>,
     /// Scrollbar track rect from the last draw.
@@ -4904,7 +4954,7 @@ impl ChatState {
             mouse_down_entry: None,
             entry_rects: Vec::new(),
             copy_hit_regions: Vec::new(),
-            code_copy_feedback_rect: None,
+            copy_feedback: None,
             title_hit_rects: Vec::new(),
             scrollbar_track_rect: None,
             scrollbar_drag: None,
@@ -4951,9 +5001,13 @@ impl ChatState {
     }
 
     fn clear_mouse_highlight(&mut self) {
-        if self.highlighted_entry.is_some() || self.mouse_down_entry.is_some() {
+        if self.highlighted_entry.is_some()
+            || self.mouse_down_entry.is_some()
+            || self.copy_feedback.is_some()
+        {
             self.highlighted_entry = None;
             self.mouse_down_entry = None;
+            self.copy_feedback = None;
             self.mark_dirty_full();
         }
     }
@@ -4964,12 +5018,14 @@ impl ChatState {
             || self.browse_cursor.is_some()
             || self.browse_anchor.is_some()
             || !self.browse_multi.is_empty()
+            || self.copy_feedback.is_some()
         {
             self.highlighted_entry = None;
             self.mouse_down_entry = None;
             self.browse_cursor = None;
             self.browse_anchor = None;
             self.browse_multi.clear();
+            self.copy_feedback = None;
             self.mark_dirty_full();
         }
     }
@@ -5314,18 +5370,35 @@ impl ChatState {
         let copy_lbl = " [Copy] ";
         let mut regions: Vec<CopyHitRegion> = Vec::new();
         let (lines, mut screen_cursor) = self.visible_copy_scan(scroll, body.height);
-        let mut pending: Option<(u16, u16, u16, Option<String>, String)> = None;
+        let mut pending: Option<(u16, u16, u16, usize, Option<String>, String)> = None;
         for line in &lines {
             let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
             if first.starts_with('\u{250c}') {
                 let lang = header_fence_lang(line);
-                pending = label_cells(line, copy_lbl)
-                    .map(|(col, cells)| (screen_cursor, col, cells, lang, String::new()));
+                pending = label_cells(line, copy_lbl).map(|(col, cells)| {
+                    (
+                        screen_cursor,
+                        col,
+                        cells,
+                        screen_cursor as usize,
+                        lang,
+                        String::new(),
+                    )
+                });
             } else if first.starts_with('\u{2514}') {
-                if let Some((header_row, header_col, header_cells, lang, acc)) = pending.take() {
+                if let Some((header_row, header_col, header_cells, group, lang, acc)) =
+                    pending.take()
+                {
                     let text = fenced_text(lang.as_deref(), &acc);
-                    if let Some(r) =
-                        copy_region(header_row, header_col, header_cells, scroll, body, &text)
+                    if let Some(r) = copy_region(
+                        header_row,
+                        header_col,
+                        header_cells,
+                        scroll,
+                        body,
+                        &text,
+                        group,
+                    )
                     {
                         regions.push(r);
                     }
@@ -5337,12 +5410,13 @@ impl ChatState {
                             scroll,
                             body,
                             &text,
+                            group,
                         )
                     {
                         regions.push(r);
                     }
                 }
-            } else if let Some((_, _, _, _, acc)) = pending.as_mut() {
+            } else if let Some((_, _, _, _, _, acc)) = pending.as_mut() {
                 let full: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
                 let body_text = full.strip_prefix("  ").unwrap_or(&full).to_string();
                 if !acc.is_empty() {
@@ -5374,6 +5448,7 @@ impl ChatState {
             rect: centered_message_copy_rect(&label, *rect, body)?,
             text,
             kind: CopyHitKind::Message,
+            group: idx,
         })
     }
 
@@ -5880,14 +5955,42 @@ impl ChatState {
         self.mark_dirty_full();
     }
 
-    fn set_code_copy_feedback(&mut self, anchor: Rect) {
-        self.code_copy_feedback_rect = code_copy_feedback_rect(&code_copied_label(), anchor);
+    fn set_code_copy_feedback(&mut self, group: usize) {
+        self.copy_feedback = Some(CopyFeedback::Code {
+            group,
+            shown_at: Instant::now(),
+        });
+        self.mark_dirty_full();
+    }
+
+    fn set_message_copy_feedback(&mut self, anchor: Rect) {
+        self.copy_feedback =
+            message_copy_feedback_rect(&message_copied_label(), anchor).map(|rect| {
+                CopyFeedback::Message {
+                    rect,
+                    shown_at: Instant::now(),
+                }
+            });
         self.mark_dirty_full();
     }
 
     /// Drop the active info-bar message (on submit, inject, or turn start).
     pub fn clear_info_notice(&mut self) {
-        if self.info_message.take().is_some() || self.code_copy_feedback_rect.take().is_some() {
+        if self.info_message.take().is_some() || self.copy_feedback.take().is_some() {
+            self.mark_dirty_full();
+        }
+    }
+
+    fn expire_copy_feedback(&mut self) {
+        let expired = match self.copy_feedback {
+            Some(CopyFeedback::Code { shown_at, .. })
+            | Some(CopyFeedback::Message { shown_at, .. }) => {
+                shown_at.elapsed() >= COPY_FEEDBACK_TTL
+            }
+            None => false,
+        };
+        if expired {
+            self.copy_feedback = None;
             self.mark_dirty_full();
         }
     }
@@ -6097,6 +6200,9 @@ impl ChatState {
         self.streaming_text.clear();
         self.streaming_thought.clear();
         self.cached_lines.clear();
+        self.entry_rects.clear();
+        self.copy_hit_regions.clear();
+        self.copy_feedback = None;
         self.dirty = LinesDirty::Full;
         self.cached_entry_count = 0;
         self.cached_render_start = 0;
@@ -7584,6 +7690,10 @@ mod tests {
             state.highlighted_entry, None,
             "copy action should dismiss the transient selection"
         );
+        assert!(
+            matches!(state.copy_feedback, Some(CopyFeedback::Message { .. })),
+            "message copy should leave a transient copied-state cue"
+        );
     }
 
     #[tokio::test]
@@ -7614,12 +7724,23 @@ mod tests {
             })
             .expect("draw chat");
 
-        let copy_rect = state
+        let code_regions: Vec<CopyHitRegion> = state
             .copy_hit_regions
             .iter()
-            .find(|region| region.text == "echo hello")
-            .expect("code copy region should be rendered")
-            .rect;
+            .filter(|region| region.text == "echo hello")
+            .cloned()
+            .collect();
+        assert_eq!(
+            code_regions.len(),
+            2,
+            "top and bottom fence labels should both be copy targets"
+        );
+        assert_eq!(
+            code_regions[0].group, code_regions[1].group,
+            "top and bottom copy targets for one fence should share feedback"
+        );
+        let copy_rect = code_regions[0].rect;
+        let copy_group = code_regions[0].group;
         state.dirty = LinesDirty::Clean;
         chat.phase = ChatPhase::Active(Box::new(state));
 
@@ -7643,10 +7764,10 @@ mod tests {
             state.info_message.as_ref().map(|m| m.text.as_str()),
             Some(crate::i18n::t("zc-chat-copied-clipboard").as_str())
         );
-        assert!(
-            state.code_copy_feedback_rect.is_some(),
-            "code copy should render an in-place copied-state cue"
-        );
+        assert!(matches!(
+            state.copy_feedback,
+            Some(CopyFeedback::Code { group, .. }) if group == copy_group
+        ));
     }
 
     fn authoritative_rows(s: &ChatState, width: u16) -> u16 {
@@ -8905,9 +9026,27 @@ mod tests {
         s.turn_in_flight = true;
         s.enqueue_message("a".to_string(), Vec::new()).unwrap();
         s.queue_paused = true;
+        s.copy_hit_regions.push(CopyHitRegion {
+            rect: Rect::new(1, 1, 6, 1),
+            text: "stale".to_string(),
+            kind: CopyHitKind::Message,
+            group: 0,
+        });
+        s.copy_feedback = Some(CopyFeedback::Message {
+            rect: Rect::new(1, 1, 8, 1),
+            shown_at: Instant::now(),
+        });
         s.reset_for_session("sess-2".to_string(), None);
         assert_eq!(s.queue_len(), 0);
         assert!(!s.queue_paused());
+        assert!(
+            s.copy_hit_regions.is_empty(),
+            "session reset must clear stale copy hit regions"
+        );
+        assert!(
+            s.copy_feedback.is_none(),
+            "session reset must clear stale copy feedback"
+        );
     }
 
     #[test]
