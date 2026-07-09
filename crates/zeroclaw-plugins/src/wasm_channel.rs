@@ -1,8 +1,5 @@
 //! Channel adapter: `WasmChannel` implements `zeroclaw_api::channel::Channel`
 //! backed by the `channel-plugin` component world.
-//!
-//! Warm lifecycle: the store and bindings are created once and held in an async
-//! mutex. `listen` runs a poll-to-push bridge with exponential backoff.
 
 use crate::PluginPermission;
 use crate::component::InboundQueue;
@@ -96,14 +93,6 @@ fn build_linker(http: bool) -> Result<Linker<PluginState>> {
 }
 
 impl WasmChannel {
-    /// Compile and instantiate a channel plugin, caching its capabilities and
-    /// the static-identity exports needed by the sync trait methods. The
-    /// permission set decides whether the store and linker expose outbound
-    /// `wasi:http`; without `HttpClient` the channel cannot reach the network.
-    /// The returned channel owns an [`InboundQueue`]; a host-run listener obtains
-    /// its handle via [`WasmChannel::inbound`] and enqueues received traffic for
-    /// the plugin's `poll-message` to drain. `limits` bounds the per-call fuel
-    /// and the memory/table/instance ceilings.
     pub async fn from_wasm(
         alias: impl Into<String>,
         wasm_path: &Path,
@@ -815,11 +804,6 @@ mod tests {
 
     #[test]
     fn host_enqueued_inbound_reaches_the_drain_handle() {
-        // The inbound contract is host-fed: a listener the orchestrator owns
-        // (vendor tunnel, webhook) enqueues through the handle from
-        // `WasmChannel::inbound()`, and the plugin drains the same queue. Prove
-        // the producer side here so the transport is not just asserted at the
-        // queue type but at the handle a host listener actually holds.
         let queue = crate::component::InboundQueue::default();
         let listener_handle = queue.clone();
         assert_eq!(queue.pending(), 0, "starts empty");
