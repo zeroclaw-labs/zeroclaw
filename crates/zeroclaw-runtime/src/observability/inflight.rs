@@ -91,6 +91,12 @@ impl Default for InFlightObserver {
     }
 }
 
+impl InFlightObserver {
+    fn with_registry(reg: InFlightRegistry) -> Self {
+        Self { registry: reg }
+    }
+}
+
 impl Observer for InFlightObserver {
     fn record_event(&self, event: &ObserverEvent) {
         match event {
@@ -173,9 +179,8 @@ mod tests {
 
     #[test]
     fn observer_maps_start_and_end() {
-        reset_in_flight_registry();
-        let obs = InFlightObserver::default();
-        let reg = in_flight_registry();
+        let reg = InFlightRegistry::default();
+        let obs = InFlightObserver::with_registry(reg.clone());
 
         obs.record_event(&ObserverEvent::AgentStart {
             model_provider: "openai".into(),
@@ -201,9 +206,8 @@ mod tests {
 
     #[test]
     fn observer_ignores_missing_alias() {
-        reset_in_flight_registry();
-        let obs = InFlightObserver::default();
-        let reg = in_flight_registry();
+        let reg = InFlightRegistry::default();
+        let obs = InFlightObserver::with_registry(reg.clone());
 
         obs.record_event(&ObserverEvent::AgentStart {
             model_provider: "openai".into(),
@@ -217,16 +221,13 @@ mod tests {
 
     #[test]
     fn observer_ignores_unrelated_events() {
-        reset_in_flight_registry();
-        let obs = InFlightObserver::default();
-        let reg = in_flight_registry();
+        let reg = InFlightRegistry::default();
+        let obs = InFlightObserver::with_registry(reg.clone());
         reg.inc("z");
 
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_event(&ObserverEvent::TurnComplete);
         assert_eq!(reg.get("z"), 1);
-
-        reset_in_flight_registry();
     }
 
     #[test]
@@ -236,5 +237,6 @@ mod tests {
         let reg2 = in_flight_registry();
         reg1.inc("shared");
         assert_eq!(reg2.get("shared"), 1);
+        reset_in_flight_registry();
     }
 }
