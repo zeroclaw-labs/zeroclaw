@@ -5480,6 +5480,19 @@ async fn process_channel_message_body(
     });
     let loop_knobs = LoopKnobs::default();
     let turn_id = uuid::Uuid::new_v4().to_string();
+    // Bracket the channel turn with AgentStart/AgentEnd so lifecycle events
+    // reach observers (and, via the broadcast hook, /api/events and
+    // /api/events/history) for channel-originated turns — mirroring the CLI
+    // `run` and `Agent::turn_streamed` entry points. Emitted once per logical
+    // turn, before the model-switch retry loop; a mid-turn `/model` switch
+    // additionally emits its own re-attributing AgentStart below.
+    ctx.observer.record_event(&ObserverEvent::AgentStart {
+        model_provider: route.model_provider.clone(),
+        model: route.model.clone(),
+        channel: Some(msg.channel.to_string()),
+        agent_alias: Some(ctx.agent_alias.to_string()),
+        turn_id: Some(turn_id.clone()),
+    });
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
             let thread_scope_id = msg
@@ -5702,6 +5715,32 @@ async fn process_channel_message_body(
         (llm_result, fb)
     })
     .await;
+
+    // Close the turn bracket. This single convergence point covers every
+    // exit of the loop above — success, LLM/tool error, timeout, and
+    // cancellation — so a cancelled turn can never leave an unmatched
+    // AgentStart. `route` is read after the loop so a mid-turn model switch
+    // reports the final (actually-used) provider/model, consistent with the
+    // re-attributing AgentStart emitted on switch.
+    let turn_tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
+        let usage = ctx.snapshot_turn_usage();
+        (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(
+            zeroclaw_api::observability_traits::TurnTokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            },
+        )
+    });
+    ctx.observer.record_event(&ObserverEvent::AgentEnd {
+        model_provider: route.model_provider.clone(),
+        model: route.model.clone(),
+        duration: llm_call_start.elapsed(),
+        tokens_used: turn_tokens_used,
+        cost_usd: None,
+        channel: Some(msg.channel.to_string()),
+        agent_alias: Some(ctx.agent_alias.to_string()),
+        turn_id: Some(turn_id.clone()),
+    });
 
     // Drop all senders so updater tasks can exit (rx.recv() returns None).
     ::zeroclaw_log::record!(
@@ -13581,6 +13620,26 @@ api_key = "anthropic-key"
         model_provider_ref: &str,
         hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
     ) -> Arc<ChannelRuntimeContext> {
+        test_runtime_ctx_with_observer(
+            channel,
+            model_provider,
+            prompt_config,
+            agent_cfg,
+            model_provider_ref,
+            hooks,
+            Arc::new(NoopObserver),
+        )
+    }
+
+    fn test_runtime_ctx_with_observer(
+        channel: Arc<dyn Channel>,
+        model_provider: Arc<dyn ModelProvider>,
+        prompt_config: zeroclaw_config::schema::Config,
+        agent_cfg: zeroclaw_config::schema::AliasedAgentConfig,
+        model_provider_ref: &str,
+        hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
+        observer: Arc<dyn Observer>,
+    ) -> Arc<ChannelRuntimeContext> {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
@@ -13599,7 +13658,7 @@ api_key = "anthropic-key"
                 ),
             ),
             tools_registry: Arc::new(vec![]),
-            observer: Arc::new(NoopObserver),
+            observer,
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
@@ -13724,6 +13783,276 @@ api_key = "anthropic-key"
                 "ok".to_string()
             )]
         );
+    }
+
+    /// Serializes tests that interact with the process-wide model-switch
+    /// request (`MODEL_SWITCH_REQUEST` in zeroclaw-runtime's agent loop).
+    /// While a pending request exists, ANY concurrently running
+    /// `process_channel_message` turn can observe it, short-circuit to the
+    /// switch handler, and clear it — so the test that sets it AND tests
+    /// whose assertions are sensitive to an unexpected switch retry must
+    /// hold this guard. `tokio::sync::Mutex` because it is held across
+    /// awaits; the `OnceLock` wrapper gives a `'static` initializer in a
+    /// `static` context without `lazy_static`.
+    static MODEL_SWITCH_TEST_GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    fn model_switch_test_guard() -> &'static tokio::sync::Mutex<()> {
+        MODEL_SWITCH_TEST_GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    /// Observer that records every event, for turn-lifecycle assertions.
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: std::sync::Mutex<Vec<ObserverEvent>>,
+    }
+
+    impl Observer for RecordingObserver {
+        fn record_event(&self, event: &ObserverEvent) {
+            self.events.lock().unwrap().push(event.clone());
+        }
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn flush(&self) {}
+    }
+
+    /// Provider stub that cancels the turn's `CancellationToken` from inside
+    /// the LLM call and then parks forever, so the orchestrator's
+    /// `tokio::select!` deterministically takes the cancelled arm mid-turn.
+    struct CancelMidTurnModelProvider {
+        token: CancellationToken,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CancelMidTurnModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.token.cancel();
+            std::future::pending::<()>().await;
+            unreachable!("parked future never resumes")
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.token.cancel();
+            std::future::pending::<()>().await;
+            unreachable!("parked future never resumes")
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for CancelMidTurnModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "CancelMidTurnModelProvider"
+        }
+    }
+
+    fn lifecycle_bracket_snapshot(
+        events: &[ObserverEvent],
+    ) -> (
+        Vec<(Option<String>, Option<String>, Option<String>)>,
+        Vec<(Option<String>, Option<String>, Option<String>)>,
+    ) {
+        let starts = events
+            .iter()
+            .filter_map(|e| match e {
+                ObserverEvent::AgentStart {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => Some((channel.clone(), agent_alias.clone(), turn_id.clone())),
+                _ => None,
+            })
+            .collect();
+        let ends = events
+            .iter()
+            .filter_map(|e| match e {
+                ObserverEvent::AgentEnd {
+                    channel,
+                    agent_alias,
+                    turn_id,
+                    ..
+                } => Some((channel.clone(), agent_alias.clone(), turn_id.clone())),
+                _ => None,
+            })
+            .collect();
+        (starts, ends)
+    }
+
+    /// Regression guard for the fix where channel-originated turns (Telegram,
+    /// Discord, ...) never emitted `AgentStart`/`AgentEnd`, so
+    /// `/api/events/history` showed `llm_request` frames but no turn
+    /// lifecycle brackets. A successful turn must emit exactly one
+    /// `AgentStart` (before the LLM request) and one `AgentEnd` (last),
+    /// all sharing one `turn_id` and carrying the channel + agent alias.
+    #[tokio::test]
+    async fn process_channel_message_brackets_turn_with_agent_start_and_agent_end() {
+        // The exactly-one-AgentStart assertion is sensitive to a leaked
+        // process-wide model-switch request (the switch retry emits an
+        // extra re-attributing AgentStart), so serialize on the guard.
+        let _guard = model_switch_test_guard().lock().await;
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let observer = Arc::new(RecordingObserver::default());
+
+        let runtime_ctx = test_runtime_ctx_with_observer(
+            channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            observer.clone(),
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let events = observer.events.lock().unwrap();
+        let (starts, ends) = lifecycle_bracket_snapshot(&events);
+        assert_eq!(starts.len(), 1, "exactly one AgentStart, got {events:?}");
+        assert_eq!(ends.len(), 1, "exactly one AgentEnd, got {events:?}");
+
+        let start_pos = events
+            .iter()
+            .position(|e| matches!(e, ObserverEvent::AgentStart { .. }))
+            .unwrap();
+        let llm_request_pos = events
+            .iter()
+            .position(|e| matches!(e, ObserverEvent::LlmRequest { .. }))
+            .expect("turn should emit an LlmRequest");
+        assert!(
+            start_pos < llm_request_pos,
+            "AgentStart must precede the LlmRequest: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(ObserverEvent::AgentEnd { .. })),
+            "AgentEnd must be the last event: {events:?}"
+        );
+
+        let (start_channel, start_alias, start_turn_id) = starts[0].clone();
+        let (end_channel, end_alias, end_turn_id) = ends[0].clone();
+        assert_eq!(start_channel.as_deref(), Some("test-channel"));
+        assert_eq!(end_channel.as_deref(), Some("test-channel"));
+        assert_eq!(start_alias.as_deref(), Some("test-agent"));
+        assert_eq!(end_alias.as_deref(), Some("test-agent"));
+        assert!(start_turn_id.is_some(), "AgentStart must carry a turn_id");
+        assert_eq!(start_turn_id, end_turn_id, "brackets must share a turn_id");
+
+        let llm_request_turn_id = events.iter().find_map(|e| match e {
+            ObserverEvent::LlmRequest { turn_id, .. } => Some(turn_id.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            llm_request_turn_id,
+            Some(start_turn_id),
+            "inner LlmRequest must share the brackets' turn_id"
+        );
+    }
+
+    /// An erroring LLM turn must still close its bracket: one `AgentStart`
+    /// and one `AgentEnd`, same `turn_id`.
+    #[tokio::test]
+    async fn process_channel_message_emits_brackets_when_llm_errors() {
+        // See the guard note on the success-turn bracket test.
+        let _guard = model_switch_test_guard().lock().await;
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let observer = Arc::new(RecordingObserver::default());
+
+        let runtime_ctx = test_runtime_ctx_with_observer(
+            channel,
+            Arc::new(FormatErrorModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            observer.clone(),
+        );
+
+        let mut msg = message_sent_hook_test_message();
+        msg.content = "trigger format error".to_string();
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        let events = observer.events.lock().unwrap();
+        let (starts, ends) = lifecycle_bracket_snapshot(&events);
+        assert_eq!(starts.len(), 1, "exactly one AgentStart, got {events:?}");
+        assert_eq!(ends.len(), 1, "exactly one AgentEnd, got {events:?}");
+        assert_eq!(
+            starts[0].2, ends[0].2,
+            "brackets must share a turn_id even on error"
+        );
+        assert!(starts[0].2.is_some(), "brackets must carry a turn_id");
+    }
+
+    /// A turn cancelled mid-flight (interrupt-on-new-message) must still
+    /// close its bracket — the ZeroHome-critical guarantee that a cancelled
+    /// turn cannot wedge an "agent in flight" indicator with an unmatched
+    /// `AgentStart`.
+    #[tokio::test]
+    async fn process_channel_message_emits_brackets_when_cancelled_mid_turn() {
+        // See the guard note on the success-turn bracket test.
+        let _guard = model_switch_test_guard().lock().await;
+        let token = CancellationToken::new();
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let observer = Arc::new(RecordingObserver::default());
+
+        let runtime_ctx = test_runtime_ctx_with_observer(
+            channel,
+            Arc::new(CancelMidTurnModelProvider {
+                token: token.clone(),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            observer.clone(),
+        );
+
+        process_channel_message(runtime_ctx, message_sent_hook_test_message(), token).await;
+
+        let events = observer.events.lock().unwrap();
+        let (starts, ends) = lifecycle_bracket_snapshot(&events);
+        assert_eq!(
+            starts.len(),
+            1,
+            "cancelled turn must still emit AgentStart, got {events:?}"
+        );
+        assert_eq!(
+            ends.len(),
+            1,
+            "cancelled turn must still emit AgentEnd, got {events:?}"
+        );
+        assert_eq!(
+            starts[0].2, ends[0].2,
+            "brackets must share a turn_id even when cancelled"
+        );
+        assert!(starts[0].2.is_some(), "brackets must carry a turn_id");
     }
 
     #[tokio::test]
@@ -16071,15 +16400,7 @@ BTC is currently around $65,000 based on latest tool output."#
     async fn process_channel_message_persists_model_switch_with_route_credential() {
         // Serialize on the process-wide model-switch state so this test
         // doesn't race other tests that also touch the same static.
-        // `tokio::sync::Mutex` is held across the awaits below; the
-        // `OnceLock` wrapper gives us a `'static` initializer in a
-        // `static` context without `lazy_static`.
-        static MODEL_SWITCH_TEST_GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> =
-            std::sync::OnceLock::new();
-        let _guard = MODEL_SWITCH_TEST_GUARD
-            .get_or_init(|| tokio::sync::Mutex::new(()))
-            .lock()
-            .await;
+        let _guard = model_switch_test_guard().lock().await;
         clear_model_switch_request();
 
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
@@ -21672,6 +21993,13 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[tokio::test]
     async fn process_channel_message_persists_image_payload_verbatim() {
+        // `calls.len() == 1` below is sensitive to a leaked process-wide
+        // model-switch request (a pending request makes this turn
+        // short-circuit and retry, doubling the provider calls), so
+        // serialize on the shared guard. Observed colliding with
+        // `process_channel_message_persists_model_switch_with_route_credential`
+        // in parallel runs.
+        let _guard = model_switch_test_guard().lock().await;
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 

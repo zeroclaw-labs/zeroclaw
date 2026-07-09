@@ -909,11 +909,13 @@ pub use super::tool_execution::{ToolExecutionOutcome, should_execute_tools_in_pa
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
 /// `agent_alias`, when the caller has resolved one, is threaded onto the
-/// inner `ToolLoop` so lifecycle observer events (llm_request, llm_response,
-/// tool_call_start, tool_call) carry the full `(channel, agent_alias,
-/// turn_id)` correlation triple that observer consumers (Prometheus, OTel,
-/// the gateway `/api/events` stream) rely on for per-agent attribution.
-/// `None` opts out for callers without a resolved alias (tests, benches).
+/// turn's `AgentStart`/`AgentEnd` brackets and onto the inner `ToolLoop`, so
+/// every lifecycle observer event of the turn (agent_start, llm_request,
+/// llm_response, tool_call_start, tool_call, agent_end) carries the full
+/// `(channel, agent_alias, turn_id)` correlation triple that observer
+/// consumers (Prometheus, OTel, the gateway `/api/events` stream) rely on for
+/// per-agent attribution. `None` opts out for callers without a resolved
+/// alias (tests, benches).
 #[allow(clippy::too_many_arguments)]
 pub async fn agent_turn(
     model_provider: &dyn ModelProvider,
@@ -943,7 +945,21 @@ pub async fn agent_turn(
     agent_alias: Option<&str>,
 ) -> Result<String> {
     let turn_id = uuid::Uuid::new_v4().to_string();
-    run_tool_call_loop(ToolLoop {
+    let turn_started_at = std::time::Instant::now();
+    // Bracket the turn with AgentStart/AgentEnd so entry points that dispatch
+    // through `agent_turn` (gateway webhook chat via `process_message`, peer
+    // messages) surface turn lifecycle events to observers — mirroring the
+    // CLI `run` and `Agent::turn_streamed` entry points. The brackets carry
+    // the caller's resolved alias, so they agree with the inner events on the
+    // full (channel, agent_alias, turn_id) triple.
+    observer.record_event(&ObserverEvent::AgentStart {
+        model_provider: provider_name.to_string(),
+        model: model.to_string(),
+        channel: Some(channel_name.to_string()),
+        agent_alias: agent_alias.map(str::to_string),
+        turn_id: Some(turn_id.clone()),
+    });
+    let result = run_tool_call_loop(ToolLoop {
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
                 model_provider,
@@ -994,7 +1010,39 @@ pub async fn agent_turn(
         agent_alias,
         turn_id: &turn_id,
     })
-    .await
+    .await;
+    // Snapshot token usage from the task-local cost context when the caller
+    // scoped one around this call (the gateway scopes both
+    // `TOOL_LOOP_TURN_USAGE` and `TOOL_LOOP_COST_TRACKING_CONTEXT` around
+    // `process_message`); unscoped callers report `None`. When this runs
+    // nested inside a parent turn's scoped context (peer-message-as-tool),
+    // `snapshot_turn_usage` prefers the caller-scoped task-local and may
+    // report the parent turn's cumulative usage — pre-existing cost
+    // attribution semantics, kept as-is.
+    let tokens_used = TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(std::clone::Clone::clone)
+        .ok()
+        .flatten()
+        .and_then(|ctx| {
+            let usage = ctx.snapshot_turn_usage();
+            (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(
+                zeroclaw_api::observability_traits::TurnTokenUsage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                },
+            )
+        });
+    observer.record_event(&ObserverEvent::AgentEnd {
+        model_provider: provider_name.to_string(),
+        model: model.to_string(),
+        duration: turn_started_at.elapsed(),
+        tokens_used,
+        cost_usd: None,
+        channel: Some(channel_name.to_string()),
+        agent_alias: agent_alias.map(str::to_string),
+        turn_id: Some(turn_id),
+    });
+    result
 }
 
 // ── Agent Tool-Call Loop ──────────────────────────────────────────────────
@@ -15615,6 +15663,77 @@ Let me check the result."#;
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
 
         let events = capturing.events.lock();
+        assert_all_events_share_turn_id(&events, Some("test-agent"), Some("daemon"));
+    }
+
+    /// `agent_turn` (the `process_message` path: gateway webhook chat and
+    /// peer messages) must bracket every turn with exactly one
+    /// `AgentStart`/`AgentEnd` pair carrying the same `(channel, agent_alias,
+    /// turn_id)` triple as the inner engine events. Regression guard for the
+    /// fix where channel/daemon turns never emitted these lifecycle events,
+    /// so `/api/events/history` had `llm_request` but no
+    /// `agent_start`/`agent_end`.
+    #[tokio::test]
+    async fn agent_turn_brackets_turn_with_agent_start_and_agent_end() {
+        let model_provider = ScriptedModelProvider::from_text_responses(vec!["done"]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let capturing = Arc::new(CapturingObserver::default());
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let result = agent_turn(
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            capturing.as_ref(),
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            "daemon",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            false, // parallel_tools
+            0,     // max_tool_result_chars: disabled for test
+            0,     // context_token_budget: disabled for test
+            None,  // channel
+            TurnOrigin::SubTurn,
+            None,
+            Some("test-agent"),
+        )
+        .await
+        .expect("turn should succeed");
+        assert_eq!(result, "done");
+
+        let events = capturing.events.lock();
+        let starts = events
+            .iter()
+            .filter(|e| matches!(e, ObserverEvent::AgentStart { .. }))
+            .count();
+        let ends = events
+            .iter()
+            .filter(|e| matches!(e, ObserverEvent::AgentEnd { .. }))
+            .count();
+        assert_eq!(starts, 1, "exactly one AgentStart, got {events:?}");
+        assert_eq!(ends, 1, "exactly one AgentEnd, got {events:?}");
+        assert!(
+            matches!(events.first(), Some(ObserverEvent::AgentStart { .. })),
+            "first event must be AgentStart, got {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(ObserverEvent::AgentEnd { .. })),
+            "last event must be AgentEnd, got {events:?}"
+        );
+
+        // The brackets and the inner engine events they wrap must agree on
+        // the full (channel, agent_alias, turn_id) triple — the same
+        // expectation every other bracketed entry point is held to.
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("daemon"));
     }
 
