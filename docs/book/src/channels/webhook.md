@@ -49,7 +49,7 @@ agent access is an open ingress that should not exist in any deployment.
 > **Breaking change.** Deployments that previously ran the listener
 > secretless behind a reverse proxy or bound to a private network must
 > now configure a `secret` in `[channels.webhook.<alias>].secret`.
-> The secretless fallback path is removed — an enabled webhook listener
+> The secretless fallback path is removed: an enabled webhook listener
 > is treated as an unconditional risk that no deployment topology should
 > be exposed to. Operators in this situation should set a `secret` and
 > either keep the listener behind their existing reverse proxy or
