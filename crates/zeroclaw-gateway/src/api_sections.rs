@@ -64,10 +64,14 @@ pub async fn handle_catalog_models(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    let _ = state;
     let local = zeroclaw_runtime::quickstart::model_provider_is_local(&q.model_provider);
+    // Snapshot config so the catalog resolves the alias credential and can reach
+    // the native /models endpoint (surfacing new native-only models that the
+    // models.dev snapshot may not carry yet) instead of silently falling back.
+    let cfg = state.config.read().clone();
     let (models, pricing, live) =
-        zeroclaw_runtime::quickstart::model_catalog(&q.model_provider).await;
+        zeroclaw_runtime::quickstart::model_catalog_with_config(Some(&cfg), &q.model_provider)
+            .await;
     axum::Json(CatalogModelsResult {
         model_provider: q.model_provider,
         models,
@@ -1122,10 +1126,14 @@ pub async fn handle_section_select(
                         .with_path(section_key),
                     );
                 }
-                if let Err(err) =
-                    zeroclaw_config::schema::ensure_bootstrap_files(&workspace_dir).await
+                if let Err(err) = zeroclaw_runtime::agent::personality::seed_default_personality(
+                    &working,
+                    &key,
+                    &workspace_dir,
+                )
+                .await
                 {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": key, "workspace": workspace_dir.display().to_string(), "err": err.to_string()})), "agent workspace scaffolded but bootstrap files seed failed (continuing)");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": key, "workspace": workspace_dir.display().to_string(), "err": err.to_string()})), "agent workspace scaffolded but personality seed failed (continuing)");
                 }
             }
             (format!("{section_key}.{key}"), created)

@@ -34,6 +34,7 @@ use zeroclaw_api::jsonrpc::{
     ACP_PROTOCOL_VERSION, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
 };
 use zeroclaw_api::model_provider::ConversationMessage;
+use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::acp_session_store::AcpSessionStore;
 use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
@@ -1123,6 +1124,20 @@ impl AcpServer {
             .model_provider_for_agent(&restore_alias)
             .and_then(|mp| mp.model.clone())
             .unwrap_or_default();
+
+        // Replay the durable TodoWrite plan so the resuming client's tracker
+        // repopulates without a model round-trip — parity with the daemon RPC
+        // ACP bridge. Best-effort: a load failure or empty plan emits nothing.
+        if let Some(store) = self.store.as_ref() {
+            let entries = store.get_plan(&session_id).unwrap_or_default();
+            if !entries.is_empty()
+                && let Some(notification) =
+                    notification_for_turn_event(&session_id, &TurnEvent::Plan { entries })
+            {
+                self.write_notification(&notification).await;
+            }
+        }
+
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
@@ -1138,7 +1153,6 @@ impl AcpServer {
         );
         Ok(serde_json::json!({}))
     }
-
     /// Handle `session/close` requests (ACP spec §Session Management).
     ///
     /// Closes a session: fires the cancel token to interrupt any in-flight turn,
@@ -1366,6 +1380,10 @@ impl AcpServer {
         // Track streamed text so partial content survives cancellation.
         let mut accumulated_text = String::new();
         let mut tool_call_count: u32 = 0;
+        // Latest whole-list plan emitted this turn (TodoWrite). Persisted
+        // durably after the turn so external ACP clients get the same
+        // resume/restart replay the daemon RPC bridge already provides.
+        let mut latest_plan: Option<Vec<PlanEntry>> = None;
         while let Some(event) = event_rx.recv().await {
             // ACP has no `session/update` shape for token-usage events; the
             // task-local cost tracker records them out-of-band. We DO use the
@@ -1447,6 +1465,11 @@ impl AcpServer {
                 TurnEvent::Chunk { delta } => {
                     accumulated_text.push_str(delta);
                 }
+                TurnEvent::Plan { entries } => {
+                    // Whole-list replace: keep only the latest plan for
+                    // post-turn durable persistence.
+                    latest_plan = Some(entries.clone());
+                }
                 _ => {}
             }
             if let Some(notification) = notification_for_turn_event(&session_id, &event) {
@@ -1527,6 +1550,34 @@ impl AcpServer {
                             "error": detail,
                         })),
                     "Failed to persist turn; session continues in memory"
+                );
+            }
+        }
+
+        // Durably persist the latest TodoWrite plan for this turn so it
+        // replays on session/resume (best-effort; the live emission above
+        // already reached the client). Whole-list replace, including an
+        // empty list (a cleared plan).
+        if let Some(store) = &self.store
+            && let Some(entries) = latest_plan
+        {
+            let store = store.clone();
+            let sid = session_id.clone();
+            let persisted =
+                tokio::task::spawn_blocking(move || store.set_plan(&sid, &entries)).await;
+            let error = match persisted {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(join) => Some(join.to_string()),
+            };
+            if let Some(detail) = error {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Channel)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({ "error": detail })),
+                    "Failed to persist TodoWrite plan; session continues in memory"
                 );
             }
         }
@@ -1996,7 +2047,6 @@ fn map_tool_kind(name: &str) -> &'static str {
         | "microsoft365"
         | "model_routing_config"
         | "model_switch"
-        | "pdf_read"
         | "project_intel"
         | "proxy_config"
         | "read_skill"
@@ -2117,6 +2167,21 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
                     "droppedMessages": dropped_messages,
                     "keptTurns": kept_turns,
                     "reason": reason,
+                }
+            }),
+        },
+        TurnEvent::Plan { entries } => JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "plan",
+                    // PlanEntry serializes to the ACP-faithful
+                    // { content, priority, status } shape (+ additive
+                    // activeForm when present, which strict ACP clients
+                    // ignore). Whole-list replace per the ACP plan spec.
+                    "entries": entries,
                 }
             }),
         },
@@ -3184,6 +3249,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn plan_event_projects_to_acp_plan_update() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+
+        let event = TurnEvent::Plan {
+            entries: vec![
+                PlanEntry {
+                    content: "Analyze the existing codebase structure".to_string(),
+                    status: PlanStatus::Pending,
+                    priority: PlanPriority::High,
+                    active_form: None,
+                },
+                PlanEntry {
+                    content: "Create unit tests".to_string(),
+                    status: PlanStatus::InProgress,
+                    priority: PlanPriority::Medium,
+                    active_form: Some("Creating unit tests".to_string()),
+                },
+            ],
+        };
+        let notif =
+            notification_for_turn_event("sess_abc", &event).expect("plan yields a notification");
+        let v = serde_json::to_value(&notif).unwrap();
+
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["sessionId"], "sess_abc");
+        assert_eq!(v["params"]["update"]["sessionUpdate"], "plan");
+        let entries = v["params"]["update"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0]["content"],
+            "Analyze the existing codebase structure"
+        );
+        assert_eq!(entries[0]["priority"], "high");
+        assert_eq!(entries[0]["status"], "pending");
+        // ACP-required fields always present on every entry:
+        assert!(entries[1]["priority"].is_string());
+        assert_eq!(entries[1]["status"], "in_progress");
+        // ZeroClaw extension carried but additive:
+        assert_eq!(entries[1]["activeForm"], "Creating unit tests");
+    }
+
     /// `session/stop` must succeed while a `session/prompt` turn is in flight.
     ///
     /// The session entry lives in the outer map for its entire lifetime.
@@ -3826,11 +3933,63 @@ mod tests {
         // Session must be in memory
         assert!(server.sessions.lock().await.contains_key(session_id));
 
-        // No notifications must have been emitted
+        // A resume with no stored plan must not emit notifications (transcript
+        // is seeded into the agent, not replayed to the client as updates).
         assert!(
             writer_rx.try_recv().is_err(),
-            "session/resume must not emit session/update notifications"
+            "session/resume with no plan must not emit session/update notifications"
         );
+    }
+
+    #[tokio::test]
+    async fn session_resume_replays_stored_plan() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+
+        let session_id = "sess-resume-plan";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+        // A durable plan exists from a prior turn.
+        store
+            .set_plan(
+                session_id,
+                &[PlanEntry {
+                    content: "Resume me".to_string(),
+                    status: PlanStatus::InProgress,
+                    priority: PlanPriority::High,
+                    active_form: Some("Resuming".to_string()),
+                }],
+            )
+            .unwrap();
+
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        server
+            .handle_session_resume(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/resume must succeed");
+
+        // The stored plan must be replayed as a native ACP `plan` update.
+        let raw = writer_rx
+            .try_recv()
+            .expect("resume must emit a plan session/update");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["update"]["sessionUpdate"], "plan");
+        assert_eq!(v["params"]["update"]["entries"][0]["content"], "Resume me");
+        assert_eq!(v["params"]["update"]["entries"][0]["status"], "in_progress");
     }
 
     #[tokio::test]

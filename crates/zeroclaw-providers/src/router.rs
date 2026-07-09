@@ -1318,7 +1318,8 @@ mod tests {
                 "properties": {
                     "command": { "type": "string" }
                 }
-            }),
+            })
+            .into(),
         }];
 
         let mut stream = router.stream_chat(

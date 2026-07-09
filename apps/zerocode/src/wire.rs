@@ -734,3 +734,89 @@ mod elicitation_wire_tests {
         assert!(ElicitationShape::from_schema(&schema).is_none());
     }
 }
+
+// ── TodoWrite plan wire shapes (mirror of the daemon's plan entry) ───
+//
+// Carried locally so `apps/zerocode/Cargo.toml` stays free of
+// `zeroclaw-*` crate deps. Field casing matches the daemon exactly:
+// snake-case status/priority values (`in_progress`), `activeForm` for
+// the optional extension.
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanPriority {
+    High,
+    #[default]
+    Medium,
+    Low,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanEntry {
+    pub content: String,
+    #[serde(default)]
+    pub status: PlanStatus,
+    #[serde(default)]
+    pub priority: PlanPriority,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "activeForm"
+    )]
+    pub active_form: Option<String>,
+}
+
+// ── TodoWrite plan wire tests ──────────────────────────────
+
+#[cfg(test)]
+mod plan_wire_tests {
+    use super::*;
+
+    #[test]
+    fn plan_entry_deserializes_daemon_shape() {
+        let raw = serde_json::json!({
+            "content": "Analyze codebase",
+            "status": "in_progress",
+            "priority": "high",
+            "activeForm": "Analyzing codebase"
+        });
+        let entry: PlanEntry = serde_json::from_value(raw).unwrap();
+        assert_eq!(entry.content, "Analyze codebase");
+        assert_eq!(entry.status, PlanStatus::InProgress);
+        assert_eq!(entry.priority, PlanPriority::High);
+        assert_eq!(entry.active_form.as_deref(), Some("Analyzing codebase"));
+    }
+
+    #[test]
+    fn plan_entry_defaults_missing_optionals() {
+        let raw = serde_json::json!({ "content": "x", "status": "pending" });
+        let entry: PlanEntry = serde_json::from_value(raw).unwrap();
+        assert_eq!(entry.priority, PlanPriority::Medium);
+        assert_eq!(entry.active_form, None);
+    }
+
+    #[test]
+    fn plan_entry_round_trips() {
+        let entry = PlanEntry {
+            content: "y".to_string(),
+            status: PlanStatus::Completed,
+            priority: PlanPriority::Low,
+            active_form: None,
+        };
+        let v = serde_json::to_value(&entry).unwrap();
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["priority"], "low");
+        assert!(v.get("activeForm").is_none());
+        let back: PlanEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(back, entry);
+    }
+}

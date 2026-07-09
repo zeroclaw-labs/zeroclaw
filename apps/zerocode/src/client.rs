@@ -17,6 +17,8 @@ use tokio::sync::{broadcast, mpsc};
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
 use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
 
+const CRON_TRIGGER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 // ── Platform local-stream shim ──────────────────────────────────
 
 #[cfg(unix)]
@@ -93,10 +95,13 @@ pub mod method {
     pub const HEALTH: &str = "health";
     pub const DOCTOR_RUN: &str = "doctor/run";
     pub const COST_QUERY: &str = "cost/query";
+    pub const COST_ORG: &str = "cost/org";
     pub const SESSION_LIST: &str = "session/list";
     pub const SESSION_LIST_ACP: &str = "session/list-acp";
     pub const AGENTS_STATUS: &str = "agents/status";
     pub const CRON_LIST: &str = "cron/list";
+    pub const CRON_RUNS: &str = "cron/runs";
+    pub const CRON_TRIGGER: &str = "cron/trigger";
     pub const MEMORY_LIST: &str = "memory/list";
     pub const MEMORY_SEARCH: &str = "memory/search";
     pub const SESSION_MESSAGES: &str = "session/messages";
@@ -190,6 +195,15 @@ pub struct RpcInboundRequest {
     pub params: Value,
 }
 
+/// Buffer capacity for the server-initiated inbound-request broadcast.
+///
+/// These frames are response-bearing (today: `elicitation/create`): a dropped
+/// one parks the daemon's tool call until the session timeout. The buffer is
+/// sized generously so a busy TUI draw loop does not lag the receiver and lose
+/// an elicitation. The Chat pane additionally surfaces a `Lagged` overflow so
+/// the rare drop is diagnosable rather than a silent hang.
+pub const INBOUND_REQUEST_CHANNEL_CAPACITY: usize = 1024;
+
 // ── Typed session updates ────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -234,6 +248,13 @@ pub enum SessionUpdate {
         session_id: String,
         outcome: TurnEndOutcome,
         content: String,
+    },
+    /// The agent published or updated its execution plan (TodoWrite).
+    /// Whole-list replacement; `entries` is the complete authoritative
+    /// list. An empty vec clears the tracker.
+    Plan {
+        session_id: String,
+        entries: Vec<crate::wire::PlanEntry>,
     },
 }
 
@@ -300,6 +321,14 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
                 .unwrap_or_default()
                 .to_string(),
         }),
+        "plan" => {
+            let entries = params.get("entries")?.clone();
+            let entries: Vec<crate::wire::PlanEntry> = serde_json::from_value(entries).ok()?;
+            Some(SessionUpdate::Plan {
+                session_id: sid,
+                entries,
+            })
+        }
         _ => None,
     }
 }
@@ -521,7 +550,8 @@ impl RpcClient {
         let rpc = Arc::new(RpcOutbound::new(writer_tx));
         let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
         let notif_tx_for_reader = notif_tx.clone();
-        let (inbound_tx, _) = broadcast::channel::<RpcInboundRequest>(64);
+        let (inbound_tx, _) =
+            broadcast::channel::<RpcInboundRequest>(INBOUND_REQUEST_CHANNEL_CAPACITY);
         let inbound_tx_for_reader = inbound_tx.clone();
 
         let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
@@ -666,7 +696,8 @@ impl RpcClient {
         let rpc = Arc::new(jsonrpc::RpcOutbound::new(writer_tx));
         let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
         let notif_tx_for_reader = notif_tx.clone();
-        let (inbound_tx, _) = broadcast::channel::<RpcInboundRequest>(64);
+        let (inbound_tx, _) =
+            broadcast::channel::<RpcInboundRequest>(INBOUND_REQUEST_CHANNEL_CAPACITY);
         let inbound_tx_for_reader = inbound_tx.clone();
 
         let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
@@ -1319,6 +1350,35 @@ impl RpcClient {
             .await
     }
 
+    /// Optional organization-level billed-cost snapshot from the daemon's
+    /// `<data_dir>/org_cost.json`. Returns `None` when the file is absent (a
+    /// vanilla build never writes it), so the dashboard simply omits the
+    /// organization row. An integrator can populate it via an external sync.
+    pub async fn cost_org(&self) -> Result<Option<OrgCost>> {
+        let v: serde_json::Value = self.call(method::COST_ORG, serde_json::json!({})).await?;
+        if v.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_value(v)?))
+    }
+
+    /// Cost summary scoped to a `[from, to)` window (RFC3339). The daemon rolls
+    /// up only records in the window, so `session_cost_usd` / `total_tokens` /
+    /// `by_model` reflect that period — used by the Cost tab's day/month/
+    /// quarter/YTD breakdown.
+    pub async fn cost_query_window(
+        &self,
+        from: &str,
+        to: &str,
+        agent: Option<&str>,
+    ) -> Result<CostSummaryResult> {
+        self.call(
+            method::COST_QUERY,
+            serde_json::json!({ "from": from, "to": to, "agent": agent }),
+        )
+        .await
+    }
+
     pub async fn session_list(&self, query: Option<&str>) -> Result<SessionListResult> {
         self.call(method::SESSION_LIST, serde_json::json!({ "query": query }))
             .await
@@ -1339,6 +1399,23 @@ impl RpcClient {
 
     pub async fn cron_list(&self) -> Result<CronListResult> {
         self.call(method::CRON_LIST, serde_json::json!({})).await
+    }
+
+    pub async fn cron_runs(&self, id: &str, limit: Option<u32>) -> Result<CronRunsResult> {
+        self.call(
+            method::CRON_RUNS,
+            serde_json::json!({ "id": id, "limit": limit }),
+        )
+        .await
+    }
+
+    pub async fn cron_trigger(&self, id: &str) -> Result<CronTriggerResult> {
+        self.call_with_timeout(
+            method::CRON_TRIGGER,
+            serde_json::json!({ "id": id }),
+            CRON_TRIGGER_TIMEOUT,
+        )
+        .await
     }
 
     pub async fn memory_list(&self, category: Option<&str>) -> Result<MemoryListResult> {
@@ -2090,6 +2167,44 @@ pub struct CostSummaryResult {
     pub by_agent: std::collections::HashMap<String, AgentCostStats>,
 }
 
+/// One calendar month of organization spend (oldest first; the last entry may
+/// be the partial current month).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct OrgMonthCost {
+    #[serde(default)]
+    pub cost_usd: f64,
+}
+
+/// Year-to-date billed totals for a single scope (the user, or the whole org).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct OrgScopeStat {
+    #[serde(default)]
+    pub ytd_cost_usd: f64,
+    #[serde(default)]
+    pub ytd_tokens: u64,
+    #[serde(default)]
+    pub monthly: Vec<OrgMonthCost>,
+}
+
+/// Organization-level billed snapshot returned by `cost/org`, deserialized from
+/// the daemon's `org_cost.json`. Mirrors a typical billing-export cache shape
+/// but is vendor-neutral here; absent on vanilla builds.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct OrgCost {
+    #[serde(default)]
+    pub year: i32,
+    #[serde(default)]
+    pub generated: String,
+    /// Display label for the organization scope (e.g. "Acme"). Falls back to
+    /// "Organization" when absent.
+    #[serde(default)]
+    pub org_label: Option<String>,
+    #[serde(default)]
+    pub personal: Option<OrgScopeStat>,
+    #[serde(default)]
+    pub org: Option<OrgScopeStat>,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum CronSchedule {
@@ -2133,6 +2248,31 @@ pub struct CronJobEntry {
 #[serde(rename_all = "snake_case")]
 pub struct CronListResult {
     pub jobs: Vec<CronJobEntry>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CronRunEntry {
+    pub id: i64,
+    pub job_id: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub status: String,
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(default)]
+    pub duration_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CronRunsResult {
+    pub runs: Vec<CronRunEntry>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CronTriggerResult {
+    pub id: String,
+    pub success: bool,
+    pub output: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -2307,6 +2447,81 @@ mod session_method_tests {
             .expect("client.session_cancel must resolve after the response is dispatched")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cron_runs_sends_job_id_and_limit() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move { client.cron_runs("job-1", Some(3)).await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.cron_runs must send a wire request; a hang here wedges the TTY")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "cron/runs");
+        assert_eq!(req["params"]["id"], "job-1");
+        assert_eq!(req["params"]["limit"], 3);
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({
+                "runs": [{
+                    "id": 7,
+                    "job_id": "job-1",
+                    "started_at": "2026-06-18T00:00:00Z",
+                    "finished_at": "2026-06-18T00:00:02Z",
+                    "status": "ok",
+                    "output": "done",
+                    "duration_ms": 2000
+                }]
+            })),
+            None,
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.cron_runs must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.runs.len(), 1);
+        assert_eq!(result.runs[0].job_id, "job-1");
+        assert_eq!(result.runs[0].duration_ms, Some(2000));
+    }
+
+    #[tokio::test]
+    async fn cron_trigger_sends_job_id() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move { client.cron_trigger("job-1").await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.cron_trigger must send a wire request; a hang here wedges the TTY")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "cron/trigger");
+        assert_eq!(req["params"]["id"], "job-1");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({"id": "job-1", "success": true, "output": "done"})),
+            None,
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.cron_trigger must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.id, "job-1");
+        assert!(result.success);
+        assert_eq!(result.output, "done");
     }
 
     #[tokio::test]
@@ -2546,5 +2761,54 @@ mod tls_tests {
     fn insecure_tls_config_builds_without_panic() {
         let cfg = RpcClient::insecure_tls_config();
         assert!(Arc::strong_count(&cfg) >= 1);
+    }
+}
+
+#[cfg(test)]
+mod plan_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parses_plan_update() {
+        let params = serde_json::json!({
+            "type": "plan",
+            "session_id": "sess-1",
+            "entries": [
+                { "content": "A", "status": "completed", "priority": "high" },
+                { "content": "B", "status": "in_progress", "activeForm": "Doing B" }
+            ]
+        });
+        let update = parse_session_update(&params).expect("plan parses");
+        match update {
+            SessionUpdate::Plan {
+                session_id,
+                entries,
+            } => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].status, crate::wire::PlanStatus::Completed);
+                assert_eq!(entries[1].active_form.as_deref(), Some("Doing B"));
+            }
+            _ => panic!("expected SessionUpdate::Plan"),
+        }
+    }
+
+    #[test]
+    fn parses_empty_plan_update_as_clear() {
+        let params = serde_json::json!({
+            "type": "plan",
+            "session_id": "sess-2",
+            "entries": []
+        });
+        match parse_session_update(&params).expect("empty plan parses") {
+            SessionUpdate::Plan { entries, .. } => assert!(entries.is_empty()),
+            _ => panic!("expected SessionUpdate::Plan"),
+        }
+    }
+
+    #[test]
+    fn plan_update_missing_entries_is_none() {
+        let params = serde_json::json!({ "type": "plan", "session_id": "s" });
+        assert!(parse_session_update(&params).is_none());
     }
 }
