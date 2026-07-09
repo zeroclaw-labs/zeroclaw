@@ -1,9 +1,4 @@
 //! Inbound message debouncing for rapid senders.
-//!
-//! When users type fast and send multiple messages in quick succession, each
-//! message would normally trigger a separate LLM call. [`MessageDebouncer`]
-//! accumulates rapid messages per sender within a configurable time window and
-//! emits them as a single concatenated message, reducing unnecessary agent runs.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,15 +46,6 @@ impl MessageDebouncer {
         !self.window.is_zero()
     }
 
-    /// Submit a message for debouncing.
-    ///
-    /// - If the window is zero, returns [`DebounceResult::Passthrough`] immediately.
-    /// - Otherwise, accumulates the message under `sender_key` and returns
-    ///   [`DebounceResult::Pending`] with a receiver that will eventually yield the
-    ///   concatenated messages once the window expires.
-    ///
-    /// Each new message resets the timer. When the timer fires it concatenates all
-    /// accumulated messages with `"\n"` and sends them through the oneshot channel.
     pub async fn debounce(&self, sender_key: &str, message: &str) -> DebounceResult {
         if !self.enabled() {
             return DebounceResult::Passthrough(message.to_owned());
