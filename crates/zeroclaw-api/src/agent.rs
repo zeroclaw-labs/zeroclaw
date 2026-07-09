@@ -9,9 +9,13 @@ use crate::plan::PlanEntry;
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
     /// A text chunk from the LLM response (may arrive many times).
-    Chunk { delta: String },
+    Chunk {
+        delta: String,
+    },
     /// A reasoning/thinking chunk from a thinking model (may arrive many times).
-    Thinking { delta: String },
+    Thinking {
+        delta: String,
+    },
     /// The agent is invoking a tool.
     ToolCall {
         /// Stable correlation ID shared with the matching [`TurnEvent::ToolResult`].
@@ -26,12 +30,9 @@ pub enum TurnEvent {
         name: String,
         output: String,
     },
-    /// The agent published or updated its execution plan (TodoWrite).
-    ///
-    /// Whole-list replacement: `entries` is the complete authoritative
-    /// plan; an empty vec clears it. Downstream consumers replace their
-    /// held plan wholesale — no merge.
-    Plan { entries: Vec<PlanEntry> },
+    Plan {
+        entries: Vec<PlanEntry>,
+    },
     /// The agent is waiting for the operator to approve, deny, or always-allow
     /// a tool call. The transport (e.g. gateway WebSocket) is expected to
     /// surface this to the operator and route the response back through the

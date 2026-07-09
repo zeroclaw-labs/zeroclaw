@@ -124,12 +124,7 @@ pub(crate) struct Chat {
     /// Double-click tracker for the agent picker: a second click on the same row
     /// confirms (enters the session), matching the keyboard Enter.
     pick_agent_double_click: crate::mouse::DoubleClickTracker,
-    /// Parsed `[todotracker]` config, fetched once (lazily, on first
-    /// session start) and applied to every `ChatState` this pane
-    /// constructs. Defaults until fetched.
     todo_settings: crate::todo_tracker::TodoTrackerSettings,
-    /// Guards the one-shot `[todotracker]` config fetch so it doesn't
-    /// repeat on every session start.
     todo_settings_loaded: bool,
     /// Inbound `elicitation/create` requests that arrived while the pane was
     /// not yet `Active` on their target session (e.g. mid resume/reset/switch).
@@ -384,11 +379,6 @@ impl Chat {
     /// - Unix: always passes the local CWD (ignores `cwd_override`).
     /// - WSS: passes `cwd_override` if provided, otherwise `None`.
     async fn start_session(&mut self, agent_alias: &str, cwd_override: Option<&str>) {
-        // Fetch the [todotracker] config once, lazily, the first time this
-        // pane starts a session — so the tracker honors enabled /
-        // enabled_at_start / location / width / max_height. Best-effort: a
-        // failure keeps the schema defaults. Done here (not in init()) so the
-        // hot refresh path stays a single agents/status round-trip.
         if !self.todo_settings_loaded {
             self.todo_settings_loaded = true;
             if let Ok(fields) = self.rpc.config_list(Some("todotracker")).await {
@@ -2804,13 +2794,6 @@ fn draw_error(frame: &mut Frame, area: Rect, msg: &str, tab_title: &str) {
 
 // ── Active chat rendering ────────────────────────────────────────
 
-/// Split `area` into (body, optional tracker area) based on the
-/// tracker's location and visibility. Side panels (`Left`/`Right`) take
-/// the configured column width clamped to at most half the pane width;
-/// the bottom strip grows with the plan up to the configured max height,
-/// clamped to at most half the pane height. Returns `None` for the
-/// tracker area when it wants no space — the body then gets the whole
-/// area (existing layout untouched).
 fn carve_todo_area(tracker: &crate::todo_tracker::TodoTracker, area: Rect) -> (Rect, Option<Rect>) {
     if !tracker.wants_space() {
         return (area, None);
@@ -2834,8 +2817,6 @@ fn carve_todo_area(tracker: &crate::todo_tracker::TodoTracker, area: Rect) -> (R
             (body, Some(panel))
         }
         crate::todo_tracker::TodoLocation::Bottom => {
-            // Grow up to the configured cap (+2 rows for the bordered
-            // block), but never exceed half the pane height.
             let want = (tracker.total() as u16 + 2).min(tracker.max_height());
             let h = want.min(area.height / 2);
             let body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(h));
@@ -2846,10 +2827,6 @@ fn carve_todo_area(tracker: &crate::todo_tracker::TodoTracker, area: Rect) -> (R
 }
 
 fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
-    // Carve the TodoWrite tracker's area first (outermost split), so the
-    // rest of the pane (queue sidebar, transcript, input) lays out in the
-    // remaining body. When the tracker wants no space, `body == area` and
-    // the existing layout is untouched.
     let (area, todo_area) = carve_todo_area(&state.todo_tracker, area);
     if let Some(panel) = todo_area {
         state.todo_tracker.render(f, panel);
@@ -3427,8 +3404,6 @@ fn header_fence_lang(line: &Line<'static>) -> Option<String> {
     }
 }
 
-/// Return the code body for clipboard copy without markdown fences.
-/// Users pasting into a terminal expect raw commands, not fenced blocks.
 fn fenced_text(_lang: Option<&str>, body: &str) -> String {
     body.to_string()
 }
@@ -4748,8 +4723,6 @@ pub struct ChatState {
     pub info_message: Option<crate::widgets::InfoMessage>,
     /// Active model / model_provider picker overlay.
     model_picker: ModelPickerOverlay,
-    /// Live TodoWrite tracker panel for this session. Read-only; fed by
-    /// `SessionUpdate::Plan`, toggled by the user, laid out per config.
     todo_tracker: crate::todo_tracker::TodoTracker,
 }
 
@@ -5561,9 +5534,6 @@ impl ChatState {
                     }
                 }
             }
-            // Whole-list replace: hand the authoritative plan to the
-            // tracker, which runs the auto-pop rule. Session routing is
-            // already enforced by the session_id check above.
             SessionUpdate::Plan { entries, .. } => {
                 self.todo_tracker.set_plan(entries);
             }
@@ -6114,7 +6084,7 @@ mod tests {
             crate::todo_tracker::TodoLocation::Right,
             true,
             false,
-        ); // hidden, no plan
+        );
         let full = Rect::new(0, 0, 100, 40);
         let (body, tracker) = carve_todo_area(&t, full);
         assert_eq!(body, full);
@@ -6149,7 +6119,7 @@ mod tests {
             true,
             true,
         );
-        let full = Rect::new(0, 0, 40, 20); // narrow
+        let full = Rect::new(0, 0, 40, 20);
         let (_body, tracker) = carve_todo_area(&t, full);
         let tracker = tracker.expect("side panel visible");
         assert!(tracker.width <= full.width / 2, "clamped to <= 50% width");
@@ -6515,8 +6485,6 @@ mod tests {
             None,
         );
 
-        // Second request: the one-shot [todotracker] config fetch fired on the
-        // first session start. Respond with an empty field set (defaults apply).
         let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("start_session should fetch todotracker config")
@@ -6526,9 +6494,6 @@ mod tests {
         let id = request["id"].as_str().unwrap().to_string();
         rpc.dispatch_response(&id, Some(serde_json::json!([])), None);
 
-        // Third request must be session_new_with_id carrying the prior id for
-        // the prior agent — NOT a fresh pick / fresh session. This is the whole
-        // fix: a multi-agent reconnect reattaches instead of minting fresh.
         let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("reconnect should reattach the prior session")

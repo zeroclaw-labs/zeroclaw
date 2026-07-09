@@ -411,6 +411,23 @@ fn dirs_data_local() -> Option<std::path::PathBuf> {
     directories::BaseDirs::new().map(|d| d.data_local_dir().to_path_buf())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebDashboardAvailability {
+    Embedded,
+    Filesystem(std::path::PathBuf),
+}
+
+pub fn resolve_web_dashboard_availability(config: &Config) -> Option<WebDashboardAvailability> {
+    #[cfg(feature = "embedded-web")]
+    {
+        Some(WebDashboardAvailability::Embedded)
+    }
+    #[cfg(not(feature = "embedded-web"))]
+    {
+        resolve_web_dist_dir(config).map(WebDashboardAvailability::Filesystem)
+    }
+}
+
 pub fn resolve_web_dist_dir(config: &Config) -> Option<std::path::PathBuf> {
     match config
         .gateway
@@ -1435,29 +1452,40 @@ pub async fn run_gateway(
         );
     }
 
-    if let Some(ref dir) = web_dist_dir {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            &format!("Web dashboard: serving from {}", dir.display().to_string())
-        );
-    } else if config.gateway.web_dist_dir.is_some() {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "Web dashboard: not available — configured gateway.web_dist_dir is missing on \
-             this machine and no fallback location was found. Reinstall with the supported \
-             installer (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to \
-             build and place the dashboard where the gateway looks for it."
-        );
-    } else {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "Web dashboard: not available — no web/dist found. Reinstall with the supported \
-             installer (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to \
-             build and place the dashboard where the gateway looks for it."
-        );
+    match resolve_web_dashboard_availability(&config) {
+        Some(WebDashboardAvailability::Embedded) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "Web dashboard: serving embedded assets"
+            );
+        }
+        Some(WebDashboardAvailability::Filesystem(ref dir)) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!("Web dashboard: serving from {}", dir.display().to_string())
+            );
+        }
+        None if config.gateway.web_dist_dir.is_some() => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "Web dashboard: not available — configured gateway.web_dist_dir is missing on \
+                 this machine and no fallback location was found. Reinstall with the supported \
+                 installer (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to \
+                 build and place the dashboard where the gateway looks for it."
+            );
+        }
+        None => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "Web dashboard: not available — no web/dist found. Reinstall with the supported \
+                 installer (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to \
+                 build and place the dashboard where the gateway looks for it."
+            );
+        }
     }
 
     let pfx = path_prefix.unwrap_or("");
@@ -1465,7 +1493,7 @@ pub async fn run_gateway(
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
     }
-    if web_dist_dir.is_some() {
+    if resolve_web_dashboard_availability(&config).is_some() {
         println!("  🌐 Web Dashboard: http://{display_addr}{pfx}/");
     } else {
         println!(
@@ -4617,6 +4645,33 @@ mod tests {
         assert_ne!(
             resolve_web_dist_dir(&config),
             Some(temp.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "embedded-web"))]
+    fn web_dashboard_availability_uses_filesystem_dist() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let dist_dir = temp.path().join("dist");
+        std::fs::create_dir_all(&dist_dir).expect("create dist dir");
+        std::fs::write(dist_dir.join("index.html"), "").expect("write index.html");
+        let mut config = Config::default();
+        config.gateway.web_dist_dir = Some(dist_dir.display().to_string());
+
+        assert_eq!(
+            resolve_web_dashboard_availability(&config),
+            Some(WebDashboardAvailability::Filesystem(dist_dir))
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "embedded-web")]
+    fn web_dashboard_availability_reports_embedded_assets() {
+        let config = Config::default();
+
+        assert_eq!(
+            resolve_web_dashboard_availability(&config),
+            Some(WebDashboardAvailability::Embedded)
         );
     }
 

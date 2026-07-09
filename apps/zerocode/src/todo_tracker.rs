@@ -1,13 +1,5 @@
-//! Read-only TodoWrite tracker widget for the Code pane.
-//!
-//! Holds the last authoritative plan (whole-list replace) and owns the
-//! show/hide state machine: auto-pop once on the first plan of a
-//! session, after which the user's toggle is authoritative; a master
-//! `enabled` flag hard-gates all rendering.
-
 use crate::wire::{ConfigFieldEntry, PlanEntry, PlanStatus};
 
-/// Where the tracker renders relative to the Code pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum TodoLocation {
@@ -17,8 +9,6 @@ pub(crate) enum TodoLocation {
 }
 
 impl TodoLocation {
-    /// Parse the `[todotracker] location` config value. Unknown values
-    /// fall back to `Right` (the schema default).
     fn from_config_str(s: &str) -> Self {
         match s {
             "bottom" => Self::Bottom,
@@ -28,9 +18,6 @@ impl TodoLocation {
     }
 }
 
-/// Parsed `[todotracker]` config, sourced from the daemon over
-/// `config/list` at pane init. Defaults mirror the schema defaults so a
-/// fetch failure or absent section still yields correct behavior.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub(crate) struct TodoTrackerSettings {
@@ -54,12 +41,6 @@ impl Default for TodoTrackerSettings {
 }
 
 impl TodoTrackerSettings {
-    /// Build settings from `config/list` field entries (prefix
-    /// `todotracker`). Each field is keyed by its dotted `path`
-    /// (`todotracker.enabled`, …); absent or unparseable fields keep the
-    /// schema default. The daemon is the source of truth for defaults,
-    /// but we re-apply them here so a partial/failed fetch degrades
-    /// gracefully.
     #[allow(dead_code)]
     pub(crate) fn from_config_fields(fields: &[ConfigFieldEntry]) -> Self {
         let mut s = Self::default();
@@ -109,15 +90,12 @@ pub(crate) struct TodoTracker {
     has_ever_popped: bool,
     location: TodoLocation,
     enabled: bool,
-    /// Side-panel target column width (left/right); runtime-clamped.
     width: u16,
-    /// Bottom-strip max height in rows (grows up to this).
     max_height: u16,
 }
 
 #[allow(dead_code)]
 impl TodoTracker {
-    /// Construct from parsed `[todotracker]` settings.
     pub(crate) fn from_settings(settings: TodoTrackerSettings) -> Self {
         Self {
             entries: Vec::new(),
@@ -130,8 +108,6 @@ impl TodoTracker {
         }
     }
 
-    /// Test-only convenience constructor: builds settings from the three
-    /// behavioral flags with default width/max_height.
     #[cfg(test)]
     pub(crate) fn new(location: TodoLocation, enabled: bool, enabled_at_start: bool) -> Self {
         Self::from_settings(TodoTrackerSettings {
@@ -146,18 +122,14 @@ impl TodoTracker {
         self.location
     }
 
-    /// Side-panel target column width from config (left/right).
     pub(crate) fn width(&self) -> u16 {
         self.width
     }
 
-    /// Bottom-strip max height from config.
     pub(crate) fn max_height(&self) -> u16 {
         self.max_height
     }
 
-    /// Replace the plan wholesale. On the first non-empty plan of the
-    /// session, auto-pop into view exactly once (unless master-disabled).
     pub(crate) fn set_plan(&mut self, entries: Vec<PlanEntry>) {
         self.entries = entries;
         if self.enabled && !self.has_ever_popped && !self.entries.is_empty() {
@@ -166,7 +138,6 @@ impl TodoTracker {
         }
     }
 
-    /// User show/hide. Inert while master-disabled.
     pub(crate) fn toggle(&mut self) {
         if self.enabled {
             self.visible = !self.visible;
@@ -192,10 +163,6 @@ impl TodoTracker {
             .count()
     }
 
-    /// Whether the tracker should be allocated layout space right now.
-    /// Side panels always claim space when visible (placeholder when
-    /// empty); the bottom strip claims space only when it has entries
-    /// (terminal row height is precious).
     pub(crate) fn wants_space(&self) -> bool {
         if !self.is_visible() {
             return false;
@@ -312,7 +279,6 @@ mod tests {
 
     #[test]
     fn settings_keep_defaults_for_absent_or_bad_fields() {
-        // Unknown location string falls back to Right; missing fields keep defaults.
         let fields = vec![field("todotracker.location", serde_json::json!("diagonal"))];
         let s = TodoTrackerSettings::from_config_fields(&fields);
         assert_eq!(s.location, TodoLocation::Right);
@@ -322,8 +288,6 @@ mod tests {
 
     #[test]
     fn config_enabled_false_disables_tracker() {
-        // The reviewer's core case: [todotracker] enabled = false must
-        // actually disable the running tracker.
         let fields = vec![field("todotracker.enabled", serde_json::json!(false))];
         let s = TodoTrackerSettings::from_config_fields(&fields);
         let mut t = TodoTracker::from_settings(s);
@@ -424,8 +388,6 @@ mod tests {
         assert_eq!(t.total(), 3);
         assert_eq!(t.done(), 1);
     }
-
-    // ── rendering tests ────────────────────────────────────────────────────
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;

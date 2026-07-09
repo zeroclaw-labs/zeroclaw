@@ -4549,18 +4549,29 @@ async fn main() -> Result<()> {
             }
             #[cfg(feature = "gateway")]
             {
-                if let Some(web_dist_dir) = zeroclaw_gateway::resolve_web_dist_dir(&config) {
-                    let path = web_dist_dir.display().to_string();
-                    let fallback = format!("🌐 Web UI:        FOUND ({path})");
-                    println!(
-                        "{}",
-                        ta("cli-status-web-ui-found", &[("path", &path)], &fallback)
-                    );
-                } else {
-                    println!(
-                        "{}",
-                        t("cli-status-web-ui-missing", "🌐 Web UI:        MISSING")
-                    );
+                match zeroclaw_gateway::resolve_web_dashboard_availability(&config) {
+                    Some(zeroclaw_gateway::WebDashboardAvailability::Embedded) => {
+                        let path = "embedded";
+                        let fallback = format!("🌐 Web UI:        FOUND ({path})");
+                        println!(
+                            "{}",
+                            ta("cli-status-web-ui-found", &[("path", path)], &fallback)
+                        );
+                    }
+                    Some(zeroclaw_gateway::WebDashboardAvailability::Filesystem(web_dist_dir)) => {
+                        let path = web_dist_dir.display().to_string();
+                        let fallback = format!("🌐 Web UI:        FOUND ({path})");
+                        println!(
+                            "{}",
+                            ta("cli-status-web-ui-found", &[("path", &path)], &fallback)
+                        );
+                    }
+                    None => {
+                        println!(
+                            "{}",
+                            t("cli-status-web-ui-missing", "🌐 Web UI:        MISSING")
+                        );
+                    }
                 }
             }
             let effective_memory_backend = config.resolve_active_storage().kind();

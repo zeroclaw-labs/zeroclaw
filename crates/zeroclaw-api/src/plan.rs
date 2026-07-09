@@ -1,17 +1,5 @@
-//! Shared execution-plan types for the TodoWrite tracker.
-//!
-//! These mirror the ACP `plan` entry shape (`content`, `priority`,
-//! `status`) with one additive ZeroClaw extension (`active_form`,
-//! serialized as `activeForm`) that strict ACP clients ignore. The
-//! entry field casing already matches ACP; only `active_form` needs a
-//! `rename`. The `session/update` envelope casing (camel for ACP,
-//! snake for the ZeroCode RPC channel) is handled at the two emission
-//! sites, not here.
-
 use serde::{Deserialize, Serialize};
 
-/// Execution status of a single plan entry. Snake-case on the wire to
-/// match ACP (`in_progress`).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanStatus {
@@ -21,9 +9,6 @@ pub enum PlanStatus {
     Completed,
 }
 
-/// Relative importance of a plan entry. Defaults to `Medium` when a
-/// caller omits it; ACP requires `priority` on the outward projection,
-/// so normalization to a concrete value happens at parse time here.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanPriority {
@@ -33,8 +18,6 @@ pub enum PlanPriority {
     Low,
 }
 
-/// A single plan entry. ACP-shaped (`content`/`priority`/`status`) plus
-/// the optional ZeroClaw `active_form` extension.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanEntry {
     pub content: String,

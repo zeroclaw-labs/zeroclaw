@@ -735,13 +735,6 @@ mod elicitation_wire_tests {
     }
 }
 
-// ── TodoWrite plan wire shapes (mirror of the daemon's plan entry) ───
-//
-// Carried locally so `apps/zerocode/Cargo.toml` stays free of
-// `zeroclaw-*` crate deps. Field casing matches the daemon exactly:
-// snake-case status/priority values (`in_progress`), `activeForm` for
-// the optional extension.
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanStatus {
@@ -774,8 +767,6 @@ pub struct PlanEntry {
     )]
     pub active_form: Option<String>,
 }
-
-// ── TodoWrite plan wire tests ──────────────────────────────
 
 #[cfg(test)]
 mod plan_wire_tests {
