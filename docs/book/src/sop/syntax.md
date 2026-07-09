@@ -102,6 +102,30 @@ Parser behavior:
   `[sop.approval].policies` fails closed (the gate stays waiting) rather than
   clearing on a single approval.
 
+### `[sop.approval]` policies and route delivery
+
+A policy may also route its approval out of band to a channel, so an approver can
+act without watching the surface that started the run:
+
+```toml
+[sop.approval.policies.prod]
+required_group = "release"
+quorum = 2
+# Delivered when a run PARKS at a gate this policy governs.
+request_route = "discord.ops:123456789012345678"
+# Delivered only if that gate later TIMES OUT (a distinct second route).
+escalation_route = "discord.oncall:987654321098765432"
+```
+
+Both routes are `channel:recipient`: `channel` is a configured channel's map key
+(`<channel>.<alias>`, or bare `<channel>` for a singleton) and `recipient` is that
+channel's addressee (a Discord channel id, a chat id, ...). Delivery is best-effort
+and never blocks or clears the gate - the approval itself still comes back through
+the normal approve/deny surfaces (`zeroclaw sop approve|deny`, the gateway
+approve/deny route, or the `sop_approve` agent tool). Routes fire only in the daemon
+(where channels are configured); leave them unset (or empty) to notify only the
+originating surface, which is the default.
+
 ### Step Contract Enforcement
 
 Step contracts are optional. When present, `input` and `output` accept a compact

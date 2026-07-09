@@ -53,6 +53,7 @@ pub fn build_sop_engine(
     config: SopConfig,
     workspace_dir: &Path,
     audit_memory: Arc<dyn Memory>,
+    route_adapter: Option<Arc<dyn approval::ApprovalRouteAdapter>>,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
     // Select the run-state backend from config (default: durable sqlite, so parked
     // HITL runs survive a restart). A backend-open failure must not crash daemon
@@ -70,11 +71,13 @@ pub fn build_sop_engine(
         Arc::new(store::InMemoryRunStore::new())
     });
     // EPIC G: the approval broker (membership + quorum) resolves policies/groups
-    // from the engine's live `[sop.approval]` at use-time; a no-op route adapter
-    // until channel delivery is wired.
-    let approval_broker = Arc::new(approval::ApprovalBroker::with_route(Arc::new(
-        approval::NoopRouteAdapter,
-    )));
+    // from the engine's live `[sop.approval]` at use-time. The route adapter
+    // delivers approval request/escalation notices to a channel; the daemon injects
+    // a real channel-delivering adapter, while CLI/standalone callers pass `None`
+    // and fall back to the no-op (log-only) adapter - unchanged behavior there.
+    let route: Arc<dyn approval::ApprovalRouteAdapter> =
+        route_adapter.unwrap_or_else(|| Arc::new(approval::NoopRouteAdapter));
+    let approval_broker = Arc::new(approval::ApprovalBroker::with_route(route));
     let mut engine = SopEngine::new(config)
         .with_store(store)
         .with_metrics(SopMetricsCollector::shared())
