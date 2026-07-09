@@ -1,11 +1,4 @@
 //! End-to-end tests for memory–loop–heartbeat continuity.
-//!
-//! Validates that:
-//! - Memory persists across agent turns and sessions
-//! - The agent loop maintains context awareness through tool iterations
-//! - Memory recall enriches prompts so the agent "remembers" prior work
-//! - Context compression preserves facts to memory before discarding
-//! - Multi-step tasks complete without the agent stopping prematurely
 
 use std::sync::Arc;
 
@@ -21,7 +14,6 @@ use crate::support::{CountingTool, EchoTool, MockModelProvider};
 // 1. Memory Store + Recall Persistence
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Store a fact, then recall it in a fresh memory instance (same DB).
 #[tokio::test]
 async fn memory_persists_across_instances() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -55,7 +47,6 @@ async fn memory_persists_across_instances() {
     }
 }
 
-/// Store multiple facts across categories and recall by relevance.
 #[tokio::test]
 async fn memory_recall_returns_relevant_entries() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -98,7 +89,6 @@ async fn memory_recall_returns_relevant_entries() {
 // 2. Agent Loop Multi-Step Completion
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Agent completes a 5-step tool chain without stopping.
 #[tokio::test]
 async fn agent_completes_five_step_tool_chain() {
     let (counting_tool, count) = CountingTool::new();
@@ -150,7 +140,6 @@ async fn agent_completes_five_step_tool_chain() {
     );
 }
 
-/// Agent handles a multi-turn conversation, maintaining history.
 #[tokio::test]
 async fn agent_maintains_history_across_turns() {
     let model_provider = Box::new(MockModelProvider::new(vec![
@@ -176,7 +165,6 @@ async fn agent_maintains_history_across_turns() {
 // 3. Memory-Enriched Agent Turns
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Agent with SqliteMemory stores and recalls across turns.
 #[tokio::test]
 async fn agent_auto_saves_and_recalls_memory() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -211,7 +199,6 @@ async fn agent_auto_saves_and_recalls_memory() {
 // 5. Battle-Tested Loop Scenarios
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Agent handles interleaved tool calls and text responses without stopping.
 #[tokio::test]
 async fn agent_handles_interleaved_tools_and_text() {
     let model_provider = Box::new(MockModelProvider::new(vec![
@@ -244,7 +231,6 @@ async fn agent_handles_interleaved_tools_and_text() {
     );
 }
 
-/// Agent survives large tool output (truncation should kick in).
 #[tokio::test]
 async fn agent_survives_large_tool_output() {
     use zeroclaw::tools::{Tool, ToolResult};
@@ -304,7 +290,6 @@ async fn agent_survives_large_tool_output() {
     );
 }
 
-/// Agent handles parallel tool calls in a single iteration.
 #[tokio::test]
 async fn agent_handles_parallel_tool_calls() {
     let (counting_tool, count) = CountingTool::new();
@@ -346,7 +331,6 @@ async fn agent_handles_parallel_tool_calls() {
     );
 }
 
-/// Multi-turn with tools: each turn builds on the previous.
 #[tokio::test]
 async fn agent_multi_turn_with_tools_builds_context() {
     let (counting_tool, count) = CountingTool::new();
@@ -396,7 +380,6 @@ async fn agent_multi_turn_with_tools_builds_context() {
 // 6. Memory Consolidation Integration
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Direct test of consolidate_turn saving to memory.
 #[tokio::test]
 async fn consolidation_extracts_facts_to_memory() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -427,7 +410,6 @@ async fn consolidation_extracts_facts_to_memory() {
     );
 }
 
-/// Memory survives multiple consolidation rounds without corruption.
 #[tokio::test]
 async fn memory_survives_rapid_consolidation() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -467,7 +449,6 @@ async fn memory_survives_rapid_consolidation() {
 // 7. Session Persistence End-to-End
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// SQLite session backend stores and loads messages correctly.
 #[tokio::test]
 async fn session_backend_persists_messages() {
     use zeroclaw::channels::session_backend::SessionBackend;
@@ -489,7 +470,6 @@ async fn session_backend_persists_messages() {
     assert_eq!(messages.len(), 2, "Both messages should persist");
 }
 
-/// Session state transitions work correctly.
 #[tokio::test]
 async fn session_state_transitions() {
     use zeroclaw::channels::session_backend::SessionBackend;

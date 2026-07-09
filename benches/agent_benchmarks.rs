@@ -1,13 +1,4 @@
 //! Performance benchmarks for ZeroClaw hot paths.
-//!
-//! Benchmarks cover:
-//!   - Tool dispatch (XML parsing, native parsing)
-//!   - Memory store/recall cycles (SQLite backend)
-//!   - Agent turn cycle (full orchestration loop)
-//!
-//! Run: `cargo bench`
-//!
-//! Ref: <https://github.com/zeroclaw-labs/zeroclaw/issues/618> (item 7)
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
