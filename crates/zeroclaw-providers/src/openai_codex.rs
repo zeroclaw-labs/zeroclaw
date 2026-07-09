@@ -63,7 +63,9 @@ pub(crate) struct ResponsesToolSpec {
     pub(crate) kind: String,
     pub(crate) name: String,
     pub(crate) description: String,
-    pub(crate) parameters: Value,
+    /// `Arc`-shared with the tool registry's stored schema — serialized
+    /// transparently, never deep-cloned per request (#8642).
+    pub(crate) parameters: std::sync::Arc<Value>,
     pub(crate) strict: bool,
 }
 
@@ -257,7 +259,7 @@ pub(crate) fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<ResponsesT
                 kind: "function".to_string(),
                 name: tool.name.clone(),
                 description: tool.description.clone(),
-                parameters: tool.parameters.clone(),
+                parameters: std::sync::Arc::clone(&tool.parameters),
                 strict: false,
             })
             .collect(),
@@ -1770,7 +1772,7 @@ mod tests {
             kind: "function".to_string(),
             name: name.to_string(),
             description: String::new(),
-            parameters: serde_json::json!({}),
+            parameters: serde_json::json!({}).into(),
             strict: false,
         }
     }
@@ -2434,7 +2436,8 @@ data: [DONE]
                     "issue_key": { "type": "string" }
                 },
                 "required": ["action"]
-            }),
+            })
+            .into(),
         }];
 
         let converted = convert_tools(Some(&tools)).expect("tool should convert");

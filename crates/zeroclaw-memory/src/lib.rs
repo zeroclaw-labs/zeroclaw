@@ -4,10 +4,11 @@
 //! ## Reserved Key Prefixes
 //!
 //! The following key prefixes are reserved for the auto-save system. Any memory
-//! stored under these keys will be **excluded from context assembly** by all
-//! three context-building paths (`build_context`, `DefaultMemoryLoader`, and
-//! `should_skip_memory_context_entry`). Do not use these prefixes for semantic
-//! memories that should surface in agent context.
+//! stored under these keys will be **excluded from context assembly** by the
+//! engine's unified memory-context renderer (`agent::memory_inject` in
+//! `zeroclaw-runtime`), which applies this skip set on every injection path.
+//! Do not use these prefixes for semantic memories that should surface in
+//! agent context.
 //!
 //! | Prefix | Purpose | Detection function |
 //! |---|---|---|
@@ -63,6 +64,8 @@ pub use backend::{
     MemoryBackendKind, MemoryBackendProfile, classify_memory_backend, default_memory_backend_key,
     memory_backend_profile, selectable_memory_backends,
 };
+#[allow(unused_imports)]
+pub use embeddings::EmbeddingIdentity;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
@@ -173,8 +176,9 @@ pub fn is_assistant_autosave_key(key: &str) -> bool {
 }
 
 /// Auto-save key used for raw user messages captured per-turn.
-/// Re-injecting these into build_context causes exponential bloat: each recalled
-/// entry contains prior generations' context verbatim, growing unboundedly.
+/// Re-injecting these into the memory-context preamble causes exponential
+/// bloat: each recalled entry contains prior generations' context verbatim,
+/// growing unboundedly; the engine's memory-context skip set filters them.
 /// Consolidated knowledge is already promoted to Core/Daily entries.
 pub fn is_user_autosave_key(key: &str) -> bool {
     let normalized = key.trim().to_ascii_lowercase();
@@ -598,6 +602,7 @@ pub fn create_memory_with_storage_and_routes(
                 &resolved_embedding.model,
                 resolved_embedding.dimensions,
             ));
+        let has_embedder = embedder.dimensions() > 0;
 
         #[allow(clippy::cast_possible_truncation)]
         let mem = SqliteMemory::with_embedder(
@@ -610,6 +615,23 @@ pub fn create_memory_with_storage_and_routes(
             sqlite_open_timeout_secs,
             config.search_mode.clone(),
         )?;
+
+        // Identity reconciliation is lifecycle policy, kept out of the
+        // backend per the #6850 storage/policy boundary. Skipped without a
+        // real embedder so keyword-only setups stay byte-identical: a
+        // temporarily unresolved provider (NoopEmbedding) must not be
+        // mistaken for an identity change and wipe valid vectors.
+        if has_embedder {
+            reconcile_embedding_identity(
+                &mem,
+                &embeddings::EmbeddingIdentity {
+                    provider: resolved_embedding.model_provider.clone(),
+                    model: resolved_embedding.model.clone(),
+                    dimensions: resolved_embedding.dimensions,
+                },
+                config.auto_reindex_on_identity_change,
+            );
+        }
         Ok(mem)
     }
 
@@ -683,6 +705,152 @@ pub fn create_memory_with_storage_and_routes(
         },
         "",
     )
+}
+
+/// Outcome of a startup embedding-identity reconciliation.
+#[derive(Debug, PartialEq, Eq)]
+enum EmbeddingIdentityOutcome {
+    /// No identity was recorded (fresh store, or one predating identity
+    /// tracking): the current identity was adopted without touching vectors.
+    Adopted,
+    /// Stored identity matches the current config — nothing to do.
+    Match,
+    /// Stored identity differed: vectors were invalidated (set to NULL),
+    /// the embedding cache cleared, and the new identity stamped.
+    Invalidated(usize),
+    /// Reconciliation failed; the store is untouched and the error was
+    /// logged. Startup proceeds — recall degrades no further than it
+    /// already would, and the next boot retries.
+    Failed,
+}
+
+/// Compare the embedding identity recorded in the store against the one the
+/// current config resolves to, and auto-migrate on mismatch (issue #7948).
+///
+/// Policy (this fn) is deliberately separate from the storage primitives on
+/// [`SqliteMemory`], following the #6850 storage/lifecycle boundary:
+///
+/// - no identity recorded → adopt the current one silently (a pre-existing
+///   store's vectors were produced by an unknown embedder; wiping them on
+///   upgrade would surprise operators, and recall behavior is unchanged);
+/// - identical → no-op;
+/// - mismatch → invalidate vectors + clear the embedding cache (lossless,
+///   zero API calls — `content` is retained on every row) and warn. The
+///   expensive re-embed is gated: run `zeroclaw memory reindex`, or set
+///   `[memory] auto_reindex_on_identity_change = true` to have it kicked
+///   off in the background here.
+///
+/// Errors are logged, not propagated: a reconcile failure must not take
+/// memory (or the daemon) down with it.
+fn reconcile_embedding_identity(
+    mem: &SqliteMemory,
+    current: &embeddings::EmbeddingIdentity,
+    auto_reindex: bool,
+) -> EmbeddingIdentityOutcome {
+    let stored = match mem.stored_embedding_identity() {
+        Ok(stored) => stored,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                "memory: failed to read stored embedding identity; skipping reconciliation"
+            );
+            return EmbeddingIdentityOutcome::Failed;
+        }
+    };
+
+    match stored {
+        None => match mem.record_embedding_identity(current) {
+            Ok(()) => EmbeddingIdentityOutcome::Adopted,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "memory: failed to record embedding identity; will retry next startup"
+                );
+                EmbeddingIdentityOutcome::Failed
+            }
+        },
+        Some(stored) if stored == *current => EmbeddingIdentityOutcome::Match,
+        Some(stored) => match mem.invalidate_embeddings_for_identity_change(current) {
+            Ok(invalidated) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "stored_identity": stored.to_string(),
+                            "current_identity": current.to_string(),
+                            "vectors_invalidated": invalidated,
+                        })),
+                    "memory: embedding identity changed; stored vectors invalidated and \
+                     embedding cache cleared (content retained). Semantic recall is \
+                     keyword-only until re-embedded — run `zeroclaw memory reindex`"
+                );
+                if auto_reindex && invalidated > 0 {
+                    spawn_auto_reindex(mem);
+                }
+                EmbeddingIdentityOutcome::Invalidated(invalidated)
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "stored_identity": stored.to_string(),
+                            "current_identity": current.to_string(),
+                            "error": format!("{e}"),
+                        })),
+                    "memory: embedding identity changed but invalidation failed; \
+                     store untouched, will retry next startup"
+                );
+                EmbeddingIdentityOutcome::Failed
+            }
+        },
+    }
+}
+
+/// Kick off the gated re-embed in the background after an identity
+/// migration, when `[memory] auto_reindex_on_identity_change` opts in.
+/// Outside an async runtime (no tokio context) the spawn is skipped and the
+/// operator is pointed at `zeroclaw memory reindex` instead.
+fn spawn_auto_reindex(mem: &SqliteMemory) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "memory: auto_reindex_on_identity_change is set but no async runtime is \
+             available here; run `zeroclaw memory reindex` to re-embed"
+        );
+        return;
+    };
+    let mem = mem.clone();
+    handle.spawn(async move {
+        match mem.reindex().await {
+            Ok(count) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"reembedded": count})),
+                    "memory: background re-embed after embedding identity change complete"
+                );
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "memory: background re-embed after embedding identity change failed; \
+                     run `zeroclaw memory reindex` to retry"
+                );
+            }
+        }
+    });
 }
 
 pub fn create_memory_for_migration(
@@ -835,6 +1003,202 @@ mod tests {
         };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
         assert_eq!(mem.name(), "sqlite");
+    }
+
+    // ── Embedding identity reconciliation policy (issue #7948) ────
+
+    /// Embedder returning fixed vectors so store() persists real embeddings.
+    struct StaticEmbedding(usize);
+
+    #[async_trait::async_trait]
+    impl embeddings::EmbeddingProvider for StaticEmbedding {
+        fn name(&self) -> &str {
+            "static"
+        }
+        fn dimensions(&self) -> usize {
+            self.0
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.25f32; self.0]).collect())
+        }
+    }
+
+    fn static_sqlite(dir: &Path, dims: usize) -> SqliteMemory {
+        SqliteMemory::with_embedder(
+            "test",
+            dir,
+            Arc::new(StaticEmbedding(dims)),
+            0.7,
+            0.3,
+            1000,
+            None,
+            zeroclaw_config::schema::SearchMode::default(),
+        )
+        .unwrap()
+    }
+
+    fn ident(provider: &str, model: &str, dimensions: usize) -> embeddings::EmbeddingIdentity {
+        embeddings::EmbeddingIdentity {
+            provider: provider.into(),
+            model: model.into(),
+            dimensions,
+        }
+    }
+
+    fn embedded_rows(mem: &SqliteMemory) -> i64 {
+        let conn = mem.connection().lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn identity_adopted_on_fresh_store_then_matches() {
+        let tmp = TempDir::new().unwrap();
+        let mem = static_sqlite(tmp.path(), 4);
+        let id = ident("openai", "text-embedding-3-small", 4);
+
+        assert_eq!(
+            reconcile_embedding_identity(&mem, &id, false),
+            EmbeddingIdentityOutcome::Adopted
+        );
+        assert_eq!(
+            reconcile_embedding_identity(&mem, &id, false),
+            EmbeddingIdentityOutcome::Match
+        );
+        assert_eq!(mem.stored_embedding_identity().unwrap(), Some(id));
+    }
+
+    #[tokio::test]
+    async fn identity_adoption_on_legacy_store_keeps_vectors() {
+        let tmp = TempDir::new().unwrap();
+        let mem = static_sqlite(tmp.path(), 4);
+        // Rows written before identity tracking existed: vectors present,
+        // no recorded identity. Adoption must not invalidate them.
+        mem.store("legacy", "pre-existing row", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(embedded_rows(&mem), 1);
+
+        assert_eq!(
+            reconcile_embedding_identity(&mem, &ident("openai", "model-a", 4), false),
+            EmbeddingIdentityOutcome::Adopted
+        );
+        assert_eq!(embedded_rows(&mem), 1);
+    }
+
+    #[tokio::test]
+    async fn identity_mismatch_invalidates_vectors() {
+        let tmp = TempDir::new().unwrap();
+        let mem = static_sqlite(tmp.path(), 4);
+        reconcile_embedding_identity(&mem, &ident("openai", "model-a", 4), false);
+        mem.store("k1", "first row", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("k2", "second row", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(embedded_rows(&mem), 2);
+
+        let new_id = ident("openai", "model-b", 4);
+        assert_eq!(
+            reconcile_embedding_identity(&mem, &new_id, false),
+            EmbeddingIdentityOutcome::Invalidated(2)
+        );
+        assert_eq!(embedded_rows(&mem), 0);
+        assert_eq!(mem.stored_embedding_identity().unwrap(), Some(new_id));
+
+        // Content was retained: rows are still recallable by keyword.
+        let hits = mem.recall("second", 10, None, None, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn identity_dimension_change_alone_triggers_invalidation() {
+        let tmp = TempDir::new().unwrap();
+        let mem = static_sqlite(tmp.path(), 4);
+        reconcile_embedding_identity(&mem, &ident("openai", "model-a", 4), false);
+
+        assert_eq!(
+            reconcile_embedding_identity(&mem, &ident("openai", "model-a", 8), false),
+            EmbeddingIdentityOutcome::Invalidated(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_mismatch_with_auto_reindex_reembeds_in_background() {
+        let tmp = TempDir::new().unwrap();
+        let mem = static_sqlite(tmp.path(), 4);
+        reconcile_embedding_identity(&mem, &ident("openai", "model-a", 4), false);
+        mem.store("k1", "auto reindex row", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(embedded_rows(&mem), 1);
+
+        assert_eq!(
+            reconcile_embedding_identity(&mem, &ident("openai", "model-b", 4), true),
+            EmbeddingIdentityOutcome::Invalidated(1)
+        );
+
+        // The re-embed runs on the runtime in the background; poll briefly.
+        let mut restored = false;
+        for _ in 0..100 {
+            if embedded_rows(&mem) == 1 {
+                restored = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(restored, "background auto-reindex did not re-embed the row");
+    }
+
+    #[test]
+    fn keyword_only_factory_records_no_identity() {
+        let tmp = TempDir::new().unwrap();
+        // Default config: embedding_provider = "none" → NoopEmbedding.
+        let cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            ..MemoryConfig::default()
+        };
+        drop(create_memory(&cfg, tmp.path(), None).unwrap());
+
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        assert_eq!(mem.stored_embedding_identity().unwrap(), None);
+    }
+
+    #[test]
+    fn factory_with_embedder_stamps_and_migrates_identity() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            embedding_provider: "openai".into(),
+            embedding_model: "model-a".into(),
+            embedding_dimensions: 4,
+            ..MemoryConfig::default()
+        };
+        drop(create_memory(&cfg, tmp.path(), Some("test-key")).unwrap());
+        {
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+            assert_eq!(
+                mem.stored_embedding_identity().unwrap(),
+                Some(ident("openai", "model-a", 4))
+            );
+        }
+
+        // Same config again → identity unchanged (Match path, no churn).
+        drop(create_memory(&cfg, tmp.path(), Some("test-key")).unwrap());
+
+        // Model change → factory reconciles to the new identity.
+        cfg.embedding_model = "model-b".into();
+        drop(create_memory(&cfg, tmp.path(), Some("test-key")).unwrap());
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        assert_eq!(
+            mem.stored_embedding_identity().unwrap(),
+            Some(ident("openai", "model-b", 4))
+        );
     }
 
     #[test]
