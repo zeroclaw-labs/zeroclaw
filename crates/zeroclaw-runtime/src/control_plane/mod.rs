@@ -5,6 +5,7 @@
 //! the megafiles (`tools/delegate.rs`, `tools/spawn_subagent.rs`, `daemon/mod.rs`)
 //! change only as thin wiring at named seams:
 //!   * [`task_registry`] — the `TaskRegistry` trait + `TaskRecord`/`TaskKind`/`TaskStatus`.
+//!   * [`goal_task`] — goal-mode extension records and repository operations.
 //!   * [`task_store_sqlite`] — the single SQLite impl, modelled on
 //!     `zeroclaw_infra::acp_session_store`.
 //!   * [`authority`] — `is_authoritative`: the runtime-authority reclaim guard.
@@ -19,6 +20,7 @@
 pub mod authority;
 pub mod boot;
 pub mod global;
+pub mod goal_task;
 pub mod reaper;
 pub mod task_registry;
 pub mod task_store_sqlite;
@@ -26,5 +28,9 @@ pub mod task_store_sqlite;
 pub use authority::is_authoritative;
 pub use boot::ControlPlaneHandle;
 pub use global::{control_plane, init_control_plane};
+pub use goal_task::{
+    GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, GoalTaskRecord,
+    GoalTaskRegistry, TaskContinuationContext, TaskContinuationConversationScope, TaskGoal,
+};
 pub use task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
 pub use task_store_sqlite::SqliteTaskStore;

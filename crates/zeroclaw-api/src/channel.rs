@@ -5,6 +5,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::media::MediaAttachment;
 
+/// Reserved `ChannelMessage.subject` prefix that the git/forge channel uses
+/// to label SOP-ingress events for human-readable logs and reply threading.
+/// Routing is NOT keyed on this (see `ChannelMessage::internal_sop_event`);
+/// it lives here so any channel that fills `subject` from user-controlled
+/// data (email) can keep this reserved namespace out of inbound subjects.
+pub const CHANNEL_SOP_SUBJECT_PREFIX: &str = "zeroclaw:sop-event:";
+
 // ── Channel approval types ──────────────────────────────────────
 
 /// Compact description of a tool call presented to the user for approval.
@@ -32,6 +39,22 @@ pub enum ChannelApprovalResponse {
     /// Deny this call and supply an edited replacement for the arguments.
     #[serde(rename = "deny_with_edit")]
     DenyWithEdit { replacement: String },
+}
+
+/// An approval response together with the back-channel that produced it.
+///
+/// When a channel fans a single approval request out to several registered
+/// back-channels (the agent's approval bridge does this so an ACP editor and a
+/// WebSocket dashboard can both answer), `decided_by` names the back-channel
+/// that actually answered, so the approval audit trail can attribute the
+/// decision to the deciding surface. Because the attribution travels with the
+/// returned decision, concurrent approvals on the same channel instance cannot
+/// cross-wire it. Ordinary single channels leave it `None` — their own
+/// [`Channel::name`] already identifies the surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributedApprovalResponse {
+    pub response: ChannelApprovalResponse,
+    pub decided_by: Option<String>,
 }
 
 /// Conversation history scope for an inbound channel message.
@@ -73,9 +96,19 @@ pub struct ChannelMessage {
     pub attachments: Vec<MediaAttachment>,
     /// Email subject for reply threading.
     pub subject: Option<String>,
+    /// Internal SOP-ingress marker carrying the event topic, set ONLY by the
+    /// git/forge channel producer. The orchestrator routes a message into the
+    /// SOP engine when (and only when) this is `Some`, so the decision can
+    /// never be driven by user-controlled fields like `subject` or `content`.
+    /// `None` for every inbound conversational message. Not part of any wire
+    /// format - this never round-trips through serde.
+    pub internal_sop_event: Option<String>,
     /// When true, the orchestrator records this as context only and must not
     /// start an agent turn or emit visible channel side effects.
     pub passive_context: bool,
+    /// Channel adapter observed that this inbound message explicitly addressed
+    /// the bot through a platform-level signal such as an @mention.
+    pub explicitly_addressed: bool,
     /// Controls whether conversation history is sender-scoped or room-scoped.
     pub conversation_scope: ChannelConversationScope,
 }
@@ -516,16 +549,29 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(None)
     }
 
-    /// The name of the back-channel that produced the most recent
-    /// [`Channel::request_approval`] decision, when this channel fans a single
-    /// request out to several registered back-channels (the agent's approval
-    /// bridge does this so an ACP editor and a WebSocket dashboard can both
-    /// answer). Ordinary single channels return `None` — their own
-    /// [`Channel::name`] already identifies the deciding surface — so the
-    /// approval audit trail can record the channel that actually decided
-    /// instead of the turn loop's static channel name.
-    fn last_decision_channel(&self) -> Option<String> {
-        None
+    /// Like [`Channel::request_approval`], but also reports which back-channel
+    /// produced the decision when this channel fans the request out to several
+    /// registered back-channels (the agent's approval bridge does this so an
+    /// ACP editor and a WebSocket dashboard can both answer). The attribution
+    /// travels with the returned decision, so concurrent approvals on the same
+    /// channel instance cannot cross-wire it.
+    ///
+    /// The default implementation delegates to [`Channel::request_approval`]
+    /// and reports no specific back-channel (`decided_by: None`), which keeps
+    /// the deciding surface as the channel's own [`Channel::name`]. Only a
+    /// fan-out bridge needs to override this.
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
+        Ok(self
+            .request_approval(recipient, request)
+            .await?
+            .map(|response| AttributedApprovalResponse {
+                response,
+                decided_by: None,
+            }))
     }
 
     /// Ask the user a multiple-choice question and return the chosen option's text.
@@ -642,6 +688,7 @@ mod tests {
         assert!(msg.attachments.is_empty());
         assert!(msg.subject.is_none());
         assert!(!msg.passive_context);
+        assert!(!msg.explicitly_addressed);
         assert_eq!(msg.conversation_scope, ChannelConversationScope::Sender);
     }
 

@@ -97,7 +97,7 @@ Core architecture is trait-driven and modular. Extend by implementing traits and
 
 Key extension points:
 
-- `crates/zeroclaw-api/src/provider.rs` (`Provider`)
+- `crates/zeroclaw-api/src/model_provider.rs` (`ModelProvider`)
 - `crates/zeroclaw-api/src/channel.rs` (`Channel`)
 - `crates/zeroclaw-api/src/tool.rs` (`Tool`)
 - `crates/zeroclaw-api/src/memory_traits.rs` (`Memory`)
@@ -117,6 +117,7 @@ Every workspace crate carries a stability tier per the Microkernel Architecture 
 | `zeroclaw-providers` | Beta | — |
 | `zeroclaw-memory` | Beta | — |
 | `zeroclaw-infra` | Beta | — |
+| `zeroclaw-commands` | Experimental | Built-in command catalogue and metadata |
 | `zeroclaw-tool-call-parser` | Beta | Stable at v0.8.0 |
 | `zeroclaw-channels` | Experimental | Plugin migration at v1.0.0 |
 | `zeroclaw-tools` | Experimental | Plugin migration at v1.0.0 |
@@ -139,7 +140,7 @@ Tiers are promoted, never demoted, through deliberate team decision.
 
 - `src/main.rs` — CLI entrypoint and command routing
 - `src/lib.rs` — module re-exports and CLI command enum definitions
-- `crates/zeroclaw-api/` — public trait definitions (Provider, Channel, Tool, Memory, Observer, Peripheral)
+- `crates/zeroclaw-api/` — public trait definitions (ModelProvider, Channel, Tool, Memory, Observer, Peripheral)
 - `crates/zeroclaw-config/` — schema, config loading/merging
 - `crates/zeroclaw-log/` — unified log surface (record! macro, LogEvent schema, JSONL persistence, broadcast hook, Observer bridge)
 - `crates/zeroclaw-macros/` — Configurable derive macro
@@ -159,6 +160,7 @@ Tiers are promoted, never demoted, through deliberate team decision.
 - `apps/zerocode/` — TUI onboarding wizard
 - `crates/zeroclaw-plugins/` — WASM plugin system
 - `crates/zeroclaw-tool-call-parser/` — tool call parsing
+- `apps/tauri/` — Tauri-based desktop GUI
 - `docs/` — topic-based documentation (setup-guides, reference, ops, security, hardware, contributing, maintainers)
 - `.github/` — CI, templates, automation workflows
 
@@ -205,6 +207,7 @@ AI coding assistant skills live in `.claude/skills/`. Use the right one for the 
 
 - `.claude/skills/github-pr-review-session/SKILL.md` — PR review co-pilot; assists **you** as the human reviewer. Resolves the active reviewer from session state or `gh`, uses the RFC feedback taxonomy (🔴/🟡/✅/🔵/🟢), and formats formal review findings as H3 headings that start with the taxonomy emoji. Trigger: `review 1234`, `re-review 1234`, `go through the queue`.
 - `.claude/skills/changelog-generation/SKILL.md` — generates `CHANGELOG-next.md` between stable tags, resolves contributors via GraphQL, feeds the release workflow. Trigger: `generate changelog`, `release notes for v0.7.x`.
+- `.claude/skills/pr-architecture-check/SKILL.md` — Advisory architecture review of a PR diff; validates dependency direction, trait boundaries, extension patterns, crate placement, and core constraints against AGENTS.md and FND-001. Posts a non-blocking comment. Trigger: `arch-check #N`, `architecture check #N`.
 - `.claude/skills/github-issue-triage/SKILL.md` — Issue triage and lifecycle management; manages the backlog, labels, and stale policies. Trigger: `triage issues`, `sweep issues`, `handle issue #N`.
 - `.claude/skills/github-issue/SKILL.md` — Interactively files structured GitHub issues (bug reports or feature requests) using repo templates. Trigger: `file issue`, `report bug`, `feature request`.
 - `.claude/skills/github-pr/SKILL.md` — Opens or updates GitHub PRs, handles validation evidence, and manages PR descriptions. Trigger: `open PR`, `update PR`, `submit for review`.
@@ -236,3 +239,4 @@ Dev-operational contracts — files consumed by AI coding skills and development
 - `@docs/book/src/developing/extension-examples.md` — adding providers, channels, tools, peripherals; tool shared-state contract; architecture boundary rules
 - `@docs/book/src/contributing/privacy.md` — privacy rules and neutral-placeholder palette
 - `@docs/book/src/maintainers/superseding.md` — superseded-PR attribution, PR/commit templates, handoff template
+- `@docs/maintainers/audit-policy.md` — `.cargo/audit.toml` / `deny.toml` ignore rationale and add/remove workflow (tracks #8519, #8059)

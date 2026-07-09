@@ -239,9 +239,10 @@ impl SopRunStore for SqliteRunStore {
 
     fn last_terminal_completed_at(&self, sop_name: &str) -> Result<Option<String>, StoreError> {
         let g = self.lock()?;
-        // `completed_at` lives inside the run JSON, not a column. Pull the terminal
-        // rows for this SOP (bounded by retention) and take the max completion.
-        // ISO-8601 UTC ("...Z") timestamps sort lexically in completion order.
+        // `completed_at` lives inside the run JSON, not a column. Pull the
+        // successful terminal rows for this SOP (bounded by retention) and take
+        // the max completion. ISO-8601 UTC ("...Z") timestamps sort lexically
+        // in completion order.
         let mut stmt = g
             .prepare("SELECT json FROM sop_runs WHERE terminal=1")
             .map_err(sql_err)?;
@@ -251,7 +252,9 @@ impl SopRunStore for SqliteRunStore {
         let mut latest: Option<String> = None;
         for row in rows {
             let pr: PersistedRun = serde_json::from_str(&row.map_err(sql_err)?)?;
-            if pr.run.sop_name != sop_name {
+            if pr.run.sop_name != sop_name
+                || pr.run.status != crate::sop::types::SopRunStatus::Completed
+            {
                 continue;
             }
             if let Some(completed) = pr.run.completed_at
