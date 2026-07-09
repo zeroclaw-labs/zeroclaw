@@ -3079,6 +3079,7 @@ fn chord_label_pair(
 }
 
 fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
+    let fill = theme::fill_style();
     let title = crate::i18n::t_args(
         "zc-queue-title",
         &[("count", &state.queue_len().to_string())],
@@ -3088,6 +3089,7 @@ fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
         .title(Span::styled(format!(" {title} "), theme::title_style()));
     let inner = block.inner(area);
     f.render_widget(Clear, area);
+    f.render_widget(Block::default().style(fill), area);
     f.render_widget(block, area);
     state.queue_item_rects.clear();
     state.queue_sidebar_rect = None;
@@ -3166,7 +3168,7 @@ fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
     // width hard-truncates. Wrapping made long messages spill onto extra rows
     // and pushed the queue out of alignment; the preview is already clipped to
     // the inner width above, and ratatui truncates anything still too wide.
-    let para = Paragraph::new(rows).scroll((scroll, 0));
+    let para = Paragraph::new(rows).style(fill).scroll((scroll, 0));
     f.render_widget(para, inner);
 }
 
@@ -3853,7 +3855,9 @@ fn render_session_list_overlay(
 ) {
     let overlay_area = session_list_overlay_area(area);
 
+    let fill = theme::fill_style();
     f.render_widget(Clear, overlay_area);
+    f.render_widget(Block::default().style(fill), overlay_area);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3876,7 +3880,9 @@ fn render_session_list_overlay(
         })
         .collect();
 
-    let list = List::new(items).highlight_style(theme::list_highlight_style());
+    let list = List::new(items)
+        .style(fill)
+        .highlight_style(theme::list_highlight_style());
     // Copy state to pass as mutable.
     let mut ls = *list_state;
     f.render_stateful_widget(list, inner, &mut ls);
@@ -6973,6 +6979,85 @@ mod tests {
             cell.style().bg,
             Some(expected_bg),
             "approval overlay interior must use the active ZeroCode theme background"
+        );
+    }
+
+    #[test]
+    fn queue_sidebar_uses_theme_background_after_clear() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let expected_bg = theme::background();
+        assert_ne!(
+            expected_bg,
+            ratatui::style::Color::Reset,
+            "default ZeroCode theme should provide a concrete sidebar background"
+        );
+
+        let mut s = state();
+        s.enqueue_message("queued prompt".to_string(), Vec::new())
+            .expect("queue message");
+
+        let area = Rect::new(0, 0, 36, 8);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_queue_sidebar(frame, &mut s, area);
+            })
+            .expect("draw queue sidebar");
+
+        let cell = &terminal.backend().buffer()[(area.width - 2, area.height - 2)];
+        assert_eq!(
+            cell.style().bg,
+            Some(expected_bg),
+            "queue sidebar interior must use the active ZeroCode theme background"
+        );
+    }
+
+    #[test]
+    fn session_list_overlay_uses_theme_background_after_clear() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let expected_bg = theme::background();
+        assert_ne!(
+            expected_bg,
+            ratatui::style::Color::Reset,
+            "default ZeroCode theme should provide a concrete overlay background"
+        );
+
+        let sessions = vec![SessionEntry {
+            session_id: "sess-1".to_string(),
+            session_key: "agent:sess-1".to_string(),
+            created_at: "2026-07-09T00:00:00Z".to_string(),
+            last_activity: "2026-07-09T00:00:00Z".to_string(),
+            message_count: 3,
+            agent_alias: Some("myagent".to_string()),
+            channel_id: None,
+            name: Some("Work session".to_string()),
+        }];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+
+        let area = Rect::new(0, 0, 100, 30);
+        let overlay = session_list_overlay_area(area);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_session_list_overlay(frame, area, &sessions, &list_state);
+            })
+            .expect("draw session list overlay");
+
+        let cell = &terminal.backend().buffer()[(
+            overlay.x + overlay.width - 2,
+            overlay.y + overlay.height - 2,
+        )];
+        assert_eq!(
+            cell.style().bg,
+            Some(expected_bg),
+            "session picker interior must use the active ZeroCode theme background"
         );
     }
 
