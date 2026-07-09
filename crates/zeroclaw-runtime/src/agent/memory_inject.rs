@@ -311,10 +311,12 @@ mod tests {
     }
 
     /// Recall returns the fixture list for the requested session scope;
-    /// `fail` simulates a backend error.
+    /// `fail` simulates a backend error. `recalls` counts backend recalls
+    /// so pipeline-composition tests can observe cache hits.
     struct FixtureMemory {
         by_session: HashMap<Option<String>, Vec<MemoryEntry>>,
         fail: bool,
+        recalls: std::sync::atomic::AtomicUsize,
     }
 
     impl FixtureMemory {
@@ -324,6 +326,7 @@ mod tests {
             Self {
                 by_session,
                 fail: false,
+                recalls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -331,6 +334,7 @@ mod tests {
             Self {
                 by_session: HashMap::new(),
                 fail: true,
+                recalls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
     }
@@ -355,6 +359,8 @@ mod tests {
             _since: Option<&str>,
             _until: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recalls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.fail {
                 anyhow::bail!("backend down");
             }
@@ -750,6 +756,7 @@ mod tests {
         let mem = FixtureMemory {
             by_session,
             fail: false,
+            recalls: std::sync::atomic::AtomicUsize::new(0),
         };
         let observer = RecordingObserver::default();
 
@@ -769,5 +776,57 @@ mod tests {
         assert!(context.contains("- only_first: h"));
         assert!(context.contains("- only_sender: s"));
         assert_eq!(observer.recalls.lock().as_slice(), &[(3, true)]);
+    }
+
+    /// Injection-path smoke for the staged retrieval pipeline: when the
+    /// turn's memory handle is pipeline-wrapped (as `create_memory_for_agent`
+    /// now builds it), the renderer's recall observably routes through the
+    /// pipeline -- a repeated render is served from the pipeline's hot cache
+    /// (one backend recall), and the rendered block is identical.
+    #[tokio::test]
+    async fn recall_routes_through_retrieval_pipeline_and_reuses_cache() {
+        let fixture = std::sync::Arc::new(FixtureMemory::with(vec![entry(
+            "fact",
+            "server is prod-3",
+            MemoryCategory::Core,
+            Some(0.9),
+        )]));
+        let pipeline = zeroclaw_memory::RetrievalPipeline::new(
+            fixture.clone() as std::sync::Arc<dyn Memory>,
+            zeroclaw_memory::RetrievalConfig::default(),
+        );
+        let observer = RecordingObserver::default();
+
+        let first = render_memory_context(
+            &pipeline,
+            &observer,
+            "which server",
+            &[],
+            &MemoryInjectConfig::default(),
+            false,
+        )
+        .await;
+        let second = render_memory_context(
+            &pipeline,
+            &observer,
+            "which server",
+            &[],
+            &MemoryInjectConfig::default(),
+            false,
+        )
+        .await;
+
+        assert!(first.contains("- fact: server is prod-3"));
+        assert_eq!(first, second, "cached recall must render identically");
+        assert_eq!(
+            fixture.recalls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "second render must be served from the pipeline hot cache"
+        );
+        assert_eq!(
+            observer.recalls.lock().as_slice(),
+            &[(1, true), (1, true)],
+            "both renders emit a MemoryRecall event"
+        );
     }
 }

@@ -871,6 +871,39 @@ pub fn create_memory_for_migration(
     )
 }
 
+/// Wrap an agent memory handle in the staged [`RetrievalPipeline`] so every
+/// recall on it routes through the configured `[memory] retrieval_stages`
+/// (hot cache, FTS early-return, vector) and every mutation invalidates the
+/// pipeline's hot cache.
+///
+/// The pipeline can only produce rows out of a backend stage
+/// ([`retrieval::BACKEND_STAGES`]); a stage list without one would turn
+/// every recall into an empty result. Such a config keeps direct recall
+/// (with a warning) rather than silently losing memory.
+fn wrap_in_retrieval_pipeline(memory: Arc<dyn Memory>, config: &MemoryConfig) -> Arc<dyn Memory> {
+    if !retrieval::has_backend_stage(&config.retrieval_stages) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Memory)
+                .with_attrs(::serde_json::json!({
+                    "retrieval_stages": config.retrieval_stages,
+                })),
+            "memory: [memory] retrieval_stages lists no backend stage (\"fts\" or \
+             \"vector\"); staged retrieval disabled, recall goes direct to the backend"
+        );
+        return memory;
+    }
+    Arc::new(retrieval::RetrievalPipeline::new(
+        memory,
+        RetrievalConfig {
+            stages: config.retrieval_stages.clone(),
+            fts_early_return_score: config.fts_early_return_score,
+            ..RetrievalConfig::default()
+        },
+    ))
+}
+
 /// Build the per-agent memory wrapper for `agent_alias`.
 ///
 /// Wraps the appropriate inner backend with `AgentScopedMemory` (for
@@ -879,6 +912,11 @@ pub fn create_memory_for_migration(
 /// Markdown-backed agents — per-agent dirs, peer set composed from
 /// the resolved `read_memory_from` allowlist). `NoneMemory` agents
 /// pass through unwrapped.
+///
+/// The scoped handle is then wrapped in the staged [`RetrievalPipeline`]
+/// (outermost), so per-turn injection recall and the memory tools route
+/// through `[memory] retrieval_stages`. `NoneMemory` agents skip the
+/// pipeline: there is nothing to stage or cache.
 ///
 /// Cross-backend allowlist entries are rejected at config load, so by
 /// the time we get here every entry on
@@ -911,7 +949,7 @@ pub async fn create_memory_for_agent(
             });
         }
         let scoped = AgentScopedMarkdownMemory::new(agent_alias, own, peers);
-        return Ok(Arc::new(scoped));
+        return Ok(wrap_in_retrieval_pipeline(Arc::new(scoped), &config.memory));
     }
 
     // None branch: nothing to scope, no agents-table lookup needed.
@@ -950,7 +988,7 @@ pub async fn create_memory_for_agent(
     }
 
     let scoped = AgentScopedMemory::new(inner_arc, bound_id, allowlist_ids);
-    Ok(Arc::new(scoped))
+    Ok(wrap_in_retrieval_pipeline(Arc::new(scoped), &config.memory))
 }
 
 /// Factory: create an optional response cache from config.
@@ -1913,5 +1951,93 @@ mod tests {
         assert_eq!(value["severity_text"], "WARN");
         assert_eq!(value["attributes"]["provider_ref"], "custom.myembed");
         assert_eq!(value["attributes"]["provider_kind"], "custom");
+    }
+
+    // -- create_memory_for_agent x retrieval pipeline --------------
+
+    fn agent_config(tmp: &TempDir) -> zeroclaw_config::schema::Config {
+        let mut agents = std::collections::HashMap::new();
+        agents.insert(
+            "ops".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            agents,
+            ..zeroclaw_config::schema::Config::default()
+        }
+    }
+
+    /// The agent factory wraps the scoped handle in the retrieval pipeline:
+    /// a repeated identical recall is served from handle-local hot cache
+    /// (a sibling handle's write is not seen until this handle mutates or
+    /// the TTL lapses), and any mutation through the handle invalidates it.
+    #[tokio::test]
+    async fn create_memory_for_agent_routes_recall_through_pipeline() {
+        let tmp = TempDir::new().unwrap();
+        let config = agent_config(&tmp);
+
+        let handle_a = create_memory_for_agent(&config, "ops", None).await.unwrap();
+        let handle_b = create_memory_for_agent(&config, "ops", None).await.unwrap();
+
+        handle_a
+            .store("k1", "first fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let first = handle_a.recall("fact", 10, None, None, None).await.unwrap();
+        assert_eq!(first.len(), 1, "seed row must be recallable");
+
+        // A sibling handle writes; handle_a's cached recall must stay
+        // byte-identical to its first result (pipeline cache is live).
+        handle_b
+            .store("k2", "second fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let cached = handle_a.recall("fact", 10, None, None, None).await.unwrap();
+        assert_eq!(
+            serde_json::to_string(&cached).unwrap(),
+            serde_json::to_string(&first).unwrap(),
+            "identical recall on an unmutated handle is served from the pipeline cache"
+        );
+        assert_eq!(
+            handle_b
+                .recall("fact", 10, None, None, None)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "the writing handle sees its own row immediately"
+        );
+
+        // A mutation through handle_a invalidates its cache: the next
+        // recall reflects the full store again.
+        handle_a
+            .store("k3", "third fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let fresh = handle_a.recall("fact", 10, None, None, None).await.unwrap();
+        assert_eq!(fresh.len(), 3, "post-mutation recall must be uncached");
+    }
+
+    /// A stage list without a backend stage would make every recall empty;
+    /// the factory refuses to wrap and recall stays direct.
+    #[tokio::test]
+    async fn factory_skips_pipeline_without_backend_stage() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = agent_config(&tmp);
+        config.memory.retrieval_stages = vec!["cache".to_string()];
+
+        let handle = create_memory_for_agent(&config, "ops", None).await.unwrap();
+        handle
+            .store("k1", "first fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let hits = handle.recall("fact", 10, None, None, None).await.unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "recall must keep working without the pipeline"
+        );
     }
 }
