@@ -51,6 +51,11 @@ impl AuthService {
         self.store.load().await
     }
 
+    /// Read-only listing of persisted profile IDs (no decrypt, no migration).
+    pub async fn list_profile_ids(&self) -> Result<Vec<String>> {
+        self.store.list_profile_ids().await
+    }
+
     pub async fn store_openai_tokens(
         &self,
         profile_name: &str,

@@ -10,6 +10,7 @@ import {
   Puzzle,
   Settings,
   Smartphone,
+  Sparkles,
   Stethoscope,
   Terminal,
   Wrench,
@@ -49,6 +50,7 @@ const navGroups: NavGroup[] = [
       { to: '/config', icon: Settings, labelKey: 'nav.config' },
       { to: '/config/agents', icon: Bot, labelKey: 'nav.agent' },
       { to: '/tools', icon: Wrench, labelKey: 'nav.tools' },
+      { to: '/skills', icon: Sparkles, labelKey: 'nav.skills' },
       { to: '/integrations', icon: Puzzle, labelKey: 'nav.integrations' },
       { to: '/cron', icon: Clock, labelKey: 'nav.cron' },
     ],
@@ -285,7 +287,7 @@ function RailLogo() {
           style={{ background: 'linear-gradient(135deg, rgba(var(--pc-accent-rgb), 0.15), rgba(var(--pc-accent-rgb), 0.05))' }}
         />
         <img
-          src={`${basePath}/_app/zeroclaw-trans.png`}
+          src={`${basePath}/_app/logo.png`}
           alt={t('sidebar.logo_alt')}
           className="relative h-8 w-8 rounded-xl object-cover"
           onError={(e) => {
@@ -310,7 +312,7 @@ function DrawerLogo() {
           style={{ background: 'linear-gradient(135deg, rgba(var(--pc-accent-rgb), 0.15), rgba(var(--pc-accent-rgb), 0.05))' }}
         />
         <img
-          src={`${basePath}/_app/zeroclaw-trans.png`}
+          src={`${basePath}/_app/logo.png`}
           alt={t('sidebar.logo_alt')}
           className="relative h-9 w-9 rounded-xl object-cover"
           onError={(e) => {
