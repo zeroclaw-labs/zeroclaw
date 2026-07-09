@@ -133,9 +133,7 @@ verdict:
 - Linked issue verbs are accurate: use `Closes` / `Fixes` / `Resolves` only
   when the PR fully resolves the issue; otherwise use `Related`, `Depends on`,
   or `Supersedes`.
-- Validation evidence names commands that actually ran, includes relevant
-  output or an honest skip reason, and does not treat pending CI as local
-  validation.
+- Validation evidence names the checks being relied on: required CI, focused local tests, manual smoke, docs/link gates, or full workspace checks when broad coverage proves something narrower evidence would miss. Commands that ran include relevant output or an honest skip reason. Fresh required CI is valid evidence when it covers the changed surface; do not require duplicate local Cargo for the same head, target, and feature set. Pending CI is not evidence yet.
 - Security/privacy, compatibility, rollback, and scope-boundary claims match
   the diff and current behavior.
 - Public text does not include bot/AI attribution footers, local workflow
@@ -148,11 +146,16 @@ verdict:
 
 | Situation | Verdict flag |
 |---|---|
-| Your review is approving, the template/truthfulness checks are satisfied, and no other reviewer holds an active block | `--approve` |
+| Your review is approving, the template/truthfulness checks are satisfied, and active blocks are resolved, dismissed, stale, or explicitly reconciled in your review | `--approve` |
 | Your review is rejecting on substantive grounds you'd block on personally | `--request-changes` |
 | You have nothing new to block on but other reviewers hold active blocks | `--comment` |
 | You have specific findings but they're all 🔵 suggestions or non-blocking clarification questions | `--comment` |
-| You're a maintainer override-approving over another reviewer's `CHANGES_REQUESTED` | **Don't.** Get the other reviewer to dismiss or convert their review first. |
+
+Do not ignore another reviewer's active `CHANGES_REQUESTED`. Before approving, check whether the concern is resolved in the current diff, stale, dismissed, or still valid. If you approve while an older block is still visible, explain why that concern has been resolved.
+
+## Validation evidence gaps
+
+When validation is the concern, identify the exact evidence gap instead of asking for "full Cargo" by reflex. Check the current required CI jobs and the changed surface, then ask for extra validation only where required CI does not prove the thing under review: tests for a platform that only received compile checks, Clippy for a platform or path outside the required lint job, desktop coverage when the desktop workflow did not trigger, release targets outside the PR matrix, stale CI, or unavailable CI.
 
 ## Feedback taxonomy
 
