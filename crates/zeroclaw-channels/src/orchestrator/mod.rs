@@ -20695,162 +20695,169 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[tokio::test]
     async fn process_channel_message_memory_recall_difference_keeps_system_byte_identical() {
-        // Regression for Blocker 2: PR #6630 still appended the per-turn
-        // memory_context to the system prompt. When recall returns
-        // different entries across turns (which it does in real use),
-        // the system prompt churned and the cache missed. The fix
-        // moves memory into the outgoing user turn preamble so the
-        // system prefix stays byte-stable.
-        //
-        // We use a query-aware test memory that returns different
-        // content based on the inbound user message text.
-        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+        Box::pin(async {
+            // Regression for Blocker 2: PR #6630 still appended the per-turn
+            // memory_context to the system prompt. When recall returns
+            // different entries across turns (which it does in real use),
+            // the system prompt churned and the cache missed. The fix
+            // moves memory into the outgoing user turn preamble so the
+            // system prefix stays byte-stable.
+            //
+            // We use a query-aware test memory that returns different
+            // content based on the inbound user message text.
+            let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
 
-        struct QueryAwareMemory;
-        #[async_trait::async_trait]
-        impl Memory for QueryAwareMemory {
-            fn name(&self) -> &str {
-                "query-aware-memory"
+            struct QueryAwareMemory;
+            #[async_trait::async_trait]
+            impl Memory for QueryAwareMemory {
+                fn name(&self) -> &str {
+                    "query-aware-memory"
+                }
+                async fn store(
+                    &self,
+                    _key: &str,
+                    _content: &str,
+                    _category: zeroclaw_memory::MemoryCategory,
+                    _session_id: Option<&str>,
+                ) -> anyhow::Result<()> {
+                    Ok(())
+                }
+                async fn recall(
+                    &self,
+                    query: &str,
+                    _limit: usize,
+                    _session_id: Option<&str>,
+                    _since: Option<&str>,
+                    _until: Option<&str>,
+                ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+                    Ok(vec![zeroclaw_memory::MemoryEntry {
+                        id: "entry-x".to_string(),
+                        key: format!("key-for-{}", query),
+                        content: format!("memory-for-{}", query),
+                        category: zeroclaw_memory::MemoryCategory::Conversation,
+                        timestamp: "2026-02-20T00:00:00Z".to_string(),
+                        session_id: None,
+                        score: Some(0.9),
+                        namespace: "default".into(),
+                        importance: None,
+                        superseded_by: None,
+                        kind: None,
+                        pinned: false,
+                        tenant_id: None,
+                        agent_alias: None,
+                        agent_id: None,
+                    }])
+                }
+                async fn get(
+                    &self,
+                    _key: &str,
+                ) -> anyhow::Result<Option<zeroclaw_memory::MemoryEntry>> {
+                    Ok(None)
+                }
+                async fn list(
+                    &self,
+                    _category: Option<&zeroclaw_memory::MemoryCategory>,
+                    _session_id: Option<&str>,
+                ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+                    Ok(Vec::new())
+                }
+                async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+                    Ok(false)
+                }
+                async fn forget_for_agent(
+                    &self,
+                    _key: &str,
+                    _agent_id: &str,
+                ) -> anyhow::Result<bool> {
+                    Ok(false)
+                }
+                async fn count(&self) -> anyhow::Result<usize> {
+                    Ok(1)
+                }
+                async fn health_check(&self) -> bool {
+                    true
+                }
+                async fn store_with_agent(
+                    &self,
+                    _key: &str,
+                    _content: &str,
+                    _category: zeroclaw_memory::MemoryCategory,
+                    _session_id: Option<&str>,
+                    _namespace: Option<&str>,
+                    _importance: Option<f64>,
+                    _agent_id: Option<&str>,
+                ) -> anyhow::Result<()> {
+                    Ok(())
+                }
+                async fn recall_for_agents(
+                    &self,
+                    _allowed_agent_ids: &[&str],
+                    query: &str,
+                    _limit: usize,
+                    _session_id: Option<&str>,
+                    _since: Option<&str>,
+                    _until: Option<&str>,
+                ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+                    self.recall(query, 5, None, None, None).await
+                }
             }
-            async fn store(
-                &self,
-                _key: &str,
-                _content: &str,
-                _category: zeroclaw_memory::MemoryCategory,
-                _session_id: Option<&str>,
-            ) -> anyhow::Result<()> {
-                Ok(())
+            impl ::zeroclaw_api::attribution::Attributable for QueryAwareMemory {
+                fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                    ::zeroclaw_api::attribution::Role::Memory(
+                        ::zeroclaw_api::attribution::MemoryKind::InMemory,
+                    )
+                }
+                fn alias(&self) -> &str {
+                    "QueryAwareMemory"
+                }
             }
-            async fn recall(
-                &self,
-                query: &str,
-                _limit: usize,
-                _session_id: Option<&str>,
-                _since: Option<&str>,
-                _until: Option<&str>,
-            ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
-                Ok(vec![zeroclaw_memory::MemoryEntry {
-                    id: "entry-x".to_string(),
-                    key: format!("key-for-{}", query),
-                    content: format!("memory-for-{}", query),
-                    category: zeroclaw_memory::MemoryCategory::Conversation,
-                    timestamp: "2026-02-20T00:00:00Z".to_string(),
-                    session_id: None,
-                    score: Some(0.9),
-                    namespace: "default".into(),
-                    importance: None,
-                    superseded_by: None,
-                    kind: None,
-                    pinned: false,
-                    tenant_id: None,
-                    agent_alias: None,
-                    agent_id: None,
-                }])
-            }
-            async fn get(
-                &self,
-                _key: &str,
-            ) -> anyhow::Result<Option<zeroclaw_memory::MemoryEntry>> {
-                Ok(None)
-            }
-            async fn list(
-                &self,
-                _category: Option<&zeroclaw_memory::MemoryCategory>,
-                _session_id: Option<&str>,
-            ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
-                Ok(Vec::new())
-            }
-            async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
-                Ok(false)
-            }
-            async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
-                Ok(false)
-            }
-            async fn count(&self) -> anyhow::Result<usize> {
-                Ok(1)
-            }
-            async fn health_check(&self) -> bool {
-                true
-            }
-            async fn store_with_agent(
-                &self,
-                _key: &str,
-                _content: &str,
-                _category: zeroclaw_memory::MemoryCategory,
-                _session_id: Option<&str>,
-                _namespace: Option<&str>,
-                _importance: Option<f64>,
-                _agent_id: Option<&str>,
-            ) -> anyhow::Result<()> {
-                Ok(())
-            }
-            async fn recall_for_agents(
-                &self,
-                _allowed_agent_ids: &[&str],
-                query: &str,
-                _limit: usize,
-                _session_id: Option<&str>,
-                _since: Option<&str>,
-                _until: Option<&str>,
-            ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
-                self.recall(query, 5, None, None, None).await
-            }
-        }
-        impl ::zeroclaw_api::attribution::Attributable for QueryAwareMemory {
-            fn role(&self) -> ::zeroclaw_api::attribution::Role {
-                ::zeroclaw_api::attribution::Role::Memory(
-                    ::zeroclaw_api::attribution::MemoryKind::InMemory,
-                )
-            }
-            fn alias(&self) -> &str {
-                "QueryAwareMemory"
-            }
-        }
 
-        let runtime_ctx =
-            cache_stability_test_context(provider_impl.clone(), Arc::new(QueryAwareMemory));
+            let runtime_ctx =
+                cache_stability_test_context(provider_impl.clone(), Arc::new(QueryAwareMemory));
 
-        drive_one_message(runtime_ctx.clone(), "alice", "chat:42", "alpha", "msg-1", 1).await;
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        drive_one_message(runtime_ctx.clone(), "alice", "chat:42", "beta", "msg-2", 2).await;
+            drive_one_message(runtime_ctx.clone(), "alice", "chat:42", "alpha", "msg-1", 1).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            drive_one_message(runtime_ctx.clone(), "alice", "chat:42", "beta", "msg-2", 2).await;
 
-        let calls = provider_impl
-            .calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(calls.len(), 2);
-        // System prompt must remain byte-stable even though the per-turn
-        // memory recall returns different entries (key-for-alpha vs
-        // key-for-beta, memory-for-alpha vs memory-for-beta).
-        assert_eq!(
-            calls[0][0].1, calls[1][0].1,
-            "system prompt must not vary with per-turn memory recall"
-        );
-        assert!(
-            !calls[0][0].1.contains("memory-for-"),
-            "system prompt must not contain memory content (it's now in the user turn): {}",
-            calls[0][0].1
-        );
-        // The current outgoing user turn is the LAST element of each call's
-        // history snapshot (the cache prefix is everything before it).
-        let last_user_turn_0 = calls[0]
-            .iter()
-            .rfind(|(role, _)| role == "user")
-            .expect("first call should contain a user turn");
-        let last_user_turn_1 = calls[1]
-            .iter()
-            .rfind(|(role, _)| role == "user")
-            .expect("second call should contain a user turn");
-        assert!(
-            last_user_turn_0.1.contains("memory-for-alpha"),
-            "first turn current user content: {}",
-            last_user_turn_0.1
-        );
-        assert!(
-            last_user_turn_1.1.contains("memory-for-beta"),
-            "second turn current user content: {}",
-            last_user_turn_1.1
-        );
+            let calls = provider_impl
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(calls.len(), 2);
+            // System prompt must remain byte-stable even though the per-turn
+            // memory recall returns different entries (key-for-alpha vs
+            // key-for-beta, memory-for-alpha vs memory-for-beta).
+            assert_eq!(
+                calls[0][0].1, calls[1][0].1,
+                "system prompt must not vary with per-turn memory recall"
+            );
+            assert!(
+                !calls[0][0].1.contains("memory-for-"),
+                "system prompt must not contain memory content (it's now in the user turn): {}",
+                calls[0][0].1
+            );
+            // The current outgoing user turn is the LAST element of each call's
+            // history snapshot (the cache prefix is everything before it).
+            let last_user_turn_0 = calls[0]
+                .iter()
+                .rfind(|(role, _)| role == "user")
+                .expect("first call should contain a user turn");
+            let last_user_turn_1 = calls[1]
+                .iter()
+                .rfind(|(role, _)| role == "user")
+                .expect("second call should contain a user turn");
+            assert!(
+                last_user_turn_0.1.contains("memory-for-alpha"),
+                "first turn current user content: {}",
+                last_user_turn_0.1
+            );
+            assert!(
+                last_user_turn_1.1.contains("memory-for-beta"),
+                "second turn current user content: {}",
+                last_user_turn_1.1
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
