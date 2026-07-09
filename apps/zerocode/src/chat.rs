@@ -2315,6 +2315,7 @@ impl Chat {
                         .find(|r| mouse::in_rect(col, row, r.rect))
                         .map(|r| r.text.clone())
                     {
+                        state.clear_transcript_selection();
                         if !text.is_empty() {
                             crate::mouse::copy_osc52(&text);
                             state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
@@ -2325,10 +2326,14 @@ impl Chat {
                         .entry_rects
                         .iter()
                         .find(|(_, r)| mouse::in_rect(col, row, *r))
-                        .map(|(idx, _)| *idx);
+                        .map(|(idx, rect)| (*idx, *rect));
                     let shift = mouse.modifiers.contains(KM::SHIFT);
                     let ctrl = mouse.modifiers.contains(KM::CONTROL);
-                    if let Some(idx) = hit {
+                    if let Some((idx, rect)) = hit {
+                        if !state.entry_has_content_at(idx, col, row, rect) {
+                            state.clear_transcript_selection();
+                            return;
+                        }
                         if ctrl {
                             if state.in_browse_mode() {
                                 if !state.browse_multi.remove(&idx) {
@@ -2368,18 +2373,14 @@ impl Chat {
                                 state.browse_cursor = Some(idx);
                                 state.mouse_down_entry = Some(idx);
                             } else {
-                                // Out of browse mode: copy silently, brief highlight
+                                // Out of browse mode: select the entry and reveal
+                                // its contextual copy action without touching the
+                                // clipboard.
                                 state.highlighted_entry = Some(idx);
-                                ChatState::copy_entry_silently(state, idx);
                             }
                         }
                     } else {
-                        state.browse_multi.clear();
-                        state.browse_cursor = None;
-                        state.highlighted_entry = None;
-                        state.mouse_down_entry = None;
-                        state.browse_anchor = None;
-                        state.mark_dirty_full();
+                        state.clear_transcript_selection();
                     }
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
@@ -3389,10 +3390,17 @@ fn render_tool_entry(
 fn render_entry_into(
     entry: &ChatEntry,
     is_selected: bool,
+    show_copy_action: bool,
     show_thoughts: bool,
     width: u16,
     lines: &mut Vec<Line<'static>>,
 ) {
+    if show_copy_action {
+        lines.push(Line::from(Span::styled(
+            message_copy_label(),
+            theme::accent_style().add_modifier(Modifier::BOLD),
+        )));
+    }
     let sel_mod = if is_selected {
         Modifier::REVERSED
     } else {
@@ -3501,6 +3509,18 @@ fn label_cells(line: &Line<'static>, copy_lbl: &str) -> Option<(u16, u16)> {
         col += UnicodeWidthStr::width(content) as u16;
     }
     None
+}
+
+fn message_copy_label() -> String {
+    crate::i18n::t("zc-chat-copy-message")
+}
+
+fn line_display_width(line: &Line<'static>) -> u16 {
+    use unicode_width::UnicodeWidthStr;
+    line.spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>() as u16
 }
 
 /// Recover the fence language token from a code-fence header bar line. The
@@ -3700,6 +3720,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
 
     let body_rect = Rect::new(body_x, body_y, body_w, body_h);
     state.rebuild_copy_regions(inner_width, scroll, body_rect);
+    state.rebuild_message_copy_region(body_rect);
     let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
         .position(scroll as usize)
         .viewport_content_length(inner_height as usize);
@@ -4872,6 +4893,22 @@ impl ChatState {
         }
     }
 
+    fn clear_transcript_selection(&mut self) {
+        if self.highlighted_entry.is_some()
+            || self.mouse_down_entry.is_some()
+            || self.browse_cursor.is_some()
+            || self.browse_anchor.is_some()
+            || !self.browse_multi.is_empty()
+        {
+            self.highlighted_entry = None;
+            self.mouse_down_entry = None;
+            self.browse_cursor = None;
+            self.browse_anchor = None;
+            self.browse_multi.clear();
+            self.mark_dirty_full();
+        }
+    }
+
     // ── Browse-mode helpers ───────────────────────────────────────
 
     /// True when browse mode is active (cursor is set).
@@ -4884,8 +4921,7 @@ impl ChatState {
         self.browse_cursor.is_some() || !self.browse_multi.is_empty()
     }
 
-    /// Yank a single entry's body text — used by the auto-copy-on-click
-    /// feature when the user clicks a chat entry.
+    /// Yank a single entry's body text for explicit copy actions.
     fn yank_single_entry(&self, idx: usize) -> String {
         self.entries
             .get(idx)
@@ -5072,6 +5108,7 @@ impl ChatState {
                 render_entry_into(
                     entry,
                     self.is_entry_highlighted(abs_idx),
+                    self.highlighted_entry == Some(abs_idx),
                     show_thoughts,
                     width,
                     &mut new_lines,
@@ -5105,6 +5142,7 @@ impl ChatState {
             render_entry_into(
                 entry,
                 self.is_entry_highlighted(abs_idx),
+                self.highlighted_entry == Some(abs_idx),
                 show_thoughts,
                 width,
                 &mut lines,
@@ -5253,6 +5291,75 @@ impl ChatState {
             screen_cursor += wrapped_rows(line, width);
         }
         self.copy_hit_regions = regions;
+    }
+
+    fn rebuild_message_copy_region(&mut self, body: Rect) {
+        let Some(idx) = self.highlighted_entry else {
+            return;
+        };
+        let Some((_, rect)) = self
+            .entry_rects
+            .iter()
+            .find(|(entry_idx, _)| *entry_idx == idx)
+        else {
+            return;
+        };
+        if rect.height == 0 {
+            return;
+        }
+        let text = self.yank_single_entry(idx);
+        if text.is_empty() {
+            return;
+        }
+        let label = message_copy_label();
+        let line = Line::from(Span::raw(label.clone()));
+        let Some((col, cells)) = label_cells(&line, &label) else {
+            return;
+        };
+        let row = rect.y;
+        if row < body.y || row >= body.y.saturating_add(body.height) {
+            return;
+        }
+        self.copy_hit_regions.push(CopyHitRegion {
+            rect: Rect::new(rect.x + col, row, cells, 1),
+            text,
+        });
+    }
+
+    fn entry_has_content_at(&self, idx: usize, col: u16, row: u16, rect: Rect) -> bool {
+        if !mouse::in_rect(col, row, rect) {
+            return false;
+        }
+        let Some(&(_, line_lo, line_hi)) = self
+            .cached_line_ranges
+            .iter()
+            .find(|(entry_idx, _, _)| *entry_idx == idx)
+        else {
+            return true;
+        };
+        let Some(&(_, screen_lo, _)) = self
+            .cached_screen_ranges
+            .iter()
+            .find(|(entry_idx, _, _)| *entry_idx == idx)
+        else {
+            return true;
+        };
+        let visible_lo = screen_lo.max(self.scroll_offset);
+        let target_row = visible_lo.saturating_add(row.saturating_sub(rect.y));
+        let local_col = col.saturating_sub(rect.x);
+        let width = self.cached_render_width.max(1);
+        let mut row_cursor = screen_lo;
+        for line in &self.cached_lines[line_lo..line_hi] {
+            let rows = wrapped_rows(line, width);
+            if target_row < row_cursor.saturating_add(rows) {
+                if rows > 1 {
+                    return true;
+                }
+                return local_col < line_display_width(line).min(width);
+            }
+            row_cursor = row_cursor.saturating_add(rows);
+        }
+        true
     }
 
     fn compute_cached_rows(&self, width: u16) -> u16 {
@@ -7338,6 +7445,152 @@ mod tests {
             state.dirty,
             LinesDirty::Full,
             "clearing the highlight must invalidate rendered transcript lines"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_message_click_reveals_copy_action_without_copying() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &mut state, area);
+            })
+            .expect("draw chat");
+
+        let entry_rect = state
+            .entry_rects
+            .first()
+            .expect("entry region should be rendered")
+            .1;
+        state.dirty = LinesDirty::Clean;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: entry_rect.x + 1,
+            row: entry_rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(click, area).await;
+
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(
+            state.highlighted_entry,
+            Some(0),
+            "plain click should select the message"
+        );
+        assert!(
+            state.info_message.is_none(),
+            "plain click must not copy or show copied feedback"
+        );
+
+        terminal
+            .draw(|frame| {
+                render(frame, state, area);
+            })
+            .expect("redraw selected chat");
+
+        let copy_rect = state
+            .copy_hit_regions
+            .iter()
+            .find(|region| region.text == "hello")
+            .expect("selected message copy action should be rendered")
+            .rect;
+        let copy_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: copy_rect.x,
+            row: copy_rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(copy_click, area).await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(
+            state.info_message.as_ref().map(|m| m.text.as_str()),
+            Some(crate::i18n::t("zc-chat-copied-clipboard").as_str()),
+            "explicit message copy action should copy"
+        );
+        assert_eq!(
+            state.highlighted_entry, None,
+            "copy action should dismiss the transient selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_copy_clears_stale_highlight_and_shows_feedback() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("previous")));
+        state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
+            "```bash\necho hello\n```",
+        )));
+        state.highlighted_entry = Some(0);
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &mut state, area);
+            })
+            .expect("draw chat");
+
+        let copy_rect = state
+            .copy_hit_regions
+            .iter()
+            .find(|region| region.text == "echo hello")
+            .expect("code copy region should be rendered")
+            .rect;
+        state.dirty = LinesDirty::Clean;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: copy_rect.x,
+            row: copy_rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        chat.handle_mouse(click, area).await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(
+            state.highlighted_entry, None,
+            "code copy is a scoped button action, not whole-message selection"
+        );
+        assert_eq!(state.mouse_down_entry, None);
+        assert_eq!(
+            state.info_message.as_ref().map(|m| m.text.as_str()),
+            Some(crate::i18n::t("zc-chat-copied-clipboard").as_str())
         );
     }
 
