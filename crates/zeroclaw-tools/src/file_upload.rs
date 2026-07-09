@@ -104,12 +104,6 @@ impl FileUploadTool {
         }
     }
 
-    /// Stream the receiver's response body into memory while never buffering
-    /// more than `RESPONSE_BODY_LIMIT_BYTES` (+1 sentinel byte to detect that
-    /// more was available). The response comes from the operator-configured
-    /// endpoint and is untrusted: a misbehaving or hostile receiver must not be
-    /// able to make the tool read an unbounded body into memory just to surface
-    /// a small preview. Mirrors the bounded-read shape used by `web_fetch`.
     async fn read_response_body_capped(response: reqwest::Response) -> Vec<u8> {
         let hard_cap = RESPONSE_BODY_LIMIT_BYTES.saturating_add(1);
         let mut bytes = Vec::new();
@@ -128,12 +122,6 @@ impl FileUploadTool {
         bytes
     }
 
-    /// Shape a (already byte-bounded) response body into a preview of at most
-    /// `RESPONSE_BODY_LIMIT_BYTES`, snapping the cut *down* to the nearest UTF-8
-    /// character boundary so a multi-byte character straddling the limit cannot
-    /// panic the slice (`&body[..n]` requires `n` to be a char boundary). The
-    /// caller bounds the read via [`Self::read_response_body_capped`]; this only
-    /// trims the display text and flags that the body was longer than the limit.
     fn truncate_response_body(body: &str) -> String {
         if body.len() <= RESPONSE_BODY_LIMIT_BYTES {
             return body.to_string();

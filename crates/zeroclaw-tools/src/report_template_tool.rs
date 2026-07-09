@@ -1,5 +1,4 @@
 //! Report template tool — standalone access to template engine.
-//!
 //! Exposes the report template engine directly so agents can render
 //! templates with custom variable maps without going through ProjectIntelTool.
 
@@ -9,11 +8,6 @@ use serde_json::json;
 use std::collections::HashMap;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
-/// Standalone report template tool.
-///
-/// Provides direct access to the template engine for rendering
-/// weekly_status, sprint_review, risk_register, and milestone_report
-/// templates in en/de/fr/it.
 pub struct ReportTemplateTool;
 
 impl ReportTemplateTool {
