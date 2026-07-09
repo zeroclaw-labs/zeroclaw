@@ -1046,7 +1046,7 @@ impl OpenAiResponsesBuilder {
                 }
             })
             .unwrap_or_else(|| RESPONSES_URL.to_string());
-        OpenAiResponsesModelProvider {
+        OpenAiResponsesModelProvider {                     
             alias: self.alias,
             responses_url,
             credential: self.credential,
@@ -1084,8 +1084,16 @@ impl OpenAiResponsesModelProvider {
     /// Override the non-streaming HTTP request timeout in seconds.
     /// Streaming SSE calls are unaffected; they use the connect-timeout-only
     /// `streaming_client` so long responses aren't killed by a total timeout.
+    ///
+    /// Values of 0 are ignored (the default 120 s is kept) so a stray
+    /// `Some(0)` from config cannot silently disable the safety timeout.
+    /// Matches the guard on `OpenAiModelProvider::with_timeout_secs`,
+    /// `OpenAiCompatibleModelProvider::with_timeout_secs`, and
+    /// `OpenRouterModelProvider::with_timeout_secs`.
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
-        self.timeout_secs = secs;
+        if secs > 0 {
+            self.timeout_secs = secs;
+        }
         self
     }
 
