@@ -126,7 +126,9 @@ use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
 use zeroclaw_config::schema::Config;
-use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
+#[cfg(test)]
+use zeroclaw_memory::MEMORY_CONTEXT_OPEN;
+use zeroclaw_memory::{self, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
@@ -267,9 +269,6 @@ const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
-const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
-const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
-const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
 /// Proactive context-window budget in estimated characters (~4 chars/token).
@@ -1207,23 +1206,18 @@ fn build_channel_turn_context_preamble(
     preamble
 }
 
-/// Compose the outgoing user-turn content from the volatile preamble, the
-/// per-turn memory recall block, and the raw (timestamped) user content.
+/// Compose the outgoing user-turn content from the volatile preamble and
+/// the raw (timestamped) user content. The per-turn memory block is no
+/// longer composed here: the turn engine injects it above the whole user
+/// turn (agent::memory_inject), so the wire order is memory -> preamble ->
+/// raw content, matching the CLI shape.
 ///
-/// Order on the wire: preamble → memory_context → raw user content, joined
-/// by blank lines. When `preamble` is empty (CLI-style / no `reply_target`)
-/// and `memory_context` is empty, returns the raw content unchanged.
-fn compose_outgoing_user_turn_with_context(
-    preamble: &str,
-    memory_context: &str,
-    raw_user_content: &str,
-) -> String {
-    let mut parts: Vec<&str> = Vec::with_capacity(3);
+/// When `preamble` is empty (CLI-style / no `reply_target`), returns the
+/// raw content unchanged.
+fn compose_outgoing_user_turn_with_context(preamble: &str, raw_user_content: &str) -> String {
+    let mut parts: Vec<&str> = Vec::with_capacity(2);
     if !preamble.is_empty() {
         parts.push(preamble);
-    }
-    if !memory_context.is_empty() {
-        parts.push(memory_context);
     }
     parts.push(raw_user_content);
     parts.join("\n\n")
@@ -2088,7 +2082,8 @@ fn refreshed_new_session_system_prompt(ctx: &ChannelRuntimeContext) -> String {
             ctx.agent_alias.as_ref(),
         ),
         ctx.workspace_dir.as_ref(),
-        ctx.prompt_config.skills.prompt_injection_mode,
+        ctx.prompt_config
+            .effective_skills_prompt_mode(ctx.agent_alias.as_str()),
     );
     replace_available_skills_section(ctx.system_prompt.as_str(), &refreshed_skills)
 }
@@ -2257,45 +2252,6 @@ fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
     }
 
     zeroclaw_providers::reliable::is_non_retryable(error)
-}
-
-fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
-    if zeroclaw_memory::is_assistant_autosave_key(key) {
-        return true;
-    }
-
-    // Skip raw per-turn user messages: re-injecting them causes each
-    // recalled entry to embed all prior generations, growing exponentially.
-    // Consolidated knowledge is already promoted to Core/Daily entries.
-    if zeroclaw_memory::is_user_autosave_key(key) {
-        return true;
-    }
-
-    if zeroclaw_memory::should_skip_autosave_content(content) {
-        return true;
-    }
-
-    if key.trim().to_ascii_lowercase().ends_with("_history") {
-        return true;
-    }
-
-    // Skip entries containing image markers to prevent duplication.
-    // When auto_save stores a photo message to memory, a subsequent
-    // memory recall on the same turn would surface the marker again,
-    // causing two identical image blocks in the model_provider request.
-    if content.contains("[IMAGE:") {
-        return true;
-    }
-
-    // Skip entries containing tool_result blocks. After a daemon restart
-    // these can be recalled from SQLite and injected as memory context,
-    // presenting the LLM with a `<tool_result>` without a preceding
-    // `<tool_call>` and triggering hallucinated output.
-    if content.contains("<tool_result") {
-        return true;
-    }
-
-    content.chars().count() > MEMORY_CONTEXT_MAX_CHARS
 }
 
 fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
@@ -2970,114 +2926,6 @@ async fn handle_runtime_command_if_needed(
     }
 
     true
-}
-
-async fn build_memory_context(
-    mem: &dyn Memory,
-    user_msg: &str,
-    min_relevance_score: f64,
-    session_id: Option<&str>,
-) -> String {
-    build_memory_context_for_sessions(mem, user_msg, min_relevance_score, &[session_id]).await
-}
-
-async fn build_memory_context_for_sessions(
-    mem: &dyn Memory,
-    user_msg: &str,
-    min_relevance_score: f64,
-    session_ids: &[Option<&str>],
-) -> String {
-    let mut entries = Vec::new();
-    let mut seen_keys = HashSet::new();
-
-    match session_ids {
-        [] => {}
-        [session_id] => {
-            let recalled = mem.recall(user_msg, 5, *session_id, None, None).await;
-            append_recalled_memory_entries(&mut entries, &mut seen_keys, recalled);
-        }
-        [first_session_id, second_session_id] => {
-            let (first_entries, second_entries) = tokio::join!(
-                mem.recall(user_msg, 5, *first_session_id, None, None),
-                mem.recall(user_msg, 5, *second_session_id, None, None)
-            );
-            append_recalled_memory_entries(&mut entries, &mut seen_keys, first_entries);
-            append_recalled_memory_entries(&mut entries, &mut seen_keys, second_entries);
-        }
-        _ => {
-            for session_id in session_ids {
-                let recalled = mem.recall(user_msg, 5, *session_id, None, None).await;
-                append_recalled_memory_entries(&mut entries, &mut seen_keys, recalled);
-            }
-        }
-    }
-
-    format_memory_context(&entries, min_relevance_score)
-}
-
-fn append_recalled_memory_entries(
-    entries: &mut Vec<zeroclaw_memory::MemoryEntry>,
-    seen_keys: &mut HashSet<String>,
-    recalled: Result<Vec<zeroclaw_memory::MemoryEntry>>,
-) {
-    if let Ok(recalled) = recalled {
-        for entry in recalled {
-            if seen_keys.insert(entry.key.clone()) {
-                entries.push(entry);
-            }
-        }
-    }
-}
-
-fn format_memory_context(
-    entries: &[zeroclaw_memory::MemoryEntry],
-    min_relevance_score: f64,
-) -> String {
-    let mut context = String::new();
-
-    let mut included = 0usize;
-    let mut used_chars = 0usize;
-
-    for entry in entries.iter().filter(|e| match e.score {
-        Some(score) => score >= min_relevance_score,
-        None => true, // keep entries without a score (e.g. non-vector backends)
-    }) {
-        if included >= MEMORY_CONTEXT_MAX_ENTRIES {
-            break;
-        }
-
-        if should_skip_memory_context_entry(&entry.key, &entry.content) {
-            continue;
-        }
-
-        let content = if entry.content.chars().count() > MEMORY_CONTEXT_ENTRY_MAX_CHARS {
-            truncate_with_ellipsis(&entry.content, MEMORY_CONTEXT_ENTRY_MAX_CHARS)
-        } else {
-            entry.content.clone()
-        };
-
-        let line = format!("- {}: {}\n", entry.key, content);
-        let line_chars = line.chars().count();
-        if used_chars + line_chars > MEMORY_CONTEXT_MAX_CHARS {
-            break;
-        }
-
-        if included == 0 {
-            context.push_str(MEMORY_CONTEXT_OPEN);
-            context.push('\n');
-        }
-
-        context.push_str(&line);
-        used_chars += line_chars;
-        included += 1;
-    }
-
-    if included > 0 {
-        context.push_str(MEMORY_CONTEXT_CLOSE);
-        context.push_str("\n\n");
-    }
-
-    context
 }
 
 fn is_group_reply_target(reply_target: &str) -> bool {
@@ -5104,48 +4952,19 @@ async fn process_channel_message_body(
     // within the context budget (#3460).
     collapse_inline_image_payloads(&mut prior_turns);
 
-    // ── Dual-scope memory recall ──────────────────────────────────
-    // Always recall before each LLM call (not just first turn).
-    // For group chats: merge sender-scope + group-scope memories.
-    // For DMs: recall from the current conversation scope plus sender scope.
+    // ── Dual-scope memory recall (engine-injected) ───────────────
+    // Memory context is injected once in the turn engine, keyed on the
+    // ingress origin (agent::memory_inject). This site only assembles the
+    // session scopes: sender scope(s) always; the group/history scope is
+    // added for group chats so both are recalled (key-deduped, one block).
     let is_group_chat = is_group_reply_target(&msg.reply_target);
-
-    let mem_recall_start = Instant::now();
-    let sender_session_ids = sender_memory_session_ids(&msg, &history_key);
-    let sender_session_id_refs: Vec<Option<&str>> = sender_session_ids
-        .iter()
-        .map(|s| Some(s.as_str()))
+    let mut memory_sessions: Vec<Option<String>> = sender_memory_session_ids(&msg, &history_key)
+        .into_iter()
+        .map(Some)
         .collect();
-    let sender_memory_fut = build_memory_context_for_sessions(
-        ctx.memory.as_ref(),
-        &msg.content,
-        ctx.min_relevance_score,
-        sender_session_id_refs.as_slice(),
-    );
-
-    let (sender_memory, group_memory) = if is_group_chat {
-        let group_memory_fut = build_memory_context(
-            ctx.memory.as_ref(),
-            &msg.content,
-            ctx.min_relevance_score,
-            Some(&history_key),
-        );
-        tokio::join!(sender_memory_fut, group_memory_fut)
-    } else {
-        (sender_memory_fut.await, String::new())
-    };
-    #[allow(clippy::cast_possible_truncation)]
-    let mem_recall_ms = mem_recall_start.elapsed().as_millis() as u64;
-    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"mem_recall_ms": mem_recall_ms, "sender_empty": sender_memory.is_empty(), "group_empty": group_memory.is_empty()})), "memory recall completed");
-
-    // Merge sender and group memory context blocks.
-    let memory_context = if group_memory.is_empty() {
-        sender_memory
-    } else if sender_memory.is_empty() {
-        group_memory
-    } else {
-        format!("{sender_memory}\n{group_memory}")
-    };
+    if is_group_chat {
+        memory_sessions.push(Some(history_key.clone()));
+    }
 
     // Build the byte-stable system prompt for the cached prefix.
     // Note: memory recall is NOT injected here (it used to be, but the
@@ -5230,8 +5049,7 @@ async fn process_channel_message_body(
         && last_turn.role == "user"
     {
         let raw_content = last_turn.content.clone();
-        last_turn.content =
-            compose_outgoing_user_turn_with_context(&preamble, &memory_context, &raw_content);
+        last_turn.content = compose_outgoing_user_turn_with_context(&preamble, &raw_content);
     }
 
     // ── Reply-intent precheck ────────────────────────────────────────
@@ -5239,37 +5057,111 @@ async fn process_channel_message_body(
         .as_ref()
         .map(|c| c.is_direct_message(&msg))
         .unwrap_or(false);
-    let classifier_intent = if should_bypass_reply_intent_precheck(&msg, direct_message) {
-        AssistantChannelOutcome::Reply(String::new())
-    } else {
-        let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (
-            Arc<dyn ModelProvider>,
-            String,
-            Option<f64>,
-        ) = resolve_classifier_route(
-            ctx.as_ref(),
-            &ctx.agent_cfg.classifier_provider,
-            &runtime_defaults,
-        )
-        .await
-        .unwrap_or_else(|| {
-            (
-                Arc::clone(&active_model_provider),
-                route.model.clone(),
-                None,
-            )
-        });
+    let precheck = &ctx.agent_cfg.precheck;
+    let classifier_intent = ::zeroclaw_log::scope!(
+        category: "channel",
+        model_provider: route.model_provider.as_str(),
+        model: route.model.as_str(),
+        => async {
+            if should_bypass_reply_intent_precheck(&msg, direct_message) {
+                AssistantChannelOutcome::Reply(String::new())
+            } else if !precheck.enabled {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip).with_attrs(
+                        ::serde_json::json!({
+                            "phase": "precheck",
+                            "reason": "disabled",
+                        })
+                    ),
+                    "reply-intent precheck skipped"
+                );
+                AssistantChannelOutcome::Reply(String::new())
+            } else {
+                let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (
+                    Arc<dyn ModelProvider>,
+                    String,
+                    Option<f64>,
+                ) = resolve_classifier_route(
+                    ctx.as_ref(),
+                    &ctx.agent_cfg.classifier_provider,
+                    &runtime_defaults,
+                )
+                .await
+                .unwrap_or_else(|| {
+                    (
+                        Arc::clone(&active_model_provider),
+                        route.model.clone(),
+                        None,
+                    )
+                });
 
-        classify_channel_reply_intent(
-            classifier_provider_arc.as_ref(),
-            history[0].content.as_str(),
-            &history,
-            classifier_model_owned.as_str(),
-            classifier_temperature.or(runtime_defaults.defaults.temperature),
-        )
-        .await
-        .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
-    };
+                let started = Instant::now();
+                let precheck_future = classify_channel_reply_intent(
+                    classifier_provider_arc.as_ref(),
+                    history[0].content.as_str(),
+                    &history,
+                    classifier_model_owned.as_str(),
+                    classifier_temperature.or(runtime_defaults.defaults.temperature),
+                );
+                match tokio::time::timeout(Duration::from_secs(precheck.timeout_secs), precheck_future)
+                    .await
+                {
+                    Ok(Ok(outcome)) => {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_duration(
+                                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "classifier_model": classifier_model_owned.as_str(),
+                                    "phase": "precheck",
+                                })),
+                            "reply-intent precheck completed"
+                        );
+                        outcome
+                    }
+                    Ok(Err(e)) => {
+                        let safe_err = zeroclaw_providers::sanitize_api_error(&e.to_string());
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_duration(
+                                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "classifier_model": classifier_model_owned.as_str(),
+                                    "error": safe_err,
+                                    "phase": "precheck",
+                                })),
+                            "reply-intent precheck failed open"
+                        );
+                        AssistantChannelOutcome::Reply(String::new())
+                    }
+                    Err(_) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_duration(
+                                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "classifier_model": classifier_model_owned.as_str(),
+                                    "phase": "precheck",
+                                    "timeout_secs": precheck.timeout_secs,
+                                })),
+                            "reply-intent precheck timed out; failing open"
+                        );
+                        AssistantChannelOutcome::Reply(String::new())
+                    }
+                }
+            }
+        }
+    )
+    .await;
 
     // ACP sessions are direct user requests — there is no broadcast,
     // no peer context, no spam concern. The no-reply classifier is a
@@ -5706,9 +5598,19 @@ async fn process_channel_message_body(
                 steering: None,
                 new_messages_out: None,
                 image_cache: None,
-                // Phase 1: stamp Internal/Trusted. Real per-transport
-                // stamping is PR C (RFC #6971 §4).
-                ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                // Channel-orchestrator dispatch; source/transport/trust stay
+                // placeholders, not yet stamped at the edge.
+                memory: Some(zeroclaw_runtime::agent::memory_inject::TurnMemory {
+                    handle: ctx.memory.as_ref(),
+                    query: msg.content.clone(),
+                    sessions: memory_sessions.clone(),
+                    suppress: false,
+                    cfg: zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
+                        min_relevance_score: ctx.min_relevance_score,
+                        ..Default::default()
+                    },
+                }),
+                ingress: zeroclaw_api::ingress::IngressContext::channel(),
                 agent_alias: Some(ctx.agent_alias.as_str()),
                 turn_id: &turn_id,
             });
@@ -5732,7 +5634,17 @@ async fn process_channel_message_body(
                 result = timed_tool_loop => LlmExecutionResult::Completed(result),
             };
 
-            // Handle model switch: re-create the model_provider and retry
+            // Handle model switch: re-create the model_provider and retry.
+            //
+            // Resolves the requested provider to a configured
+            // `<type>.<alias>` ref, picks up any route-specific `api_key`
+            // from `ctx.model_routes`, then reuses `get_or_create_provider`
+            // so the new provider lands in the cache (consistent with the
+            // normal route-selection path) and is built with the proper
+            // credentials. The resolved route is persisted via
+            // `set_route_selection` only after the provider is built, so
+            // subsequent messages from this sender keep using the switched
+            // model instead of reverting to the default (#6173).
             if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result
                 && let Some((new_model_provider, new_model)) = is_model_switch_requested(e)
             {
@@ -5766,19 +5678,52 @@ async fn process_channel_message_body(
                     }
                 };
 
+                // Resolve a route-specific api_key by matching the switched
+                // provider/model against `model_routes` (the same lookup the
+                // `/model` command uses). Falls back to None so
+                // `get_or_create_provider` resolves credentials strictly from
+                // the requested provider's own config entry.
+                let resolved_api_key = ctx
+                    .model_routes
+                    .iter()
+                    .find(|r| {
+                        r.model_provider.eq_ignore_ascii_case(&new_model_provider)
+                            && (r.model.eq_ignore_ascii_case(&new_model)
+                                || r.hint.eq_ignore_ascii_case(&new_model))
+                    })
+                    .and_then(|r| r.api_key.clone());
+
                 match get_or_create_provider(
                     ctx.as_ref(),
                     &resolved_model_provider,
-                    None,
+                    resolved_api_key.as_deref(),
                     &runtime_defaults,
                 )
                 .await
                 {
                     Ok(new_prov) => {
+                        // Commit state only after the provider was built
+                        // successfully, so a failure leaves the turn on the
+                        // original provider/model pair instead of a
+                        // half-switched state.
                         active_model_provider = new_prov;
                         route.model_provider = resolved_model_provider;
                         route.model = new_model;
+                        route.api_key = resolved_api_key;
                         clear_model_switch_request();
+
+                        // Persist the route override so subsequent messages
+                        // from this sender continue using the switched model.
+                        set_route_selection(
+                            ctx.as_ref(),
+                            &history_key,
+                            ChannelRouteSelection {
+                                model_provider: route.model_provider.clone(),
+                                model: route.model.clone(),
+                                api_key: route.api_key.clone(),
+                            },
+                            &runtime_defaults,
+                        );
 
                         ctx.observer.record_event(&ObserverEvent::AgentStart {
                             model_provider: route.model_provider.clone(),
@@ -10370,7 +10315,7 @@ pub async fn start_channels(
         ];
 
         if matches!(
-            config.skills.prompt_injection_mode,
+            config.effective_skills_prompt_mode(agent_alias),
             zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
         ) {
             tool_descs.push((
@@ -10453,7 +10398,7 @@ pub async fn start_channels(
             bootstrap_max_chars,
             Some(&risk_profile),
             native_tools,
-            config.skills.prompt_injection_mode,
+            config.effective_skills_prompt_mode(agent_alias),
             agent.resolved.compact_context,
             agent.resolved.max_system_prompt_chars,
             true,
@@ -12671,62 +12616,6 @@ temperature = 0.3
         assert!(!is_context_window_overflow_error(&other_err));
     }
 
-    #[test]
-    fn memory_context_skip_rules_exclude_history_blobs() {
-        assert!(should_skip_memory_context_entry(
-            "telegram_123_history",
-            r#"[{"role":"user"}]"#
-        ));
-        assert!(should_skip_memory_context_entry(
-            "assistant_resp_legacy",
-            "fabricated memory"
-        ));
-        assert!(!should_skip_memory_context_entry("telegram_123_45", "hi"));
-
-        // Entries containing image markers must be skipped to prevent
-        // auto-saved photo messages from duplicating image blocks.
-        assert!(should_skip_memory_context_entry(
-            "telegram_user_msg_99",
-            "[IMAGE:/tmp/workspace/photo_1_2.jpg]"
-        ));
-        assert!(should_skip_memory_context_entry(
-            "telegram_user_msg_100",
-            "[IMAGE:/tmp/workspace/photo_1_2.jpg]\n\nCheck this screenshot"
-        ));
-        // Plain text without image markers should not be skipped.
-        assert!(!should_skip_memory_context_entry(
-            "telegram_user_msg_101",
-            "Please describe the image"
-        ));
-
-        // Entries containing tool_result blocks must be skipped.
-        assert!(should_skip_memory_context_entry(
-            "telegram_user_msg_200",
-            r#"[Tool results]
-<tool_result name="shell">Mon Feb 20</tool_result>"#
-        ));
-        assert!(!should_skip_memory_context_entry(
-            "telegram_user_msg_201",
-            "plain text without tool results"
-        ));
-
-        // Per-turn user auto-save keys must be skipped to prevent exponential
-        // context bloat from re-injected conversation history.
-        assert!(should_skip_memory_context_entry(
-            "user_msg",
-            "original user message text"
-        ));
-        assert!(should_skip_memory_context_entry(
-            "user_msg_a1b2c3d4e5f6",
-            "follow-up message embedding prior context"
-        ));
-        // Channel-scoped keys (e.g. telegram_*) must NOT be affected.
-        assert!(!should_skip_memory_context_entry(
-            "telegram_user_msg_101",
-            "Please describe the image"
-        ));
-    }
-
     fn channel_runtime_context_for_defaults_test(
         zeroclaw_dir: &std::path::Path,
         agent_alias: &str,
@@ -14916,6 +14805,7 @@ BTC is currently around $65,000 based on latest tool output."#
         precheck_calls: AtomicUsize,
         main_calls: AtomicUsize,
         models: std::sync::Mutex<Vec<String>>,
+        precheck_delay: Option<Duration>,
     }
 
     #[async_trait::async_trait]
@@ -14934,6 +14824,9 @@ BTC is currently around $65,000 based on latest tool output."#
 
             if message.starts_with("Decide whether the assistant should send any visible reply") {
                 self.precheck_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(delay) = self.precheck_delay {
+                    tokio::time::sleep(delay).await;
+                }
                 return Ok("NO_REPLY[INFO]: background chatter".to_string());
             }
 
@@ -16516,6 +16409,258 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    /// Regression for #6173: when a `model_switch` request is pending
+    /// (set by the `model_switch` tool during the previous tool
+    /// iteration), `process_channel_message` must:
+    ///
+    /// 1. resolve the route-specific `api_key` from `ctx.model_routes`
+    ///    when the switched provider/model matches a route entry,
+    /// 2. route provider construction through `get_or_create_provider`
+    ///    (so the new provider lands in the provider cache),
+    /// 3. persist the resolved route via `set_route_selection` so the
+    ///    next inbound message for the same sender uses the switched
+    ///    provider/model/key.
+    ///
+    /// The test pre-sets `MODEL_SWITCH_REQUEST` to simulate a previous
+    /// turn's tool call. `run_tool_call_loop` short-circuits to
+    /// `ModelSwitchRequested` on its first iteration because the
+    /// pending request already differs from the active route, exercising
+    /// the orchestrator's switch handler.
+    #[tokio::test]
+    async fn process_channel_message_persists_model_switch_with_route_credential() {
+        // Serialize on the process-wide model-switch state so this test
+        // doesn't race other tests that also touch the same static.
+        // `tokio::sync::Mutex` is held across the awaits below; the
+        // `OnceLock` wrapper gives us a `'static` initializer in a
+        // `static` context without `lazy_static`.
+        static MODEL_SWITCH_TEST_GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+        let _guard = MODEL_SWITCH_TEST_GUARD
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        clear_model_switch_request();
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let default_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
+        let switched_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let switched_model_provider: Arc<dyn ModelProvider> = switched_model_provider_impl.clone();
+
+        // The switch handler resolves the requested provider `openrouter` to
+        // a configured `<type>.<alias>` ref via
+        // `resolve_provider_ref_for_runtime_switch`, so the provider that is
+        // built, cached, and persisted is the dotted form.
+        let switched_provider_ref = "openrouter.default";
+        let switched_key = Some("route-specific-key");
+
+        // Seed the provider cache so `get_or_create_provider` returns our
+        // mock for the switched provider instead of constructing a real one.
+        // The cache key hashes the route-specific api_key together with the
+        // resolved (dotted) provider ref at the current (startup) generation.
+        let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        provider_cache_seed.insert(
+            "test-provider".to_string(),
+            Arc::clone(&default_model_provider),
+        );
+        provider_cache_seed.insert(
+            provider_cache_key(switched_provider_ref, switched_key, 0),
+            Arc::clone(&switched_model_provider),
+        );
+
+        let model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".to_string(),
+            model_provider: "openrouter".to_string(),
+            model: "switched-model".to_string(),
+            api_key: Some("route-specific-key".to_string()),
+        }];
+
+        // `resolve_provider_ref_for_runtime_switch` resolves `openrouter`
+        // against the configured providers, so the prompt config must define
+        // the `openrouter.default` entry for the switch to resolve and build.
+        let prompt_config = {
+            let mut cfg = zeroclaw_config::schema::Config::default();
+            {
+                let entry = cfg
+                    .providers
+                    .models
+                    .ensure("openrouter", "default")
+                    .expect("openrouter.default provider slot must be creatable");
+                entry.api_key = Some("config-openrouter-key".to_string());
+                entry.model = Some("switched-model".to_string());
+            }
+            Arc::new(cfg)
+        };
+
+        // Pre-set the model_switch request — simulates the tool having
+        // been called on a previous turn and waiting to be consumed.
+        {
+            let state = get_model_switch_state();
+            let mut guard = state.lock().unwrap();
+            *guard = Some(("openrouter".to_string(), "switched-model".to_string()));
+        }
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::clone(&default_model_provider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::clone(&prompt_config),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(model_routes),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-switch-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "trigger model switch".to_string(),
+                subject: None,
+                channel: "telegram".to_string(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        // After the switch handler runs, the route override must be
+        // persisted for this sender with the resolved api_key.
+        let route_key = "telegram_chat-1_alice";
+        let persisted = runtime_ctx
+            .route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(route_key)
+            .cloned()
+            .expect(
+                "switch handler must persist a route override under the sender's history key \
+                 (this is the regression #6173 — previously the new model was used only for \
+                 the current turn and the next inbound message reverted to the default)",
+            );
+        assert_eq!(persisted.model_provider, switched_provider_ref);
+        assert_eq!(persisted.model, "switched-model");
+        assert_eq!(
+            persisted.api_key.as_deref(),
+            Some("route-specific-key"),
+            "the route-specific api_key from model_routes must be persisted, \
+             not the global key or None — otherwise the next turn loses route auth"
+        );
+
+        // Send a second message from the same sender, with no pending
+        // model_switch this time. The persisted route override must be
+        // honored — `get_route_selection` should return the switched
+        // route and the switched provider should handle the request.
+        let calls_before = switched_model_provider_impl
+            .call_count
+            .load(Ordering::SeqCst);
+        process_channel_message(
+            runtime_ctx.clone(),
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-switch-2".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "follow-up after switch".to_string(),
+                subject: None,
+                channel: "telegram".to_string(),
+                channel_alias: None,
+                timestamp: 2,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls_after = switched_model_provider_impl
+            .call_count
+            .load(Ordering::SeqCst);
+        assert!(
+            calls_after > calls_before,
+            "follow-up message must be served by the switched provider (the persisted \
+             route override), not by the original default provider"
+        );
+
+        // Clean up shared global state so we don't leak into other tests.
+        clear_model_switch_request();
+    }
+
     #[tokio::test]
     async fn process_channel_message_uses_classifier_provider_for_precheck_model_selection() {
         let channel_impl = Arc::new(RecordingChannel::default());
@@ -16598,6 +16743,196 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             sent_messages.is_empty(),
             "provider returns NO_REPLY from precheck, so no visible reply should be sent"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn process_channel_message_precheck_log_uses_span_attribution_not_attrs() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(PrecheckProbeModelProvider::default());
+        let provider: Arc<dyn ModelProvider> = provider_impl;
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "custom.primary",
+            None,
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-precheck-log".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-precheck-log".to_string(),
+                content: "background chatter".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 5,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut precheck_event = None;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|m| m == "reply-intent precheck completed")
+                    {
+                        precheck_event = Some(value);
+                        break;
+                    }
+                }
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+
+        let value = precheck_event.expect("reply-intent precheck log should be emitted");
+        assert_eq!(
+            value["zeroclaw"]["agent_alias"], "test-agent",
+            "precheck record must inherit agent_alias from the channel turn span, got: {value}"
+        );
+        assert_eq!(
+            value["zeroclaw"]["model"], "test-model",
+            "precheck record must preserve primary model attribution, got: {value}"
+        );
+        assert_eq!(
+            value["attributes"]["classifier_model"], "test-model",
+            "classifier model must use a non-attribution attr key, got: {value}"
+        );
+        assert!(
+            value["attributes"].get("agent").is_none(),
+            "agent alias belongs in zeroclaw.agent_alias, not attributes.agent: {value}"
+        );
+        assert!(
+            value["attributes"].get("model").is_none(),
+            "classifier model must not shadow zeroclaw.model via attributes.model: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_skips_reply_intent_classifier_when_agent_precheck_disabled() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(PrecheckProbeModelProvider::default());
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let agent_cfg = zeroclaw_config::schema::AliasedAgentConfig {
+            precheck: zeroclaw_config::scattered_types::ChannelPrecheckConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            agent_cfg,
+            "test-provider",
+            None,
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-precheck-disabled".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-precheck-disabled".to_string(),
+                content: "background chatter".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(provider_impl.precheck_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider_impl.main_calls.load(Ordering::SeqCst), 1);
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.as_slice(),
+            ["chat-precheck-disabled:visible reply"]
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_precheck_timeout_fails_open_to_reply() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(PrecheckProbeModelProvider {
+            precheck_delay: Some(Duration::from_secs(2)),
+            ..Default::default()
+        });
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let agent_cfg = zeroclaw_config::schema::AliasedAgentConfig {
+            precheck: zeroclaw_config::scattered_types::ChannelPrecheckConfig {
+                timeout_secs: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            agent_cfg,
+            "test-provider",
+            None,
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-precheck-timeout".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-precheck-timeout".to_string(),
+                content: "background chatter".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(provider_impl.precheck_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_impl.main_calls.load(Ordering::SeqCst), 1);
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.as_slice(),
+            ["chat-precheck-timeout:visible reply"]
         );
     }
 
@@ -19947,17 +20282,26 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 
-    #[tokio::test]
-    async fn build_memory_context_includes_recalled_entries() {
-        let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-        mem.store("age_fact", "Age is 45", MemoryCategory::Conversation, None)
-            .await
-            .unwrap();
-
-        let context = build_memory_context(&mem, "age", 0.0, None).await;
-        assert!(context.contains(MEMORY_CONTEXT_OPEN));
-        assert!(context.contains("Age is 45"));
+    /// Test shim: the old per-orchestrator renderer call shape, routed
+    /// through the unified engine pipeline (agent::memory_inject).
+    async fn render_for_sessions(
+        mem: &dyn zeroclaw_memory::Memory,
+        user_msg: &str,
+        min_relevance_score: f64,
+        session_ids: &[Option<&str>],
+    ) -> String {
+        zeroclaw_runtime::agent::memory_inject::render_memory_context(
+            mem,
+            &zeroclaw_runtime::observability::NoopObserver,
+            user_msg,
+            session_ids,
+            &zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
+                min_relevance_score,
+                ..Default::default()
+            },
+            false,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -19993,8 +20337,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let session_ids = sender_memory_session_ids(&msg, &history_key);
         let session_id_refs: Vec<Option<&str>> =
             session_ids.iter().map(|s| Some(s.as_str())).collect();
-        let context =
-            build_memory_context_for_sessions(&mem, "quartz", 0.0, &session_id_refs).await;
+        let context = render_for_sessions(&mem, "quartz", 0.0, &session_id_refs).await;
 
         assert!(
             context.contains("Project codename is quartz"),
@@ -20057,12 +20400,11 @@ BTC is currently around $65,000 based on latest tool output."#
             .map(|s| Some(s.as_str()))
             .collect();
         let sender_context =
-            build_memory_context_for_sessions(&mem, "quartz", 0.0, &group_b_sender_session_id_refs)
-                .await;
+            render_for_sessions(&mem, "quartz", 0.0, &group_b_sender_session_id_refs).await;
         let group_context =
-            build_memory_context(&mem, "quartz", 0.0, Some(&group_b_history_key)).await;
+            render_for_sessions(&mem, "quartz", 0.0, &[Some(&group_b_history_key)]).await;
         let source_group_context =
-            build_memory_context(&mem, "quartz", 0.0, Some(&group_a_history_key)).await;
+            render_for_sessions(&mem, "quartz", 0.0, &[Some(&group_a_history_key)]).await;
 
         assert!(
             sender_context.is_empty(),
@@ -20118,52 +20460,10 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         let session_id_refs: Vec<Option<&str>> =
             session_ids.iter().map(|s| Some(s.as_str())).collect();
-        let context =
-            build_memory_context_for_sessions(&mem, "coffee", 0.0, &session_id_refs).await;
+        let context = render_for_sessions(&mem, "coffee", 0.0, &session_id_refs).await;
         assert!(
             context.contains("Alice favors filtered coffee"),
             "sender recall must find migrated row stored under sanitized sender, got: {context}"
-        );
-    }
-
-    /// Auto-saved photo messages must not surface through memory context,
-    /// otherwise the image marker gets duplicated in the model_provider request.
-    #[tokio::test]
-    async fn build_memory_context_excludes_image_marker_entries() {
-        let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-
-        // Simulate auto-save of a photo message containing an [IMAGE:] marker.
-        mem.store(
-            "telegram_user_msg_photo",
-            "[IMAGE:/tmp/workspace/photo_1_2.jpg]\n\nDescribe this screenshot",
-            MemoryCategory::Conversation,
-            None,
-        )
-        .await
-        .unwrap();
-        // Also store a plain text entry that shares a word with the query
-        // so the FTS recall returns both entries.
-        mem.store(
-            "screenshot_preference",
-            "User prefers screenshot descriptions to be concise",
-            MemoryCategory::Conversation,
-            None,
-        )
-        .await
-        .unwrap();
-
-        let context = build_memory_context(&mem, "screenshot", 0.0, None).await;
-
-        // The image-marker entry must be excluded to prevent duplication.
-        assert!(
-            !context.contains("[IMAGE:"),
-            "memory context must not contain image markers, got: {context}"
-        );
-        // Plain text entries should still be included.
-        assert!(
-            context.contains("screenshot descriptions"),
-            "plain text entry should remain in context, got: {context}"
         );
     }
 
@@ -25284,25 +25584,17 @@ Done."#;
     }
 
     #[test]
-    fn compose_outgoing_user_turn_with_context_orders_preamble_memory_content() {
-        // Order on the wire: preamble → memory_context → raw user content,
-        // joined by blank lines. Empty preamble and empty memory leave the
-        // raw content untouched (CLI-style path).
+    fn compose_outgoing_user_turn_with_context_orders_preamble_content() {
+        // Order on the wire: preamble -> raw user content, joined by blank
+        // lines (the memory block is engine-injected ABOVE the whole turn).
+        // Empty preamble leaves the raw content untouched (CLI-style path).
         assert_eq!(
-            compose_outgoing_user_turn_with_context("", "", "hello"),
+            compose_outgoing_user_turn_with_context("", "hello"),
             "hello"
         );
         assert_eq!(
-            compose_outgoing_user_turn_with_context("[turn-context] x\n\n", "", "hello"),
+            compose_outgoing_user_turn_with_context("[turn-context] x\n\n", "hello"),
             "[turn-context] x\n\n\n\nhello"
-        );
-        assert_eq!(
-            compose_outgoing_user_turn_with_context("", "[memory] y", "hello"),
-            "[memory] y\n\nhello"
-        );
-        assert_eq!(
-            compose_outgoing_user_turn_with_context("[turn-context] x\n\n", "[memory] y", "hello"),
-            "[turn-context] x\n\n\n\n[memory] y\n\nhello"
         );
     }
 

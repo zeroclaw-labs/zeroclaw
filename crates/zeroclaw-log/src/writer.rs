@@ -609,6 +609,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reinit_applies_changed_rotation_policy() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_rotating(tmp.path(), 0, false, 0, 0);
+
+        emit("before-reload");
+
+        let path = runtime_trace_path().unwrap();
+        assert!(
+            list_archives(&path).unwrap().is_empty(),
+            "size rotation should be disabled before re-init"
+        );
+        assert_eq!(total_events(&path), 1);
+
+        install_rotating(tmp.path(), 1, false, 1, 0);
+        emit("after-reload");
+
+        let archives = list_archives(&path).unwrap();
+        assert_eq!(
+            archives.len(),
+            1,
+            "re-init should apply the new byte budget and rotate on the next append"
+        );
+        assert_eq!(
+            total_events(&path),
+            2,
+            "re-init must preserve already-written events while applying the new policy"
+        );
+    }
+
+    #[test]
+    fn reinit_can_disable_persistence_without_restart() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 10);
+
+        emit("persisted-before-disable");
+
+        let path = runtime_trace_path().unwrap();
+        assert_eq!(count_lines(&path), 1);
+
+        let cfg = LogConfig {
+            log_persistence: "none".into(),
+            ..LogConfig::default()
+        };
+        init_from_config(&cfg, tmp.path());
+
+        emit("not-persisted-after-disable");
+
+        assert_eq!(
+            count_lines(&path),
+            1,
+            "disabled persistence after re-init should stop appending without deleting existing logs"
+        );
+    }
+
     // ── Rotation (StoragePolicy::Rotating) ───────────────────────
 
     fn install_rotating(
