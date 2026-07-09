@@ -4238,15 +4238,19 @@ fn matrix_single_message_streaming_enabled_for_config(
     config: &zeroclaw_config::schema::Config,
     msg: &zeroclaw_api::channel::ChannelMessage,
 ) -> bool {
-    if msg.channel != "matrix" {
-        return false;
-    }
-    let Some(alias) = msg.channel_alias.as_ref() else {
-        return false;
-    };
-    config.channels.matrix.get(alias).is_some_and(|config| {
+    matrix_config_for_message(config, msg).is_some_and(|config| {
         config.stream_mode == zeroclaw_config::schema::MatrixStreamMode::SingleMessage
     })
+}
+
+fn matrix_config_for_message<'a>(
+    config: &'a zeroclaw_config::schema::Config,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> Option<&'a zeroclaw_config::schema::MatrixConfig> {
+    if msg.channel != "matrix" {
+        return None;
+    }
+    config.channels.matrix.get(msg.channel_alias.as_ref()?)
 }
 
 fn matrix_single_message_streaming_enabled(
@@ -4260,13 +4264,7 @@ fn matrix_stream_reasoning_for_config(
     config: &zeroclaw_config::schema::Config,
     msg: &zeroclaw_api::channel::ChannelMessage,
 ) -> zeroclaw_config::schema::StreamReasoningMode {
-    if msg.channel != "matrix" {
-        return zeroclaw_config::schema::StreamReasoningMode::default();
-    }
-    let Some(alias) = msg.channel_alias.as_ref() else {
-        return zeroclaw_config::schema::StreamReasoningMode::default();
-    };
-    config.channels.matrix.get(alias).map_or(
+    matrix_config_for_message(config, msg).map_or(
         zeroclaw_config::schema::StreamReasoningMode::default(),
         |config| config.stream_reasoning,
     )
@@ -4286,19 +4284,9 @@ fn matrix_draft_update_interval_ms_for_config(
     let default_interval = zeroclaw_config::schema::MatrixConfig::default()
         .draft_update_interval_ms
         .max(50);
-    if msg.channel != "matrix" {
-        return default_interval;
-    }
-    let Some(alias) = msg.channel_alias.as_ref() else {
-        return default_interval;
-    };
-    config
-        .channels
-        .matrix
-        .get(alias)
-        .map_or(default_interval, |config| {
-            config.draft_update_interval_ms.max(50)
-        })
+    matrix_config_for_message(config, msg).map_or(default_interval, |config| {
+        config.draft_update_interval_ms.max(50)
+    })
 }
 
 fn matrix_draft_update_interval_ms(
@@ -4313,17 +4301,7 @@ fn matrix_stream_draft_lines_for_config(
     msg: &zeroclaw_api::channel::ChannelMessage,
 ) -> usize {
     let default_lines = zeroclaw_config::schema::MatrixConfig::default().stream_draft_lines;
-    if msg.channel != "matrix" {
-        return default_lines;
-    }
-    let Some(alias) = msg.channel_alias.as_ref() else {
-        return default_lines;
-    };
-    config
-        .channels
-        .matrix
-        .get(alias)
-        .map_or(default_lines, |config| config.stream_draft_lines)
+    matrix_config_for_message(config, msg).map_or(default_lines, |config| config.stream_draft_lines)
 }
 
 fn matrix_stream_draft_lines(
@@ -4340,16 +4318,7 @@ fn matrix_message_max_bytes_for_config(
     let default_bytes = zeroclaw_config::schema::MatrixConfig::default()
         .message_max_bytes
         .max(1);
-    if msg.channel != "matrix" {
-        return default_bytes;
-    }
-    let Some(alias) = msg.channel_alias.as_ref() else {
-        return default_bytes;
-    };
-    config
-        .channels
-        .matrix
-        .get(alias)
+    matrix_config_for_message(config, msg)
         .map_or(default_bytes, |config| config.message_max_bytes.max(1))
 }
 
