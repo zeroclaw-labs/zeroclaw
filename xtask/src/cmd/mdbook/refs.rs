@@ -72,6 +72,11 @@ pub fn build_refs(root: &Path) -> anyhow::Result<()> {
 pub fn build_api(root: &Path) -> anyhow::Result<()> {
     println!("==> Generating rustdoc API reference");
     let target = target_dir(root);
+    // Pass the docs-site rustdoc theme via RUSTDOCFLAGS rather than relying on
+    // `[build] rustdocflags` in `.cargo/config.toml`. The repository-wide flag
+    // would also be inherited by `cargo test --doc`, which under Rust 1.96's
+    // stricter rustdoc argument parser fails with
+    // `Option 'default-theme' given more than once` (issue #8847).
     run_cmd(
         Command::new("cargo")
             .args([
@@ -83,6 +88,7 @@ pub fn build_api(root: &Path) -> anyhow::Result<()> {
                 "--target-dir",
             ])
             .arg(&target)
+            .env("RUSTDOCFLAGS", "--default-theme=ayu")
             .current_dir(root),
     )
 }

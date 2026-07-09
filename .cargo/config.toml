@@ -4,8 +4,13 @@ fluent = "run --release -p xtask --bin fluent --"
 web = "run --release -p xtask --bin web --"
 generate = "run --release -p xtask --bin generate --"
 
-[build]
-rustdocflags = ["--default-theme=ayu"]
+# The default rustdoc theme is a documentation-site cosmetic preference, not a
+# build setting, so it intentionally does NOT live in this file. Putting it
+# under `[build] rustdocflags` (which Cargo also forwards to `cargo test --doc`)
+# caused `Option 'default-theme' given more than once` under Rust 1.96's
+# stricter argument parser (see issue #8847). The theme is now passed only
+# where rustdoc is actually driven for the public site: `xtask mdbook refs`
+# (build_api) and the docs-deploy GitHub Actions workflow.
 
 [target.x86_64-unknown-linux-musl]
 rustflags = ["-C", "link-arg=-static"]
