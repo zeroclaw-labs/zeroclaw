@@ -2485,7 +2485,9 @@ fn map_key_for_prop_path<'a>(section_path: &str, prop_path: &'a str) -> Option<&
 fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<bool> {
     let Some((section_path, key)) = Config::map_key_sections()
         .into_iter()
-        .filter(|section| section.path.starts_with("providers.") || section.path.starts_with("channels."))
+        .filter(|section| {
+            section.path.starts_with("providers.") || section.path.starts_with("channels.")
+        })
         .filter(|section| section.kind == zeroclaw_config::traits::MapKeyKind::Map)
         .filter_map(|section| {
             let key = map_key_for_prop_path(section.path, prop_path)?;
