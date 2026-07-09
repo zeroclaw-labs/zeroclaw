@@ -13866,12 +13866,15 @@ api_key = "anthropic-key"
         }
     }
 
-    fn lifecycle_bracket_snapshot(
-        events: &[ObserverEvent],
-    ) -> (
+    /// (start bracket entries, end bracket entries) — each entry is
+    /// `(channel, agent_alias, turn_id)`. Aliased to keep the return type
+    /// readable (clippy::type_complexity).
+    type LifecycleBracketSnapshot = (
         Vec<(Option<String>, Option<String>, Option<String>)>,
         Vec<(Option<String>, Option<String>, Option<String>)>,
-    ) {
+    );
+
+    fn lifecycle_bracket_snapshot(events: &[ObserverEvent]) -> LifecycleBracketSnapshot {
         let starts = events
             .iter()
             .filter_map(|e| match e {
