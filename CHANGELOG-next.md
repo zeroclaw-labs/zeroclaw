@@ -146,6 +146,7 @@ ZeroClaw treats every inbound payload as untrusted and tightens the seams an att
 
 | Area | Fix |
 |---|---|
+| providers | Model-catalog dropdown now resolves the configured alias credential (and custom `uri`) so credentialed OpenAI-compatible providers (xAI/Grok, Groq, DeepSeek, …) list from their native `/models` endpoint instead of silently falling back to models.dev — brand-new native-only models (e.g. a freshly released Grok) now appear without waiting on the public catalog |
 | daemon | Back off exponentially when a supervised component exits immediately, and trim glibc arenas between restarts, to stop the WSL2 restart-storm OOM (#5542) |
 | config | Gate Android shell import on non-Windows (#8189) |
 | tools | Normalize Windows workspace-prefixed paths (#8114) |
