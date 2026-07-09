@@ -48,6 +48,8 @@ If any intake check fails, leave one actionable checklist comment and stop. Don'
 ### Fast-lane checklist (every PR)
 
 - Scope boundary is explicit and believable.
+- Behavior changes are checked against the controlling contract: architecture docs, source-of-truth modules, trait boundaries, existing tests, public API shape, source comments, or explicit maintainer decisions.
+- PR-body provenance is true. Cited RFCs, audits, issues, PRs, paths, generated artifacts, or follow-up findings exist and support the claim.
 - Validation evidence names the checks being relied on and why they cover the changed behavior.
 - Duplicate local Cargo is not required when fresh required CI covers the same head, target, and feature set. Ask for extra validation only when it maps to a named gap in the required gate, such as macOS/Windows tests, cross-platform Clippy, desktop coverage, release target builds, stale CI, or unavailable CI.
 - User-facing behavior changes are documented.
@@ -65,6 +67,8 @@ For `risk:high` PRs, verify a concrete example in each category. One concrete in
 - **Security boundaries**: deny-by-default behavior preserved, no accidental scope broadening.
 - **Failure modes**: error handling explicit, degrades safely.
 - **Contract stability**: CLI, config, or API compatibility preserved or migration documented.
+- **Diff shape**: large or new-integration PRs are coherent, merge-justified now, not easily split, and not mostly duplicated machinery.
+- **Generated artifacts**: generated files that affect policy, schema, routes, migrations, lockfiles, release artifacts, capabilities, packages, runtime behavior, or reviewer evidence are reviewed like source.
 - **Toolchain compatibility**: MSRV or pinned-toolchain changes are intentional, aligned across CI/Docker/install surfaces, and documented for downstream/source-build users.
 - **Observability**: failures diagnosable without leaking secrets.
 - **Rollback safety**: revert path and blast radius clear.
