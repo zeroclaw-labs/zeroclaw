@@ -230,6 +230,16 @@ pub struct SecurityPolicy {
     /// `content_search`) ignore this list; write-side
     /// tools (`file_write`, `file_edit`, `git_operations`) honor it.
     pub allowed_roots_write_only: Vec<PathBuf>,
+    /// Paths write-side tools must refuse to write to even when they fall inside
+    /// `workspace_dir`, `allowed_roots`, or `allowed_roots_write_only`. Resolved from
+    /// `RiskProfileConfig.sandbox_policy` (operator-supplied `deny_write` plus, when
+    /// `mandatory_deny_write_enabled` is true, the default guardrail list — shell
+    /// configs, git hooks, `.env`, `.mcp.json`, etc.) via
+    /// [`crate::sandbox_policy::SandboxPolicy::from_risk_profile`], the same resolver the
+    /// OS sandbox backends consume. Checked in [`Self::is_resolved_path_allowed`] before
+    /// any allow-grant, mirroring the "deny_write overrides allow_write" contract
+    /// documented on `SandboxPolicyConfig`.
+    pub deny_write: Vec<PathBuf>,
     pub max_actions_per_hour: u32,
     pub max_cost_per_day_cents: u32,
     pub require_approval_for_medium_risk: bool,
@@ -554,6 +564,7 @@ impl Default for SecurityPolicy {
             allowed_roots: Vec::new(),
             allowed_roots_read_only: Vec::new(),
             allowed_roots_write_only: Vec::new(),
+            deny_write: Vec::new(),
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
@@ -2010,6 +2021,19 @@ impl SecurityPolicy {
             return true;
         }
 
+        // `deny_write` guardrails (shell configs, git hooks, `.env`, `.mcp.json`, plus
+        // any operator-supplied `sandbox_policy.deny_write` entries) override every
+        // other write grant, including the workspace root and explicit allowed roots —
+        // see `SandboxPolicyConfig` docs ("deny_write overrides allow_write"). Checked
+        // first so a guardrail path stays write-protected even inside an otherwise
+        // writable workspace or allowed root.
+        for denied in &self.deny_write {
+            let canonical = denied.canonicalize().unwrap_or_else(|_| denied.clone());
+            if resolved.starts_with(&canonical) {
+                return false;
+            }
+        }
+
         // Prefer canonical workspace root so `/a/../b` style config paths don't
         // cause false positives or negatives.
         let workspace_root = self
@@ -2415,6 +2439,97 @@ impl SecurityPolicy {
         let runtime_default = crate::schema::RuntimeProfileConfig::default();
         let runtime = runtime_profile.unwrap_or(&runtime_default);
 
+        // Canonical `sandbox_policy` resolution — the same resolver the OS sandbox
+        // backends consume (`zeroclaw-runtime::security::detect::create_sandbox`).
+        // Reusing it here closes the dual-policy-surface gap flagged in the #7821
+        // review: previously `sandbox_policy.deny_read`/`allow_read`/`allow_write`/
+        // `deny_write` were accepted by the schema but never read by this app-layer
+        // path guard, so an operator could set `sandbox_policy.deny_read =
+        // ["~/.ssh"]` and get no enforcement at all when no OS sandbox backend was
+        // active (NoopSandbox, or platforms without Bubblewrap/Landlock/Seatbelt).
+        let resolved_sandbox =
+            crate::sandbox_policy::SandboxPolicy::from_risk_profile(risk_profile, workspace_dir);
+
+        // `allow_write`'s schema default (`[".", "/tmp"]`) exists to satisfy OS-sandbox
+        // bind-mount needs (scratch space for any sandboxed process), not as an
+        // app-layer grant. Diffing against a same-`workspace_only` baseline (with
+        // `sandbox_policy`/`forbidden_paths`/`allowed_roots` at their own schema
+        // defaults) keeps only the entries the operator actually customised —
+        // otherwise every `workspace_only = false` profile that never touches
+        // `sandbox_policy` would silently gain `/tmp` write access at the app layer,
+        // contradicting `default_forbidden_paths()` blocking `/tmp` today.
+        let baseline_sandbox = crate::sandbox_policy::SandboxPolicy::from_risk_profile(
+            &crate::schema::RiskProfileConfig {
+                workspace_only: risk_profile.workspace_only,
+                forbidden_paths: Vec::new(),
+                allowed_roots: Vec::new(),
+                sandbox_policy: crate::schema::SandboxPolicyConfig::default(),
+                ..crate::schema::RiskProfileConfig::default()
+            },
+            workspace_dir,
+        );
+        let sandbox_allow_write_customized: Vec<PathBuf> = resolved_sandbox
+            .allow_write
+            .iter()
+            .filter(|p| !baseline_sandbox.allow_write.contains(p))
+            .cloned()
+            .collect();
+
+        // `forbidden_paths` conventionally stores raw, unexpanded strings (e.g. the
+        // literal `"~/.ssh"`, not an expanded `/Users/<name>/.ssh`) because
+        // `prompt_summary` surfaces it verbatim in the LLM system prompt. Using
+        // `resolved_sandbox.deny_read` here (tilde-expanded, absolute) would push a
+        // duplicate expanded entry alongside the raw one for every profile that
+        // relies on the compat fallback — i.e. every profile that never touches
+        // `sandbox_policy` at all — bloating the prompt and leaking the local
+        // username. Only merge when `sandbox_policy.deny_read` was actually
+        // customised, using the same raw strings the operator wrote.
+        let mut forbidden_paths = risk_profile.forbidden_paths.clone();
+        if !risk_profile.sandbox_policy.deny_read.is_empty() {
+            for denied in &risk_profile.sandbox_policy.deny_read {
+                if !forbidden_paths.contains(denied) {
+                    forbidden_paths.push(denied.clone());
+                }
+            }
+        }
+
+        let allowed_roots: Vec<PathBuf> = risk_profile
+            .allowed_roots
+            .iter()
+            .filter(|root| {
+                let t = root.trim();
+                !t.is_empty() && t != crate::traits::UNSET_DISPLAY && t != "*"
+            })
+            .map(|root| {
+                let expanded = expand_user_path(root);
+                if expanded.is_absolute() {
+                    expanded
+                } else {
+                    workspace_dir.join(expanded)
+                }
+            })
+            .collect();
+
+        // Both tiers below are deduped against the full read+write `allowed_roots` tier:
+        // old-style `allowed_roots` entries resolve into `resolved_sandbox.allow_read` /
+        // `.allow_write` too (compat fallback), which would otherwise duplicate the same
+        // path across tiers. Harmless either way (broader tiers are checked first), but
+        // keeping the read-only/write-only tiers to genuinely distinct grants makes them
+        // meaningful to read.
+        let mut allowed_roots_read_only = Vec::new();
+        for allowed in &resolved_sandbox.allow_read {
+            if !allowed_roots.contains(allowed) && !allowed_roots_read_only.contains(allowed) {
+                allowed_roots_read_only.push(allowed.clone());
+            }
+        }
+
+        let mut allowed_roots_write_only = Vec::new();
+        for allowed in &sandbox_allow_write_customized {
+            if !allowed_roots.contains(allowed) && !allowed_roots_write_only.contains(allowed) {
+                allowed_roots_write_only.push(allowed.clone());
+            }
+        }
+
         Self {
             autonomy: risk_profile.level,
             risk_profile_name: String::new(),
@@ -2425,31 +2540,14 @@ impl SecurityPolicy {
             config_path: None,
             workspace_only: effective_workspace_only,
             allowed_commands: risk_profile.allowed_commands.clone(),
-            forbidden_paths: risk_profile.forbidden_paths.clone(),
-            allowed_roots: risk_profile
-                .allowed_roots
-                .iter()
-                .filter(|root| {
-                    let t = root.trim();
-                    !t.is_empty() && t != crate::traits::UNSET_DISPLAY && t != "*"
-                })
-                .map(|root| {
-                    let expanded = expand_user_path(root);
-                    if expanded.is_absolute() {
-                        expanded
-                    } else {
-                        workspace_dir.join(expanded)
-                    }
-                })
-                .collect(),
-            // RiskProfileConfig has no read-only or write-only roots
-            // concept; the multi-agent runtime populates these lists
-            // when it builds a per-agent policy from the
-            // workspace.access map, turning `AccessMode::Read` and
-            // `AccessMode::Write` entries into the corresponding
-            // tiers.
-            allowed_roots_read_only: Vec::new(),
-            allowed_roots_write_only: Vec::new(),
+            forbidden_paths,
+            allowed_roots,
+            // Cross-agent read-only/write-only tiers (populated below by `for_agent`
+            // from the `workspace.access` map) plus any `sandbox_policy.allow_read` /
+            // `allow_write` grants resolved above.
+            allowed_roots_read_only,
+            allowed_roots_write_only,
+            deny_write: resolved_sandbox.deny_write,
             max_actions_per_hour: runtime.max_actions_per_hour,
             max_cost_per_day_cents: runtime.max_cost_per_day_cents,
             require_approval_for_medium_risk: risk_profile.require_approval_for_medium_risk,
@@ -5434,10 +5532,11 @@ mod tests {
     }
 
     #[test]
-    fn from_risk_profile_leaves_allowed_roots_read_only_empty() {
-        // RiskProfileConfig has no read-only-roots concept; it's
-        // populated by the multi-agent runtime when it builds the
-        // per-agent policy from workspace.access.
+    fn from_risk_profile_leaves_allowed_roots_read_only_empty_with_no_sandbox_policy() {
+        // With no `sandbox_policy.allow_read` and no workspace.access grants (that tier
+        // is populated later by the multi-agent runtime via `for_agent`), the read-only
+        // tier stays empty even though old-style `allowed_roots` populates the full
+        // read+write `allowed_roots` tier directly.
         let profile = crate::schema::RiskProfileConfig {
             allowed_roots: vec!["/projects".to_string()],
             ..crate::schema::RiskProfileConfig::default()
@@ -5446,7 +5545,146 @@ mod tests {
         assert_eq!(policy.allowed_roots, vec![PathBuf::from("/projects")]);
         assert!(
             policy.allowed_roots_read_only.is_empty(),
-            "read-only roots come from workspace.access, not RiskProfileConfig"
+            "old-style allowed_roots resolves via sandbox_policy.allow_read compat to the \
+             same /projects entry already covered by the read+write allowed_roots tier, so \
+             from_profiles skips the redundant duplicate rather than pushing it in twice"
+        );
+    }
+
+    #[test]
+    fn default_profile_forbidden_paths_are_not_duplicated_by_sandbox_policy_compat() {
+        // Regression: forbidden_paths must not gain expanded duplicates of its own raw
+        // entries (e.g. both "~/.ssh" and an expanded "/Users/<name>/.ssh") for a
+        // profile that never touches sandbox_policy — that would bloat prompt_summary
+        // and leak the local username into the LLM system prompt for every agent.
+        let profile = crate::schema::RiskProfileConfig::default();
+        let policy = SecurityPolicy::from_risk_profile(&profile, Path::new("/workspace"));
+        assert_eq!(
+            policy.forbidden_paths,
+            crate::policy::default_forbidden_paths(),
+            "default profile's forbidden_paths must stay exactly the raw default list"
+        );
+    }
+
+    #[test]
+    fn sandbox_policy_deny_read_only_blocks_resolved_path_without_old_style_fields() {
+        // Exact scenario from Audacity88's #7821 review: an operator sets ONLY
+        // sandbox_policy.deny_read, with no old-style forbidden_paths/allowed_roots.
+        // Before the from_profiles migration this was accepted by the schema but
+        // silently unenforced by the app-layer path guard (PathGuardedTool), since
+        // is_resolved_path_readable only ever consulted forbidden_paths.
+        let mut profile = crate::schema::RiskProfileConfig {
+            forbidden_paths: vec![],
+            allowed_roots: vec![],
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        profile.sandbox_policy.deny_read = vec!["~/.ssh".to_string()];
+        let workspace = Path::new("/workspace");
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        let ssh_key = expand_user_path("~/.ssh").join("id_rsa");
+        assert!(
+            !policy.is_resolved_path_readable(&ssh_key),
+            "sandbox_policy.deny_read must be enforced by the app-layer path guard even with \
+             no old-style forbidden_paths set"
+        );
+    }
+
+    #[test]
+    fn sandbox_policy_old_style_and_new_style_produce_equivalent_path_guard_decisions() {
+        // Round-trip parity: an old-style config and its sandbox_policy.* equivalent
+        // must reach the same app-layer path-guard verdicts, not just the same
+        // resolved SandboxPolicy (already covered by sandbox_policy::tests).
+        let workspace = Path::new("/workspace");
+
+        let old_style = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            forbidden_paths: vec!["/secret".to_string()],
+            allowed_roots: vec!["/extra".to_string()],
+            ..crate::schema::RiskProfileConfig::default()
+        };
+
+        let mut new_style = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            forbidden_paths: vec![],
+            allowed_roots: vec![],
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        new_style.sandbox_policy.deny_read = vec!["/secret".to_string()];
+        new_style.sandbox_policy.allow_read = vec!["/extra".to_string()];
+        new_style.sandbox_policy.allow_write = vec!["/extra".to_string()];
+
+        let old_policy = SecurityPolicy::from_risk_profile(&old_style, workspace);
+        let new_policy = SecurityPolicy::from_risk_profile(&new_style, workspace);
+
+        let probes = [
+            Path::new("/secret/data.txt"),
+            Path::new("/extra/file.txt"),
+            Path::new("/other/file.txt"),
+        ];
+        for probe in probes {
+            assert_eq!(
+                old_policy.is_resolved_path_readable(probe),
+                new_policy.is_resolved_path_readable(probe),
+                "old-style and new-style configs must produce identical READ decisions for {probe:?}"
+            );
+            assert_eq!(
+                old_policy.is_resolved_path_allowed(probe),
+                new_policy.is_resolved_path_allowed(probe),
+                "old-style and new-style configs must produce identical WRITE decisions for {probe:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_policy_allow_write_grants_write_tier_access_via_path_guard() {
+        let workspace = Path::new("/workspace");
+        let mut profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        profile.sandbox_policy.allow_write = vec!["/data".to_string()];
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            policy.is_resolved_path_allowed(Path::new("/data/output.txt")),
+            "sandbox_policy.allow_write must grant write access through the app-layer path guard"
+        );
+    }
+
+    #[test]
+    fn sandbox_policy_deny_write_overrides_nested_allow_write_via_path_guard() {
+        let workspace = Path::new("/workspace");
+        let mut profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        profile.sandbox_policy.allow_write = vec!["/data".to_string()];
+        profile.sandbox_policy.deny_write = vec!["/data/.env".to_string()];
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            policy.is_resolved_path_allowed(Path::new("/data/output.txt")),
+            "sibling file under allow_write must remain writable"
+        );
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/data/.env")),
+            "deny_write must override allow_write for the guarded path, even nested under it"
+        );
+    }
+
+    #[test]
+    fn mandatory_deny_write_guardrail_protects_dotenv_under_workspace_via_path_guard() {
+        // Previously the mandatory-deny-write guardrail (.env, .bashrc, .git/hooks/,
+        // etc.) had ZERO app-layer enforcement — it only ever reached OS sandbox
+        // backends via create_sandbox(). A NoopSandbox setup (no Bubblewrap/Landlock/
+        // Seatbelt active) gave no protection at all. This is now enforced here too.
+        let workspace = Path::new("/workspace");
+        let profile = crate::schema::RiskProfileConfig::default();
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+        assert!(
+            !policy.is_resolved_path_allowed(&workspace.join(".env")),
+            "mandatory deny-write guardrail (.env) must be enforced by the app-layer path guard"
         );
     }
 
