@@ -86,7 +86,9 @@ pub struct ChatCompletionRequest {
     pub frequency_penalty: Option<f64>,
     #[serde(default)]
     pub stop: Option<Vec<String>>,
-    /// Optional stable session key (mirrors OpenAI `user` field).
+    /// OpenAI-compatible `user` field. Accepted for wire compatibility but
+    /// currently unused: memory recall/store is unscoped (shared across all
+    /// entry points into the agent), so this is not used as a session key.
     #[serde(default)]
     pub user: Option<String>,
 }
@@ -246,7 +248,7 @@ pub async fn handle_openai_models(
 
 pub async fn handle_openai_chat_completion_stream(
     State(state): State<AppState>,
-    Extension(alias): Extension<String>,
+    Extension(_alias): Extension<String>,
     headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
@@ -276,14 +278,6 @@ pub async fn handle_openai_chat_completion_stream(
                 .into_response();
         }
     };
-
-    // Derive a stable session_id from the optional `user` field, namespaced by alias.
-    let session_id = req
-        .user
-        .as_deref()
-        .filter(|u| !u.is_empty())
-        .map(|u| format!("openai-bridge:{alias}:{u}"))
-        .or_else(|| Some(format!("openai-bridge:{alias}")));
 
     let id = completion_id();
     let created = unix_now();
@@ -341,9 +335,13 @@ pub async fn handle_openai_chat_completion_stream(
         }
     };
 
-    if let Some(ref sid) = session_id {
-        agent.set_memory_session_id(Some(sid.clone()));
-    }
+    // No per-alias/per-user memory_session_id is set here: like the
+    // orchestrator-routed channels (Telegram, Discord, etc.), recall/store
+    // runs unscoped (session_id=None) so the agent's long-term memory is
+    // shared across every entry point into it (openai bridge, WS/dashboard
+    // UI, other channels) rather than siloed per alias. See PR #8710 review
+    // discussion: siloing by alias meant memory written via the ZeroClaw UI
+    // was invisible to the openai bridge and vice versa.
 
     // Merge any caller-supplied system message(s) into ZeroClaw's own
     // built-in prompt (identity/SOUL.md/USER.md + safety + tools) as a
@@ -573,46 +571,6 @@ mod tests {
         let json = serde_json::to_string(&chunk).unwrap();
         assert!(json.contains("\"finish_reason\":\"stop\""));
         assert!(!json.contains("\"content\""));
-    }
-
-    // ── session_id namespacing by alias ──────────────────────────────────────
-
-    #[test]
-    fn session_id_includes_alias_and_user() {
-        let alias = "home-assistant";
-        let user = "user42";
-        let session_id = format!("openai-bridge:{alias}:{user}");
-        assert_eq!(session_id, "openai-bridge:home-assistant:user42");
-    }
-
-    #[test]
-    fn session_id_alias_only_when_no_user() {
-        let alias = "open-webui";
-        let req_user: Option<&str> = None;
-        let session_id = req_user
-            .filter(|u| !u.is_empty())
-            .map(|u| format!("openai-bridge:{alias}:{u}"))
-            .unwrap_or_else(|| format!("openai-bridge:{alias}"));
-        assert_eq!(session_id, "openai-bridge:open-webui");
-    }
-
-    #[test]
-    fn session_id_alias_only_when_user_is_empty_string() {
-        let alias = "my-alias";
-        let req_user: Option<&str> = Some("");
-        let session_id = req_user
-            .filter(|u| !u.is_empty())
-            .map(|u| format!("openai-bridge:{alias}:{u}"))
-            .unwrap_or_else(|| format!("openai-bridge:{alias}"));
-        assert_eq!(session_id, "openai-bridge:my-alias");
-    }
-
-    #[test]
-    fn different_aliases_produce_distinct_session_ids() {
-        let user = "alice";
-        let id_a = format!("openai-bridge:alias-a:{user}");
-        let id_b = format!("openai-bridge:alias-b:{user}");
-        assert_ne!(id_a, id_b);
     }
 
     // ── URL derivation from gateway config ───────────────────────────────────
