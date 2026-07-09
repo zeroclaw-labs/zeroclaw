@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use zeroclaw_config::schema::{Config, RuntimeConfigKind};
 
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
@@ -31,6 +32,44 @@ mod notification {
     pub const SESSION_UPDATE: &str = "session/update";
     pub const LOGS_EVENT: &str = "logs/event";
 }
+
+struct StatusRuntimeContext {
+    config_dir: String,
+    config_file: String,
+    config_kind: ConfigKind,
+    local_ipc_endpoint: String,
+}
+
+fn status_runtime_context(config: &Config, config_kind: ConfigKind) -> StatusRuntimeContext {
+    let config_file = config.config_path.display().to_string();
+    let config_dir = config
+        .config_path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let local_ipc_endpoint = super::local::socket_path(config).display().to_string();
+
+    StatusRuntimeContext {
+        config_dir,
+        config_file,
+        config_kind,
+        local_ipc_endpoint,
+    }
+}
+
+fn config_kind_from_runtime(kind: RuntimeConfigKind) -> ConfigKind {
+    match kind {
+        RuntimeConfigKind::Default => ConfigKind::Default,
+        RuntimeConfigKind::Custom => ConfigKind::Custom,
+        RuntimeConfigKind::Temporary => ConfigKind::Temporary,
+    }
+}
+
+// ── Method registry ──────────────────────────────────────────────
+//
+// Single source of truth. Every variant maps to exactly one wire
+// string. `from_wire` is a table scan — no hand-written string
+// matching anywhere in this file.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -841,6 +880,14 @@ impl RpcDispatcher {
 
     async fn handle_status(&self) -> RpcResult {
         let ids = self.ctx.sessions.list_ids().await;
+        let config_path = self.ctx.config.read().config_path.clone();
+        let config_kind = config_kind_from_runtime(
+            zeroclaw_config::schema::classify_runtime_config_kind(&config_path).await,
+        );
+        let runtime_context = {
+            let config = self.ctx.config.read();
+            status_runtime_context(&config, config_kind)
+        };
         // Count persisted sessions (channel-originated) that aren't already
         // in the in-memory RPC store.
         let persisted_count = self
@@ -855,6 +902,10 @@ impl RpcDispatcher {
             protocol_version: RPC_PROTOCOL_VERSION,
             active_sessions: total,
             session_ids: ids,
+            config_dir: Some(runtime_context.config_dir),
+            config_file: Some(runtime_context.config_file),
+            config_kind: Some(runtime_context.config_kind),
+            local_ipc_endpoint: Some(runtime_context.local_ipc_endpoint),
         })
     }
 
@@ -6005,6 +6056,71 @@ mod tests {
         assert_eq!(val["server_version"], "0.1.0");
     }
 
+    #[test]
+    fn status_runtime_context_reports_config_root_and_local_endpoint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let context = status_runtime_context(&config, ConfigKind::Temporary);
+
+        assert_eq!(context.config_dir, tmp.path().display().to_string());
+        assert_eq!(
+            context.config_file,
+            tmp.path().join("config.toml").display().to_string()
+        );
+        assert_eq!(context.config_kind, ConfigKind::Temporary);
+        assert_eq!(
+            context.local_ipc_endpoint,
+            crate::rpc::local::socket_path(&config)
+                .display()
+                .to_string()
+        );
+
+        config.config_path = std::path::PathBuf::from("/opt/zeroclaw/config.toml");
+        assert_eq!(
+            status_runtime_context(&config, ConfigKind::Custom).config_kind,
+            ConfigKind::Custom
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_status_includes_runtime_context_fields() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config.clone());
+
+        let value = dispatcher.handle_status().await.expect("status result");
+        let status: StatusResult = serde_json::from_value(value).expect("status shape");
+
+        assert_eq!(
+            status.config_dir.as_deref(),
+            Some(tmp.path().to_str().unwrap())
+        );
+        assert_eq!(
+            status.config_file.as_deref(),
+            Some(tmp.path().join("config.toml").to_str().unwrap())
+        );
+        assert_eq!(status.config_kind, Some(ConfigKind::Temporary));
+        assert_eq!(
+            status.local_ipc_endpoint.as_deref(),
+            Some(crate::rpc::local::socket_path(&config).to_str().unwrap())
+        );
+    }
+
+    /// Cover the `initialize` parsing path that caches the TUI's
+    /// `clientCapabilities.elicitation` block so the per-session
+    /// `RpcApprovalChannel` can route `request_choice` over
+    /// `elicitation/create`. Source-of-truth check: the dispatcher
+    /// is the canonical owner; the test reads the field directly.
     #[tokio::test]
     async fn handle_initialize_caches_elicitation_form_capability() {
         let (mut dispatcher, _sessions) =

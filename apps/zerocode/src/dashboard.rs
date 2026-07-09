@@ -11,7 +11,7 @@ use ratatui::{
 use std::sync::Arc;
 
 use crate::client::{
-    AgentStatusEntry, CostSummaryResult, CronJobEntry, CronRunEntry, CronSchedule,
+    AgentStatusEntry, ConfigKind, CostSummaryResult, CronJobEntry, CronRunEntry, CronSchedule,
     CronTriggerResult, MemoryEntryResult, MessageEntry, OrgCost, RpcClient, SessionEntry,
     StatusResult, TuiListEntry,
 };
@@ -525,7 +525,7 @@ impl Dashboard {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(8),                            // status box
+                Constraint::Length(12),                           // status box
                 Constraint::Length(4 + self.agents.len() as u16), // agents
                 Constraint::Min(0),                               // connected TUIs
             ])
@@ -578,6 +578,47 @@ impl Dashboard {
                     Span::styled(format!("{}", s.active_sessions), theme::accent_style()),
                 ]),
             ]);
+
+            if let Some(config_dir) = s.config_dir.as_deref() {
+                let mut spans = vec![
+                    Span::styled(
+                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-config")),
+                        theme::dim_style(),
+                    ),
+                    Span::styled(config_dir, theme::body_style()),
+                ];
+                if let Some(config_kind) = s.config_kind.as_ref() {
+                    spans.extend([
+                        Span::styled(" (", theme::body_style()),
+                        Span::styled(
+                            config_kind_label(config_kind),
+                            config_kind_style(config_kind),
+                        ),
+                        Span::styled(")", theme::body_style()),
+                    ]);
+                }
+                lines.push(Line::from(spans));
+            }
+
+            if let Some(config_file) = s.config_file.as_deref() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-config-file")),
+                        theme::dim_style(),
+                    ),
+                    Span::styled(config_file, theme::body_style()),
+                ]));
+            }
+
+            if let Some(endpoint) = s.local_ipc_endpoint.as_deref() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-endpoint")),
+                        theme::dim_style(),
+                    ),
+                    Span::styled(endpoint, theme::body_style()),
+                ]));
+            }
 
             // Process stats from health
             if let Some(ref h) = self.health
@@ -2724,6 +2765,22 @@ fn format_uptime(secs: u64) -> String {
         format!("{hours}h {mins}m")
     } else {
         format!("{mins}m")
+    }
+}
+
+fn config_kind_label(kind: &ConfigKind) -> String {
+    match kind {
+        ConfigKind::Default => crate::i18n::t("zc-dashboard-config-kind-default"),
+        ConfigKind::Custom => crate::i18n::t("zc-dashboard-config-kind-custom"),
+        ConfigKind::Temporary => crate::i18n::t("zc-dashboard-config-kind-temporary"),
+    }
+}
+
+fn config_kind_style(kind: &ConfigKind) -> Style {
+    match kind {
+        ConfigKind::Default => theme::body_style(),
+        ConfigKind::Custom => theme::accent_style(),
+        ConfigKind::Temporary => theme::warn_style(),
     }
 }
 

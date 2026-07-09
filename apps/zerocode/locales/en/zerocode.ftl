@@ -177,11 +177,17 @@ zc-dashboard-label-connected = Connected
 zc-dashboard-label-server = Server
 zc-dashboard-label-protocol = Protocol
 zc-dashboard-label-sessions = Sessions
+zc-dashboard-label-config = Config
+zc-dashboard-label-config-file = File
+zc-dashboard-label-endpoint = Endpoint
 zc-dashboard-label-memory = Memory
 zc-dashboard-label-cpu = CPU
 zc-dashboard-label-insecure-tls = ⚠ unverified TLS — certificate not checked
 zc-dashboard-label-uptime = Uptime
 zc-dashboard-label-pid = PID
+zc-dashboard-config-kind-default = default
+zc-dashboard-config-kind-custom = custom
+zc-dashboard-config-kind-temporary = temporary
 
 zc-dashboard-no-tuis = No TUIs connected
 zc-dashboard-no-session = No session selected

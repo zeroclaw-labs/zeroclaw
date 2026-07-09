@@ -86,11 +86,28 @@ rpc_type! {
 }
 
 rpc_type! {
+    #[derive(PartialEq, Eq)]
+    pub enum ConfigKind {
+        Default,
+        Custom,
+        Temporary,
+    }
+}
+
+rpc_type! {
     pub struct StatusResult {
         pub server_version: String,
         pub protocol_version: u64,
         pub active_sessions: usize,
         pub session_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub config_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub config_file: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub config_kind: Option<ConfigKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub local_ipc_endpoint: Option<String>,
     }
 }
 
