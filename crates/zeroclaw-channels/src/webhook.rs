@@ -350,7 +350,7 @@ impl Channel for WebhookChannel {
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
         // Fail-fast: a webhook with no secret accepts *all* incoming requests,
         // including unauthenticated ones.  Refuse to start so the operator is
-        // forced to configure a secret (or explicitly override this guard).
+        // forced to configure a secret.
         if self.secret.is_none() {
             anyhow::bail!(
                 "webhook channel requires a `secret` configured for request \
