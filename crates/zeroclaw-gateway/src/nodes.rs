@@ -367,7 +367,6 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
                         "Node registered: with capabilities"
                     );
                     registered_node_id = Some(node_id.clone());
-
                 } else {
                     ::zeroclaw_log::record!(
                         WARN,

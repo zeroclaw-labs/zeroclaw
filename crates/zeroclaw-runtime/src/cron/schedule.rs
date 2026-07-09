@@ -309,7 +309,6 @@ mod tests {
 
     #[test]
     fn normalize_weekday_field_handles_sunday_alias_in_range() {
-
         // 0-7 (Sun..Sun = the full week) → every cron-crate weekday.
         assert_eq!(normalize_weekday_field("0-7").unwrap(), "1,2,3,4,5,6,7");
         // 6-7 (Sat,Sun) → cron-crate 7 (Sat) + 1 (Sun).

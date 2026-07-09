@@ -3,9 +3,13 @@ use crate::plan::PlanEntry;
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
     /// A text chunk from the LLM response (may arrive many times).
-    Chunk { delta: String },
+    Chunk {
+        delta: String,
+    },
     /// A reasoning/thinking chunk from a thinking model (may arrive many times).
-    Thinking { delta: String },
+    Thinking {
+        delta: String,
+    },
     /// The agent is invoking a tool.
     ToolCall {
         /// Stable correlation ID shared with the matching [`TurnEvent::ToolResult`].
@@ -20,7 +24,9 @@ pub enum TurnEvent {
         name: String,
         output: String,
     },
-    Plan { entries: Vec<PlanEntry> },
+    Plan {
+        entries: Vec<PlanEntry>,
+    },
     ApprovalRequest {
         /// Correlation ID. The matching response frame must echo it.
         request_id: String,

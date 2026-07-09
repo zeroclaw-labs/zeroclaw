@@ -24,8 +24,8 @@ use embed::DiscordEmbed;
 
 mod types;
 // Keep the historical public path (`…::discord::DiscordSlashCommandSpec`) stable.
-pub use types::{DiscordSlashCommandResolver, DiscordSlashCommandSpec};
 pub(crate) use types::*;
+pub use types::{DiscordSlashCommandResolver, DiscordSlashCommandSpec};
 
 // Contract tier: the typed slash-command option model the command spec carries.
 // Consumers (`types`, `slash`, dispatch) import `super::slash_options::…`

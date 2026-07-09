@@ -736,7 +736,6 @@ impl AppSyncStore for RusqliteStore {
 #[cfg(feature = "whatsapp-web")]
 #[async_trait]
 impl ProtocolStore for RusqliteStore {
-
     async fn get_sender_key_devices(
         &self,
         group_jid: &str,

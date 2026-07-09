@@ -1,4 +1,3 @@
-
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use zeroclaw_api::model_provider::{ChatMessage, ChatRequest, ModelProvider};

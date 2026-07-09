@@ -1,4 +1,3 @@
-
 use serde_json::{Map, Value};
 
 /// A Discord rich embed. Every field is optional per the Discord API;

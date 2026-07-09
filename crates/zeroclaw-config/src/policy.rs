@@ -1505,11 +1505,9 @@ impl SecurityPolicy {
                             || arg.starts_with("alias.")
                     })
             }
-            "python" | "python3" => {
-                !args
-                    .iter()
-                    .any(|arg| arg.starts_with("-c") || arg.starts_with("-m"))
-            }
+            "python" | "python3" => !args
+                .iter()
+                .any(|arg| arg.starts_with("-c") || arg.starts_with("-m")),
             "node" => {
                 // -e/--eval evaluates argument as JavaScript
                 // -p/--print same as --eval but prints the result

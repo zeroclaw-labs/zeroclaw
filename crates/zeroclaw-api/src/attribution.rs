@@ -1,4 +1,3 @@
-
 use strum_macros::IntoStaticStr;
 
 /// Trait every alias-bound "thing" implements once next to its struct.

@@ -1395,31 +1395,26 @@ impl RpcDispatcher {
 
         let agent = match self.ctx.sessions.get_agent(sid).await {
             Some(a) => a,
-            None => {
-                match self.rehydrate_reaped_session(sid).await {
-                    Some(a) => a,
-                    None => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Fail,
-                            )
+            None => match self.rehydrate_reaped_session(sid).await {
+                Some(a) => a,
+                None => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail,)
                             .with_category(::zeroclaw_log::EventCategory::Agent)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({ "session_id": sid })),
-                            "session/prompt on a session absent from memory and the durable store; emitting TurnComplete so the client exits the working state"
-                        );
-                        self.emit_turn_complete(
-                            sid,
-                            crate::rpc::types::TurnCompletionOutcome::Failed,
-                            "turn cancelled by daemon: session_not_found".to_string(),
-                        )
-                        .await;
-                        return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
-                    }
+                        "session/prompt on a session absent from memory and the durable store; emitting TurnComplete so the client exits the working state"
+                    );
+                    self.emit_turn_complete(
+                        sid,
+                        crate::rpc::types::TurnCompletionOutcome::Failed,
+                        "turn cancelled by daemon: session_not_found".to_string(),
+                    )
+                    .await;
+                    return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
                 }
-            }
+            },
         };
 
         // Process inline attachments: upload each, append markers to prompt.
@@ -3996,13 +3991,11 @@ fn notification_for_turn_event(
             cached_input_tokens: _,
             output_tokens: _,
             ..
-        } => {
-            SessionUpdateEvent::ContextUsage {
-                session_id: session_id.to_string(),
-                input_tokens: *input_tokens,
-                max_context_tokens,
-            }
-        }
+        } => SessionUpdateEvent::ContextUsage {
+            session_id: session_id.to_string(),
+            input_tokens: *input_tokens,
+            max_context_tokens,
+        },
         TurnEvent::Plan { entries } => SessionUpdateEvent::Plan {
             session_id: session_id.to_string(),
             entries: entries.clone(),

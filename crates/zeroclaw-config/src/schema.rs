@@ -18598,7 +18598,6 @@ fn apply_dirty_natural_key_path(
     };
 
     if let Some(inner) = inner_suffix {
-
         let inner_raw: Vec<&str> = inner.split('.').collect();
         let inner_segments: Vec<String> = match mem_entry {
             Some(table) => resolve_dirty_segments(table, &inner_raw),

@@ -2950,7 +2950,9 @@ enum MemoryCommands {
         offset: usize,
     },
     /// Get a specific memory entry by key
-    Get { key: String },
+    Get {
+        key: String,
+    },
     /// Show memory backend statistics and health
     Stats,
     /// Clear memories by category, by key, or clear all

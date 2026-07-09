@@ -14,7 +14,9 @@ const COMPONENT_TTL: Duration = Duration::from_secs(15 * 60);
 /// tool-approval `oneshot`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ComponentIntent {
-    ResolveIntoTurn { prompt: String },
+    ResolveIntoTurn {
+        prompt: String,
+    },
     OpenModal {
         modal: Box<super::components::DiscordModal>,
         prompt: String,

@@ -1,4 +1,3 @@
-
 use serde_json::{Map, Value, json};
 
 pub(crate) const DISCORD_MAX_STATIC_CHOICES: usize = 25;

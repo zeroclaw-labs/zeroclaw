@@ -1,4 +1,3 @@
-
 use chrono::{DateTime, Utc};
 
 /// Maximum characters per posted comment. GitHub caps bodies at 65536;

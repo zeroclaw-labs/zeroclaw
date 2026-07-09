@@ -1,4 +1,3 @@
-
 use std::fmt;
 
 use zeroclaw_config::schema::Config;

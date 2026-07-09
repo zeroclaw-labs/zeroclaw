@@ -2339,7 +2339,6 @@ fn find_first_string_at_key(value: &toml::Value, key: &str) -> Option<String> {
 
 #[test]
 fn encryption_covers_every_schema_secret_field() {
-
     let tmp = tempfile::tempdir().expect("tempdir");
     let raw = generate(
         CURRENT_SCHEMA_VERSION,
@@ -2396,7 +2395,6 @@ fn encryption_covers_every_schema_secret_field() {
 
 #[test]
 fn encryption_covers_compound_map_secret_field() {
-
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = SecretStore::new(tmp.path(), true);
 

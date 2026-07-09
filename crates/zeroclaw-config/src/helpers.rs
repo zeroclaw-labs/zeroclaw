@@ -153,8 +153,14 @@ pub enum VecRoute<'a> {
     /// Path resolved to a unique element. `index` is the element's
     /// position in the underlying `Vec`; `inner_name` is the property
     /// path to pass to `T::get_prop` / `T::set_prop`.
-    Hit { index: usize, inner_name: String },
-    Ambiguous { key: &'a str, count: usize },
+    Hit {
+        index: usize,
+        inner_name: String,
+    },
+    Ambiguous {
+        key: &'a str,
+        count: usize,
+    },
 }
 
 /// Return a comma-separated string of valid enum variant names for display in error messages.
