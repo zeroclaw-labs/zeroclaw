@@ -106,10 +106,14 @@ async fn switch_mode(
     mode: &mut Mode,
     next: Mode,
     conn_state: &ConnectionState,
+    dashboard_pane: &mut dashboard::Dashboard,
     quickstart: &mut quickstart_pane::QuickstartPane,
     acp_pane: &mut acp::Acp,
     chat_pane: &mut chat::Chat,
 ) {
+    if *mode == Mode::Dashboard && next != Mode::Dashboard {
+        dashboard_pane.on_pane_blur();
+    }
     if *mode == Mode::Quickstart && next != Mode::Quickstart {
         quickstart.dismiss_beacon().await;
     }
@@ -661,6 +665,7 @@ pub async fn run(
                         &mut mode,
                         next,
                         &conn_state,
+                        &mut dashboard_pane,
                         &mut quickstart,
                         &mut acp_pane,
                         &mut chat_pane,
@@ -700,6 +705,7 @@ pub async fn run(
                         &mut mode,
                         Mode::Dashboard,
                         &conn_state,
+                        &mut dashboard_pane,
                         &mut quickstart,
                         &mut acp_pane,
                         &mut chat_pane,
@@ -738,6 +744,7 @@ pub async fn run(
                             &mut mode,
                             next,
                             &conn_state,
+                            &mut dashboard_pane,
                             &mut quickstart,
                             &mut acp_pane,
                             &mut chat_pane,
@@ -759,22 +766,7 @@ pub async fn run(
                 if !matches!(conn_state, ConnectionState::Disconnected { .. }) {
                     match mode {
                         Mode::Dashboard => {
-                            if let Some(action) = dashboard_pane.handle_mouse(mouse, content_area) {
-                                match action {
-                                    dashboard::DashboardMouseAction::OpenAgentConfig(alias) => {
-                                        config_app.open_agent_config(&alias).await?;
-                                        switch_mode(
-                                            &mut mode,
-                                            Mode::Config,
-                                            &conn_state,
-                                            &mut quickstart,
-                                            &mut acp_pane,
-                                            &mut chat_pane,
-                                        )
-                                        .await;
-                                    }
-                                }
-                            }
+                            dashboard_pane.handle_mouse(mouse, content_area);
                         }
                         Mode::Config => {
                             config_app.handle_mouse(mouse, content_area, term).await?;
