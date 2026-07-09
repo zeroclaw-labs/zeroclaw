@@ -1,9 +1,3 @@
-/// Streaming events emitted during an agent turn.
-///
-/// Used by the gateway WebSocket handler to relay real-time updates to clients.
-/// Consumers that pattern-match on [`TurnEvent::ToolCall`] or
-/// [`TurnEvent::ToolResult`] should preserve the stable `id` field for
-/// call/result correlation.
 use crate::plan::PlanEntry;
 
 #[derive(Debug, Clone)]
@@ -26,17 +20,7 @@ pub enum TurnEvent {
         name: String,
         output: String,
     },
-    /// The agent published or updated its execution plan (TodoWrite).
-    ///
-    /// Whole-list replacement: `entries` is the complete authoritative
-    /// plan; an empty vec clears it. Downstream consumers replace their
-    /// held plan wholesale — no merge.
     Plan { entries: Vec<PlanEntry> },
-    /// The agent is waiting for the operator to approve, deny, or always-allow
-    /// a tool call. The transport (e.g. gateway WebSocket) is expected to
-    /// surface this to the operator and route the response back through the
-    /// same correlation `request_id`. The runtime tool loop pauses until that
-    /// answer arrives or the channel times out.
     ApprovalRequest {
         /// Correlation ID. The matching response frame must echo it.
         request_id: String,
@@ -56,13 +40,6 @@ pub enum TurnEvent {
         kept_turns: usize,
         reason: String,
     },
-    /// Per-LLM-call token usage and cost.
-    ///
-    /// Emitted once per LLM response the agent loop processes; a single turn
-    /// that hops through tools may emit several `Usage` events, one per model
-    /// call. Consumers (e.g. the gateway WS handler) accumulate these into a
-    /// turn total before reporting back to the client. Absence means "usage
-    /// unavailable for this call" rather than zero.
     Usage {
         input_tokens: Option<u64>,
         /// Tokens served from the provider's prompt cache (e.g. Anthropic

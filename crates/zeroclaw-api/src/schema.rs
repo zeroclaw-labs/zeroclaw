@@ -1,56 +1,4 @@
 //! JSON Schema cleaning and validation for LLM tool-calling compatibility.
-//!
-//! Different model_providers support different subsets of JSON Schema. This module
-//! normalizes tool schemas to improve cross-provider compatibility while
-//! preserving semantic intent.
-//!
-//! ## What this module does
-//!
-//! 1. Removes unsupported keywords per model_provider strategy
-//! 2. Resolves local `$ref` entries from `$defs` and `definitions`
-//! 3. Flattens literal `anyOf` / `oneOf` unions into `enum`
-//! 4. Strips nullable variants from unions and `type` arrays
-//! 5. Converts `const` to single-value `enum`
-//! 6. Detects circular references and stops recursion safely
-//!
-//! # Example
-//!
-//! ```rust
-//! use serde_json::json;
-//! use zeroclaw_api::schema::SchemaCleanr;
-//!
-//! let dirty_schema = json!({
-//!     "type": "object",
-//!     "properties": {
-//!         "name": {
-//!             "type": "string",
-//!             "minLength": 1,  // Gemini rejects this
-//!             "pattern": "^[a-z]+$"  // Gemini rejects this
-//!         },
-//!         "age": {
-//!             "$ref": "#/$defs/Age"  // Needs resolution
-//!         }
-//!     },
-//!     "$defs": {
-//!         "Age": {
-//!             "type": "integer",
-//!             "minimum": 0  // Gemini rejects this
-//!         }
-//!     }
-//! });
-//!
-//! let cleaned = SchemaCleanr::clean_for_gemini(dirty_schema);
-//!
-//! // Result:
-//! // {
-//! //   "type": "object",
-//! //   "properties": {
-//! //     "name": { "type": "string" },
-//! //     "age": { "type": "integer" }
-//! //   }
-//! // }
-//! ```
-//!
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -119,7 +67,6 @@ pub struct SchemaCleanr;
 
 impl SchemaCleanr {
     /// Clean schema for Gemini compatibility (strictest).
-    ///
     /// This is the most aggressive cleaning strategy, removing all keywords
     /// that Gemini's API rejects.
     pub fn clean_for_gemini(schema: Value) -> Value {
@@ -137,7 +84,7 @@ impl SchemaCleanr {
     }
 
     /// Zero-copy wrapper around [`Self::clean`] for `Arc`-shared tool schemas
-    /// (#8642): returns the same `Arc` when the pre-scan proves cleaning is a
+    ///  returns the same `Arc` when the pre-scan proves cleaning is a
     /// no-op, deep-copying the tree only when a rewrite is actually needed.
     pub fn clean_shared(schema: &Arc<Value>, strategy: CleaningStrategy) -> Arc<Value> {
         if Self::needs_cleaning(schema, strategy) {
@@ -147,16 +94,6 @@ impl SchemaCleanr {
         }
     }
 
-    /// Conservative read-only pre-scan: `true` when [`Self::clean`] with
-    /// `strategy` could change `schema`.
-    ///
-    /// False positives are allowed (a flagged schema may clean to an equal
-    /// value); false negatives are not — `!needs_cleaning(s)` must imply
-    /// `clean(s) == s`. The triggers mirror every rewrite path in
-    /// [`Self::clean_object`]: strategy-specific keyword removal, plus the
-    /// strategy-independent rewrites (`$ref` resolution, `const` → `enum`,
-    /// `anyOf`/`oneOf` simplification and sibling-`type` skipping, and
-    /// null-stripping in `type` arrays).
     pub fn needs_cleaning(schema: &Value, strategy: CleaningStrategy) -> bool {
         match schema {
             Value::Object(obj) => {
@@ -194,7 +131,6 @@ impl SchemaCleanr {
     }
 
     /// Validate that a schema is suitable for LLM tool calling.
-    ///
     /// Returns an error if the schema is invalid or missing required fields.
     pub fn validate(schema: &Value) -> anyhow::Result<()> {
         let obj = schema
@@ -468,7 +404,6 @@ impl SchemaCleanr {
     }
 
     /// Try to flatten anyOf/oneOf with only literal values to enum.
-    ///
     /// Example: `anyOf: [{const: "a"}, {const: "b"}]` -> `{type: "string", enum: ["a", "b"]}`
     fn try_flatten_literal_union(variants: &[Value]) -> Option<Value> {
         if variants.is_empty() {
@@ -587,8 +522,6 @@ impl SchemaCleanr {
 mod tests {
     use super::*;
 
-    /// `!needs_cleaning(s)` must imply `clean(s) == s` — the safety contract
-    /// that lets `clean_shared` skip the deep copy (#8642).
     #[test]
     fn test_needs_cleaning_false_implies_clean_is_identity() {
         let clean_schemas = [
@@ -630,7 +563,6 @@ mod tests {
         }
     }
 
-    /// Every rewrite path in the cleaner must be flagged by the pre-scan.
     #[test]
     fn test_needs_cleaning_flags_every_rewrite_trigger() {
         let dirty = [
@@ -638,7 +570,6 @@ mod tests {
             json!({ "$ref": "#/$defs/Age", "$defs": { "Age": { "type": "integer" } } }),
             // const → enum conversion.
             json!({ "const": "fixed" }),
-            // anyOf/oneOf simplification and sibling-type skipping.
             json!({ "anyOf": [{ "type": "string" }, { "type": "null" }] }),
             json!({ "oneOf": [{ "type": "string" }, { "type": "number" }] }),
             // type-array null stripping.

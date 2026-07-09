@@ -41,16 +41,6 @@ pub struct MemoryEntry {
     /// Tenant or end-user scope for multi-user memory isolation.
     #[serde(default)]
     pub tenant_id: Option<String>,
-    /// Resolved, human-readable agent alias for this row (the HashMap key
-    /// in `Config::agents`, e.g. `"clamps"`). SQL-backed stores produce
-    /// this via `LEFT JOIN agents ON agents.id = memories.agent_id`;
-    /// Markdown / Qdrant / None backends populate it with the raw column
-    /// value (which is itself the alias for those backends).
-    ///
-    /// Use this field for display / routing. For scope-equality checks
-    /// (e.g. inside `AgentScopedMemory`) use [`MemoryEntry::agent_id`]
-    /// instead since that's stable across backend kinds (UUID for SQL,
-    /// alias for non-SQL).
     #[serde(default)]
     pub agent_alias: Option<String>,
     /// Raw value of the storage layer's agent column. For SQL backends
@@ -85,7 +75,6 @@ impl std::fmt::Debug for MemoryEntry {
 }
 
 /// Memory kind, orthogonal to [`MemoryCategory`].
-///
 /// Epic A owns this shared type and storage field. Later epics classify writes
 /// into kinds and use them during recall and context assembly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,7 +141,6 @@ impl std::fmt::Display for MemoryCategory {
 }
 
 /// Returns true when a recall query should be interpreted as recent/time-only recall.
-///
 /// A bare "*" is intentionally equivalent to an omitted query for tool-call
 /// compatibility. Non-bare wildcard terms such as "wild*" remain keyword queries.
 pub fn is_recent_recall_query(query: &str) -> bool {
@@ -170,7 +158,6 @@ pub fn normalize_recent_recall_query(query: &str) -> &str {
 }
 
 /// A single message in a conversation trace for procedural memory.
-///
 /// Used to capture "how to" patterns from tool-calling turns so that
 /// backends that support procedural storage can learn from them.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -251,11 +238,6 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         session_id: Option<&str>,
     ) -> anyhow::Result<()>;
 
-    /// Recall memories matching a query (keyword search), optionally scoped to a session
-    /// and time range. Empty, whitespace-only, and bare "*" queries return recent/time-only
-    /// entries. Non-bare wildcard terms such as "wild*" remain keyword queries.
-    /// Time bounds use RFC 3339 / ISO 8601 format
-    /// (e.g. "2025-03-01T00:00:00Z"); inclusive (created_at >= since, created_at <= until).
     async fn recall(
         &self,
         query: &str,
@@ -265,23 +247,8 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>>;
 
-    /// Get a specific memory by key.
-    ///
-    /// After composite uniqueness landed, multiple rows may share a `key`
-    /// (one per agent). This method returns *some* matching row without an
-    /// agent filter; callers that need an agent-scoped lookup use
-    /// [`get_for_agent`](Self::get_for_agent).
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>>;
 
-    /// Get the memory row matching `(key, agent_id)`. Siblings of the same
-    /// key under other agents are invisible.
-    ///
-    /// The default implementation composes [`get`](Self::get) with an
-    /// `agent_id` filter and is only correct for backends whose storage
-    /// layout cannot hold more than one row per `key` (markdown's
-    /// per-agent dir scheme, the `none` stub). Backends that can hold
-    /// multiple rows per `key` (SQL with composite unique, Qdrant)
-    /// override this with a native composite lookup.
     async fn get_for_agent(
         &self,
         key: &str,
@@ -303,11 +270,6 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// wrapper) use [`forget_for_agent`](Self::forget_for_agent) instead.
     async fn forget(&self, key: &str) -> anyhow::Result<bool>;
 
-    /// Remove the row matching `(key, agent_id)`. Siblings of the same key
-    /// under other agents are untouched. Returns `true` if a row was
-    /// removed. Required: no safe default exists for backends or wrappers
-    /// that can hold more than one row per `key` — the unscoped `forget`
-    /// would destroy sibling rows.
     async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool>;
 
     /// Remove all memories whose `namespace` field equals the given value.
@@ -324,11 +286,6 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         anyhow::bail!("purge_session not supported by this memory backend")
     }
 
-    /// Remove all memories in a session for one agent.
-    /// Returns the number of deleted entries.
-    /// Default: returns unsupported error. Backends with per-agent storage
-    /// override this; agent-scoped wrappers use it instead of composing a
-    /// session list with key-only deletes.
     async fn purge_session_for_agent(
         &self,
         _session_id: &str,
@@ -337,48 +294,22 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         anyhow::bail!("purge_session_for_agent not supported by this memory backend")
     }
 
-    /// Remove every memory row attributed to the given agent alias.
-    /// Returns the number of deleted entries. Called when an agent alias is
-    /// removed from `[agents.<alias>]` so the database doesn't accumulate
-    /// rows for retired aliases.
-    /// Default: returns unsupported error. Backends with per-agent storage
-    /// (sqlite, postgres) override this; backends without (markdown, none)
-    /// keep the default and the caller logs a warning.
     async fn purge_agent(&self, _agent_alias: &str) -> anyhow::Result<usize> {
         anyhow::bail!("purge_agent not supported by this memory backend")
     }
 
     /// Export every memory row attributed to `agent_alias`, for the agent-
-    /// deletion archive (export-then-delete, #7175). Pairs with
+    /// deletion archive (export-then-delete, Pairs with
     /// [`Self::purge_agent`]: the surface exports these rows to the archive,
     /// then purges. Default: empty (backends without per-agent export).
     async fn export_agent(&self, _agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
         Ok(Vec::new())
     }
 
-    /// Re-point every memory row from the `from` alias to the `to` alias,
-    /// returning the number of rows re-pointed. Called when an alias is renamed
-    /// (#7468). For the SQL backends (sqlite/postgres) memory rows ride the
-    /// agent's UUID, so this is a single `UPDATE agents SET alias` and the count
-    /// is the agents-row count (0 or 1); payload-keyed backends (qdrant) rewrite
-    /// the alias on every matching memory point and return that count.
-    /// Default: unsupported error; backends with per-agent storage override.
-    /// Markdown/none keep the default and the caller logs a warning.
     async fn rename_agent(&self, _from: &str, _to: &str) -> anyhow::Result<usize> {
         anyhow::bail!("rename_agent not supported by this memory backend")
     }
 
-    /// Read-only residue probe for the agent-rename cascade (#7940): the count
-    /// of state [`Self::rename_agent`] WOULD re-point for `agent_alias`, without
-    /// mutating anything. Used by the gateway to tell a genuine post-persist
-    /// partial failure (state still lagging at the old alias) apart from an
-    /// unrelated request, so a resume only fires on real residue.
-    ///
-    /// MUST mirror exactly what `rename_agent` moves: for the SQL backends that
-    /// is the `agents` row (alias presence), NOT the memory-row count - an agent
-    /// with an `agents` row but zero memory rows still gets re-pointed, so a
-    /// memory-row probe would be a false negative. Default 0 (markdown/none have
-    /// no DB rows and their `rename_agent` is a no-op).
     async fn count_agent(&self, _agent_alias: &str) -> anyhow::Result<usize> {
         Ok(0)
     }
@@ -390,7 +321,6 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     async fn health_check(&self) -> bool;
 
     /// Mark entries as superseded by a newer row.
-    ///
     /// Default: no-op. SQL backends can override this with reversible
     /// soft-hide behavior; non-SQL backends remain source-compatible.
     async fn supersede(&self, _superseded_ids: &[String], _new_id: &str) -> anyhow::Result<()> {
@@ -398,7 +328,6 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     }
 
     /// Store a procedural "how to" trace from a tool-calling turn.
-    ///
     /// Default: no-op. Backends that support procedural storage can override.
     async fn store_procedural(
         &self,
@@ -409,7 +338,6 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     }
 
     /// Count rows within a namespace/category scope.
-    ///
     /// Default is zero so quota enforcement remains opt-in until a backend
     /// provides an efficient implementation.
     async fn count_in_scope(
@@ -421,40 +349,16 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     }
 
     /// Read-side memory store telemetry.
-    ///
     /// Default is empty telemetry so status consumers can be introduced before
     /// every backend has native stats support.
     async fn stats(&self) -> anyhow::Result<MemoryStats> {
         Ok(MemoryStats::default())
     }
 
-    /// Rebuild backend indexes: FTS tables and any missing embedding vectors.
-    ///
-    /// Intended as a manual fixup after bulk writes that didn't go through
-    /// the normal `store()` path (e.g. `zeroclaw migrate openclaw`, which
-    /// uses `NoopEmbedding` for speed and leaves `embedding = NULL` behind).
-    /// Returns the number of entries that were re-embedded; backends
-    /// without a vector index or with nothing to fill in return 0.
-    ///
-    /// Default: no-op. Overridden by backends that maintain separate
-    /// derived indexes (e.g. `SqliteMemory`).
     async fn reindex(&self) -> anyhow::Result<usize> {
         Ok(0)
     }
 
-    /// Hot-swap the embedding provider after a `config/set` provider-profile
-    /// change, so a long-lived memory handle (e.g. the install-wide RPC memory
-    /// handle) stops using stale endpoint/key values without a daemon restart
-    /// (#8359).
-    ///
-    /// The arguments are the already-resolved embedding settings — the literal
-    /// provider (`openai` / `openrouter` / `custom:<url>`), key, model, and
-    /// dimensions produced by the memory crate's embedding resolver from the
-    /// canonical config. The impl rebuilds its embedder from them and swaps it
-    /// in place; no provider state is duplicated into a separate cache.
-    ///
-    /// Default: no-op. Backends that do not embed, or cannot swap their
-    /// embedder in place, keep the default.
     fn refresh_embedder(
         &self,
         _model_provider: &str,
@@ -465,7 +369,6 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     }
 
     /// Recall memories scoped to a specific namespace.
-    ///
     /// Default implementation delegates to `recall()` and filters by namespace.
     /// Backends with native namespace support should override for efficiency.
     async fn recall_namespaced(
@@ -488,14 +391,6 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         Ok(filtered)
     }
 
-    /// Bulk-export memories matching the given filter criteria.
-    ///
-    /// Intended for GDPR Art. 20 data portability. Returns entries ordered by
-    /// creation time (ascending). Embeddings are excluded.
-    ///
-    /// Default implementation delegates to `list()` and post-filters on
-    /// namespace and time range. Backends with native query support should
-    /// override for efficiency.
     async fn export(&self, filter: &ExportFilter) -> anyhow::Result<Vec<MemoryEntry>> {
         let entries = self
             .list(filter.category.as_ref(), filter.session_id.as_deref())
@@ -525,7 +420,6 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     }
 
     /// Store a memory entry with namespace and importance.
-    ///
     /// Default implementation delegates to `store()`. Backends with native
     /// namespace/importance support should override.
     async fn store_with_metadata(
@@ -541,7 +435,6 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     }
 
     /// Store a memory entry with the full additive metadata surface.
-    ///
     /// Default delegates through the existing metadata method and intentionally
     /// ignores fields that older backends do not yet persist.
     async fn store_with_options(
@@ -563,14 +456,6 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         .await
     }
 
-    /// Store a memory entry attributed to an explicit agent UUID.
-    /// Every backend must implement this explicitly so the agent_id
-    /// is never silently dropped at storage time. Backends with
-    /// native agent_id columns (SqliteMemory, PostgresMemory,
-    /// LucidMemory) persist the attribution in SQL; MarkdownMemory
-    /// attributes via the per-agent directory path; QdrantMemory
-    /// persists in the vector payload; NoneMemory is a no-op stub.
-    /// `AgentScopedMemory` is the canonical caller.
     async fn store_with_agent(
         &self,
         key: &str,
@@ -582,25 +467,6 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         agent_id: Option<&str>,
     ) -> anyhow::Result<()>;
 
-    /// Recall memory entries scoped to a specific set of agent UUIDs.
-    /// When `allowed_agent_ids` is non-empty, the backend filters its
-    /// result set to rows whose `agent_id` matches one of the listed
-    /// UUIDs (or is NULL, for legacy rows written before the agent_id
-    /// column existed). Every backend must implement this explicitly
-    /// so the allowlist is never silently dropped at read time.
-    ///
-    /// For SQL-backed stores the filter is `WHERE agent_id IN (...)`.
-    /// For Markdown the implementation walks the allowed agents'
-    /// per-agent directories. For Qdrant it's a payload filter on
-    /// the `agent_id` field. For None it returns an empty list.
-    /// `AgentScopedMemory` is the canonical caller; direct invocation
-    /// is also valid for read-only cross-agent queries that bypass
-    /// the wrapper.
-    ///
-    /// Cross-backend allowlist entries are rejected at config load
-    /// (`agents.<alias>.workspace.read_memory_from` cannot point at a
-    /// sibling on a different memory backend); backends therefore
-    /// never need to handle a cross-backend recall.
     async fn recall_for_agents(
         &self,
         allowed_agent_ids: &[&str],
@@ -611,16 +477,6 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>>;
 
-    /// Look up (or create) the identifier the backend uses to refer
-    /// to the agent named by `alias`.
-    ///
-    /// Backends with an `agents` table (SqliteMemory, PostgresMemory,
-    /// LucidMemory) return the row's UUID, inserting if absent.
-    /// Backends without (MarkdownMemory, QdrantMemory, NoneMemory)
-    /// return the alias verbatim — there is no UUID indirection at
-    /// the storage layer, so the alias serves as the agent_id.
-    /// Default impl returns the alias unchanged; SQL backends
-    /// override to do the real lookup.
     async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
         Ok(alias.to_string())
     }
