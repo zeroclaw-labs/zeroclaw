@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn web_dist_dir_with_tilde_resolves_to_tilde_reason_key() {
-        //  `~/web-dist` is read verbatim and silently fails.
+        // `~/web-dist` is read verbatim and silently fails.
         // Round 3: predicate now returns Fluent key, not bare phrase.
         assert_eq!(
             web_dist_dir_expansion_reason_key("~/web-dist"),
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn web_dist_dir_with_env_var_resolves_to_dollar_reason_key() {
-        //  `$HOME/web-dist` and `${HOME}/web-dist` are read verbatim.
+        // `$HOME/web-dist` and `${HOME}/web-dist` are read verbatim.
         assert_eq!(
             web_dist_dir_expansion_reason_key("$HOME/web-dist"),
             Some("cli-web-dist-dir-reason-dollar")
@@ -572,7 +572,7 @@ mod tests {
 
     #[test]
     fn check_web_dist_dir_emits_localized_fail_for_tilde() {
-        // Round 3: the failure detail goes through Fluent
+        // The failure detail goes through Fluent
         // (cli-self-test-web-dist-dir-fail-expansion) — assert the
         // resolved English string contains the inlined path + reason.
         let mut config = crate::config::Config::default();

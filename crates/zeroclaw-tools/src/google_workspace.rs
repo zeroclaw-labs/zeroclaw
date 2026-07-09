@@ -499,7 +499,7 @@ mod tests {
         })
     }
 
-    //  PATH resolution must produce a usable PathBuf
+    // PATH resolution must produce a usable PathBuf
     // even when `gws` is not installed, so the executor can still emit the
     // documented "Failed to execute gws" error rather than panicking.
     #[test]

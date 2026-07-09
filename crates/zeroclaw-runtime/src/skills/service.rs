@@ -402,7 +402,7 @@ mod tests {
         assert_eq!(alpha_only[0].r#ref.bundle(), "alpha");
     }
 
-    //  provenance derivation mirrors the resolver's own discriminators.
+    // provenance derivation mirrors the resolver's own discriminators.
     #[test]
     fn derive_origin_classifies_each_source() {
         let bundles = vec![BundleSummary {
@@ -447,7 +447,7 @@ mod tests {
         );
     }
 
-    //  the effective set unions non-bundle sources (workspace) with
+    // the effective set unions non-bundle sources (workspace) with
     // bundle skills, tagging origin + editability — the gap that made the
     // dashboard render empty when only workspace skills existed.
     #[test]

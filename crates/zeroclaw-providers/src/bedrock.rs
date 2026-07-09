@@ -1574,7 +1574,7 @@ impl ModelProvider for BedrockModelProvider {
 
         // Prompt caching (cachePoint) is only accepted by Claude/Nova models;
         // sending it to e.g. Qwen or Llama returns a 400. Gate all cachePoint
-        // insertion on model support (see
+        // insertion on model support.
         let supports_caching = bedrock_model_supports_prompt_caching(model);
 
         // Apply cachePoint to system if large.
@@ -2191,7 +2191,7 @@ mod tests {
 
     #[test]
     fn prompt_caching_unsupported_for_other_families() {
-        //  Qwen (and other non-Claude/Nova families) reject
+        // Qwen (and other non-Claude/Nova families) reject
         // cachePoint blocks, so caching must be disabled for them.
         for model in [
             "qwen.qwen3-coder-next",

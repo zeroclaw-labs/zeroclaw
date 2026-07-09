@@ -325,7 +325,7 @@ mod tests {
         );
     }
 
-    //  Gemini CLI v0.40.x removed `--print`; the
+    // Gemini CLI v0.40.x removed `--print`; the
     // headless-mode flag is now `--prompt`. The argv must (a) carry
     // `--prompt ""` so stdin still feeds the prompt content (keeping the
     // user message out of `ps`) and (b) NEVER carry `--print` or `-`.

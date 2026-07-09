@@ -73,6 +73,8 @@ impl Clone for ActionTracker {
     }
 }
 
+/// Per-sender sliding-window rate limiter. The bucket map is Arc-shared
+/// so cloned policies (SubAgents) consume from the same budgets.
 #[derive(Debug)]
 pub struct PerSenderTracker {
     buckets: std::sync::Arc<parking_lot::Mutex<HashMap<String, ActionTracker>>>,
@@ -171,6 +173,9 @@ pub struct SecurityPolicy {
     /// construction time. Empty when no read-only cross-agent access
     /// is configured.
     pub allowed_roots_read_only: Vec<PathBuf>,
+    /// Directories the agent can write but NOT read under. Populated
+    /// from cross-agent `AccessMode::Write` grants; read-side tools
+    /// ignore this list.
     pub allowed_roots_write_only: Vec<PathBuf>,
     pub max_actions_per_hour: u32,
     pub max_cost_per_day_cents: u32,
@@ -2004,6 +2009,8 @@ impl SecurityPolicy {
         roots_contain(&self.allowed_roots_read_only, &expanded)
     }
 
+    /// Union of all three root tiers; directionality is enforced later
+    /// by the resolved-path checks.
     #[must_use]
     pub fn is_under_any_allowed_root(&self, path: &str) -> bool {
         self.is_under_allowed_root(path) || self.is_under_read_only_allowed_root(path)
@@ -2122,7 +2129,6 @@ impl SecurityPolicy {
         // When autonomy is Full, disable workspace_only so the agent can
         // access paths outside the workspace. Forbidden-path checks still
         // apply, preventing access to sensitive system directories.
-        // See
         let effective_workspace_only = if risk_profile.level == AutonomyLevel::Full {
             false
         } else {
@@ -3633,7 +3639,7 @@ mod tests {
 
     #[test]
     fn git_dash_c_uppercase_is_allowed() {
-        //  git -C (change directory) must not be
+        // git -C (change directory) must not be
         // conflated with git -c (set config override) after arg lowercasing.
         let p = default_policy();
         assert!(

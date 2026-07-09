@@ -2518,7 +2518,7 @@ mod tests {
 
     #[tokio::test]
     async fn claim_due_jobs_skips_in_flight_job() {
-        //  once a due job is claimed for execution, a
+        // once a due job is claimed for execution, a
         // subsequent selection pass must not pick it up again until the prior
         // run releases it — otherwise a job that runs longer than the poll
         // interval is launched repeatedly.

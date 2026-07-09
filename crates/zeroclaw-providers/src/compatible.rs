@@ -4685,7 +4685,7 @@ mod tests {
         let stripped = p.strip_native_tool_messages(&messages);
         // tool message dropped; the pre-tool narration and the reply that
         // follows the tool result are now coalesced into a single assistant
-        // message so the output never contains consecutive assistants (see
+        // message so the output never contains consecutive assistants.
         assert_eq!(stripped.len(), 4);
         assert_eq!(stripped[0].role, "system");
         assert_eq!(stripped[1].role, "user");
@@ -4865,7 +4865,7 @@ mod tests {
 
     #[tokio::test]
     async fn normalize_messages_for_upstream_rewrites_local_image_path_to_data_uri() {
-        //  bare local paths inside `[IMAGE:...]` markers
+        // bare local paths inside `[IMAGE:...]` markers
         // must be base64-encoded at the provider boundary so strict upstreams
         // (vLLM 0.20+) never see `image_url.url = "/home/.../photo.png"`.
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -5398,7 +5398,7 @@ mod tests {
         assert_eq!(result.reasoning.as_deref(), Some("thinking..."));
     }
 
-    //  OpenRouter and vLLM (>= v0.16.0) emit reasoning
+    // OpenRouter and vLLM (>= v0.16.0) emit reasoning
     // under `reasoning` rather than `reasoning_content`. Both fields must
     // be accepted on deserialization.
     #[test]

@@ -1607,7 +1607,7 @@ mod tests {
 
     #[test]
     fn due_jobs_skips_claimed_jobs() {
-        //  a job that is in flight must not be selected
+        // a job that is in flight must not be selected
         // again by the scheduler while its previous run is still running.
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);

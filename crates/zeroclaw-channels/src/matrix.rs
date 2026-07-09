@@ -5122,7 +5122,7 @@ mod tests {
 
         #[test]
         fn self_anchored_root_strips_interruption_scope() {
-            //  when reply_in_thread anchors on the inbound event
+            // when reply_in_thread anchors on the inbound event
             // itself the anchor is a delivery detail, not a conversation
             // boundary — interruption_scope_id should be None so
             // cancellation keys match sender+room.

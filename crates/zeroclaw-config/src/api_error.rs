@@ -18,7 +18,7 @@ pub enum ConfigApiCode {
     /// The daemon-reload step after a successful save failed; on-disk config
     /// has been reverted to the pre-write snapshot to keep state consistent.
     ReloadFailed,
-    /// JSON Patch operation type is not supported in this PR (`move` / `copy`).
+    /// JSON Patch operation type is not supported (`move` / `copy`).
     OpNotSupported,
     /// JSON Patch `test` operation targeted a secret or derived-from-secret
     /// path; rejected to prevent differential value inference.

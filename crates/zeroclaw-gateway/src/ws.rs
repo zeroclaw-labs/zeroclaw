@@ -768,7 +768,7 @@ fn persist_conversation_messages(
     session_key: &str,
     messages: &[zeroclaw_providers::ConversationMessage],
 ) {
-    //  if the user deleted the session between the turn starting and
+    // if the user deleted the session between the turn starting and
     // the post-turn persistence, don't resurrect it. The `aborted` / `done`
     // / `error` frames are still sent to the client; we just refuse to
     // re-create the row that `DELETE /api/sessions/{id}` just wiped.
@@ -1794,7 +1794,7 @@ mod tests {
         );
     }
 
-    //  The mid-turn `client_msg` arm in `forward_fut`
+    // The mid-turn `client_msg` arm in `forward_fut`
     // must (a) classify stream-end / close / error frames as "client gone"
     // and (b) cancel the turn token so `tokio::join!(turn_fut, forward_fut)`
     // can return — a bare `continue` hot-loops the select forever.

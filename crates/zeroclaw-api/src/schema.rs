@@ -83,8 +83,8 @@ impl SchemaCleanr {
         Self::clean(schema, CleaningStrategy::OpenAI)
     }
 
-    /// Zero-copy wrapper around [`Self::clean`] for `Arc`-shared tool schemas
-    ///  returns the same `Arc` when the pre-scan proves cleaning is a
+    /// Zero-copy wrapper around [`Self::clean`] for `Arc`-shared tool schemas:
+    /// returns the same `Arc` when the pre-scan proves cleaning is a
     /// no-op, deep-copying the tree only when a rewrite is actually needed.
     pub fn clean_shared(schema: &Arc<Value>, strategy: CleaningStrategy) -> Arc<Value> {
         if Self::needs_cleaning(schema, strategy) {

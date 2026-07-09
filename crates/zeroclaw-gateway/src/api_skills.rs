@@ -358,7 +358,7 @@ mod tests {
     use std::path::PathBuf;
     use zeroclaw_runtime::skills::{ShadowedSkill, SkillOrigin};
 
-    //  the write-guard error maps to 403, distinct from 404/400.
+    // the write-guard error maps to 403, distinct from 404/400.
     #[test]
     fn not_editable_maps_to_forbidden() {
         let resp = service_error_response(ServiceError::NotEditable {
@@ -368,7 +368,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
-    //  shadowed records ride through to the wire entry.
+    // shadowed records ride through to the wire entry.
     #[test]
     fn agent_skill_entry_maps_shadowed() {
         let s = EffectiveSkill {
@@ -390,7 +390,7 @@ mod tests {
         assert_eq!(entry.shadowed[0].origin, "bundle");
     }
 
-    //  each SkillDropReason arm maps to the right reason_kind tag.
+    // each SkillDropReason arm maps to the right reason_kind tag.
     #[test]
     fn dropped_skill_entry_maps_each_reason_kind() {
         let mk = |reason| DroppedSkill {

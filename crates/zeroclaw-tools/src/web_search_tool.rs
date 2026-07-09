@@ -1279,7 +1279,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duckduckgo_request_reports_anomaly_modal_block() {
-        //  DuckDuckGo's anti-bot page now ships an
+        // DuckDuckGo's anti-bot page now ships an
         // `anomaly-modal` interstitial (HTTP 200/202, no `/wr.do?` redirect,
         // no verification form), and the old detector slid past it,
         // returning a misleading "No results found" message to the agent.

@@ -3933,7 +3933,7 @@ description = "fine"
             !names.contains(&"bad"),
             "bad skill must be skipped, not silently accepted; got: {names:?}"
         );
-        //  the skipped skill is surfaced as an audit drop, not silently lost.
+        // the skipped skill is surfaced as an audit drop, not silently lost.
         assert_eq!(dropped.len(), 1, "the bad TOML skill must be reported");
         assert_eq!(dropped[0].origin_hint, "workspace");
         assert!(matches!(

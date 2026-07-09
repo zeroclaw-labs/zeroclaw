@@ -276,8 +276,8 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         match resolve_routed_approval(&self.handles, &self.route, recipient, request).await {
-            // The deciding approver's name travels on the response itself (issue
-            //  `None` for a bridge-synthesized fail-closed deny.
+            // The deciding approver's name travels on the response itself;
+            // `None` for a bridge-synthesized fail-closed deny.
             RoutedApproval::Decided { response, decider } => {
                 Ok(Some(zeroclaw_api::channel::AttributedApprovalResponse {
                     response,
@@ -344,7 +344,6 @@ pub struct Agent {
     mcp_pinned_section: String,
     mcp_deferred_section: String,
     /// Hook runner for tool-call auditing and lifecycle side effects.
-    /// See
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     /// Approval manager for direct Agent execution paths such as ACP.
     approval_manager: Option<Arc<ApprovalManager>>,

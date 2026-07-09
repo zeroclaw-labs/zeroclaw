@@ -4338,8 +4338,8 @@ mod tests {
     async fn scope_switch_spares_foreign_ask_in_inactive_scope() {
         // A `/ask` registered by OTHER tooling (different description) on the
         // now-inactive global scope must NOT be reaped on a scope switch - we
-        // only delete the `/ask` whose projection matches what we register
-        //  Our own skill command on that scope is still reaped.
+        // only delete the `/ask` whose projection matches what we register.
+        // Our own skill command on that scope is still reaped.
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;

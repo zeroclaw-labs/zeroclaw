@@ -4369,7 +4369,7 @@ mod tests {
         .await;
     }
 
-    //  ReliableModelProvider::supports_vision() must reflect the
+    // ReliableModelProvider::supports_vision() must reflect the
     // primary (first) provider, not .any() across the fallback chain. This mirrors
     // supports_native_tools() which already uses .first().
     #[test]

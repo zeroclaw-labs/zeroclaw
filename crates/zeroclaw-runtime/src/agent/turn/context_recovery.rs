@@ -213,7 +213,7 @@ mod tests {
 
     #[tokio::test]
     async fn floor_exceeds_budget_single_turn_does_not_recover() {
-        //  the system prompt + tool definitions alone dominate
+        // the system prompt + tool definitions alone dominate
         // the budget and only one turn exists. Recovery must NOT loop — it
         // returns false (nothing left to drop) so the caller breaks instead of
         // re-running the same turn forever.

@@ -957,7 +957,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_manage_patch_blocks_when_skill_is_on_cooldown() {
-        //  with a non-zero cooldown configured, a skill
+        // with a non-zero cooldown configured, a skill
         // whose front-matter carries a fresh `updated_at` is on cooldown and
         // a patch must be refused with a structured error rather than writing.
         let dir = tempdir();
@@ -996,7 +996,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_manage_patch_proceeds_when_skill_is_stale() {
-        //  an `updated_at` older than cooldown_secs is
+        // an `updated_at` older than cooldown_secs is
         // stale and a patch must proceed.
         let dir = tempdir();
         let stale = (chrono::Utc::now() - chrono::Duration::seconds(7200)).to_rfc3339();
@@ -1026,7 +1026,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_manage_patch_proceeds_when_no_updated_at() {
-        //  a skill with no `updated_at` is not on
+        // a skill with no `updated_at` is not on
         // cooldown — first patch must proceed even with a cooldown configured.
         let dir = tempdir();
         write_skill(dir.path(), "deploy", VALID_SKILL).await;

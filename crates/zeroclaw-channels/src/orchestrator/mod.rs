@@ -19803,7 +19803,7 @@ BTC is currently around $65,000 based on latest tool output."#
         // Peer map (from send_message_to_peer tool) stays in the system prompt.
         // Memory context is no longer in the system prompt — it moved to the
         // outgoing user-turn preamble so the system prefix can stay byte-stable
-        // for prompt caching (see
+        // for prompt caching.
         assert_eq!(calls[0][0].0, "system");
         assert!(
             !calls[0][0].1.contains(MEMORY_CONTEXT_OPEN),

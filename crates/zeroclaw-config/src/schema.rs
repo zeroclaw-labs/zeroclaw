@@ -19351,8 +19351,8 @@ max_height = 8
 
     #[::core::prelude::v1::test]
     fn tool_filter_group_legacy_filter_builtins_key_still_parses() {
-        // `filter_builtins` was declared-but-never-read and is removed
-        //  `ToolFilterGroup` has no `deny_unknown_fields`, so configs
+        // `filter_builtins` was declared-but-never-read and is removed.
+        // `ToolFilterGroup` has no `deny_unknown_fields`, so configs
         // still carrying the key must keep deserializing (silently ignored).
         let group: super::ToolFilterGroup = toml::from_str(
             r#"
@@ -21897,7 +21897,7 @@ strict_tool_parsing = true
 
     #[test]
     async fn runtime_profile_max_tool_iterations_is_honored() {
-        //  `[runtime_profiles.*].max_tool_iterations` must actually take
+        // `[runtime_profiles.*].max_tool_iterations` must actually take
         // effect. It previously had no effect (the value had to be set on
         // `[agents.*]`); now agent-inline is inert and the profile is the
         // authoritative surface, so this guards the resolved value.
@@ -24828,7 +24828,7 @@ name = "weather-tool"
     #[test]
     #[allow(clippy::large_futures)]
     async fn load_or_init_keeps_agents_with_object_form_delegates() {
-        // Regression for the production failure that started this PR: a current
+        // Regression for a production failure: a current
         // schema config containing an object-form delegate must not degrade and
         // drop the whole `agents` section.
         let _env_guard = env_override_lock().await;
@@ -30236,7 +30236,7 @@ allowed_users = []
         );
     }
 
-    //  agent-level summary_provider validated like classifier_provider.
+    // agent-level summary_provider validated like classifier_provider.
     #[tokio::test]
     async fn config_validate_rejects_agent_summary_provider_missing_alias() {
         let toml = r#"
@@ -30264,7 +30264,7 @@ allowed_users = []
         );
     }
 
-    //  profile-level summary_provider validated by the new profile loop.
+    // profile-level summary_provider validated by the new profile loop.
     #[tokio::test]
     async fn config_validate_rejects_profile_summary_provider_missing_alias() {
         let toml = r#"
@@ -30298,7 +30298,7 @@ allowed_users = []
         );
     }
 
-    //  effective_summary_provider precedence — agent → profile → None.
+    // effective_summary_provider precedence — agent → profile → None.
     #[tokio::test]
     async fn effective_summary_provider_precedence() {
         let toml = r#"
@@ -30357,7 +30357,7 @@ allowed_users = []
         assert_eq!(cfg.effective_summary_provider("c"), None);
     }
 
-    //  config-time diagnostic for the legacy cross-provider summary_model
+    // config-time diagnostic for the legacy cross-provider summary_model
     // shape. A profile sets the deprecated bare summary_model and is shared by
     // two agents on DIFFERENT providers with no summary_provider override -> the
     // diagnostic fires and names the profile + the affected agents + providers.

@@ -46,6 +46,8 @@ pub enum TurnEvent {
         kept_turns: usize,
         reason: String,
     },
+    /// Per-LLM-call token usage and cost; a turn may emit several, one per
+    /// model call. `None` means "unavailable for this call", not zero.
     Usage {
         input_tokens: Option<u64>,
         /// Tokens served from the provider's prompt cache (e.g. Anthropic

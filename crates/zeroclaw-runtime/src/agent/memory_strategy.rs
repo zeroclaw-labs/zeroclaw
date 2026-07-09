@@ -14,9 +14,9 @@ impl DefaultMemoryStrategy {
         memory_config: zeroclaw_config::schema::MemoryConfig,
         workspace_dir: impl Into<std::path::PathBuf>,
     ) -> Self {
-        //  rerank_enabled is declared on the config schema but the
-        // retrieval-pipeline rerank stage was never landedclosed
-        // unmerged).  Emit a one-time warning so operators who set these
+        // rerank_enabled is declared on the config schema but the
+        // retrieval-pipeline rerank stage was never landed.
+        // Emit a one-time warning so operators who set these
         // fields know they currently have no effect.
         if memory_config.rerank_enabled {
             ::zeroclaw_log::record!(

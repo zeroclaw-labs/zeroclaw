@@ -1321,7 +1321,7 @@ mod tests {
         assert_eq!(*streaming.last_stream_model.lock(), "claude-opus");
     }
 
-    //  supports_vision() must reflect the default provider,
+    // supports_vision() must reflect the default provider,
     // not .any() across all sub-providers. Otherwise the multimodal.vision_provider
     // fallback in run_tool_call_loop and the image-marker stripping in the context
     // compressor are silently bypassed in mixed-provider configurations.

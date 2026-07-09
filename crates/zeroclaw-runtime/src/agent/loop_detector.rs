@@ -255,7 +255,7 @@ impl LoopDetector {
         }
 
         let last = self.window.back()?;
-        //  the stuck agent ran 43 near-duplicate shell calls returning
+        // the stuck agent ran 43 near-duplicate shell calls returning
         // byte-identical output, interleaved with other tools; filter (not a
         // consecutive take_while) is what lets that non-adjacent run be counted.
         let same_tool_same_result: Vec<&ToolCallRecord> = self
@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn no_progress_triggered_when_interleaved_with_other_calls() {
-        //  same tool + same result repeated non-consecutively, with
+        // same tool + same result repeated non-consecutively, with
         // varied unrelated calls interleaved, must still be detected. The old
         // take_while logic reset the streak on any interleaved call.
         let mut det = LoopDetector::new(default_config());

@@ -1611,7 +1611,7 @@ mod tests {
 
     #[test]
     fn private_wildcard_allows_domain_resolving_to_private_ip() {
-        //  allowed_private_hosts = ["*"] must permit a
+        // allowed_private_hosts = ["*"] must permit a
         // regular domain that resolves to a private/internal IP, as long as the
         // name itself passes allowed_domains. The DNS public check must be
         // skipped (closure panics if reached).

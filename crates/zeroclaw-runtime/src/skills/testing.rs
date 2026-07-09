@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn truncate_output_does_not_panic_on_multibyte_boundary() {
-        //  `max` landing inside a multi-byte UTF-8 char
+        // `max` landing inside a multi-byte UTF-8 char
         // must not panic. "🦀" is 4 bytes; max=2 is mid-char.
         let out = truncate_output("🦀🦀🦀", 2);
         assert!(

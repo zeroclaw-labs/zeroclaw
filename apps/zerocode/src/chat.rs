@@ -99,7 +99,7 @@ pub(crate) struct Chat {
     pane_kind: PaneKind,
     /// One-shot session id to reattach to on the next session start, set by
     /// the app layer across a reconnect so the rebuilt pane resumes the
-    /// pre-disconnect session (the daemon retains it,instead of
+    /// pre-disconnect session (the daemon retains it) instead of
     /// minting a fresh one. Cleared once consumed by `start_session`.
     resume_session_id: Option<String>,
     /// The agent the resumed session belongs to. A multi-agent reconnect must

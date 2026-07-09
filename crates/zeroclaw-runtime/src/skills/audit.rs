@@ -832,7 +832,7 @@ EOF\"\"\"
 
     #[test]
     fn audit_allows_remote_markdown_documentation_links() {
-        //  remote http/https/mailto links that happen to
+        // remote http/https/mailto links that happen to
         // end in `.md`/`.markdown` are documentation references, not fetched at
         // load time, so they must not be flagged. Real skills (e.g. Cloudinary,
         // Sanity) cite many such URLs.

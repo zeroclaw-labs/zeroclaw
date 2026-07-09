@@ -12099,7 +12099,7 @@ Let me check the result."#;
 
     #[test]
     fn scrub_credentials_multibyte_chars_no_panic() {
-        //  byte index 4 is not a char boundary
+        // byte index 4 is not a char boundary
         // when the captured value contains multi-byte UTF-8 characters.
         // The regex only matches quoted values for non-ASCII content, since
         // capture group 4 is restricted to [a-zA-Z0-9_\-\.].

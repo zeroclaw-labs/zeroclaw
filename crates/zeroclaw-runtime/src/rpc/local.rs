@@ -743,7 +743,7 @@ mod accept_error_tests {
     #[cfg(unix)]
     #[test]
     fn fd_exhaustion_accept_errors_are_recoverable() {
-        //  EMFILE/ENFILE must not terminate the daemon.
+        // EMFILE/ENFILE must not terminate the daemon.
         assert!(is_recoverable_accept_error(&Error::from_raw_os_error(24))); // EMFILE
         assert!(is_recoverable_accept_error(&Error::from_raw_os_error(23))); // ENFILE
     }

@@ -163,7 +163,7 @@ mod tests {
 
     #[tokio::test]
     async fn spec_shares_stored_schema_without_cloning() {
-        // guard: spec() must hand out the SAME allocation
+        // Regression guard: spec() must hand out the SAME allocation
         // as the stored schema, not a deep copy. Two consecutive specs must
         // also share with each other.
         let registry = empty_registry().await;

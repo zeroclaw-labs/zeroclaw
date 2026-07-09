@@ -3537,8 +3537,8 @@ async fn process_nextcloud_talk_webhook(
     }
 
     // Spawn per-message processing so the webhook returns 200 quickly.
-    // Nextcloud Talk cancels webhook requests that don't complete within ~5s
-    //  slow local models routinely exceed that. Each message gets
+    // Nextcloud Talk cancels webhook requests that don't complete within ~5s;
+    // slow local models routinely exceed that. Each message gets
     // its own task — the LLM call and reply are independent of the ack.
     for msg in messages {
         let state = state.clone();
@@ -4214,7 +4214,7 @@ mod tests {
 
     #[test]
     fn paircode_recovery_command_uses_loopback_for_nonloopback_host() {
-        //  a gateway bound to a non-loopback interface must
+        // a gateway bound to a non-loopback interface must
         // not surface a recovery hint that the localhost-only admin guard rejects.
         let cmd = format_paircode_recovery_command("192.168.1.20", 42617);
         assert!(
@@ -4253,7 +4253,7 @@ mod tests {
 
     #[test]
     fn already_paired_notice_states_no_code_was_generated() {
-        //  the banner must say plainly that NO code exists
+        // the banner must say plainly that NO code exists
         // (already paired), not just "Pairing: ACTIVE" — otherwise the operator
         // hits the dashboard's 6-digit prompt with no code printed anywhere.
         let lines = already_paired_pairing_notice("127.0.0.1", 3001, "");
@@ -4283,7 +4283,7 @@ mod tests {
             joined.contains(&format_paircode_recovery_curl("192.168.1.20", 3001, "/gw")),
             "notice must surface the curl fallback (honoring the path prefix): {joined}"
         );
-        //  never advertise the non-loopback bound host in the hint.
+        // never advertise the non-loopback bound host in the hint.
         assert!(
             !joined.contains("192.168.1.20"),
             "notice must not advertise the non-loopback bound host: {joined}"
@@ -6539,7 +6539,7 @@ mod tests {
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
     }
 
-    //  handler must return 200 OK before the (potentially
+    // handler must return 200 OK before the (potentially
     // slow) LLM call completes, so Nextcloud Talk doesn't cancel the webhook
     // request at its ~5s timeout.
     #[cfg(feature = "channel-nextcloud")]
@@ -7998,7 +7998,7 @@ mod accept_error_tests {
     #[cfg(unix)]
     #[test]
     fn fd_exhaustion_accept_errors_are_recoverable() {
-        //  EMFILE/ENFILE must not terminate the daemon.
+        // EMFILE/ENFILE must not terminate the daemon.
         assert!(is_recoverable_accept_error(&Error::from_raw_os_error(24))); // EMFILE
         assert!(is_recoverable_accept_error(&Error::from_raw_os_error(23))); // ENFILE
     }
