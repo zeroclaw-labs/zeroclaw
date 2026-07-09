@@ -884,8 +884,10 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
             "When responding on Matrix:\n\
              - Use Markdown formatting (bold, italic, code blocks)\n\
              - Be concise and direct\n\
-             - For media attachments use markers: [IMAGE:<absolute-path>], [DOCUMENT:<absolute-path>], [VIDEO:<absolute-path>], [AUDIO:<absolute-path>], or [VOICE:<absolute-path>]\n\
-             - Paths inside markers MUST be absolute (starting with /). Never use relative paths.\n\
+             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
+             - Local marker paths may be workspace-relative or absolute, but they must resolve inside the configured workspace directory.\n\
+             - Copy paths from inbound messages or file tools exactly into markers. Do not add, remove, or rewrite path components.\n\
+             - Remote media is also accepted via http:// or https:// URLs in the same marker form.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - When you receive a [Voice message], the user spoke to you. Respond naturally as in conversation.\n\
              - Your text reply will automatically be converted to audio and sent back as a voice message.\n",
@@ -21270,6 +21272,36 @@ BTC is currently around $65,000 based on latest tool output."#
             "telegram media marker guidance should live in the system prompt"
         );
         assert!(!calls[0].iter().skip(1).any(|(role, _)| role == "system"));
+    }
+
+    #[test]
+    fn channel_delivery_instructions_for_matrix_match_marker_contract() {
+        let block = channel_delivery_instructions("matrix")
+            .expect("matrix channel must have a delivery-instructions block");
+        assert!(
+            block.contains("When responding on Matrix:"),
+            "matrix block must identify itself"
+        );
+        assert!(
+            block.contains("[IMAGE:<path-or-url>]"),
+            "matrix block must describe local path or URL marker syntax"
+        );
+        assert!(
+            block.contains("workspace-relative or absolute"),
+            "matrix block must match the validator's local path contract"
+        );
+        assert!(
+            block.contains("Copy paths from inbound messages or file tools exactly"),
+            "matrix block must prevent rewriting inbound or tool-returned paths"
+        );
+        assert!(
+            block.contains("http:// or https:// URLs"),
+            "matrix block must describe supported remote marker targets"
+        );
+        assert!(
+            !block.contains("Never use relative paths"),
+            "matrix block must not contradict the workspace-relative marker contract"
+        );
     }
 
     #[test]
