@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn web_dist_dir_with_tilde_resolves_to_tilde_reason_key() {
         // `~/web-dist` is read verbatim and silently fails.
-        // Round 3: predicate now returns Fluent key, not bare phrase.
+        // The predicate returns a Fluent key, not a bare phrase.
         assert_eq!(
             web_dist_dir_expansion_reason_key("~/web-dist"),
             Some("cli-web-dist-dir-reason-tilde")

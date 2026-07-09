@@ -17825,7 +17825,7 @@ impl Config {
                     "transcription_provider",
                     agent.transcription_provider.trim(),
                 ),
-                // NEW in this PR (kanmars.req.20260522.001):
+                // Provider-alias reference fields validated below:
                 (
                     "providers.models",
                     "classifier_provider",
