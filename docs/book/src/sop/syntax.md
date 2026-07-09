@@ -15,6 +15,45 @@ Each SOP must have `SOP.toml`. `SOP.md` is optional, but runs with no parsed ste
 
 ## 2. `SOP.toml`
 
+`SOP.toml` holds SOP metadata and trigger definitions. A minimal manual SOP
+looks like this:
+
+```toml
+[sop]
+name = "daily-digest"
+description = "Collect recent alerts and write a short digest."
+version = "1.0.0"
+
+[[triggers]]
+type = "manual"
+```
+
+The `mqtt`, `amqp`, `filesystem`, `peripheral`, and `channel` trigger types
+accept `condition`. Conditions are filters: the trigger must match its
+source-specific field first, then the condition must hold against the event
+payload before a run starts.
+
+```toml
+[sop]
+name = "high-temperature-alert"
+description = "Handle elevated sensor readings."
+
+[[triggers]]
+type = "mqtt"
+topic = "facility/+/temperature"
+condition = "$.value > 85"
+
+[[triggers]]
+type = "amqp"
+routing_key = "facility.*.temperature"
+condition = "$.status == \"critical\""
+
+[[triggers]]
+type = "channel"
+topic = "git.main:pull_request.opened"
+condition = "$.repo == \"example/project\""
+```
+
 ## 3. `SOP.md` Step Format
 
 Steps are parsed from the `## Steps` section.
@@ -43,9 +82,44 @@ Parser behavior:
 - `- input:` and `- output:` attach JSON Schema-like step boundary contracts.
 - `- next:` and `- depends_on:` route non-linear runs. Ineligible routed steps
   are marked `skipped` and leave the run `pending` instead of dispatching.
+- `- when:` guards routing after a completed step using the same comparison
+  syntax as trigger conditions, evaluated against accumulated step outputs.
 - `- on_failure:` accepts `fail`, `retry:<count>`, or `goto:<step>` and is
   enforced for reported step failures and output schema failures.
 - `- mode:` overrides the SOP execution mode for that step.
+
+Example conditional route:
+
+```md
+## Steps
+
+1. **Inspect payload** - Classify the incoming event.
+   - tools: memory_recall
+   - output: {"type":"object","properties":{"severity":{"type":"string"},"notify":{"type":"boolean"}}}
+   - when: $.steps.1.notify == "true"
+   - next: 2
+
+2. **Notify** - Send the alert summary.
+   - tools: pushover
+   - depends_on: 1
+```
+
+When step 1 completes with output such as `{"severity":"critical","notify":true}`,
+run data is exposed to `when` as:
+
+```json
+{
+  "steps": {
+    "1": {
+      "severity": "critical",
+      "notify": true
+    }
+  }
+}
+```
+
+The example then routes to step 2. If the `when` guard is false, the
+run completes after step 1 instead of taking the explicit `next:` route.
 
 ### Step Contract Enforcement
 
@@ -94,11 +168,54 @@ For the live-versus-unwired status of each source and the transport details, see
 
 ## 5. Condition Syntax
 
-`condition` is evaluated fail-closed (invalid condition/payload => no match).
+`condition` and step-level `when` use the same comparison syntax. Both are
+evaluated fail-closed: an invalid expression, missing payload, invalid JSON for
+a JSON-path expression, missing path, or incomparable values produce no match.
 
 - JSON path comparisons: `$.value > 85`, `$.status == "critical"`
+- Nested JSON paths and array indexes: `$.data.sensor.value >= 85`,
+  `$.readings.1 == 20`
 - Direct numeric comparisons: `> 0` (useful for simple payloads)
 - Operators: `>=`, `<=`, `!=`, `>`, `<`, `==`
+
+For boolean values, compare against quoted `"true"` or `"false"`.
+
+JSON-path comparisons require a JSON payload. For example, this trigger:
+
+```toml
+[[triggers]]
+type = "mqtt"
+topic = "facility/+/temperature"
+condition = "$.data.sensor.value >= 85"
+```
+
+matches a payload like:
+
+```json
+{
+  "data": {
+    "sensor": {
+      "value": 87.3
+    }
+  }
+}
+```
+
+A direct numeric comparison is for scalar payloads, such as peripheral signals:
+
+```toml
+[[triggers]]
+type = "peripheral"
+board = "board-01"
+signal = "pin_3"
+condition = "> 0"
+```
+
+That condition matches payload `1` and does not match payload `0` or
+non-numeric text.
+
+Conditions are single comparisons. Boolean combinators such as `and`, `or`,
+`&&`, and `||` are not part of the supported syntax.
 
 ## 6. Validation
 
