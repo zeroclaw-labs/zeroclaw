@@ -8,7 +8,7 @@
 //!   `DISPLAY` / `DEFAULT_URL` / `AUTH`; the blanket
 //!   `impl<T: CompatFamilySpec> FamilyProviderFactory for T` produces the
 //!   provider. Families with minor modifiers (`.without_native_tools()`,
-//!   `.with_models_dev_key(...)`, multi-endpoint URI fallback) override
+//!   `.models_dev_key(...)`, multi-endpoint URI fallback) override
 //!   `build_compat` — still one place per family, no flat dispatch arm.
 //!
 //! - [`FamilyProviderFactory`] directly for bespoke families that wrap a

@@ -967,13 +967,11 @@ pub struct OpenAiResponsesModelProvider {
 ///
 /// Only `alias` is required. `api_url` defaults to the OpenAI Responses
 /// endpoint; if a custom URL is supplied, `/responses` is appended when
-/// not already present so callers can pass either shape. `timeout_secs`
-/// and `extra_headers` have builder chain setters here; the same fields
-/// are also mutable post-build via
-/// [`OpenAiResponsesModelProvider::with_timeout_secs`] /
-/// [`OpenAiResponsesModelProvider::with_extra_headers`] so factory code
-/// can apply config-driven overrides on the built provider (matching
-/// the pattern the other provider factories use).
+/// not already present so callers can pass either shape. Every runtime
+/// override (`timeout_secs` / `max_tokens` / `reasoning_effort` /
+/// `extra_headers`) is set via a chain method on this builder before
+/// [`Self::build`] — the built provider itself has no post-construction
+/// mutators.
 #[must_use]
 pub struct OpenAiResponsesBuilder {
     alias: String,
@@ -1016,8 +1014,9 @@ impl OpenAiResponsesBuilder {
     /// Override the non-streaming HTTP request timeout. Values of 0 are
     /// ignored (the default 120 s is kept) so a stray `Some(0)` from
     /// config cannot silently disable the safety timeout — same guard
-    /// as [`OpenAiResponsesModelProvider::with_timeout_secs`] and the
-    /// three sibling `with_timeout_secs` methods elsewhere in the crate.
+    /// applied by [`OpenAiBuilder::timeout_secs`],
+    /// [`OpenAiCompatibleBuilder::timeout_secs`], and
+    /// [`OpenRouterBuilder::timeout_secs`].
     pub fn timeout_secs(mut self, secs: u64) -> Self {
         if secs > 0 {
             self.timeout_secs = Some(secs);
@@ -1487,18 +1486,18 @@ mod tests {
     }
 
     #[test]
-    fn with_timeout_secs_overrides_default() {
+    fn timeout_secs_overrides_default() {
         let p = OpenAiResponsesModelProvider::builder("test")
             .timeout_secs(45)
             .build();
         assert_eq!(
             p.timeout_secs, 45,
-            "with_timeout_secs must override the 120 default"
+            "builder .timeout_secs(...) must override the 120 default"
         );
     }
 
     #[test]
-    fn with_extra_headers_propagates() {
+    fn extra_headers_propagates() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Title".to_string(), "zeroclaw".to_string());
         headers.insert(
@@ -1511,7 +1510,7 @@ mod tests {
         assert_eq!(
             p.extra_headers.len(),
             2,
-            "with_extra_headers must store the configured headers"
+            "builder .extra_headers(...) must store the configured headers"
         );
         assert_eq!(
             p.extra_headers.get("X-Title").map(String::as_str),
@@ -2272,12 +2271,12 @@ mod tests {
     // tests, and pinned for `None` propagation with `omits_*_when_unset`
     // tests):
     //
-    // | Provider builder        | Wire field on `ResponsesApiRequest` | Notes                                  |
+    // | Builder chain setter    | Wire field on `ResponsesApiRequest` | Notes                                  |
     // |-------------------------|--------------------------------------|----------------------------------------|
-    // | `with_max_tokens`       | `max_output_tokens`                  | Omits when `None`                      |
-    // | `with_reasoning_effort` | `reasoning.effort`                   | Omits when `None`                      |
-    // | `with_timeout_secs`     | (client-level: reqwest total timeout) | Default 120; non-streaming only        |
-    // | `with_extra_headers`    | (client-level: reqwest default headers) | Invalid names/values WARN-skipped     |
+    // | `.max_tokens(...)`      | `max_output_tokens`                  | Omits when `None`                      |
+    // | `.reasoning_effort(...)`| `reasoning.effort`                   | Omits when `None`                      |
+    // | `.timeout_secs(...)`    | (client-level: reqwest total timeout) | Default 120; non-streaming only        |
+    // | `.extra_headers(...)`   | (client-level: reqwest default headers) | Invalid names/values WARN-skipped     |
     // | (model arg)             | `model`                              | Always present                         |
     // | (instructions arg)      | `instructions`                       | Omits when `None`                      |
     // | (temperature arg)       | `temperature`                        | Force-1.0 for o1/o3/gpt-5-*; else pass |
@@ -2297,8 +2296,8 @@ mod tests {
     // - `frequency_penalty` / `presence_penalty` — Responses API
     //   rejects both. Same fallback path as `top_p`.
     // - `stop` / `seed` — not exposed by
-    //   `OpenAiResponsesModelProvider`'s `with_*` builders; add to this
-    //   list if/when a `with_seed` builder is introduced.
+    //   `OpenAiResponsesBuilder`; add to this list if/when a
+    //   `.seed(...)` chain setter is introduced.
     // - `logprobs` — Responses API uses `top_logprobs` instead; not
     //   propagated. Same fallback path as `top_p`.
     //
@@ -2310,14 +2309,15 @@ mod tests {
     // `factory::tests::responses_factory_forwards_timeout_secs_to_responses_provider`):
     //
     // - `provider_timeout_secs` — `OpenAiResponsesModelProvider` carries
-    //   a `timeout_secs` field (default 120) with a `with_timeout_secs`
-    //   builder; the non-streaming `http_client` applies it as the
-    //   reqwest `Client::builder().timeout(...)` and the streaming
+    //   a `timeout_secs` field (default 120) settable via
+    //   [`OpenAiResponsesBuilder::timeout_secs`]; the non-streaming
+    //   `http_client` applies it as the reqwest
+    //   `Client::builder().timeout(...)` and the streaming
     //   `streaming_client` uses connect-timeout only (no total timeout,
     //   so long SSE responses aren't killed mid-stream).
     // - `extra_headers` — `OpenAiResponsesModelProvider` carries an
-    //   `extra_headers` field (default empty `HashMap`) with a
-    //   `with_extra_headers` builder; the `build_default_headers`
+    //   `extra_headers` field (default empty `HashMap`) settable via
+    //   [`OpenAiResponsesBuilder::extra_headers`]; the `build_default_headers`
     //   helper merges them into the `reqwest::Client` default headers
     //   for both `http_client` and `streaming_client`, with invalid
     //   header names / values logged at WARN and skipped (matching
@@ -2402,7 +2402,7 @@ mod tests {
         assert_eq!(
             reasoning.get("effort").and_then(serde_json::Value::as_str),
             Some("high"),
-            "with_reasoning_effort(Some(\"high\")) must surface as reasoning.effort = \"high\" on the wire body"
+            ".reasoning_effort(Some(\"high\")) must surface as reasoning.effort = \"high\" on the wire body"
         );
     }
 

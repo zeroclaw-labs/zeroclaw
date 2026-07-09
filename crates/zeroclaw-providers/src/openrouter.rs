@@ -1925,7 +1925,7 @@ mod tests {
     }
 
     #[test]
-    fn with_timeout_secs_overrides_default() {
+    fn timeout_secs_overrides_default() {
         let model_provider = OpenRouterModelProvider::builder("test")
             .credential(Some("key"))
             .timeout_secs(300)
@@ -2038,7 +2038,7 @@ mod tests {
     }
 
     #[test]
-    fn with_extra_body_sets_value() {
+    fn extra_body_sets_value() {
         let extra = serde_json::json!({"model_provider": {"only": ["Anthropic"]}});
         let model_provider = OpenRouterModelProvider::builder("test")
             .credential(Some("key"))

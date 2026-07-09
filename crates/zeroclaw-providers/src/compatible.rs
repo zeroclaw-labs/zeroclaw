@@ -6357,7 +6357,7 @@ mod tests {
     }
 
     #[test]
-    fn with_timeout_secs_overrides_default() {
+    fn timeout_secs_overrides_default() {
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("test")
             .base_url("https://example.com")
@@ -6375,7 +6375,7 @@ mod tests {
     }
 
     #[test]
-    fn with_extra_headers_sets_headers() {
+    fn extra_headers_sets_headers() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("X-Title".to_string(), "zeroclaw".to_string());
         headers.insert(
