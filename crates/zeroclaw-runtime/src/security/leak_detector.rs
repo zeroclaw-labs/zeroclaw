@@ -189,6 +189,15 @@ impl LeakDetector {
                     Regex::new(r"github_pat_[a-zA-Z0-9_]{22,}").unwrap(),
                     "GitHub PAT",
                 ),
+                // Slack
+                (
+                    Regex::new(r"xox[baprs]-[0-9A-Za-z-]{10,}").unwrap(),
+                    "Slack token",
+                ),
+                (
+                    Regex::new(r"xapp-[0-9A-Za-z-]{10,}").unwrap(),
+                    "Slack app-level token",
+                ),
                 // Generic
                 (
                     Regex::new(r#"api[_-]?key[=:]\s*['"]*[a-zA-Z0-9_-]{20,}"#).unwrap(),
@@ -1294,6 +1303,29 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
                 assert!(!redacted.contains("123456:ABC-def_GHI"));
             }
             LeakResult::Clean => panic!("Should detect Telegram bot token"),
+        }
+    }
+
+    #[test]
+    fn detects_slack_tokens() {
+        let detector = LeakDetector::new();
+
+        let bot = "SLACK_BOT_TOKEN=xoxb-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        match detector.scan(bot) {
+            LeakResult::Detected { patterns, redacted } => {
+                assert!(patterns.iter().any(|p| p.contains("Slack")));
+                assert!(!redacted.contains("xoxb-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
+            }
+            LeakResult::Clean => panic!("Should detect Slack bot token"),
+        }
+
+        let app = "xapp-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        match detector.scan(app) {
+            LeakResult::Detected { patterns, redacted } => {
+                assert!(patterns.iter().any(|p| p.contains("Slack")));
+                assert!(!redacted.contains("xapp-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
+            }
+            LeakResult::Clean => panic!("Should detect Slack app-level token"),
         }
     }
 
