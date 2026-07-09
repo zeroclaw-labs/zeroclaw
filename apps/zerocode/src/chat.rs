@@ -283,6 +283,15 @@ impl Chat {
         }
 
         if agents.len() == 1 {
+            // ACP pane (Code tab): try to auto-resume the most recent Code
+            // session instead of starting a blank one. The daemon-side session
+            // list is already sorted by last_activity DESC, so the first entry
+            // is the most recent. No sessions → fresh start (no-op).
+            if self.pane_kind == PaneKind::Acp && self.resume_session_id.is_none() {
+                if let Ok(list) = self.rpc.acp_session_list().await {
+                    self.resume_session_id = list.sessions.into_iter().next().map(|s| s.session_id);
+                }
+            }
             self.pick_or_start_session(&agents[0]).await;
             return Ok(());
         }
