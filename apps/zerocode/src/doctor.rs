@@ -248,21 +248,52 @@ impl Doctor {
                 crate::i18n::t("zc-doctor-loading"),
                 theme::dim_style(),
             ))]
-        } else if let Some(entry) = self.selected_entry() {
-            detail_lines(entry)
         } else {
-            let mut out = Vec::new();
-            if let Some(log_path) = self.result.as_ref().and_then(|r| r.log_path.as_deref()) {
+            let mut out: Vec<Line<'_>> = Vec::new();
+
+            // Surface the resolved active log path first when the daemon
+            // advertised one — it is the operator's primary entry point for
+            // post-mortem log navigation (#8650).
+            if let Some(log_path) = self
+                .result
+                .as_ref()
+                .and_then(|r| r.log_path.as_deref())
+            {
                 out.push(Line::from(Span::styled(
                     crate::i18n::t_args("zc-doctor-log-path", &[("path", log_path)]),
                     theme::body_style(),
                 )));
                 out.push(Line::from(""));
             }
-            out.push(Line::from(Span::styled(
-                crate::i18n::t("zc-doctor-no-selection"),
-                theme::dim_style(),
-            )));
+
+            // Always show the partial-results banner when a phase timed
+            // out, even if the user has selected a specific diagnostic row.
+            // This ensures the incomplete-run state from #8647 stays
+            // persistently visible alongside any selected-row detail.
+            let is_partial = self
+                .result
+                .as_ref()
+                .is_some_and(|r| r.timed_out_phase.is_some());
+            if is_partial {
+                out.push(Line::from(Span::styled(
+                    crate::i18n::t("zc-doctor-partial-banner"),
+                    severity_style(DoctorSeverity::Warn),
+                )));
+                out.push(Line::from(Span::styled(
+                    crate::i18n::t("zc-doctor-partial-hint"),
+                    theme::dim_style(),
+                )));
+            }
+
+            if let Some(entry) = self.selected_entry() {
+                out.extend(detail_lines(entry));
+            } else if !is_partial {
+                out.push(Line::from(Span::styled(
+                    crate::i18n::t("zc-doctor-no-selection"),
+                    theme::dim_style(),
+                )));
+            }
+
             out
         };
 
@@ -519,10 +550,20 @@ fn truncate_first_line(s: &str, max: usize) -> String {
 
 fn format_doctor_error(error: &str) -> String {
     if error.contains("Unknown method") || error.contains("-32601") {
-        crate::i18n::t("zc-doctor-error-unsupported-daemon")
-    } else {
-        error.to_string()
+        return crate::i18n::t("zc-doctor-error-unsupported-daemon");
     }
+    // Whole-RPC timeout: the daemon may have failed to return for any
+    // reason (model-probe deadline, network drop, daemon overload, etc.).
+    // Without a response we cannot identify the phase — keep the message
+    // generic so the user checks the right subsystem.
+    if error.contains("timed out") || error.contains("timeout") {
+        return format!(
+            "{}\n\n{}",
+            error,
+            crate::i18n::t("zc-doctor-error-daemon-timeout"),
+        );
+    }
+    error.to_string()
 }
 
 #[cfg(test)]
@@ -561,6 +602,7 @@ mod tests {
                 errors: 1,
             },
             log_path: None,
+            timed_out_phase: None,
         }
     }
 
@@ -618,6 +660,50 @@ mod tests {
 
         assert!(message.contains("daemon"));
         assert!(!message.contains("-32601"));
+    }
+
+    #[test]
+    fn doctor_timeout_error_is_generic_not_model_probing_specific() {
+        // A whole-RPC timeout (no response) must not suggest model probing —
+        // the daemon may have timed out for any reason.
+        let message = format_doctor_error("RPC doctor/run: request timed out");
+
+        assert!(message.contains("request timed out"));
+        assert!(
+            message.contains("daemon may be busy"),
+            "whole-RPC timeout must be generic, got: {message}"
+        );
+        assert!(
+            !message.contains("Model probing") && !message.contains("provider API"),
+            "whole-RPC timeout must NOT name model probing, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_partial_result_banner_visible_alongside_selection() {
+        // When timed_out_phase is set and sync_selection selects the
+        // auto-added timeout warning, the partial banner must still be
+        // reachable — not hidden behind selected_entry().
+        let mut doctor = Doctor::new(test_client());
+        let mut result = sample_result();
+        result.timed_out_phase = Some("probe_models".into());
+        doctor.result = Some(result);
+        doctor.sync_selection();
+
+        // selected_entry() returns the warning (confirming the scenario).
+        assert!(
+            doctor.selected_entry().is_some(),
+            "should select the timeout warning entry"
+        );
+
+        // The partial flag is still set — draw_detail can show the banner.
+        assert!(
+            doctor
+                .result
+                .as_ref()
+                .is_some_and(|r| r.timed_out_phase.is_some()),
+            "partial-results state must survive sync_selection"
+        );
     }
 
     #[tokio::test]
@@ -721,6 +807,7 @@ mod tests {
                 "/home/operator/.local/share/zeroclaw/logs/trace-2026-07-13T08-30-00Z.jsonl"
                     .to_string(),
             ),
+            timed_out_phase: None,
         });
         doctor.filter = DoctorFilter::Problems;
 
@@ -774,6 +861,7 @@ mod tests {
                 errors: 0,
             },
             log_path: None,
+            timed_out_phase: None,
         });
         doctor.filter = DoctorFilter::Problems;
 

@@ -137,6 +137,8 @@ rpc_type! {
         /// Resolved active log persistence path, if available.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub log_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub timed_out_phase: Option<String>,
     }
 }
 
