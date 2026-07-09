@@ -1,10 +1,4 @@
 //! Credential leak detection for outbound content.
-//!
-//! Scans outbound messages for potential credential leaks before they are sent,
-//! preventing accidental exfiltration of API keys, tokens, passwords, and other
-//! sensitive values.
-//!
-//! Contributed from RustyClaw (MIT licensed).
 
 use regex::Regex;
 use std::ops::Range;
@@ -85,11 +79,6 @@ impl LeakDetector {
         self.scan_with_protected_spans(content, &[])
     }
 
-    /// Scan content while preserving caller-supplied byte ranges.
-    ///
-    /// Protected spans are intentionally opaque. Callers may use whatever
-    /// structured parser is appropriate to identify ranges that must not be
-    /// rewritten, while this detector remains format-agnostic.
     pub fn scan_with_protected_spans(
         &self,
         content: &str,
@@ -433,12 +422,6 @@ impl LeakDetector {
         }
     }
 
-    /// Check for messaging bot tokens embedded in API URLs.
-    ///
-    /// Telegram bot tokens appear in request URLs as `/bot<id>:<token>` and
-    /// would otherwise reach error logs verbatim. The token half is not
-    /// guaranteed high-entropy, so it needs an explicit pattern rather than
-    /// relying on the entropy scan.
     fn check_bot_token(
         &self,
         content: &str,
@@ -461,11 +444,6 @@ impl LeakDetector {
         );
     }
 
-    /// Check for high-entropy tokens that may be leaked credentials.
-    ///
-    /// Extracts candidate tokens from content (after stripping URLs to avoid
-    /// false-positives on path segments) and flags any that exceed the Shannon
-    /// entropy threshold derived from the detector's sensitivity.
     fn check_high_entropy_tokens(
         &self,
         content: &str,
@@ -476,11 +454,6 @@ impl LeakDetector {
         // Entropy threshold scales with sensitivity: at 0.7 this is ~4.37.
         let entropy_threshold = 3.5 + self.sensitivity * 1.25;
 
-        // Protect URLs and media markers before extracting tokens so that path
-        // segments are not mistaken for high-entropy credentials.
-        // Media markers like [IMAGE:/path/to/file.png] contain filesystem paths
-        // that look like high-entropy tokens when `/` is included in the token
-        // character set.
         static URL_PATTERN: OnceLock<Regex> = OnceLock::new();
         let url_re = URL_PATTERN.get_or_init(|| Regex::new(r"https?://\S+").unwrap());
         static MEDIA_MARKER_PATTERN: OnceLock<Regex> = OnceLock::new();

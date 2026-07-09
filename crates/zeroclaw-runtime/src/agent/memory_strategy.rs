@@ -2,12 +2,6 @@ use std::sync::Arc;
 use zeroclaw_api::memory_traits::{Memory, MemoryStrategy};
 use zeroclaw_api::model_provider::ModelProvider;
 
-/// Default memory strategy that delegates to existing implementations.
-///
-/// A thin wrapper over the memory lifecycle: it calls
-/// `consolidation::consolidate_turn` and `hygiene::run_if_due` directly.
-/// Context assembly is not the strategy's job; the turn engine renders the
-/// memory-context preamble via `agent::memory_inject`, keyed on `TurnOrigin`.
 pub struct DefaultMemoryStrategy {
     memory: Arc<dyn Memory>,
     memory_config: zeroclaw_config::schema::MemoryConfig,
@@ -20,8 +14,8 @@ impl DefaultMemoryStrategy {
         memory_config: zeroclaw_config::schema::MemoryConfig,
         workspace_dir: impl Into<std::path::PathBuf>,
     ) -> Self {
-        // #6722: rerank_enabled is declared on the config schema but the
-        // retrieval-pipeline rerank stage was never landed (PR #4245 closed
+        //  rerank_enabled is declared on the config schema but the
+        // retrieval-pipeline rerank stage was never landedclosed
         // unmerged).  Emit a one-time warning so operators who set these
         // fields know they currently have no effect.
         if memory_config.rerank_enabled {

@@ -1,11 +1,4 @@
 //! The single gate-clearing chokepoint (EPIC C, C3).
-//!
-//! Every principal - the agent tool, the loopback CLI, the gateway, the timeout
-//! tick - funnels through `resolve_gate`. It enforces `approval_mode`, is
-//! idempotent (a second resolve in flight is `AlreadyResolved`, no double ledger
-//! row), records WHO resolved into B's append-only ledger, and persists the
-//! mutated run. `approve_step` keeps its own (unchanged) deterministic-checkpoint
-//! path; both share the extracted `clear_waiting_gate` transition body.
 
 use anyhow::Result;
 
@@ -45,11 +38,6 @@ pub fn resolve_gate(
         return Ok(ResolveOutcome::RejectedSelfApproval);
     }
 
-    // 3. Audit FIRST, fail-closed. Durably append the immutable ledger row
-    //    (WHO/what/when) BEFORE any gate transition, so a store failure aborts the
-    //    resolution and leaves the gate untouched: the gate cannot clear or deny
-    //    without its audit-of-record row. (The store ledger is the only audit
-    //    source now that the legacy Memory approval audit is gone.)
     if let Err(e) = engine.record_gate_event(GateLedgerEntry {
         run_id: run_id.to_string(),
         step,

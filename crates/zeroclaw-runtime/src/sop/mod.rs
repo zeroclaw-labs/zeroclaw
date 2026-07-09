@@ -43,22 +43,11 @@ use types::{SopManifest, SopMeta};
 use zeroclaw_config::schema::SopConfig;
 use zeroclaw_memory::traits::Memory;
 
-/// Build a single shared SopEngine + SopAuditLogger pair.
-///
-/// This is the sole construction site for SOP state within a daemon.
-/// Callers receive `Arc<Mutex<SopEngine>>` and `Arc<SopAuditLogger>`
-/// handles — never call `SopEngine::new` or `SopAuditLogger::new`
-/// directly outside this module.
 pub fn build_sop_engine(
     config: SopConfig,
     workspace_dir: &Path,
     audit_memory: Arc<dyn Memory>,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
-    // Select the run-state backend from config (default: ephemeral in-memory,
-    // unchanged behavior). A backend-open failure must not crash daemon startup,
-    // so fall back to in-memory with a loud log. `workspace_dir` here is the
-    // daemon data dir (every caller passes `config.data_dir`), so a durable store
-    // lands at `<data_dir>/sop/runs.db` unless `[sop] run_state_dir` overrides it.
     let store = store::build_run_store(&config, workspace_dir).unwrap_or_else(|e| {
         ::zeroclaw_log::record!(
             WARN,
@@ -235,11 +224,6 @@ fn normalize_manifest_steps(mut steps: Vec<SopStep>) -> Vec<SopStep> {
 
 // ── Markdown step parser ────────────────────────────────────────
 
-/// Parse procedure steps from SOP.md content.
-///
-/// Expects a `## Steps` heading followed by numbered items (`1.`, `2.`, …).
-/// Each item's first bold text (`**...**`) is the step title; the rest is body.
-/// Sub-bullets parse execution hints and dark per-step contract metadata.
 pub fn parse_steps(md: &str) -> Vec<SopStep> {
     let mut steps = Vec::new();
     let mut in_steps_section = false;

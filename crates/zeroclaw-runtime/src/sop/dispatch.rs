@@ -1,8 +1,4 @@
 //! Unified SOP event dispatch helpers.
-//!
-//! All event sources (MQTT, webhook, cron, peripheral) route through
-//! `dispatch_sop_event` so that locking, audit, and health bookkeeping
-//! happen in exactly one place.
 
 use std::sync::{Arc, Mutex};
 
@@ -16,10 +12,6 @@ use crate::security::{ContentSafety, ScanOutcome, ScreenVerdict};
 /// Outcome of attempting to dispatch an event to the SOP engine.
 #[derive(Debug, Clone)]
 pub enum DispatchResult {
-    /// A new SOP run was started. `action` carries the next step the runtime
-    /// must execute (or wait for approval on). Callers that cannot act on the
-    /// action (e.g. headless fan-in) must still audit/log it — never silently
-    /// drop.
     Started {
         run_id: String,
         sop_name: String,
@@ -66,12 +58,6 @@ fn action_label(action: &SopRunAction) -> &'static str {
 
 // ── Core dispatch ───────────────────────────────────────────────
 
-/// Dispatch an incoming event to the SOP engine.
-///
-/// Pattern (batch lock — exactly 2 acquisitions):
-/// 1. Lock → `match_trigger` → collect SOP names → drop lock
-/// 2. Lock → for each name: `start_run` → collect results → drop lock
-/// 3. Async (no lock): audit each started run
 pub async fn dispatch_sop_event(
     engine: &Arc<Mutex<SopEngine>>,
     audit: &SopAuditLogger,
@@ -81,7 +67,6 @@ pub async fn dispatch_sop_event(
 }
 
 /// Dispatch an incoming event to one named SOP, after normal trigger matching.
-///
 /// This is useful for channel routers that already selected a configured SOP
 /// name, while still requiring that SOP to declare a matching trigger.
 pub async fn dispatch_sop_event_to(
@@ -222,12 +207,6 @@ async fn dispatch_sop_event_filtered(
                     // Extract run_id from the action (authoritative source)
                     let run_id = extract_run_id_from_action(&action).to_string();
 
-                    // Headless deterministic runs have no agent loop to execute
-                    // steps. Left as-is, the run sits in active_runs as Running
-                    // forever and its max_concurrent slot never frees, so every
-                    // later event from the same SOP is skipped. Drive it to a
-                    // terminal state here so the slot frees and the SOP can fire
-                    // again on the next event.
                     let is_deterministic = eng
                         .get_sop(sop_name)
                         .is_some_and(|s| s.execution_mode == SopExecutionMode::Deterministic);
@@ -310,13 +289,6 @@ async fn dispatch_sop_event_filtered(
 
 // ── Headless result processing ──────────────────────────────────
 
-/// Process dispatch results in headless (non-agent-loop) callers.
-///
-/// This handles audit and logging for fan-in callers (MQTT, webhook, cron)
-/// that cannot execute SOP steps interactively. For `WaitApproval` actions,
-/// approval timeout polling in the scheduler handles progression.
-/// For `ExecuteStep` actions, the run is started in the engine but steps
-/// cannot be executed without an agent loop — this is logged as a warning.
 pub fn process_headless_results(results: &[DispatchResult]) {
     for result in results {
         match result {
@@ -419,7 +391,6 @@ pub fn process_headless_results(results: &[DispatchResult]) {
 // ── Peripheral signal helper ────────────────────────────────────
 
 /// Convenience wrapper for peripheral hardware callbacks.
-///
 /// Builds a `SopEvent` with source `Peripheral` and topic `"{board}/{signal}"`
 /// then dispatches it through the standard path.
 pub async fn dispatch_peripheral_signal(
@@ -441,7 +412,6 @@ pub async fn dispatch_peripheral_signal(
 // ── Cron SOP cache + check ──────────────────────────────────────
 
 /// Pre-parsed cron schedules for SOP triggers.
-///
 /// Built once at daemon startup to avoid re-parsing cron expressions
 /// on every scheduler tick.
 #[derive(Clone)]
@@ -452,7 +422,6 @@ pub struct SopCronCache {
 
 impl SopCronCache {
     /// Build cache from the current engine state.
-    ///
     /// Locks the engine once, iterates SOPs, parses Cron trigger expressions.
     /// Invalid expressions are logged and skipped (fail-closed).
     pub fn from_engine(engine: &Arc<Mutex<SopEngine>>) -> Self {
@@ -524,7 +493,6 @@ impl SopCronCache {
         Self { schedules }
     }
 
-    /// Return the cached schedules (for testing).
     #[cfg(test)]
     pub fn schedules(&self) -> &[(String, String, cron::Schedule)] {
         &self.schedules
@@ -533,7 +501,6 @@ impl SopCronCache {
 
 /// Check all cached cron SOP triggers for firings in the window
 /// `(last_check, now]` and dispatch events for each.
-///
 /// Uses window-based evaluation so ticks between polls are never missed.
 pub async fn check_sop_cron_triggers(
     engine: &Arc<Mutex<SopEngine>>,
@@ -1019,8 +986,6 @@ mod tests {
         assert_eq!(started_count, 2);
     }
 
-    /// B1 DoD: prove that the action returned by `start_run` is captured in
-    /// `DispatchResult::Started` — not silently dropped.
     #[tokio::test]
     async fn dispatch_captures_action_for_wait_approval() {
         // Supervised mode → WaitApproval on step 1
@@ -1062,7 +1027,6 @@ mod tests {
         }
     }
 
-    /// B1 DoD: Auto-mode SOP returns ExecuteStep action in dispatch result.
     #[tokio::test]
     async fn dispatch_captures_action_for_execute_step() {
         let engine = test_engine(vec![test_sop("auto-sop", vec![SopTrigger::Manual])]);

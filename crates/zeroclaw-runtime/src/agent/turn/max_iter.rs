@@ -10,12 +10,6 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::PacingConfig;
 use zeroclaw_providers::{ChatMessage, ModelProvider, ProviderDispatch};
 
-/// Graceful shutdown after the loop exhausts `max_iterations` (upstream loop
-/// body, max-iteration exit): log exhaustion, push a summary-request user
-/// message, make a tools-free `chat` call honoring `pacing.step_timeout_secs`
-/// and the cancellation token, and return `Ok(accumulated + summary)` — or
-/// bail with "exceeded maximum tool iterations" when the summary is empty or
-/// the call fails.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finish_after_max_iterations(
     model_provider: &dyn ModelProvider,
@@ -59,17 +53,6 @@ pub(crate) async fn finish_after_max_iterations(
             .with_attrs(::serde_json::json!({"max_iterations": max_iterations})),
         "Max iterations reached, requesting final summary"
     );
-    // Sanitise tool_use / tool_result pairing before the graceful-shutdown
-    // request. When the loop exits immediately after the model emits a
-    // tool_use (hitting max_tool_iterations before the runner records a
-    // tool_result), the history carries an unpaired tool_use block.
-    // Bedrock/Anthropic reject the follow-up tools-free summary call with:
-    // "Expected toolResult blocks at messages.N.content for the following
-    // Ids: tooluse_*". Two complementary sweeps:
-    //   1. strip_orphaned_tool_calls_from_assistants — removes tool_calls from
-    //      assistant messages whose ids have no following tool result.
-    //   2. remove_orphaned_tool_messages — removes tool-role messages that no
-    //      longer have a matching assistant (symmetric case).
     let tool_calls_stripped =
         crate::agent::history_pruner::strip_orphaned_tool_calls_from_assistants(history);
     let tool_messages_removed =
@@ -93,11 +76,6 @@ pub(crate) async fn finish_after_max_iterations(
          Summarize what you accomplished and what remains to be done."
             .to_string(),
     );
-    // Pushed into history for the request below, but mirrored into the
-    // append-log (and kept in history) only when the summary call SUCCEEDS:
-    // a failed/cancelled/timed-out/empty summary must not persist an
-    // unanswered synthetic prompt into wrapper transcripts — every failure
-    // exit pops it back off.
     let summary_prompt_mirror = summary_prompt.clone();
     history.push(summary_prompt);
 
@@ -183,12 +161,6 @@ pub(crate) async fn finish_after_max_iterations(
         history.pop();
         anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
     }
-    // Persist the answered prompt + summary like every other final assistant
-    // response: without the summary message, persistent-history callers (the
-    // streamed wrapper's replay, new_messages consumers) store a transcript
-    // ending on the synthetic user prompt with no answer — the delivered
-    // summary would be absent and the model re-answers the synthetic prompt
-    // next turn.
     let summary_msg = ChatMessage::assistant(text.clone());
     if let Some(out) = &mut new_messages_out {
         out.push(summary_prompt_mirror);

@@ -34,15 +34,6 @@ use parking_lot::RwLock;
 use traits::ObserverMetric;
 use zeroclaw_config::schema::{ObservabilityBackend, ObservabilityConfig};
 
-/// Process-wide broadcast hook installed by long-running subsystems (today: the
-/// gateway) so that events emitted by observers built in *other* subsystems —
-/// notably the agent loop's `process_message` — also fan out to the SSE
-/// broadcast channel. Without this, observers created per call site stay
-/// isolated and `/api/events` only sees the gateway's own direct emissions.
-///
-/// Uses `parking_lot::RwLock` so the event-recording path never has to handle
-/// lock poisoning: a panic inside a hook would not silently disable the entire
-/// observability channel on subsequent calls.
 static BROADCAST_HOOK: OnceLock<RwLock<BroadcastHookState>> = OnceLock::new();
 
 struct BroadcastHookEntry {
@@ -78,11 +69,6 @@ pub fn set_broadcast_hook(observer: Arc<dyn Observer>) {
     });
 }
 
-/// Guard returned by [`set_scoped_broadcast_hook`].
-///
-/// Dropping the guard removes the hook it installed, but only if a later caller
-/// has not already replaced the process-wide hook. If multiple scoped hooks are
-/// live at once, dropping the newest hook restores the previous still-live hook.
 #[must_use = "hold the guard for as long as the broadcast hook should remain installed"]
 pub struct BroadcastHookGuard {
     scoped_id: u64,
@@ -118,23 +104,6 @@ fn current_broadcast_hook() -> Option<Arc<dyn Observer>> {
     broadcast_hook_slot().read().current()
 }
 
-/// Guard that flushes its observer on drop — the telemetry analogue of
-/// `agent::TurnGuard`. Held for the lifetime of a short-lived agent
-/// invocation (today: the CLI one-shot, `zeroclaw agent -m ...`), whose
-/// process exits before the OTLP batch exporter / metric
-/// `PeriodicReader`'s background interval fires. Without this flush all
-/// buffered telemetry — including the never-ended `gen_ai.agent.invoke`
-/// span, which is only `.end()`'d inside [`Observer::flush`] — is lost
-/// when the runtime is torn down.
-///
-/// Long-lived callers (daemon heartbeat/cron, channel `process_message`,
-/// subagent spawns) pass `interactive = false` and skip this guard: they
-/// rely on the periodic export firing on its own cadence, and a flush
-/// per turn would add a synchronous OTLP HTTP POST to every invocation.
-///
-/// Backend-agnostic: calls `Observer::flush()`, which is a no-op for
-/// synchronous backends (`Log`/`Verbose`/`Noop`) and meaningless-but-
-/// harmless for pull backends (`Prometheus` — see startup warning).
 #[must_use = "hold the guard for the lifetime of the agent invocation; dropping it flushes"]
 pub struct FlushGuard {
     observer: Arc<dyn Observer>,
@@ -274,12 +243,6 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
         ObservabilityBackend::Otel => {
             #[cfg(feature = "observability-otel")]
             {
-                // Derive the per-observer content policy once, at the observer
-                // construction boundary. `ObservabilityConfig` remains the source
-                // of truth; this immutable snapshot is owned by the `OtelObserver`
-                // and consulted at the OTel export boundary. There is no
-                // process-global mutable content policy, so concurrently live
-                // observers with different policies never drift into each other.
                 let content_config = OtelContentConfig::from_observability_config(config);
 
                 match OtelObserver::new(

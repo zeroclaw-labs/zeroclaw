@@ -1,19 +1,4 @@
 //! Tool subsystem for agent-callable capabilities.
-//!
-//! This module implements the tool execution surface exposed to the LLM during
-//! agentic loops. Each tool implements the [`Tool`] trait defined in the
-//! `traits` submodule, which requires a name, description, JSON parameter
-//! schema, and an async `execute` method returning a structured [`ToolResult`].
-//!
-//! Tools are assembled into registries by [`default_tools`] (shell, file read/write)
-//! and [`all_tools`] (full set including memory, browser, cron, HTTP, delegation,
-//! and optional integrations). Security policy enforcement is injected via
-//! [`SecurityPolicy`] at construction time.
-//!
-//! # Extension
-//!
-//! To add a new tool, implement [`Tool`] in a new submodule and register it in
-//! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
 pub mod attribution;
 pub mod cron_add;
@@ -176,11 +161,6 @@ use std::sync::{Arc, Mutex};
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
 
-/// Per-tool channel-map handle — `Arc<RwLock<HashMap<channel_name, channel>>>`.
-///
-/// Each channel-driven tool owns its own handle so callers can populate it
-/// independently (late-bound registration). Shared alias of the same
-/// underlying type formerly known as `ChannelMapHandle`.
 pub type PerToolChannelHandle =
     Arc<RwLock<HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>>>;
 
@@ -305,11 +285,6 @@ pub fn default_tools_with_runtime(
     ]
 }
 
-/// Register skill-defined tools into an existing tool registry.
-///
-/// Converts each skill's `[[tools]]` entries into callable `Tool` implementations
-/// and appends them to the registry. Skill tools that would shadow a built-in tool
-/// name are skipped with a warning.
 pub fn register_skill_tools(
     tools_registry: &mut Vec<Box<dyn Tool>>,
     skills: &[crate::skills::Skill],
@@ -319,7 +294,6 @@ pub fn register_skill_tools(
 }
 
 /// Register skill-defined tools with full context for builtin kinds.
-///
 /// `unfiltered_registry` provides the pre-policy tool list for `kind = "builtin"`
 /// delegation.
 pub fn register_skill_tools_with_context(
@@ -349,20 +323,6 @@ pub fn register_skill_tools_with_context_and_runtime(
     }
 
     let before = tools_registry.len();
-    // Keep the policy after `security` is moved into skill-tool construction: skill tools
-    // must honor the `excluded_tools` denylist, like every other tool. The built-in filter
-    // (`apply_policy_tool_filter`) runs before skill registration, so without this check a
-    // skill-defined tool bypasses the policy entirely - the same class of gap #6959 fixed
-    // for eager built-ins, never applied to skill tools, so `excluded_tools` silently
-    // failed to subtract a skill tool. This is the single skill-registration chokepoint
-    // (assemble, from_config, the channel orchestrator, and direct callers all funnel
-    // here), so gating once here closes it on every construction path.
-    //
-    // Denylist only, NOT the `allowed_tools` allowlist: skill tools are granted explicitly
-    // via skill config, and `builtin`-kind skill tools are scoped-elevation wrappers meant
-    // to stay callable when the raw tool is off the allowlist (see
-    // `SecurityPolicy::is_tool_excluded`). Applying the allowlist would defeat that; the
-    // denylist still removes any skill tool named in `excluded_tools`.
     let policy = Arc::clone(&security);
     let skill_tools = crate::skills::skills_to_tools_with_context_and_runtime(
         skills,
@@ -400,11 +360,6 @@ pub fn register_skill_tools_with_context_and_runtime(
     }
     let registered = tools_registry.len() - before;
 
-    // Positive-path log — matches how the rest of zeroclaw reports
-    // successful initialization (open-skills clone, daemon startup,
-    // gateway bind, etc.). Without this, a skill that audited clean,
-    // parsed cleanly, and registered N tools leaves zero signal in the
-    // log, which makes SKILL.toml / SKILL.md authoring painful to debug.
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -421,15 +376,6 @@ pub fn register_skill_tools_with_context_and_runtime(
     );
 }
 
-/// Build resolution-only MCP tool wrappers for skill MCP elevation
-/// (`kind = "mcp"`).
-///
-/// These wrappers are **not** added to the model-visible tool registry — they
-/// exist solely so a skill MCP elevation can resolve its `target`
-/// (`{server}__{tool}`, e.g. `images__generate`) by name at registration time
-/// and delegate to it. Cheap: MCP tool definitions are cached at connect time,
-/// so this performs no network I/O. Returned alongside the built-in
-/// `unfiltered_tool_arcs` to form the skill resolution registry.
 pub async fn collect_mcp_elevation_arcs(registry: &Arc<McpRegistry>) -> Vec<Arc<dyn Tool>> {
     let mut arcs: Vec<Arc<dyn Tool>> = Vec::new();
     for name in registry.tool_names() {
@@ -463,12 +409,6 @@ pub fn build_mcp_capability_tools(
     out
 }
 
-/// Always-on built-in tools that surface in the integrations panel as
-/// `(display_name, description)` pairs. The integrations registry consumes
-/// this verbatim — adding a new always-on built-in is one row here, no
-/// edit to the registry. Tools with a config struct (Browser, Cron,
-/// GoogleWorkspace) declare themselves via the `#[integration(...)]`
-/// attribute on the schema struct instead.
 pub const BUILTIN_TOOL_INTEGRATIONS: &[(&str, &str)] = &[
     ("Shell", "Terminal command execution"),
     ("File System", "Read/write files"),
@@ -480,7 +420,6 @@ pub const BUILTIN_TOOL_INTEGRATIONS: &[(&str, &str)] = &[
 ];
 
 /// Bundled return values from tool registry construction.
-///
 /// Named struct to avoid an ever-growing positional tuple that's painful
 /// to destructure across many callers.
 #[allow(clippy::type_complexity)]
@@ -714,11 +653,6 @@ pub fn all_tools_with_runtime(
     // bot/server set); the search tool reads from a shared archive DB
     // so it's enabled when at least one alias archives.
     if root_config.channels.discord.values().any(|d| d.archive) {
-        // Read from the SHARED store (`config.data_dir`) the channel archive
-        // writer persists to (orchestrator builds `discord.db` under
-        // `&config.data_dir`), NOT the per-agent `workspace_dir` — otherwise the
-        // tool opens an empty DB and litters a stray `memory/discord.db` under
-        // every agent workspace.
         match zeroclaw_memory::SqliteMemory::new_named("sqlite", &config.data_dir, "discord") {
             Ok(discord_mem) => {
                 tool_arcs.push(Arc::new(DiscordSearchTool::new(Arc::new(discord_mem))));
@@ -1150,17 +1084,6 @@ pub fn all_tools_with_runtime(
         security.clone(),
     )));
 
-    // Session tools share the channel orchestrator's backend via the
-    // `make_session_backend` factory, keyed off `[channels].session_backend`.
-    // Previously the tools opened the JSONL `SessionStore` while the
-    // gateway WS path opened `SqliteSessionBackend`, so any session
-    // created via /ws/chat was invisible to `sessions_list` /
-    // `sessions_history`. Routing both call sites through the factory
-    // closes that gap and honors the operator's configured backend.
-    // Read from the SHARED sessions store (`config.data_dir`) the gateway/daemon
-    // write to (they build the backend under `&config.data_dir`), NOT the
-    // per-agent `workspace_dir` — otherwise `sessions_list`/`sessions_history`
-    // miss real sessions and a stray `sessions/sessions.db` is created per agent.
     if let Ok(backend) =
         zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
     {
@@ -1171,13 +1094,6 @@ pub fn all_tools_with_runtime(
             security.clone(),
         )));
         tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
-        // NOTE: SessionResetTool and SessionDeleteTool are available via
-        // zeroclaw_tools::sessions but NOT registered by default. They are
-        // destructive operations (clear/delete conversation history) and
-        // should only be enabled by callers that explicitly need them
-        // (e.g., orchestration dashboards). Agent-callable registrations must
-        // use SessionOwnershipScope so one agent cannot reset/delete another
-        // agent's sessions. The unscoped constructors are operator/admin only.
     }
 
     // LinkedIn integration (config-gated)
@@ -1309,12 +1225,6 @@ pub fn all_tools_with_runtime(
         AskUserTool::new(security.clone(), ask_user_handle.as_ref().cloned().unwrap());
     tool_arcs.push(Arc::new(ask_user_tool));
 
-    // Per-turn routing tool — shares ask_user's channel map (populated by
-    // start_channels). Peer-group authority is resolved live from config at call
-    // time so a reload (membership / external_peers / channel alias / modality)
-    // takes effect without rebuilding the registry; callers without a live config
-    // handle (one-shot / non-channel paths) fall back to a snapshot. The per-turn
-    // routing handle is scoped into TURN_ROUTING by the orchestrator, not held here.
     {
         let agent_peer_groups: AgentPeerGroupResolver = if let Some(live) = live_config.clone() {
             let alias = agent_alias.to_string();
@@ -1472,13 +1382,6 @@ pub fn all_tools_with_runtime(
         .with_workspace_dir(workspace_dir.to_path_buf())
         .with_memory(memory.clone())
         .with_providers_models({
-            // DelegateTool's signature still expects the flat HashMap shape;
-            // collapse the typed ModelProviders container down to base-config
-            // entries here. Family-specific extras (wire_api / requires_openai_auth /
-            // resource / etc.) aren't needed by DelegateTool — it only resolves
-            // baseline fields (model, api_key, uri) for sub-agent dispatch.
-            // Phase 7 will switch DelegateTool to consume Arc<ModelProviders>
-            // directly and drop this collapse.
             let mut m: std::collections::HashMap<
                 String,
                 std::collections::HashMap<String, zeroclaw_config::schema::ModelProviderConfig>,
@@ -1540,14 +1443,6 @@ pub fn all_tools_with_runtime(
                         max_instances: config.plugins.limits.max_instances,
                     };
                     for (manifest, wasm_path) in details {
-                        // SSOT: `config` is the snapshot the whole tool set is
-                        // built from, identical to every other tool here. A
-                        // config reload tears down and rebuilds the daemon
-                        // iteration (rpc ConfigReload -> reload_tx), so the
-                        // agent and its tools are reconstructed from the new
-                        // Config; plugin config is never hot-swapped into a live
-                        // WasmTool. The owned map below is that fresh snapshot,
-                        // not a second source of truth.
                         let plugin_config = config
                             .plugins
                             .entry_config(&manifest.name)
@@ -1660,9 +1555,6 @@ mod tests {
         assert_eq!(tools.len(), 6);
     }
 
-    /// Regression: SOP tools must NOT appear in the tool registry when the
-    /// engine handle is not provided (i.e. no `sops_dir` configured).
-    /// Proves the production gating path at `all_tools_with_runtime`.
     #[test]
     fn sop_tools_absent_when_engine_not_provided() {
         let tmp = TempDir::new().unwrap();
@@ -1720,9 +1612,6 @@ mod tests {
         }
     }
 
-    /// SOP tools MUST appear in the tool registry when an engine handle is
-    /// provided, regardless of config. Proves the parameter-passing path
-    /// works end-to-end.
     #[test]
     fn sop_tools_present_when_engine_provided() {
         let tmp = TempDir::new().unwrap();
@@ -1850,10 +1739,6 @@ mod tests {
         );
     }
 
-    /// Regression for #6687: two tool registries built from clones of the same
-    /// engine `Arc` must reference the same underlying `SopEngine`. This is the
-    /// property the daemon relies on so MQTT-triggered runs are visible to
-    /// `sop_status`/`sop_approve`/`sop_advance` invoked from agent sessions.
     #[test]
     fn shared_sop_engine_arc_is_observed_by_multiple_registrations() {
         let tmp = TempDir::new().unwrap();
@@ -1937,13 +1822,6 @@ mod tests {
         assert!(Arc::strong_count(&shared_audit) >= 3);
     }
 
-    /// Regression: `discord_search` and the `sessions_*` tools must open their
-    /// SQLite stores under the SHARED `config.data_dir` (where the channel
-    /// orchestrator / gateway WRITE them), not the per-agent `workspace_dir`.
-    /// Reading the per-agent dir made the tools see empty DBs and litter a
-    /// stray `memory/discord.db` + `sessions/sessions.db` into every agent
-    /// workspace. With `data_dir` and `workspace_dir` deliberately distinct,
-    /// nothing must be created under the workspace.
     #[test]
     fn shared_store_tools_open_data_dir_not_per_agent_workspace() {
         let tmp = TempDir::new().unwrap();
@@ -2031,9 +1909,6 @@ mod tests {
         );
     }
 
-    /// Regression for #6687 blocker: a config with `sop.sops_dir` set but no
-    /// `agents.default` must not fail SOP engine construction. The per-agent
-    /// paths now use `agent_alias` instead of the hardcoded `"default"` string.
     #[tokio::test]
     async fn sop_audit_memory_uses_agent_alias_not_default() {
         let tmp = TempDir::new().unwrap();
@@ -2104,12 +1979,6 @@ mod tests {
         }
     }
 
-    /// End-to-end wiring test (issue #4627): tools registered via
-    /// `default_tools_with_runtime` against an ephemeral runtime must surface the
-    /// loud warning (shell/file_read/file_edit) or refuse outright (file_write).
-    /// The per-tool unit tests construct tools directly with the flag; this is
-    /// the only test that proves `has_filesystem_access()` is actually threaded
-    /// through registration to all four tools.
     #[tokio::test]
     async fn registered_tools_warn_or_block_on_ephemeral_runtime() {
         let tmp = TempDir::new().unwrap();
@@ -2278,12 +2147,6 @@ mod tests {
         assert!(names.contains(&"proxy_config"));
     }
 
-    /// Wiring guard for issue #6689: SOP tools registered via `all_tools` must
-    /// carry a real audit logger, so a tool-driven run persists the documented
-    /// `sop_run_*` Memory key. The per-tool unit tests prove `with_audit` works;
-    /// this is the only test proving registration actually wires it. Without the
-    /// `.with_audit(...)` calls in the SOP block, the audit trail is silently a
-    /// no-op on the agent path (the path the AMQP/sop_execute deployment uses).
     #[tokio::test]
     async fn registered_sop_tools_persist_audit_trail() {
         let tmp = TempDir::new().unwrap();

@@ -1,9 +1,4 @@
 //! Procedural-memory proposal lifecycle for SOP definitions.
-//!
-//! Epic F stages self-improvement as capture/propose/apply rather than letting a
-//! model write SOP files directly. Proposals live in the shared SOP run store,
-//! carry provenance and target hashes, scan before write-back, write rollback
-//! copies, and reload the engine only after a validated apply.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -398,11 +393,6 @@ fn contained_existing_dir(sops_root: &Path, location: &Path) -> Result<PathBuf> 
     Ok(target)
 }
 
-/// Assert that `target` resolves to a path inside `sops_root`. Both paths may
-/// not yet exist on disk (a fresh Create has neither the root nor the leaf), so
-/// each is resolved by canonicalizing its nearest existing ancestor (which
-/// follows symlinks where they actually live - the real escape vector) and
-/// re-appending the remaining lexical components.
 fn ensure_within_root(sops_root: &Path, target: &Path) -> Result<()> {
     let root = resolve_existing_ancestor(sops_root)?;
     let resolved_target = resolve_existing_ancestor(target)?;
