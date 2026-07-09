@@ -1,10 +1,3 @@
-// `apps/zerocode` is a standalone TUI client, not daemon-path code.
-// It speaks JSON-RPC to whatever ZeroClaw daemon is at the configured
-// address; the daemon owns attribution, the TUI owns its session id.
-// Bare `tokio::spawn` is the right primitive here — the workspace-wide
-// `zeroclaw_spawn::spawn!` rule is daemon-path only (see
-// `clippy.toml`'s commentary; this matches the `robot-kit/src/safety.rs`
-// exemption pattern).
 #![allow(clippy::disallowed_methods)]
 
 use std::path::PathBuf;
@@ -199,16 +192,6 @@ enum InsecureTlsChoice {
     Abort,
 }
 
-/// Prompt the operator to accept an insecure-TLS connection to `url`.
-///
-/// Returns the operator's [`InsecureTlsChoice`]:
-/// - [`InsecureTlsChoice::Once`] for `y` / `yes` (connect once, do not persist)
-/// - [`InsecureTlsChoice::Always`] for `a` / `always` (connect and remember this route)
-/// - [`InsecureTlsChoice::Abort`] for everything else (default, empty, `n`, junk)
-///
-/// Reads the operator's answer from `reader` and writes the prompt to
-/// `writer` so tests can inject deterministic input without touching
-/// `stdin` / `stderr`.
 fn confirm_insecure_tls_with<R: std::io::BufRead, W: std::io::Write>(
     mut reader: R,
     writer: &mut W,
@@ -516,29 +499,6 @@ mod connection_tests {
 
 #[cfg(test)]
 mod confirm_insecure_tls_tests {
-    //! Tests for [`crate::confirm_insecure_tls_with`], the test-seam
-    //! extracted from the original `confirm_insecure_tls(url)` so the
-    //! input → choice mapping and prompt content can be asserted
-    //! deterministically without touching `stdin` / `stderr`.
-    //!
-    //! Acceptance criterion coverage for issue #7693:
-    //! 1. "Insecure TLS cannot be accepted without explicit confirmation"
-    //!    — the empty / `n` / junk / uppercase-`N` / default branches all
-    //!    return [`InsecureTlsChoice::Abort`].
-    //! 2. "Decline/abort paths leave no persisted insecure-TLS choice"
-    //!    — the static-source test
-    //!    [`abort_arm_of_confirm_match_must_not_call_persist`] enforces
-    //!    the structural invariant that the `Abort` arm of the production
-    //!    match in `run()` does not invoke `persist_wss_route_ack`.
-    //! 3. "Mode transition tests cover the quickstart/chat handoff" is
-    //!    covered by the existing `connection_tests::flag_connect_*` /
-    //!    `config_uri_*` / `skip_verify_*` tests; this issue does not
-    //!    change `resolve_wss_target`'s contract.
-    //! 4. "prompt persistence behavior needed to test those transitions
-    //!    deterministically" is covered by the existing
-    //!    `route_acked_membership` / `persist_wss_route_ack_dedups` /
-    //!    `persist_wss_route_ack_preserves_other_sections` tests in
-    //!    `crate::config` — this issue does not duplicate that coverage.
 
     use super::InsecureTlsChoice::{Abort, Always, Once};
     use super::*;
@@ -613,11 +573,6 @@ mod confirm_insecure_tls_tests {
 
     #[test]
     fn confirm_prompt_writes_url_and_choice_menu_to_writer() {
-        // The operator must see (a) which URL they are accepting
-        // insecure-TLS for, and (b) the `[y/a/N]` choice menu, before
-        // any answer is read. Capture the prompt text and pin both
-        // invariants so a future refactor cannot silently truncate the
-        // warning or the menu.
         let url = "wss://insecure-host.example:8443";
         let (_, stderr) = run("n\n", url);
         assert!(
@@ -636,21 +591,6 @@ mod confirm_insecure_tls_tests {
         );
     }
 
-    /// Static invariant from issue #7693 acceptance criterion 2:
-    /// "Decline/abort paths leave no persisted insecure-TLS choice."
-    ///
-    /// `confirm_insecure_tls` is called from `run()` in a `match` that
-    /// decides whether to invoke `persist_wss_route_ack`. Persisting on
-    /// the `Abort` branch would silently store an insecure-TLS choice
-    /// the operator explicitly declined — a security-sensitive
-    /// regression that no other test in the suite catches.
-    ///
-    /// Rather than spawn the full CLI / daemon / config-dir stack to
-    /// exercise the abort path end-to-end, this test inspects the
-    /// production source of `main.rs` and asserts the `Abort` arm does
-    /// not contain the persist call. This is a structural guard: any
-    /// future move of `persist_wss_route_ack(...)` into the abort arm
-    /// trips this test loudly.
     #[test]
     fn abort_arm_of_confirm_match_must_not_call_persist() {
         const MAIN_SRC: &str = include_str!("main.rs");
@@ -661,12 +601,6 @@ mod confirm_insecure_tls_tests {
         let match_open_idx = MAIN_SRC
             .find(MATCH_OPEN)
             .unwrap_or_else(|| panic!("main.rs must contain a `{MATCH_OPEN}` block"));
-        // Locate the matching closing brace by scanning for the first
-        // `}\n` after the open that is preceded by another `}` at the
-        // same indentation depth. The match block in `run()` is
-        // followed by code at lower indentation, so we use a simple
-        // brace-pair scan: every `{` increments depth, every `}`
-        // decrements, and depth 0 is the close.
         let after_open = match_open_idx + MATCH_OPEN.len();
         let mut depth: usize = 1;
         let mut idx = after_open;

@@ -1,14 +1,10 @@
 //! AppleScript capability — runs arbitrary AppleScript via osascript, gated by
 //! the macOS Automation TCC permission (per-target-app prompts handled by the
 //! system). This is a *risky* capability and will be wrapped behind a per-app
-//! approval allowlist when the full NodeClient lands (#6321 / #6499).
-//!
-//! For now, callers (the dashboard devtools console during testing) take
-//! responsibility for not running scripts they wouldn't run themselves.
+//! approval allowlist when the full NodeClient lands/
 
 #[cfg(target_os = "macos")]
 use std::process::Command;
-///
 /// Returns the trimmed stdout on success, or the stderr from osascript on
 /// failure (which usually surfaces the per-app TCC prompt rejection).
 #[tauri::command]

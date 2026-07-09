@@ -1,8 +1,5 @@
 //! Screenshot capability — captures the current display(s) using the system
 //! `screencapture` tool, which respects the Screen Recording TCC permission.
-//!
-//! Returns a base64-encoded PNG. The agent (or the dashboard webview during
-//! testing) can render this directly via a `data:image/png;base64,…` URL.
 
 #[cfg(target_os = "macos")]
 use base64::Engine;
@@ -17,7 +14,6 @@ pub struct ScreenshotResult {
 }
 
 /// Capture the screen and return a base64-encoded PNG.
-///
 /// Returns `permission_denied("screen_recording")` when TCC blocks the capture.
 #[tauri::command]
 pub fn take_screenshot() -> Result<ScreenshotResult, String> {

@@ -85,18 +85,6 @@ pub(crate) struct Chat {
     rpc: Arc<RpcClient>,
     rpc_out: Arc<RpcOutbound>,
     notif_rx: broadcast::Receiver<RpcNotification>,
-    /// Receiver for server-initiated JSON-RPC requests that expect a
-    /// response (today: `elicitation/create`). Drained per draw alongside
-    /// `notif_rx` so an ACP-style multiple-choice prompt routed over the
-    /// Code tab's RPC channel is surfaced as an interactive modal — or
-    /// auto-cancelled when it can't be matched to the active session or
-    /// its schema won't parse — without blocking the daemon's tool call
-    /// indefinitely.
-    ///
-    /// See `crates/zeroclaw-runtime/src/rpc/approval_channel.rs` for the
-    /// emitter side and the ACP elicitation RFD
-    /// (https://agentclientprotocol.com/rfds/elicitation).
-    /// for the wire protocol.
     inbound_rx: broadcast::Receiver<crate::client::RpcInboundRequest>,
     /// Background-fetched git status updates: (session_id, branch, hash).
     git_branch_tx: mpsc::Sender<GitStatusUpdate>,
@@ -111,7 +99,7 @@ pub(crate) struct Chat {
     pane_kind: PaneKind,
     /// One-shot session id to reattach to on the next session start, set by
     /// the app layer across a reconnect so the rebuilt pane resumes the
-    /// pre-disconnect session (the daemon retains it, #7182) instead of
+    /// pre-disconnect session (the daemon retains it,instead of
     /// minting a fresh one. Cleared once consumed by `start_session`.
     resume_session_id: Option<String>,
     /// The agent the resumed session belongs to. A multi-agent reconnect must
@@ -131,22 +119,9 @@ pub(crate) struct Chat {
     /// Guards the one-shot `[todotracker]` config fetch so it doesn't
     /// repeat on every session start.
     todo_settings_loaded: bool,
-    /// Inbound `elicitation/create` requests that arrived while the pane was
-    /// not yet `Active` on their target session (e.g. mid resume/reset/switch).
-    /// Rather than auto-cancel a legitimately-owned prompt during that
-    /// transient window — which silently drops the agent's `ask_user` — we
-    /// hold it here and retry installation on subsequent drains until it
-    /// either matches (modal installed) or its grace deadline expires (then
-    /// answered `cancel`, unblocking the daemon's tool call). See
-    /// `drain_inbound_requests` / `try_install_elicitation`.
     deferred_elicitations: Vec<DeferredInboundRequest>,
 }
 
-/// How long an unroutable inbound `elicitation/create` is retried before it is
-/// answered `cancel`. Covers the transient window where the pane is switching
-/// or resuming a session and `phase` is briefly not `Active` on the target
-/// session. Short enough that a genuinely-unroutable request still unblocks the
-/// daemon's tool call promptly.
 const ELICITATION_ROUTE_GRACE: Duration = Duration::from_secs(2);
 
 /// An inbound server-initiated request buffered for a retry pass because it
@@ -186,12 +161,6 @@ struct ModelFetchResult {
     current: Option<String>,
 }
 
-// Whether returning to a chat-style pane (Code/Chat) should re-fetch the agent
-// list. True for the error screen (e.g. a stale "no agents yet" left over from a
-// fresh install) AND for the agent picker, so an agent created elsewhere —
-// Quickstart or manual Config — shows up without a reconnect. `Active` /
-// `PickCwd` are intentionally excluded: a live session or an in-flight
-// directory pick must not be torn down just to refresh a list.
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
     matches!(phase, ChatPhase::Error(_) | ChatPhase::PickAgent { .. })
 }
@@ -299,11 +268,6 @@ impl Chat {
             return Ok(());
         }
 
-        // Preserve the highlighted alias across a re-entry refresh: init() also
-        // runs when the user returns to the pane (see refresh_if_inactive), and
-        // resetting the cursor to the top every tab switch would be jarring.
-        // Falls back to the first row for a brand-new picker or if the prior
-        // selection was removed.
         let prior_alias = match &self.phase {
             ChatPhase::PickAgent {
                 agents: prev,
@@ -362,33 +326,13 @@ impl Chat {
         self.pick_or_start_session(agent_alias).await;
     }
 
-    /// Re-sync the agent list when the user returns to a chat-style pane.
-    ///
-    /// Two cases this covers, both for agents created while the pane sat
-    /// untouched: a stale "no agents" error from a fresh install, and the
-    /// agent picker missing an agent added via Quickstart or manual Config.
-    /// Quickstart's freshly-created agent is handed straight to Chat via
-    /// `focus_agent()`, but the *other* chat-style pane (and the picker in
-    /// general) only learns about new agents through this hook — the
-    /// Dashboard stays current on its own because it polls `agents/status`.
     pub(crate) async fn refresh_if_inactive(&mut self) {
         if should_retry_on_entry(&self.phase) {
             let _ = self.init().await;
         }
     }
 
-    /// Start the session, optionally with a caller-supplied `cwd`.
-    ///
-    /// - Resume (carried session id): never overrides cwd; the daemon keeps the
-    ///   retained session's own working directory.
-    /// - Unix: always passes the local CWD (ignores `cwd_override`).
-    /// - WSS: passes `cwd_override` if provided, otherwise `None`.
     async fn start_session(&mut self, agent_alias: &str, cwd_override: Option<&str>) {
-        // Fetch the [todotracker] config once, lazily, the first time this
-        // pane starts a session — so the tracker honors enabled /
-        // enabled_at_start / location / width / max_height. Best-effort: a
-        // failure keeps the schema defaults. Done here (not in init()) so the
-        // hot refresh path stays a single agents/status round-trip.
         if !self.todo_settings_loaded {
             self.todo_settings_loaded = true;
             if let Ok(fields) = self.rpc.config_list(Some("todotracker")).await {
@@ -572,38 +516,10 @@ impl Chat {
         }
     }
 
-    /// Drain server-initiated JSON-RPC requests (today: only
-    /// `elicitation/create`) and dispatch them so the daemon's tool call
-    /// doesn't stall.
-    ///
-    /// An `elicitation/create` targeting the active session with a schema we
-    /// understand is installed as an interactive picker modal (via
-    /// `route_inbound_elicitation` → `try_install_elicitation`); the user's
-    /// selection is sent back as the JSON-RPC response. A request whose schema
-    /// won't parse is answered `{"action": "cancel"}` immediately. A request
-    /// that parses but does not target the active session — the pane may be
-    /// mid resume/reset/switch — is *deferred* and retried for a short grace
-    /// window before it is cancelled, so a legitimately-owned prompt is never
-    /// dropped during a transition. `cancel` collapses to `Ok(None)` in the
-    /// daemon's `RpcApprovalChannel::request_choice`, letting the calling tool
-    /// fall back to its non-channel path. See the ACP elicitation RFD
-    /// (https://agentclientprotocol.com/rfds/elicitation).
-    ///
-    /// Unknown server methods get a `METHOD_NOT_FOUND` response so a
-    /// future daemon-side feature doesn't silently park a request id.
     fn drain_inbound_requests(&mut self) {
         loop {
             let req = match self.inbound_rx.try_recv() {
                 Ok(req) => req,
-                // A `Lagged` receiver has irrecoverably lost frames from the
-                // broadcast buffer. For response-bearing requests (today:
-                // `elicitation/create`) a lost frame means the daemon parks
-                // its tool call until `session_timeout_secs` (default 3600s) —
-                // the user sees `ask_user` hang. We cannot recover the dropped
-                // ids here, but we MUST NOT swallow it silently: surface a
-                // system message so the hang is diagnosable, then keep draining
-                // the frames still buffered. The capacity bump on the sender
-                // side (`INBOUND_REQUEST_CHANNEL_CAPACITY`) makes this rare.
                 Err(broadcast::error::TryRecvError::Lagged(_)) => {
                     if let ChatPhase::Active(ref mut state) = self.phase {
                         state
@@ -701,19 +617,6 @@ impl Chat {
         });
     }
 
-    /// Try to install an inbound elicitation as a modal on the active session.
-    ///
-    /// Returns [`ElicitationRouting`]:
-    /// - `Installed` — the request targets the active session and parsed; a
-    ///   modal was installed and owns the request id.
-    /// - `Unparseable(id)` — the schema could not be decoded; the caller must
-    ///   answer `cancel` (retrying would never succeed).
-    /// - `Defer(req)` — the request parsed but does not (yet) target the
-    ///   active session; the caller should retry it briefly rather than
-    ///   cancelling a possibly-owned prompt during a session transition.
-    ///
-    /// Wire shape per the ACP elicitation RFD
-    /// (https://agentclientprotocol.com/rfds/elicitation).
     fn try_install_elicitation(
         &mut self,
         req: crate::client::RpcInboundRequest,
@@ -1111,12 +1014,6 @@ impl Chat {
             }
         }
 
-        // ── Elicitation modal key handling ───────────────────────
-        // Highest-priority Active-phase overlay after the model picker:
-        // an outstanding agent question must be answered before normal
-        // chat keys resume. Navigation mutates the modal in place;
-        // confirm/cancel answer the daemon's JSON-RPC request id and
-        // clear the modal.
         if state.pending_elicitation.is_some() {
             use crate::keymap::ModalAction;
             let action = ModalAction::from_chord(&key);
@@ -1352,21 +1249,9 @@ impl Chat {
             };
             if !is_browse_key {
                 state.exit_browse_mode();
-                // Fall through — input bar handling below will pick up
-                // any remaining non-navigation key now that browse mode
-                // is off.  Note: Ctrl+C (Quit) is intercepted by app.rs
-                // before reaching this handler, so we don't need to
-                // special-case it here.
             }
         }
 
-        // ── Delegate to input bar first ─────────────────────────
-        // The input bar handles: file explorer, Ctrl+A, Ctrl+V,
-        // Enter in browse mode → exit back to input, then let Enter submit.
-        //
-        // NOTE: Ctrl+K (BrowseEnter) must be intercepted here, before the
-        // input bar, because the textarea consumes Ctrl+K as "kill to end of
-        // line" and never passes it through to the action dispatch.
         if state.pending_approval().is_none() && !state.turn_in_flight {
             use crate::keymap::ChatTabAction;
             if let Some(ChatTabAction::BrowseEnter) = ChatTabAction::from_chord(&key) {
@@ -1396,11 +1281,6 @@ impl Chat {
                     state.clear_info_notice();
                     let prompt = text.unwrap_or_default();
                     let enq = state.inject_message(prompt, attachments);
-                    // An inject is an explicit "send now": if a turn is live,
-                    // interrupt it so the injected message dispatches as soon
-                    // as the turn settles. Without this the inject only jumps
-                    // the queue and still waits for the live turn to finish on
-                    // its own — the opposite of immediate.
                     if enq.is_ok()
                         && state.turn_in_flight
                         && !matches!(state.turn_status, TurnStatus::Cancelling)
@@ -2369,13 +2249,6 @@ impl Chat {
         }
     }
 
-    /// Returns true when the pane is accepting text input (blocks `?` help).
-    ///
-    /// In active chat: text input mode is on when the user has started typing
-    /// (non-empty input buffer) and is not in selection mode or an overlay.
-    /// When input is empty we're in "command" mode — single-char keybindings
-    /// like `t`, `j`, `k`, `y`, `?` should work.
-    /// Return the current context token counts for the status bar.
     pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>) {
         match &self.phase {
             ChatPhase::Active(s) => (s.context_input_tokens, s.context_max_tokens),
@@ -2448,13 +2321,6 @@ impl Chat {
                 if s.model_picker.is_open() {
                     return true;
                 }
-                // An elicitation modal is modal too: claim text-input (like
-                // the model picker) so global chords — `?` help, `Ctrl+R`
-                // reload — are suppressed by `app.rs` and the pane's own modal
-                // handler owns every key while the daemon waits on the
-                // `elicitation/create` response. Returning `false` here would
-                // let those globals fire *over* an in-flight prompt, breaking
-                // modality.
                 if s.pending_elicitation().is_some() {
                     return true;
                 }
@@ -2804,13 +2670,6 @@ fn draw_error(frame: &mut Frame, area: Rect, msg: &str, tab_title: &str) {
 
 // ── Active chat rendering ────────────────────────────────────────
 
-/// Split `area` into (body, optional tracker area) based on the
-/// tracker's location and visibility. Side panels (`Left`/`Right`) take
-/// the configured column width clamped to at most half the pane width;
-/// the bottom strip grows with the plan up to the configured max height,
-/// clamped to at most half the pane height. Returns `None` for the
-/// tracker area when it wants no space — the body then gets the whole
-/// area (existing layout untouched).
 fn carve_todo_area(tracker: &crate::todo_tracker::TodoTracker, area: Rect) -> (Rect, Option<Rect>) {
     if !tracker.wants_space() {
         return (area, None);
@@ -3697,14 +3556,6 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
     f.render_widget(p, overlay_area);
 }
 
-/// Render the elicitation modal: the agent's question plus a selectable
-/// list of choices. Single-select shows a `>` cursor; multi-select adds
-/// `[x]`/`[ ]` checkboxes and a live count against the min/max bounds.
-///
-/// Height is derived from the choice count, clamped to the available
-/// area so a long list scrolls rather than overflowing. Mirrors the
-/// bottom-anchored, horizontally-inset geometry of
-/// [`render_approval_overlay`].
 fn render_elicitation_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
     let e = match state.pending_elicitation() {
         Some(e) => e,
@@ -3882,20 +3733,6 @@ fn render_session_list_overlay(
     f.render_stateful_widget(list, inner, &mut ls);
 }
 
-/// Render a single-row context usage bar showing token consumption.
-///
-/// Shows: `ctx: 12,345 / 200,000  [████████░░░░░░░░░░░░]  6%`
-/// When max is unknown, shows: `ctx: 12,345 tokens`
-/// Render a markdown blob into terminal lines.
-///
-/// `width` is the available rendering width in cells (the chat-area inner
-/// width). It only matters for tables, which compute their column budgets
-/// from it; non-table content ignores it.
-/// Emit the body lines of a code fence into `lines`, two-space indented to
-/// match the no-gutter body convention the copy-region recovery relies on.
-/// When `lang` resolves to a known language the body is syntax-highlighted via
-/// the theme palette; otherwise every line falls back to the flat code-block
-/// style.
 fn emit_code_block_body(lines: &mut Vec<Line<'static>>, text: &str, lang: Option<&str>) {
     let body = text.strip_suffix('\n').unwrap_or(text);
     if body.is_empty() {
@@ -4252,13 +4089,6 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-/// Render a parsed table to box-drawing terminal lines.
-///
-/// `width` is the total available render width. Per-column width is
-/// proportional to the longest cell in that column, capped so the table
-/// fits in `width`. Cells that exceed their column cap are truncated with
-/// `…`. A column whose budget would force a truncation under 2 cells
-/// collapses to a single `…`.
 fn render_table(
     rows: Vec<Vec<String>>,
     alignments: Vec<pulldown_cmark::Alignment>,
@@ -4403,20 +4233,6 @@ pub struct PendingApproval {
     pub timeout_secs: u64,
 }
 
-/// A pending ACP `elicitation/create` prompt awaiting a user choice.
-///
-/// Unlike [`PendingApproval`] (fixed allow/reject buttons), an
-/// elicitation is a selectable list of choices — single- or
-/// multi-select — that the agent authored. The modal owns the cursor
-/// and (for multi-select) the per-row checkbox state; on confirm we
-/// translate the selection back into the index-based `choice-N` wire
-/// constants the daemon expects and answer the original JSON-RPC
-/// request id.
-///
-/// `request_id` is a `serde_json::Value` (not `String`) because
-/// JSON-RPC permits numeric ids and we must echo the exact id shape
-/// the daemon sent. See the ACP elicitation RFD
-/// (https://agentclientprotocol.com/rfds/elicitation).
 #[derive(Debug, Clone)]
 pub struct PendingElicitation {
     /// JSON-RPC request id to respond to. Echoed verbatim.
@@ -4483,14 +4299,6 @@ impl PendingElicitation {
     }
 }
 
-/// One row in the chat / code-tab transcript. Heavy payloads
-/// (agent messages, tool inputs, tool outputs) are refcounted via
-/// `Arc<str>` so cloning is O(1) — the renderer and the
-/// `cached_lines` line cache both hold cheap refs into the same
-/// bytes instead of duplicating the string per render. Long
-/// sessions stay flat on memory because every per-entry payload
-/// has exactly one heap allocation regardless of how many places
-/// borrow it.
 #[derive(Debug, Clone)]
 pub enum ChatEntry {
     AgentMessage(Arc<str>),
@@ -4644,11 +4452,6 @@ pub struct ChatState {
     streaming_text: String,
     streaming_thought: String,
     pending_approval: Option<PendingApproval>,
-    /// A pending ACP elicitation prompt (single- or multi-select). Like
-    /// `pending_approval`, this is a modal overlay that captures keys
-    /// until the user confirms or cancels. Mutually exclusive with
-    /// `pending_approval` in practice — the daemon never has both an
-    /// approval and an elicitation outstanding for the same session.
     pending_elicitation: Option<PendingElicitation>,
     pub turn_in_flight: bool,
     /// Fine-grained label for the input-bar title while a turn is active.
@@ -5007,11 +4810,6 @@ impl ChatState {
         out
     }
 
-    /// Rebuild (or incrementally extend) the cached rendered lines from committed entries.
-    ///
-    /// `width` is the chat-area inner width in cells. A change in width
-    /// invalidates the table layouts inside the cached lines, so a width
-    /// change forces a full rebuild.
     fn rebuild_lines(&mut self, width: u16) {
         if self.cached_render_width != width {
             self.dirty = LinesDirty::Full;
@@ -5089,13 +4887,6 @@ impl ChatState {
         self.rebuild_screen_ranges(width);
     }
 
-    /// Collect only the cached lines whose wrapped screen rows intersect the
-    /// viewport `[scroll, scroll + height)`, plus the residual scroll within
-    /// the first partially-visible entry. Lets `render_conversation` build a
-    /// `Paragraph` sized to the viewport instead of cloning the whole history
-    /// every frame, so scroll and keystroke latency stay flat as a session
-    /// grows. Returns `(lines, local_scroll)`; an empty slice yields the full
-    /// `scroll` so the caller's clamping is unchanged.
     fn visible_line_slice(&self, scroll: u16, height: u16) -> (Vec<Line<'static>>, u16) {
         if self.cached_screen_ranges.is_empty() || self.cached_line_ranges.is_empty() {
             return (self.cached_lines.clone(), scroll);
@@ -5479,11 +5270,6 @@ impl ChatState {
                         break;
                     }
                 }
-                // Tool finished; we're back in the model's hands. Don't clobber
-                // a more specific status if one has already arrived (chunks can
-                // race the result), so only step down from the matching
-                // CallingTool state. Also guard against post-commit stale
-                // notifications flipping us out of Idle.
                 if self.turn_in_flight && matches!(self.turn_status, TurnStatus::CallingTool(_)) {
                     self.turn_status = TurnStatus::Working;
                 }
@@ -5510,11 +5296,6 @@ impl ChatState {
                 max_context_tokens,
                 ..
             } => {
-                // Replace-on-arrival: ContextUsage reports the *current* prompt
-                // size for the upcoming/just-sent turn. It is an absolute
-                // measurement of how full the model's context window is, not
-                // an increment. Accumulating across turns produced a runaway
-                // counter that quickly exceeded the window.
                 if input_tokens.is_some() {
                     self.context_input_tokens = input_tokens;
                 }
@@ -5524,25 +5305,17 @@ impl ChatState {
             }
             SessionUpdate::TurnComplete {
                 outcome, content, ..
-            } => {
-                // Single source of truth for turn end. RPC errors on
-                // session/prompt cannot reach this — only the daemon can.
-                // For a cancel or failure the daemon composes the attributed
-                // reason in `content` (who cancelled, and why); render it as a
-                // system line. For a clean finish, `content` is the final text
-                // and commit_turn handles it.
-                match outcome {
-                    TurnEndOutcome::Completed => {
-                        self.commit_turn(content, true);
-                    }
-                    TurnEndOutcome::Cancelled | TurnEndOutcome::Failed => {
-                        self.entries
-                            .push(ChatEntry::SystemMessage(Arc::<str>::from(content.as_str())));
-                        self.mark_dirty_append();
-                        self.commit_turn(String::new(), false);
-                    }
+            } => match outcome {
+                TurnEndOutcome::Completed => {
+                    self.commit_turn(content, true);
                 }
-            }
+                TurnEndOutcome::Cancelled | TurnEndOutcome::Failed => {
+                    self.entries
+                        .push(ChatEntry::SystemMessage(Arc::<str>::from(content.as_str())));
+                    self.mark_dirty_append();
+                    self.commit_turn(String::new(), false);
+                }
+            },
             // Whole-list replace: hand the authoritative plan to the
             // tracker, which runs the auto-pop rule. Session routing is
             // already enforced by the session_id check above.
@@ -5914,11 +5687,6 @@ impl ChatState {
         self.queue_sel = None;
     }
 
-    /// Replay persisted message history into the transcript on a session resume.
-    /// Mirrors the daemon-retained store into UI entries and seeds the pinned
-    /// first-message recovery row, so a reconnect/reattach shows the prior
-    /// conversation instead of an empty pane. Idempotent on entries: callers
-    /// invoke it on a freshly reset session state.
     fn load_history(&mut self, messages: Vec<crate::client::MessageEntry>) {
         for m in messages {
             match m.role() {
@@ -6357,13 +6125,6 @@ mod tests {
 
     #[tokio::test]
     async fn pending_elicitation_makes_chat_claim_text_input() {
-        // Regression: while an `elicitation/create` prompt is pending the
-        // pane MUST be modal — it has to claim
-        // text-input so `app.rs` suppresses global chords (`?` help,
-        // `Ctrl+R` reload) and routes every key to the modal handler. If
-        // this returns `false`, those globals fire over an in-flight
-        // prompt while the daemon waits on the JSON-RPC response, breaking
-        // modality. Mirrors `open_picker_makes_chat_claim_text_input`.
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
@@ -7057,9 +6818,6 @@ mod tests {
 
     // ── Interleaving regression tests ────────────────────────────
 
-    /// Core interleaving scenario:
-    /// text chunk → tool call → tool result → text chunk → commit
-    /// Expected committed order: AgentMessage | Tool | AgentMessage
     #[test]
     fn text_before_tool_call_is_flushed_as_separate_agent_message() {
         let mut s = state();
@@ -7101,8 +6859,6 @@ mod tests {
         );
     }
 
-    /// After a tool call, post-tool text chunks accumulate in streaming_text
-    /// as normal and are committed by commit_turn.
     #[test]
     fn text_after_tool_call_commits_separately() {
         let mut s = state();
@@ -7162,7 +6918,6 @@ mod tests {
         );
     }
 
-    /// If there is NO pre-tool text, no spurious empty AgentMessage is inserted.
     #[test]
     fn no_spurious_agent_message_when_no_pre_tool_text() {
         let mut s = state();
@@ -7181,8 +6936,6 @@ mod tests {
         assert!(matches!(&s.entries()[0], ChatEntry::Tool { .. }));
     }
 
-    /// commit_turn must not push a duplicate AgentMessage for text already
-    /// flushed as a pre-tool entry.
     #[test]
     fn commit_turn_does_not_duplicate_already_flushed_text() {
         let mut s = state();
@@ -8268,8 +8021,6 @@ mod tests {
         (Chat::new(client, PaneKind::Chat), rx)
     }
 
-    /// An elicitation whose session matches the active pane installs a modal
-    /// immediately and sends no response (the user answers it later).
     #[tokio::test]
     async fn elicitation_matching_active_session_installs_modal() {
         let (mut chat, mut rx) = test_chat();
@@ -8293,8 +8044,6 @@ mod tests {
         );
     }
 
-    /// An elicitation for a *different* session must NOT be auto-cancelled on
-    /// arrival — the pane may be mid-transition. It is deferred for retry.
     #[tokio::test]
     async fn elicitation_for_other_session_is_deferred_not_cancelled() {
         let (mut chat, mut rx) = test_chat();
@@ -8315,7 +8064,6 @@ mod tests {
         );
     }
 
-    /// A deferred elicitation installs as soon as its session becomes active.
     #[tokio::test]
     async fn deferred_elicitation_installs_once_session_becomes_active() {
         let (mut chat, _rx) = test_chat();
@@ -8337,8 +8085,6 @@ mod tests {
         }
     }
 
-    /// A deferred elicitation whose grace window elapses without becoming
-    /// installable is answered `cancel` so the daemon's tool call unblocks.
     #[tokio::test]
     async fn expired_deferred_elicitation_is_cancelled() {
         let (mut chat, mut rx) = test_chat();
@@ -8367,8 +8113,6 @@ mod tests {
         assert_eq!(frame["result"]["action"], "cancel");
     }
 
-    /// An unparseable elicitation (unknown schema) is cancelled immediately —
-    /// deferring it would never succeed.
     #[tokio::test]
     async fn unparseable_elicitation_is_cancelled_immediately() {
         let (mut chat, mut rx) = test_chat();
