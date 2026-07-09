@@ -248,6 +248,20 @@ zc-dashboard-section-by-agent = By Agent
 zc-dashboard-section-command = Command
 zc-dashboard-section-prompt = Prompt
 zc-dashboard-section-last-output = Last Output
+zc-dashboard-section-manual-run = Manual Run
+zc-dashboard-section-recent-runs = Recent Runs
+zc-dashboard-actions = Actions
+zc-dashboard-cron-action-hint = { $run } run now · { $refresh } refresh
+zc-dashboard-loading-runs = Loading runs…
+zc-dashboard-runs-error = Failed to load runs
+zc-dashboard-no-runs = No runs recorded yet
+zc-dashboard-run-succeeded = Run succeeded
+zc-dashboard-run-failed = Run failed
+zc-dashboard-run-running = Run started: { $id }
+zc-dashboard-run-already-running = Run already in progress: { $id }
+zc-dashboard-run-pending-status = running
+zc-dashboard-run-pending-window = starting now
+zc-dashboard-run-pending-output = Manual trigger in progress…
 
 
 zc-dashboard-yes = yes

@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
-/// Token usage information from a single API call.
+
+/// Provider-reported token usage and the USD price derived for one API call.
+///
+/// This is the atomic usage fact embedded in a [`CostRecord`]. Feature-level
+/// budget code must aggregate these rows from the ledger instead of caching
+/// consumed counters elsewhere. `pricing_available` records whether `cost_usd`
+/// is trustworthy for budget enforcement, so unknown pricing does not silently
+/// become a free call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsage {
     /// Model identifier (e.g., "anthropic/claude-sonnet-4-20250514")
@@ -18,12 +25,29 @@ pub struct TokenUsage {
     pub total_tokens: u64,
     /// Calculated cost in USD
     pub cost_usd: f64,
+    /// Whether `cost_usd` was computed from an explicit provider/rate-sheet
+    /// price or known catalog entry.
+    ///
+    /// This is a ledger fact, not a budget counter. Goal mode uses it to
+    /// distinguish truly consumed $0 from "we counted tokens but do not know
+    /// the price", which must pause cost-limited goals instead of treating the
+    /// call as free.
+    #[serde(default = "default_true", skip_serializing_if = "is_true_bool")]
+    pub pricing_available: bool,
     /// Timestamp of the request
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true_bool(v: &bool) -> bool {
+    *v
 }
 
 impl TokenUsage {
@@ -104,6 +128,7 @@ impl TokenUsage {
             cached_input_tokens,
             total_tokens,
             cost_usd,
+            pricing_available: true,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -114,15 +139,28 @@ impl TokenUsage {
     }
 }
 
-/// Time period for cost aggregation.
+/// Time period for cost aggregation and budget checks.
+///
+/// These periods describe the ledger aggregation window, not goal lifecycle
+/// state. Goal budgets use task attribution directly and do not add a new
+/// period variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UsagePeriod {
+    /// Current tracker session for this daemon lifetime.
     Session,
+    /// Current UTC/local-day aggregate used by daily budget checks.
     Day,
+    /// Current calendar-month aggregate used by monthly budget checks.
     Month,
 }
 
-/// A single cost record for persistent storage.
+/// A single persisted usage/cost ledger row.
+///
+/// This is the canonical source for consumed tokens and dollars. Goal budgets
+/// store only effective limits; status views derive consumed and remaining
+/// values by aggregating these records by task attribution. Pricing reliability
+/// lives on `usage` so cost-limited features can tell known zero-cost usage from
+/// unknown-cost usage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostRecord {
     /// Unique identifier
@@ -136,6 +174,19 @@ pub struct CostRecord {
     /// attribution, or when `[cost].track_per_agent = false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_alias: Option<String>,
+    /// Persisted task-attribution key.
+    ///
+    /// The Rust field is task-generic because any supervised task can use this
+    /// ledger dimension. The serialized key remains `goal_task_id` for JSONL
+    /// compatibility with early goal-mode rows; this is still one ledger fact,
+    /// not a duplicate lifecycle copy.
+    #[serde(
+        default,
+        rename = "goal_task_id",
+        alias = "task_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub task_id: Option<String>,
 }
 
 impl CostRecord {
@@ -146,6 +197,7 @@ impl CostRecord {
             usage,
             session_id: session_id.into(),
             agent_alias: None,
+            task_id: None,
         }
     }
 
@@ -160,25 +212,54 @@ impl CostRecord {
             usage,
             session_id: session_id.into(),
             agent_alias,
+            task_id: None,
+        }
+    }
+
+    /// Create a new cost record attributed to an agent and/or durable task.
+    pub fn with_attribution(
+        session_id: impl Into<String>,
+        agent_alias: Option<String>,
+        task_id: Option<String>,
+        usage: TokenUsage,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            usage,
+            session_id: session_id.into(),
+            agent_alias,
+            task_id,
         }
     }
 }
 
-/// Budget enforcement result.
+/// Result of checking projected cost against configured global limits.
+///
+/// This is a global cost-policy decision. Feature-level budgets, including
+/// goal budgets, may use the same ledger rows but should not overload this
+/// enum with task-specific state.
 #[derive(Debug, Clone)]
 pub enum BudgetCheck {
-    /// Within budget, request can proceed
+    /// Within budget; request can proceed.
     Allowed,
-    /// Warning threshold exceeded but request can proceed
+    /// Warning threshold exceeded, but request can proceed.
     Warning {
+        /// Current spend in the affected aggregation period before the
+        /// estimated request cost is committed.
         current_usd: f64,
+        /// Configured limit for the affected aggregation period.
         limit_usd: f64,
+        /// Aggregation period that crossed the warning threshold.
         period: UsagePeriod,
     },
-    /// Budget exceeded, request blocked
+    /// Budget exceeded; request should be blocked before provider dispatch.
     Exceeded {
+        /// Current spend in the affected aggregation period before the
+        /// estimated request cost is committed.
         current_usd: f64,
+        /// Configured limit for the affected aggregation period.
         limit_usd: f64,
+        /// Aggregation period whose limit would be exceeded.
         period: UsagePeriod,
     },
 }
@@ -333,7 +414,50 @@ mod tests {
         let record = CostRecord::new("session-123", usage);
 
         assert_eq!(record.session_id, "session-123");
+        assert!(record.task_id.is_none());
         assert!(!record.id.is_empty());
         assert_eq!(record.usage.model, "test/model");
+    }
+
+    #[test]
+    fn cost_record_task_attribution_roundtrips_existing_field() {
+        let usage = TokenUsage::new("test/model", 100, 50, 0, 1.0, 2.0, 0.0);
+        let record = CostRecord::with_attribution(
+            "session-123",
+            Some("agent-a".into()),
+            Some("goal-123".into()),
+            usage,
+        );
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(
+            json.contains("goal_task_id"),
+            "serialized key stays compatible with existing JSONL"
+        );
+        let parsed: CostRecord = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.agent_alias.as_deref(), Some("agent-a"));
+        assert_eq!(parsed.task_id.as_deref(), Some("goal-123"));
+    }
+
+    #[test]
+    fn cost_record_task_attribution_accepts_generic_alias() {
+        let json = r#"{
+            "id": "rec-1",
+            "usage": {
+                "model": "test/model",
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "total_tokens": 15,
+                "cost_usd": 0.001,
+                "timestamp": "2026-06-30T00:00:00Z"
+            },
+            "session_id": "session-123",
+            "agent_alias": "agent-a",
+            "task_id": "task-123"
+        }"#;
+        let parsed: CostRecord = serde_json::from_str(json).unwrap();
+
+        assert_eq!(parsed.task_id.as_deref(), Some("task-123"));
+        assert!(parsed.usage.pricing_available);
     }
 }
