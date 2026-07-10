@@ -251,10 +251,19 @@ impl Doctor {
         } else if let Some(entry) = self.selected_entry() {
             detail_lines(entry)
         } else {
-            vec![Line::from(Span::styled(
+            let mut out = Vec::new();
+            if let Some(log_path) = self.result.as_ref().and_then(|r| r.log_path.as_deref()) {
+                out.push(Line::from(Span::styled(
+                    crate::i18n::t_args("zc-doctor-log-path", &[("path", log_path)]),
+                    theme::body_style(),
+                )));
+                out.push(Line::from(""));
+            }
+            out.push(Line::from(Span::styled(
                 crate::i18n::t("zc-doctor-no-selection"),
                 theme::dim_style(),
-            ))]
+            )));
+            out
         };
 
         let para = Paragraph::new(lines)
@@ -551,6 +560,7 @@ mod tests {
                 warnings: 1,
                 errors: 1,
             },
+            log_path: None,
         }
     }
 
@@ -665,5 +675,28 @@ mod tests {
         doctor.handle_mouse(click, Rect::new(0, 0, 80, 20));
 
         assert_eq!(doctor.filter, DoctorFilter::Errors);
+    }
+
+    #[tokio::test]
+    async fn doctor_detail_panel_includes_log_path_when_no_entry_selected() {
+        let mut doctor = Doctor::new(test_client());
+        let mut result = sample_result();
+        result.log_path = Some("/home/user/.local/share/zeroclaw/logs/trace.jsonl".into());
+        doctor.result = Some(result);
+
+        // No entry is selected → draw_detail renders log_path before
+        // "No diagnostic selected".
+        assert!(
+            doctor.selected_entry().is_none(),
+            "no diagnostic entry should be selected after initial result load"
+        );
+        assert!(
+            doctor
+                .result
+                .as_ref()
+                .and_then(|r| r.log_path.as_deref())
+                .is_some(),
+            "log_path must be accessible to draw_detail when no entry selected"
+        );
     }
 }

@@ -134,6 +134,9 @@ rpc_type! {
     pub struct DoctorRunResult {
         pub results: Vec<DiagResult>,
         pub summary: DoctorSummary,
+        /// Resolved active log persistence path, if available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub log_path: Option<String>,
     }
 }
 

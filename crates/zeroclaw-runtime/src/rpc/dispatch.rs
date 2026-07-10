@@ -828,7 +828,18 @@ impl RpcDispatcher {
         let config = self.ctx.config.read().clone();
         let results = crate::doctor::run_structured(&config).await;
         let summary = doctor_summary(&results);
-        to_result(DoctorRunResult { results, summary })
+        let log_path = if config.observability.log_persistence
+            != zeroclaw_config::schema::LogPersistence::None
+        {
+            zeroclaw_log::current_log_path().map(|p| p.to_string_lossy().to_string())
+        } else {
+            None
+        };
+        to_result(DoctorRunResult {
+            results,
+            summary,
+            log_path,
+        })
     }
 
     // ── TUI handlers ─────────────────────────────────────────────
@@ -5254,6 +5265,27 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(Arc::new(ctx), tx, "test-peer".into());
         (dispatcher, sessions)
+    }
+
+    #[tokio::test]
+    async fn doctor_run_omits_log_path_when_persistence_is_disabled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        // Set persistence to None — writer state may still resolve a path,
+        // but the RPC must not advertise it as active.
+        config.observability.log_persistence = zeroclaw_config::schema::LogPersistence::None;
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        let result = dispatcher
+            .handle_doctor_run()
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+        assert!(
+            obj.get("log_path").map(|v| v.is_null()).unwrap_or(true),
+            "log_path must be null when persistence is disabled; got: {:?}",
+            obj.get("log_path")
+        );
     }
 
     #[tokio::test]
