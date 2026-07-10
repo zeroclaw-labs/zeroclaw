@@ -18,7 +18,6 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::attachment::PendingAttachment;
 use crate::clipboard;
@@ -171,11 +170,13 @@ struct VisualLine {
 }
 
 fn char_cell_width(ch: char) -> u16 {
-    ch.width().and_then(|w| u16::try_from(w).ok()).unwrap_or(0)
+    u16::try_from(crate::display_width::char_display_width(ch)).unwrap_or(0)
 }
 
 fn str_cell_width(text: &str) -> u16 {
-    UnicodeWidthStr::width(text).try_into().unwrap_or(u16::MAX)
+    crate::display_width::display_width(text)
+        .try_into()
+        .unwrap_or(u16::MAX)
 }
 
 fn push_hard_wrapped(
@@ -2339,6 +2340,17 @@ mod tests {
     fn cursor_to_visual_uses_terminal_cell_width() {
         let text = "abcd界";
         assert_eq!(cursor_to_visual(text, text.len(), 5), (1, 2));
+    }
+
+    #[test]
+    fn cursor_to_visual_emoji_presentation_is_two_cells() {
+        // 🏔️ is U+1F3D4 + U+FE0F. Terminals draw it as 2 cells; under-counting
+        // leaves the cursor (and any following space) one cell short.
+        let emoji = "\u{1F3D4}\u{FE0F}";
+        let text = format!("{emoji}x");
+        assert_eq!(cursor_to_visual(&text, text.len(), 10), (0, 3));
+        assert_eq!(str_cell_width(emoji), 2);
+        assert_eq!(str_cell_width(&format!("{emoji} ")), 3);
     }
 
     #[test]
