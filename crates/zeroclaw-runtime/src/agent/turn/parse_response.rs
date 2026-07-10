@@ -91,9 +91,25 @@ pub(crate) fn unforwarded_narration<'a>(
     display_text: &'a str,
     streamed_visible_text: &str,
 ) -> &'a str {
+    if let Some(remainder) = display_text.strip_prefix(streamed_visible_text) {
+        return remainder;
+    }
+
+    let trailing_trimmed_streamed_visible_text = streamed_visible_text.trim_end();
+    if !trailing_trimmed_streamed_visible_text.is_empty()
+        && let Some(remainder) = display_text.strip_prefix(trailing_trimmed_streamed_visible_text)
+    {
+        return remainder;
+    }
+
+    let leading_trimmed_streamed_visible_text = streamed_visible_text.trim_start();
+    if !leading_trimmed_streamed_visible_text.is_empty()
+        && let Some(remainder) = display_text.strip_prefix(leading_trimmed_streamed_visible_text)
+    {
+        return remainder;
+    }
+
     display_text
-        .strip_prefix(streamed_visible_text)
-        .unwrap_or(display_text)
 }
 
 /// The interpreted Ok-arm of one provider call.
@@ -319,6 +335,22 @@ mod tests {
         assert_eq!(
             unforwarded_narration("fully streamed", "fully streamed"),
             ""
+        );
+    }
+
+    #[test]
+    fn returns_empty_when_streamed_text_only_has_trailing_whitespace() {
+        assert_eq!(
+            unforwarded_narration("About to check the count.", "About to check the count.\n\n"),
+            ""
+        );
+    }
+
+    #[test]
+    fn returns_suffix_when_streamed_text_only_has_leading_whitespace() {
+        assert_eq!(
+            unforwarded_narration("About to check the count.", "\nAbout to "),
+            "check the count."
         );
     }
 
