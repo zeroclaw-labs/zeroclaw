@@ -128,6 +128,9 @@ pub(crate) struct Chat {
     /// Guards the one-shot `[todotracker]` config fetch so it doesn't
     /// repeat on every session start.
     todo_settings_loaded: bool,
+    /// One-shot app-level Help request, set by the `/help` slash command and
+    /// drained immediately by `app.rs` after this pane handles the key.
+    help_requested: bool,
     deferred_elicitations: Vec<DeferredInboundRequest>,
 }
 
@@ -201,6 +204,7 @@ impl Chat {
             session_list_double_click: crate::mouse::DoubleClickTracker::new(),
             todo_settings: crate::todo_tracker::TodoTrackerSettings::default(),
             todo_settings_loaded: false,
+            help_requested: false,
             deferred_elicitations: Vec::new(),
         }
     }
@@ -1421,6 +1425,16 @@ impl Chat {
                     state.mark_dirty_append();
                     return false;
                 }
+                InputBarAction::EnterBrowseMode => {
+                    if !state.in_browse_mode() {
+                        state.enter_browse_mode();
+                    }
+                    return false;
+                }
+                InputBarAction::OpenHelp => {
+                    self.help_requested = true;
+                    return false;
+                }
                 InputBarAction::ClearQueue(idx) => {
                     let notice = state.clear_queue_cmd(idx);
                     state.set_info_notice(notice);
@@ -2516,6 +2530,10 @@ impl Chat {
             }
             _ => false,
         }
+    }
+
+    pub(crate) fn take_help_request(&mut self) -> bool {
+        std::mem::take(&mut self.help_requested)
     }
 
     pub(crate) fn wants_text_input(&self) -> bool {

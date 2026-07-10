@@ -663,6 +663,15 @@ pub async fn run(
                 if quit {
                     break;
                 }
+                match mode {
+                    Mode::Acp if acp_pane.take_help_request() => {
+                        show_help = true;
+                    }
+                    Mode::Chat if chat_pane.take_help_request() => {
+                        show_help = true;
+                    }
+                    _ => {}
+                }
                 if mode == Mode::Quickstart && quickstart.take_leave_request() {
                     switch_mode(
                         &mut mode,
