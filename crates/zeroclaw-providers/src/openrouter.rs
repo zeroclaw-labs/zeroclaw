@@ -260,13 +260,19 @@ impl OpenRouterModelProvider {
                 {
                     let tool_calls = parsed_calls
                         .into_iter()
-                        .map(|tc| NativeToolCall {
-                            id: Some(tc.id),
-                            kind: Some("function".to_string()),
-                            function: NativeFunctionCall {
-                                name: tc.name,
-                                arguments: tc.arguments,
-                            },
+                        .map(|tc| {
+                            let name = tc.name;
+                            NativeToolCall {
+                                id: Some(tc.id),
+                                kind: Some("function".to_string()),
+                                function: NativeFunctionCall {
+                                    arguments: crate::compatible::sanitize_tool_arguments(
+                                        &name,
+                                        &tc.arguments,
+                                    ),
+                                    name,
+                                },
+                            }
                         })
                         .collect::<Vec<_>>();
                     let content = crate::request_payload::non_empty_string_field(&value, "content")

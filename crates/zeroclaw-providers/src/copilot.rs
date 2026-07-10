@@ -323,13 +323,19 @@ impl CopilotModelProvider {
                 {
                     let tool_calls = parsed_calls
                         .into_iter()
-                        .map(|tool_call| NativeToolCall {
-                            id: Some(tool_call.id),
-                            kind: Some("function".to_string()),
-                            function: NativeFunctionCall {
-                                name: tool_call.name,
-                                arguments: tool_call.arguments,
-                            },
+                        .map(|tool_call| {
+                            let name = tool_call.name;
+                            NativeToolCall {
+                                id: Some(tool_call.id),
+                                kind: Some("function".to_string()),
+                                function: NativeFunctionCall {
+                                    arguments: crate::compatible::sanitize_tool_arguments(
+                                        &name,
+                                        &tool_call.arguments,
+                                    ),
+                                    name,
+                                },
+                            }
                         })
                         .collect::<Vec<_>>();
 

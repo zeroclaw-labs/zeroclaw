@@ -422,11 +422,15 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
                     }
 
                     for call in parsed_calls {
+                        let name = call.name;
                         input.push(serde_json::json!({
                             "type": "function_call",
                             "call_id": call.id,
-                            "name": call.name,
-                            "arguments": call.arguments,
+                            "name": name,
+                            "arguments": crate::compatible::sanitize_tool_arguments(
+                                &name,
+                                &call.arguments,
+                            ),
                         }));
                     }
                 } else if !msg.content.trim().is_empty() {
