@@ -47,6 +47,15 @@
 //! driver falls back to the env vars above (parity with the private-bank env
 //! fallback). A shared/system bank equal to the private bank is ignored so a
 //! misconfig never turns private writes into shared ones.
+//!
+//! Deletion (`forget` / `forget_for_agent`): mapped to the hindsight invalidate
+//! endpoint (`PATCH .../memories/{id}` with `state=invalidated`), a soft-delete.
+//! The `key` the trait passes is the memory id the read paths surface (`id` and
+//! `key` are both the server id in `to_entry`). Deletion targets the PRIVATE
+//! bank only - the same bank writes land in and the one retention/hygiene needs
+//! to prune. The read-merged shared/system banks are never written or pruned
+//! through this driver instance, so their rows are not removable here; that is
+//! intentional (shared/system are append-only tiers managed out of band).
 
 use super::traits::{Memory, MemoryCategory, MemoryEntry, SharedWritable};
 use anyhow::{Context, Result};
@@ -294,6 +303,48 @@ impl HindsightMemory {
         format!("{}/v1/default/banks/{}/memories/list", self.base_url, bank)
     }
 
+    /// URL of a single memory item, used by the invalidate (soft-delete) PATCH.
+    fn memory_item_url_for(&self, bank: &str, id: &str) -> String {
+        format!(
+            "{}/v1/default/banks/{}/memories/{}",
+            self.base_url, bank, id
+        )
+    }
+
+    /// Soft-delete (invalidate) a memory item in `bank` by id via
+    /// `PATCH .../memories/{id}` with `{"state":"invalidated"}` - the same call
+    /// the ops diagnosis used to prune remote rows. Returns `Ok(true)` when the
+    /// server accepted the invalidation, `Ok(false)` for a `404` (already gone /
+    /// unknown id) so retention/hygiene degrade gracefully. Other non-success
+    /// statuses surface as an error. Client errors are mapped to `Ok`/`false`
+    /// rather than bubbling so a bad id cannot trip the caller's breaker.
+    async fn invalidate_in_bank(&self, bank: &str, id: &str) -> Result<bool> {
+        if id.trim().is_empty() {
+            return Ok(false);
+        }
+        let resp = self
+            .client
+            .patch(self.memory_item_url_for(bank, id))
+            .bearer_auth(&self.token)
+            .json(&InvalidateBody {
+                state: "invalidated",
+            })
+            .send()
+            .await
+            .context("hindsight invalidate request failed")?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(true);
+        }
+        // Treat "not found" as a graceful no-op: the row is already absent, so
+        // retention has nothing to remove.
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("hindsight invalidate returned HTTP {status}: {text}");
+    }
+
     /// Recall against a single named bank.
     async fn recall_bank(&self, bank: &str, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
         let body = RecallBody { query, limit };
@@ -424,6 +475,12 @@ struct RetainBody<'a> {
 struct RecallBody<'a> {
     query: &'a str,
     limit: usize,
+}
+
+/// Body of the invalidate (soft-delete) PATCH: sets the item's lifecycle state.
+#[derive(serde::Serialize)]
+struct InvalidateBody<'a> {
+    state: &'a str,
 }
 
 // The recall score object's primary field is literally "final" (a Rust
@@ -622,15 +679,23 @@ impl Memory for HindsightMemory {
         Ok(entries)
     }
 
-    async fn forget(&self, _key: &str) -> Result<bool> {
-        // Deletion maps to hindsight invalidate (PATCH); not wired for the
-        // verification scope. Report "nothing removed" rather than error so the
-        // memory tools degrade gracefully.
-        Ok(false)
+    async fn forget(&self, key: &str) -> Result<bool> {
+        // Hindsight has no key-addressed delete: `key` is the memory id the
+        // read paths surface (both `id` and `key` on a `MemoryEntry` are set to
+        // the server id in `to_entry`). Soft-delete it in the private bank via
+        // the invalidate PATCH. Writes only ever land in the private bank, so
+        // that is the correct target for retention/hygiene prunes; the
+        // read-merged shared/system banks are not written or pruned from here
+        // (see the limitation note in the module docs). A `404` maps to
+        // `Ok(false)` so hygiene degrades gracefully.
+        self.invalidate_in_bank(&self.bank, key).await
     }
 
-    async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> Result<bool> {
-        Ok(false)
+    async fn forget_for_agent(&self, key: &str, _agent_id: &str) -> Result<bool> {
+        // The bank is the per-agent scope, so agent_id is redundant here: the
+        // private bank already isolates this agent's rows. Forget by id in the
+        // private bank, same as `forget`.
+        self.invalidate_in_bank(&self.bank, key).await
     }
 
     async fn count(&self) -> Result<usize> {
@@ -1092,6 +1157,85 @@ mod tests {
 
         let mem = memory_for(&server.uri(), "zeroclaw-test");
         assert_eq!(mem.count().await.expect("count"), 3);
+    }
+
+    #[tokio::test]
+    async fn forget_issues_invalidate_patch_to_private_bank() {
+        // forget(id) must PATCH .../memories/{id} on the PRIVATE bank with
+        // {"state":"invalidated"} and map a 2xx to Ok(true).
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/mem-123"))
+            .and(header("authorization", "Bearer test-token"))
+            .and(body_partial_json(json!({ "state": "invalidated" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let removed = mem.forget("mem-123").await.expect("forget should succeed");
+        assert!(removed, "a 2xx invalidate must report the row removed");
+    }
+
+    #[tokio::test]
+    async fn forget_maps_404_to_false() {
+        // An unknown/already-gone id returns 404 -> Ok(false), so hygiene
+        // degrades gracefully instead of erroring.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/missing"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        assert!(!mem.forget("missing").await.expect("404 must not error"));
+    }
+
+    #[tokio::test]
+    async fn forget_surfaces_server_error() {
+        // A 5xx is a real failure and must surface as an error (not a silent
+        // false), so the caller can retry/log.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/boom"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("kaboom"))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let err = mem.forget("boom").await.unwrap_err();
+        assert!(
+            err.to_string().contains("500"),
+            "5xx must surface the status: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_empty_id_is_a_noop() {
+        // No mock mounted: an empty id must not fire a request.
+        let mem = memory_for("http://127.0.0.1:1", "zeroclaw-test");
+        assert!(!mem.forget("   ").await.expect("empty id short-circuits"));
+    }
+
+    #[tokio::test]
+    async fn forget_for_agent_targets_private_bank_by_id() {
+        // forget_for_agent ignores agent_id (the bank is the per-agent scope)
+        // and invalidates by id in the private bank, same as forget.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/mem-9"))
+            .and(body_partial_json(json!({ "state": "invalidated" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        assert!(
+            mem.forget_for_agent("mem-9", "any-agent")
+                .await
+                .expect("forget_for_agent should succeed")
+        );
     }
 
     #[tokio::test]
