@@ -413,7 +413,11 @@ impl Memory for HindsightMemory {
         _since: Option<&str>,
         _until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        let effective_limit = if limit == 0 { self.default_top_k } else { limit };
+        let effective_limit = if limit == 0 {
+            self.default_top_k
+        } else {
+            limit
+        };
         let normalized = super::traits::normalize_recent_recall_query(query);
         // Hindsight recall needs a query; for recent/empty queries fall back to list.
         if normalized.trim().is_empty() {
@@ -428,7 +432,9 @@ impl Memory for HindsightMemory {
             .await?;
         // Shared read-only bank, if set, is merged in (read-only, never written).
         if let Some(shared) = self.shared_bank.as_deref() {
-            let shared_entries = self.recall_bank(shared, normalized, effective_limit).await?;
+            let shared_entries = self
+                .recall_bank(shared, normalized, effective_limit)
+                .await?;
             entries.extend(shared_entries);
             // Highest score first, then keep the top slice.
             entries.sort_by(|a, b| {
@@ -485,9 +491,9 @@ impl Memory for HindsightMemory {
             items: Vec::new(),
             total: None,
         });
-        Ok(parsed
-            .total
-            .map_or(parsed.items.len(), |t| usize::try_from(t).unwrap_or(usize::MAX)))
+        Ok(parsed.total.map_or(parsed.items.len(), |t| {
+            usize::try_from(t).unwrap_or(usize::MAX)
+        }))
     }
 
     async fn health_check(&self) -> bool {

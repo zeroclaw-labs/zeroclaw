@@ -919,7 +919,11 @@ pub async fn create_memory_for_agent(
     // Selected when the per-agent backend is Hindsight, or when the install-wide
     // `[memory] backend = "hindsight"` string selects it for all agents
     // (backwards-compatible with the pre-enum install-wide selection).
-    let install_wide_hindsight = config.memory.backend.trim().eq_ignore_ascii_case("hindsight");
+    let install_wide_hindsight = config
+        .memory
+        .backend
+        .trim()
+        .eq_ignore_ascii_case("hindsight");
     if matches!(backend_kind, ConfigBackend::Hindsight) || install_wide_hindsight {
         let backend = hindsight::HindsightMemory::from_config(
             &config.memory.hindsight,
