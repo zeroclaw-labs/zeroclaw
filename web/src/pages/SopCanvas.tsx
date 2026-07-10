@@ -718,8 +718,12 @@ export default function SopCanvas({
             const toIdx = toNode
               ? dataPins(toNode, 'inputs').findIndex((p) => p.name === w.to_pin)
               : -1;
-            const srcY = fromIdx >= 0 ? dataPinY(a.y, fromIdx) : a.y + NODE_H / 2;
-            const dstY = toIdx >= 0 ? dataPinY(b.y, toIdx) : b.y + NODE_H / 2;
+            // A data wire whose endpoints do not resolve to real pins would
+            // otherwise anchor to the node's bare center and render as a
+            // phantom pipe leaving from nowhere. Drop it instead.
+            if (fromIdx < 0 || toIdx < 0) return null;
+            const srcY = dataPinY(a.y, fromIdx);
+            const dstY = dataPinY(b.y, toIdx);
             const d = edgePath(a, b, srcY, dstY);
             const hovered = hoverWire === -(i + 1);
             return (
