@@ -147,6 +147,10 @@ function flowInY(nodeY: number, kind: FlowRole): number {
   return nodeY + NODE_H / 2 + (offset ?? 0);
 }
 
+// Pointer travel (px) allowed between a wire press and release before the
+// gesture is treated as a pan instead of a delete-click.
+const WIRE_CLICK_SLOP = 4;
+
 const EMPTY_RUN_STATE: Map<number, NodeRunState> = new Map();
 
 interface Props {
@@ -285,6 +289,10 @@ export default function SopCanvas({
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const panRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
   const [panning, setPanning] = useState(false);
+  // A wire is deleted only by a deliberate click: press and release on the same
+  // wire without moving past this threshold. This keeps a click-and-hold pan
+  // that happens to start on a wire from destroying it.
+  const wireClickRef = useRef<{ id: number; x: number; y: number } | null>(null);
   const [legend, setLegend] = useState<GraphLegend | null>(null);
 
   useEffect(() => {
@@ -369,6 +377,7 @@ export default function SopCanvas({
     }
     setDrag(null);
     panRef.current = null;
+    wireClickRef.current = null;
     setPanning(false);
   }, [drag, pos, onMoveNode]);
 
@@ -586,10 +595,26 @@ export default function SopCanvas({
                   onPointerEnter={() => setHoverWire(i)}
                   onPointerLeave={() => setHoverWire((h) => (h === i ? null : h))}
                   onPointerDown={(e) => {
-                    e.stopPropagation();
                     // Trigger edges are derived from the SOP's triggers; they
                     // are not hand-wired and cannot be deleted from the canvas.
                     if (readOnly || kind === 'trigger') return;
+                    // Arm a delete-click; deletion only fires if the pointer is
+                    // released on the same wire without travelling (a real
+                    // click, not a click-and-hold pan).
+                    e.stopPropagation();
+                    wireClickRef.current = { id: i, x: e.clientX, y: e.clientY };
+                  }}
+                  onPointerUp={(e) => {
+                    if (readOnly || kind === 'trigger') return;
+                    const armed = wireClickRef.current;
+                    wireClickRef.current = null;
+                    if (!armed || armed.id !== i) return;
+                    if (
+                      Math.abs(e.clientX - armed.x) > WIRE_CLICK_SLOP ||
+                      Math.abs(e.clientY - armed.y) > WIRE_CLICK_SLOP
+                    )
+                      return;
+                    e.stopPropagation();
                     onDisconnect(w.from_step, w.to_step, kind, portIndex);
                   }}
                 >
@@ -709,8 +734,21 @@ export default function SopCanvas({
                   onPointerEnter={() => setHoverWire(-(i + 1))}
                   onPointerLeave={() => setHoverWire((h) => (h === -(i + 1) ? null : h))}
                   onPointerDown={(e) => {
-                    e.stopPropagation();
                     if (readOnly || !w.to_pin) return;
+                    e.stopPropagation();
+                    wireClickRef.current = { id: -(i + 1), x: e.clientX, y: e.clientY };
+                  }}
+                  onPointerUp={(e) => {
+                    if (readOnly || !w.to_pin) return;
+                    const armed = wireClickRef.current;
+                    wireClickRef.current = null;
+                    if (!armed || armed.id !== -(i + 1)) return;
+                    if (
+                      Math.abs(e.clientX - armed.x) > WIRE_CLICK_SLOP ||
+                      Math.abs(e.clientY - armed.y) > WIRE_CLICK_SLOP
+                    )
+                      return;
+                    e.stopPropagation();
                     onDisconnectData(w.to_step, w.to_pin);
                   }}
                 >
