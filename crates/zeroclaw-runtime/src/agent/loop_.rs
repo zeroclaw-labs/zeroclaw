@@ -1931,10 +1931,17 @@ pub async fn run(
                                     query: effective_msg.clone(),
                                     sessions: vec![memory_session_id.clone()],
                                     suppress: suppress_memory_inject,
-                                    cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
-                                        &config.memory,
-                                        crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
-                                    ),
+                                    // Preserve master's rerank-aware
+                                    // `from_memory_config` while threading S3's
+                                    // config-driven recall limit + entry cap.
+                                    cfg: {
+                                        let mut cfg = crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                                            &config.memory,
+                                            config.effective_memory_recall_limit(agent_alias),
+                                        );
+                                        cfg.max_entries = config.effective_memory_inject_max_entries();
+                                        cfg
+                                    },
                                 }),
                                 ingress: IngressContext::from_origin(origin),
                                 agent_alias: Some(agent_alias),
@@ -2479,10 +2486,18 @@ pub async fn run(
                                         query: effective_input.clone(),
                                         sessions: vec![memory_session_id.clone()],
                                         suppress: suppress_memory_inject,
-                                        cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
-                                            &config.memory,
-                                            crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
-                                        ),
+                                        // Preserve master's rerank-aware
+                                        // `from_memory_config` while threading
+                                        // S3's config-driven recall limit + cap.
+                                        cfg: {
+                                            let mut cfg = crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                                                &config.memory,
+                                                config.effective_memory_recall_limit(agent_alias),
+                                            );
+                                            cfg.max_entries =
+                                                config.effective_memory_inject_max_entries();
+                                            cfg
+                                        },
                                     }),
                                     ingress: IngressContext::from_origin(origin),
                                     agent_alias: Some(agent_alias),
@@ -3305,10 +3320,17 @@ pub async fn process_message(
                         query: effective_message.clone(),
                         sessions: vec![session_id.map(str::to_string)],
                         suppress: false,
-                        cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
-                            &config.memory,
-                            crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
-                        ),
+                        // Preserve master's rerank-aware `from_memory_config`
+                        // while threading S3's config-driven recall limit + cap.
+                        cfg: {
+                            let mut cfg =
+                                crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                                    &config.memory,
+                                    config.effective_memory_recall_limit(agent_alias),
+                                );
+                            cfg.max_entries = config.effective_memory_inject_max_entries();
+                            cfg
+                        },
                     }),
                     Some(agent_alias),
                     Some(&turn_id),

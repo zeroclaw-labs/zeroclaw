@@ -1657,12 +1657,20 @@ impl Agent {
             .observer(observer)
             .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)
-            .memory_inject_cfg(
-                crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+            .memory_inject_cfg({
+                // The `from_memory_config` constructor threads the rerank stage,
+                // relevance floor, rerank settings, and rerank-bounded limit.
+                // This layers its
+                // config-driven entry cap on top: build from the canonical
+                // constructor to preserve rerank, then override `max_entries`
+                // with the resolved `effective_memory_inject_max_entries()`.
+                let mut cfg = crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
                     &config.memory,
                     config.effective_memory_recall_limit(agent_alias),
-                ),
-            )
+                );
+                cfg.max_entries = config.effective_memory_inject_max_entries();
+                cfg
+            })
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(
                 config
