@@ -198,6 +198,10 @@ impl LeakDetector {
                     Regex::new(r"xapp-[0-9A-Za-z-]{10,}").unwrap(),
                     "Slack app-level token",
                 ),
+                (
+                    Regex::new(r"xwfp-[0-9A-Za-z-]{10,}").unwrap(),
+                    "Slack workflow token",
+                ),
                 // Generic
                 (
                     Regex::new(r#"api[_-]?key[=:]\s*['"]*[a-zA-Z0-9_-]{20,}"#).unwrap(),
@@ -1326,6 +1330,15 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
                 assert!(!redacted.contains("xapp-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
             }
             LeakResult::Clean => panic!("Should detect Slack app-level token"),
+        }
+
+        let workflow = "xwfp-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        match detector.scan(workflow) {
+            LeakResult::Detected { patterns, redacted } => {
+                assert!(patterns.iter().any(|p| p.contains("Slack")));
+                assert!(!redacted.contains("xwfp-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
+            }
+            LeakResult::Clean => panic!("Should detect Slack workflow token"),
         }
     }
 
