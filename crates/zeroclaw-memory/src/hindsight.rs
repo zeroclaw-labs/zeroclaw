@@ -28,15 +28,27 @@
 //! | `ZC_HINDSIGHT_BASE` | API base URL                              | `https://tokengate.appz.cloud/api/embedding/hindsight` |
 //! | `ZC_HINDSIGHT_BANK` | Explicit bank id (overrides per-agent)    | `zeroclaw-<alias>` |
 //! | `ZC_HINDSIGHT_TOP_K`| Default recall limit when caller passes 0 | `5` |
-//! | `ZC_HINDSIGHT_SHARED_BANK`| Extra read-only bank merged into recall/list (never written) | (none) |
+//! | `ZC_HINDSIGHT_SHARED_BANK`| Shared/family bank merged read-only into recall/list; written only via the `shared_memory_store` tool | (none) |
+//! | `ZC_HINDSIGHT_SYSTEM_BANK`| System bank merged read-only into recall/list; written only via the `system_memory_store` tool | (none) |
 //!
-//! Shared read bank: `ZC_HINDSIGHT_SHARED_BANK` names a second bank every
-//! agent can READ from (recall + list) but never WRITE to. Writes always land
-//! in the per-agent private `bank`, so personal memory stays isolated while a
-//! common household/shared bank is visible to all agents. This is the native
-//! mechanism for "private per agent + one shared bank both can read".
+//! Shared and system banks: `ZC_HINDSIGHT_SHARED_BANK` and
+//! `ZC_HINDSIGHT_SYSTEM_BANK` name two extra banks every agent can READ from
+//! (merged into recall + list). Ordinary writes (`store`, including automatic
+//! per-turn consolidation) always land in the per-agent private `bank`, so
+//! personal memory stays isolated. The shared/system banks are written ONLY via
+//! the explicit [`HindsightMemory::store_to_bank`] path behind the dedicated
+//! `shared_memory_store` / `system_memory_store` tools, which are per-agent
+//! gateable by name. This is the native mechanism for a tiered memory model:
+//! private per agent + permitted shared/family writes + admin-only system
+//! writes, all readable by everyone.
+//!
+//! Bank resolution precedence for shared/system: the typed `[memory.hindsight]`
+//! `shared_bank` / `system_bank` fields win when non-empty; otherwise the
+//! driver falls back to the env vars above (parity with the private-bank env
+//! fallback). A shared/system bank equal to the private bank is ignored so a
+//! misconfig never turns private writes into shared ones.
 
-use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use super::traits::{Memory, MemoryCategory, MemoryEntry, SharedWritable};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -44,17 +56,26 @@ use zeroclaw_config::schema::HindsightMemoryConfig;
 
 const DEFAULT_BASE: &str = "https://tokengate.appz.cloud/api/embedding/hindsight";
 const DEFAULT_TOP_K: usize = 5;
-/// Env var naming the extra shared read-only bank (merged into recall/list).
+/// Env var naming the shared/family bank (read-merged; written via tool only).
 const SHARED_BANK_ENV: &str = "ZC_HINDSIGHT_SHARED_BANK";
+/// Env var naming the system bank (read-merged; written via tool only).
+const SYSTEM_BANK_ENV: &str = "ZC_HINDSIGHT_SYSTEM_BANK";
 
-/// Hindsight-backed memory store bound to a single bank.
+/// Hindsight-backed memory store bound to a single private bank, with optional
+/// shared and system banks that are read-merged and written only via the
+/// explicit [`HindsightMemory::store_to_bank`] tool path.
 pub struct HindsightMemory {
     alias: String,
     base_url: String,
     bank: String,
-    /// Optional extra bank merged into recall/list as READ-ONLY. Writes never
-    /// touch it, so it acts as a shared bank all agents can read.
+    /// Optional shared/family bank merged into recall/list as READ-ONLY.
+    /// Ordinary writes never touch it; the `shared_memory_store` tool writes it
+    /// via `store_to_bank`.
     shared_bank: Option<String>,
+    /// Optional system bank merged into recall/list as READ-ONLY. Ordinary
+    /// writes never touch it; the `system_memory_store` tool writes it via
+    /// `store_to_bank`.
+    system_bank: Option<String>,
     token: String,
     default_top_k: usize,
     client: reqwest::Client,
@@ -67,9 +88,29 @@ impl std::fmt::Debug for HindsightMemory {
             .field("base_url", &self.base_url)
             .field("bank", &self.bank)
             .field("shared_bank", &self.shared_bank)
+            .field("system_bank", &self.system_bank)
             .field("default_top_k", &self.default_top_k)
             .finish_non_exhaustive()
     }
+}
+
+/// Resolve a secondary (shared/system) bank from typed config with an env
+/// fallback, dropping it when empty or when it collides with an already-taken
+/// bank (private or, for system, the shared bank).
+fn resolve_secondary_bank(
+    configured: Option<&str>,
+    env_var: &str,
+    taken: &[&str],
+) -> Option<String> {
+    configured
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var(env_var)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .filter(|b| !b.is_empty() && !taken.contains(&b.as_str()))
 }
 
 impl HindsightMemory {
@@ -108,10 +149,19 @@ impl HindsightMemory {
             })?;
         let base_url = cfg.base_url.trim().trim_end_matches('/').to_string();
         let bank = cfg.bank_for(agent_alias, bank_override);
-        let shared_bank = std::env::var(SHARED_BANK_ENV)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty() && *s != bank);
+        // Shared/system banks: typed config wins, env is the fallback. A bank
+        // colliding with the private bank (or, for system, the shared bank) is
+        // dropped so private writes can never leak into a shared tier.
+        let shared_bank = resolve_secondary_bank(
+            cfg.shared_bank_configured(),
+            SHARED_BANK_ENV,
+            &[bank.as_str()],
+        );
+        let system_bank = resolve_secondary_bank(
+            cfg.system_bank_configured(),
+            SYSTEM_BANK_ENV,
+            &[bank.as_str(), shared_bank.as_deref().unwrap_or_default()],
+        );
         let default_top_k = if cfg.top_k == 0 {
             DEFAULT_TOP_K
         } else {
@@ -123,6 +173,7 @@ impl HindsightMemory {
             base_url,
             bank,
             shared_bank,
+            system_bank,
             token,
             default_top_k,
             client: reqwest::Client::new(),
@@ -152,11 +203,14 @@ impl HindsightMemory {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| format!("zeroclaw-{agent_alias}"));
-        // Optional shared read-only bank; ignored if it equals the private bank.
-        let shared_bank = std::env::var("ZC_HINDSIGHT_SHARED_BANK")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty() && *s != bank);
+        // Optional shared/system read-only banks; ignored if they equal an
+        // already-taken bank (private, or for system the shared bank).
+        let shared_bank = resolve_secondary_bank(None, SHARED_BANK_ENV, &[bank.as_str()]);
+        let system_bank = resolve_secondary_bank(
+            None,
+            SYSTEM_BANK_ENV,
+            &[bank.as_str(), shared_bank.as_deref().unwrap_or_default()],
+        );
         let default_top_k = std::env::var("ZC_HINDSIGHT_TOP_K")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
@@ -168,6 +222,7 @@ impl HindsightMemory {
             base_url,
             bank,
             shared_bank,
+            system_bank,
             token,
             default_top_k,
             client: reqwest::Client::new(),
@@ -181,14 +236,51 @@ impl HindsightMemory {
         &self.bank
     }
 
-    /// The optional shared read-only bank merged into recall/list.
+    /// The optional shared/family bank merged into recall/list and written by
+    /// the `shared_memory_store` tool.
     #[must_use]
     pub fn shared_bank(&self) -> Option<&str> {
         self.shared_bank.as_deref()
     }
 
+    /// The optional system bank merged into recall/list and written by the
+    /// `system_memory_store` tool.
+    #[must_use]
+    pub fn system_bank(&self) -> Option<&str> {
+        self.system_bank.as_deref()
+    }
+
+    /// Construct a `HindsightMemory` directly, for tests in this and dependent
+    /// crates (e.g. the shared/system write tools). Bypasses env/config
+    /// resolution so tests can point at a mock server with explicit banks.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_test(
+        alias: &str,
+        base_url: &str,
+        bank: &str,
+        shared_bank: Option<&str>,
+        system_bank: Option<&str>,
+        token: &str,
+    ) -> Self {
+        Self {
+            alias: alias.to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            bank: bank.to_string(),
+            shared_bank: shared_bank.map(str::to_string),
+            system_bank: system_bank.map(str::to_string),
+            token: token.to_string(),
+            default_top_k: DEFAULT_TOP_K,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    fn memories_url_for(&self, bank: &str) -> String {
+        format!("{}/v1/default/banks/{}/memories", self.base_url, bank)
+    }
+
     fn memories_url(&self) -> String {
-        format!("{}/v1/default/banks/{}/memories", self.base_url, self.bank)
+        self.memories_url_for(&self.bank)
     }
 
     fn recall_url_for(&self, bank: &str) -> String {
@@ -230,6 +322,59 @@ impl HindsightMemory {
                 Self::to_entry(r.id, r.text, r.context, r.mentioned_at, score)
             })
             .collect())
+    }
+
+    /// Explicit retain into a NAMED bank, used by the shared/system write tools.
+    ///
+    /// Unlike [`Memory::store`] (which always targets the private `self.bank`),
+    /// this posts to `bank` and stamps the item with the writer alias plus a
+    /// `tier:<tier>` tag for auditability. `tier` is a short marker such as
+    /// `"shared"` or `"system"` describing which tool wrote it. Empty content is
+    /// a no-op (mirrors `store`). This is the ONLY path that writes a
+    /// non-private bank; automatic per-turn consolidation never calls it.
+    pub async fn store_to_bank(
+        &self,
+        bank: &str,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        tier: &str,
+    ) -> Result<()> {
+        if content.trim().is_empty() {
+            return Ok(());
+        }
+        let context_owned = if key.trim().is_empty() {
+            category.to_string()
+        } else {
+            key.to_string()
+        };
+        let mut tags = Self::tags_for(&category);
+        tags.push(format!("author:{}", self.alias));
+        if !tier.trim().is_empty() {
+            tags.push(format!("tier:{tier}"));
+        }
+        let body = RetainBody {
+            items: vec![RetainItem {
+                content,
+                context: Some(context_owned.as_str()),
+                tags,
+            }],
+            is_async: false,
+        };
+        let resp = self
+            .client
+            .post(self.memories_url_for(bank))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .context("hindsight shared/system retain request failed")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("hindsight shared/system retain returned HTTP {status}: {text}");
+        }
+        Ok(())
     }
 
     /// List a single named bank.
@@ -365,6 +510,10 @@ impl Memory for HindsightMemory {
         "hindsight"
     }
 
+    fn as_shared_writable(&self) -> Option<&dyn SharedWritable> {
+        Some(self)
+    }
+
     async fn store(
         &self,
         key: &str,
@@ -430,12 +579,17 @@ impl Memory for HindsightMemory {
         let mut entries = self
             .recall_bank(&self.bank, normalized, effective_limit)
             .await?;
-        // Shared read-only bank, if set, is merged in (read-only, never written).
-        if let Some(shared) = self.shared_bank.as_deref() {
-            let shared_entries = self
-                .recall_bank(shared, normalized, effective_limit)
-                .await?;
-            entries.extend(shared_entries);
+        // Shared/system read-only banks, if set, are merged in (never written
+        // through this path). Both tiers are readable by every agent.
+        let mut merged_any = false;
+        for extra in [self.shared_bank.as_deref(), self.system_bank.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            entries.extend(self.recall_bank(extra, normalized, effective_limit).await?);
+            merged_any = true;
+        }
+        if merged_any {
             // Highest score first, then keep the top slice.
             entries.sort_by(|a, b| {
                 b.score
@@ -459,8 +613,11 @@ impl Memory for HindsightMemory {
         _session_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
         let mut entries = self.list_bank(&self.bank).await?;
-        if let Some(shared) = self.shared_bank.as_deref() {
-            entries.extend(self.list_bank(shared).await?);
+        for extra in [self.shared_bank.as_deref(), self.system_bank.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            entries.extend(self.list_bank(extra).await?);
         }
         Ok(entries)
     }
@@ -543,6 +700,45 @@ impl ::zeroclaw_api::attribution::Attributable for HindsightMemory {
     }
 }
 
+#[async_trait]
+impl SharedWritable for HindsightMemory {
+    fn shared_bank(&self) -> Option<&str> {
+        self.shared_bank.as_deref()
+    }
+
+    fn system_bank(&self) -> Option<&str> {
+        self.system_bank.as_deref()
+    }
+
+    async fn store_to_shared(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+    ) -> Result<()> {
+        let bank = self
+            .shared_bank
+            .as_deref()
+            .context("no shared bank configured")?;
+        self.store_to_bank(bank, key, content, category, "shared")
+            .await
+    }
+
+    async fn store_to_system(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+    ) -> Result<()> {
+        let bank = self
+            .system_bank
+            .as_deref()
+            .context("no system bank configured")?;
+        self.store_to_bank(bank, key, content, category, "system")
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,6 +755,7 @@ mod tests {
             base_url: base_url.trim_end_matches('/').to_string(),
             bank: bank.to_string(),
             shared_bank: None,
+            system_bank: None,
             token: "test-token".to_string(),
             default_top_k: 5,
             client: reqwest::Client::new(),
@@ -730,5 +927,158 @@ mod tests {
         mem.store("k", "   ", MemoryCategory::Core, None)
             .await
             .expect("empty content should short-circuit without any request");
+    }
+
+    /// A memory with explicit private + shared + system banks for the
+    /// shared-write and read-merge tests.
+    fn memory_with_tiers(
+        base_url: &str,
+        shared: Option<&str>,
+        system: Option<&str>,
+    ) -> HindsightMemory {
+        HindsightMemory::for_test(
+            "and",
+            base_url,
+            "zeroclaw-and",
+            shared,
+            system,
+            "test-token",
+        )
+    }
+
+    #[tokio::test]
+    async fn store_to_bank_posts_to_named_bank_not_private() {
+        let server = MockServer::start().await;
+        // The named (shared) bank must receive the POST.
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-house/memories"))
+            .and(header("authorization", "Bearer test-token"))
+            .and(body_partial_json(json!({
+                "items": [{ "content": "trash Tuesday", "context": "trash_day" }]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let mem = memory_with_tiers(&server.uri(), Some("zeroclaw-house"), None);
+        mem.store_to_bank(
+            "zeroclaw-house",
+            "trash_day",
+            "trash Tuesday",
+            MemoryCategory::Core,
+            "shared",
+        )
+        .await
+        .expect("store_to_bank should hit the named bank");
+    }
+
+    #[tokio::test]
+    async fn store_to_bank_tags_author_and_tier() {
+        let server = MockServer::start().await;
+        // Assert the retained item carries author:<alias> and tier:<tier> tags.
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-house/memories"))
+            .and(body_partial_json(json!({
+                "items": [{ "tags": ["zeroclaw", "core", "author:and", "tier:shared"] }]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let mem = memory_with_tiers(&server.uri(), Some("zeroclaw-house"), None);
+        mem.store_to_bank("zeroclaw-house", "k", "v", MemoryCategory::Core, "shared")
+            .await
+            .expect("author + tier tags must be present");
+    }
+
+    #[tokio::test]
+    async fn store_to_bank_empty_content_is_noop() {
+        // No mock mounted: an empty write must not fire a request.
+        let mem = memory_with_tiers("http://127.0.0.1:1", Some("zeroclaw-house"), None);
+        mem.store_to_bank("zeroclaw-house", "k", "   ", MemoryCategory::Core, "shared")
+            .await
+            .expect("empty content should short-circuit");
+    }
+
+    #[tokio::test]
+    async fn store_still_targets_private_bank() {
+        // Regression: the ordinary store path is unchanged and hits the
+        // PRIVATE bank, never the shared one, even when a shared bank is set.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-and/memories"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let mem = memory_with_tiers(&server.uri(), Some("zeroclaw-house"), None);
+        mem.store("k", "private note", MemoryCategory::Core, None)
+            .await
+            .expect("store must target the private bank");
+    }
+
+    #[tokio::test]
+    async fn shared_writable_store_to_shared_uses_configured_bank() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-house/memories"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let mem = memory_with_tiers(
+            &server.uri(),
+            Some("zeroclaw-house"),
+            Some("zeroclaw-system"),
+        );
+        // Exercise the SharedWritable trait surface the tools use.
+        assert_eq!(mem.shared_bank(), Some("zeroclaw-house"));
+        assert_eq!(mem.system_bank(), Some("zeroclaw-system"));
+        SharedWritable::store_to_shared(&mem, "k", "v", MemoryCategory::Core)
+            .await
+            .expect("store_to_shared should hit the shared bank");
+    }
+
+    #[tokio::test]
+    async fn store_to_shared_without_bank_errors() {
+        let mem = memory_with_tiers("http://127.0.0.1:1", None, None);
+        assert!(mem.shared_bank().is_none());
+        let err = SharedWritable::store_to_shared(&mem, "k", "v", MemoryCategory::Core)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no shared bank configured"));
+    }
+
+    #[tokio::test]
+    async fn recall_merges_system_bank_read_only() {
+        let server = MockServer::start().await;
+        // Private, shared, and system banks each answer recall; all three merge.
+        for (bank, text) in [
+            ("zeroclaw-and", "private-hit"),
+            ("zeroclaw-house", "shared-hit"),
+            ("zeroclaw-system", "system-hit"),
+        ] {
+            Mock::given(method("POST"))
+                .and(path(format!("/v1/default/banks/{bank}/memories/recall")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "results": [{ "id": bank, "text": text, "scores": { "final": 0.5 } }]
+                })))
+                .mount(&server)
+                .await;
+        }
+
+        let mem = memory_with_tiers(
+            &server.uri(),
+            Some("zeroclaw-house"),
+            Some("zeroclaw-system"),
+        );
+        let hits = mem
+            .recall("anything", 10, None, None, None)
+            .await
+            .expect("recall merges all tiers");
+        let texts: Vec<&str> = hits.iter().map(|h| h.content.as_str()).collect();
+        assert!(texts.contains(&"private-hit"));
+        assert!(texts.contains(&"shared-hit"));
+        assert!(texts.contains(&"system-hit"));
     }
 }

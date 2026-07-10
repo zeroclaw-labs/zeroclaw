@@ -10550,6 +10550,23 @@ pub struct HindsightMemoryConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Shared/family-tier bank id: a bank every hindsight agent can READ (merged
+    /// read-only into recall/list) and that permitted agents can WRITE via the
+    /// explicit `shared_memory_store` tool (never auto-consolidation). Empty
+    /// (default) means no shared tier from config; the driver then falls back to
+    /// the `ZC_HINDSIGHT_SHARED_BANK` env var for parity with the existing
+    /// resolution. A value here takes precedence over the env fallback. Ignored
+    /// when it equals an agent's private bank.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub shared_bank: String,
+    /// System-tier bank id: a shared bank readable by every hindsight agent and
+    /// writable only by admin agents through the explicit `system_memory_store`
+    /// tool. Empty (default) means no system tier from config; the driver then
+    /// falls back to the `ZC_HINDSIGHT_SYSTEM_BANK` env var. A value here takes
+    /// precedence over the env fallback. Ignored when it equals the private or
+    /// shared bank.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub system_bank: String,
 }
 
 impl Default for HindsightMemoryConfig {
@@ -10560,6 +10577,8 @@ impl Default for HindsightMemoryConfig {
             top_k: default_hindsight_top_k(),
             token_env: default_hindsight_token_env(),
             token: None,
+            shared_bank: String::new(),
+            system_bank: String::new(),
         }
     }
 }
@@ -10574,6 +10593,24 @@ impl HindsightMemoryConfig {
             return trimmed.to_string();
         }
         self.bank_template.replace("{agent}", alias)
+    }
+
+    /// The shared-tier bank configured here, or `None` when empty. Empty means
+    /// "not configured in TOML"; the driver may then fall back to the
+    /// `ZC_HINDSIGHT_SHARED_BANK` env var.
+    #[must_use]
+    pub fn shared_bank_configured(&self) -> Option<&str> {
+        let trimmed = self.shared_bank.trim();
+        (!trimmed.is_empty()).then_some(trimmed)
+    }
+
+    /// The system-tier bank configured here, or `None` when empty. Empty means
+    /// "not configured in TOML"; the driver may then fall back to the
+    /// `ZC_HINDSIGHT_SYSTEM_BANK` env var.
+    #[must_use]
+    pub fn system_bank_configured(&self) -> Option<&str> {
+        let trimmed = self.system_bank.trim();
+        (!trimmed.is_empty()).then_some(trimmed)
     }
 
     /// Validate the section's own invariants. Called from `Config::validate`
@@ -32934,11 +32971,18 @@ base_url = "https://tokengate.appz.cloud/api/embedding/hindsight"
 bank_template = "zeroclaw-{agent}"
 top_k = 7
 token_env = "ZC_HINDSIGHT_TOKEN"
+shared_bank = "zeroclaw-house"
+system_bank = "zeroclaw-system"
 "#;
         let cfg: Config = toml::from_str(toml_input).expect("parse hindsight section");
         assert_eq!(cfg.memory.hindsight.top_k, 7);
         assert_eq!(cfg.memory.hindsight.bank_template, "zeroclaw-{agent}");
         assert_eq!(cfg.memory.hindsight.token_env, "ZC_HINDSIGHT_TOKEN");
+        assert_eq!(cfg.memory.hindsight.shared_bank_configured(), Some("zeroclaw-house"));
+        assert_eq!(
+            cfg.memory.hindsight.system_bank_configured(),
+            Some("zeroclaw-system")
+        );
         assert_eq!(
             cfg.memory.hindsight.bank_for("clawdia", ""),
             "zeroclaw-clawdia"
@@ -32946,6 +32990,8 @@ token_env = "ZC_HINDSIGHT_TOKEN"
         // Round-trip back to TOML and confirm the section survives.
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(serialized.contains("bank_template = \"zeroclaw-{agent}\""));
+        assert!(serialized.contains("shared_bank = \"zeroclaw-house\""));
+        assert!(serialized.contains("system_bank = \"zeroclaw-system\""));
     }
 
     #[test]
@@ -32953,6 +32999,41 @@ token_env = "ZC_HINDSIGHT_TOKEN"
         let mut config = Config::default();
         config.memory.backend = "hindsight".to_string();
         assert_eq!(config.resolve_active_storage().kind(), "hindsight");
+    }
+
+    #[test]
+    async fn hindsight_shared_and_system_bank_round_trip() {
+        let toml_input = r#"
+shared_bank = "zeroclaw-house"
+system_bank = "zeroclaw-system"
+"#;
+        let cfg: HindsightMemoryConfig = toml::from_str(toml_input).expect("parse tiers");
+        assert_eq!(cfg.shared_bank, "zeroclaw-house");
+        assert_eq!(cfg.system_bank, "zeroclaw-system");
+        assert_eq!(cfg.shared_bank_configured(), Some("zeroclaw-house"));
+        assert_eq!(cfg.system_bank_configured(), Some("zeroclaw-system"));
+
+        // Empty tiers are skipped on serialize (backwards-compatible default).
+        let default_toml = toml::to_string(&HindsightMemoryConfig::default()).unwrap();
+        assert!(
+            !default_toml.contains("shared_bank"),
+            "empty shared_bank must not serialize: {default_toml}"
+        );
+        assert!(
+            !default_toml.contains("system_bank"),
+            "empty system_bank must not serialize: {default_toml}"
+        );
+    }
+
+    #[test]
+    async fn hindsight_tier_configured_helpers_treat_blank_as_unset() {
+        let cfg = HindsightMemoryConfig {
+            shared_bank: "   ".to_string(),
+            system_bank: String::new(),
+            ..HindsightMemoryConfig::default()
+        };
+        assert_eq!(cfg.shared_bank_configured(), None);
+        assert_eq!(cfg.system_bank_configured(), None);
     }
 
     #[test]

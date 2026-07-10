@@ -654,6 +654,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn assemble_gates_shared_memory_write_by_risk_profile() {
+        // Per-agent gating of the shared-memory write tier: an agent whose risk
+        // profile excludes `system_memory_store` must not get it, while
+        // `shared_memory_store` (unexcluded) survives - proving the tiers are
+        // independently gateable by name through the one filter seam.
+        let security = Arc::new(SecurityPolicy {
+            excluded_tools: Some(vec!["system_memory_store".into()]),
+            ..SecurityPolicy::default()
+        });
+        let names = assemble_names(
+            security,
+            vec![
+                Box::new(MockTool("shared_memory_store")),
+                Box::new(MockTool("system_memory_store")),
+                Box::new(MockTool("memory_store")),
+            ],
+            None,
+        )
+        .await;
+        assert!(
+            names.iter().any(|n| n == "shared_memory_store"),
+            "shared write tier kept: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "memory_store"),
+            "private write kept: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "system_memory_store"),
+            "excluded system write tier dropped: {names:?}"
+        );
+    }
+
     /// Regression pin for #7733 at the seam (ported from the gateway's
     /// `append_scoped_mcp_tools_is_a_noop_for_agent_without_bundles` when the
     /// gateway cut over to `assemble`): an agent with NO `mcp_bundles` grant

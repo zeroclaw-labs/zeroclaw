@@ -236,11 +236,63 @@ pub enum MemoryPolicyDecision {
     Deny { reason: String },
 }
 
+/// Controlled write access to shared/system memory tiers.
+///
+/// This is a small, backend-specific capability (only the hindsight backend
+/// implements it) kept OFF the generic [`Memory`] trait on purpose: most
+/// backends have no concept of a "shared bank", and the write PERMISSION is
+/// gated per agent by tool name rather than by the trait. The native
+/// `shared_memory_store` / `system_memory_store` tools obtain a
+/// `&dyn SharedWritable` via [`Memory::as_shared_writable`] and call
+/// [`SharedWritable::store_to_shared`] / [`SharedWritable::store_to_system`].
+///
+/// Reads of the shared/system tiers need no special trait: they already merge
+/// into ordinary `recall`/`list`.
+#[async_trait]
+pub trait SharedWritable: Send + Sync {
+    /// The configured shared/family bank id, or `None` when no shared tier is
+    /// configured. When `None`, the shared write tool degrades gracefully.
+    fn shared_bank(&self) -> Option<&str>;
+
+    /// The configured system bank id, or `None` when no system tier is
+    /// configured. When `None`, the system write tool degrades gracefully.
+    fn system_bank(&self) -> Option<&str>;
+
+    /// Explicitly write a memory into the shared/family tier. Fails if no
+    /// shared bank is configured (callers should check [`Self::shared_bank`]
+    /// first and degrade gracefully).
+    async fn store_to_shared(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+    ) -> anyhow::Result<()>;
+
+    /// Explicitly write a memory into the system tier. Fails if no system bank
+    /// is configured (callers should check [`Self::system_bank`] first).
+    async fn store_to_system(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+    ) -> anyhow::Result<()>;
+}
+
 /// Core memory trait — implement for any persistence backend
 #[async_trait]
 pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// Backend name
     fn name(&self) -> &str;
+
+    /// Downcast to the shared/system write capability when this backend
+    /// supports controlled shared-tier writes (only hindsight does today).
+    ///
+    /// Default `None`: backends without a shared/system tier expose no shared
+    /// write path, so the `shared_memory_store` / `system_memory_store` tools
+    /// are simply never constructed for them.
+    fn as_shared_writable(&self) -> Option<&dyn SharedWritable> {
+        None
+    }
 
     /// Store a memory entry, optionally scoped to a session
     async fn store(
