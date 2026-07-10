@@ -27,6 +27,7 @@ use zeroclaw_tools::memory_forget::MemoryForgetTool;
 use zeroclaw_tools::memory_purge::MemoryPurgeTool;
 use zeroclaw_tools::memory_recall::MemoryRecallTool;
 use zeroclaw_tools::memory_store::MemoryStoreTool;
+use zeroclaw_tools::shared_memory_store::SharedMemoryStoreTool;
 
 fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
@@ -676,13 +677,30 @@ impl DelegateTool {
         memory: Arc<dyn Memory>,
         security: Arc<SecurityPolicy>,
     ) -> Vec<Box<dyn Tool>> {
-        vec![
+        let mut tools: Vec<Box<dyn Tool>> = vec![
             Box::new(MemoryStoreTool::new(memory.clone(), security.clone())),
             Box::new(MemoryRecallTool::new(memory.clone())),
             Box::new(MemoryForgetTool::new(memory.clone(), security.clone())),
             Box::new(MemoryExportTool::new(memory.clone())),
-            Box::new(MemoryPurgeTool::new(memory, security)),
-        ]
+            Box::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
+        ];
+        // Mirror the primary assembly: expose the shared/system write tools on
+        // the delegate path too, but only when the target's backend supports
+        // the tier, so a delegated turn neither silently gains nor loses the
+        // capability. The same per-agent risk-profile gate still applies.
+        if SharedMemoryStoreTool::is_supported(&memory, false) {
+            tools.push(Box::new(SharedMemoryStoreTool::new_shared(
+                memory.clone(),
+                security.clone(),
+            )));
+        }
+        if SharedMemoryStoreTool::is_supported(&memory, true) {
+            tools.push(Box::new(SharedMemoryStoreTool::new_system(
+                memory.clone(),
+                security.clone(),
+            )));
+        }
+        tools
     }
 
     async fn independent_agentic_tools_for_target(
