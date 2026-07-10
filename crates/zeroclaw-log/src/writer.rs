@@ -41,7 +41,6 @@ use crate::event::LogEvent;
 use crate::migrate;
 use crate::observer_bridge;
 use anyhow::{Context, Result};
-use parking_lot::Mutex;
 use serde_json::Value;
 
 /// Capacity of the bounded mpsc between `record_event` and the worker.
