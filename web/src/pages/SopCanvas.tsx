@@ -91,60 +91,83 @@ function edgePath(a: XY, b: XY, sourceY?: number, targetY?: number): string {
   return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
 }
 
-const SWITCH_PORT_TOP = 34;
-const SWITCH_PORT_GAP = 14;
+// Vertical lanes inside a node, laid out top-to-bottom with no overlap:
+//   header band          title (0..26)
+//   flow lane             failure / sequence / dependency handles (both edges)
+//   switch-port lane      one handle per switch rule (right edge, switch only)
+//   data-pin lane         data in/out pins (left/right edges)
+// Every zone gets its own y-range so handles never collide across kinds.
+
+// Flow handle lane. Three fixed rows under the header, spaced far enough that
+// r<=6 dots never touch. Order top-to-bottom: failure, sequence, dependency.
+const FLOW_LANE_TOP = 42;
+const FLOW_LANE_GAP = 16;
+const FLOW_ROW: Record<'failure' | 'sequence' | 'dependency', number> = {
+  failure: 0,
+  sequence: 1,
+  dependency: 2,
+};
+function flowLaneY(nodeY: number, kind: 'failure' | 'sequence' | 'dependency'): number {
+  return nodeY + FLOW_LANE_TOP + FLOW_ROW[kind] * FLOW_LANE_GAP;
+}
+// Bottom of the flow lane (last row center + a little breathing room).
+const FLOW_LANE_BOTTOM = FLOW_LANE_TOP + FLOW_ROW.dependency * FLOW_LANE_GAP + 10;
+
+// Switch-port lane sits directly below the flow lane on switch nodes.
+const SWITCH_PORT_GAP = 16;
+function switchPortTop(): number {
+  return FLOW_LANE_BOTTOM + 6;
+}
 function switchPortY(nodeY: number, index: number): number {
-  return nodeY + SWITCH_PORT_TOP + index * SWITCH_PORT_GAP;
+  return nodeY + switchPortTop() + index * SWITCH_PORT_GAP;
 }
 
-const DATA_PIN_TOP = 68;
-const DATA_PIN_GAP = 15;
-function dataPinY(nodeY: number, index: number): number {
-  return nodeY + DATA_PIN_TOP + index * DATA_PIN_GAP;
+function switchPortLaneBottom(ruleCount: number): number {
+  if (ruleCount <= 0) return FLOW_LANE_BOTTOM;
+  return switchPortTop() + (ruleCount - 1) * SWITCH_PORT_GAP + 10;
+}
+
+const DATA_PIN_GAP = 16;
+// Data-pin lane top depends on whether the node has a switch-port lane above it,
+// so pins always land below the flow (and switch) handles with a divider gap.
+function dataPinTop(ruleCount: number): number {
+  return switchPortLaneBottom(ruleCount) + 8;
+}
+function dataPinY(nodeY: number, index: number, ruleCount: number): number {
+  return nodeY + dataPinTop(ruleCount) + index * DATA_PIN_GAP;
 }
 
 function dataPins(node: GraphNode, side: 'inputs' | 'outputs'): GraphPin[] {
   return node[side].filter((p) => p.class === 'data');
 }
 
-function nodeHeight(node: GraphNode): number {
+function nodeHeight(node: GraphNode, ruleCount: number): number {
   const pinRows = Math.max(dataPins(node, 'inputs').length, dataPins(node, 'outputs').length);
-  return NODE_H + (pinRows > 0 ? pinRows * DATA_PIN_GAP + 8 : 0);
+  const bottom =
+    pinRows > 0
+      ? dataPinTop(ruleCount) + pinRows * DATA_PIN_GAP + 6
+      : switchPortLaneBottom(ruleCount) + 6;
+  return Math.max(NODE_H, bottom);
 }
 
 function dataTypesCompatible(from: string | null, to: string | null): boolean {
   return from === null || to === null || from === to;
 }
 
-// Vertical offsets of the default output handles from the node's vertical
-// center. Wires must leave from the handle that spawned them, not from a
-// single midpoint, or the rope visually detaches from its port.
-const HANDLE_OFFSET: Partial<Record<FlowRole, number>> = {
-  sequence: 0,
-  dependency: 18,
-  failure: -18,
-};
-
-// Switch nodes fill the right edge with their ports, so failure/dependency
-// handles move up into the header band instead of the center offsets.
-const SWITCH_NODE_FAILURE_Y = 8;
-const SWITCH_NODE_DEPENDENCY_Y = 20;
-
-function flowOutY(nodeY: number, kind: FlowRole, hasSwitch: boolean): number | undefined {
-  if (hasSwitch) {
-    if (kind === 'failure') return nodeY + SWITCH_NODE_FAILURE_Y;
-    if (kind === 'dependency') return nodeY + SWITCH_NODE_DEPENDENCY_Y;
-    return undefined;
+function flowOutY(nodeY: number, kind: FlowRole): number | undefined {
+  if (kind === 'sequence' || kind === 'failure' || kind === 'dependency') {
+    return flowLaneY(nodeY, kind);
   }
-  const offset = HANDLE_OFFSET[kind];
-  return offset !== undefined ? nodeY + NODE_H / 2 + offset : undefined;
+  return undefined;
 }
 
-// Inbound flow anchors mirror the outbound convention so a wire lands on a
-// visible handle instead of the node's bare edge.
+// Inbound flow anchors mirror the outbound lane so a wire lands on a visible
+// handle instead of the node's bare edge.
 function flowInY(nodeY: number, kind: FlowRole): number {
-  const offset = HANDLE_OFFSET[kind];
-  return nodeY + NODE_H / 2 + (offset ?? 0);
+  if (kind === 'sequence' || kind === 'failure' || kind === 'dependency') {
+    return flowLaneY(nodeY, kind);
+  }
+  return nodeY + FLOW_LANE_TOP + FLOW_ROW.sequence * FLOW_LANE_GAP;
 }
 
 // Pointer travel (px) allowed between a wire press and release before the
@@ -342,6 +365,13 @@ export default function SopCanvas({
       const idx = src?.routing?.switch?.findIndex((r) => r.name === w.from_pin);
       return idx !== undefined && idx >= 0 ? idx : undefined;
     },
+    [stepByNum],
+  );
+
+  // Switch-rule count for a step, the single source that drives the switch-port
+  // lane and the data-pin lane offset below it.
+  const rulesForStep = useCallback(
+    (step: number): number => (stepByNum.get(step)?.routing?.switch ?? []).length,
     [stepByNum],
   );
 
@@ -574,11 +604,8 @@ export default function SopCanvas({
             const kind = (w.flow_role ?? 'sequence') as FlowRole;
             const active = runStateByStep.get(w.to_step) === 'active';
             const portIndex = switchPortIndex(w);
-            const srcHasSwitch = (stepByNum.get(w.from_step)?.routing?.switch ?? []).length > 0;
             const srcY =
-              portIndex !== undefined
-                ? switchPortY(a.y, portIndex)
-                : flowOutY(a.y, kind, srcHasSwitch);
+              portIndex !== undefined ? switchPortY(a.y, portIndex) : flowOutY(a.y, kind);
             const dstY = kind === 'trigger' ? undefined : flowInY(b.y, kind);
             const d = edgePath(a, b, srcY, dstY);
             const hovered = hoverWire === i;
@@ -722,8 +749,8 @@ export default function SopCanvas({
             // otherwise anchor to the node's bare center and render as a
             // phantom pipe leaving from nowhere. Drop it instead.
             if (fromIdx < 0 || toIdx < 0) return null;
-            const srcY = dataPinY(a.y, fromIdx);
-            const dstY = dataPinY(b.y, toIdx);
+            const srcY = dataPinY(a.y, fromIdx, rulesForStep(w.from_step));
+            const dstY = dataPinY(b.y, toIdx, rulesForStep(w.to_step));
             const d = edgePath(a, b, srcY, dstY);
             const hovered = hoverWire === -(i + 1);
             return (
@@ -781,9 +808,7 @@ export default function SopCanvas({
               { x: cursor.x - NODE_W, y: cursor.y - NODE_H / 2 },
               linkPort !== undefined
                 ? switchPortY((pos.get(linkFrom) as XY).y, linkPort)
-                : HANDLE_OFFSET[linkKind] !== undefined
-                  ? (pos.get(linkFrom) as XY).y + NODE_H / 2 + (HANDLE_OFFSET[linkKind] as number)
-                  : undefined,
+                : flowOutY((pos.get(linkFrom) as XY).y, linkKind),
             )}
             fill="none"
             stroke={wireStroke(linkKind)}
@@ -801,7 +826,7 @@ export default function SopCanvas({
                 d={edgePath(
                   src,
                   { x: cursor.x - NODE_W, y: cursor.y - NODE_H / 2 },
-                  idx >= 0 ? dataPinY(src.y, idx) : undefined,
+                  idx >= 0 ? dataPinY(src.y, idx, rulesForStep(dataLink.step)) : undefined,
                 )}
                 fill="none"
                 stroke={WIRE_STROKE.data}
@@ -867,6 +892,7 @@ export default function SopCanvas({
     const selected = selectedStep === node.step;
     const isCheckpoint = step?.kind === 'checkpoint';
     const switchRules = step?.routing?.switch ?? [];
+    const ruleCount = switchRules.length;
     return (
       <g
         key={node.step}
@@ -888,7 +914,7 @@ export default function SopCanvas({
       >
         <rect
           width={NODE_W}
-          height={nodeHeight(node)}
+          height={nodeHeight(node, ruleCount)}
           rx={10}
           fill="var(--pc-bg-surface)"
           stroke={selected ? 'var(--pc-accent)' : nodeStateStroke(state)}
@@ -927,11 +953,37 @@ export default function SopCanvas({
         ) : null}
         {switchRules.length > 0 ? (
           <g>
+            <circle
+              cx={NODE_W}
+              cy={flowLaneY(0, 'failure')}
+              r={5}
+              fill={wireStroke('failure')}
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                if (!readOnly) startLink(node.step, 'failure');
+              }}
+              className={readOnly ? '' : 'cursor-crosshair'}
+            >
+              <title>{handleTitle('sops.handle_failure', 'failure')}</title>
+            </circle>
+            <circle
+              cx={NODE_W}
+              cy={flowLaneY(0, 'dependency')}
+              r={5}
+              fill={wireStroke('dependency')}
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                if (!readOnly) startLink(node.step, 'dependency');
+              }}
+              className={readOnly ? '' : 'cursor-crosshair'}
+            >
+              <title>{handleTitle('sops.handle_dependency', 'dependency')}</title>
+            </circle>
             {switchRules.map((rule, ri) => (
               <g key={`port-${ri}`}>
                 <text
                   x={NODE_W - 16}
-                  y={SWITCH_PORT_TOP + ri * SWITCH_PORT_GAP + 3}
+                  y={switchPortTop() + ri * SWITCH_PORT_GAP + 3}
                   fontSize="9"
                   textAnchor="end"
                   fill="var(--pc-accent-light)"
@@ -940,7 +992,7 @@ export default function SopCanvas({
                 </text>
                 <circle
                   cx={NODE_W}
-                  cy={SWITCH_PORT_TOP + ri * SWITCH_PORT_GAP}
+                  cy={switchPortTop() + ri * SWITCH_PORT_GAP}
                   r={5}
                   fill={wireStroke('switch')}
                   onPointerDown={(e) => {
@@ -955,38 +1007,12 @@ export default function SopCanvas({
                 </circle>
               </g>
             ))}
-            <circle
-              cx={NODE_W}
-              cy={SWITCH_NODE_FAILURE_Y}
-              r={4.5}
-              fill={wireStroke('failure')}
-              onPointerDown={(e) => {
-                e.stopPropagation();
-                if (!readOnly) startLink(node.step, 'failure');
-              }}
-              className={readOnly ? '' : 'cursor-crosshair'}
-            >
-              <title>{handleTitle('sops.handle_failure', 'failure')}</title>
-            </circle>
-            <circle
-              cx={NODE_W}
-              cy={SWITCH_NODE_DEPENDENCY_Y}
-              r={4.5}
-              fill={wireStroke('dependency')}
-              onPointerDown={(e) => {
-                e.stopPropagation();
-                if (!readOnly) startLink(node.step, 'dependency');
-              }}
-              className={readOnly ? '' : 'cursor-crosshair'}
-            >
-              <title>{handleTitle('sops.handle_dependency', 'dependency')}</title>
-            </circle>
           </g>
         ) : (
           <g>
             <circle
               cx={NODE_W}
-              cy={NODE_H / 2}
+              cy={flowLaneY(0, 'sequence')}
               r={6}
               fill={wireStroke('sequence')}
               onPointerDown={(e) => {
@@ -999,7 +1025,7 @@ export default function SopCanvas({
             </circle>
             <circle
               cx={NODE_W}
-              cy={NODE_H / 2 - 18}
+              cy={flowLaneY(0, 'failure')}
               r={5}
               fill={wireStroke('failure')}
               onPointerDown={(e) => {
@@ -1012,7 +1038,7 @@ export default function SopCanvas({
             </circle>
             <circle
               cx={NODE_W}
-              cy={NODE_H / 2 + 18}
+              cy={flowLaneY(0, 'dependency')}
               r={5}
               fill={wireStroke('dependency')}
               onPointerDown={(e) => {
@@ -1025,13 +1051,13 @@ export default function SopCanvas({
             </circle>
           </g>
         )}
-        <circle cx={0} cy={NODE_H / 2} r={5} fill={wireStroke('sequence')} stroke="var(--pc-bg-surface)" strokeWidth={1}>
+        <circle cx={0} cy={flowLaneY(0, 'sequence')} r={5} fill={wireStroke('sequence')} stroke="var(--pc-bg-surface)" strokeWidth={1}>
           <title>{handleTitle('sops.handle_in_sequence', 'sequence')}</title>
         </circle>
-        <circle cx={0} cy={NODE_H / 2 - 18} r={4} fill={wireStroke('failure')} stroke="var(--pc-bg-surface)" strokeWidth={1}>
+        <circle cx={0} cy={flowLaneY(0, 'failure')} r={4} fill={wireStroke('failure')} stroke="var(--pc-bg-surface)" strokeWidth={1}>
           <title>{handleTitle('sops.handle_in_failure', 'failure')}</title>
         </circle>
-        <circle cx={0} cy={NODE_H / 2 + 18} r={4} fill={wireStroke('dependency')} stroke="var(--pc-bg-surface)" strokeWidth={1}>
+        <circle cx={0} cy={flowLaneY(0, 'dependency')} r={4} fill={wireStroke('dependency')} stroke="var(--pc-bg-surface)" strokeWidth={1}>
           <title>{handleTitle('sops.handle_in_dependency', 'dependency')}</title>
         </circle>
         {dataPins(node, 'inputs').map((pin, di) => {
@@ -1040,7 +1066,7 @@ export default function SopCanvas({
             <g key={`din-${pin.name}`}>
               <circle
                 cx={0}
-                cy={dataPinY(0, di)}
+                cy={dataPinY(0, di, ruleCount)}
                 r={5}
                 fill={active ? WIRE_STROKE.data : 'var(--pc-bg-surface)'}
                 stroke={WIRE_STROKE.data}
@@ -1063,7 +1089,7 @@ export default function SopCanvas({
                   {pin.required ? ` (${t('sops.pin_required')})` : ''}
                 </title>
               </circle>
-              <text x={10} y={dataPinY(0, di) + 3} fontSize="9" fill="var(--pc-text-muted)">
+              <text x={10} y={dataPinY(0, di, ruleCount) + 3} fontSize="9" fill="var(--pc-text-muted)">
                 {pin.name.slice(0, 18)}
               </text>
             </g>
@@ -1073,7 +1099,7 @@ export default function SopCanvas({
           <g key={`dout-${pin.name}`}>
             <circle
               cx={NODE_W}
-              cy={dataPinY(0, di)}
+              cy={dataPinY(0, di, ruleCount)}
               r={5}
               fill={WIRE_STROKE.data}
               onPointerDown={(e) => {
@@ -1086,7 +1112,7 @@ export default function SopCanvas({
                 {pin.name}: {pin.data_type ?? t('sops.pin_any')}
               </title>
             </circle>
-            <text x={NODE_W - 10} y={dataPinY(0, di) + 3} fontSize="9" textAnchor="end" fill="var(--pc-text-muted)">
+            <text x={NODE_W - 10} y={dataPinY(0, di, ruleCount) + 3} fontSize="9" textAnchor="end" fill="var(--pc-text-muted)">
               {pin.name.slice(0, 18)}
             </text>
           </g>
