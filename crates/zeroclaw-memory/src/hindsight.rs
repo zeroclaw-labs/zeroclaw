@@ -28,12 +28,22 @@
 //! template. There is no env-only constructor: the typed config is the single
 //! source of truth for endpoint, token env, timeout, and bank derivation.
 //!
-//! Deletion (`forget` / `forget_for_agent`): mapped to the hindsight invalidate
-//! endpoint (`PATCH .../memories/{id}` with `state=invalidated`), a soft-delete
-//! so a first-class backend never silently declines a removal. The `key` the
-//! trait passes is the memory id the read paths surface (`id` and `key` are both
-//! set to the server id in `to_entry`). Deletion targets the private bank only -
-//! the same bank writes land in.
+//! Deletion (`forget` / `forget_for_agent`): the `Memory` contract removes by
+//! the SAME logical key `store` accepts (mirroring every other backend, e.g.
+//! `SqliteMemory::forget` deletes `WHERE key = ?`). Hindsight stores that
+//! caller key as `context` and assigns its OWN opaque item id server-side, so
+//! `forget` cannot simply treat the caller's key as the id: it first resolves
+//! `context == key` to the matching item id(s) via a list scan
+//! ([`HindsightMemory::resolve_context_to_ids`]), then invalidates each
+//! resolved id via `PATCH .../memories/{id}` with `state=invalidated` (a
+//! soft-delete). `to_entry` surfaces the caller's original key on
+//! `MemoryEntry::key` (from `context`) and the server id separately on
+//! `MemoryEntry::id`, so a `store`/`recall`/`forget` round trip works with the
+//! same key throughout. Hindsight v0.8.4 only allows curating (invalidating)
+//! `world`/`experience` facts, not derived `observation` rows; a `forget` that
+//! resolves to an `observation` item returns a clear error instead of silently
+//! failing or bypassing the backend's own contract. Deletion targets the
+//! private bank only - the same bank writes land in.
 //!
 //! Recall type filter: `recall_types` (typed `[memory.hindsight] recall_types`,
 //! env fallback `ZC_HINDSIGHT_RECALL_TYPES`) restricts recall to selected
@@ -60,6 +70,17 @@
 //! private bank, so one agent's shared tier can never alias another agent's
 //! private bank. The per-instance [`resolve_secondary_bank`] drop below is a
 //! second, defense-in-depth guard for the single constructing instance.
+//!
+//! Retention scope (IMPORTANT): explicit deletion (`forget` / `forget_for_agent`,
+//! documented above) covers a caller that holds a memory id. *Automatic*
+//! time-based retention is NOT wired to this backend: [`crate::hygiene::run_if_due`]
+//! prunes the local SQLite/markdown stores under the workspace directory
+//! directly and never routes expiry through the [`Memory`] trait, so an
+//! expired Hindsight Daily item is not auto-invalidated remotely.
+//! Backend-neutral automatic retention (routing hygiene expiry through
+//! `forget`) is deliberately out of scope here and tracked as follow-up work;
+//! do not claim automatic remote retention for this driver until that wiring
+//! lands.
 
 use super::traits::{Memory, MemoryCategory, MemoryEntry, SharedWritable};
 use anyhow::{Context, Result};
@@ -82,6 +103,18 @@ const SYSTEM_BANK_ENV: &str = "ZC_HINDSIGHT_SYSTEM_BANK";
 /// `urlencoding` before interpolating them into a request URL.
 fn encode_segment(segment: &str) -> String {
     urlencoding::encode(segment).into_owned()
+}
+
+/// Whether `segment` is the reserved single- or double-dot path segment
+/// (`.` or `..`). `urlencoding::encode` passes `.` through unchanged (it is an
+/// unreserved URL byte), but HTTP clients and servers normalize `.`/`..` path
+/// segments during URL resolution. An id of exactly `.` or `..` sent as the
+/// final path segment of an authenticated PATCH could therefore be resolved to
+/// a different resource than `.../memories/{id}` (e.g. the bank collection
+/// itself, or its parent). Reject the id outright rather than relying on
+/// percent-encoding to protect a byte it deliberately leaves untouched.
+fn is_reserved_dot_segment(segment: &str) -> bool {
+    segment == "." || segment == ".."
 }
 
 /// Maximum number of bytes of a remote error body echoed into an error message.
@@ -385,10 +418,18 @@ impl HindsightMemory {
     /// `Ok(true)` when the server accepted the invalidation, `Ok(false)` for a
     /// `404` (already gone / unknown id) so retention/hygiene degrade
     /// gracefully. Other non-success statuses surface as an error; an empty id
-    /// is a no-op.
+    /// is a no-op. A literal `.`/`..` id segment is refused: `urlencoding`
+    /// leaves those bytes unchanged, but URL/path normalization collapses them,
+    /// so an unencoded dot-segment id could re-route this authenticated PATCH
+    /// away from the intended `.../memories/{id}` resource.
     async fn invalidate_in_bank(&self, bank: &str, id: &str) -> Result<bool> {
         if id.trim().is_empty() {
             return Ok(false);
+        }
+        if is_reserved_dot_segment(id.trim()) {
+            anyhow::bail!(
+                "hindsight invalidate refused: id {id:?} is a reserved '.'/'..' path segment"
+            );
         }
         let resp = self
             .client
@@ -409,6 +450,39 @@ impl HindsightMemory {
         }
         let body = bounded_error_body(resp).await;
         anyhow::bail!("hindsight invalidate returned HTTP {status}: {body}");
+    }
+
+    /// `Memory::forget` / `forget_for_agent` entry point: resolve the
+    /// caller-facing logical `key` (the `context` `store` wrote) to the
+    /// matching Hindsight item id(s) in `bank`, then invalidate each. An empty
+    /// key or no match is a no-op (`Ok(false)`), matching every other
+    /// backend's "nothing removed" contract. If any matching row is a derived
+    /// `observation` - which Hindsight v0.8.4 does not allow curating - this
+    /// returns a clear error instead of silently skipping it or leaving it
+    /// behind after removing sibling rows, so a caller never believes a key
+    /// was fully forgotten when part of it is actually undeletable.
+    async fn forget_by_key_in_bank(&self, bank: &str, key: &str) -> Result<bool> {
+        if key.trim().is_empty() {
+            return Ok(false);
+        }
+        let (ids, blocked_observation) = self.resolve_context_to_ids(bank, key).await?;
+        if blocked_observation {
+            anyhow::bail!(
+                "hindsight forget refused: key {key:?} matches a derived 'observation' fact, \
+                 which Hindsight does not allow curating (invalidating); only 'world'/'experience' \
+                 facts can be deleted"
+            );
+        }
+        if ids.is_empty() {
+            return Ok(false);
+        }
+        let mut removed_any = false;
+        for id in ids {
+            if self.invalidate_in_bank(bank, &id).await? {
+                removed_any = true;
+            }
+        }
+        Ok(removed_any)
     }
 
     fn recall_url_for(&self, bank: &str) -> String {
@@ -517,16 +591,12 @@ impl HindsightMemory {
         Ok(())
     }
 
-    /// List a single named bank.
-    ///
-    /// The Hindsight list endpoint has no server-side `types` filter, so when
-    /// `recall_types` is configured the filter is applied LOCALLY on each row's
-    /// fact type here. This makes the recent-recall (empty/`*` query) path -
-    /// which falls back to `list` - honor the same type restriction as the
-    /// query-based `recall` path, instead of returning every fact type. A row
-    /// with no server-provided type is KEPT so unlabeled/legacy history is never
-    /// silently dropped by the filter.
-    async fn list_bank(&self, bank: &str) -> Result<Vec<MemoryEntry>> {
+    /// Raw list of a single named bank's items, unfiltered by `recall_types`.
+    /// The forget key-resolution path needs to see every fact type (including
+    /// `observation`) so it can distinguish "no such key" from "key exists but
+    /// names an undeletable observation", which the `recall_types`-filtered
+    /// [`Self::list_bank`] view would otherwise hide.
+    async fn list_bank_raw(&self, bank: &str) -> Result<Vec<ListItem>> {
         let resp = self
             .client
             .get(self.list_url_for(bank))
@@ -543,12 +613,55 @@ impl HindsightMemory {
             .json()
             .await
             .context("hindsight list returned unparseable JSON")?;
-        Ok(parsed
-            .items
+        Ok(parsed.items)
+    }
+
+    /// List a single named bank.
+    ///
+    /// The Hindsight list endpoint has no server-side `types` filter, so when
+    /// `recall_types` is configured the filter is applied LOCALLY on each row's
+    /// fact type here. This makes the recent-recall (empty/`*` query) path -
+    /// which falls back to `list` - honor the same type restriction as the
+    /// query-based `recall` path, instead of returning every fact type. A row
+    /// with no server-provided type is KEPT so unlabeled/legacy history is never
+    /// silently dropped by the filter.
+    async fn list_bank(&self, bank: &str) -> Result<Vec<MemoryEntry>> {
+        Ok(self
+            .list_bank_raw(bank)
+            .await?
             .into_iter()
             .filter(|i| self.fact_type_allowed(i.fact_type.as_deref()))
             .map(|i| Self::to_entry(i.id, i.text, i.context, i.mentioned_at, &i.tags, None))
             .collect())
+    }
+
+    /// Resolve a caller-facing logical `key` (the `context` value `store`
+    /// wrote) to the Hindsight item id(s) currently carrying it in `bank`, so
+    /// `forget`/`forget_for_agent` can invalidate by the SAME key `store`
+    /// accepted rather than misinterpreting the key as an opaque server id.
+    ///
+    /// Returns `(deletable_ids, blocked_observation)`: `deletable_ids` are
+    /// `world`/`experience` item ids matching `key` (Hindsight v0.8.4 only
+    /// allows curating those two fact types), and `blocked_observation` is
+    /// `true` when at least one matching row is a derived `observation` that
+    /// the curation PATCH cannot remove. A caller sees `blocked_observation`
+    /// even when other deletable rows also matched, so `forget` can refuse the
+    /// whole operation rather than silently leaving an undeletable row behind.
+    async fn resolve_context_to_ids(&self, bank: &str, key: &str) -> Result<(Vec<String>, bool)> {
+        let items = self.list_bank_raw(bank).await?;
+        let mut ids = Vec::new();
+        let mut blocked_observation = false;
+        for item in items {
+            if item.context.as_deref() != Some(key) {
+                continue;
+            }
+            let Some(id) = item.id else { continue };
+            match item.fact_type.as_deref() {
+                Some("observation") => blocked_observation = true,
+                _ => ids.push(id),
+            }
+        }
+        Ok((ids, blocked_observation))
     }
 
     /// Whether a row with the given server fact type passes the configured
@@ -701,15 +814,24 @@ impl HindsightMemory {
         tags: &[String],
         score: Option<f64>,
     ) -> MemoryEntry {
+        // `key` carries the caller-facing logical key (`store`'s `context`),
+        // NOT the server-assigned item id, so a `store(key, ...)` /
+        // `recall`/`list` / `forget(key)` round trip uses the same key
+        // throughout - matching every other `Memory` backend's contract
+        // (`forget` removes by the key `store` accepted). The opaque server
+        // id is exposed separately on `id`, and `forget`/`forget_for_agent`
+        // internally resolve a caller key back to it (see
+        // `resolve_context_to_ids`).
+        let context = context.unwrap_or_else(|| "default".to_string());
         MemoryEntry {
-            id: id.clone().unwrap_or_default(),
-            key: id.unwrap_or_default(),
+            id: id.unwrap_or_default(),
+            key: context.clone(),
             content: text.unwrap_or_default(),
             category: Self::category_from_tags(tags),
             timestamp: mentioned_at.unwrap_or_default(),
             session_id: None,
             score,
-            namespace: context.unwrap_or_else(|| "default".to_string()),
+            namespace: context,
             importance: None,
             superseded_by: None,
             kind: None,
@@ -857,20 +979,21 @@ impl Memory for HindsightMemory {
     }
 
     async fn forget(&self, key: &str) -> Result<bool> {
-        // Hindsight has no key-addressed delete: `key` is the memory id the
-        // read paths surface (both `id` and `key` on a `MemoryEntry` are set to
-        // the server id in `to_entry`). Soft-delete it in the private bank via
-        // the invalidate PATCH so a first-class backend never silently declines
-        // a removal. A `404` maps to `Ok(false)` so hygiene degrades
-        // gracefully.
-        self.invalidate_in_bank(&self.bank, key).await
+        // `key` is the SAME logical key `store` accepted (Hindsight's
+        // `context`), matching the `Memory::forget` contract every other
+        // backend implements. Resolve it to the underlying Hindsight item
+        // id(s) in the private bank, then invalidate each one; empty/no-match
+        // keys are a no-op, and a match that resolves to a derived
+        // `observation` (which Hindsight's curation PATCH cannot remove) is a
+        // clear error rather than a silent no-op or a misdirected PATCH.
+        self.forget_by_key_in_bank(&self.bank, key).await
     }
 
     async fn forget_for_agent(&self, key: &str, _agent_id: &str) -> Result<bool> {
         // The bank is the per-agent scope, so agent_id is redundant here: the
-        // private bank already isolates this agent's rows. Forget by id in the
+        // private bank already isolates this agent's rows. Forget by key in the
         // private bank, same as `forget`.
-        self.invalidate_in_bank(&self.bank, key).await
+        self.forget_by_key_in_bank(&self.bank, key).await
     }
 
     async fn count(&self) -> Result<usize> {
@@ -1720,12 +1843,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forget_issues_invalidate_patch_to_private_bank() {
-        // forget(id) must PATCH .../memories/{id} on the PRIVATE bank with
-        // {"state":"invalidated"} and map a 2xx to Ok(true).
+    async fn forget_resolves_caller_key_to_server_id_then_invalidates() {
+        // The Memory contract: forget(key) removes by the SAME key store()
+        // accepted. store() writes the caller key as `context`; the server
+        // assigns its own opaque id ("srv-abc123", NOT "user_lang"). forget
+        // must resolve "user_lang" -> "srv-abc123" via a list scan, then PATCH
+        // invalidate on THAT id - never PATCH the raw caller key as if it were
+        // the server id.
         let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "srv-abc123", "text": "Rust", "context": "user_lang", "type": "world" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        // The mock only matches a PATCH to the RESOLVED server id - a PATCH to
+        // the literal caller key "user_lang" would 404 against this mock,
+        // failing the test.
         Mock::given(method("PATCH"))
-            .and(path("/v1/default/banks/zeroclaw-test/memories/mem-123"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/srv-abc123"))
             .and(header("authorization", "Bearer test-token"))
             .and(body_partial_json(json!({ "state": "invalidated" })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
@@ -1734,39 +1873,143 @@ mod tests {
 
         let mem = memory_for(&server.uri(), "zeroclaw-test");
         assert!(
-            mem.forget("mem-123").await.expect("forget should succeed"),
-            "a 2xx invalidate must report the row removed"
+            mem.forget("user_lang")
+                .await
+                .expect("forget should succeed"),
+            "resolving the caller key to the server id must invalidate the right resource"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_recall_forget_round_trip_uses_the_same_caller_key() {
+        // Full contract proof: store(key) -> recall() surfaces MemoryEntry::key
+        // == the original caller key (not the server id) -> forget(that same
+        // key) resolves and removes the right resource. This is the "real
+        // store->recall->forget round trip" the key-contract fix must satisfy,
+        // as opposed to a test that fabricates a server id directly.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/recall"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    { "id": "srv-xyz", "text": "Prefers Rust", "context": "user_lang", "type": "world" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "srv-xyz", "text": "Prefers Rust", "context": "user_lang", "type": "world" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/srv-xyz"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        mem.store("user_lang", "Prefers Rust", MemoryCategory::Core, None)
+            .await
+            .expect("store should succeed");
+
+        let recalled = mem
+            .recall("Rust", 5, None, None, None)
+            .await
+            .expect("recall should succeed");
+        assert_eq!(recalled.len(), 1);
+        // The caller-facing key survives the round trip; it is NOT the opaque
+        // server id.
+        assert_eq!(recalled[0].key, "user_lang");
+        assert_eq!(recalled[0].id, "srv-xyz");
+
+        let removed = mem
+            .forget(&recalled[0].key)
+            .await
+            .expect("forget with the recalled caller key should succeed");
+        assert!(removed, "forget must resolve the caller key and remove it");
+    }
+
+    #[tokio::test]
+    async fn forget_no_matching_key_is_a_noop() {
+        // A key with no matching `context` in the bank must not fire any PATCH
+        // and must report nothing removed, same as every other backend's
+        // "not found" contract.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "srv-1", "text": "unrelated", "context": "other_key", "type": "world" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        // No PATCH mock mounted: a request to any PATCH path fails the test.
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        assert!(
+            !mem.forget("missing_key")
+                .await
+                .expect("no match must not error")
         );
     }
 
     #[tokio::test]
     async fn forget_maps_404_to_false() {
-        // An unknown/already-gone id returns 404 -> Ok(false), so hygiene
-        // degrades gracefully instead of erroring.
+        // A resolved id that the server has already removed (404 on the
+        // invalidate PATCH) maps to Ok(false), so hygiene degrades gracefully.
         let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "srv-gone", "text": "t", "context": "stale_key", "type": "world" }
+                ]
+            })))
+            .mount(&server)
+            .await;
         Mock::given(method("PATCH"))
-            .and(path("/v1/default/banks/zeroclaw-test/memories/missing"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/srv-gone"))
             .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
             .mount(&server)
             .await;
 
         let mem = memory_for(&server.uri(), "zeroclaw-test");
-        assert!(!mem.forget("missing").await.expect("404 must not error"));
+        assert!(!mem.forget("stale_key").await.expect("404 must not error"));
     }
 
     #[tokio::test]
     async fn forget_surfaces_server_error() {
-        // A 5xx is a real failure and must surface as an error (not a silent
-        // false), so the caller can retry/log.
+        // A 5xx from the invalidate PATCH is a real failure and must surface
+        // as an error (not a silent false), so the caller can retry/log.
         let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "srv-boom", "text": "t", "context": "boom_key", "type": "world" }
+                ]
+            })))
+            .mount(&server)
+            .await;
         Mock::given(method("PATCH"))
-            .and(path("/v1/default/banks/zeroclaw-test/memories/boom"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/srv-boom"))
             .respond_with(ResponseTemplate::new(500).set_body_string("kaboom"))
             .mount(&server)
             .await;
 
         let mem = memory_for(&server.uri(), "zeroclaw-test");
-        let err = mem.forget("boom").await.unwrap_err();
+        let err = mem.forget("boom_key").await.unwrap_err();
         assert!(
             err.to_string().contains("500"),
             "5xx must surface the status: {err}"
@@ -1774,19 +2017,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forget_empty_id_is_a_noop() {
-        // No mock mounted: an empty id must not fire a request.
+    async fn forget_empty_key_is_a_noop() {
+        // No mock mounted: an empty/whitespace key must not fire any request.
         let mem = memory_for("http://127.0.0.1:1", "zeroclaw-test");
-        assert!(!mem.forget("   ").await.expect("empty id short-circuits"));
+        assert!(!mem.forget("   ").await.expect("empty key short-circuits"));
     }
 
     #[tokio::test]
-    async fn forget_for_agent_targets_private_bank_by_id() {
-        // forget_for_agent ignores agent_id (the bank is the per-agent scope)
-        // and invalidates by id in the private bank, same as forget.
+    async fn forget_refuses_dot_id_segments() {
+        // Even if a resolved (or directly-supplied) id were exactly "." or
+        // "..", the invalidate path must refuse it rather than let unencoded
+        // dot-segment normalization re-route the authenticated PATCH away from
+        // the intended memory item.
+        let mem = memory_for("http://127.0.0.1:1", "zeroclaw-test");
+        let err = mem
+            .invalidate_in_bank("zeroclaw-test", ".")
+            .await
+            .expect_err("a single-dot id must be refused");
+        assert!(err.to_string().contains('.'));
+
+        let err = mem
+            .invalidate_in_bank("zeroclaw-test", "..")
+            .await
+            .expect_err("a double-dot id must be refused");
+        assert!(err.to_string().contains(".."));
+    }
+
+    #[tokio::test]
+    async fn forget_refuses_observation_fact_type() {
+        // Hindsight v0.8.4 only allows curating (invalidating) world/experience
+        // facts, not derived observations. A key that resolves to an
+        // observation must return a clear typed error rather than silently
+        // no-op-ing or firing a PATCH the server would reject anyway.
         let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "srv-obs", "text": "derived", "context": "obs_key", "type": "observation" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        // No PATCH mock mounted: an observation must never reach the PATCH
+        // call at all.
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let err = mem
+            .forget("obs_key")
+            .await
+            .expect_err("forget on an observation-backed key must error");
+        assert!(
+            err.to_string().to_lowercase().contains("observation"),
+            "error must name the observation constraint: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_for_agent_resolves_caller_key_in_private_bank() {
+        // forget_for_agent ignores agent_id (the bank is the per-agent scope)
+        // and resolves+invalidates by key in the private bank, same as forget.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "srv-mem-9", "text": "t", "context": "agent_key", "type": "world" }
+                ]
+            })))
+            .mount(&server)
+            .await;
         Mock::given(method("PATCH"))
-            .and(path("/v1/default/banks/zeroclaw-test/memories/mem-9"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/srv-mem-9"))
             .and(body_partial_json(json!({ "state": "invalidated" })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
             .mount(&server)
@@ -1794,7 +2096,7 @@ mod tests {
 
         let mem = memory_for(&server.uri(), "zeroclaw-test");
         assert!(
-            mem.forget_for_agent("mem-9", "any-agent")
+            mem.forget_for_agent("agent_key", "any-agent")
                 .await
                 .expect("forget_for_agent should succeed")
         );
@@ -1975,6 +2277,74 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no shared bank configured"));
+    }
+
+    #[tokio::test]
+    async fn count_reports_total_from_list_endpoint() {
+        // The dashboard memory-count path calls `count()`; a hindsight bank with
+        // many entries must map through as a non-zero total (the bug it fixes:
+        // the UI showed 0 while the bank was full).
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "1", "text": "a" },
+                    { "id": "2", "text": "b" }
+                ],
+                "total": 12
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let n = mem.count().await.expect("count should succeed");
+        assert_eq!(n, 12, "count must reflect the bank total, not 0");
+    }
+
+    #[tokio::test]
+    async fn count_falls_back_to_item_len_without_total() {
+        // When the server omits `total`, the item count is the fallback - still
+        // non-zero for a populated bank.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "1", "text": "a" },
+                    { "id": "2", "text": "b" },
+                    { "id": "3", "text": "c" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        assert_eq!(mem.count().await.expect("count"), 3);
+    }
+
+    #[tokio::test]
+    async fn list_returns_bank_items() {
+        // The dashboard/gateway list path maps hindsight list items to entries.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [
+                    { "id": "m1", "text": "first", "context": "c1" },
+                    { "id": "m2", "text": "second", "context": "c2" }
+                ],
+                "total": 2
+            })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        let items = mem.list(None, None).await.expect("list should succeed");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].content, "first");
+        assert_eq!(items[1].content, "second");
     }
 
     #[tokio::test]
