@@ -779,6 +779,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             // incremental writer needs no natural-key hint
                             // to descend through it.
                             natural_key: None,
+                            resource_key: #is_resource_key,
                         });
                     });
 
@@ -1065,6 +1066,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             // HashMap arm above — the alias IS the TOML
                             // key, no natural-key hint needed.
                             natural_key: None,
+                            resource_key: #is_resource_key,
                         });
                     });
                     let validate_create = if is_resource_key {
@@ -1389,6 +1391,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         // `ObjectArray` round-trip and don't need
                         // per-element addressing.
                         natural_key: #vec_natural_key_token,
+                        resource_key: #is_resource_key,
                     });
                 });
                 // `create_map_key` on a Vec section. Two flavours:

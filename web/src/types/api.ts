@@ -77,6 +77,7 @@ export interface CronJob {
   enabled: boolean;
   delivery: CronDeliveryConfig;
   delete_after_run: boolean;
+  uses_memory: boolean;
   session_target: string | null;
   model: string | null;
   allowed_tools: string[] | null;

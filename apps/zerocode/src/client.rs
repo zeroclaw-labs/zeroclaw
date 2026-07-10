@@ -249,6 +249,13 @@ pub enum SessionUpdate {
         outcome: TurnEndOutcome,
         content: String,
     },
+    /// The agent published or updated its execution plan (TodoWrite).
+    /// Whole-list replacement; `entries` is the complete authoritative
+    /// list. An empty vec clears the tracker.
+    Plan {
+        session_id: String,
+        entries: Vec<crate::wire::PlanEntry>,
+    },
 }
 
 /// Wire mirror of the daemon's `TurnCompletionOutcome`. Decoded straight from
@@ -314,6 +321,14 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
                 .unwrap_or_default()
                 .to_string(),
         }),
+        "plan" => {
+            let entries = params.get("entries")?.clone();
+            let entries: Vec<crate::wire::PlanEntry> = serde_json::from_value(entries).ok()?;
+            Some(SessionUpdate::Plan {
+                session_id: sid,
+                entries,
+            })
+        }
         _ => None,
     }
 }
@@ -2746,5 +2761,54 @@ mod tls_tests {
     fn insecure_tls_config_builds_without_panic() {
         let cfg = RpcClient::insecure_tls_config();
         assert!(Arc::strong_count(&cfg) >= 1);
+    }
+}
+
+#[cfg(test)]
+mod plan_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parses_plan_update() {
+        let params = serde_json::json!({
+            "type": "plan",
+            "session_id": "sess-1",
+            "entries": [
+                { "content": "A", "status": "completed", "priority": "high" },
+                { "content": "B", "status": "in_progress", "activeForm": "Doing B" }
+            ]
+        });
+        let update = parse_session_update(&params).expect("plan parses");
+        match update {
+            SessionUpdate::Plan {
+                session_id,
+                entries,
+            } => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].status, crate::wire::PlanStatus::Completed);
+                assert_eq!(entries[1].active_form.as_deref(), Some("Doing B"));
+            }
+            _ => panic!("expected SessionUpdate::Plan"),
+        }
+    }
+
+    #[test]
+    fn parses_empty_plan_update_as_clear() {
+        let params = serde_json::json!({
+            "type": "plan",
+            "session_id": "sess-2",
+            "entries": []
+        });
+        match parse_session_update(&params).expect("empty plan parses") {
+            SessionUpdate::Plan { entries, .. } => assert!(entries.is_empty()),
+            _ => panic!("expected SessionUpdate::Plan"),
+        }
+    }
+
+    #[test]
+    fn plan_update_missing_entries_is_none() {
+        let params = serde_json::json!({ "type": "plan", "session_id": "s" });
+        assert!(parse_session_update(&params).is_none());
     }
 }

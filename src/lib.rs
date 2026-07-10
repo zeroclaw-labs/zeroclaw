@@ -615,6 +615,10 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        /// Set to false for stateless digest/report jobs that should not accumulate or consume memory.
+        #[arg(long)]
+        uses_memory: Option<bool>,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -641,6 +645,9 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -666,6 +673,9 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -692,6 +702,9 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
         /// Command (shell) or prompt (when --prompt) to run
         command: String,
     },
@@ -733,6 +746,9 @@ Examples:
         /// Replace the agent job allowlist with the specified tool names (repeatable)
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
     },
     /// Pause a scheduled task
     Pause {

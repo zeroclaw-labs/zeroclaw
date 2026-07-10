@@ -258,6 +258,13 @@ pub struct Config {
     #[group = "Agent"]
     pub heartbeat: HeartbeatConfig,
 
+    /// ZeroCode live task tracker (`[todotracker]`), the read-only
+    /// TodoWrite visual tracker in the Code pane.
+    #[serde(default)]
+    #[nested]
+    #[group = "Operations"]
+    pub todotracker: TodoTrackerConfig,
+
     /// Declarative cron jobs (`[cron.<alias>]`), alias-keyed.
     ///
     /// Each entry is a named scheduled job synced into the database at
@@ -5500,21 +5507,29 @@ pub enum ToolFilterGroupMode {
 
 /// A named group of MCP tool patterns with an activation mode.
 ///
-/// Each group lists glob patterns for MCP tool names (prefix `mcp_`) and an
-/// optional set of keywords that trigger inclusion in `dynamic` mode.
-/// Built-in (non-MCP) tools always pass through and are never affected by
-/// `tool_filter_groups`.
+/// Each group lists glob patterns for MCP tool names and an optional set of
+/// keywords that trigger inclusion in `dynamic` mode. MCP tools are named
+/// `<server>__<tool>` (double-underscore separator, e.g. `filesystem__read_file`).
+///
+/// Classification is by origin, not name shape: only tools that actually came
+/// from the MCP registry are subject to these groups. Built-in tools AND skill
+/// tools — which share the `<x>__<y>` naming convention (`{skill}__{tool}`) —
+/// always pass through and are never affected by `tool_filter_groups`.
+///
+/// Under `[mcp] deferred_loading = true`, `mode = "always"` entries are
+/// pre-activated at assembly time so matching tools are live from the first
+/// turn without a `tool_search` round-trip.
 ///
 /// # Example
 /// ```toml
-/// [[agent.tool_filter_groups]]
+/// [[runtime_profiles.default.tool_filter_groups]]
 /// mode = "always"
-/// tools = ["mcp_filesystem_*"]
+/// tools = ["filesystem__*"]
 /// keywords = []
 ///
-/// [[agent.tool_filter_groups]]
+/// [[runtime_profiles.default.tool_filter_groups]]
 /// mode = "dynamic"
-/// tools = ["mcp_browser_*"]
+/// tools = ["browser__*"]
 /// keywords = ["browse", "website", "url", "search"]
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5530,9 +5545,6 @@ pub struct ToolFilterGroup {
     /// Ignored when `mode = "always"`.
     #[serde(default)]
     pub keywords: Vec<String>,
-    /// When true, also filter built-in tools (not just MCP tools).
-    #[serde(default)]
-    pub filter_builtins: bool,
 }
 
 /// OpenAI Whisper STT model_provider configuration (`[transcription.openai]`).
@@ -12013,6 +12025,74 @@ impl Default for HeartbeatConfig {
     }
 }
 
+// ── TodoTracker ──────────────────────────────────────────────────
+
+/// Location of the ZeroCode TodoWrite tracker panel.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum TodoTrackerLocation {
+    /// Horizontal strip between the transcript and the input bar (Claude Code style).
+    Bottom,
+    /// Vertical side panel on the left.
+    Left,
+    /// Vertical side panel on the right (OpenCode style). Default.
+    #[default]
+    Right,
+}
+
+/// ZeroCode live task tracker configuration (`[todotracker]` section).
+///
+/// Read-only visual tracker driven by the model's `TodoWrite` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "todotracker"]
+pub struct TodoTrackerConfig {
+    /// Master switch. When `false` the tracker never renders and never
+    /// auto-pops. Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Whether the panel is visible at launch (when `enabled`). When
+    /// `false` it stays hidden until toggled or auto-popped by the first
+    /// plan. Default: `false`.
+    #[serde(default)]
+    pub enabled_at_start: bool,
+    /// Panel location: `bottom` (between transcript and input), `left`,
+    /// or `right` (default).
+    #[serde(default)]
+    pub location: TodoTrackerLocation,
+    /// Side-panel target column width (left/right). Runtime-clamped to at
+    /// most half the terminal width. Ignored for `bottom`. Default: `32`.
+    #[serde(default = "default_todotracker_width")]
+    pub width: u16,
+    /// Bottom-strip maximum height in rows (grows up to this). Ignored for
+    /// left/right. Default: `5`.
+    #[serde(default = "default_todotracker_max_height")]
+    pub max_height: u16,
+}
+
+fn default_todotracker_width() -> u16 {
+    32
+}
+
+fn default_todotracker_max_height() -> u16 {
+    5
+}
+
+impl Default for TodoTrackerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            enabled_at_start: false,
+            location: TodoTrackerLocation::Right,
+            width: default_todotracker_width(),
+            max_height: default_todotracker_max_height(),
+        }
+    }
+}
+
 // ── Cron ────────────────────────────────────────────────────────
 
 /// A declarative cron job definition (`[cron.<alias>]`).
@@ -16849,6 +16929,7 @@ impl Default for Config {
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            todotracker: TodoTrackerConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig::default(),
@@ -17499,6 +17580,54 @@ impl Config {
                 }
             }
         }
+        out
+    }
+
+    /// Sender usernames authorized to issue `/model --agent <model>` on
+    /// `<channel_type>.<alias>` for agent `agent_alias`. A
+    /// `[peer_groups.<name>]` contributes when its `channel` matches
+    /// (type-wide or dotted), its `admin_for_agent_scope = true`, and its
+    /// `agents` list (if non-empty) contains `agent_alias`. Returns
+    /// deduped and sorted. Live-resolve against the `Config` this method
+    /// is called on — no internal cache. Edits to `peer_groups` take
+    /// effect at the next `Config::channel_agent_scope_admins` call; the
+    /// orchestrator gate reads through a snapshot of this `Config`, so
+    /// operator edits become visible after the runtime context is rebuilt
+    /// (daemon restart). See issue #8044.
+    pub fn channel_agent_scope_admins(
+        &self,
+        channel_type: &str,
+        alias: &str,
+        agent_alias: &str,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for group in self.peer_groups.values() {
+            if !group.admin_for_agent_scope {
+                continue;
+            }
+            let group_matches = match group.channel.split_once('.') {
+                Some((ty, al)) => ty == channel_type && al == alias,
+                None => group.channel == channel_type,
+            };
+            if !group_matches {
+                continue;
+            }
+            // Agent-bound: when the group's `agents` list is non-empty,
+            // only grant the privilege if `agent_alias` appears in it.
+            // An empty `agents` list is interpreted as "all agents"
+            // (backward-compatible channel-wide default).
+            if !group.agents.is_empty() && !group.agents.iter().any(|a| a.as_str() == agent_alias) {
+                continue;
+            }
+            for peer in &group.external_peers {
+                let username = peer.as_str().to_string();
+                if seen.insert(username.clone()) {
+                    out.push(username);
+                }
+            }
+        }
+        out.sort();
         out
     }
 
@@ -21395,6 +21524,32 @@ impl HasPropKind for serde_json::Value {
 mod tests {
 
     #[::core::prelude::v1::test]
+    fn todotracker_config_defaults() {
+        let cfg = super::TodoTrackerConfig::default();
+        assert!(cfg.enabled);
+        assert!(!cfg.enabled_at_start);
+        assert_eq!(cfg.location, super::TodoTrackerLocation::Right);
+        assert_eq!(cfg.width, 32);
+        assert_eq!(cfg.max_height, 5);
+    }
+
+    #[::core::prelude::v1::test]
+    fn todotracker_config_parses_from_toml() {
+        let toml = r#"
+enabled = true
+enabled_at_start = true
+location = "bottom"
+width = 40
+max_height = 8
+"#;
+        let cfg: super::TodoTrackerConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.enabled_at_start);
+        assert_eq!(cfg.location, super::TodoTrackerLocation::Bottom);
+        assert_eq!(cfg.width, 40);
+        assert_eq!(cfg.max_height, 8);
+    }
+
+    #[::core::prelude::v1::test]
     fn mcp_server_config_pinned_resources_defaults_empty_and_round_trips() {
         // Absent field defaults to empty.
         let cfg: McpServerConfig = serde_json::from_str(r#"{"name":"s","command":"x"}"#).unwrap();
@@ -21406,6 +21561,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.pinned_resources, vec!["file:///a", "file:///b"]);
+    }
+
+    #[::core::prelude::v1::test]
+    fn tool_filter_group_legacy_filter_builtins_key_still_parses() {
+        // `filter_builtins` was declared-but-never-read and is removed
+        // (#6699). `ToolFilterGroup` has no `deny_unknown_fields`, so configs
+        // still carrying the key must keep deserializing (silently ignored).
+        let group: super::ToolFilterGroup = toml::from_str(
+            r#"
+            mode = "always"
+            tools = ["filesystem__*"]
+            filter_builtins = true
+            "#,
+        )
+        .expect("legacy filter_builtins key must not break deserialization");
+        assert!(matches!(group.mode, super::ToolFilterGroupMode::Always));
+        assert_eq!(group.tools, vec!["filesystem__*".to_string()]);
     }
 
     #[::core::prelude::v1::test]
@@ -23410,6 +23582,7 @@ auto_save = true
                 to: Some("123456".into()),
                 ..HeartbeatConfig::default()
             },
+            todotracker: TodoTrackerConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig {
@@ -24183,6 +24356,7 @@ default_temperature = 0.7
             pipeline: PipelineConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            todotracker: TodoTrackerConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig::default(),

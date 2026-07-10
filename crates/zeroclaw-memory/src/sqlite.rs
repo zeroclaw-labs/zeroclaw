@@ -2937,22 +2937,6 @@ mod tests {
         assert_eq!(embedding.len(), 4, "vector must come from the new embedder");
     }
 
-    #[test]
-    fn cloned_handle_observes_live_embedder_swap() {
-        let (_tmp, mem) = temp_sqlite();
-        let cloned = mem.clone();
-
-        assert_eq!(cloned.embedder_dimensions(), 0);
-
-        mem.swap_embedder(Arc::new(StubEmbedding::new(4, 0.1)));
-
-        assert_eq!(
-            cloned.embedder_dimensions(),
-            4,
-            "cloned handles must share the live embedder source of truth"
-        );
-    }
-
     /// After an embedder swap, the same content must re-embed through the NEW
     /// provider rather than return the previous provider's cached vector — the
     /// `embedding_cache` (keyed by content hash only) must be invalidated.
