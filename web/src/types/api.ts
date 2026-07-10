@@ -13,6 +13,12 @@ export interface StatusResponse {
   gateway_port: number;
   locale: string;
   memory_backend: string;
+  /** Live entry count of the resolved memory backend. When the request is
+   *  scoped with `?agent=<alias>` this reflects THAT agent's own backend
+   *  (its per-alias hindsight bank, its agent-scoped SQL rows, …); without an
+   *  agent it is the install-wide store. For hindsight it counts the private
+   *  per-agent bank only, not the read-merged shared/system tiers. */
+  memory_count: number;
   paired: boolean;
   channels: Record<string, boolean>;
   health: HealthSnapshot;

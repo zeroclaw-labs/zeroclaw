@@ -299,6 +299,25 @@ pub async fn handle_api_status(
 
     let process = zeroclaw_runtime::process_stats::sample();
 
+    // Memory count for the active backend. When `?agent=<alias>` is supplied we
+    // resolve that agent's OWN backend (the per-alias hindsight bank, the
+    // agent-scoped SQL rows, the agent's markdown dir, …) so the dashboard
+    // reflects the live store rather than a default/empty local one. This is the
+    // dispatch the web memory-count path was missing for hindsight agents (their
+    // rows live in a per-agent server bank with no `agent_alias`, so the old
+    // frontend bucketing of install-wide entries always read 0). Best-effort:
+    // an unreachable/misconfigured backend yields 0 rather than failing status.
+    // Semantics: for hindsight this is the PRIVATE per-agent bank only (an
+    // agent's own footprint), not the read-merged shared/system tiers, so the
+    // dashboard's per-agent sum is not inflated by household-shared entries.
+    let memory_count: usize = match agent_alias {
+        Some(alias) => match resolve_memory_handle(&state, Some(alias)).await {
+            Ok(handle) => handle.count().await.unwrap_or(0),
+            Err(_) => 0,
+        },
+        None => state.mem.count().await.unwrap_or(0),
+    };
+
     let body = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "model_provider": model_provider,
@@ -309,6 +328,7 @@ pub async fn handle_api_status(
         "gateway_port": config.gateway.port,
         "locale": locale,
         "memory_backend": memory_backend,
+        "memory_count": memory_count,
         "paired": state.pairing.is_paired(),
         "channels": channels,
         "health": health,
@@ -2271,6 +2291,52 @@ pub(crate) mod tests {
         assert_eq!(json["entries"][0]["key"], "huge-memory");
         assert_eq!(json["entries"][0]["category"], "conversation");
         assert_ne!(content, huge);
+    }
+
+    #[tokio::test]
+    async fn handle_api_status_reports_memory_count_from_active_backend() {
+        // Regression for the dashboard "0 memories" bug: the status endpoint
+        // must surface a live entry count from the resolved backend so the UI
+        // no longer bucketed install-wide entries by `agent_alias` (which read 0
+        // for hindsight). Here the install-wide `state.mem` holds three rows;
+        // the unscoped status count must be 3.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        let entries = vec![
+            memory_entry_with_content("one".into()),
+            memory_entry_with_content("two".into()),
+            memory_entry_with_content("three".into()),
+        ];
+        let state = test_state_with_memory(config, entries);
+
+        let response = handle_api_status(
+            State(state),
+            HeaderMap::new(),
+            Query(StatusQuery { agent: None }),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        assert_eq!(json["memory_count"], 3);
+    }
+
+    #[tokio::test]
+    async fn handle_api_status_memory_count_zero_when_backend_empty() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        let state = test_state_with_memory(config, Vec::new());
+
+        let response = handle_api_status(
+            State(state),
+            HeaderMap::new(),
+            Query(StatusQuery { agent: None }),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        assert_eq!(json["memory_count"], 0);
     }
 
     #[tokio::test]
