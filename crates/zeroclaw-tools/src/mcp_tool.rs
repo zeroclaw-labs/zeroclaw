@@ -1,13 +1,13 @@
 //! Wraps a discovered MCP tool as a zeroclaw [`Tool`] so it is dispatched
 //! through the existing tool registry and agent loop without modification.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 
 use crate::mcp_client::McpRegistry;
 use crate::mcp_protocol::McpToolDef;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolResult, ToolSpec};
 
 /// A zeroclaw [`Tool`] backed by an MCP server tool.
 ///
@@ -23,6 +23,12 @@ pub struct McpToolWrapper {
     input_schema: serde_json::Value,
     /// Shared registry — used to dispatch actual tool calls.
     registry: Arc<McpRegistry>,
+    /// Lazily-cached tool spec returned by `spec()`. The agent loop calls
+    /// `tool.spec()` once per iteration across every registered tool; without
+    /// this cache, an MCP tool's full `input_schema` (`serde_json::Value`) is
+    /// deep-cloned on every call, which RSS-monotonically fills glibc arenas
+    /// under sustained MCP-heavy tool loops. #8642.
+    spec_cache: OnceLock<ToolSpec>,
 }
 
 impl McpToolWrapper {
@@ -33,6 +39,7 @@ impl McpToolWrapper {
             description,
             input_schema: def.input_schema,
             registry,
+            spec_cache: OnceLock::new(),
         }
     }
 }
@@ -49,6 +56,23 @@ impl Tool for McpToolWrapper {
 
     fn parameters_schema(&self) -> serde_json::Value {
         self.input_schema.clone()
+    }
+
+    /// Return the agent-loop-visible `ToolSpec` for this MCP tool, building it
+    /// on first call and returning a clone of the cached value thereafter.
+    ///
+    /// Without this, the default trait impl calls
+    /// `self.parameters_schema()` (a deep clone of `self.input_schema`) for
+    /// every invocation across every iteration of every turn — the dominant
+    /// RSS-growth path reported in #8642.
+    fn spec(&self) -> ToolSpec {
+        self.spec_cache
+            .get_or_init(|| ToolSpec {
+                name: self.name().to_string(),
+                description: self.description().to_string(),
+                parameters: self.input_schema.clone(),
+            })
+            .clone()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -149,6 +173,54 @@ mod tests {
         assert_eq!(spec.name, "fs__list_dir");
         assert_eq!(spec.description, "List directory");
         assert_eq!(spec.parameters, schema);
+    }
+
+    // ── spec() caching (regression: #8642) ────────────────────────────────
+    // The agent loop calls `tool.spec()` per iteration across every registered
+    // tool. Before the cache, every call deep-cloned the full
+    // `input_schema` (a `serde_json::Value`), which dominated RSS growth on
+    // glibc during sustained MCP-heavy loops. The cache must (a) return
+    // byte-identical specs across invocations and (b) lazy-init from the same
+    // source the default trait impl used.
+
+    #[tokio::test]
+    async fn spec_is_stable_across_repeated_calls() {
+        let registry = empty_registry().await;
+        let schema = json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"],
+        });
+        let def = make_def("read_file", Some("Read file"), schema.clone());
+        let wrapper = McpToolWrapper::new("fs__read_file".to_string(), def, registry);
+        let first = wrapper.spec();
+        // Many iterations later — every call must return a spec identical to
+        // the first call (same content, independent of any later state).
+        for _ in 0..32 {
+            let again = wrapper.spec();
+            assert_eq!(again.name, first.name);
+            assert_eq!(again.description, first.description);
+            assert_eq!(again.parameters, first.parameters);
+        }
+    }
+
+    #[tokio::test]
+    async fn spec_cache_is_independent_per_wrapper() {
+        // Two wrappers, two distinct schemas. Each must build its own cache
+        // entry from its own `input_schema` — caching must not leak across
+        // tool instances.
+        let registry = empty_registry().await;
+        let schema_a = json!({ "type": "object", "title": "A" });
+        let schema_b = json!({ "type": "object", "title": "B" });
+        let def_a = make_def("a", Some("Tool A"), schema_a.clone());
+        let def_b = make_def("b", Some("Tool B"), schema_b.clone());
+        let wrapper_a = McpToolWrapper::new("srv__a".to_string(), def_a, registry.clone());
+        let wrapper_b = McpToolWrapper::new("srv__b".to_string(), def_b, registry);
+        assert_eq!(wrapper_a.spec().parameters, schema_a);
+        assert_eq!(wrapper_b.spec().parameters, schema_b);
+        // Cross-check: a third call on wrapper_b must not have been poisoned
+        // by the prior `wrapper_a.spec()` invocation.
+        assert_eq!(wrapper_b.spec().parameters, schema_b);
     }
 
     // ── execute() error path ───────────────────────────────────────────────
