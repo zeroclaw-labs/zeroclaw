@@ -464,8 +464,8 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
         steering: None,
         new_messages_out: None,
         image_cache: None,
-        // Phase 1: stamp Internal/Trusted. Real per-transport
-        // stamping is PR C (RFC§4).
+        // Phase 1: stamp Internal/Trusted. Per-transport
+        // stamping lands in a later phase.
         memory: None,
         ingress: IngressContext::sub_turn(),
         agent_alias: None,
@@ -846,8 +846,8 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                 steering: None,
                 new_messages_out: None,
                 image_cache: None,
-                // Phase 1: stamp Internal/Trusted. Real per-transport
-                // stamping is PR C (RFC§4).
+                // Phase 1: stamp Internal/Trusted. Per-transport
+                // stamping lands in a later phase.
                 memory: None,
                 ingress: IngressContext::sub_turn(),
                 agent_alias: None,

@@ -825,8 +825,8 @@ pub async fn agent_turn(
         new_messages_out: None,
         image_cache: None,
         // Origin and the per-turn memory half are threaded from the entry
-        // point; source/transport/trust stay phase-1 placeholders. Real
-        // per-transport stamping is PR C (RFC§4).
+        // point; source/transport/trust stay phase-1 placeholders until
+        // per-transport stamping lands.
         memory,
         ingress: IngressContext::from_origin(origin),
         agent_alias: None,
@@ -1755,7 +1755,7 @@ pub async fn run(
                                 image_cache: None,
                                 // Origin is threaded from the entry point;
                                 // source/transport/trust stay phase-1
-                                // placeholders (real stamping is RFC§4).
+                                // placeholders until per-transport stamping.
                                 memory: Some(crate::agent::memory_inject::TurnMemory {
                                     handle: mem.as_ref(),
                                     query: effective_msg.clone(),
@@ -2298,7 +2298,7 @@ pub async fn run(
                                     image_cache: None,
                                     // Origin is threaded from the entry point;
                                     // source/transport/trust stay phase-1
-                                    // placeholders (real stamping is RFC§4).
+                                    // placeholders until per-transport stamping.
                                     memory: Some(crate::agent::memory_inject::TurnMemory {
                                         handle: mem.as_ref(),
                                         query: effective_input.clone(),
@@ -4861,8 +4861,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -4935,8 +4935,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -5016,8 +5016,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -5102,8 +5102,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -5173,8 +5173,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -5247,8 +5247,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -5322,8 +5322,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -5689,8 +5689,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -5763,8 +5763,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -5836,8 +5836,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -5995,8 +5995,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -6400,8 +6400,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -6570,8 +6570,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -6676,8 +6676,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -6766,8 +6766,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -6848,8 +6848,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -6938,8 +6938,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -7031,8 +7031,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -7129,8 +7129,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -7509,8 +7509,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -7603,8 +7603,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -7699,8 +7699,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -7781,8 +7781,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -7867,8 +7867,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -7948,8 +7948,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8027,8 +8027,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8109,8 +8109,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8188,8 +8188,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8266,8 +8266,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8336,8 +8336,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8407,8 +8407,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8478,8 +8478,8 @@ mod tests {
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8551,8 +8551,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8629,8 +8629,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8719,8 +8719,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8792,8 +8792,8 @@ Done."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8868,8 +8868,8 @@ Done."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -8942,8 +8942,8 @@ Done."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -9017,8 +9017,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -9149,8 +9149,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -9232,8 +9232,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -9319,8 +9319,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -9429,8 +9429,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -9544,8 +9544,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -9633,8 +9633,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -10613,8 +10613,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -11073,8 +11073,8 @@ This is an example, not an invocation."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -13389,8 +13389,8 @@ Let me check the result."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -13564,8 +13564,8 @@ Let me check the result."#;
                     steering: None,
                     new_messages_out: None,
                     image_cache: None,
-                    // Phase 1: stamp Internal/Trusted. Real per-transport
-                    // stamping is PR C (RFC§4).
+                    // Phase 1: stamp Internal/Trusted. Per-transport
+                    // stamping lands in a later phase.
                     memory: None,
                     ingress: IngressContext::sub_turn(),
                     agent_alias: None,
@@ -13638,8 +13638,8 @@ Let me check the result."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
@@ -13751,8 +13751,8 @@ Let me check the result."#;
                     steering: None,
                     new_messages_out: None,
                     image_cache: None,
-                    // Phase 1: stamp Internal/Trusted. Real per-transport
-                    // stamping is PR C (RFC§4).
+                    // Phase 1: stamp Internal/Trusted. Per-transport
+                    // stamping lands in a later phase.
                     memory: None,
                     ingress: IngressContext::sub_turn(),
                     agent_alias: None,
@@ -13830,8 +13830,8 @@ Let me check the result."#;
             steering: None,
             new_messages_out: None,
             image_cache: None,
-            // Phase 1: stamp Internal/Trusted. Real per-transport
-            // stamping is PR C (RFC§4).
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
             agent_alias: None,

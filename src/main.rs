@@ -79,7 +79,7 @@ fn read_capped_line<R: std::io::BufRead>(reader: R, cap: usize) -> std::io::Resu
 /// Truncate `line` in place to at most `cap` bytes, rounding the cut down to a
 /// UTF-8 char boundary. `String::truncate` panics when the byte index lands
 /// inside a multi-byte character, so a raw `line.truncate(cap)` on piped input
-/// is a latent panic (#7828). No-op when the string already fits.
+/// is a latent panic. No-op when the string already fits.
 fn cap_line_utf8_safe(line: &mut String, cap: usize) {
     if line.len() > cap {
         line.truncate(line.floor_char_boundary(cap));
@@ -302,7 +302,7 @@ fn pause_after_no_command_help() {
     if line.len() > STDIN_LINE_CAP {
         // Round down to a UTF-8 char boundary before truncating: a piped
         // multi-byte payload can land the byte cap inside a character, and
-        // `String::truncate` panics on a non-boundary index (#7828).
+        // `String::truncate` panics on a non-boundary index.
         cap_line_utf8_safe(&mut line, STDIN_LINE_CAP);
     }
 }
@@ -7598,7 +7598,7 @@ mod tests {
     fn cap_line_utf8_safe_no_panic_on_multibyte_boundary() {
         // Neutral multi-byte placeholder text; each CJK char is 3 bytes, so a
         // byte cap can land inside a character. Pre-fix this panicked via the
-        // raw `String::truncate(cap)` (#7828).
+        // raw `String::truncate(cap)`.
         let mut line = "语言".repeat(64); // 128 chars, 384 bytes, all 3-byte
         let cap = 10; // byte index 10 is mid-character (10 % 3 != 0)
         assert!(

@@ -3455,7 +3455,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         }
         // Width follows the entry's rendered text, not the full panel, so a
         // click in the blank margin beside a short message misses every rect
-        // and clears the highlight (#8652).
+        // and clears the highlight.
         let rect = Rect::new(
             body_x,
             body_y + (visible_lo - scroll),

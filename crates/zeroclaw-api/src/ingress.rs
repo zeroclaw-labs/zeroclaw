@@ -71,7 +71,7 @@ pub enum TrustClass {
 pub struct UntrustedFraming {}
 
 /// The envelope stamped by the entry layer; travels with the turn into the
-/// engine. See the module docs and RFC§3.
+/// engine. See the module docs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngressContext {
     /// Stable inbound id (e.g. a `ChannelMessage.id`) — provenance + audit

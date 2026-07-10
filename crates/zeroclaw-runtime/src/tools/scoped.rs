@@ -175,7 +175,7 @@ impl ScopedToolRegistry {
         let mut pinned_section = String::new();
         let mut activated_handle: Option<Arc<std::sync::Mutex<ActivatedToolSet>>> = None;
         let mut mcp_elevation_arcs: Vec<Arc<dyn Tool>> = Vec::new();
-        // MCP-origin ground truth for the tool_filter_groups gates see
+        // MCP-origin ground truth for the tool_filter_groups gates; see
         // the `ScopedAssembled::mcp_tool_names` field doc for the contract.
         let mut mcp_tool_names: HashSet<String> = HashSet::new();
 

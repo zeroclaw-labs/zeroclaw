@@ -1737,10 +1737,10 @@ mod tests {
             ChatMessage::user("[IMAGE:/tmp/new.png]\nNew caption".to_string()),
         ];
 
-        // Should not error — instead trims oldest.
-        // (Will error on normalize_image_reference for the surviving images
-        //  since /tmp/mid.png and /tmp/new.png don't exist, but the trimming
-        //  itself should succeed.)
+        // Should not error — instead trims oldest. (Will error on
+        // normalize_image_reference for the surviving images since
+        // /tmp/mid.png and /tmp/new.png don't exist, but the trimming
+        // itself should succeed.)
         let trimmed = trim_old_images(&messages, 2);
         assert_eq!(trimmed.len(), 3);
 

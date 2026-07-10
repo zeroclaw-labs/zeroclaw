@@ -914,6 +914,19 @@ fn build_channel_system_prompt_for_message(
     build_channel_system_prompt(base_prompt, &msg.channel, bot_mention.as_deref())
 }
 
+/// Build the cached system-prompt prefix for a channel session.
+///
+/// **Byte-stability contract:** given identical `base_prompt`, `channel_name`,
+/// and `bot_mention` arguments, this function MUST return byte-identical
+/// output across consecutive calls — even across a second boundary, across
+/// sender/reply_target/message_id changes, and across per-turn memory
+/// recall. Provider-side prompt caching keys on this prefix, so any
+/// per-turn data here invalidates the cache for every turn.
+///
+/// The volatile per-turn data (datetime, reply_target, sender, message_id,
+/// cron_add delivery hint, and bot_mention for the current turn only)
+/// lives in [`build_channel_turn_context_preamble`] and is prepended to
+/// the outgoing user turn by the caller.
 fn build_channel_system_prompt(
     base_prompt: &str,
     channel_name: &str,
@@ -1024,6 +1037,24 @@ fn find_latest_date_heading_before(prompt: &str, before: usize) -> Option<(usize
         .max_by_key(|(start, _)| *start)
 }
 
+/// Build the volatile per-turn context that the model needs but the cached
+/// system prompt must NOT contain. The caller prepends the returned string
+/// to the current outgoing user turn; the cached conversation history copy
+/// stays clean.
+///
+/// **Trust-boundary contract:** the caller MUST prepend this preamble to the
+/// current outgoing user turn whenever `reply_target` is non-empty, without
+/// inspecting user-controlled content. A user message that happens to start
+/// with `[turn-context]` is not treated as proof that this preamble is
+/// already present — the runtime preamble is authoritative, not
+/// user-suppressible. (An earlier draft used a `starts_with("[turn-context]")`
+/// guard on the outgoing user turn that let a malicious sender suppress the
+/// `reply_target` / `sender` / delivery hint; this helper removes that
+/// regression.)
+///
+/// Carries: channel/reply_target/sender/message_id, the wall-clock datetime,
+/// the `cron_add` delivery hint (with the webhook `delivery.thread_id`
+/// contract preserved), and (if set) the bot_mention handle.
 fn build_channel_turn_context_preamble(
     msg: &zeroclaw_api::channel::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
@@ -1040,6 +1071,10 @@ fn build_channel_turn_context_preamble(
     let sender = msg.sender.as_str();
     let message_id = msg.id.as_str();
 
+    // Webhook contract: downstream services expect the *sender* as the
+    // recipient and the thread/conversation identifier in `thread_id`.
+    // Reusing `reply_target` as `to` for webhook would strip the thread
+    // context and the receiver would discard the reply.
     let delivery_hint = if channel_name.eq_ignore_ascii_case("webhook") {
         format!(
             "delivery={{\"mode\":\"announce\",\"channel\":\"{channel_name}\",\
@@ -1132,8 +1167,8 @@ fn timestamped_channel_user_history_content(
 
 /// Collapse only heavy inline `data:` image payloads in historical turns while
 /// preserving re-loadable `[IMAGE:<path>]` file references, so a later turn can
-/// re-inflate from diskwithout re-sending megabytes of base64 every
-/// request File-path and placeholder markers pass through untouched.
+/// re-inflate from disk without re-sending megabytes of base64 every request.
+/// File-path and placeholder markers pass through untouched.
 fn collapse_inline_image_payloads(turns: &mut [ChatMessage]) {
     if turns.len() <= 1 {
         return;
@@ -1859,7 +1894,6 @@ fn set_scope_override(
 /// `AGENTS.md` SINGLE SOURCE OF TRUTH). Default deny
 /// (`RequireExplicit`); operators who want the prior behavior opt in
 /// by marking one or more peer groups `admin_for_agent_scope = true`.
-/// See issue #8044.
 ///
 /// **Effective-on-restart semantics:** this gate reads
 /// `ctx.prompt_config`, an `Arc<Config>` snapshot captured when the
@@ -2671,7 +2705,7 @@ async fn handle_runtime_command_if_needed(
                 "Model ID cannot be empty. Use `/model --user|--agent <model-id>`.".to_string()
             } else if scope == OverrideScope::Agent && !is_agent_scope_authorized(ctx, msg) {
                 // Per-sender authorization gate for the `--agent` scope only.
-                // `/model --user` is unaffected. See issue #8044.
+                // `/model --user` is unaffected.
                 let channel_alias = msg.channel_alias.as_deref().unwrap_or(msg.channel.as_str());
                 ::zeroclaw_log::record!(
                     WARN,
@@ -18891,7 +18925,7 @@ BTC is currently around $65,000 based on latest tool output."#
     // Build a ChannelRuntimeContext with a Config that has peer_groups
     // populated for the agent-scope authorization tests below. Mirrors
     // `channel_runtime_context_for_defaults_test` but lets the caller
-    // inject a pre-built peer_groups map. See issue #8044.
+    // inject a pre-built peer_groups map.
     fn channel_runtime_context_with_peer_groups(
         zeroclaw_dir: &std::path::Path,
         peer_groups: std::collections::HashMap<
@@ -19125,7 +19159,7 @@ BTC is currently around $65,000 based on latest tool output."#
     // (strip leading `@`, ASCII-lowercase) and honor `["*"]` for the
     // configured peer list. These tests pin that contract so a future
     // refactor cannot silently fall back to the raw `==` shape that
-    // rejected correctly-configured admins. See issue #8044.
+    // rejected correctly-configured admins.
 
     #[test]
     fn normalize_peer_username_strips_leading_at_and_lowercases() {
@@ -19234,7 +19268,7 @@ BTC is currently around $65,000 based on latest tool output."#
     // a future refactor that drops `scope == OverrideScope::Agent &&
     // !is_agent_scope_authorized(...)` from the dispatch site cannot
     // silently re-open the hole — every helper-only test would still pass
-    // while the gate was bypassed. See issue #8044 review pass 2.
+    // while the gate was bypassed.
 
     fn scope_user_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
         zeroclaw_api::channel::ChannelMessage {
@@ -24944,7 +24978,7 @@ Done."#;
         );
     }
 
-    // --- Surface 1(a) regression tests---
+    // --- Surface 1(a) regression tests ---
 
     fn build_msg_for_signal_test() -> zeroclaw_api::channel::ChannelMessage {
         zeroclaw_api::channel::ChannelMessage {
@@ -25486,7 +25520,7 @@ Done."#;
         );
     }
 
-    /// Pins #7809: the channel tool-loop reads `strict_tool_parsing` and
+    /// Pins the contract: the channel tool-loop reads `strict_tool_parsing` and
     /// `parallel_tools` from `agent_cfg.resolved` (populated), not from
     /// `prompt_config.agent(alias).resolved` (serde-skipped default).
     #[test]

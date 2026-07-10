@@ -2109,7 +2109,7 @@ mod tests {
                 provider.supports_vision(),
                 "alias `{alias}` should report vision capability"
             );
-            // Kimi Code moved to api.kimi.com — see
+            // Kimi Code moved to api.kimi.com.
             assert_eq!(
                 moonshot_code_base_url(),
                 "https://api.kimi.com/coding/v1",

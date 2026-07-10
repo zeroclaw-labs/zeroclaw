@@ -115,7 +115,7 @@ pub struct PeerGroupConfig {
     /// Default `false` (deny-by-default). The runtime resolves this live
     /// from `Config::peer_groups` at command-dispatch time via
     /// `Config::channel_agent_scope_admins`; no cache, no per-channel
-    /// duplicate sender list. See issue #8044.
+    /// duplicate sender list.
     #[serde(default)]
     pub admin_for_agent_scope: bool,
 }

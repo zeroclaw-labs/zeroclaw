@@ -181,7 +181,7 @@ pub fn plan_delete(cfg: &Config, kind: &AliasKind, alias: &str) -> ImpactReport 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CascadePolicy {
     /// Refuse if any HARD reference blocks; otherwise scrub the soft references
-    /// and remove the entry. The-accepted default.
+    /// and remove the entry. The default.
     RefuseOnHard,
     /// Compute the plan and mutate nothing (the dry-run a surface renders).
     DryRun,

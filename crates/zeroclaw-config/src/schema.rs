@@ -70,17 +70,33 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 // ── Top-level config ──────────────────────────────────────────────
 
 /// Top-level ZeroClaw configuration, loaded from `config.toml`.
+///
 /// Resolution order: `ZEROCLAW_CONFIG_DIR` env → `ZEROCLAW_WORKSPACE` env → `~/.zeroclaw/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct Config {
+    /// Shared instance data directory (databases, hygiene state, cost
+    /// records, daemon state files). Computed from `ZEROCLAW_CONFIG_DIR`
+    /// / `ZEROCLAW_DATA_DIR` / `ZEROCLAW_WORKSPACE` (deprecated) at
+    /// load time, not serialized. Per-agent identity + markdown lives
+    /// at `agent_workspace_dir(&alias)`, not here.
     #[serde(skip)]
     pub data_dir: PathBuf,
     /// Path to config.toml - computed from home, not serialized
     #[serde(skip)]
     pub config_path: PathBuf,
+    /// Dotted prop-paths overridden by `ZEROCLAW_*` env vars at load time.
+    /// Populated by `apply_env_overrides`; consulted by `save()` to mask the
+    /// env-injected values back to disk-or-default before encryption, and by
+    /// `prop_is_env_overridden` for O(1) display-layer lookup (config list,
+    /// dashboard, quickstart).
     #[serde(skip)]
     pub env_overridden_paths: std::collections::HashSet<String>,
+    /// Per-path snapshot of pre-override raw values, captured at apply time
+    /// from the post-`decrypt_secrets` in-memory state (so secret entries
+    /// hold plaintext, not the display mask). `save()` restores from this
+    /// map so env-injected values never reach disk and the operator's
+    /// original on-disk credentials survive any save cycle.
     #[serde(skip)]
     pub pre_override_snapshots: std::collections::HashMap<String, String>,
     /// Per-path snapshot of `op://` external secret references captured before
@@ -98,12 +114,23 @@ pub struct Config {
     /// instance until repaired. Never serialized — a load-time signal.
     #[serde(skip)]
     pub degraded_security: Vec<String>,
+    /// Non-security sections the resilient loader reset to `Default`
+    /// because the on-disk block was malformed (e.g. `[plugins.entries]`
+    /// written where `[[plugins.entries]]` was meant). Never serialized;
+    /// a load-time signal the CLI surfaces on stderr so a silently-dropped
+    /// section is impossible to miss.
     #[serde(skip)]
     pub degraded_sections: Vec<String>,
     /// Config file schema version.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
 
+    /// All configured provider profiles, grouped by category under a
+    /// single `[providers]` root. Categories today: `models`, `tts`,
+    /// `transcription`. Shape: `[providers.<category>.<type>.<alias>]`,
+    /// e.g. `[providers.models.anthropic.default]`,
+    /// `[providers.tts.openai.default]`,
+    /// `[providers.transcription.groq.default]`.
     #[serde(default)]
     #[nested]
     pub providers: crate::providers::Providers,
@@ -160,6 +187,12 @@ pub struct Config {
     #[group = "Operations"]
     pub cloud_ops: CloudOpsConfig,
 
+    /// Conversational AI agent builder configuration (`[conversational_ai]`).
+    ///
+    /// Experimental / future feature — not yet wired into the agent runtime.
+    /// Omitted from generated config files when disabled (the default).
+    /// Existing configs that already contain this section will continue to
+    /// deserialize correctly thanks to `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "ConversationalAiConfig::is_disabled")]
     #[nested]
     #[group = "Operations"]
@@ -232,6 +265,11 @@ pub struct Config {
     #[group = "Operations"]
     pub todotracker: TodoTrackerConfig,
 
+    /// Declarative cron jobs (`[cron.<alias>]`), alias-keyed.
+    ///
+    /// Each entry is a named scheduled job synced into the database at
+    /// scheduler startup. Subsystem runtime knobs (enable/disable, catch-up,
+    /// run-history retention) live on `[scheduler]`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub cron: HashMap<String, CronJobDecl>,
@@ -304,6 +342,27 @@ pub struct Config {
     #[group = "Tools"]
     pub browser: BrowserConfig,
 
+    /// Browser delegation configuration (`[browser_delegate]`).
+    ///
+    /// Delegates browser-based tasks to a browser-capable CLI subprocess (e.g.
+    /// Claude Code with `claude-in-chrome` MCP tools). Useful for interacting
+    /// with corporate web apps (Teams, Outlook, Jira, Confluence) that lack
+    /// direct API access. A persistent Chrome profile can be configured so SSO
+    /// sessions survive across invocations.
+    ///
+    /// Fields:
+    /// - `enabled` (`bool`, default `false`) — enable the browser delegation tool.
+    /// - `cli_binary` (`String`, default `"claude"`) — CLI binary to spawn for browser tasks.
+    /// - `chrome_profile_dir` (`String`, default `""`) — Chrome user-data directory for
+    ///   persistent SSO sessions. When empty, a fresh profile is used each invocation.
+    /// - `allowed_domains` (`Vec<String>`, default `[]`) — allowlist of domains the browser
+    ///   may navigate to. Empty means all non-blocked domains are permitted.
+    /// - `blocked_domains` (`Vec<String>`, default `[]`) — denylist of domains. Blocked
+    ///   domains take precedence over allowed domains.
+    /// - `task_timeout_secs` (`u64`, default `120`) — per-task timeout in seconds.
+    ///
+    /// Compatibility: additive and disabled by default; existing configs remain valid when omitted.
+    /// Rollback/migration: remove `[browser_delegate]` or keep `enabled = false` to disable.
     #[serde(default)]
     #[nested]
     #[group = "Tools"]
@@ -389,6 +448,11 @@ pub struct Config {
     #[group = "Multi-agent"]
     pub delegate: DelegateToolConfig,
 
+    /// Aliased agents in this install. Each entry under `[agents.<alias>]`
+    /// is one user-facing agent with its own identity, channels, model
+    /// provider, risk profile, workspace, and memory scope.
+    /// `DelegateTool` consults this map when one agent delegates a
+    /// subtask to another.
     #[serde(default)]
     #[nested]
     pub agents: HashMap<String, AliasedAgentConfig>,
@@ -418,6 +482,12 @@ pub struct Config {
     #[nested]
     pub mcp_bundles: HashMap<String, McpBundleConfig>,
 
+    /// Named peer groups (`[peer_groups.<name>]`). Each entry binds a
+    /// channel, a list of member agents, and optional non-agent
+    /// (external) members and a per-group blocklist. Mutual opt-in:
+    /// two agents become peers only when both appear in the same
+    /// group's `agents`. Empty by default for single-agent installs.
+    /// See `crate::multi_agent::PeerGroupConfig`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub peer_groups: HashMap<String, crate::multi_agent::PeerGroupConfig>,
@@ -520,6 +590,14 @@ pub struct Config {
     #[group = "Tools"]
     pub plugins: PluginsConfig,
 
+    /// Locale for tool descriptions (e.g. `"en"`, `"zh-CN"`).
+    ///
+    /// When set, tool descriptions shown in system prompts are loaded from
+    /// Fluent `.ftl` locale files. Falls back to embedded English, then to
+    /// hardcoded descriptions.
+    ///
+    /// If omitted or empty, the locale is auto-detected from the host
+    /// system's locale (defaulting to `"en"` if that can't be determined).
     #[serde(default)]
     pub locale: Option<String>,
 
@@ -578,9 +656,16 @@ pub struct Config {
 }
 
 /// Multi-client workspace isolation configuration.
+///
 /// When enabled, each client engagement gets an isolated workspace with
 /// separate memory, audit, secrets, and tool restrictions.
 #[allow(clippy::struct_excessive_bools)]
+/// Opaque state the Quickstart flow writes so it can tell, on a
+/// re-run, which sections the user has already walked through at least
+/// once — which lets it offer "Reconfigure? [y/N]" skip gates instead of
+/// forcing users through every field again.
+///
+/// This is meta-state about the Quickstart flow, not user-facing config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "onboard_state"]
@@ -590,24 +675,56 @@ pub struct OnboardStateConfig {
     /// (`"workspace"`, `"model_providers"`, …).
     #[serde(default)]
     pub completed_sections: Vec<String>,
+    /// `true` once the Quickstart has applied a `BuilderSubmission`
+    /// successfully on this install. Web gateway and TUI auto-launch
+    /// the Quickstart on startup iff this is `false` **and** no
+    /// `agents.*` entries exist (the implicit-completion rule covers
+    /// upgrades). The flag is flipped in the same atomic write that
+    /// lands the Quickstart submission; re-entering the Quickstart
+    /// later to add another agent does not flip it back to `false`.
     #[serde(default)]
     pub quickstart_completed: bool,
 }
 
+/// Used by `#[serde(skip_serializing_if)]` on plain `bool` fields to omit
+/// them from TOML output when they carry their struct-level default (`false`).
+/// Keeps fresh model_provider entries clean — a default-constructed
+/// `ModelProviderConfig` for one model_provider family shouldn't write flag fields
+/// that only apply to a different family.
 fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// One trait per family-endpoint enum. Returns the URI template for the chosen
+/// variant — a literal URL for fixed endpoints (`https://api.openai.com/v1`),
+/// or a substitution template for computed endpoints (Azure's
+/// `https://{resource}.openai.azure.com/...`). Substitution happens family-side
+/// in the runtime constructor; for non-templated families the return value is
+/// the final URL.
+///
+/// Resolution order at runtime is uniform across every model model_provider family:
+/// operator's `cfg.uri` first; family endpoint enum's `uri()` second; loud
+/// failure when neither is set.
 pub trait ModelEndpoint {
     fn uri(&self) -> &'static str;
 }
 
+/// Implemented by every `*ModelProviderConfig`. Multi-region families
+/// override to return `Some(self.endpoint.uri())`; single-endpoint families
+/// inherit the `None` default. Drives `ModelProviders::resolved_endpoint_uri`,
+/// which is itself driven by the `for_each_model_provider_slot!` macro — so
+/// adding a new family without an impl is a compile error.
 pub trait FamilyEndpoint {
     fn endpoint_uri(&self) -> Option<&'static str> {
         None
     }
 }
 
+/// Wire protocol flavor for the model_provider client. `responses` routes
+/// through OpenAI's Codex/Responses API (`POST /v1/responses`);
+/// `chat_completions` routes through the legacy `/v1/chat/completions` (or
+/// the family's chat-completions-compatible endpoint). Auto-selected per
+/// family when unset.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
 )]
@@ -671,9 +788,22 @@ pub struct ModelProviderConfig {
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Ordered list of other provider aliases to try when every model on this
+    /// alias has failed. Each entry is a dotted `<type>.<alias>` reference into
+    /// `providers.models` and resolves with its own credentials, endpoint, and
+    /// model. A fallback never inherits this alias's key. The walk is
+    /// depth-first: this alias's models are exhausted first, then each fallback
+    /// alias is descended in turn (applying its own `fallback_models` and
+    /// `fallback`). Empty means no provider-level fallback.
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback: Vec<crate::providers::ModelProviderRef>,
+    /// Ordered alternate models to try on THIS provider before falling over to
+    /// the `fallback` aliases. Same endpoint, key, and headers as the primary
+    /// `model`. Only the model identifier changes. Use this when a provider
+    /// serves a backup model (e.g. a smaller or older variant) that should be
+    /// tried before leaving the provider entirely. Empty means only `model` is
+    /// tried.
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_models: Vec<String>,
@@ -717,6 +847,17 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_extra: Option<serde_json::Value>,
+    /// Per-model pricing for cost tracking, USD per 1M tokens.
+    ///
+    /// Free-form key/value map. Keys are user-defined model identifiers; an
+    /// optional `.input` / `.output` suffix encodes pricing dimension when
+    /// the operator wants to split rates. A bare key without a suffix is
+    /// used as a flat per-token rate when neither dimension is specified.
+    /// Default is empty: cost tracking falls back to "unknown" rates and
+    /// only token usage is recorded.
+    ///
+    /// Example: `pricing = { opus = 15.0, sonnet = 3.0 }`
+    /// Or split: `pricing = { "opus.input" = 15.0, "opus.output" = 75.0 }`
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub pricing: HashMap<String, f64>,
@@ -727,9 +868,27 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_assistant_reasoning: Option<bool>,
+    /// Pull live token prices for this provider's models from its own
+    /// OpenAI-compatible `/models` listing (the gateway is the source of truth
+    /// for its prices), filling cost-tracking rates for models the operator
+    /// has NOT priced under `[cost.rates]` / `pricing`. Models the gateway does
+    /// not price (or providers with no HTTP `/models` listing at all, such as
+    /// a subprocess gateway like `kilocli`) fall back to the public models.dev
+    /// catalog. Configured rates always win; live prices only fill gaps. A
+    /// background task refreshes the price snapshot hourly; the cost-recording
+    /// path reads the cached snapshot and never blocks on the network. Default
+    /// `false`: off means no fetching and behavior identical to a build
+    /// without the feature.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "is_false")]
     pub live_pricing: bool,
+    /// Override the provider's default for native tool calling.
+    /// `None` (default) honors the provider's built-in choice. `Some(true)`
+    /// forces native tool calls on, `Some(false)` forces text-fallback.
+    /// Currently consulted only by the Groq factory, which defaults to
+    /// text-fallback because llama-family Groq models reject native tool
+    /// calls with HTTP 400. Setting `native_tools = true` re-enables native
+    /// tool calling for Groq models that support it.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_tools: Option<bool>,
@@ -740,6 +899,11 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub think: Option<bool>,
+    /// Arbitrary key/value pairs forwarded verbatim as `chat_template_kwargs`
+    /// in the request body (llama.cpp-specific). Use this to pass model-family
+    /// template variables that control behaviour not exposed by other fields.
+    /// Example (Qwen3 thinking suppression):
+    ///   `chat_template_kwargs = { enable_thinking = false }`
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
@@ -756,6 +920,23 @@ pub struct ModelProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca_cert_path: Option<String>,
 }
+
+// ── Per-family model model_provider configs ────────────────────────────
+//
+// Each family carries its own typed config (composing `ModelProviderConfig`
+// via `#[serde(flatten)]`) plus a per-family `*Endpoint` enum that names the
+// known endpoints and resolves them via the `ModelEndpoint` trait. Families
+// that support multiple auth flows additionally carry an `auth_mode` field.
+//
+// Pattern reference for adding a new family:
+// - Single-endpoint family with no extras: see `AnthropicModelProviderConfig`
+// - Family with extras: see `OpenAIModelProviderConfig`
+// - Family with computed-endpoint template: see `AzureModelProviderConfig`
+// - Multi-region family with a required `endpoint` field: see `MoonshotModelProviderConfig`
+//
+// The `ModelProviders` container in `crates/zeroclaw-config/src/model_providers.rs`
+// holds a typed slot per family; the runtime impls in zeroclaw-providers
+// consume the typed configs directly.
 
 // ── OpenAI ──
 
@@ -778,6 +959,11 @@ impl ModelEndpoint for OpenAIEndpoint {
     }
 }
 
+/// OpenAI model model_provider config. The OpenAI-family extras (`wire_api`,
+/// `requires_openai_auth`) live on the shared `ModelProviderConfig` base
+/// because they're consumed by validation and runtime helpers that operate
+/// on the base struct without family awareness; this wrapper is a thin
+/// typed slot, no extra fields.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.openai"]
@@ -906,7 +1092,6 @@ impl ModelEndpoint for MoonshotEndpoint {
             Self::Cn => "https://api.moonshot.cn/v1",
             Self::Intl => "https://api.moonshot.ai/v1",
             // Kimi Code (Kimi For Coding) moved to api.kimi.com — the old api.moonshot.cn/coder/v1 returns 404.
-            // See https://github.com/zeroclaw-labs/zeroclaw/issues/8154
             Self::Code => "https://api.kimi.com/coding/v1",
         }
     }
@@ -983,6 +1168,11 @@ pub struct QwenModelProviderConfig {
     /// OAuth-cache integration instead of the `api_key` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<AuthMode>,
+    /// Long-lived Qwen OAuth refresh token. When set, the runtime
+    /// exchanges it for a short-lived access token at provider
+    /// construction time. Operators relying on the upstream `qwen login`
+    /// tool (which writes `~/.qwen/oauth_creds.json`) leave this unset;
+    /// the file-cache integration takes over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[secret(category = "model_provider")]
     pub oauth_refresh_token: Option<String>,
@@ -1070,6 +1260,11 @@ pub struct OllamaModelProviderConfig {
     /// (`OLLAMA_DEFAULT_NUM_PREDICT`) when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_predict: Option<i32>,
+    /// Force every Ollama `/api/chat` request to use this temperature,
+    /// overriding the per-call value passed through
+    /// `ModelProvider::chat_with_system(.., temperature)`. When unset
+    /// (`None`, the default), the per-call temperature wins: full
+    /// backward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature_override: Option<f64>,
 }
@@ -2165,6 +2360,11 @@ pub struct MinimaxModelProviderConfig {
     pub endpoint: MinimaxEndpoint,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<AuthMode>,
+    /// Long-lived OAuth refresh token issued by MiniMax. When set, the
+    /// runtime exchanges it for a short-lived access token at provider
+    /// construction time and uses that as the API credential. Operators
+    /// who prefer dashboard-generated long-lived API keys can leave this
+    /// unset and populate `api_key` directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[secret(category = "model_provider")]
     pub oauth_refresh_token: Option<String>,
@@ -2370,6 +2570,11 @@ pub struct GeminiModelProviderConfig {
     /// OAuth-cache integration instead of the `api_key` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<AuthMode>,
+    /// Google OAuth app `client_id`, used when this alias drives ZeroClaw's
+    /// own browser/device-code login flow (`zeroclaw auth login
+    /// --model-provider gemini --profile <alias>`). Operators relying on
+    /// the upstream `gemini login` tool don't need this; that tool writes
+    /// its own client_id / client_secret into `~/.gemini/oauth_creds.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[secret(category = "model_provider")]
     pub oauth_client_id: Option<String>,
@@ -2980,6 +3185,15 @@ pub struct BedrockModelProviderConfig {
     pub region: Option<String>,
 }
 
+// ── FamilyEndpoint default impls (single-endpoint families) ─────
+//
+// Multi-endpoint families (Moonshot, Qwen, Glm, Minimax, Zai, Stepfun) define
+// their own `impl FamilyEndpoint` next to the struct. Every other family
+// gets the `None` default via this list. The list is exhaustive: a new
+// family with no impl here AND no manual impl elsewhere will fail to
+// compile against `ModelProviders::resolved_endpoint_uri`, which expands
+// `endpoint_uri()` per slot through `for_each_model_provider_slot!`.
+
 macro_rules! impl_default_family_endpoint {
     ($($t:ty),+ $(,)?) => {
         $( impl FamilyEndpoint for $t {} )+
@@ -3172,6 +3386,11 @@ pub enum DelegateExecutionMode {
     Independent,
 }
 
+/// One explicit delegate target listed under `[agents.<alias>].delegates`.
+///
+/// String entries deserialize as `{ agent = "<string>", mode = "bounded" }`
+/// for concise manual editing. Serialization always emits the object form so
+/// the config surface is a pure object array.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Configurable, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "delegate_target"]
@@ -3184,6 +3403,11 @@ pub struct DelegateTargetConfig {
 }
 
 impl DelegateTargetConfig {
+    /// Construct the legacy-equivalent target shape used for string entries.
+    ///
+    /// Most tests and migration paths call this instead of spelling out
+    /// `mode = Bounded`, making it explicit that a bare delegate alias never
+    /// opts into independent execution.
     #[must_use]
     pub fn bounded(agent: impl Into<String>) -> Self {
         Self {
@@ -3193,6 +3417,7 @@ impl DelegateTargetConfig {
     }
 
     /// Return the raw configured alias.
+    ///
     /// Callers that compare aliases should trim at the comparison boundary so
     /// diagnostics can still point at the stored value when validation fails.
     #[must_use]
@@ -3263,6 +3488,9 @@ impl<'de> Deserialize<'de> for DelegateTargetConfig {
     }
 }
 
+/// Configuration for an aliased agent. Each `[agents.<alias>]` TOML
+/// block deserializes into one of these. The `DelegateTool` looks up
+/// entries here to dispatch a subtask to a named sibling agent.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "delegate_agent"]
@@ -3302,9 +3530,25 @@ pub struct AliasedAgentConfig {
     #[tab(Bundles)]
     #[serde(default)]
     pub knowledge_bundles: Vec<String>,
+    /// MCP bundle aliases. Each entry references `mcp_bundles[key]`, a named
+    /// group of MCP servers. Secure by default: an agent is granted only the
+    /// servers named by its bundles. An agent with no `mcp_bundles` receives
+    /// no MCP servers (omission is not a grant). See
+    /// `Config::mcp_servers_for_agent`.
     #[tab(Bundles)]
     #[serde(default)]
     pub mcp_bundles: Vec<String>,
+    /// Initialize this agent's `mcp_bundles` tools when it serves an ACP
+    /// (`session/new`) session.
+    ///
+    /// Off by default: MCP servers are external processes/services that can
+    /// block startup while they connect, and ACP `session/new` is expected to
+    /// return promptly. Enable it when this agent must call its `mcp_bundles`
+    /// tools over ACP; `session/new` then pays the one-time MCP connection cost
+    /// (bounded and non-fatal per server). Set per agent so each ACP profile
+    /// opts in independently; when this agent is the ACP default
+    /// (`acp.default_agent`, or the sole configured agent), the flag is picked
+    /// up automatically for sessions that omit `agentAlias`.
     #[tab(Bundles)]
     #[serde(default)]
     pub acp_enable_mcp: bool,
@@ -3321,10 +3565,41 @@ pub struct AliasedAgentConfig {
     #[tab(Providers)]
     #[serde(default)]
     pub tts_provider: crate::providers::TtsProviderRef,
+    /// Transcription / STT provider as a dotted alias reference
+    /// (`<type>.<alias>`, e.g. `"groq.<alias>"`). Resolves through
+    /// `transcription_providers.<type>.<alias>`. Empty = agent has no
+    /// transcription preference; channels that ingest voice still need a
+    /// resolved provider (there is no global default), so an inbound voice
+    /// flow into an agent with empty `transcription_provider` errors loudly
+    /// at the channel boundary.
     #[tab(Providers)]
     #[serde(default)]
     pub transcription_provider: crate::providers::TranscriptionProviderRef,
 
+    /// Optional override for the per-message LLM reply-intent classifier
+    /// (`classify_channel_reply_intent` in zeroclaw-channels). When non-empty,
+    /// the channel orchestrator routes the "should this message be replied to?"
+    /// classification call to `[providers.models.<type>.<alias>]` referenced
+    /// here, instead of reusing the main agent's `model_provider`.
+    ///
+    /// Source of truth for api_key / uri / model / temperature etc. is the
+    /// referenced `[providers.models.<type>.<alias>]` entry. This field is
+    /// a reference only (NEVER a copy), per AGENTS.md SINGLE SOURCE OF TRUTH.
+    ///
+    /// Empty (`Default`) = inherit the main agent's resolved provider+model
+    /// (preserves pre-PR behavior; backward compatible).
+    ///
+    /// Use case: classification is a cheap REPLY/NO_REPLY decision, doesn't
+    /// need a high-end model. Point this at a fast/free small model
+    /// (e.g. `kimi-k2.5`, `qwen-turbo`) while `model_provider` stays on the
+    /// expensive answering model (e.g. `qwen3.6-plus`).
+    ///
+    /// Note: TOML table names cannot contain `.`, so alias `kimi-k2.5`
+    /// must be written as `[providers.models.custom.kimi-k2-5]`. The
+    /// underlying `model = "kimi-k2.5"` string can still contain dots.
+    ///
+    /// ACP channels (IDE-direct) always reply and skip the classifier
+    /// entirely, so this field has no effect on ACP traffic.
     #[tab(Providers)]
     #[serde(default)]
     pub classifier_provider: crate::providers::ModelProviderRef,
@@ -3337,14 +3612,32 @@ pub struct AliasedAgentConfig {
     #[nested]
     pub precheck: crate::scattered_types::ChannelPrecheckConfig,
 
+    /// Per-agent override for the context-compression summarizer provider, as
+    /// a `providers.models.<type>.<alias>` reference. Empty (Default) = inherit
+    /// the runtime profile's `context_compression.summary_provider`, else the
+    /// agent's own resolved provider+model. Reference only, never a copy;
+    /// resolved by [`Config::effective_summary_provider`]. Validated in
+    /// `Config::validate()`.
     #[tab(Providers)]
     #[serde(default)]
     pub summary_provider: crate::providers::ModelProviderRef,
 
+    /// Auto-allow delegation to every agent sharing this agent's risk
+    /// profile. Default `true` preserves the historical reach where any
+    /// same-profile peer is a delegation target. Set `false` to opt this
+    /// agent out so only the explicit `delegates` list is reachable.
+    /// Gating (whether delegation is permitted at all) still lives on the
+    /// risk profile's `delegation_policy.mode`; this only narrows reach.
     #[tab(General)]
     #[serde(default = "default_true")]
     pub delegate_same_risk_profile: bool,
 
+    /// Explicit delegate roster: additional agent aliases this agent may
+    /// delegate to, beyond same-profile peers. Possibly empty. String
+    /// entries are accepted for concise manual editing and load as bounded
+    /// delegates; saved config emits object entries with explicit modes.
+    /// Entries may name agents on a different risk profile. `Config::validate()`
+    /// fails loud on a dangling alias, duplicate alias, or self-reference.
     #[tab(General)]
     #[serde(default)]
     pub delegates: Vec<DelegateTargetConfig>,
@@ -3354,6 +3647,11 @@ pub struct AliasedAgentConfig {
     #[serde(skip)]
     pub resolved: ResolvedRuntime,
 
+    /// Per-agent workspace block (`[agents.<alias>.workspace]`).
+    /// Holds the agent's filesystem path, cross-agent access allowlist,
+    /// filesystem-escape boolean, and cross-agent memory allowlist.
+    /// Default is fully jailed (no cross-agent access). See
+    /// `crate::multi_agent::AgentWorkspaceConfig`.
     #[tab(Workspace)]
     #[serde(default)]
     #[nested]
@@ -3368,11 +3666,21 @@ pub struct AliasedAgentConfig {
     #[nested]
     pub memory: crate::multi_agent::AgentMemoryConfig,
 
+    /// Per-agent identity format (`[agents.<alias>.identity]`). Each
+    /// agent renders its own IDENTITY.md / SOUL.md inside its
+    /// per-agent workspace; this block selects the format (OpenClaw or
+    /// AIEOS) and optional inline/file source for the agent's identity
+    /// document.
     #[tab(Tuning)]
     #[serde(default)]
     #[nested]
     pub identity: IdentityConfig,
 
+    /// Per-agent A2A publication block (`[agents.<alias>.a2a]`). Gates
+    /// whether this alias is discoverable as a spec-conforming A2A agent
+    /// and which resolved skills appear on its card. Default-closed
+    /// (`published = false`, no exposed skills). See
+    /// `crate::multi_agent::AgentA2aConfig`.
     #[tab(General)]
     #[serde(default)]
     #[nested]
@@ -3474,6 +3782,11 @@ impl Config {
         }
     }
 
+    /// Return the first concrete `model` string available for use as a
+    /// default. Scans every typed slot's entries (iteration order is
+    /// the macro slot order) for one with `model` set. Returns `None`
+    /// only when no model-provider entry has any model configured at
+    /// all.
     #[must_use]
     pub fn resolve_default_model(&self) -> Option<String> {
         self.providers
@@ -3484,6 +3797,14 @@ impl Config {
             .map(ToString::to_string)
     }
 
+    /// Resolve the risk profile for an explicit agent alias.
+    ///
+    /// Each agent's `risk_profile` field names a `[risk_profiles.<alias>]`
+    /// entry that gates its actions. There is no "global" risk profile in
+    /// every callsite must come through an agent. When the agent has
+    /// no profile set or names a missing entry, returns `None` and the
+    /// caller decides how to handle it (validation rejects this shape at
+    /// load time; the runtime treating `None` as a config error).
     #[must_use]
     pub fn risk_profile_for_agent(&self, agent_alias: &str) -> Option<&RiskProfileConfig> {
         let agent = self.agents.get(agent_alias)?;
@@ -3494,6 +3815,14 @@ impl Config {
         self.risk_profiles.get(profile_alias)
     }
 
+    /// Resolve the delegate targets `caller_alias` may reach:
+    /// same-profile peers when `delegate_same_risk_profile` is set, unioned
+    /// with the explicit `delegates` roster, minus the caller. Single
+    /// source of truth for delegate reach and mode; gating
+    /// (`delegation_policy`) is enforced separately by the caller.
+    /// Deduped, sorted; unknown caller yields empty. Disabled targets are
+    /// never reachable. Explicit entries override the bounded mode used for
+    /// implicit same-profile peers.
     #[must_use]
     pub fn reachable_delegate_target_configs(
         &self,
@@ -3547,6 +3876,12 @@ impl Config {
             .collect()
     }
 
+    /// Resolve the execution mode for one reachable delegate target.
+    ///
+    /// Target aliases are normalized the same way the reachable roster
+    /// normalizes explicit `delegates` entries. This keeps callers that need
+    /// one target mode aligned with the canonical roster resolver instead of
+    /// creating a subtly different admission rule.
     #[must_use]
     pub fn delegate_target_mode(
         &self,
@@ -3564,6 +3899,11 @@ impl Config {
             .map(|target| target.mode)
     }
 
+    /// Resolve the `[runtime_profiles.<alias>]` entry owned by an agent
+    /// (via `agents.<alias>.runtime_profile`). Returns `None` when the
+    /// agent has no runtime profile set or names a missing entry. Unlike
+    /// `risk_profile_for_agent`, the missing case is not a hard error
+    /// because runtime budgets and tunables fall back to global defaults.
     #[must_use]
     pub fn runtime_profile_for_agent(&self, agent_alias: &str) -> Option<&RuntimeProfileConfig> {
         let agent = self.agents.get(agent_alias)?;
@@ -3574,6 +3914,13 @@ impl Config {
         self.runtime_profiles.get(profile_alias)
     }
 
+    /// Effective context-compression summarizer provider for an agent:
+    /// agent-level `summary_provider` override → the runtime profile's
+    /// `context_compression.summary_provider` → `None` (the caller then reuses
+    /// the agent's own provider+model, optionally via the deprecated
+    /// `summary_model` swap). Unlike the inert agent-inline tunables below, the
+    /// agent-level override IS consulted — it's an explicit per-agent choice,
+    /// mirroring `classifier_provider`'s "empty = inherit" semantics.
     #[must_use]
     pub fn effective_summary_provider(
         &self,
@@ -3589,6 +3936,16 @@ impl Config {
             .filter(|r| !r.trim().is_empty())
             .cloned()
     }
+
+    // ── Effective per-agent runtime tunables ──────────────────────────
+    //
+    // Runtime tunables live on `[runtime_profiles.<profile>]`, referenced by an
+    // agent via `agents.<alias>.runtime_profile`. A profile value that is
+    // explicitly set (non-sentinel, i.e. `> 0` for `max_tool_iterations`) is
+    // authoritative; otherwise the global default applies. Agent-inline copies
+    // of these tunable keys are inert — superseded by runtime profiles (see the
+    // `agent_level_tunable_keys_are_inert` test) — so they are deliberately not
+    // consulted here as a fallback.
 
     #[must_use]
     pub fn effective_max_tool_iterations(&self, agent_alias: &str) -> usize {
@@ -3688,6 +4045,19 @@ impl Config {
             .unwrap_or_else(default_keep_tool_context_turns)
     }
 
+    /// Return a clone of the named agent's `AliasedAgentConfig` with all
+    /// runtime-profile overrides baked in. Use this when an `Agent` (or
+    /// any other struct) needs to own a self-contained, already-resolved
+    /// view of the agent's runtime knobs without holding a reference to
+    /// the full `Config`.
+    ///
+    /// Returns `None` when `agent_alias` is not present in `agents`.
+    ///
+    /// Semantics: every field touched here mirrors the matching
+    /// `effective_*` helper above. If you add a new runtime_profile knob,
+    /// add it both to an `effective_*` helper *and* to this function so
+    /// downstream consumers see consistent values regardless of which
+    /// surface they read from.
     #[must_use]
     pub fn resolved_agent_config(&self, agent_alias: &str) -> Option<AliasedAgentConfig> {
         let mut out = self.agents.get(agent_alias)?.clone();
@@ -3722,6 +4092,17 @@ impl Config {
         Some(out)
     }
 
+    /// Resolve the effective skills prompt-injection mode for an agent: the
+    /// agent's resolved runtime profile's `prompt_injection_mode` override when
+    /// set, otherwise the global `[skills] prompt_injection_mode`. Agents with
+    /// no runtime profile (or an unknown alias) fall back to the global value.
+    ///
+    /// Keyed on the resolved runtime profile — the sanctioned surface for
+    /// per-agent runtime tunables — so agent-inline knobs stay inert.
+    /// Centralizing the fallback here keeps the system-prompt builder and the
+    /// `read_skill` tool-registration gate in lockstep on one effective mode,
+    /// so a compact prompt is never paired with a missing `read_skill` tool
+    /// (or a full prompt with a spurious one).
     #[must_use]
     pub fn effective_skills_prompt_mode(&self, agent_alias: &str) -> SkillsPromptInjectionMode {
         self.runtime_profile_for_agent(agent_alias)
@@ -3729,6 +4110,18 @@ impl Config {
             .unwrap_or(self.skills.prompt_injection_mode)
     }
 
+    /// Resolve an agent's `model_provider` reference (`"<type>.<alias>"`) to
+    /// its concrete `ModelProviderConfig` entry. Returns `None` when the
+    /// agent doesn't exist, the reference is unparseable, or the
+    /// `<type>.<alias>` pair doesn't resolve in `providers.models`.
+    ///
+    /// This is the lookup the orchestrator uses to build per-agent
+    /// model_provider runtime options via explicit `<type>.<alias>`
+    /// resolution — there is no concept of a "first" or "default"
+    /// provider. The matching split logic lives in
+    /// `crates/zeroclaw-runtime/src/tools/delegate.rs::resolve_brain` for
+    /// the delegation path; this helper exposes the same contract for the
+    /// channel-server startup path.
     #[must_use]
     pub fn model_provider_for_agent(&self, agent_alias: &str) -> Option<&ModelProviderConfig> {
         let agent = self.agents.get(agent_alias)?;
@@ -3736,6 +4129,13 @@ impl Config {
         self.providers.models.find(type_key, alias_key)
     }
 
+    /// Resolve `(provider_type, provider_alias, &ModelProviderConfig)` for an
+    /// agent. Same lookup as `model_provider_for_agent` but also returns the
+    /// `'static` type key that downstream provider factories
+    /// (`create_routed_model_provider_with_options`, etc.) need. Returns
+    /// `None` when the agent has no `model_provider` set, when the reference
+    /// is unparseable, or when the resolved entry has been deleted from
+    /// `providers.models`.
     #[must_use]
     pub fn resolved_model_provider_for_agent(
         &self,
@@ -3749,6 +4149,11 @@ impl Config {
             .find(|(ty, al, _)| *ty == type_key && *al == alias_key)
     }
 
+    /// Reverse-lookup the agent alias that owns a configured channel
+    /// (`<type>.<alias>`). Returns the first agent listing the channel in
+    /// its `channels` field. `None` when no agent owns the channel —
+    /// orphaned channels are a config error the orchestrator surfaces at
+    /// startup.
     #[must_use]
     pub fn agent_for_channel(&self, channel_alias: &str) -> Option<&str> {
         self.agents
@@ -3766,6 +4171,11 @@ impl Config {
             .map_or_else(|| self.data_dir.clone(), |a| self.agent_workspace_dir(a))
     }
 
+    /// Schema-walk: every populated `[channels.<type>.<alias>]` block.
+    /// Type names come from the `prop_fields()` enumeration (kebab as the
+    /// macro emits them) so adding a new channel type via the macro
+    /// surfaces here without touching this code. Alias keys are HashMap
+    /// keys; not kebab-converted.
     #[must_use]
     pub fn channels_by_alias(&self) -> Vec<ChannelAliasInfo> {
         use std::collections::BTreeMap;
@@ -3795,6 +4205,14 @@ impl Config {
             .collect()
     }
 
+    /// Reverse-lookup the agent alias that owns a declaratively-configured
+    /// cron job (`[cron.<alias>]`). Returns the first agent listing the
+    /// alias in its `cron_jobs` field. `None` when no agent claims the
+    /// job — orphaned cron jobs are skipped at scheduler time with a
+    /// warning. Imperative jobs (created at runtime via `cron_add`) have
+    /// UUID-shaped ids that won't match any agent's `cron_jobs`; the
+    /// scheduler treats those separately (carrying their owning agent
+    /// alongside the DB row is a follow-up).
     #[must_use]
     pub fn agent_for_cron_job(&self, cron_alias: &str) -> Option<&str> {
         self.agents
@@ -3803,6 +4221,22 @@ impl Config {
             .map(|(alias, _)| alias.as_str())
     }
 
+    /// Resolve the per-agent workspace directory for `alias`.
+    ///
+    /// Returns the agent's `[agents.<alias>.workspace.path]` override
+    /// when set (operator-explicit, e.g. for putting a workspace on a
+    /// different disk), otherwise derives
+    /// `<install>/agents/<alias>/workspace/` from the install root
+    /// (the directory containing `config.toml`).
+    ///
+    /// Per-agent workspaces live under
+    /// `<install>/agents/<alias>/workspace/` and hold the agent's
+    /// markdown memory (MEMORY.md), identity files (IDENTITY.md,
+    /// SOUL.md), and any other per-agent plaintext state. Shared
+    /// databases (SQLite memory, sessions, cost records) live under
+    /// `config.data_dir` instead and partition by agent at the row
+    /// level. Per-agent overrides via `[agents.<alias>.workspace.path]`
+    /// pin an arbitrary filesystem path (e.g. a different mount).
     #[must_use]
     pub fn agent_workspace_dir(&self, agent_alias: &str) -> std::path::PathBuf {
         if let Some(cfg) = self.agents.get(agent_alias)
@@ -3816,6 +4250,12 @@ impl Config {
             .join("workspace")
     }
 
+    /// Effective MCP servers granted to an agent by its `mcp_bundles`.
+    ///
+    /// Secure by default: omission is not a grant. An agent is reached via
+    /// `resolved_agent_config`; an unknown alias or one with no `mcp_bundles`
+    /// receives NO MCP servers. See [`Self::mcp_servers_for_bundles`] for how
+    /// a non-empty bundle list resolves to servers.
     #[must_use]
     pub fn mcp_servers_for_agent(&self, agent_alias: &str) -> Vec<McpServerConfig> {
         match self.resolved_agent_config(agent_alias) {
@@ -3824,6 +4264,19 @@ impl Config {
         }
     }
 
+    /// Resolve a set of `[mcp_bundles.<alias>]` references to the concrete
+    /// `[mcp.servers]` entries they grant.
+    ///
+    /// Secure by default: omission is not a grant.
+    /// - An empty `bundle_aliases` grants NO servers (`Vec::new()`).
+    /// - The grant is the union of each referenced bundle's `servers`, in
+    ///   first-seen order with duplicates dropped.
+    /// - Deny wins: a server name listed in ANY referenced bundle's `exclude`
+    ///   is removed from the grant, regardless of which bundle included it.
+    /// - An unknown bundle alias grants nothing (it is skipped, not an error)
+    ///   and a server name with no matching `[mcp.servers]` entry grants
+    ///   nothing. Both fail closed: a misconfiguration narrows access, never
+    ///   widens it.
     #[must_use]
     pub fn mcp_servers_for_bundles(&self, bundle_aliases: &[String]) -> Vec<McpServerConfig> {
         if bundle_aliases.is_empty() {
@@ -3859,6 +4312,11 @@ impl Config {
             .collect()
     }
 
+    /// `<install>/shared/` — directory shared across every agent on this
+    /// host. Holds skills, skill bundles, knowledge bundles, and any
+    /// other content not scoped to a single agent's workspace. Distinct
+    /// from `agent_workspace_dir(alias)` (per-agent state) and
+    /// `data_dir` (databases + runtime state).
     #[must_use]
     pub fn shared_workspace_dir(&self) -> std::path::PathBuf {
         self.install_root_dir().join("shared")
@@ -3884,6 +4342,18 @@ impl Config {
         self.agents.get(agent_alias)
     }
 
+    /// Resolve the runtime-active agent alias the orchestrator binds
+    /// channels to. Mirrors the same selection logic as
+    /// `start_channels()` in zeroclaw-channels: prefer the migration-
+    /// synthesized `"default"` agent, otherwise fall back to the
+    /// lexicographically-smallest enabled alias. Returns `None` only
+    /// when no enabled agent is configured.
+    ///
+    /// Used by per-agent infrastructure (TtsManager, TranscriptionManager)
+    /// to pick which agent's `tts_provider` / `transcription_provider`
+    /// drives the manager's resolved alias. Until the per-channel
+    /// dispatch refactor lands, the orchestrator runs in single-agent
+    /// mode, so all manager instances share the same resolved agent.
     #[must_use]
     pub fn resolved_runtime_agent_alias(&self) -> Option<&str> {
         self.agents
@@ -3899,6 +4369,15 @@ impl Config {
             })
     }
 
+    /// Resolve the active storage backend for the memory subsystem.
+    ///
+    /// `MemoryConfig.backend` is a dotted reference (`<backend>.<alias>`) into
+    /// `Config.storage.<backend>.<alias>`. Bare backend names are interpreted
+    /// as `<backend>.default` for back-compat.
+    ///
+    /// Returns `ActiveStorage::None` when no backend is configured, when the
+    /// backend is `"none"`, or when the dotted alias does not resolve to a
+    /// configured entry.
     pub fn resolve_active_storage(&self) -> ActiveStorage<'_> {
         let backend = self.memory.backend.trim();
         if backend.is_empty() || backend.eq_ignore_ascii_case("none") {
@@ -3942,6 +4421,7 @@ impl Config {
 }
 
 /// Resolved storage backend variant.
+///
 /// Returned from [`Config::resolve_active_storage`]. Each variant carries a
 /// borrow of the typed config from the corresponding `Config.storage` map.
 #[derive(Debug, Clone, Copy)]
@@ -4025,8 +4505,21 @@ pub const REPLY_MIN_INTERVAL_MAX_SECS: u64 = 3600;
 /// explicitly. Validator rejects values above this ceiling.
 pub const REPLY_QUEUE_DEPTH_CEILING: u16 = 1024;
 
+/// Fallback queue depth applied at the pacing-wrapper construction site
+/// when a channel's `reply_queue_depth_max` is left at `0`. Sized for the
+/// AI-pacing use case: a paced channel buffering more than this is a sign
+/// the agent is producing replies faster than the floor will ever drain
+/// them and the overflow log is the right signal.
 pub const DEFAULT_REPLY_QUEUE_DEPTH: u16 = 16;
 
+/// Idle-state LRU cap on the pacing wrapper's per-recipient rows.
+/// Bounds growth when a bot legitimately serves many thousands of distinct
+/// peers. Eviction only reclaims idle rows (no queued sends, no running
+/// worker, no in-flight dispatch), so under a pathological all-active burst
+/// the row count can temporarily exceed this target until rows become idle —
+/// it is not an unconditional hard bound. Each recipient's queue depth stays
+/// bounded regardless. Not exposed in config — promote to a schema field if
+/// an operator reports hitting it.
 pub const PACING_RECIPIENT_CAP: usize = 1024;
 
 /// Validate that a temperature value is within the allowed range.
@@ -4073,6 +4566,13 @@ where
     Ok(T::deserialize(raw).unwrap_or_default())
 }
 
+/// Deserialize an `Option<String>` that maps an empty literal `""` to
+/// `None`. Used by `JiraConfig::email` so a config that round-tripped
+/// `email = ""` to disk (the legacy `email: String` had no
+/// `skip_serializing_if`) doesn't deserialize as `Some("")` and silently
+/// break Basic auth — the email-required validation was removed when
+/// Server/DC Bearer-token support landed, so this is the last line of
+/// defense.
 fn deserialize_optional_email_skip_empty<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<String>, D::Error>
@@ -4129,6 +4629,11 @@ pub struct HardwareConfig {
     /// Target chip identifier for `transport = probe` (e.g. `STM32F401RE`, `nRF52840_xxAA`). Passed straight to probe-rs for flash/debug operations; must match a chip probe-rs recognizes.
     #[serde(default)]
     pub probe_target: Option<String>,
+    /// Index pre-converted `.md` and `.txt` datasheets from the workspace into
+    /// a local RAG store, so the agent can look up pin assignments and
+    /// electrical specs inline when you ask hardware questions. PDFs are not
+    /// parsed as text; download or convert them to `.md`/`.txt` first. Off by
+    /// default — turn on once the workspace has relevant text datasheets.
     #[serde(default)]
     pub workspace_datasheets: bool,
 }
@@ -4184,6 +4689,7 @@ fn default_google_stt_language_code() -> String {
 }
 
 /// Voice transcription configuration with multi-provider support.
+///
 /// The top-level `api_url`, `model`, and `api_key` fields remain for backward
 /// compatibility with existing Groq-based configurations.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -4194,6 +4700,7 @@ pub struct TranscriptionConfig {
     #[serde(default)]
     pub enabled: bool,
     /// API key used for transcription requests (Groq transcription provider).
+    ///
     /// If unset, runtime falls back to `GROQ_API_KEY` for backward compatibility.
     #[serde(default)]
     #[secret]
@@ -4299,6 +4806,11 @@ impl McpTransport {
         }
     }
 
+    /// The `McpServerConfig` leaf this transport requires to be non-empty.
+    /// Single source of truth shared by `validate_mcp_config` (runtime
+    /// enforcement) and the config-form `x-required-by-transport` schema
+    /// metadata the Operator Console reads to mark the right field Required
+    /// per transport. Changing the relationship here updates both consumers.
     pub fn required_leaf(self) -> &'static str {
         match self {
             McpTransport::Stdio => "command",
@@ -4307,6 +4819,13 @@ impl McpTransport {
     }
 }
 
+/// Every transport, enumerated on-demand from the schema rather than a
+/// hand-maintained list, so the set is derived from the enum itself and a new
+/// variant shows up here automatically (its `required_leaf` arm then forces a
+/// decision). schemars emits a fieldless enum as a top-level `enum` array, or
+/// as `oneOf` of `const`s once the variants carry doc comments; handle both,
+/// matching the existing `enum_variants` helper. The wire tokens honor the
+/// serde rename, so they round-trip straight back to the enum.
 #[cfg(feature = "schema-export")]
 fn mcp_transports() -> Vec<McpTransport> {
     let schema = serde_json::to_value(schemars::schema_for!(McpTransport)).unwrap_or_default();
@@ -4327,6 +4846,11 @@ fn mcp_transports() -> Vec<McpTransport> {
         .collect()
 }
 
+/// Per-transport required-leaf map, projected from [`McpTransport::required_leaf`]
+/// onto the schema as the `x-required-by-transport` extension on
+/// `McpServerConfig`. The Operator Console config form reads it so the Required
+/// badge tracks the selected transport (`stdio` needs `command`, `http`/`sse`
+/// need `url`) instead of hardcoding the relationship in the web surface.
 #[cfg(feature = "schema-export")]
 fn mcp_required_by_transport() -> serde_json::Value {
     let map: serde_json::Map<String, serde_json::Value> = mcp_transports()
@@ -4382,6 +4906,11 @@ pub struct McpServerConfig {
     /// Optional per-call timeout in seconds (hard capped in validation).
     #[serde(default)]
     pub tool_timeout_secs: Option<u64>,
+    /// Resource URIs to read once at agent startup and inject into the system
+    /// prompt as untrusted, server-origin context. Each is read via
+    /// `resources/read` on this server; pins on a server that does not advertise
+    /// resources, or that the agent's tool policy denies, are skipped with a
+    /// warning. Read once per run (not refreshed; no subscriptions).
     #[serde(default)]
     pub pinned_resources: Vec<String>,
 }
@@ -4402,6 +4931,21 @@ pub struct McpConfig {
     #[tab(Settings)]
     #[serde(default = "default_deferred_loading")]
     pub deferred_loading: bool,
+    /// Configured MCP servers. The `#[nested]` annotation makes the macro
+    /// expose this as a List section in `map_key_sections()`, so the
+    /// dashboard's `+ Add MCP server` affordance and the `POST
+    /// /api/config/map-key?path=mcp.servers&key=<name>` endpoint pick it
+    /// up automatically (no hand-table on the gateway side).
+    ///
+    /// `#[natural_key = "name"]` opts the Vec into per-element property
+    /// routing (see `route_vec_path` and the `Configurable` derive's
+    /// `#[natural_key]` arm). With it, `set_prop("mcp.servers.<name>.url",
+    /// ...)` and `get_prop("mcp.servers.<name>.transport")` resolve to
+    /// the matching element's own `set_prop` / `get_prop`, and the
+    /// `mcp.servers` section behaves like a `HashMap<String,
+    /// McpServerConfig>` from the dashboard / TUI's point of view.
+    /// `name` itself becomes read-only via `set_prop`; rename goes
+    /// through `rename_map_key` which mutates the `name` field in place.
     #[tab(Servers)]
     #[serde(default, alias = "mcpServers")]
     #[nested]
@@ -4459,6 +5003,7 @@ impl Default for VerifiableIntentConfig {
 // ── Nodes (Dynamic Node Discovery) ───────────────────────────────
 
 /// Configuration for the dynamic node discovery system (`[nodes]`).
+///
 /// When enabled, external processes/devices can connect via WebSocket
 /// at `/ws/nodes` and advertise their capabilities at runtime.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -4507,6 +5052,11 @@ fn default_tts_max_text_length() -> usize {
     4096
 }
 
+/// Text-to-Speech subsystem configuration (`[tts]`).
+///
+/// Per-instance TTS configs live under `[tts_providers.<type>.<alias>]`
+/// (parallel to `providers.models`). What remains here are the global
+/// runtime knobs that apply to every model_provider invocation.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tts"]
@@ -4536,6 +5086,12 @@ impl Default for TtsConfig {
     }
 }
 
+/// Per-instance TTS model_provider configuration (`[tts_providers.<type>.<alias>]`).
+///
+/// Mirrors `ModelProviderConfig` in shape — one struct holds the union of
+/// fields across backends. Only the fields relevant to the selected backend
+/// (determined by the outer `<type>` map key) are read at runtime; others
+/// are quietly ignored.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tts_provider"]
@@ -4574,6 +5130,14 @@ pub struct TtsProviderConfig {
     #[serde(alias = "api_url")]
     pub uri: Option<String>,
 }
+
+// ── TTS endpoint trait + per-family typed configs ──────────────────────────
+//
+// Mirrors the model provider typed-family pattern. Each TTS family carries
+// its own typed config (composing TtsProviderConfig as the shared base via
+// `#[serde(flatten)]`) and a single-variant `*TtsEndpoint` enum impl'ing
+// `TtsEndpoint`. Edge and Piper skip the base — they're subprocess / local
+// runtimes with no shared `api_key` / `voice` defaults.
 
 /// One trait per family-endpoint enum. Returns the URI for the chosen
 /// variant. Mirrors `ModelEndpoint` for parity across model and TTS.
@@ -4711,6 +5275,15 @@ pub struct PiperTtsProviderConfig {
     #[serde(flatten)]
     pub base: TtsProviderConfig,
 }
+
+// ── Transcription providers (typed-family split, mirrors models/tts) ────
+//
+// Six family slots: `groq`, `openai`, `deepgram`, `assemblyai`, `google`,
+// `local_whisper`. Each is a `HashMap<String, *TranscriptionProviderConfig>`
+// keyed by operator-chosen alias. The shared `TranscriptionProviderConfig`
+// base carries `api_key` + `language` since every cloud STT family takes
+// both; `local_whisper` skips the base because it's a self-hosted endpoint
+// with its own auth token, not a vendor API key.
 
 /// Shared base for cloud transcription providers. Each cloud family
 /// composes this via `#[serde(flatten)] base: TranscriptionProviderConfig`.
@@ -4931,6 +5504,33 @@ pub enum ToolFilterGroupMode {
     Dynamic,
 }
 
+/// A named group of MCP tool patterns with an activation mode.
+///
+/// Each group lists glob patterns for MCP tool names and an optional set of
+/// keywords that trigger inclusion in `dynamic` mode. MCP tools are named
+/// `<server>__<tool>` (double-underscore separator, e.g. `filesystem__read_file`).
+///
+/// Classification is by origin, not name shape: only tools that actually came
+/// from the MCP registry are subject to these groups. Built-in tools AND skill
+/// tools — which share the `<x>__<y>` naming convention (`{skill}__{tool}`) —
+/// always pass through and are never affected by `tool_filter_groups`.
+///
+/// Under `[mcp] deferred_loading = true`, `mode = "always"` entries are
+/// pre-activated at assembly time so matching tools are live from the first
+/// turn without a `tool_search` round-trip.
+///
+/// # Example
+/// ```toml
+/// [[runtime_profiles.default.tool_filter_groups]]
+/// mode = "always"
+/// tools = ["filesystem__*"]
+/// keywords = []
+///
+/// [[runtime_profiles.default.tool_filter_groups]]
+/// mode = "dynamic"
+/// tools = ["browser__*"]
+/// keywords = ["browse", "website", "url", "search"]
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ToolFilterGroup {
@@ -5008,6 +5608,7 @@ pub struct GoogleSttConfig {
 }
 
 /// Local/self-hosted Whisper-compatible STT endpoint (`[transcription.local_whisper]`).
+///
 /// Configures a self-hosted STT endpoint. Can be on localhost, a private network host, or any reachable URL.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -5022,6 +5623,11 @@ pub struct LocalWhisperConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bearer_token: Option<String>,
+    /// Maximum audio file size in bytes accepted by this endpoint.
+    /// Defaults to 25 MB — matching the cloud API cap for a safe out-of-the-box
+    /// experience. Self-hosted endpoints can accept much larger files; raise this
+    /// as needed, but note that each transcription call clones the audio buffer
+    /// into a multipart payload, so peak memory per request is ~2× this value.
     #[serde(default = "default_local_whisper_max_audio_bytes")]
     pub max_audio_bytes: usize,
     /// Request timeout in seconds. Defaults to 300 (large files on local GPU).
@@ -5037,6 +5643,12 @@ fn default_local_whisper_timeout_secs() -> u64 {
     300
 }
 
+/// HMAC tool execution receipt configuration, per agent
+/// (`[agents.<alias>.tool_receipts]`).
+///
+/// Receipts are short HMAC-SHA256 tags appended to tool results so the model
+/// cannot claim it ran a tool that never actually executed. See
+/// `docs/book/src/security/tool-receipts.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "delegate_agent.tool_receipts"]
@@ -5090,6 +5702,11 @@ fn default_max_system_prompt_chars() -> usize {
 
 // ── Pacing ────────────────────────────────────────────────────────
 
+/// Pacing controls for slow/local LLM workloads (`[pacing]` section).
+///
+/// All fields are optional and default to values that preserve existing
+/// behavior. When set, they extend — not replace — the existing timeout
+/// and loop-detection subsystems.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "pacing"]
@@ -5113,6 +5730,11 @@ pub struct PacingConfig {
     #[serde(default)]
     pub loop_ignore_tools: Vec<String>,
 
+    /// Override for the hardcoded timeout scaling cap (default: 4).
+    /// The channel message timeout budget is computed as:
+    ///   `message_timeout_secs * min(max_tool_iterations, message_timeout_scale_max)`
+    /// Raising this value lets long multi-step tasks with slow local models
+    /// receive a proportionally larger budget without inflating the base timeout.
     #[serde(default)]
     pub message_timeout_scale_max: Option<u64>,
 
@@ -5173,6 +5795,7 @@ pub enum SkillsPromptInjectionMode {
 }
 
 /// An external, user-configured skill registry ZeroClaw can install from.
+///
 /// Reuses the same git-clone mechanism as the default `zeroclaw-skills`
 /// registry. Install a skill from it with `registry:<name>/<skill>`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -5249,6 +5872,11 @@ pub struct ExternalRegistry {
 }
 
 impl ExternalRegistry {
+    /// Returns true when `name` can be addressed by `registry:<name>/<skill>`.
+    ///
+    /// Keep this as the single registry-alias rule used by both config
+    /// validation and runtime install-spec parsing. Lowercase aliases also
+    /// avoid clone-directory collisions on case-insensitive filesystems.
     pub fn is_valid_name(name: &str) -> bool {
         !name.is_empty()
             && name
@@ -5316,6 +5944,14 @@ pub struct SkillCreationConfig {
     /// Embedding similarity threshold for deduplication.
     /// Skills with descriptions more similar than this value are skipped.
     pub similarity_threshold: f64,
+    /// Synthesize a canonical `SKILL.md` from the execution trace via a
+    /// bounded model-provider reflection call instead of the deterministic
+    /// `SKILL.toml` generator. Requires `enabled = true`. Falls back to
+    /// `SKILL.toml` whenever the reflection call or its output is invalid, so
+    /// turning this on never leaves a skill un-created. This is distinct from
+    /// the `[skills.skill_improvement]` background review fork, which patches
+    /// existing skills after use rather than creating new ones from a trace.
+    /// Default: `false`.
     #[serde(default = "default_reflection_enabled")]
     pub reflection_enabled: bool,
     /// Maximum characters of the final assistant answer fed into the
@@ -5374,6 +6010,12 @@ pub struct SkillInstallSuggestionsConfig {
     pub enabled: bool,
 }
 
+/// Skill self-improvement configuration (`[skills.skill-improvement]` section).
+///
+/// Controls the post-turn background review fork that may patch, expand, or
+/// archive skills based on what the conversation revealed. The fork runs in a
+/// restricted toolset (only `skills_list`, `skill_view`, `skill_manage`) and
+/// never touches the user-visible conversation.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "skills.skill_improvement"]
@@ -5454,15 +6096,47 @@ impl Default for PipelineConfig {
     }
 }
 
+/// Multimodal (image) handling configuration (`[multimodal]` section).
+///
+/// # Privacy and cost note
+///
+/// Tool results that print real local image paths (e.g. shell tools doing
+/// `ls /pictures` or `find . -name '*.png'`) are canonicalized into
+/// `[IMAGE:...]` markers and base64-inlined into the next provider request.
+/// This means image bytes that previously stayed local will be uploaded to
+/// the configured provider when surfaced by a tool.
+///
+/// `max_images` (and the `trim_old_images` LRU policy) bounds the per-request
+/// image budget, but operators running shell-style tools over directories of
+/// personal or sensitive images should be aware of the upload semantics. See
+/// `docs/book/src/contributing/privacy.md` for the project's privacy stance.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "multimodal"]
 pub struct MultimodalConfig {
+    /// Maximum number of image attachments accepted per request.
+    ///
+    /// Caps the total number of `[IMAGE:...]` markers that survive into the
+    /// provider request after multimodal preprocessing. Older images are
+    /// dropped first when the cumulative count exceeds this limit. Acts as
+    /// the upper bound on per-turn upload cost when tool outputs surface
+    /// local image paths.
     #[serde(default = "default_multimodal_max_images")]
     pub max_images: usize,
     /// Maximum image payload size in MiB before base64 encoding.
     #[serde(default = "default_multimodal_max_image_size_mb")]
     pub max_image_size_mb: usize,
+    /// Maximum age of images in conversation turns.
+    ///
+    /// When non-zero, images in user messages that are more than this many
+    /// turns back from the end of history are stripped before the request is
+    /// sent to the provider. This prevents a single screenshot from being
+    /// re-encoded and re-uploaded on every subsequent turn indefinitely.
+    /// Tool-result images are already managed by the stale-tool-result
+    /// mechanism and are not affected by this setting.
+    ///
+    /// `0` (the default) disables age-based trimming entirely — images are
+    /// only evicted by the `max_images` count cap.
     #[serde(default)]
     pub max_image_turns: usize,
     /// Allow fetching remote image URLs (http/https). Disabled by default.
@@ -5511,6 +6185,11 @@ impl Default for MultimodalConfig {
 
 // ── Media Pipeline ──────────────────────────────────────────────
 
+/// Automatic media understanding pipeline configuration (`[media_pipeline]`).
+///
+/// When enabled, inbound channel messages with media attachments are
+/// pre-processed before reaching the agent: audio is transcribed, images are
+/// annotated, and videos are summarised.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -5547,6 +6226,7 @@ impl Default for MediaPipelineConfig {
 // ── Identity (AIEOS / OpenClaw format) ──────────────────────────
 
 /// Identity format configuration (`[identity]` section).
+///
 /// Supports `"openclaw"` (default) or `"aieos"` identity documents.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -5623,6 +6303,26 @@ pub struct CostConfig {
     #[serde(default = "default_track_per_agent")]
     pub track_per_agent: bool,
 
+    /// Operator-managed rate sheet at `[cost.rates.*]`. Sections mirror
+    /// the `[providers.*]` dotted-path exactly with the trailing `alias`
+    /// segment replaced by the resource the rate applies to (model id,
+    /// tool name, …). Layout:
+    ///
+    /// ```toml
+    /// [cost.rates.providers.models.anthropic."claude-opus-4-7"]
+    /// input_per_mtok        = 15.0
+    /// output_per_mtok       = 75.0
+    /// cached_input_per_mtok = 1.5
+    ///
+    /// [cost.rates.providers.tts.openai."tts-1-hd"]
+    /// per_mchar = 30.0
+    ///
+    /// [cost.rates.providers.transcription.openai.whisper-1]
+    /// per_minute = 0.006
+    ///
+    /// [cost.rates.tools.web_search]
+    /// per_call = 0.005
+    /// ```
     #[tab(Costs)]
     #[serde(default)]
     #[nested]
@@ -5735,6 +6435,13 @@ impl CostRatesConfig {
     }
 }
 
+/// `[cost.rates.providers.*]` — provider-shaped rate sheets. Each field
+/// here mirrors a corresponding field on `[providers.*]` with the
+/// trailing alias segment replaced by the resource the rate prices.
+/// The inner typed wrappers carry the per-provider-type slot layout
+/// and own dispatch (their slot list is the single source of truth,
+/// shared with their providers counterpart via the `for_each_*_provider_slot!`
+/// macros in [`crate::providers`]).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "cost.rates.providers"]
@@ -5839,6 +6546,7 @@ impl Default for CostConfig {
 // ── Peripherals (hardware: STM32, RPi GPIO, etc.) ────────────────────────
 
 /// Peripheral board integration configuration (`[peripherals]` section).
+///
 /// Boards become agent tools when enabled.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -5895,6 +6603,7 @@ impl Default for PeripheralBoardConfig {
 // ── Gateway security ─────────────────────────────────────────────
 
 /// Gateway server configuration (`[gateway]` section).
+///
 /// Controls the HTTP gateway for webhook and pairing endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -5913,6 +6622,15 @@ pub struct GatewayConfig {
     /// Allow binding to non-localhost without a tunnel (default: false)
     #[serde(default)]
     pub allow_public_bind: bool,
+    /// Allow authenticated remote callers to use admin endpoints that are
+    /// otherwise localhost-only. Currently this gates `POST /admin/reload`.
+    /// When false (default), those endpoints reject any non-loopback peer.
+    /// When true, a non-loopback request is accepted only if it also passes
+    /// pairing authentication — which requires `require_pairing = true`; with
+    /// pairing off a remote caller cannot be authenticated and is rejected, so
+    /// this flag never exposes an anonymous remote reload. `/admin/shutdown`
+    /// and the pairing-code endpoints stay localhost-only regardless.
+    /// (default: false)
     #[serde(default)]
     pub allow_remote_admin: bool,
     /// Paired bearer tokens (managed automatically, not user-edited)
@@ -5967,6 +6685,11 @@ pub struct GatewayConfig {
     #[nested]
     pub pairing_dashboard: PairingDashboardConfig,
 
+    /// Path to the web dashboard `dist` directory.  When set, the gateway
+    /// serves the compiled frontend from the filesystem instead of requiring
+    /// it to be embedded in the binary.  Accepts absolute paths or paths
+    /// relative to the working directory.  When omitted the gateway runs in
+    /// API-only mode (no web dashboard) unless auto-detection finds it.
     #[serde(default)]
     pub web_dist_dir: Option<String>,
 
@@ -6165,6 +6888,11 @@ impl Default for GatewayClientAuthConfig {
     }
 }
 
+/// WebSocket Secure (WSS) transport for remote TUI-to-daemon connections (`[wss]`).
+///
+/// When enabled, the daemon listens for TLS-encrypted WebSocket connections
+/// on the configured bind address and port. TUI clients connect via
+/// `--connect wss://host:port`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "wss"]
@@ -6275,6 +7003,7 @@ impl Default for NodeTransportConfig {
 // ── Composio (managed tool surface) ─────────────────────────────
 
 /// Composio managed OAuth tools integration (`[composio]` section).
+///
 /// Provides access to 1000+ OAuth-connected tools via the Composio platform.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -6311,6 +7040,7 @@ impl Default for ComposioConfig {
 // ── Microsoft 365 (Graph API integration) ───────────────────────
 
 /// Microsoft 365 integration via Microsoft Graph API (`[microsoft365]` section).
+///
 /// Provides access to Outlook mail, Teams messages, Calendar events,
 /// OneDrive files, and SharePoint search.
 #[derive(Clone, Serialize, Deserialize, Configurable)]
@@ -6406,6 +7136,7 @@ impl Default for SecretsConfig {
 // ── Browser (friendly-service browsing only) ───────────────────
 
 /// Computer-use sidecar configuration (`[browser.computer_use]` section).
+///
 /// Delegates OS-level mouse, keyboard, and screenshot actions to a local sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -6460,6 +7191,7 @@ impl Default for BrowserComputerUseConfig {
 }
 
 /// Browser automation configuration (`[browser]` section).
+///
 /// Controls the `browser_open` tool and browser automation backends.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -6499,6 +7231,14 @@ pub struct BrowserConfig {
     #[serde(default)]
     #[nested]
     pub computer_use: BrowserComputerUseConfig,
+    /// Private/internal hosts allowed to bypass SSRF protection.
+    /// Exact and subdomain matches are supported; `["*"]` permits **all** private/local
+    /// hosts (RFC 1918, loopback, link-local, `.local`). Default: empty (deny).
+    /// Listed hosts also bypass `allowed_domains`. Both the `browser` tool and
+    /// `browser_open` accept `http://` for listed hosts — internal services
+    /// frequently lack a public TLS cert.
+    /// Warning: `["*"]` also reaches link-local addresses, including the cloud metadata
+    /// endpoint (`169.254.169.254`) — list specific hosts unless you accept that exposure.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
 }
@@ -6534,6 +7274,11 @@ impl Default for BrowserConfig {
 
 // ── HTTP request tool ───────────────────────────────────────────
 
+/// HTTP request tool configuration (`[http_request]` section).
+///
+/// Domain filtering: `allowed_domains` controls which hosts are reachable (use `["*"]`
+/// for all public hosts, which is the default). If `allowed_domains` is empty, all
+/// requests are rejected.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "http_request"]
@@ -6594,6 +7339,12 @@ fn default_allowed_domains_star() -> Vec<String> {
 
 // ── Web fetch ────────────────────────────────────────────────────
 
+/// Web fetch tool configuration (`[web_fetch]` section).
+///
+/// Fetches web pages and converts HTML to plain text for LLM consumption.
+/// Domain filtering: `allowed_domains` controls which hosts are reachable (use `["*"]`
+/// for all public hosts). `blocked_domains` takes priority over `allowed_domains`.
+/// If `allowed_domains` is empty, all requests are rejected (deny-by-default).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "web_fetch"]
@@ -6607,6 +7358,14 @@ pub struct WebFetchConfig {
     /// Blocked domains (exact or subdomain match; always takes priority over allowed_domains)
     #[serde(default)]
     pub blocked_domains: Vec<String>,
+    /// Private/internal hosts allowed to bypass SSRF protection (e.g. `["192.168.1.10", "internal.local"]`).
+    /// Exact and subdomain matches are supported. Listing a host skips the
+    /// resolved-IP SSRF check for it; a *literal* private/local host (IP literal,
+    /// localhost, .local) listed here also bypasses `allowed_domains`. The `*`
+    /// wildcard permits any literal private/local host and lets a name already in
+    /// `allowed_domains` resolve to a private IP, but it does NOT widen
+    /// `allowed_domains` — a non-private host (matched explicitly or via `*`) still
+    /// needs `allowed_domains`, so `*` cannot reach an arbitrary public host.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
     /// Maximum response size in bytes (default: 500KB, plain text is much smaller than raw HTML)
@@ -6636,6 +7395,11 @@ pub enum FirecrawlMode {
     Crawl,
 }
 
+/// Firecrawl fallback configuration for JS-heavy and bot-blocked sites.
+///
+/// When enabled, if the standard web fetch fails (HTTP error, empty body, or
+/// body shorter than 100 characters suggesting a JS-only page), the tool
+/// falls back to the Firecrawl API for stealth content extraction.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "web_fetch.firecrawl"]
@@ -6702,6 +7466,12 @@ impl Default for WebFetchConfig {
 
 // ── Link enricher ─────────────────────────────────────────────────
 
+/// Automatic link understanding for inbound channel messages (`[link_enricher]`).
+///
+/// When enabled, URLs in incoming messages are automatically fetched and
+/// summarised. The summary is prepended to the message before the agent
+/// processes it, giving the LLM context about linked pages without an
+/// explicit tool call.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "link_enricher"]
@@ -6738,6 +7508,7 @@ impl Default for LinkEnricherConfig {
 // ── Text browser ─────────────────────────────────────────────────
 
 /// Text browser tool configuration (`[text_browser]` section).
+///
 /// Uses text-based browsers (lynx, links, w3m) to render web pages as plain
 /// text. Designed for headless/SSH environments without graphical browsers.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -6753,6 +7524,11 @@ pub struct TextBrowserConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_text_browser_timeout_secs")]
     pub timeout_secs: u64,
+    /// Private/internal hosts allowed to bypass SSRF protection.
+    /// Exact and subdomain matches are supported; `["*"]` permits **all** private/local
+    /// hosts (RFC 1918, loopback, link-local, `.local`). Default: empty (deny).
+    /// Warning: `["*"]` also reaches link-local addresses, including the cloud metadata
+    /// endpoint (`169.254.169.254`) — list specific hosts unless you accept that exposure.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
 }
@@ -6774,6 +7550,11 @@ impl Default for TextBrowserConfig {
 
 // ── Shell tool ───────────────────────────────────────────────────
 
+/// Shell tool configuration (`[shell_tool]` section).
+///
+/// Controls the behaviour of the `shell` execution tool. The main
+/// tunable is `timeout_secs` — the maximum wall-clock time a single
+/// shell command may run before it is killed.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "shell_tool"]
@@ -6797,11 +7578,18 @@ impl Default for ShellToolConfig {
 
 // ── Escalation routing ───────────────────────────────────────────
 
+/// Escalation routing configuration (`[escalation]` section).
+///
+/// Controls which channels receive alert notifications when
+/// `escalate_to_human` is called with high or critical urgency.
+/// Channels are identified by name (e.g. `"telegram"`, `"slack"`).
+/// Alerts are sent best-effort and do not block the escalation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "escalation"]
 pub struct EscalationConfig {
     /// Channel names to alert on high/critical escalations (default: empty).
+    ///
     /// Each name must match a configured channel. Unrecognised names are
     /// logged at WARN level and skipped.
     #[serde(default)]
@@ -7047,6 +7835,12 @@ impl Default for DataRetentionConfig {
 
 // ── Google Workspace ─────────────────────────────────────────────
 
+/// Built-in default service allowlist for the `google_workspace` tool.
+///
+/// Applied when `allowed_services` is empty. Defined here (not in the tool layer)
+/// so that config validation can cross-check `allowed_operations` entries against
+/// the effective service set in all cases, including when the operator relies on
+/// the default.
 pub const DEFAULT_GWS_SERVICES: &[&str] = &[
     "drive",
     "sheets",
@@ -7064,6 +7858,33 @@ pub const DEFAULT_GWS_SERVICES: &[&str] = &[
     "events",
 ];
 
+/// Google Workspace CLI (`gws`) tool configuration (`[google_workspace]` section).
+///
+/// ## Defaults
+/// - `enabled`: `false` (tool is not registered unless explicitly opted-in).
+/// - `allowed_services`: empty vector, which grants access to the full default
+///   service set: `drive`, `sheets`, `gmail`, `calendar`, `docs`, `slides`,
+///   `tasks`, `people`, `chat`, `classroom`, `forms`, `keep`, `meet`, `events`.
+/// - `credentials_path`: `None` (uses default `gws` credential discovery).
+/// - `default_account`: `None` (uses the `gws` active account).
+/// - `rate_limit_per_minute`: `60`.
+/// - `timeout_secs`: `30`.
+/// - `audit_log`: `false`.
+/// - `credentials_path`: `None` (uses default `gws` credential discovery).
+/// - `default_account`: `None` (uses the `gws` active account).
+/// - `rate_limit_per_minute`: `60`.
+/// - `timeout_secs`: `30`.
+/// - `audit_log`: `false`.
+///
+/// ## Compatibility
+/// Configs that omit the `[google_workspace]` section entirely are treated as
+/// `GoogleWorkspaceConfig::default()` (disabled, all defaults allowed). Adding
+/// the section is purely opt-in and does not affect other config sections.
+///
+/// ## Rollback / Migration
+/// To revert, remove the `[google_workspace]` section from the config file (or
+/// set `enabled = false`). No data migration is required; the tool simply stops
+/// being registered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct GoogleWorkspaceAllowedOperation {
@@ -7082,6 +7903,30 @@ pub struct GoogleWorkspaceAllowedOperation {
     pub methods: Vec<String>,
 }
 
+/// Google Workspace CLI (`gws`) tool configuration (`[google_workspace]` section).
+///
+/// ## Defaults
+/// - `enabled`: `false` (tool is not registered unless explicitly opted-in).
+/// - `allowed_services`: empty vector, which grants access to the full default
+///   service set: `drive`, `sheets`, `gmail`, `calendar`, `docs`, `slides`,
+///   `tasks`, `people`, `chat`, `classroom`, `forms`, `keep`, `meet`, `events`.
+/// - `allowed_operations`: empty vector, which preserves the legacy behavior of
+///   allowing any resource/method under the allowed service set.
+/// - `credentials_path`: `None` (uses default `gws` credential discovery).
+/// - `default_account`: `None` (uses the `gws` active account).
+/// - `rate_limit_per_minute`: `60`.
+/// - `timeout_secs`: `30`.
+/// - `audit_log`: `false`.
+///
+/// ## Compatibility
+/// Configs that omit the `[google_workspace]` section entirely are treated as
+/// `GoogleWorkspaceConfig::default()` (disabled, all defaults allowed). Adding
+/// the section is purely opt-in and does not affect other config sections.
+///
+/// ## Rollback / Migration
+/// To revert, remove the `[google_workspace]` section from the config file (or
+/// set `enabled = false`). No data migration is required; the tool simply stops
+/// being registered.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "google_workspace"]
@@ -7095,13 +7940,37 @@ pub struct GoogleWorkspaceConfig {
     /// Enable the `google_workspace` tool. Default: `false`.
     #[serde(default)]
     pub enabled: bool,
+    /// Restrict which Google Workspace services the agent can access.
+    ///
+    /// When empty (the default), the full default service set is allowed (see
+    /// struct-level docs). When non-empty, only the listed service IDs are
+    /// permitted. Each entry must be non-empty, lowercase alphanumeric with
+    /// optional underscores/hyphens, and unique.
     #[serde(default)]
     pub allowed_services: Vec<String>,
+    /// Restrict which resource/method combinations the agent can access.
+    ///
+    /// When empty (the default), all methods under `allowed_services` remain
+    /// available for backward compatibility. When non-empty, the runtime denies
+    /// any `(service, resource, sub_resource, method)` combination that is not
+    /// explicitly listed. `sub_resource` is optional per entry: an entry without
+    /// it matches only 3-segment `gws` calls; an entry with it matches only calls
+    /// that supply that exact sub_resource value.
+    ///
+    /// Each entry's `service` must appear in `allowed_services` when that list is
+    /// non-empty; config validation rejects entries that would never match at
+    /// runtime.
     #[serde(default)]
     pub allowed_operations: Vec<GoogleWorkspaceAllowedOperation>,
+    /// Path to service account JSON or OAuth client credentials file.
+    ///
+    /// When `None`, the tool relies on the default `gws` credential discovery
+    /// (`gws auth login`). Set this to point at a service-account key or an
+    /// OAuth client-secrets JSON for headless / CI environments.
     #[serde(default)]
     pub credentials_path: Option<String>,
     /// Default Google account email to pass to `gws --account`.
+    ///
     /// When `None`, the currently active `gws` account is used.
     #[serde(default)]
     pub default_account: Option<String>,
@@ -7188,6 +8057,7 @@ impl Default for KnowledgeConfig {
 // ── LinkedIn ────────────────────────────────────────────────────
 
 /// LinkedIn integration configuration (`[linkedin]` section).
+///
 /// When enabled, the `linkedin` tool is registered in the agent tool surface.
 /// Requires `LINKEDIN_*` credentials in the workspace `.env` file.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -7284,12 +8154,24 @@ impl PluginsConfig {
 }
 
 impl PluginsConfig {
+    /// Resolve `plugins_dir` to an absolute path, expanding a leading `~/`.
+    ///
+    /// This is the single source of truth for the plugin directory: the CLI,
+    /// runtime tool/skill discovery, and the gateway all resolve through it so
+    /// that `zeroclaw plugin install` and the agent agree on one location.
+    /// Pure — performs no filesystem I/O.
     #[must_use]
     pub fn resolved_plugins_dir(&self) -> PathBuf {
         expand_tilde_path(&self.plugins_dir)
     }
 }
 
+/// Plugin signature verification configuration (`[plugins.security]`).
+///
+/// Controls Ed25519 signature verification for plugin manifests.
+/// In `strict` mode, only plugins signed by a trusted publisher key are loaded.
+/// In `permissive` mode, unsigned or untrusted plugins produce warnings but are
+/// still loaded. In `disabled` mode (the default), no signature checking occurs.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "plugins.security"]
@@ -7315,6 +8197,12 @@ impl Default for PluginSecurityConfig {
     }
 }
 
+/// Per-call WASM execution limits (`[plugins.limits]`).
+///
+/// Bounds a single plugin call so a runaway or malicious component traps
+/// instead of hanging the host or exhausting memory. `call_fuel` caps
+/// instructions per call; the memory, table, and instance ceilings bound a
+/// store's growth. Every value is operator-tunable and validated as non-zero.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "plugins.limits"]
@@ -7383,6 +8271,7 @@ impl Default for PluginsConfig {
 }
 
 /// Content strategy configuration for LinkedIn auto-posting (`[linkedin.content]`).
+///
 /// The agent reads this via the `linkedin get_content_strategy` action to know
 /// what feeds to check, which repos to highlight, and how to write posts.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -7630,6 +8519,11 @@ impl Default for ImageProviderFluxConfig {
 
 // ── Standalone Image Generation ─────────────────────────────────
 
+/// Standalone image generation tool configuration (`[image_gen]`).
+///
+/// When enabled, registers an `image_gen` tool that generates images via
+/// fal.ai's synchronous API (Flux / Nano Banana models) and saves them
+/// to the workspace `images/` directory.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "image_gen"]
@@ -7668,6 +8562,15 @@ impl Default for ImageGenConfig {
 
 // ── File Upload ─────────────────────────────────────────────────
 
+/// Standalone file upload tool configuration (`[file_upload]`).
+///
+/// When `url` is set to a non-empty value, registers a `file_upload` tool that
+/// POSTs files from the agent's local filesystem to the configured endpoint
+/// using `multipart/form-data`. The LLM provides only a file path; the host
+/// reads the bytes and uploads them without ever including file content in
+/// the model context.
+///
+/// When `url` is `None` or empty, the tool is not registered.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "file_upload"]
@@ -7732,6 +8635,15 @@ impl Default for FileUploadConfig {
 
 // ── File Upload Bundle ──────────────────────────────────────────
 
+/// Standalone multi-file bundle upload tool configuration
+/// (`[file_upload_bundle]`).
+///
+/// When `url` is set to a non-empty value, registers a `file_upload_bundle`
+/// tool that POSTs N files from the agent's local filesystem to the
+/// configured endpoint as a single `multipart/form-data` request. The LLM
+/// provides only file paths; the host reads the bytes.
+///
+/// When `url` is `None` or empty, the tool is not registered.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "file-upload-bundle"]
@@ -7823,6 +8735,16 @@ impl Default for FileUploadBundleConfig {
 
 // ── File Download ───────────────────────────────────────────────
 
+/// Standalone file download tool configuration (`[file_download]`).
+///
+/// When `url` is set to a non-empty value, registers a `file_download` tool
+/// that GETs a file from the configured endpoint and writes it to the agent's
+/// workspace filesystem. The LLM supplies only a document identifier and a
+/// workspace-relative destination path; the endpoint URL comes solely from this
+/// config and is never model-controlled. Response bytes are streamed to disk
+/// and never loaded into model context.
+///
+/// When `url` is `None` or empty, the tool is not registered.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "file-download"]
@@ -7873,6 +8795,11 @@ impl Default for FileDownloadConfig {
 
 // ── Claude Code ─────────────────────────────────────────────────
 
+/// Claude Code CLI tool configuration (`[claude_code]` section).
+///
+/// Delegates coding tasks to the `claude -p` CLI. Authentication uses the
+/// binary's own OAuth session (Max subscription) by default — no API key
+/// needed unless `env_passthrough` includes `ANTHROPIC_API_KEY`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "claude_code"]
@@ -7925,6 +8852,11 @@ impl Default for ClaudeCodeConfig {
 
 // ── Claude Code Runner ──────────────────────────────────────────
 
+/// Claude Code task runner configuration (`[claude_code_runner]` section).
+///
+/// Spawns Claude Code in a tmux session with HTTP hooks that POST tool
+/// execution events back to ZeroClaw's gateway, updating a Slack message
+/// in-place with progress plus an SSH handoff link.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "claude_code_runner"]
@@ -7964,6 +8896,11 @@ impl Default for ClaudeCodeRunnerConfig {
 
 // ── Codex CLI ───────────────────────────────────────────────────
 
+/// Codex CLI tool configuration (`[codex_cli]` section).
+///
+/// Delegates coding tasks to the `codex exec` CLI. Authentication uses the
+/// binary's own session by default — no API key needed unless
+/// `env_passthrough` includes `OPENAI_API_KEY`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "codex_cli"]
@@ -7981,6 +8918,17 @@ pub struct CodexCliConfig {
     #[serde(default)]
     #[credential_class = "legacy_env_path"]
     pub env_passthrough: Vec<String>,
+    /// Extra CLI arguments appended to `codex exec` before the prompt.
+    ///
+    /// Values come from operator-controlled config (same trust level as
+    /// `env_passthrough`) and are not validated — the operator is responsible
+    /// for understanding the implications of flags passed here.
+    ///
+    /// **Warning:** `--sandbox=danger-full-access` disables Codex's bubblewrap
+    /// isolation; only use in environments where the container itself provides
+    /// isolation (e.g. Kubernetes pods with restricted PSS).
+    ///
+    /// Example: `["--sandbox=danger-full-access", "--skip-git-repo-check"]`
     #[serde(default)]
     pub extra_args: Vec<String>,
 }
@@ -8007,6 +8955,11 @@ impl Default for CodexCliConfig {
 
 // ── Gemini CLI ──────────────────────────────────────────────────
 
+/// Gemini CLI tool configuration (`[gemini_cli]` section).
+///
+/// Delegates coding tasks to the `gemini -p` CLI. Authentication uses the
+/// binary's own session by default — no API key needed unless
+/// `env_passthrough` includes `GOOGLE_API_KEY`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "gemini_cli"]
@@ -8047,6 +9000,11 @@ impl Default for GeminiCliConfig {
 
 // ── OpenCode CLI ───────────────────────────────────────────────
 
+/// OpenCode CLI tool configuration (`[opencode_cli]` section).
+///
+/// Delegates coding tasks to the `opencode run` CLI. Authentication uses the
+/// binary's own session by default — no API key needed unless
+/// `env_passthrough` includes provider-specific keys.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "opencode_cli"]
@@ -8769,10 +9727,26 @@ fn apply_explicit_proxy_to_builder(
     builder
 }
 
+// ── Proxy-aware WebSocket connect ────────────────────────────────
+//
+// `tokio_tungstenite::connect_async` does not honour proxy settings.
+// The helpers below resolve the effective proxy URL for a given service
+// key and, when a proxy is active, establish a tunnelled TCP connection
+// (HTTP CONNECT for http/https proxies, SOCKS5 for socks5/socks5h)
+// before handing the stream to `tokio_tungstenite` for the WebSocket
+// handshake.
+
 /// Combined async IO trait for boxed WebSocket transport streams.
 trait AsyncReadWrite: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
+/// A boxed async IO stream used when a WebSocket connection is tunnelled
+/// through a proxy.  The concrete type varies depending on the proxy
+/// kind (HTTP CONNECT vs SOCKS5) and the target scheme (ws vs wss).
+///
+/// We wrap in a newtype so we can implement `AsyncRead` and `AsyncWrite`
+/// via delegation, since Rust trait objects cannot combine multiple
+/// non-auto traits.
 pub struct BoxedIo(Box<dyn AsyncReadWrite>);
 
 impl tokio::io::AsyncRead for BoxedIo {
@@ -8873,6 +9847,15 @@ fn resolve_ws_proxy_url(
     preferred.or_else(|| normalize_proxy_url_option(cfg.all_proxy.as_deref()))
 }
 
+/// Connect a WebSocket through the configured proxy (if any).
+///
+/// When no proxy applies, this is a thin wrapper around
+/// `tokio_tungstenite::connect_async`.  When a proxy is active the
+/// function tunnels the TCP connection through the proxy before
+/// performing the WebSocket upgrade.
+///
+/// `service_key` is the proxy-service selector (e.g. `"channel.discord"`).
+/// `channel_proxy_url` is the optional per-channel proxy override.
 pub async fn ws_connect_with_proxy(
     ws_url: &str,
     service_key: &str,
@@ -8885,6 +9868,15 @@ pub async fn ws_connect_with_proxy(
 
     match proxy_url {
         None => {
+            // No proxy — establish TCP+TLS manually, wrap in BoxedIo, then
+            // perform the WebSocket handshake over the wrapped stream.
+            //
+            // Previous implementation used `connect_async` followed by
+            // `into_inner()` + `from_raw_socket` to normalize the return
+            // type.  That pattern discards data already buffered by the
+            // tungstenite frame codec, causing channels (Slack Socket Mode,
+            // Discord, etc.) to silently miss the first frames sent by the
+            // server and all subsequent events.
             use tokio::net::TcpStream;
 
             let target = reqwest::Url::parse(ws_url)
@@ -9125,6 +10117,13 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 
 // ── Memory ───────────────────────────────────────────────────
 
+/// Persistent storage configuration (`[storage]` section).
+///
+/// Storage is a two-tier alias-keyed map: `[storage.<backend>.<alias>]`,
+/// parallel to `[providers.models.<type>.<alias>]`. Each backend has its own typed
+/// config struct. `MemoryConfig.backend` carries a dotted reference (`"sqlite.default"`,
+/// `"postgres.work"`) that resolves to one of these entries via
+/// [`Config::resolve_active_storage`].
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "storage"]
@@ -9166,6 +10165,7 @@ pub struct SqliteStorageConfig {
 }
 
 /// PostgreSQL storage backend (`[storage.postgres.<alias>]`).
+///
 /// Holds connection parameters AND pgvector settings on one alias-keyed
 /// entry; previously these lived in two separate sections.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -9205,6 +10205,7 @@ impl Default for PostgresStorageConfig {
 }
 
 /// Qdrant vector database backend (`[storage.qdrant.<alias>]`).
+///
 /// URL, collection, and API key all fall back to environment variables
 /// (`QDRANT_URL`, `QDRANT_COLLECTION`, `QDRANT_API_KEY`) when unset.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -9283,11 +10284,22 @@ pub enum SearchMode {
     Hybrid,
 }
 
+/// Memory backend configuration (`[memory]` section).
+///
+/// Controls conversation memory storage, embeddings, hybrid search, response
+/// caching, and memory snapshot/hydration. Backend-specific connection settings
+/// live under `[storage.<backend>.<alias>]`; this section selects which storage
+/// instance to use via the `backend` dotted reference.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "memory"]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
+    /// Dotted reference to the active storage instance: `<backend>.<alias>`
+    /// (e.g. `"sqlite.default"`, `"postgres.work"`). Resolves through
+    /// `Config.storage.<backend>.<alias>` at runtime. Bare backend names
+    /// (`"sqlite"`) are treated as `"<backend>.default"`. Set to `"none"` to
+    /// disable persistence entirely.
     #[serde(default = "default_memory_backend")]
     pub backend: String,
     /// Auto-save what *you* tell ZeroClaw into memory as conversation history — the agent's own replies are not saved. Turn off if you want memory to only hold things you explicitly record via the memory tool.
@@ -9678,6 +10690,14 @@ pub enum LogPersistence {
     #[default]
     Rolling,
     Full,
+    /// Persist all events, but with ZeroClaw-managed archive rotation: the
+    /// active file is rotated to a timestamped archive on a size and/or daily
+    /// boundary, and old archives are pruned by count and/or age. Unlike
+    /// `rolling` (entry-count trim of the active file), rotated events are
+    /// preserved in archive files for later diagnostics. Rotation is tuned via
+    /// the `log_persistence_max_bytes`, `log_persistence_rotate_daily`,
+    /// `log_persistence_retention_max_files`, and
+    /// `log_persistence_retention_max_age_days` settings.
     Rotating,
 }
 
@@ -9785,6 +10805,12 @@ pub struct ObservabilityConfig {
     #[serde(default)]
     pub otel_service_name: Option<String>,
 
+    /// Optional HTTP headers sent with every OTLP export request (e.g. authorization).
+    /// Specified as key-value pairs in TOML:
+    /// ```toml
+    /// [observability.otel_headers]
+    /// Authorization = "Bearer sk-..."
+    /// ```
     #[serde(default)]
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
@@ -9839,6 +10865,12 @@ pub struct ObservabilityConfig {
     #[serde(default = "default_log_persistence_retention_max_age_days")]
     pub log_persistence_retention_max_age_days: u64,
 
+    /// Tool I/O capture policy: "off" | "redacted" | "full".
+    /// - `off`: only tool name + outcome + duration land in the log.
+    /// - `redacted` (default): tool input + output are leak-scanned and
+    ///   truncated at `log_tool_io_truncate_bytes` before persisting.
+    /// - `full`: full input + output, still leak-scanned. For operators
+    ///   who need replay fidelity and accept the disk cost.
     #[serde(
         default = "default_log_tool_io",
         deserialize_with = "deserialize_enum_lenient"
@@ -9858,12 +10890,28 @@ pub struct ObservabilityConfig {
     #[serde(default)]
     pub log_tool_io_denylist: Vec<String>,
 
+    /// LLM request payload capture: "off" | "redacted" | "full".
+    /// - `off` (default): only `messages_count` lands on the `llm_request`
+    ///   event. No prompt or conversation content is persisted.
+    /// - `redacted`: the full message history (role + content) is leak-scanned
+    ///   and truncated at `log_tool_io_truncate_bytes` before persisting.
+    /// - `full`: full message history, still leak-scanned, untruncated. For
+    ///   operators who need replay fidelity and accept the disk cost.
+    ///
+    /// Opt-in (default off) because `full`/`redacted` capture the entire system
+    /// prompt and conversation on every turn.
     #[serde(
         default = "default_log_llm_request_payload",
         deserialize_with = "deserialize_enum_lenient"
     )]
     pub log_llm_request_payload: LogLlmRequestPayload,
 
+    /// OTel GenAI content capture: "off" | "redacted" | "full".
+    /// Controls whether `gen_ai.system_instructions`, `gen_ai.input.messages`,
+    /// and `gen_ai.output.messages` are emitted on OTel spans.
+    /// - `off` (default): no content attributes, only metadata.
+    /// - `redacted`: content is leak-scanned and truncated at `otel_genai_content_max_chars`.
+    /// - `full`: content is leak-scanned but not truncated.
     #[serde(default, deserialize_with = "deserialize_enum_lenient")]
     pub otel_genai_content: OtelContentPolicy,
 
@@ -9873,6 +10921,12 @@ pub struct ObservabilityConfig {
     #[serde(default = "default_otel_genai_content_max_chars")]
     pub otel_genai_content_max_chars: usize,
 
+    /// OTel tool I/O capture: "off" | "redacted" | "full".
+    /// Controls whether `gen_ai.tool.arguments`, `input.value`,
+    /// `gen_ai.tool.result`, and `output.value` are emitted on OTel spans.
+    /// - `off` (default): no content attributes, only tool name + outcome.
+    /// - `redacted`: content is leak-scanned and truncated at `otel_tool_io_max_chars`.
+    /// - `full`: content is leak-scanned but not truncated.
     #[serde(default, deserialize_with = "deserialize_enum_lenient")]
     pub otel_tool_io: OtelContentPolicy,
 
@@ -9970,6 +11024,7 @@ fn default_otel_tool_io_max_chars() -> usize {
 #[prefix = "hooks"]
 pub struct HooksConfig {
     /// Enable lifecycle hook execution.
+    ///
     /// Hooks run in-process with the same privileges as the main runtime.
     /// Keep enabled hook handlers narrowly scoped and auditable.
     #[serde(default = "default_true")]
@@ -9996,6 +11051,7 @@ pub struct BuiltinHooksConfig {
     #[serde(default)]
     pub command_logger: bool,
     /// Configuration for the webhook-audit hook.
+    ///
     /// When enabled, POSTs a JSON payload to `url` for every tool invocation
     /// that matches one of `tool_patterns`.
     #[serde(default)]
@@ -10003,6 +11059,11 @@ pub struct BuiltinHooksConfig {
     pub webhook_audit: WebhookAuditConfig,
 }
 
+/// Configuration for the webhook-audit builtin hook.
+///
+/// Sends an HTTP POST with a JSON body to an external endpoint each time
+/// a tool call matches one of the configured patterns. Useful for
+/// centralised audit logging, SIEM ingestion, or compliance pipelines.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "hooks.builtin.webhook_audit"]
@@ -10018,6 +11079,7 @@ pub struct WebhookAuditConfig {
     #[serde(default)]
     pub tool_patterns: Vec<String>,
     /// Include tool call arguments in the audit payload. Default: `false`.
+    ///
     /// Be mindful of sensitive data — arguments may contain secrets or PII.
     #[serde(default)]
     pub include_args: bool,
@@ -10043,6 +11105,14 @@ impl Default for WebhookAuditConfig {
         }
     }
 }
+
+// ── Autonomy / Security ──────────────────────────────────────────
+//
+// All policy fields live on per-agent `[risk_profiles.<alias>]` entries
+// (see `RiskProfileConfig` below). `Config::active_risk_profile(agent_alias)`
+// resolves the active profile for any callsite (agent-driven or non-agent
+// contexts). Configs from older schema versions are folded into
+// `risk_profiles.default` by the migration in `schema/v2.rs`.
 
 pub fn default_auto_approve() -> Vec<String> {
     vec![
@@ -10122,6 +11192,15 @@ fn is_valid_env_var_name(name: &str) -> bool {
 
 // ── Profiles & Bundles ───────────────────────────────────────────
 
+/// Named risk/autonomy profile (`[risk_profiles.<alias>]`).
+///
+/// Unified policy surface. Agents reference a profile by alias and the
+/// runtime resolves through it for shell command allowlists, approval gates,
+/// sandbox/resource limits, and delegation guardrails. The conventional
+/// `risk_profiles["default"]` is the resolution target for non-agent
+/// contexts (orchestrator init, cron worker startup); the `Default` impl
+/// below mirrors the legacy safety-first defaults so a fresh install
+/// behaves the same as a config from before the per-profile split.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "risk_profile"]
@@ -10155,9 +11234,51 @@ pub struct RiskProfileConfig {
     #[serde(default)]
     #[nested]
     pub delegation_policy: DelegationPolicy,
+    /// Route this profile's tool approvals to a DISTINCT approver channel instead of the
+    /// channel that triggered the run (closes the cross-channel-HITL gap). Absent ⇒ the
+    /// originating channel approves (today's behavior). See [`crate::autonomy::ApprovalRoute`].
+    ///
+    /// Honored on both the interactive channel-driven path and the non-interactive turn path
+    /// (gateway chat/webhook dispatch and agent-to-agent peer messages). On the non-interactive
+    /// path the approver is resolved from the live daemon channel registry; if no registry is
+    /// available or the approver is not live, the gate keeps the non-interactive default
+    /// (fail-closed deny under the default `on_no_approver`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_route: Option<crate::autonomy::ApprovalRoute>,
+    /// Tools the agent may call in agentic mode. Empty = inherit / no
+    /// authorization constraint. Authorization decision: which tools is
+    /// the agent permitted to invoke at all. See `excluded_tools` for
+    /// the inverse denylist scoped to non-CLI channels.
+    ///
+    /// The TOML config does not distinguish an omitted field from
+    /// `allowed_tools = []`; both deserialize to `Vec::new()` and
+    /// `SecurityPolicy::from_profiles` maps that to "no authorization
+    /// constraint" at this layer. If you need an explicit deny-all gate,
+    /// apply it on the caller-supplied per-run `allowed_tools` (cron
+    /// jobs and other narrowers pass that list in directly to
+    /// `ToolAccessPolicy`, which honors `Some(vec![])` as deny-all) or
+    /// via `excluded_tools` covering the specific tools you want blocked.
+    ///
+    /// MCP exception: when the list is non-empty, runtime-discovered MCP
+    /// tools (any name containing `__`, which is the `<server>__<tool>`
+    /// convention used by the MCP wrapper) are auto-admitted into the
+    /// effective allow-list without needing to be listed here individually.
+    /// This keeps the eager-MCP default usable for agents with an
+    /// explicit allow-list. Block individual MCP tools via `excluded_tools`.
+    ///
+    /// Scope of the exception: the `__` auto-admit applies only to this
+    /// risk-profile allow-list, **not** to caller-supplied per-run
+    /// `allowed_tools` (cron job `allowed_tools`, narrowed delegate
+    /// invocations, etc.). Per-run lists are still strict explicit-list
+    /// intersections, so a job that narrows `allowed_tools = ["cron_add"]`
+    /// will not see runtime-discovered MCP tools unless it names them.
     pub allowed_tools: Vec<String>,
+    /// Tools excluded from non-CLI channels under this profile.
+    ///
+    /// Also subtracts from the agentic-delegate allow-list resolved at
+    /// runtime, which is the only way to block individual
+    /// `<server>__<tool>` MCP names that would otherwise be auto-admitted
+    /// by the `allowed_tools` MCP exception described above.
     pub excluded_tools: Vec<String>,
     // ── Sandbox (from security.sandbox) ─────────────────────────────
     /// Whether the sandbox is enabled for this profile. `None` inherits global.
@@ -10192,6 +11313,16 @@ impl Default for RiskProfileConfig {
     }
 }
 
+/// Named runtime/LLM execution profile (`[runtime_profiles.<alias>]`).
+///
+/// Reusable operational tuning: agentic mode, iteration caps, context
+/// budget, parallel dispatch, resource ceilings, recursion depth, and
+/// the budget knobs that `SecurityPolicy` enforces with subagent
+/// parent-subset discipline. Anything authorization-shaped (allowed
+/// commands/tools/paths, approval gates, sandbox) lives on
+/// `[risk_profiles.<alias>]`. Anything model-provider shaped (model,
+/// temperature, max_tokens, timeout_secs) lives on
+/// `[providers.models.<type>.<alias>]`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "runtime_profile"]
@@ -10202,6 +11333,12 @@ pub struct RuntimeProfileConfig {
     /// Maximum tool-call iterations in agentic mode. `0` inherits the global default.
     pub max_tool_iterations: usize,
     // ── Budget caps (enforced with subagent parent-subset discipline) ──
+    /// Maximum actions allowed per hour. `0` is a hard zero budget — the
+    /// per-sender rate tracker treats a max of 0 as always exhausted
+    /// (`PerSenderTracker::is_exhausted`), blocking every action. For an
+    /// effectively-unlimited budget use a high value (e.g. `u32::MAX`), not 0.
+    /// `SecurityPolicy::ensure_no_escalation_beyond` rejects subagents
+    /// that try to raise this above the parent's value.
     pub max_actions_per_hour: u32,
     /// Maximum cost per day in cents. `0` inherits the global limit.
     /// Parent-subset enforced for subagents.
@@ -10238,6 +11375,13 @@ pub struct RuntimeProfileConfig {
     /// Maximum memory entries injected per turn. `None` inherits global default (5).
     /// Set to `0` for unlimited.
     pub memory_recall_limit: Option<usize>,
+    /// How skills are injected into the system prompt for agents on this
+    /// profile. `None` inherits the global `[skills] prompt_injection_mode`;
+    /// `compact` inlines only compact skill metadata and registers the
+    /// `read_skill` tool, `full` inlines full skill instructions. Resolved
+    /// through [`Config::effective_skills_prompt_mode`], the single point both
+    /// the system-prompt builder and the `read_skill` tool-registration gate
+    /// consult so they always agree on the effective mode.
     pub prompt_injection_mode: Option<SkillsPromptInjectionMode>,
     pub strict_tool_parsing: bool,
     #[nested]
@@ -10290,6 +11434,7 @@ impl Default for RuntimeProfileConfig {
 }
 
 /// Named skill bundle (`[skill_bundles.<alias>]`).
+///
 /// A reusable group of skills that can be attached to an agent or channel
 /// by alias, controlling which skills are loaded and from where.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -10317,6 +11462,7 @@ impl SkillBundleConfig {
 }
 
 /// Named knowledge bundle (`[knowledge_bundles.<alias>]`).
+///
 /// A reusable set of knowledge sources (documents, URLs, or RAG corpus paths)
 /// that can be attached to an agent by alias.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -10330,6 +11476,14 @@ pub struct KnowledgeBundleConfig {
     pub tags: Vec<String>,
 }
 
+/// Named MCP server bundle (`[mcp_bundles.<alias>]`).
+///
+/// A reusable group of MCP servers granted to an agent that references the
+/// bundle by alias in `agents.<alias>.mcp_bundles`. Server IDs are matched
+/// against `[mcp.servers]` by `name`. Resolution is secure by default (see
+/// `Config::mcp_servers_for_bundles`): an ID with no matching server grants
+/// nothing, and `exclude` wins over `servers` across every bundle an agent
+/// references.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "mcp_bundle"]
@@ -10382,6 +11536,34 @@ pub struct RuntimeConfig {
     #[nested]
     pub docker: DockerRuntimeConfig,
 
+    /// Shell binary the native runtime uses for command execution.
+    ///
+    /// Applies only to `runtime.kind = "native"`; other runtimes ignore it.
+    /// When unset or `null`, the system default `sh` is used. The shell is
+    /// invoked as `<shell> -c "<command>"`, so it must be a POSIX-compatible
+    /// shell binary.
+    ///
+    /// Accepted forms (Unix):
+    /// - a bare command name resolved via `PATH` (e.g. `"bash"`), or
+    /// - an absolute path (e.g. `"/bin/bash"`, `"/usr/bin/zsh"`).
+    ///
+    /// The value is validated when the native runtime is constructed, so a bad
+    /// value is reported up front rather than failing on the first shell
+    /// command. Rejected: empty/whitespace; a relative path with separators
+    /// (e.g. `"./sh"`, `"bin/sh"` — use a bare `PATH` name or an absolute path
+    /// instead); a bare name not found on `PATH`; and a path that does not
+    /// exist or is not executable.
+    ///
+    /// **Ignored on Windows and Android** (and not validated there): Windows
+    /// always uses `cmd.exe`, and Android always uses `/system/bin/sh`
+    /// (its shell is not on `PATH` for spawned processes).
+    ///
+    /// **Examples:**
+    /// ```toml
+    /// [runtime]
+    /// shell = "bash"           # resolves via PATH
+    /// shell = "/bin/zsh"       # absolute path
+    /// ```
     #[serde(default)]
     pub shell: Option<String>,
 
@@ -10463,6 +11645,7 @@ impl Default for DockerRuntimeConfig {
 // ── Reliability / supervision ────────────────────────────────────
 
 /// Reliability and supervision configuration (`[reliability]` section).
+///
 /// Controls model_provider retries, API key rotation, and channel restart backoff.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -10535,6 +11718,11 @@ impl Default for ReliabilityConfig {
 
 // ── Scheduler ────────────────────────────────────────────────────
 
+/// Scheduler configuration for periodic task execution (`[scheduler]` section).
+///
+/// Owns the cron-runtime knobs: per-job declarations live on
+/// `Config.cron: HashMap<String, CronJobDecl>` (alias-keyed), while the
+/// scheduler loop's runtime behavior (`enabled`, polling cap, catch-up) lives here.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "scheduler"]
@@ -10548,6 +11736,11 @@ pub struct SchedulerConfig {
     /// Maximum tasks executed in parallel within a single polling cycle.
     #[serde(default = "default_scheduler_max_concurrent")]
     pub max_concurrent: usize,
+    /// Run all overdue jobs at scheduler startup. Default: `true`.
+    ///
+    /// When the daemon restarts late, jobs whose `next_run` is in the past
+    /// fire once before normal polling resumes. Disable to wait for the
+    /// next scheduled occurrence instead.
     #[serde(default = "default_true")]
     pub catch_up_on_startup: bool,
     /// Maximum number of historical cron run records to retain. Default: `50`.
@@ -10581,6 +11774,21 @@ impl Default for SchedulerConfig {
 
 // ── Model routing ────────────────────────────────────────────────
 
+/// Route a task hint to a specific model_provider + model.
+///
+/// ```toml
+/// [[model_routes]]
+/// hint = "reasoning"
+/// model_provider = "openrouter.default"
+/// model = "anthropic/claude-opus-4-20250514"
+///
+/// [[model_routes]]
+/// hint = "fast"
+/// model_provider = "groq.low-latency"
+/// model = "llama-3.3-70b-versatile"
+/// ```
+///
+/// Usage: pass `hint:reasoning` as the model parameter to route the request.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "model_routes"]
@@ -10611,6 +11819,18 @@ pub struct ModelRouteConfig {
 
 // ── Embedding routing ───────────────────────────────────────────
 
+/// Route an embedding hint to a specific model_provider + model.
+///
+/// ```toml
+/// [[embedding_routes]]
+/// hint = "semantic"
+/// model_provider = "openai.embeddings"
+/// model = "text-embedding-3-small"
+/// dimensions = 1536
+///
+/// [memory]
+/// embedding_model = "hint:semantic"
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "embedding_routes"]
@@ -10741,6 +11961,12 @@ pub struct HeartbeatConfig {
     /// Maximum number of heartbeat run history records to retain. Default: `100`.
     #[serde(default = "default_heartbeat_max_run_history")]
     pub max_run_history: u32,
+    /// Load the channel session history before each heartbeat task execution so
+    /// the LLM has conversational context. Default: `false`.
+    ///
+    /// When `true`, the session file for the configured `target`/`to` is passed
+    /// to the agent as `session_state_file`, giving it access to the recent
+    /// conversation history — just as if the user had sent a message.
     #[serde(default)]
     pub load_session_context: bool,
     /// Maximum wall-clock seconds allowed for a single agent invocation
@@ -10816,6 +12042,7 @@ pub enum TodoTrackerLocation {
 }
 
 /// ZeroCode live task tracker configuration (`[todotracker]` section).
+///
 /// Read-only visual tracker driven by the model's `TodoWrite` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -10866,6 +12093,13 @@ impl Default for TodoTrackerConfig {
 
 // ── Cron ────────────────────────────────────────────────────────
 
+/// A declarative cron job definition (`[cron.<alias>]`).
+///
+/// Stored alias-keyed on `Config.cron`. The map key serves as the stable job id.
+/// Synced into the database at scheduler startup with `source = "declarative"`,
+/// distinguishing them from jobs created imperatively via CLI or API.
+/// Declarative config takes precedence on each sync: if the config changes,
+/// the DB is updated to match. Imperative jobs are never deleted by sync.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "cron"]
@@ -11045,6 +12279,7 @@ impl Default for AcpConfig {
 // ── Tunnel ──────────────────────────────────────────────────────
 
 /// Tunnel configuration for exposing the gateway publicly (`[tunnel]` section).
+///
 /// Supported model_providers: `"none"` (default), `"cloudflare"`, `"tailscale"`, `"ngrok"`, `"openvpn"`, `"pinggy"`, `"custom"`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -11138,6 +12373,13 @@ pub struct NgrokTunnelConfig {
     pub domain: Option<String>,
 }
 
+/// OpenVPN tunnel configuration (`[tunnel.openvpn]`).
+///
+/// Required when `tunnel.tunnel_provider = "openvpn"`. Omitting this section entirely
+/// preserves previous behavior. Setting `tunnel.tunnel_provider = "none"` (or removing
+/// the `[tunnel.openvpn]` block) cleanly reverts to no-tunnel mode.
+///
+/// Defaults: `connect_timeout_secs = 30`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tunnel.openvpn"]
@@ -11209,6 +12451,11 @@ pub struct CustomTunnelConfig {
 
 // ── Channels ─────────────────────────────────────────────────────
 
+/// Top-level channel configurations (`[channels]` section).
+///
+/// each channel type is a keyed table of named instances (aliases).
+/// `[channels.telegram.default]` is the conventional single-instance key.
+/// Access via `config.channels.telegram.get("default")`.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -11361,6 +12608,11 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub filesystem: HashMap<String, FilesystemConfig>,
+    /// Base timeout in seconds for processing a single channel message (LLM + tools).
+    /// Runtime uses this as a per-turn budget that scales with tool-loop depth
+    /// (up to 4x, capped) so one slow/retried model call does not consume the
+    /// entire conversation budget.
+    /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
     #[serde(default = "default_channel_message_timeout_secs")]
     pub message_timeout_secs: u64,
     /// Per-channel multiplier for the global channel message in-flight budget.
@@ -11397,6 +12649,13 @@ pub struct ChannelsConfig {
 }
 
 impl ChannelsConfig {
+    /// Returns metadata and configuration status for every known channel type.
+    ///
+    /// Always returns the full set of channel types regardless of compile-time
+    /// feature flags — the `configured` flag reflects whether the operator has
+    /// populated that channel's config section.  For a list restricted to only
+    /// the channels compiled into this binary use
+    /// `zeroclaw_channels::listing::compiled_channels` instead.
     pub fn channels(&self) -> Vec<super::traits::ChannelInfo> {
         use super::traits::ChannelInfo;
         vec![
@@ -11619,6 +12878,11 @@ impl ChannelsConfig {
         ]
     }
 
+    /// Returns `true` when at least one channel entry across all channel types
+    /// has `enabled = true`. Used by the daemon to decide whether the channels
+    /// supervisor should be started — a config with only `enabled = false`
+    /// entries (e.g. partially-configured or disabled bots) must not start the
+    /// supervisor, otherwise it exits immediately and restarts in a tight loop.
     pub fn has_any_enabled(&self) -> bool {
         self.telegram.values().any(|c| c.enabled)
             || self.discord.values().any(|c| c.enabled)
@@ -11658,6 +12922,13 @@ impl ChannelsConfig {
             || self.git.values().any(|c| c.enabled)
     }
 
+    /// One `(canonical_name, configured, deliverable)` row per channel in the
+    /// registry. Single source for name-addressed channel lookups so no surface
+    /// has to hardcode a subset of the channel list. `deliverable` is `false`
+    /// for input-only transports whose `Channel::send` is a no-op (mqtt and
+    /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
+    /// outbound surface such as `heartbeat.target` can refuse them at validation
+    /// instead of accepting a target the delivery layer silently drops.
     pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
         [
             ("telegram", !self.telegram.is_empty(), true),
@@ -11811,6 +13082,12 @@ pub enum StreamMode {
     MultiMessage,
 }
 
+/// Where a channel registers its skill slash commands. `global` (default)
+/// registers application-wide - the commands work everywhere the bot is, but
+/// Discord takes up to ~1h to propagate changes. `guild` registers to each
+/// guild in `guild_ids`, which propagates instantly (the right choice for fast
+/// iteration and single-server bots). When `guild` is set with an empty
+/// `guild_ids`, the channel logs a warning and falls back to global.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]
@@ -11916,6 +13193,11 @@ pub struct TelegramConfig {
     /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
     #[serde(default)]
     pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
 }
@@ -11949,6 +13231,12 @@ impl ChannelConfig for TelegramConfig {
     }
 }
 
+/// Scope of inbound Discord reaction events the bot records.
+///
+/// Anything other than `Off` adds the GUILD_MESSAGE_REACTIONS and
+/// DIRECT_MESSAGE_REACTIONS gateway intents (both unprivileged; no
+/// Developer Portal toggle needed) and archives matching reactions to the
+/// channel's `discord.db` sidecar when `archive` is enabled.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]
@@ -12022,6 +13310,13 @@ pub struct DiscordConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub slash_commands: bool,
+    /// Scope for registered slash commands: `global` (default, application-wide,
+    /// ~1h propagation) or `guild` (registered to each `guild_ids` entry,
+    /// instant). Only meaningful when `slash_commands = true`; `guild` with an
+    /// empty `guild_ids` warns and falls back to global. Switching scope reaps
+    /// owned commands from the now-inactive scope; note that *removing* a guild
+    /// from `guild_ids` (without switching scope) does not reap that guild's
+    /// commands - remove the bot from the guild, or switch scope, to clear them.
     #[tab(Behavior)]
     #[serde(default)]
     pub slash_command_scope: SlashCommandScope,
@@ -12051,9 +13346,25 @@ pub struct DiscordConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub stall_timeout_secs: u64,
+    /// Raw gateway intent mask override. When set, this exact value is sent
+    /// in IDENTIFY instead of the derived mask: an operator escape hatch
+    /// for downstream deployments that consume gateway events through
+    /// custom builds or forks. The operator owns the consequences:
+    /// privileged bits still need their Developer Portal toggles, and
+    /// dropping baseline bits silences message handling (a warning is
+    /// logged). Unset (default) = derive the mask from the channel's
+    /// feature config.
     #[tab(Advanced)]
     #[serde(default)]
     pub intents_mask: Option<u64>,
+    /// Which inbound reactions to record: `off` (default: reaction events
+    /// are not even requested from the gateway), `own` (reactions to the
+    /// bot's messages), or `all` (reactions to any message passing the
+    /// channel's filters). Recorded reactions are archived to `discord.db`
+    /// when `archive` is enabled, and removed again when a user removes
+    /// their reaction (bulk clears, remove-all / remove-emoji, are not
+    /// yet swept). A set `intents_mask` overrides the derived mask: if it
+    /// omits the reaction intents, nothing is recorded.
     #[tab(Behavior)]
     #[serde(default)]
     pub reaction_notifications: DiscordReactionScope,
@@ -12071,6 +13382,11 @@ pub struct DiscordConfig {
     /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
     #[serde(default)]
     pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
 }
@@ -12097,11 +13413,22 @@ pub struct SlackConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
+    /// Slack bot OAuth token (xoxb-...). Optional in config: when unset or
+    /// empty it is resolved at channel construction from
+    /// `ZEROCLAW_SLACK_BOT_TOKEN`, then `SLACK_BOT_TOKEN`. `#[serde(default)]`
+    /// so a config that omits it still deserializes - the env fallback then
+    /// supplies it - instead of failing with `missing field 'bot_token'`.
+
     #[secret]
     #[serde(default)]
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bot_token: Option<String>,
+    /// Slack app-level token for Socket Mode (xapp-...). When unset or empty,
+    /// resolved at channel construction from `ZEROCLAW_SLACK_APP_TOKEN`, then
+    /// `SLACK_APP_TOKEN`. `#[serde(default)]` makes omission explicit (an
+    /// `Option` field is already omittable, but this keeps it consistent with
+    /// `bot_token`).
     #[secret]
     #[serde(default)]
     #[tab(Connection)]
@@ -12128,6 +13455,12 @@ pub struct SlackConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// When true (and `mention_only` is also true), messages inside a Slack
+    /// thread must also @-mention the bot to trigger a response. By default,
+    /// thread replies are allowed through without a mention so the bot can
+    /// keep a back-and-forth going without the user repeating @-mentions.
+    /// Set this to true in channels shared with human discussion where the
+    /// bot should stay silent unless explicitly addressed.
     #[tab(Advanced)]
     #[serde(default)]
     pub strict_mention_in_thread: bool,
@@ -12170,6 +13503,11 @@ pub struct SlackConfig {
     /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
     #[serde(default)]
     pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
 }
@@ -12188,6 +13526,12 @@ impl ChannelConfig for SlackConfig {
 }
 
 impl SlackConfig {
+    /// Resolve the effective Slack bot token: the configured `bot_token` when
+    /// set and non-empty, else the `ZEROCLAW_SLACK_BOT_TOKEN` env var, else
+    /// `SLACK_BOT_TOKEN`. Returns `None` when none is available. Resolving here
+    /// (rather than writing the env value back into the config struct) keeps an
+    /// env-supplied secret out of any config that might later be persisted to
+    /// disk.
     pub fn resolved_bot_token(&self) -> Option<String> {
         resolve_slack_token(self.bot_token.as_deref(), "BOT")
     }
@@ -12260,6 +13604,11 @@ pub struct MattermostConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default)]
     pub password: Option<String>,
+    /// Channel IDs to restrict the bot to. Empty or `["*"]` = auto-discover
+    /// every channel the bot can read (public, private, DMs, group DMs) and
+    /// poll them all. Explicit IDs disable discovery and pin the bot to the
+    /// listed channels only. Migrated from the legacy `channel_id` singular
+    /// field.
     #[tab(Advanced)]
     #[serde(default)]
     pub channel_ids: Vec<String>,
@@ -12270,6 +13619,11 @@ pub struct MattermostConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub team_ids: Vec<String>,
+    /// When true (default), auto-discovery includes DM (`type=D`) and group
+    /// DM (`type=G`) channels. Set false to restrict the bot to public and
+    /// private team channels only. Has no effect when `channel_ids` lists
+    /// explicit IDs. Defaults to `true` at the call site via
+    /// `discover_dms.unwrap_or(true)`.
     #[tab(Advanced)]
     #[serde(default)]
     pub discover_dms: Option<bool>,
@@ -12278,6 +13632,11 @@ pub struct MattermostConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub thread_replies: Option<bool>,
+    /// When true, only respond to messages that @-mention the bot. Other
+    /// messages in the channel are silently ignored. DM and group DM
+    /// channels always bypass this filter: a 1:1 (or small-group) direct
+    /// conversation has no ambient noise to gate against, so every message
+    /// is treated as addressed to the bot.
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: Option<bool>,
@@ -12301,6 +13660,11 @@ pub struct MattermostConfig {
     /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
     #[serde(default)]
     pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
 }
@@ -12315,6 +13679,7 @@ impl ChannelConfig for MattermostConfig {
 }
 
 /// Webhook channel configuration.
+///
 /// Receives messages via HTTP POST and sends replies to a configurable outbound URL.
 /// This is the "universal adapter" for any system that supports webhooks.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -12365,6 +13730,11 @@ pub struct WebhookConfig {
     /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
     #[serde(default)]
     pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
 
@@ -12416,6 +13786,11 @@ pub struct IMessageConfig {
     /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
     #[serde(default)]
     pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
 }
@@ -12460,6 +13835,11 @@ pub struct MatrixConfig {
     #[tab(Connection)]
     #[serde(default)]
     pub device_id: Option<String>,
+    /// Allowed Matrix room IDs. Empty = allow all rooms the bot has joined.
+    /// Entries are matched literally against the canonical room ID
+    /// (`!abc:server`) of each incoming message; `#room:server` aliases are
+    /// not resolved for this allowlist (they are resolved only for outbound
+    /// delivery targets such as cron `delivery.to`).
     #[tab(Behavior)]
     #[serde(default)]
     pub allowed_rooms: Vec<String>,
@@ -12527,6 +13907,11 @@ pub struct MatrixConfig {
     /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
     #[serde(default)]
     pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
 }
@@ -12597,6 +13982,11 @@ pub struct SignalConfig {
     /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
     #[serde(default)]
     pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
 }
@@ -12610,6 +14000,12 @@ impl ChannelConfig for SignalConfig {
     }
 }
 
+/// WhatsApp Web usage mode.
+///
+/// `Personal` treats the account as a personal phone — the bot only responds to
+/// incoming messages that pass the DM/group/self-chat policy filters.
+/// `Business` (default) responds to all incoming messages, subject only to the
+/// `allowed_numbers` allowlist.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, zeroclaw_macros::ConfigEnum)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -12637,6 +14033,7 @@ pub enum WhatsAppChatPolicy {
 }
 
 /// WhatsApp channel configuration (Cloud API or Web mode).
+///
 /// Set `phone_number_id` for Cloud API mode, or `session_path` for Web mode.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -12747,6 +14144,15 @@ pub struct WhatsAppConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub group_mention_patterns: Vec<String>,
+    /// Allowed group chats by JID (Web mode). An empty list (the default)
+    /// permits all groups; a non-empty list drops every group message whose
+    /// chat JID matches no entry. Each entry matches either the full group
+    /// JID (`123456789012345@g.us`) or the JID user part - the segment before
+    /// `@` (`123456789012345`) - compared exactly, not as a string prefix.
+    /// Direct messages bypass this filter regardless of list contents.
+    /// Modeled on the Matrix channel's `allowed_rooms`; it gates group
+    /// identity, which `dm_policy`/`group_policy` (chat type) and the
+    /// sender allowlist (sender) do not.
     #[tab(Advanced)]
     #[serde(default)]
     pub allowed_groups: Vec<String>,
@@ -12769,6 +14175,11 @@ pub struct WhatsAppConfig {
     /// Range: `0..=REPLY_MIN_INTERVAL_MAX_SECS` (0 disables).
     #[serde(default)]
     pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    /// Range: `0..=REPLY_QUEUE_DEPTH_CEILING`. When `reply_min_interval_secs > 0`
+    /// and this value is `0`, the pacing wrapper substitutes
+    /// `DEFAULT_REPLY_QUEUE_DEPTH` (16). When the queue is full, the
+    /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
 }
@@ -12908,6 +14319,7 @@ pub struct NextcloudTalkConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub app_token: String,
     /// Shared secret for webhook signature verification.
+    ///
     /// Can also be set via `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET`.
     #[serde(default)]
     #[secret]
@@ -12930,6 +14342,11 @@ pub struct NextcloudTalkConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+    /// Controls whether and how streaming draft updates are delivered.
+    ///
+    /// - `"off"` (default): responses are sent as a single final message.
+    /// - `"partial"`: a placeholder is posted first and edited incrementally
+    ///   as tokens arrive, making long responses visible in real time.
     #[tab(Behavior)]
     #[serde(default)]
     pub stream_mode: StreamMode,
@@ -12950,6 +14367,11 @@ impl ChannelConfig for NextcloudTalkConfig {
 }
 
 impl WhatsAppConfig {
+    /// Detect which backend to use based on config fields.
+    /// Cloud API when `phone_number_id` is set; otherwise Web when any
+    /// Web-only selector (`session_path`, `pair_phone`, `pair_code`,
+    /// `ws_url`, or `mode = personal`) is present. Falls back to Cloud
+    /// for an otherwise-empty config (env-injected Cloud credentials).
     pub fn backend_type(&self) -> &'static str {
         if self.phone_number_id.is_some() {
             "cloud"
@@ -12984,6 +14406,7 @@ impl WhatsAppConfig {
     }
 
     /// Returns true when both Cloud and Web selectors are present.
+    ///
     /// Runtime currently prefers Cloud mode in this case for backward compatibility.
     pub fn is_ambiguous_config(&self) -> bool {
         self.phone_number_id.is_some() && self.has_web_selector()
@@ -12991,6 +14414,7 @@ impl WhatsAppConfig {
 }
 
 /// MQTT channel configuration (SOP listener).
+///
 /// Subscribes to MQTT topics and dispatches incoming messages
 /// to the SOP engine for processing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -13047,6 +14471,14 @@ pub struct MqttConfig {
 }
 
 impl MqttConfig {
+    /// Validate the MQTT configuration.
+    ///
+    /// Checks:
+    /// - QoS is 0, 1, or 2
+    /// - broker_url uses valid scheme (`mqtt://` or `mqtts://`)
+    /// - `use_tls` flag matches broker_url scheme
+    /// - At least one topic is configured
+    /// - client_id is non-empty
     pub fn validate(&self) -> anyhow::Result<()> {
         // QoS validation
         if self.qos > 2 {
@@ -13110,6 +14542,11 @@ fn default_mqtt_keep_alive_secs() -> u64 {
     30
 }
 
+/// Filesystem SOP listener configuration.
+///
+/// Watches configured paths and dispatches file create/modify/delete/rename
+/// events to the SOP engine. This is a fan-in listener, not a chat channel:
+/// its `Channel::send` has no outbound surface.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.filesystem"]
@@ -13161,9 +14598,20 @@ pub struct FilesystemConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub follow_symlinks: bool,
+    /// Maximum file content bytes admitted into a payload when `read_content`,
+    /// and the size ceiling for hashing. `Some(n)` caps reads and hashing at
+    /// `n` bytes; oversize files are skipped rather than truncated. `None`
+    /// removes the ceiling entirely (unbounded reads). Defaults to
+    /// `Some(65536)` (64 KiB), so the cap applies by default whenever
+    /// `read_content` or hashing runs.
     #[tab(Advanced)]
     #[serde(default = "default_filesystem_max_content_bytes")]
     pub max_content_bytes: Option<usize>,
+    /// Watch broad system roots (`/`, `/home`, `/etc`, `/var`, `/proc`,
+    /// `/sys`, `/dev`, `/tmp`) despite the deny-broad-roots default. The
+    /// pseudo-filesystems `/proc` and `/sys` would surface kernel object
+    /// paths in SOP payloads and flood the watcher with events. Off unless
+    /// explicitly enabled.
     #[tab(Advanced)]
     #[serde(default)]
     pub allow_broad_roots: bool,
@@ -13256,6 +14704,14 @@ fn default_filesystem_max_content_bytes() -> Option<usize> {
     Some(65536)
 }
 
+/// Generic AMQP 0-9-1 channel configuration (RabbitMQ, Fedora Messaging, etc.).
+///
+/// Subscribes to an exchange via routing keys and lifts each delivery into an
+/// inbound `ChannelMessage`. The mapping from a JSON delivery body to message
+/// fields is config-driven (`content_template`, `thread_id_field`) so a new
+/// source — Anitya, an internal bus, anything publishing JSON — is onboarded by
+/// configuration rather than code.
+/// Where an AMQP delivery is routed once consumed.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]
@@ -13338,6 +14794,12 @@ pub struct AmqpConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub thread_id_field: String,
+    /// Acknowledgement mode. When `true` (default), deliveries are acked only
+    /// after the message is durably handed to the agent loop, giving
+    /// at-least-once semantics: a crash before hand-off redelivers the event.
+    /// Set `false` for at-most-once (broker acks on dispatch), which silently
+    /// drops in-flight events on crash and is only appropriate for
+    /// non-side-effecting, drop-on-overload consumers.
     #[tab(Behavior)]
     #[serde(default = "default_amqp_durable_ack")]
     pub durable_ack: bool,
@@ -13356,6 +14818,14 @@ pub struct AmqpConfig {
 }
 
 impl AmqpConfig {
+    /// Validate the AMQP configuration.
+    ///
+    /// Checks:
+    /// - `amqp_url` uses a valid scheme (`amqp://` or `amqps://`)
+    /// - `amqps://` connections carry a CA certificate
+    /// - `client_cert` and `client_key` are supplied together (mutual TLS)
+    /// - the exchange is non-empty
+    /// - at least one routing key is bound
     pub fn validate(&self) -> anyhow::Result<()> {
         let is_tls = self.amqp_url.starts_with("amqps://");
         let is_plain = self.amqp_url.starts_with("amqp://");
@@ -13532,6 +15002,7 @@ fn default_irc_port() -> u16 {
 }
 
 /// How ZeroClaw receives events from Feishu / Lark.
+///
 /// - `websocket` (default) — persistent WSS long-connection; no public URL required.
 /// - `webhook`             — HTTP callback server; requires a public HTTPS endpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum)]
@@ -13611,6 +15082,11 @@ pub struct LarkConfig {
     #[tab(Behavior)]
     #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// When `true`, group-chat sessions key on the sender's open_id, so
+    /// distinct members of the same group chat don't share conversation
+    /// context. When `false` (default), all members of a group share one
+    /// session keyed on chat_id (matches the existing behavior). 1-on-1
+    /// chats are unaffected (chat_id is already unique per user-bot pair).
     #[tab(Behavior)]
     #[serde(default)]
     pub per_user_session: bool,
@@ -13622,6 +15098,11 @@ pub struct LarkConfig {
     #[serde(default)]
     pub ack_reactions: Option<bool>,
 
+    /// Streaming mode for the LLM response: `off` (default) routes every
+    /// response through `send()`; `partial` opens a Feishu interactive
+    /// card and edits it incrementally via `update_draft` /
+    /// `finalize_draft`; `multi_message` is rejected for Lark (Feishu has
+    /// no equivalent surface — falls back to `off` with a warning).
     #[tab(Behavior)]
     #[serde(default)]
     pub stream_mode: StreamMode,
@@ -13704,9 +15185,19 @@ pub struct LineConfig {
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub channel_secret: String,
+    /// DM (1:1 chat) access policy. Default: `pairing`.
+    ///
+    /// - `open`: respond to everyone
+    /// - `pairing`: require one-time `/bind <code>` handshake on first contact
+    /// - `allowlist`: respond only to user IDs listed in `allowed_users`
     #[tab(Advanced)]
     #[serde(default)]
     pub dm_policy: LineDmPolicy,
+    /// Group / multi-person chat policy. Default: `mention`.
+    ///
+    /// - `open`: respond to every message
+    /// - `mention`: respond only when @mentioned
+    /// - `disabled`: ignore all group messages
     #[tab(Advanced)]
     #[serde(default)]
     pub group_policy: LineGroupPolicy,
@@ -13748,6 +15239,11 @@ impl ChannelConfig for LineConfig {
 
 // ── Security Config ─────────────────────────────────────────────────
 
+/// Security configuration for audit logging, OTP, e-stop, IAM/SSO, and WebAuthn.
+///
+/// Sandbox backend and resource limits live on per-agent risk profiles
+/// (see `RiskProfileConfig::sandbox_*` and `RiskProfileConfig::max_*`); the
+/// runtime resolves them via `Config::active_risk_profile(agent_alias)`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security"]
@@ -13784,6 +15280,13 @@ pub struct SecurityConfig {
     pub webauthn: WebAuthnConfig,
 }
 
+/// Outbound credential leak detection configuration.
+///
+/// These settings control the final guardrail pass over outbound channel
+/// responses before they are delivered. Deterministic credential patterns
+/// include API keys, private keys, database URLs, bot tokens, and related
+/// token syntax. The high-entropy pass is a separate heuristic for standalone
+/// opaque tokens.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security.leak_detection"]
@@ -13824,6 +15327,7 @@ impl Default for LeakDetectionConfig {
 }
 
 /// WebAuthn / FIDO2 hardware key authentication configuration (`[security.webauthn]`).
+///
 /// Enables registration and authentication via hardware security keys
 /// (YubiKey, SoloKey, etc.) and platform authenticators (Touch ID, Windows Hello).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -13995,6 +15499,7 @@ impl Default for EstopConfig {
 }
 
 /// Nevis IAM integration configuration.
+///
 /// When `enabled` is true, ZeroClaw validates incoming requests against a Nevis
 /// Security Suite instance and maps Nevis roles to tool/workspace permissions.
 #[derive(Clone, Serialize, Deserialize, Configurable)]
@@ -14068,6 +15573,7 @@ impl std::fmt::Debug for NevisConfig {
 
 impl NevisConfig {
     /// Validate that required fields are present when Nevis is enabled.
+    ///
     /// Call at config load time to fail fast on invalid configuration rather
     /// than deferring errors to the first authentication request.
     pub fn validate(&self) -> Result<(), String> {
@@ -14340,6 +15846,7 @@ fn default_wecom_ws_stream_mode() -> StreamMode {
 }
 
 /// WeCom AI Bot WebSocket configuration.
+///
 /// This is distinct from webhook-based [`WeComConfig`] and uses the WeCom AI
 /// Bot long-connection API for inbound messages and active-session replies.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -14364,6 +15871,11 @@ pub struct WeComWsConfig {
     /// Allowed WeCom group chat IDs. Empty = deny all groups, "*" = allow all groups.
     #[serde(default)]
     pub allowed_groups: Vec<String>,
+    /// Display name or mention alias of the WeCom AI bot, for example `danya`.
+    ///
+    /// WeCom group text often arrives as plain text such as `@danya say hi`;
+    /// passing this name through lets the generic reply-intent precheck
+    /// recognize that a group message was addressed to the bot.
     #[serde(default)]
     pub bot_name: Option<String>,
     /// File retention days for downloaded WeCom attachments under the workspace cache.
@@ -14411,6 +15923,11 @@ impl ChannelConfig for WeComWsConfig {
     }
 }
 
+/// WeChat personal iLink Bot channel configuration.
+///
+/// Uses the iLink Bot API (`ilinkai.weixin.qq.com`) with QR-code login.
+/// The bot token is obtained by scanning a QR code and persisted to disk
+/// so subsequent restarts do not require re-scanning.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.wechat"]
@@ -14661,6 +16178,14 @@ impl ChannelConfig for BlueskyConfig {
     }
 }
 
+/// Git-forge channel configuration (polling-based; no webhook required).
+///
+/// A `provider` selects the forge. GitHub authenticates as a GitHub App:
+/// a short-lived RS256 JWT signed with the app's private key is exchanged
+/// for per-installation access tokens. Gitea and Forgejo use a personal
+/// access token against the instance's `/api/v1` endpoint, named by the
+/// required `api_base_url`. Inbound issue/PR comments are polled from the
+/// forge REST API, so the daemon needs no inbound network exposure.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.git"]
@@ -14695,6 +16220,13 @@ pub struct GitConfig {
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installation_id: Option<u64>,
+    /// Gitea/Forgejo API base URL, including `/api/v1`, for example
+    /// `https://git.example.org/api/v1` (for the public Gitea service:
+    /// `https://gitea.com/api/v1`). Required when `provider` is `"gitea"`
+    /// or `"forgejo"` - there is no default host, because every API
+    /// request carries `access_token`; the channel fails closed at
+    /// startup rather than send the token to an endpoint the operator
+    /// never named. Gitea/Forgejo provider only.
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_base_url: Option<String>,
@@ -14731,10 +16263,25 @@ pub struct GitConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// Per-event routing table, keyed by normalized event type
+    /// (`"issue_comment.created"`, `"pull_request.opened"`,
+    /// `"workflow_run.failed"`, …). Event types absent from the table fall
+    /// back to the conversational default: `issue_comment.created`,
+    /// `issues.opened`, and `pull_request.opened` are delivered as
+    /// messages (mention-gated); everything else is ignored. Which API
+    /// endpoints are polled is derived from this table; routing an event
+    /// type is also subscribing to it.
     #[tab(Behavior)]
     #[serde(default)]
     #[nested]
     pub events: HashMap<String, GitEventRoute>,
+    /// Also poll the repository Events API (`/repos/{owner}/{repo}/events`)
+    /// as a broad backbone transport: one conditional (ETag) request per
+    /// repository per tick, so an idle repo costs almost nothing. Caveats:
+    /// events arrive with a delay of up to ~5 minutes and the feed carries
+    /// no Actions/check events (workflow runs always use their dedicated
+    /// endpoint). Items also surfaced by a targeted endpoint are
+    /// de-duplicated. Default: `false`.
     #[tab(Advanced)]
     #[serde(default)]
     pub events_backbone: bool,
@@ -14785,6 +16332,12 @@ impl ChannelConfig for GitConfig {
     }
 }
 
+/// Routing for one normalized git-forge event type, keyed in
+/// `[channels.git.<alias>.events]` by the event type string
+/// (`"pull_request.opened" = { sop = "pr-triage" }`).
+///
+/// An entry with neither `message = true` nor a `sop` explicitly ignores the
+/// event type (overriding the conversational default).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.git.events"]
@@ -14798,6 +16351,7 @@ pub struct GitEventRoute {
 }
 
 /// Voice duplex configuration (`[channels.voice_duplex]`).
+///
 /// Enables full-duplex voice event handling over WebSocket.
 /// When disabled (default), voice events are rejected as unknown types.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
@@ -14815,6 +16369,11 @@ pub struct VoiceDuplexConfig {
     pub excluded_tools: Vec<String>,
 }
 
+/// Voice wake word detection channel configuration.
+///
+/// Listens on the default microphone for a configurable wake word,
+/// then captures the following utterance and transcribes it via the
+/// existing transcription API.
 #[derive(Debug, Clone, Serialize, Deserialize, zeroclaw_macros::Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "voice_wake"]
@@ -14935,6 +16494,11 @@ pub fn default_nostr_relays() -> Vec<String> {
 
 // -- Notion --
 
+/// Notion integration configuration (`[notion]`).
+///
+/// When `enabled = true`, the agent polls a Notion database for pending tasks
+/// and exposes a `notion` tool for querying, reading, creating, and updating pages.
+/// Requires `api_key` (or the `NOTION_API_KEY` env var) and `database_id`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "notion"]
@@ -14997,6 +16561,23 @@ impl Default for NotionConfig {
     }
 }
 
+/// Jira integration configuration (`[jira]`).
+///
+/// When `enabled = true`, registers the `jira` tool which can get tickets,
+/// search with JQL, and add comments. Requires `base_url` and `api_token`
+/// (or the `JIRA_API_TOKEN` env var).
+///
+/// ## Defaults
+/// - `enabled`: `false`
+/// - `allowed_actions`: `["get_ticket"]` — read-only by default.
+///   Add `"search_tickets"` or `"comment_ticket"` to unlock them.
+/// - `timeout_secs`: `30`
+///
+/// ## Auth
+/// Jira Cloud uses HTTP Basic auth: `email` + `api_token`.
+/// Jira Server/Data Center uses Bearer token auth: omit `email` and set
+/// `api_token` to a personal access token.
+/// `api_token` is stored encrypted at rest; set it here or via `JIRA_API_TOKEN`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "jira"]
@@ -15007,6 +16588,13 @@ pub struct JiraConfig {
     /// Atlassian instance base URL, e.g. `https://yourco.atlassian.net`.
     #[serde(default)]
     pub base_url: String,
+    /// Jira account email used for Basic auth (Cloud).
+    /// Omit for Server/DC deployments using Bearer token auth.
+    /// An empty string (`email = ""`) deserializes as `None`. Configs
+    /// that round-tripped the empty default to disk would otherwise
+    /// silently regress to Basic auth with empty username, since the
+    /// email-required validation was dropped when Server/DC Bearer-token
+    /// support landed.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -15019,6 +16607,11 @@ pub struct JiraConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_token: String,
+    /// Actions the agent is permitted to call.
+    /// Valid values: `"get_ticket"`, `"search_tickets"`, `"comment_ticket"`,
+    /// `"list_projects"`, `"myself"`, `"list_transitions"`,
+    /// `"transition_ticket"`, `"create_ticket"`.
+    /// Defaults to `["get_ticket"]` (read-only).
     #[serde(default = "default_jira_allowed_actions")]
     pub allowed_actions: Vec<String>,
     /// Request timeout in seconds. Default: `30`.
@@ -15047,6 +16640,7 @@ impl Default for JiraConfig {
     }
 }
 
+///
 /// Controls the read-only cloud transformation analysis tools:
 /// IaC review, migration assessment, cost analysis, and architecture review.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -15172,6 +16766,7 @@ fn default_conversational_ai_timeout_secs() -> u64 {
 }
 
 /// Conversational AI agent builder configuration (`[conversational_ai]` section).
+///
 /// **Status: Reserved for future use.** This configuration is parsed but not yet
 /// consumed by the runtime. Setting `enabled = true` will produce a startup warning.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -15208,6 +16803,11 @@ pub struct ConversationalAiConfig {
 }
 
 impl ConversationalAiConfig {
+    /// Returns `true` when the feature is disabled (the default).
+    ///
+    /// Used by `#[serde(skip_serializing_if)]` to omit the entire
+    /// `[conversational_ai]` section from newly-generated config files,
+    /// avoiding user confusion over an undocumented / experimental section.
     pub fn is_disabled(&self) -> bool {
         !self.enabled
     }
@@ -15423,10 +17023,21 @@ fn default_config_dir() -> Result<PathBuf> {
     Ok(home.join(".zeroclaw"))
 }
 
+/// Canonical on-disk directory for a locale's runtime/zerocode FTL catalogues:
+/// `<config_dir>/data/ftl/<locale>/`. This is where `zeroclaw locales fetch`
+/// writes downloaded translations and where the runtime i18n loader reads them.
+/// `<config_dir>` honors `ZEROCLAW_CONFIG_DIR` and otherwise defaults to
+/// `~/.zeroclaw`. The zerocode binary mirrors this path inline (it carries no
+/// `zeroclaw-*` dependency).
 pub fn ftl_locale_dir(locale: &str) -> Result<PathBuf> {
     Ok(default_config_dir()?.join("data").join("ftl").join(locale))
 }
 
+/// The FTL catalogues that `zeroclaw locales fetch` / the daemon's
+/// `locales/fetch` RPC can download, as `(name, upstream-path-template,
+/// output-filename)`. `{locale}` is substituted per request. This is the single
+/// source of truth — a caller supplies only a catalog *name* matched against
+/// this table, never a path.
 pub const FTL_CATALOGS: &[(&str, &str, &str)] = &[
     (
         "cli",
@@ -15445,6 +17056,19 @@ pub const FTL_CATALOGS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Build a default path string by joining `relative` onto the resolved
+/// platform config dir. The form sees the resolved absolute path
+/// (`/home/<user>/.zeroclaw/<relative>` on Linux,
+/// `C:\Users\<user>\.zeroclaw\<relative>` on Windows, etc.) instead of a
+/// literal `~/...` token that doesn't expand on Windows. Falls back to
+/// `~/.zeroclaw/<relative>` if the platform dir can't be resolved (rare —
+/// e.g. no HOME and `directories::UserDirs` returns None); the runtime's
+/// `expand_tilde_path()` handles that literal at use-time.
+///
+/// Switching to platform-native config locations (`~/Library/Application
+/// Support/zeroclaw/` on macOS, `%APPDATA%\zeroclaw\` on Windows) is the
+/// schema-v3 follow-up — that needs a migration to move
+/// existing users' configs.
 fn default_path_under_config_dir(relative: &str) -> String {
     match default_config_dir() {
         Ok(dir) => dir.join(relative).to_string_lossy().into_owned(),
@@ -15478,6 +17102,11 @@ pub fn resolve_config_dir_for_data(data_dir: &Path) -> (PathBuf, PathBuf) {
     (data_config_dir.clone(), data_config_dir.join("data"))
 }
 
+/// Resolve the current runtime config/data directories.
+///
+/// This mirrors the same precedence used by `Config::load_or_init()`:
+/// `ZEROCLAW_CONFIG_DIR` > `ZEROCLAW_DATA_DIR` > `ZEROCLAW_WORKSPACE`
+/// (deprecated) > defaults.
 pub async fn resolve_runtime_dirs() -> Result<(PathBuf, PathBuf)> {
     let (default_zeroclaw_dir, default_data_dir) = default_config_and_data_dirs()?;
     let (config_dir, data_dir, _) =
@@ -15506,6 +17135,11 @@ impl ConfigResolutionSource {
     }
 }
 
+/// Expand tilde in paths, falling back to `UserDirs` when HOME is unset.
+///
+/// In non-TTY environments (e.g. cron), HOME may not be set, causing
+/// `shellexpand::tilde` to return the literal `~` unexpanded. This helper
+/// detects that case and uses `directories::UserDirs` as a fallback.
 fn expand_tilde_path(path: &str) -> PathBuf {
     let expanded = shellexpand::tilde(path);
     let expanded_str = expanded.as_ref();
@@ -15533,6 +17167,14 @@ fn expand_tilde_path(path: &str) -> PathBuf {
     PathBuf::from(expanded_str)
 }
 
+/// Returns the legacy plugin directories that still hold installed plugins not
+/// visible to the runtime, which now scans [`PluginsConfig::resolved_plugins_dir`].
+///
+/// Historically `zeroclaw plugin install` wrote to `<data_dir>/plugins` (and,
+/// before the data-dir rename, `<install_root>/workspace/plugins`). A directory
+/// is reported only when it differs from the configured plugins dir and contains
+/// at least one plugin (a subdirectory with a `manifest.toml`). Used to surface a
+/// migration hint and to drive `zeroclaw plugin migrate`.
 #[must_use]
 pub fn legacy_plugin_dirs_with_entries(config: &Config) -> Vec<PathBuf> {
     let target = config.plugins.resolved_plugins_dir();
@@ -15556,6 +17198,11 @@ fn dir_has_plugin(dir: &Path) -> bool {
         .any(|entry| entry.path().join("manifest.toml").exists())
 }
 
+/// Detect if an executable path lives under a macOS Homebrew prefix and return
+/// the Homebrew-managed config directory.
+///
+/// Homebrew can execute ZeroClaw from `<prefix>/Cellar/zeroclaw/<version>/bin/`,
+/// `<prefix>/bin/`, or `<prefix>/opt/zeroclaw/bin/`.
 async fn try_resolve_macos_homebrew_config_dir(exe: &Path) -> Option<PathBuf> {
     let parts = exe.iter().collect::<Vec<_>>();
     let prefix = match parts.as_slice() {
@@ -15718,8 +17365,18 @@ fn config_dir_creation_error(path: &Path) -> String {
     )
 }
 
+/// Top-level keys that must always appear in the saved config even
+/// when their value equals the default. `schema_version` is the
+/// migration detector's anchor — dropping it from a freshly-saved
+/// config would make the next load mis-detect the file as V1 (no
+/// version key = V1).
 const SAVE_PRESERVE_KEYS: &[&str] = &["schema_version"];
 
+/// Insert a blank line before every `[section]` header that doesn't
+/// already have one, so the serialized TOML reads as discrete blocks
+/// instead of running every section header directly after the
+/// previous line (`toml::to_string_pretty` doesn't gap between a
+/// trailing scalar and the next section header).
 fn ensure_blank_line_before_sections(toml: &str) -> String {
     let mut out = String::with_capacity(toml.len() + 64);
     let mut prev_line_blank = true; // start of file counts as blank
@@ -15735,6 +17392,15 @@ fn ensure_blank_line_before_sections(toml: &str) -> String {
     out
 }
 
+/// Walk `actual` and drop every key whose value matches the same
+/// key's value in `defaults`. Tables recurse; the recursion drops a
+/// sub-table when every one of its keys was itself dropped (i.e. the
+/// sub-table contained only defaults). Keys that don't appear in
+/// `defaults` are operator-added and always survive.
+///
+/// HashMap-keyed sub-trees (e.g. `agents`, `providers.models.<family>`)
+/// are not in the typed default tree, so their operator-added aliases
+/// pass through this filter unchanged.
 fn prune_default_values(actual: &mut toml::Table, defaults: &toml::Table) {
     let keys: Vec<String> = actual.keys().cloned().collect();
     for key in keys {
@@ -15806,6 +17472,11 @@ fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
         .is_some_and(|value| !value.is_empty())
 }
 
+/// Ensure that essential bootstrap files exist in the workspace directory.
+///
+/// When the workspace is created outside of Quickstart (e.g., non-tty
+/// daemon/cron sessions), these files would otherwise be missing. This function
+/// creates sensible defaults that allow the agent to operate with a basic identity.
 pub async fn ensure_bootstrap_files(workspace_dir: &Path) -> Result<()> {
     let defaults: &[(&str, &str)] = &[
         (
@@ -15848,6 +17519,12 @@ struct ExtraNestedModelProviderTable {
 }
 
 impl Config {
+    /// External-peer usernames authorized on `<channel_type>.<alias>`.
+    ///
+    /// A `[peer_groups.<name>]` contributes when its `channel` field either
+    /// matches `channel_type` (type-wide group, applies to every alias of
+    /// that type) or matches the full dotted `"<channel_type>.<alias>"`
+    /// (instance-scoped group, applies to that one alias only).
     pub fn channel_external_peers(&self, channel_type: &str, alias: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -15869,6 +17546,15 @@ impl Config {
         out
     }
 
+    /// Voice-peer usernames for `<channel_type>.<alias>` that should always
+    /// receive TTS voice replies.
+    ///
+    /// A `[peer_groups.<name>]` contributes when its `channel` field matches
+    /// (type-wide or dotted) **and** `output_modality = "voice"`.
+    ///
+    /// This is the live-resolve counterpart of `channel_external_peers`,
+    /// filtered to voice-only peer groups. No cache — single source of truth
+    /// is `self.peer_groups`.
     pub fn channel_voice_peers(&self, channel_type: &str, alias: &str) -> Vec<String> {
         use crate::multi_agent::OutputModality;
 
@@ -15905,7 +17591,7 @@ impl Config {
     /// effect at the next `Config::channel_agent_scope_admins` call; the
     /// orchestrator gate reads through a snapshot of this `Config`, so
     /// operator edits become visible after the runtime context is rebuilt
-    /// (daemon restart). See issue #8044.
+    /// (daemon restart).
     pub fn channel_agent_scope_admins(
         &self,
         channel_type: &str,
@@ -15949,6 +17635,13 @@ impl Config {
     /// row in this method. The integrations registry consumes the result
     /// without per-vendor branches.
     pub fn integration_descriptors(&self) -> Vec<crate::config::IntegrationDescriptor> {
+        // BrowserConfig and GoogleWorkspaceConfig carry
+        // `#[integration(...)]` annotations on V3, so the macro emits
+        // `integration_descriptor()` on each. Cron has been flattened
+        // to `HashMap<String, CronJobDecl>` with no enable toggle, so
+        // it gets a hand-crafted descriptor whose `active` reflects
+        // whether any job is configured. Display copy lives next to
+        // the field so the registry never branches on a category name.
         vec![
             self.browser.integration_descriptor(),
             self.google_workspace.integration_descriptor(),
@@ -15961,6 +17654,13 @@ impl Config {
         ]
     }
 
+    /// Return top-level TOML keys in `raw_toml` that Config does not recognise.
+    ///
+    /// Keys present in `Config::default()` serialization pass immediately.
+    /// Remaining keys are probed: the key is deserialized in isolation and
+    /// the result compared to the default — a changed output means serde
+    /// consumed it (covers `Option<T>` fields and `#[serde(alias)]` names).
+    /// V1 legacy keys (consumed by migration) are also accepted.
     pub fn unknown_keys(raw_toml: &str) -> Vec<String> {
         let raw: toml::Table = match raw_toml.parse() {
             Ok(t) => t,
@@ -15995,6 +17695,12 @@ impl Config {
             .collect()
     }
 
+    /// Return `<kind>.<family>` entries under `[providers]` in `raw_toml`
+    /// whose family is not a known typed slot (kinds: models, tts,
+    /// transcription). Serde silently drops these sections at deserialize
+    /// time, so a typo'd family (`[providers.models.antropic.x]`) or one
+    /// from a newer binary vanishes on reload: the alias "works" in the
+    /// session that created it, then disappears after restart.
     pub fn unknown_provider_families(raw_toml: &str) -> Vec<String> {
         let raw: toml::Table = match raw_toml.parse() {
             Ok(t) => t,
@@ -16026,6 +17732,16 @@ impl Config {
         out
     }
 
+    /// Return extra-nested model-provider alias tables that look like a
+    /// misplaced provider config, e.g.
+    /// `[providers.models.zai.default.default]`.
+    ///
+    /// Serde treats the first `default` as the alias and silently ignores the
+    /// second `default` child table. When that child table carries provider
+    /// fields such as `model`, `api_key`, or family-specific fields, the
+    /// operator's settings are dropped while the empty alias still validates as
+    /// an in-progress provider. This raw-TOML detector runs before that shape
+    /// is erased by typed deserialization.
     fn extra_nested_model_provider_tables(raw_toml: &str) -> Vec<ExtraNestedModelProviderTable> {
         let raw: toml::Table = match raw_toml.parse() {
             Ok(t) => t,
@@ -16075,6 +17791,11 @@ impl Config {
     }
 
     fn is_model_provider_table_valued_field(key: &str) -> bool {
+        // These shared model-provider fields legitimately deserialize from
+        // nested TOML tables under an alias. Every other table-valued child of
+        // `[providers.models.<family>.<alias>]` is an ignored extra section,
+        // regardless of whether its contents are shared or family-specific
+        // provider fields.
         matches!(
             key,
             "chat_template_kwargs" | "extra_headers" | "pricing" | "provider_extra"
@@ -16091,9 +17812,26 @@ impl Config {
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_data_dirs()?;
 
+        // Resolve env overrides FIRST so the migration runs against
+        // the install root the operator actually uses. Running the
+        // migration against `default_zeroclaw_dir` would silently skip
+        // any install reached via `ZEROCLAW_CONFIG_DIR` or
+        // `ZEROCLAW_WORKSPACE`.
         let (zeroclaw_dir, _legacy_workspace_dir, resolution_source) =
             resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
 
+        // One-time, V<3 → V3 ONLY move of `<install>/workspace/` into
+        // `<install>/agents/default/workspace/`. The "default" alias is
+        // the migration bridge — it must NEVER appear on a fresh install
+        // or on a V3 install that already declared its own aliases.
+        //
+        // Gate strictly on the on-disk config's `schema_version`:
+        // - missing config.toml      → fresh install, skip.
+        // - schema_version >= 3      → already V3, skip.
+        // - schema_version 1 or 2    → upgrade in progress, run.
+        // Anything else (parse failure, weird value) is treated as
+        // "don't touch the filesystem"; the TOML migrator will surface
+        // the real error.
         let config_toml_path = zeroclaw_dir.join("config.toml");
         let needs_fs_migration = config_toml_path.is_file()
             && matches!(
@@ -16134,6 +17872,23 @@ impl Config {
 
         let config_path = zeroclaw_dir.join("config.toml");
 
+        // The install dir is the only directory `load_or_init` creates
+        // unconditionally. Per-agent workspaces (`agents/<alias>/workspace/`)
+        // are seeded lazily at agent-loop entry by
+        // `Agent::from_config_with_session_cwd_and_mcp`, which runs
+        // `ensure_bootstrap_files` for the agent it is starting. There
+        // is no fresh-install "default" agent and therefore no
+        // `agents/default/workspace/` synthesized at boot; the only
+        // legitimate origin for that directory is the V1/V2→V3
+        // legacy-workspace migration above, which fires only when a
+        // pre-multi-agent install's `<install>/workspace/` is present
+        // and needs to be moved into the new layout.
+        //
+        // `config.data_dir` resolves to `<install>/data/` — the shared
+        // instance data directory holding databases (memory, sessions,
+        // cost records) and hygiene/state files. Per-agent identity
+        // and markdown (MEMORY.md, IDENTITY.md, SOUL.md) lives at
+        // `Config::agent_workspace_dir(alias)` instead.
         let data_dir = zeroclaw_dir.join("data");
         fs::create_dir_all(&data_dir).await.with_context(|| {
             format!(
@@ -16188,11 +17943,37 @@ impl Config {
                 .await
                 .context("Failed to read config file")?;
 
+            // Deserialize the config with the standard TOML parser.
+            //
+            // Previously this used `serde_ignored::deserialize` for both
+            // deserialization and unknown-key detection.  However,
+            // `serde_ignored` silently drops field values inside nested
+            // structs that carry `#[serde(default)]` (e.g. the entire
+            // `[autonomy]` table), causing user-supplied values to be
+            // replaced by defaults.
+            //
+            // We now deserialize with `toml::from_str` (which is correct)
+            // and run `serde_ignored` separately just for diagnostics.
+            //
+            // `migrate_to_current` parses the TOML, detects the schema
+            // version, runs the typed V1→V2→V3 chain via `V1Config::migrate`
+            // / `V2Config::migrate`, and deserializes the result into the
+            // current `Config` shape.
+            //
+            // Detect the on-disk version up-front so we can emit one WARN
+            // line when the daemon auto-migrates an older config in memory:
+            // the disk file is left untouched and the user is advised to lock
+            // the migration in with `zeroclaw config migrate`.
             let stale_version = toml::from_str::<toml::Value>(&contents)
                 .ok()
                 .as_ref()
                 .and_then(|v| crate::migration::detect_version(v).ok())
                 .filter(|n| *n != crate::migration::CURRENT_SCHEMA_VERSION);
+            // Daemon load must never hard-fail on a malformed config — the
+            // operator needs the process up to repair it. The resilient path
+            // degrades (dropping invalid blocks to defaults); security-critical
+            // drops are recorded on `degraded_security` for exposure gating.
+            // Strict validation lives in `zeroclaw config migrate`.
             let salvage = crate::migration::migrate_to_current_salvaged(&contents);
             let mut config: Config = salvage.config;
             config.degraded_security = salvage.dropped_security;
@@ -16214,6 +17995,25 @@ impl Config {
                 );
             }
 
+            // Ensure the built-in default auto_approve entries are always
+            // present on a `risk_profiles.default` entry that already
+            // exists (typically post-V1/V2→V3 migration). When a user
+            // specifies `auto_approve` in their TOML (e.g. to add a
+            // custom tool), serde replaces the default list instead of
+            // merging — this re-adds the framework defaults so safe
+            // tools like `weather` and `calculator` keep their
+            // auto-approve status.
+            //
+            // Users who want to require approval for a default tool can
+            // add it to `always_ask`, which takes precedence over
+            // `auto_approve` in the approval decision (see approval/mod.rs).
+            //
+            // Skipped when the loaded config has no `risk_profiles.default`
+            // entry: we will not synthesize a `default` alias here.
+            // `default` is a migration artifact (V1/V2→V3
+            // single-instance bridge); a config that arrives without it
+            // is a legitimate multi-aliased shape and must not have one
+            // injected at load time.
             if let Some(default_profile) = config.risk_profiles.get_mut("default") {
                 default_profile.ensure_default_auto_approve();
             }
@@ -16322,6 +18122,12 @@ impl Config {
             config.env_overridden_paths = applied.paths;
             config.pre_override_snapshots = applied.snapshots;
 
+            // Validation must NOT prevent the daemon from booting. If
+            // it did, a single broken agent reference would lock the
+            // operator out of `/config` — the only place they can fix
+            // it. Demote to a startup warning; the gateway and dashboard
+            // still come up so the user can navigate to the bad section
+            // and repair it.
             if let Err(e) = config.validate() {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -16374,6 +18180,18 @@ impl Config {
         }
     }
 
+    /// Collect non-fatal validation warnings — config that loads and
+    /// validates successfully (`validate()` returns `Ok(())`) but will fail
+    /// at runtime because of a logical inconsistency the schema cannot
+    /// enforce structurally.
+    ///
+    /// Called by `validate()` (which emits each warning via `tracing::warn!`
+    /// for log visibility) and by the gateway HTTP API (which returns the
+    /// structured list in `PropResponse` / `PatchResponse` so dashboard
+    /// callers see the same signal the CLI sees on stderr).
+    ///
+    /// Adding a new warning: append a check here, pick a stable `code`,
+    /// and document the code in `validation_warnings.rs`.
     pub fn collect_warnings(&self) -> Vec<crate::validation_warnings::ValidationWarning> {
         let mut warnings = Vec::new();
         self.collect_fallback_warnings(&mut warnings);
@@ -16495,6 +18313,16 @@ impl Config {
             && dimensions > 0
     }
 
+    /// Surface the A2A `exposed_skills` filter that can never resolve a skill.
+    /// `exposed_skills` is a narrowing filter over the agent's resolved skill
+    /// set, which comes from `skill_bundles`. An agent that lists
+    /// `a2a.exposed_skills` but declares no `skill_bundles` advertises an empty
+    /// `skills: []` array on its agent card with no error, because every wanted
+    /// id is dropped for belonging to a bundle the agent does not declare. The
+    /// same silent emptiness happens when a wanted id names no skill in any
+    /// declared bundle, or when the owning bundle's include/exclude filter
+    /// excludes it; those need disk resolution, so this offline check covers the
+    /// common structural case: exposed skills with zero declared bundles.
     fn collect_a2a_exposed_skills_warnings(
         &self,
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
@@ -16520,6 +18348,20 @@ impl Config {
         }
     }
 
+    /// Surface the cross-provider summary shape on a legacy config that has NOT
+    /// migrated to `summary_provider`. The deprecated
+    /// `runtime_profiles.<p>.context_compression.summary_model` is a bare model
+    /// id dispatched onto each consuming agent's OWN provider; when a single
+    /// profile is shared by agents resolving to MORE THAN ONE distinct provider,
+    /// that one bare id is cross-provider for at least one of them and silently
+    /// fails at runtime. The new `summary_provider` (agent override or profile
+    /// level) supersedes the bare id and is self-contained, so an agent that
+    /// sets it is safe and excluded from the count.
+    ///
+    /// This is the offline, deterministic "startup diagnostic" the review
+    /// asked for: no schema bump, no network, no model catalog. It names the
+    /// profile, the affected agents, and their differing providers, and
+    /// recommends migrating to `context_compression.summary_provider`.
     fn collect_cross_provider_summary_model_warnings(
         &self,
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
@@ -16592,6 +18434,12 @@ impl Config {
         }
     }
 
+    /// Canonical label for an agent's resolved model provider, used to decide
+    /// whether two agents sit on distinct providers. A non-empty ref that
+    /// resolves through `[providers.models]` collapses to its canonical
+    /// `<family>.<alias>` so equivalent spellings (bare vs dotted) compare
+    /// equal; an empty or unresolved ref keeps its raw form (empty becomes a
+    /// stable sentinel) so it still participates as a distinct bucket.
     fn canonical_provider_label(&self, provider_ref: &str) -> String {
         if provider_ref.is_empty() {
             return "<agent default provider>".to_string();
@@ -16745,6 +18593,7 @@ impl Config {
     }
 
     /// Validate configuration values that would cause runtime failures.
+    ///
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
@@ -16807,6 +18656,12 @@ impl Config {
             )?;
         }
 
+        // Git forge channel: a PAT-backed provider must name its API origin
+        // explicitly. There is deliberately no default host - every request
+        // carries `access_token` as a bearer credential, so guessing an
+        // endpoint (e.g. gitea.com) would disclose the token to a host the
+        // operator never configured. Only enabled aliases are checked so a
+        // half-filled disabled block doesn't fail the whole config.
         for (alias, git) in &self.channels.git {
             let provider = git.provider.trim().to_ascii_lowercase();
             if git.enabled && matches!(provider.as_str(), "gitea" | "forgejo") {
@@ -16924,6 +18779,11 @@ impl Config {
             }
         }
 
+        // Skill bundles — directories must stay inside `<install>/shared/`
+        // and no two bundles may resolve to the same directory. Default
+        // directory and the rules themselves live in
+        // [`crate::skill_bundles`] so the runtime SkillsService and this
+        // validator share one implementation.
         if !self.skill_bundles.is_empty() {
             let install_root = self.install_root_dir();
             for alias in self.skill_bundles.keys() {
@@ -16957,7 +18817,20 @@ impl Config {
             }
         }
 
+        // MCP bundles: resolution is secure by default, so a dangling
+        // reference fails closed (the agent is granted fewer servers, never
+        // more). Surface the misconfiguration as a warning so an operator is
+        // not left wondering why an agent's MCP tools vanished, without
+        // turning a typo into a hard startup failure.
         {
+            // Operator UX: secure-by-default means an agent with no
+            // `mcp_bundles` grant connects to ZERO MCP servers. When MCP is
+            // enabled and `[[mcp.servers]]` is non-empty but no
+            // `[mcp_bundles.*]` exists at all, every agent silently gets
+            // nothing. That is the inverse of the original silent
+            // no-op and surprises operators upgrading from <0.8.3. Warn
+            // once at startup so this surfaces via `doctor` and the
+            // standard startup warning stream.
             if self.mcp.enabled && !self.mcp.servers.is_empty() && self.mcp_bundles.is_empty() {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -17235,6 +19108,16 @@ impl Config {
                 .map(str::trim)
                 .is_some_and(|value| !value.is_empty());
 
+            // Entries created by migration from top-level fields use the
+            // model_provider type+alias as the map key and may not have
+            // explicit `uri` (the model_provider factory resolves the
+            // family's default endpoint via `ModelEndpoint`). An entry
+            // with no identifying information at all is almost always an
+            // in-progress quickstart state — the user picked the model
+            // provider but hasn't filled anything in yet. Warn but don't
+            // bail; the runtime falls back to family-default endpoint at
+            // use time, and a chat against the unconfigured model
+            // provider fails with a clear error then.
             let has_api_key = profile
                 .api_key
                 .as_deref()
@@ -17292,6 +19175,11 @@ impl Config {
             }
         }
 
+        // Non-fatal validation warnings: surfaced both via tracing (CLI sees
+        // on stderr) and via Config::collect_warnings (gateway HTTP returns
+        // structured to dashboard callers). Single source of truth lives in
+        // collect_warnings; emit each one to tracing here so the existing
+        // log behavior is preserved.
         for w in self.collect_warnings() {
             ::zeroclaw_log::record!(
                 WARN,
@@ -17758,7 +19646,7 @@ impl Config {
         }
 
         // Per-profile validation: the context-compression summarizer provider
-        // refmust resolve to a configured `[providers.models.*]` alias.
+        // ref must resolve to a configured `[providers.models.*]` alias.
         // Empty = inherit (valid). A shared profile fails loud at config time
         // instead of only when some agent using it compresses.
         let mut profile_aliases: Vec<&String> = self.runtime_profiles.keys().collect();
@@ -17871,6 +19759,13 @@ impl Config {
                 }
             }
 
+            // Per-agent provider refs that resolve into the typed provider
+            // sections. Empty = no preference for that category (no TTS / no
+            // STT for this agent), which is valid. Non-empty values must
+            // match a configured `[providers.<category>.<type>.<alias>]`
+            // entry, fail loud with the dangling ref otherwise.
+            // there is no global default-X-provider concept — every consumer
+            // either picks a configured alias or opts out entirely.
             let typed_provider_refs: &[(&str, &str, &str)] = &[
                 ("providers.tts", "tts_provider", agent.tts_provider.trim()),
                 (
@@ -17878,13 +19773,12 @@ impl Config {
                     "transcription_provider",
                     agent.transcription_provider.trim(),
                 ),
-                // Provider-alias reference fields validated below:
                 (
                     "providers.models",
                     "classifier_provider",
                     agent.classifier_provider.trim(),
                 ),
-                // Agent-level context-compression summarizer override
+                // Agent-level context-compression summarizer override:
                 (
                     "providers.models",
                     "summary_provider",
@@ -17916,6 +19810,13 @@ impl Config {
                 }
             }
 
+            // Bare-alias bundle refs. Tuple is (kebab section path, kebab
+            // agent field name, value list). Both names use the schema's
+            // kebab form: section name matches what `get_map_keys` expects
+            // (macro converts snake→kebab via `snake_to_kebab` per
+            // crates/zeroclaw-macros/src/lib.rs:1056); field name matches
+            // what `prop_fields()` emits, so DanglingReference paths bind
+            // directly to the right inline error in the dashboard form.
             let bare_multi: &[(&str, &str, &[String])] = &[
                 ("skill_bundles", "skill_bundles", &agent.skill_bundles),
                 (
@@ -18038,6 +19939,11 @@ impl Config {
                 }
             }
 
+            // workspace.read_memory_from: every alias must exist as a
+            // configured agent and must use the same MemoryBackendKind
+            // as the declaring agent. Mismatched backends fail at
+            // config load rather than producing a runtime error when
+            // the per-agent memory plumbing consumes the allowlist.
             let agent_backend = agent.memory.backend;
             for (i, target) in agent.workspace.read_memory_from.iter().enumerate() {
                 let target_str = target.as_str();
@@ -18066,6 +19972,12 @@ impl Config {
             }
         }
 
+        // Peer groups: every member alias must exist as a configured
+        // agent, and the group's channel must be in each member's
+        // channels list. Mutual opt-in resolution happens at runtime;
+        // this cross-reference check keeps misconfigured group
+        // members from looking like real peer relationships at load
+        // time.
         let mut peer_group_names: Vec<&String> = self.peer_groups.keys().collect();
         peer_group_names.sort();
         for group_name in peer_group_names {
@@ -18170,6 +20082,16 @@ impl Config {
         self.dirty_paths.insert(path.to_string());
     }
 
+    /// Auto-create the parent map key for a dotted set-prop `path` when it does
+    /// not yet exist, so a `set_prop` on a brand-new alias's field materializes
+    /// the entry first.
+    ///
+    /// Returns `true` iff it REFUSED to create the reserved `default` agent: a
+    /// set-prop surface should then surface a reserved-name error rather than the
+    /// generic "not configured" that the still-missing entry would otherwise
+    /// produce. Returns `false` in every other case (created, already existed, or
+    /// the path is not a map-keyed entry). The bool is advisory; statement-callers
+    /// that do not distinguish the reserved case may ignore it.
     pub fn ensure_map_key_for_path(&mut self, path: &str) -> bool {
         use crate::traits::MapKeyKind;
         let mut best: Option<&'static str> = None;
@@ -18198,6 +20120,13 @@ impl Config {
         {
             return false;
         }
+        // Never auto-vivify the reserved `default` agent from a set-prop path: a
+        // prop write under a nonexistent `agents.default` must not materialize the
+        // reserved runtime fallback (the operator would get an agent the rename
+        // guard then traps). This is the set-prop analogue of the create guard in
+        // `create_map_key_checked`. The migration that legitimately synthesizes
+        // `agents.default` calls `create_map_key` directly, not this path, and an
+        // already-present `default` is left untouched by the existence check above.
         if section == "agents" && crate::alias_refs::is_reserved_agent_alias(alias) {
             // Make the refusal observable: callers that check the return surface a
             // reserved-name error, and this WARN with a stable `error_key` lets an
@@ -18263,7 +20192,7 @@ impl Config {
         // Stamp the current schema version on every write. The in-memory
         // config is always at `CURRENT_SCHEMA_VERSION` (load-time migration
         // brings it forward), but pin it explicitly so a full save can never
-        // emit a body-newer-than-label file. See `save_dirty` and
+        // emit a body-newer-than-label file. See `save_dirty`.
         config_to_save.schema_version = crate::migration::CURRENT_SCHEMA_VERSION;
         let config_path = self.resolve_config_path_for_save().await?;
         let zeroclaw_dir = config_path
@@ -18271,6 +20200,12 @@ impl Config {
             .context("Config path must have a parent directory")?;
         let store = crate::secrets::SecretStore::new(zeroclaw_dir, self.secrets.encrypt);
 
+        // Restore env-overridden paths to their pre-override snapshots before
+        // encryption, so values supplied via `ZEROCLAW_*` env vars never reach
+        // disk. Snapshots were captured at apply time from the post-decrypt
+        // in-memory state, so secrets carry the original plaintext that
+        // `encrypt_secrets()` will re-encrypt to fresh ciphertext that
+        // decrypts back to the same value.
         if !self.pre_override_snapshots.is_empty() {
             crate::env_overrides::mask_env_overrides_for_save(
                 &mut config_to_save,
@@ -18286,6 +20221,12 @@ impl Config {
         // Encrypt all #[secret]-annotated fields via Configurable derive
         config_to_save.encrypt_secrets(&store)?;
 
+        // Serialize, then prune fields whose values match
+        // `Config::default()` so the on-disk config carries only the
+        // operator's actual choices (no hundreds of lines of struct
+        // defaults the operator never touched). The schema's
+        // `#[serde(default = "...")]` annotations re-supply the
+        // defaults on load, so the pruned file round-trips identically.
         let mut new_table: toml::Table = toml::Value::try_from(&config_to_save)
             .context("Failed to serialize config to TOML value")?
             .try_into()
@@ -18322,6 +20263,12 @@ impl Config {
         write_config_atomically(&config_path, &toml_str).await
     }
 
+    /// Incremental save: only the paths in `self.dirty_paths` are written
+    /// against the existing on-disk file. Non-dirty entries (including
+    /// secret ciphertext) are left untouched; dirty paths whose value
+    /// equals the schema default are removed from the doc instead of
+    /// written. Falls back to a full `save()` when the file doesn't
+    /// exist yet. Clears the dirty set on success.
     pub async fn save_dirty(&mut self) -> Result<()> {
         if self.dirty_paths.is_empty() {
             return Ok(());
@@ -18378,6 +20325,14 @@ impl Config {
             apply_dirty_path(doc.as_table_mut(), path, &full_table, &default_table);
         }
 
+        // Stamp the current schema version. An incremental save writes
+        // current-schema-shaped sections (e.g. the dashboard saving a single
+        // `agents.<name>.model_provider`) but `schema_version` is never a
+        // dirty path, so without this it keeps whatever an older binary first
+        // wrote on disk. The resulting body-newer-than-label file then crashes
+        // older binaries with an opaque `missing field ...` serde error. See
+        // `insert` updates the existing key in place (preserving its
+        // position at the top of the file) or appends it when absent.
         doc.as_table_mut().insert(
             "schema_version",
             toml_edit::value(i64::from(crate::migration::CURRENT_SCHEMA_VERSION)),
@@ -18528,11 +20483,27 @@ fn apply_dirty_path(
         return;
     }
 
+    // Natural-key `Vec<T>` sections (`#[natural_key = "<f>"]`, currently
+    // `mcp.servers`) serialize as `[[mcp.servers]]` — an
+    // `Item::ArrayOfTables`, not a Table. The generic walker below
+    // assumes every intermediate node is a Table (`as_table()` /
+    // `as_table_mut()`), so without this branch a dirty path like
+    // `mcp.servers.fs.command` would resolve to `None` in `full_table`,
+    // get misclassified as `should_delete`, then bail at the
+    // `ArrayOfTables` segment in `delete_path_in_doc` too. Net effect:
+    // the per-field MCP editor's edits go nowhere on disk. See the
+    // regression test `save_dirty_persists_mcp_server_field_via_natural_key`.
     if let Some(section) = find_natural_key_section_for_path(dotted) {
         apply_dirty_natural_key_path(root, &section, dotted, full_table, default_table);
         return;
     }
 
+    // Resolve each segment against the in-memory table: struct fields
+    // serialize as snake_case (so `input-per-mtok` → `input_per_mtok`), but
+    // HashMap keys are preserved verbatim and may legitimately carry hyphens
+    // (`claude-opus-4-7`, `tts-1-hd`). Blind `s.replace('-', "_")` mangles
+    // those keys and lookup returns None, which apply_dirty_path treats as
+    // "delete this path" — silently dropping every cost.rates save.
     let segments: Vec<String> = resolve_dirty_segments(full_table, &raw);
     let segs: Vec<&str> = segments.iter().map(String::as_str).collect();
 
@@ -18563,6 +20534,36 @@ struct NaturalKeySection {
     natural_key_field: &'static str,
 }
 
+/// Return the longest natural-key `Kind::List` section whose path is a
+/// strict prefix of `dotted` (i.e. `dotted` starts with `<path>.`).
+/// Strict-prefix wins so a nested natural-key section would always
+/// outscore its parent; today there's only `mcp.servers`, so the lookup
+/// is effectively a single-entry match, but the longest-match rule
+/// keeps the writer correct when a future `#[natural_key]` Vec lands
+/// inside another section.
+///
+/// Returns the `<section_path>` (e.g. `"mcp.servers"`) and the
+/// `<natural_key_field>` (e.g. `"name"`) the writer needs to locate
+/// the matching `[[<section_path>]]` element on disk.
+///
+/// Section paths are exact-matched against the leading segments of
+/// `dotted`; the function does **not** apply the kebab→snake fallback
+/// that the inner segment resolver (`resolve_dirty_segments`) uses.
+/// That is deliberate and mirrors the in-memory routing macro's
+/// `section_path == expected` check in
+/// `crates/zeroclaw-macros/src/lib.rs` (the `get_map_keys` /
+/// `route_vec_path` arms) — making either side dash-tolerant in
+/// isolation would let the dispatcher and the writer disagree on
+/// which call participates in this branch, which is exactly the
+/// memory-vs-disk divergence this PR exists to eliminate. If a
+/// future natural-key section needs an underscore in its path AND
+/// must be addressable via a kebab wire path, change **both** sides
+/// together (the macro arm and this match).
+///
+/// Plain `Kind::List` Vec sections without `#[natural_key]` (their
+/// `natural_key` is `None`) are intentionally excluded — those use the
+/// legacy whole-array `ObjectArray` save path and don't need the
+/// array-of-tables walker.
 fn find_natural_key_section_for_path(dotted: &str) -> Option<NaturalKeySection> {
     use crate::traits::MapKeyKind;
 
@@ -18604,6 +20605,49 @@ fn find_natural_key_section_for_path(dotted: &str) -> Option<NaturalKeySection> 
     best
 }
 
+/// Apply a dirty path of the form
+/// `<section_path>.<alias>[.<inner_suffix>...]` against an
+/// `[[<section_path>]]` array of tables.
+///
+/// Three shapes show up in practice:
+///
+///   1. `<section>.<alias>.<inner>` — per-field edit (the dashboard /
+///      TUI editor). Locate the in-memory element whose natural-key
+///      field equals `<alias>` and reconcile its `<inner>` sub-path
+///      against the doc's matching `[[<section>]]` table.
+///
+///   2. `<section>.<alias>` with the element still in memory — the
+///      whole-element write the rename path emits for the *new* alias.
+///      Reseed the matching doc entry from the in-memory serialization
+///      so a rename `fs` → `filesystem` updates the entire
+///      `[[mcp.servers]]` table (in particular its `name` field).
+///
+///   3. `<section>.<alias>` with the element gone from memory — the
+///      delete path the rename emits for the *old* alias, and what
+///      `delete_map_key` plus an explicit `mark_dirty` would produce.
+///      Drop the matching doc entry.
+///
+/// All three are handled by walking the doc through the section's
+/// non-array parents, locating the `ArrayOfTables` at the section's
+/// last path segment, then either editing or removing the entry whose
+/// natural-key field matches `<alias>`. The `<inner>` recursion reuses
+/// the existing Table-shaped `set_path_in_doc` / `delete_path_in_doc`
+/// helpers against the located entry's table.
+///
+/// **Order-independence invariant.** `Config::dirty_paths` is a
+/// `HashSet<String>`, so the three shapes above can apply in any
+/// interleaving within a single `save_dirty` batch — in particular,
+/// a rename emits both the old and new aliases dirty without an
+/// ordering guarantee, and a create-then-edit sequence may walk the
+/// per-field path before the whole-element write. Convergence under
+/// every ordering is load-bearing here and works only because every
+/// branch derives its write from the current in-memory state and the
+/// case-1 delete fires only on mem-absence (not on default
+/// equivalence). Future edits — e.g. an early-exit that assumes
+/// whole-element writes run before per-field ones, or a "skip if
+/// already written" optimization keyed on the doc shape — would
+/// break this. Preserve commutativity across the three shapes for
+/// any single (section, alias) tuple.
 fn apply_dirty_natural_key_path(
     root: &mut toml_edit::Table,
     section: &NaturalKeySection,
@@ -18650,8 +20694,40 @@ fn apply_dirty_natural_key_path(
         return;
     };
 
+    // Inner-suffix path: per-field edit (case 1). Reconcile the inner
+    // sub-path on the matched doc table the same way the generic
+    // Table-shaped walker does — mem-vs-default comparison decides
+    // delete vs write — and bail out before touching the array spine
+    // if the entry doesn't exist in either memory or the doc.
     if let Some(inner) = inner_suffix {
+        // Look up the same inner sub-path on the default-shaped element.
+        // `Config::default()` always has an empty `mcp.servers` (and no
+        // default natural-key Vec entry is non-empty), so we synthesize
+        // the default by going through the inner type's own
+        // `Default` impl via the existing `default_table` plus an
+        // alias-keyed lookup. The Vec being empty in defaults means
+        // `default_array_entry` is always `None`, which mirrors the
+        // existing HashMap behaviour: `default_val` for an alias's
+        // child is None too, because the alias key doesn't exist in
+        // `Config::default()`. Keep the comparison shape identical so
+        // the delete-on-default rule degrades the same way the HashMap
+        // path already does (i.e. it doesn't catch "field is set to
+        // its serde default"; that limitation is shared and not a
+        // regression from this fix). The `_default_table` parameter
+        // is intentionally unused for this reason — kept on the
+        // signature so the call site in `save_dirty` stays uniform
+        // with `apply_dirty_path`, which does consume it.
+
         let inner_raw: Vec<&str> = inner.split('.').collect();
+        // Same dash-aware segment resolution the top-level Table-shaped
+        // walker uses (`apply_dirty_path` → `resolve_dirty_segments`), but
+        // rooted at the natural-key entry's own serialized table so kebab
+        // inner segments like `mcp.servers.fs.tool-timeout-secs` resolve
+        // to the snake `tool_timeout_secs` field on disk. Sharing the
+        // helper instead of forking is load-bearing: this PR exists
+        // because two parallel walks (in-memory vs on-disk) drifted apart;
+        // a forked copy here would recreate exactly that hazard, so any
+        // future fix to dash handling lands in both code paths at once.
         let inner_segments: Vec<String> = match mem_entry {
             Some(table) => resolve_dirty_segments(table, &inner_raw),
             None => inner_raw.iter().map(|s| (*s).to_string()).collect(),
@@ -18740,6 +20816,25 @@ fn apply_dirty_natural_key_path(
     }
 }
 
+/// Emit a single `WARN` event when a natural-key writer (ensure /
+/// find / delete) bails because the on-disk node has the wrong shape
+/// — for example an operator hand-edited `mcp.servers = "foo"`, or
+/// wrote `servers = [{ name = "fs", ... }]` (an inline array of
+/// tables, which `toml_edit` parses as `Item::Value(Value::Array)`
+/// rather than the `Item::ArrayOfTables` this writer produces).
+///
+/// Without this, `config/set` returns success, the in-memory mutation
+/// and the dashboard/TUI both reflect the new value, and the on-disk
+/// file silently stays stale — the exact symptom the underlying
+/// natural-key persistence bug fix exists to eliminate. The
+/// `WARN` shape mirrors the 0600-permissions fallback below: same
+/// `Action::Note` / `EventOutcome::Unknown` / module path, so log
+/// scrapers that already understand the schema warnings will surface
+/// these the same way.
+///
+/// `op` is `"ensure"`, `"find"`, or `"delete"` — which writer bailed.
+/// `kind` is `"parent_segment"` or `"array_key"` — which node was
+/// wrong-shaped. `which` is the specific seg/key name involved.
 fn warn_natural_key_doc_kind_mismatch(
     parent_segs: &[&str],
     array_key: &str,
@@ -18769,6 +20864,30 @@ fn warn_natural_key_doc_kind_mismatch(
     );
 }
 
+/// Locate or create the `[[<section_path>]]` entry whose natural-key
+/// field equals `alias`, returning a mutable reference to its inner
+/// `toml_edit::Table`.
+///
+/// Three shapes are reconciled here:
+///
+///   * Parent Tables along `parent_segs` are auto-created if missing
+///     (mirrors `set_path_in_doc`).
+///   * The `array_key` slot may not yet exist; insert an
+///     `ArrayOfTables` if so.
+///   * The array may not yet contain an entry whose natural-key field
+///     matches `alias`; push a new table with `<natural_key_field> =
+///     "<alias>"` seeded.
+///
+/// Returns `None` only when an existing doc node at `parent_segs` or
+/// `array_key` has the wrong kind (e.g. an operator hand-edited
+/// `mcp.servers = "foo"`, or wrote an inline `servers = [{ ... }]`
+/// array-of-tables that parses as `Item::Value(Value::Array)` rather
+/// than the `Item::ArrayOfTables` shape this writer expects); in that
+/// case we refuse to clobber the hand-edit and let the save bail
+/// rather than data-loss the user's file. A `WARN`-level event is
+/// emitted on every wrong-kind bail so the divergence between memory
+/// and disk is observable in logs — silent bails were what let the
+/// underlying natural-key bug ship.
 fn ensure_array_of_tables_entry<'a>(
     root: &'a mut toml_edit::Table,
     parent_segs: &[&str],
@@ -18831,6 +20950,13 @@ fn ensure_array_of_tables_entry<'a>(
     aot.get_mut(idx)
 }
 
+/// Read-only counterpart to [`ensure_array_of_tables_entry`] used by
+/// the delete path: never creates a missing array or entry, just
+/// locates one if present. Returning `None` on a miss lets the caller
+/// skip the doc-mutation step entirely. Distinguishes "node doesn't
+/// exist" (silent no-op — the legitimate fresh-alias case) from "node
+/// exists but has the wrong kind" (a `WARN`-logged bail — the
+/// hand-edited inline-array hazard).
 fn find_array_of_tables_entry_mut<'a>(
     root: &'a mut toml_edit::Table,
     parent_segs: &[&str],
@@ -18872,6 +20998,11 @@ fn find_array_of_tables_entry_mut<'a>(
     aot.get_mut(pos)
 }
 
+/// Remove the `[[<section_path>]]` entry whose natural-key field
+/// equals `alias`. No-op if the array or entry isn't present. When the
+/// removal empties the `ArrayOfTables`, drop the array slot too so the
+/// on-disk file doesn't carry a vestigial `[[mcp.servers]]`-shaped
+/// blank section header.
 fn delete_array_of_tables_entry(
     root: &mut toml_edit::Table,
     parent_segs: &[&str],
@@ -18927,6 +21058,12 @@ fn delete_array_of_tables_entry(
     }
 }
 
+/// Drop empty arrays / tables / strings from a value before writing it
+/// to the doc. HashMap entries serialize every default field (no
+/// `skip_serializing_if` on individual `Vec<String>` fields), so without
+/// this pass an `mcp_bundles.<alias>` write produces `servers = []`,
+/// `exclude = []`, etc. The pruned form round-trips identically because
+/// each dropped field's serde default IS the dropped value.
 fn prune_empty_leaves(value: &mut toml::Value) {
     match value {
         toml::Value::Table(t) => {
@@ -19091,6 +21228,11 @@ async fn sync_directory(path: &Path) -> Result<()> {
 
 // ── SOP engine configuration ───────────────────────────────────
 
+/// Standard Operating Procedures engine configuration (`[sop]`).
+///
+/// The `default_execution_mode` field uses the `SopExecutionMode` type from
+/// `sop::types` (re-exported via `sop::SopExecutionMode`). To avoid circular
+/// module references, config stores it using the same enum definition.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "sop"]
@@ -19124,6 +21266,12 @@ pub struct SopConfig {
     #[serde(default = "default_sop_max_finished_runs")]
     pub max_finished_runs: usize,
 
+    /// How often (seconds) the daemon runs the SOP maintenance tick: fire
+    /// fail-closed approval timeouts (per `approval_timeout_secs` /
+    /// `approval_timeout_action`), reap expired concurrency-claim leases, and
+    /// prune terminal runs past `max_finished_runs`. Default `60`; set to `0` to
+    /// disable the tick entirely. The tick itself self-approves nothing - timeout
+    /// handling is governed by `approval_timeout_action` (default `escalate`).
     #[serde(default = "default_sop_maintenance_interval_secs")]
     pub maintenance_interval_secs: u64,
 
@@ -19356,6 +21504,16 @@ impl HasPropKind for crate::autonomy::DelegationPolicy {
 }
 
 impl HasPropKind for serde_json::Value {
+    // `serde_json::Value` is an arbitrary JSON document, not an enum.
+    // Classifying it as `Enum` previously made `enum_variants_for::<Value>()`
+    // hand back the literal placeholder `"(unknown variants)"`, and the
+    // dashboard form rendered fields like `model_providers.<key>.provider_extra`
+    // as a single-option dropdown. `String` is the closest scalar kind —
+    // the form renders a text input where the user pastes raw JSON.
+    // Round-trip via `set_prop` stays correct: serde deserializes the TOML
+    // string back into `Value::String(...)`. Power users editing complex
+    // objects still use `zeroclaw config set --json` or hand-edit the
+    // `config.toml`.
     const PROP_KIND: PropKind = PropKind::String;
 }
 
@@ -19404,7 +21562,7 @@ max_height = 8
 
     #[::core::prelude::v1::test]
     fn tool_filter_group_legacy_filter_builtins_key_still_parses() {
-        // `filter_builtins` was declared-but-never-read and is removed.
+        // `filter_builtins` was declared-but-never-read and is removed
         // `ToolFilterGroup` has no `deny_unknown_fields`, so configs
         // still carrying the key must keep deserializing (silently ignored).
         let group: super::ToolFilterGroup = toml::from_str(
@@ -20071,6 +22229,12 @@ untrusted_outbound_redact = false
         );
     }
 
+    /// Regression test for the operator-UX warning:
+    /// when MCP is enabled and `[[mcp.servers]]` is non-empty but no
+    /// `[mcp_bundles.*]` exists, validate() must still succeed (warnings
+    /// are non-fatal) AND every agent must resolve to zero servers
+    /// (proving the secure-by-default semantics that motivate the warning
+    /// are still in force).
     #[test]
     async fn validate_warns_when_servers_configured_but_no_bundles() {
         use crate::schema::{McpServerConfig, McpTransport};
@@ -20100,6 +22264,10 @@ untrusted_outbound_redact = false
         }
     }
 
+    /// Counterpart to `validate_warns_when_servers_configured_but_no_bundles`:
+    /// once at least one `[mcp_bundles.*]` exists, the warning's
+    /// precondition no longer holds. validate() still succeeds and the
+    /// granted agent resolves to its bundled server.
     #[test]
     async fn validate_does_not_warn_when_a_bundle_exists() {
         use crate::schema::{McpBundleConfig, McpServerConfig, McpTransport};
@@ -20144,6 +22312,12 @@ untrusted_outbound_redact = false
             merged.push(']');
         }
         merged.push('\n');
+        // Schema-deserialization helper: parses TOML directly into Config
+        // WITHOUT running migration transforms. Tests that need migration
+        // behavior should use `migrate_to_current` directly. This helper
+        // exists so V2-shaped inputs (e.g. flat `[autonomy]` blocks) can
+        // be exercised against the typed deserializer without losing
+        // sections that V2→V3 strips.
         let mut config: Config = toml::from_str(&merged).unwrap();
         config
             .risk_profiles
@@ -21189,6 +23363,11 @@ auto_save = true
 
     #[test]
     async fn ollama_alias_tuning_fields_roundtrip() {
+        // Ollama-specific tuning lives on `OllamaModelProviderConfig`,
+        // not on the generic `ModelProviderConfig` base. These knobs
+        // ride alongside the flattened `base` so a TOML alias like
+        // `[providers.models.ollama.local]` accepts them at the same
+        // level as `model`, `api_key`, etc.
         let toml = r#"
             num_ctx = 16384
             num_predict = 4096
@@ -21629,6 +23808,8 @@ default_temperature = 0.7
         );
     }
 
+    /// `[autonomy]` migrates onto `[risk_profiles.default]` via the V2→V3
+    /// migration. The fields must round-trip without being silently dropped.
     #[test]
     async fn v2_autonomy_section_migrates_onto_risk_profiles_default() {
         let raw = r#"
@@ -21654,6 +23835,8 @@ auto_approve = ["file_read", "memory_recall", "http_request"]
         assert_eq!(runtime.max_actions_per_hour, 99);
     }
 
+    /// Regression test: when a user provides a custom auto_approve
+    /// list, the built-in defaults must still be present.
     #[test]
     async fn auto_approve_merges_user_entries_with_defaults() {
         let raw = r#"
@@ -21686,6 +23869,7 @@ auto_approve = ["my_custom_tool", "another_tool"]
         assert!(defaults.contains(&"tool_search".to_string()));
     }
 
+    /// Regression test: empty auto_approve still gets defaults merged.
     #[test]
     async fn auto_approve_empty_list_gets_defaults() {
         let raw = r#"
@@ -21704,6 +23888,8 @@ auto_approve = []
         }
     }
 
+    /// When no risk_profiles section is provided, defaults are applied to the
+    /// synthesized "default" profile.
     #[test]
     async fn auto_approve_defaults_when_no_risk_profile_section() {
         let raw = r#"
@@ -21719,6 +23905,8 @@ default_temperature = 0.7
         }
     }
 
+    /// Duplicates are not introduced when ensure_default_auto_approve runs
+    /// on a list that already contains the defaults.
     #[test]
     async fn auto_approve_no_duplicates() {
         let raw = r#"
@@ -22780,6 +24968,12 @@ default_temperature = 0.7
 
     // ── iMessage / Matrix config ────────────────────────────
 
+    // iMessage `allowed_contacts` was lifted out of `IMessageConfig` in V3;
+    // inbound peer authorization lives in `Config::peer_groups`. The
+    // round-trip of contact-list values from a V2 TOML is exercised by
+    // `imessage_v2_allowed_contacts_fold_into_peer_groups` below; per-field
+    // struct serde for `allowed_contacts` no longer applies.
+
     #[test]
     async fn imessage_v2_allowed_contacts_fold_into_peer_groups() {
         // V2 TOML with `allowed_contacts` on the channel must be folded
@@ -23052,6 +25246,13 @@ allowed_users = ["@u:matrix.org"]
         assert!(c.imessage.is_empty());
         assert!(c.matrix.is_empty());
     }
+
+    // ── Edge cases: serde(default) for non-secret optional fields ─────
+    // The legacy `allowed_users` field is no longer carried on channel
+    // configs (V3 moved inbound peer authorization into
+    // `Config::peer_groups`); V2 TOMLs with `allowed_users` are folded
+    // by `migrate_to_current` into `[peer_groups.<type>_<alias>]`. See
+    // `discord_v2_allowed_users_fold_into_peer_groups` below.
 
     #[test]
     async fn discord_v2_allowed_users_fold_into_peer_groups() {
@@ -23920,7 +26121,7 @@ default_temperature = 0.7
 
     #[test]
     async fn slack_config_deserializes_without_bot_token() {
-        // / before `bot_token` became
+        // Regression: before `bot_token` became
         // `Option<String>` + `#[serde(default)]`, a config that omitted it
         // failed to deserialize with `missing field 'bot_token'`, aborting
         // startup before the env-var fallback could ever run.
@@ -24005,6 +26206,14 @@ default_temperature = 0.7
 
     #[test]
     async fn v1_known_provider_migrates_with_globals_folded_onto_typed_slot() {
+        // Top-level `model_provider` + `model` + `default_temperature` flow
+        // onto the migrated typed-slot entry. Vendor-canonical names like
+        // `openai` map straight to their typed slot; `wire_api` and
+        // `requires_openai_auth` survive the move.
+        //
+        // (Unknown V1 names like `sub2api` are intentionally silent-dropped
+        // by the V2→V3 migration — see the `Unknown/passthrough` arm of
+        // `normalize_provider_type` in schema/v2.rs.)
         let raw = r#"
 default_temperature = 0.7
 model_provider = "openai"
@@ -24088,6 +26297,9 @@ requires_openai_auth = true
         assert!(entry.requires_openai_auth);
     }
 
+    /// Round-trip test for the config CLI: a TOML file with a typed-family
+    /// model entry must deserialize, find via the typed accessor, and
+    /// re-serialize without losing any field.
     #[test]
     async fn provider_models_round_trips_through_load_apply_serialize() {
         let _env_guard = env_override_lock().await;
@@ -24118,6 +26330,10 @@ model = "primary-model"
         );
     }
 
+    /// `resolve_default_model` returns the first available `models.*` entry's
+    /// model. Returning `None` is reserved for "no model_provider has any model
+    /// configured", which callers must surface as a configuration error
+    /// rather than silently substituting a vendor default.
     #[test]
     async fn resolve_default_model_picks_first_available() {
         let _env_guard = env_override_lock().await;
@@ -24534,6 +26750,11 @@ wire_api = "ws"
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
+        // V3 fresh init: `config.data_dir` lives at `<install>/data/`
+        // (the shared databases root); the install root holds
+        // `config.toml`. No synthesized `agents/default/workspace/` is
+        // created at boot — `default` is migration-only, and per-agent
+        // workspaces are created lazily at agent-loop entry.
         assert_eq!(config.data_dir, workspace_dir.join("data"));
         assert_eq!(config.config_path, workspace_dir.join("config.toml"));
         assert!(workspace_dir.join("config.toml").exists());
@@ -24737,6 +26958,11 @@ default_model = "persisted-profile"
 
         let logs = drain_captured(&mut rx);
 
+        // V3: shared databases live at `<install>/data/`, per-agent
+        // identity at `<install>/agents/<alias>/workspace/`. The
+        // ZEROCLAW_WORKSPACE env var (deprecated alias for
+        // ZEROCLAW_DATA_DIR) pinned the install root, so data_dir is
+        // `<install>/data/` derived from the resolved root.
         assert_eq!(config.data_dir, workspace_dir.join("data"));
         assert_eq!(config.config_path, config_path);
         assert_eq!(
@@ -24815,6 +27041,12 @@ audit = "should-be-a-table-not-a-string"
 
     #[test]
     async fn salvage_reports_dropped_plugins_section_for_malformed_entries() {
+        // `[plugins.entries]` written as a table instead of an array of
+        // tables (`[[plugins.entries]]`) drops the whole [plugins] section
+        // to defaults on the resilient path. That drop must land on
+        // `ResilientLoad::dropped`; load_or_init copies it onto
+        // `degraded_sections` so the CLI surfaces it on stderr instead of
+        // the operator discovering `enabled = false` by accident.
         let raw = r#"schema_version = 3
 
 [plugins]
@@ -25143,6 +27375,13 @@ runtime_profile = "default"
 
     #[test]
     async fn jira_email_empty_string_deserializes_as_none() {
+        // Legacy configs round-tripped `email = ""` to disk because the
+        // pre-rename `email: String` lacked `skip_serializing_if`. The
+        // current `Option<String>` would otherwise deserialize `""` as
+        // `Some("")`, and JiraTool would attempt Basic auth with empty
+        // username (the dropped email-required validation no longer
+        // catches this). Defense-in-depth: empty strings deserialize as
+        // None.
         let toml_input = r#"
 enabled = true
 base_url = "https://jira.example.test"
@@ -25539,6 +27778,11 @@ allowed_users = ["user_alpha", "user_beta"]
 
     #[test]
     async fn line_config_toml_roundtrip() {
+        // Full [channels.line] TOML block — covers every user-facing field.
+        //
+        // channel_access_token and channel_secret can be omitted here and
+        // supplied via LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET env vars
+        // instead; both fields default to "" when absent.
         let toml = r#"
 [channels_config.line.default]
 enabled = true
@@ -25706,7 +27950,7 @@ group_policy = "disabled"
         };
         config.save().await.unwrap();
 
-        // Simulate the regression state observed in
+        // Simulate the historical corrupted-state regression.
         std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let loose_mode = std::fs::metadata(&config_path)
             .unwrap()
@@ -25736,6 +27980,11 @@ group_policy = "disabled"
 
     #[test]
     async fn save_dirty_stamps_current_schema_version_on_stale_label() {
+        // Regression: an incremental save writes current-schema-shaped
+        // sections, but `schema_version` is never a dirty path. Without an
+        // explicit stamp, a file first written by an older binary keeps its
+        // stale `schema_version` label while gaining a current-schema body — a
+        // state that crashes older binaries with `missing field ...`.
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
 
@@ -25778,6 +28027,15 @@ group_policy = "disabled"
         );
     }
 
+    /// Regression for the per-field `[[mcp.servers]]` editor: after
+    /// `d06ed25` shipped the natural-key arm, in-memory edits succeed
+    /// (the TUI / dashboard show the new value) but `save_dirty` is
+    /// silently a no-op because `apply_dirty_path` walks the serialized
+    /// TOML as if every segment is a `Table` — `mcp.servers` is an
+    /// array of tables, so `lookup_path_in_table` returns `None` at the
+    /// natural-key segment, the path is misclassified as
+    /// `should_delete`, and `delete_path_in_doc` bails when it hits the
+    /// array too. Net effect: the on-disk file keeps its stale value.
     #[test]
     async fn save_dirty_persists_mcp_server_field_via_natural_key() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -25797,6 +28055,12 @@ group_policy = "disabled"
         );
         std::fs::write(&config_path, &seed).unwrap();
 
+        // Build the in-memory config to match the seeded file. We
+        // don't need to round-trip through deserialization — the bug
+        // is purely on the save side, and the on-disk seed gives
+        // `save_dirty` an existing file to do an incremental write
+        // into (the new-file fallback to full `save` would mask the
+        // dirty-path bug because it serializes the whole struct).
         let mut config = Config {
             config_path: config_path.clone(),
             ..Default::default()
@@ -25838,11 +28102,21 @@ group_policy = "disabled"
         );
     }
 
+    /// `create_map_key("mcp.servers", "new")` followed by per-field
+    /// edits must produce a complete `[[mcp.servers]]` table on disk —
+    /// including the seeded natural-key field. This is the path the
+    /// dashboard's `+ Add MCP server` affordance walks: insert, then
+    /// edit `command` / `transport` etc.
     #[test]
     async fn save_dirty_writes_new_mcp_server_added_via_create_map_key() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
 
+        // Seed an unrelated existing entry so we exercise the
+        // append-into-existing-array path (not the create-array-from-
+        // scratch path). Both matter; the empty-doc case is covered by
+        // `save` instead of `save_dirty` (see the `!config_path.exists()`
+        // branch at the top of `save_dirty`).
         let seed = format!(
             "schema_version = {}\n\n\
              [[mcp.servers]]\n\
@@ -25917,6 +28191,11 @@ group_policy = "disabled"
         assert_eq!(gh.url.as_deref(), Some("https://mcp.example/"));
     }
 
+    /// `rename_map_key("mcp.servers", "fs", "filesystem")` rewrites the
+    /// in-memory entry's `name` field in place and marks BOTH aliases
+    /// dirty. The incremental writer must update the matching
+    /// `[[mcp.servers]]` entry's `name` to the new value without
+    /// leaving a stale duplicate behind.
     #[test]
     async fn save_dirty_persists_mcp_server_rename_via_natural_key() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -25975,6 +28254,11 @@ group_policy = "disabled"
         assert_eq!(reparsed.mcp.servers[0].command, "/usr/bin/mcp-fs");
     }
 
+    /// `delete_map_key("mcp.servers", "fs")` removes the in-memory
+    /// entry and marks the alias dirty. The incremental writer must
+    /// drop the corresponding `[[mcp.servers]]` entry from disk,
+    /// dropping the array slot entirely when no entries remain so the
+    /// file doesn't carry a dangling `[[mcp.servers]]` section header.
     #[test]
     async fn save_dirty_removes_mcp_server_deleted_via_natural_key() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -26036,6 +28320,11 @@ group_policy = "disabled"
         assert_eq!(reparsed.mcp.servers[0].name, "github");
     }
 
+    /// Deleting the last `[[mcp.servers]]` entry drops the array slot
+    /// entirely. A vestigial empty `[[mcp.servers]]` header would
+    /// reparse as a single default-shaped element with an empty
+    /// natural-key field, which the validator then rejects on next
+    /// load — actively breaking the file the writer just produced.
     #[test]
     async fn save_dirty_drops_array_header_when_last_mcp_server_removed() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -26075,6 +28364,13 @@ group_policy = "disabled"
         assert!(reparsed.mcp.servers.is_empty());
     }
 
+    /// `Config::map_key_sections()` must surface the natural-key field
+    /// for `mcp.servers`. This is the metadata `apply_dirty_path` reads
+    /// to decide whether to take the array-of-tables branch; if the
+    /// derive ever stops emitting it for `#[natural_key = "..."]` Vec
+    /// fields, the dirty-path writer falls back to the broken
+    /// Table-only walker and silently drops MCP edits on the floor
+    /// again. Lock the contract here.
     #[test]
     async fn map_key_sections_exposes_natural_key_for_mcp_servers() {
         let sections = Config::map_key_sections();
@@ -26105,6 +28401,10 @@ group_policy = "disabled"
         assert_eq!(anthropic.natural_key, None);
     }
 
+    /// `model_routes` and `embedding_routes` are `#[nested]` Vec fields
+    /// with `#[natural_key = "hint"]` — they must surface in
+    /// `map_key_sections()` as `List` entries so the dashboard and the
+    /// incremental TOML writer can address individual route entries.
     #[tokio::test]
     async fn map_key_sections_exposes_natural_key_for_model_routes() {
         let sections = Config::map_key_sections();
@@ -26139,6 +28439,16 @@ group_policy = "disabled"
         );
     }
 
+    /// A dirty path with a kebab-shaped inner field (e.g.
+    /// `mcp.servers.fs.tool-timeout-secs`) must resolve through the
+    /// shared `resolve_dirty_segments` helper inside the natural-key
+    /// branch the same way the top-level Table walker does — landing
+    /// on the snake `tool_timeout_secs` field on disk. This pins the
+    /// dash-aware resolution that's load-bearing for any future
+    /// natural-key struct field whose snake_case name is multi-word.
+    /// Without this, a UI client that emits kebab field names would
+    /// recreate the exact symptom the PR fixes (memory updates, disk
+    /// stays stale) for any such field.
     #[test]
     async fn save_dirty_persists_mcp_server_kebab_inner_field_via_natural_key() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -26166,6 +28476,14 @@ group_policy = "disabled"
             ..Default::default()
         });
 
+        // mark_dirty directly with a kebab leaf segment so the
+        // dash-aware resolver inside `resolve_dirty_segments` is the
+        // only thing that can possibly land this on disk. set_prop /
+        // set_prop_persistent route through the macro which has its
+        // own snake-only field-name lookup; this test isolates the
+        // writer-side resolution. The in-memory mutation above
+        // simulates the dispatcher having already routed the
+        // set_prop side; what we're testing here is the save side.
         config.mark_dirty("mcp.servers.fs.tool-timeout-secs");
         config.save_dirty().await.unwrap();
 
@@ -26187,6 +28505,18 @@ group_policy = "disabled"
         assert_eq!(reparsed.mcp.servers[0].tool_timeout_secs, Some(45));
     }
 
+    /// An explicit per-field unset (the in-memory field reverts to
+    /// `None`, but the dirty path still names that specific inner
+    /// field rather than the whole element) must drive the case-1
+    /// `mem missing → delete` branch — removing the field from the
+    /// `[[mcp.servers]]` entry on disk without touching its siblings.
+    /// The pre-existing whole-element delete test covers a different
+    /// path (the rename source / `delete_map_key`); this one pins
+    /// the per-field delete branch independently. Without it, a
+    /// future refactor that collapses case-1's `None` branch into
+    /// the whole-element path would silently break "clear this field"
+    /// edits — the field would survive on disk while showing as
+    /// unset in the UI.
     #[test]
     async fn save_dirty_unset_per_field_drops_field_from_mcp_server_entry() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -26218,6 +28548,11 @@ group_policy = "disabled"
             tool_timeout_secs: None,
             ..Default::default()
         });
+        // Per-field dirty path — exactly what a UI "clear this
+        // field" affordance emits. The whole-element bare alias
+        // `mcp.servers.fs` is intentionally NOT marked: the bare
+        // alias is the rename/delete shape; the bug-prone case is
+        // the per-field one.
         config.mark_dirty("mcp.servers.fs.tool_timeout_secs");
         config.save_dirty().await.unwrap();
 
@@ -26226,6 +28561,9 @@ group_policy = "disabled"
             !written.contains("tool_timeout_secs"),
             "explicit per-field unset must drop the field from disk; got:\n{written}"
         );
+        // Siblings survive: the entry isn't deleted, just the one
+        // field, and the natural-key field itself must stay so
+        // subsequent loads still know which alias this entry is.
         assert!(
             written.contains("name = \"fs\""),
             "natural-key field must survive a per-field unset; got:\n{written}"
@@ -26241,11 +28579,31 @@ group_policy = "disabled"
         assert_eq!(reparsed.mcp.servers[0].tool_timeout_secs, None);
     }
 
+    /// When the on-disk node at `mcp.servers` exists but has the
+    /// wrong kind — e.g. a hand-edited `mcp.servers = "foo"`, or an
+    /// inline-array-of-tables literal `servers = [{ ... }]` that
+    /// `toml_edit` parses as `Item::Value(Value::Array)` rather than
+    /// `Item::ArrayOfTables` — the writer must refuse to clobber
+    /// rather than data-loss the user's hand-edit. The bail is
+    /// observable (a `WARN`-level log event), but here we just pin
+    /// the don't-clobber behavior at the disk level: the original
+    /// shape survives the save unchanged. This is the explicit
+    /// contract test for the wrong-kind bail surface; without it,
+    /// a refactor that "fixes" the bail by overwriting silently
+    /// would corrupt every operator who has either of these
+    /// (otherwise valid) TOML shapes in their config.
     #[test]
     async fn save_dirty_refuses_to_clobber_wrong_kind_mcp_servers_node() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
 
+        // Hand-edited file: operator wrote `mcp.servers` as a scalar.
+        // This is invalid against the schema but is what
+        // `Item::Value(Value::String)` looks like in toml_edit, and
+        // it's representative of the wrong-kind case (the same bail
+        // path also fires for `Item::Value(Value::Array)` inline
+        // arrays). Schema validation would reject this on load; the
+        // test forces the writer to face the shape regardless.
         let seed = format!(
             "schema_version = {}\n\n\
              [mcp]\n\
@@ -26544,6 +28902,11 @@ high_entropy_tokens = false
 
     #[test]
     async fn security_validation_accepts_unknown_gated_action_but_does_not_bail() {
+        // An unknown but well-formed action name is a silent no-op today
+        // (OTP enforcement of gated_actions is not wired through). Config load
+        // must not fail on it — the operator's whole config would be rejected
+        // for a typo'd gate — but the runtime emits a WARN so the no-op is not
+        // silent. This asserts the warn-and-continue contract: load succeeds.
         let mut config = Config::default();
         config.security.otp.gated_actions = vec!["kubectl_write".into()];
 
@@ -26565,6 +28928,13 @@ high_entropy_tokens = false
             .expect_err("malformed gated action must still be rejected");
         assert!(err.to_string().contains("gated_actions"));
     }
+
+    // The two `validate_*_transcription_default_provider` tests were removed
+    // alongside the deleted `TranscriptionConfig.default_transcription_provider`
+    // field was removed; there is no global default-provider concept; the equivalent
+    // dangling-reference enforcement now lives on the per-agent
+    // `agent.transcription_provider` field (see
+    // `Config::validate()` checks for `tts_provider` / `transcription_provider`).
 
     #[tokio::test]
     async fn channel_secret_telegram_bot_token_roundtrip() {
@@ -28240,6 +30610,13 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
     #[test]
     async fn prop_is_secret_routes_through_hashmap_keyed_paths() {
+        // Regression: the macro's HashMap<String, T> arm previously passed the
+        // full materialised path (e.g. `model_providers.openrouter.api-key`)
+        // straight to the inner type's `prop_is_secret`, which then matched on
+        // its own configurable_prefix and returned false. Result: the CLI's
+        // `config set --json` and the gateway's PropResponse both took the
+        // non-secret branch and emitted `{value}` instead of `{populated}` for
+        // any secret on a map-keyed nested type.
         assert!(Config::prop_is_secret(
             "providers.models.openrouter.default.api_key"
         ));
@@ -28360,6 +30737,22 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
     #[test]
     async fn env_override_save_cycle_preserves_on_disk_secret() {
+        // Regression bar for the data-loss bug identified in PR
+        // review: an operator with a real on-disk credential who sets a
+        // `ZEROCLAW_*` env override for the same path and triggers any
+        // save (dashboard auto-save, CLI `config set` for an unrelated
+        // field, Quickstart finalizer) must NOT corrupt the disk file.
+        //
+        // Pre-fix behavior: `mask_env_overrides_for_save` read disk via
+        // `get_prop`, which returns `"**** (encrypted)"` for secret-typed
+        // fields regardless of underlying state. That mask string then got
+        // re-encrypted as plaintext and written to disk, destroying the
+        // operator's real credential on the next reload.
+        //
+        // Post-fix: `apply_env_overrides` snapshots the post-decrypt
+        // plaintext at apply time; `mask_env_overrides_for_save` restores
+        // from that snapshot before `encrypt_secrets()` runs. The disk
+        // secret survives the cycle.
         let dir = TempDir::new().unwrap();
         let mut config = Config {
             config_path: dir.path().join("config.toml"),
@@ -28398,6 +30791,11 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             "baseline: original secret round-trips through one save/reload cycle",
         );
 
+        // Simulate `apply_env_overrides` having injected a different value
+        // for the same path — this is the state `Config::load_or_init`
+        // leaves the in-memory config in when an operator boots with
+        // `ZEROCLAW_providers__models__anthropic__default__api_key=...`
+        // set in the environment.
         let env_value = "sk-ant-from-env-DIFFERENT";
         reloaded.env_overridden_paths = std::collections::HashSet::from([api_key_path.to_string()]);
         reloaded.pre_override_snapshots = std::collections::HashMap::from([(
@@ -28674,6 +31072,12 @@ api_key = "op://zeroclaw/provider/openai-api-key"
             "agents map should be discoverable"
         );
 
+        // mcp.servers is a Vec<McpServerConfig> with #[nested] — should
+        // surface as a List-kind section so the dashboard's "+ Add MCP
+        // server" affordance picks it up. Without this, dashboard users
+        // hit a silent dead-end and have to hand-edit config.toml. Pinned
+        // here so a regression that drops the #[nested] annotation or the
+        // Configurable derive on McpServerConfig fails CI.
         let mcp_servers = sections
             .iter()
             .find(|s| s.path == "mcp.servers")
@@ -28703,6 +31107,11 @@ api_key = "op://zeroclaw/provider/openai-api-key"
 
     #[test]
     async fn create_map_key_seeds_plugin_entry_and_routes_config_set() {
+        // The `zeroclaw plugin install` seeding path: a fresh
+        // `[[plugins.entries]]` entry named after the plugin must make
+        // `config set plugins.entries.<name>.config.<key>` routable;
+        // natural-key path routing only matches keys already present in
+        // live config.
         let mut config = Config::default();
         let created = config
             .create_map_key("plugins.entries", "weather-tool")
@@ -28897,6 +31306,12 @@ model = "gpt-4o"
             nested: nested.to_string(),
         };
 
+        // serde accepts `[providers.models.zai.default.default]` by treating
+        // the first `default` as the provider alias and erasing the second
+        // child table. The typed Config therefore looks like an empty
+        // `zai.default` provider and `validate()` accepts it as an
+        // in-progress quickstart entry. The raw-TOML detector must preserve
+        // that diagnostic signal before deserialization erases the shape.
         let raw = r#"
 schema_version = 3
 
@@ -29026,6 +31441,11 @@ model = "gpt-4o"
 
     #[test]
     async fn map_key_create_survives_incremental_save() {
+        // Repro for the zerocode "providers vanish after restart" report:
+        // the RPC config/map-key-create path is create_map_key + mark_dirty
+        // + save_dirty. The new alias must reach config.toml, otherwise it
+        // exists only in-memory and a daemon restart silently drops it
+        // (and any agents.*.model_provider referencing it dangles).
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
 
@@ -29119,6 +31539,11 @@ allowed_users = []
 
     #[test]
     async fn init_defaults_then_set_prop_round_trips_vec_string() {
+        // Regression: Channels picker → form → save:
+        // 1. create_map_key inserts channels.matrix["default"] = MatrixConfig::default()
+        // 2. set_prop on channels.matrix.default.allowed_rooms must accept a JSON-array
+        //    string (the shape coerce_for_set_prop emits for Vec<String>).
+        // 3. get_prop reads it back.
         let mut config = Config::default();
         config
             .create_map_key("channels.matrix", "default")
@@ -29150,6 +31575,17 @@ allowed_users = []
 
     #[test]
     async fn mcp_servers_addable_via_create_map_key_and_per_entry_props() {
+        // `mcp.servers` is a `Vec<McpServerConfig>` with `#[nested]`, so the
+        // `Configurable` derive surfaces it as a List section (not an
+        // ObjectArray prop) — operators add servers via
+        // `POST /api/config/map-key?path=mcp.servers&key=<name>` and edit
+        // each server's fields via per-prop GET/PUT.
+        //
+        // This replaces the prior model where the entire Vec round-tripped
+        // through set_prop("mcp.servers", "<json-array>"). The List model
+        // matches the rest of the schema (`providers.models`, `agents`,
+        // etc.) and gives the dashboard a per-field editor instead of a
+        // monolithic JSON blob.
         let mut config = Config::default();
 
         // The List section is discoverable.
@@ -29193,6 +31629,11 @@ allowed_users = []
             crate::schema::McpTransport::Http
         );
 
+        // The natural-key field itself is read-only via set_prop — the
+        // routing arm returns an explicit error pointing at
+        // config_map_key_rename rather than mutating `name` in place
+        // (which would silently re-key the entry and strand any
+        // in-flight references to the old key).
         let err = config
             .set_prop("mcp.servers.fs.name", "filesystem")
             .expect_err("set_prop on the natural-key field must refuse");
@@ -29251,6 +31692,19 @@ allowed_users = []
 
     #[test]
     async fn mcp_servers_create_map_key_is_idempotent_on_existing_natural_key() {
+        // Regression for the per-field editor contract: the rest of the
+        // natural-key surface (`get_prop` / `set_prop` / `rename_map_key`)
+        // treats duplicate natural keys as `VecRoute::Ambiguous` and
+        // refuses to mutate (see `mcp_servers_routing_is_ambiguous_on_
+        // duplicate_names`). If `create_map_key` always appended, a UI
+        // retry — or any caller that re-issued the same add after an
+        // uncertain RPC response — would drop `mcp.servers` into that
+        // invalid state and leave `mcp.servers.<name>.command` no longer
+        // routing until the operator hand-repaired the duplicate.
+        //
+        // The contract is the same as the `HashMap<String, T>` arm:
+        // re-adding an existing key is `Ok(false)` (idempotent no-op),
+        // not "append a second element that happens to share the key".
         let mut config = Config::default();
 
         let first = config
@@ -29309,6 +31763,12 @@ allowed_users = []
 
     #[test]
     async fn mcp_servers_routing_is_ambiguous_on_duplicate_names() {
+        // `validate_mcp_config` rejects duplicate `name` at save time,
+        // but until the operator repairs the config the in-flight
+        // routing must refuse to silently mutate one of the duplicates.
+        // This is the schema-side anchor for that contract; the helper
+        // function's behaviour is unit-tested directly in
+        // `helpers::tests::route_vec_path_reports_ambiguous_duplicates`.
         let mut config = Config::default();
         config.mcp.servers.push(McpServerConfig {
             name: "dupe".into(),
@@ -29490,6 +31950,8 @@ allowed_users = []
         assert_eq!(config.gateway.paired_tokens, vec!["token-a", "token-b"]);
     }
 
+    /// Walk every property on a default Config: get_prop must succeed,
+    /// and set_prop must round-trip for non-secret, non-enum scalar fields.
     #[test]
     async fn every_prop_is_gettable_and_settable() {
         let mut config = Config::default();
@@ -29541,6 +32003,17 @@ allowed_users = []
         }
     }
 
+    /// Audit gate: every path emitted by `prop_fields()` must round-trip
+    /// through `get_prop`. The CLI (`zeroclaw config get/set`), the TUI
+    /// Quickstart prompts (`prompt_field`), the gateway list endpoint
+    /// (`/api/config/list`), and the dashboard form all derive from
+    /// `prop_fields()`; if a path appears here but `get_prop` rejects
+    /// it, that field is unreachable on every surface.
+    ///
+    /// `init_defaults(None)` populates Option-shaped subsections (memory
+    /// backend specifics, tunnel provider details, etc.) so the walk
+    /// also exercises fields that only materialize once a backend is
+    /// chosen.
     #[test]
     async fn every_prop_field_path_is_reachable_via_get_prop() {
         let mut config = Config::default();
@@ -29559,6 +32032,10 @@ allowed_users = []
         }
     }
 
+    /// The dashboard's `/config/channels` global-settings tab filters the
+    /// canonical `prop_fields()` list down to direct `[channels]` fields.
+    /// Keep root settings such as `show_tool_calls` discoverable there without
+    /// mixing per-alias fields into the same editor.
     #[test]
     async fn channels_root_settings_stay_on_direct_prop_surface() {
         let mut config = Config::default();
@@ -29602,6 +32079,10 @@ allowed_users = []
         );
     }
 
+    /// Audit gate: any credential-shaped property path
+    /// that reaches the CLI/gateway/TUI property surface must have an explicit
+    /// classification. This catches future config additions whose names imply
+    /// credential handling before they silently land without a security call.
     #[test]
     async fn credential_shaped_prop_fields_have_explicit_classification() {
         let mut config = Config::default();
@@ -29862,6 +32343,10 @@ allowed_users = []
         );
     }
 
+    /// `onboard_state.quickstart_completed` is the flag the Quickstart
+    /// flips when it lands a `BuilderSubmission`. Defaults to `false`
+    /// so first launches auto-open the Quickstart; round-trips through
+    /// `set_prop` / `get_prop` like any other top-level config field.
     #[test]
     async fn onboard_state_quickstart_completed_round_trips() {
         let mut config = Config::default();
@@ -29922,6 +32407,12 @@ allowed_users = []
         );
     }
 
+    /// Audit gate: every non-secret scalar prop round-trips through
+    /// `set_prop(get_prop(p))`. The CLI's `zeroclaw config set` and the
+    /// dashboard's PATCH op both rely on this being true so an operator
+    /// can read a value, edit it locally, and write it back. Vec /
+    /// object-array fields are skipped — they pass through serde-JSON
+    /// rather than scalar string parsing.
     #[test]
     async fn every_scalar_prop_round_trips_through_set_prop() {
         let mut config = Config::default();
@@ -29955,6 +32446,8 @@ allowed_users = []
         }
     }
 
+    /// Every enum field must have a working enum_variants callback, and
+    /// set_prop must accept each variant it advertises.
     #[test]
     async fn every_enum_variant_is_settable() {
         let mut config = Config::default();
@@ -31390,6 +33883,24 @@ model_provider = \"ollama.default\"
             "only input-only transports may be non-deliverable; update channel_presence and is_channel_deliverable together"
         );
     }
+
+    // ── Serde-default vs struct-Default drift guards ──────────────
+    //
+    // The save path prunes fields whose value equals serde's default.
+    // If `#[serde(default)]` and `impl Default` disagree, a save →
+    // load round-trip silently flips the field to the serde default,
+    // These tests catch that drift: an empty TOML
+    // table (the extreme case of pruning — all fields pruned away)
+    // must deserialize to the same value as the struct's `Default`.
+
+    // ── Schema-walked reload round-trip smoke battery ─────────────
+    //
+    // Reload re-reads config.toml and rebuilds the in-memory Config; any
+    // scalar field that does not survive a serialize -> deserialize cycle
+    // is silently lost on reload. This walks every
+    // scalar prop the derive exposes, mutates it off-default, round-trips
+    // the whole Config through TOML, and asserts the mutated value comes
+    // back. Driven entirely off prop_fields() so it tracks the schema.
 
     fn values_match(a: &str, b: &str) -> bool {
         if a == b {

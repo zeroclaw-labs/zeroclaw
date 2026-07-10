@@ -2459,7 +2459,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         // Normalize image markers (e.g. local file paths from channel
         // attachments) into base64 data URIs before this message reaches the
-        // upstream provider — see
+        // upstream provider.
         let user_msg = ChatMessage {
             role: "user".to_string(),
             content: message.to_string(),
