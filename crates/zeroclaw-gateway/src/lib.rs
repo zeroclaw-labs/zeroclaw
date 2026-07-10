@@ -5419,6 +5419,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer,
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
@@ -6240,6 +6241,7 @@ mod tests {
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer,
+            in_flight: zeroclaw_runtime::observability::get_inflight_registry(),
             tools_registry: Arc::new(Vec::new()),
             tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
