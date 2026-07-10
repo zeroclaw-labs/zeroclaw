@@ -10666,7 +10666,9 @@ impl HindsightMemoryConfig {
             return Err("[memory.hindsight] top_k must be greater than zero".to_string());
         }
         if self.token_env.trim().is_empty() {
-            return Err("[memory.hindsight] token_env must name an environment variable".to_string());
+            return Err(
+                "[memory.hindsight] token_env must name an environment variable".to_string(),
+            );
         }
         Ok(())
     }
@@ -31185,6 +31187,67 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     }
 
     #[test]
+    async fn hindsight_settings_are_editable_through_set_prop() {
+        // The dashboard/settings write path goes through set_prop +
+        // validate. Confirm the typed [memory.hindsight] fields are visible
+        // and editable, and that a bad value is rejected on validate when a
+        // hindsight agent exists.
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Hindsight;
+
+        // Fields surface on the prop plane.
+        let names: std::collections::HashSet<String> =
+            config.prop_fields().into_iter().map(|f| f.name).collect();
+        assert!(names.contains("memory.hindsight.base_url"));
+        assert!(names.contains("memory.hindsight.bank_template"));
+        assert!(names.contains("memory.hindsight.top_k"));
+        assert!(names.contains("memory.hindsight.token_env"));
+
+        // Edit through set_prop, read back, and validate cleanly.
+        config
+            .set_prop("memory.hindsight.top_k", "9")
+            .expect("top_k is editable");
+        config
+            .set_prop("memory.hindsight.bank_template", "team-{agent}")
+            .expect("bank_template is editable");
+        assert_eq!(config.memory.hindsight.top_k, 9);
+        assert_eq!(config.memory.hindsight.bank_template, "team-{agent}");
+        config
+            .validate()
+            .expect("edited hindsight settings should validate");
+
+        // An invalid edit is caught at validate for a hindsight agent.
+        config
+            .set_prop("memory.hindsight.top_k", "0")
+            .expect("set_prop itself accepts the raw value");
+        config
+            .validate()
+            .expect_err("top_k = 0 must fail validation for a hindsight agent");
+    }
+
+    #[test]
+    async fn agent_memory_backend_is_switchable_to_hindsight_through_set_prop() {
+        let mut config = multi_agent_test_config();
+        // The per-agent backend is editable through the settings write path.
+        config
+            .set_prop("agents.alpha.memory.backend", "hindsight")
+            .expect("backend is settable to hindsight");
+        assert_eq!(
+            config.agents.get("alpha").unwrap().memory.backend,
+            crate::multi_agent::MemoryBackendKind::Hindsight
+        );
+        config
+            .set_prop("agents.alpha.memory.bank_id", "alpha-private")
+            .expect("bank_id override is settable");
+        assert_eq!(
+            config.agents.get("alpha").unwrap().memory.bank_id,
+            "alpha-private"
+        );
+        config.validate().expect("switched agent should validate");
+    }
+
+    #[test]
     async fn get_prop_returns_values_by_path() {
         let mx = test_matrix_config();
 
@@ -33482,7 +33545,10 @@ token_env = "ZC_HINDSIGHT_TOKEN"
         assert_eq!(cfg.memory.hindsight.top_k, 7);
         assert_eq!(cfg.memory.hindsight.bank_template, "zeroclaw-{agent}");
         assert_eq!(cfg.memory.hindsight.token_env, "ZC_HINDSIGHT_TOKEN");
-        assert_eq!(cfg.memory.hindsight.bank_for("clawdia", ""), "zeroclaw-clawdia");
+        assert_eq!(
+            cfg.memory.hindsight.bank_for("clawdia", ""),
+            "zeroclaw-clawdia"
+        );
         // Round-trip back to TOML and confirm the section survives.
         let serialized = toml::to_string(&cfg).expect("serialize");
         assert!(serialized.contains("bank_template = \"zeroclaw-{agent}\""));
