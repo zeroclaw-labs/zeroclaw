@@ -1203,19 +1203,19 @@ fn api_key_and_uri_for_provider(
 /// For model-switch retries, the caller emits a short-lived `AgentEnd` *before*
 /// each nested `AgentStart`; the main guard then fires the final `AgentEnd`
 /// with the last model name and accumulated token usage.
-struct LoopTurnGuard {
-    observer: Arc<dyn Observer>,
-    model_provider: String,
-    model: String,
-    channel_name: String,
-    agent_alias: String,
-    turn_id: String,
-    turn_started_at: Instant,
-    done: bool,
+pub struct LoopTurnGuard {
+    pub observer: Arc<dyn Observer>,
+    pub model_provider: String,
+    pub model: String,
+    pub channel_name: String,
+    pub agent_alias: String,
+    pub turn_id: String,
+    pub turn_started_at: Instant,
+    pub done: bool,
 }
 
 impl LoopTurnGuard {
-    fn fire(&mut self) {
+    pub fn fire(&mut self) {
         if self.done {
             return;
         }
