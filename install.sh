@@ -663,6 +663,7 @@ install_web_dist() {
     info "[dry-run] Would install web dashboard to $web_data_dir"
     return 0
   fi
+  rm -rf "$web_data_dir"
   mkdir -p "$web_data_dir"
   cp -r "$src_dist/." "$web_data_dir/"
   info "Web dashboard installed to $web_data_dir"

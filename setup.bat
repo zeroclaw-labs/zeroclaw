@@ -323,6 +323,7 @@ if %ERRORLEVEL% EQU 0 (
     cargo web build
     if %ERRORLEVEL% EQU 0 (
         if exist "web\dist\index.html" (
+            if exist "%LOCALAPPDATA%\zeroclaw\web\dist" rmdir /S /Q "%LOCALAPPDATA%\zeroclaw\web\dist"
             mkdir "%LOCALAPPDATA%\zeroclaw\web\dist" 2>nul
             xcopy /E /I /Y "web\dist" "%LOCALAPPDATA%\zeroclaw\web\dist" >nul
             echo   %GREEN%OK%RESET% Web dashboard installed to %LOCALAPPDATA%\zeroclaw\web\dist
