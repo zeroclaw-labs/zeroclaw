@@ -385,6 +385,7 @@ mod payload_capture_tests {
             strict_tool_parsing: false,
             channel: None,
             draft_reasoning,
+            stream_tool_arguments: None,
             agent_alias: None,
             turn_id: "trace-req-test",
         }

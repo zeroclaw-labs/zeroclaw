@@ -4,7 +4,7 @@
 //! consolidation is an explicit field here, set per caller. `Default`
 //! preserves today's channel/CLI behaviour.
 
-use zeroclaw_config::schema::StreamReasoningMode;
+use zeroclaw_config::schema::{StreamReasoningMode, StreamToolArgumentEntry};
 
 /// How to handle max-tool-iteration exhaustion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -32,6 +32,15 @@ pub struct LoopKnobs {
     /// draft/status surface. Raw reasoning is opt-in; the default only emits a
     /// liveness tick so existing channel progress remains privacy-preserving.
     pub draft_reasoning: StreamReasoningMode,
+    /// Tool-progress argument policy materialized for this turn. Matrix
+    /// single-message streaming currently supplies it because the runtime
+    /// renders tool calls into `StreamDelta::Status` text before the channel
+    /// consumes them; carrying the policy here keeps that transport-specific
+    /// choice explicit instead of hiding it in task-local state. `None`
+    /// preserves the existing formatter for every other caller. This bridge
+    /// can disappear once tool progress is emitted as structured events and
+    /// formatted at the channel boundary.
+    pub stream_tool_arguments: Option<Vec<StreamToolArgumentEntry>>,
 }
 
 impl Default for LoopKnobs {
@@ -41,6 +50,7 @@ impl Default for LoopKnobs {
             max_iteration_behavior: MaxIterationBehavior::GracefulSummary,
             detect_protocol_without_tools: true,
             draft_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: None,
         }
     }
 }

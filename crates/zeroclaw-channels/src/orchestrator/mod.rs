@@ -4125,6 +4125,21 @@ fn matrix_stream_reasoning(
     matrix_stream_reasoning_for_config(ctx.prompt_config.as_ref(), msg)
 }
 
+fn matrix_stream_tool_arguments_for_config(
+    config: &zeroclaw_config::schema::Config,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> Vec<zeroclaw_config::schema::StreamToolArgumentEntry> {
+    matrix_config_for_message(config, msg)
+        .map_or_else(Vec::new, |config| config.stream_tool_arguments.clone())
+}
+
+fn matrix_stream_tool_arguments(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> Vec<zeroclaw_config::schema::StreamToolArgumentEntry> {
+    matrix_stream_tool_arguments_for_config(ctx.prompt_config.as_ref(), msg)
+}
+
 fn matrix_draft_update_interval_ms_for_config(
     config: &zeroclaw_config::schema::Config,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -5528,6 +5543,7 @@ async fn process_channel_message_body(
     let mut loop_knobs = LoopKnobs::default();
     if matrix_single_message_streaming {
         loop_knobs.draft_reasoning = matrix_stream_reasoning(ctx.as_ref(), &msg);
+        loop_knobs.stream_tool_arguments = Some(matrix_stream_tool_arguments(ctx.as_ref(), &msg));
     }
     let turn_id = uuid::Uuid::new_v4().to_string();
     let (llm_result, fallback_info) = scope_provider_fallback(async {
@@ -11425,6 +11441,12 @@ mod tests {
             "single".to_string(),
             zeroclaw_config::schema::MatrixConfig {
                 stream_mode: zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+                stream_tool_arguments: vec![
+                    zeroclaw_config::schema::StreamToolArgumentEntry::Defaults {
+                        default_base: zeroclaw_config::schema::StreamToolArgumentBase::None,
+                        argument_chars: Some(240),
+                    },
+                ],
                 ..Default::default()
             },
         );
@@ -11472,6 +11494,14 @@ mod tests {
         assert!(!matrix_single_message_streaming_enabled_for_config(
             &config, &slack_msg
         ));
+        assert_eq!(
+            matrix_stream_tool_arguments_for_config(&config, &single_msg),
+            vec![zeroclaw_config::schema::StreamToolArgumentEntry::Defaults {
+                default_base: zeroclaw_config::schema::StreamToolArgumentBase::None,
+                argument_chars: Some(240),
+            }]
+        );
+        assert!(matrix_stream_tool_arguments_for_config(&config, &slack_msg).is_empty());
     }
 
     #[test]

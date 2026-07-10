@@ -13028,6 +13028,50 @@ pub enum StreamReasoningMode {
     Full,
 }
 
+/// Base policy for Matrix single-message tool argument progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum StreamToolArgumentBase {
+    /// Do not display any arguments unless a per-tool rule includes them.
+    None,
+    /// Use ZeroClaw's conservative per-tool recommendations.
+    #[default]
+    Safe,
+    /// Display every argument except runtime-internal fields, after leak scrubbing.
+    All,
+}
+
+/// One entry in `MatrixConfig::stream_tool_arguments`.
+///
+/// A list may contain at most one defaults entry plus independent per-tool
+/// rules. Entry order is not significant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(untagged, deny_unknown_fields)]
+pub enum StreamToolArgumentEntry {
+    /// Override inherited settings for tools without a matching rule.
+    Defaults {
+        default_base: StreamToolArgumentBase,
+        /// Override the inherited per-value character cap. `0` disables it.
+        #[serde(default)]
+        argument_chars: Option<usize>,
+    },
+    /// Override or adjust inherited settings for one exact tool name.
+    Tool {
+        tool: String,
+        #[serde(default)]
+        base: Option<StreamToolArgumentBase>,
+        #[serde(default)]
+        include: Vec<String>,
+        #[serde(default)]
+        exclude: Vec<String>,
+        /// Override the inherited per-value character cap. `0` disables it.
+        #[serde(default)]
+        argument_chars: Option<usize>,
+    },
+}
+
 /// Where a channel registers its skill slash commands. `global` (default)
 /// registers application-wide - the commands work everywhere the bot is, but
 /// Discord takes up to ~1h to propagate changes. `guild` registers to each
@@ -13076,6 +13120,8 @@ fn default_matrix_draft_update_interval_ms() -> u64 {
 fn default_matrix_stream_draft_lines() -> usize {
     10
 }
+
+pub const DEFAULT_STREAM_TOOL_ARGUMENT_CHARS: usize = 60;
 
 fn default_matrix_message_max_bytes() -> usize {
     48_000
@@ -13841,6 +13887,17 @@ pub struct MatrixConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub stream_reasoning: StreamReasoningMode,
+    /// Tool arguments shown in Matrix single-message progress lines. Missing or
+    /// empty means the conservative `safe` defaults. Use one
+    /// `{ default_base = "none" | "safe" | "all" }` entry for inherited
+    /// settings, then exact-name tool entries with optional `base`, `include`,
+    /// `exclude`, and `argument_chars` adjustments. `argument_chars` limits
+    /// each displayed value and defaults to 60; `0` disables that limit.
+    /// Unknown tools resolve to no arguments under `safe`; every selected value
+    /// is leak-scrubbed before display.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub stream_tool_arguments: Vec<StreamToolArgumentEntry>,
     /// When true, only respond to messages that @-mention the bot in groups.
     /// Direct messages are always processed.
     #[tab(Behavior)]
@@ -13913,6 +13970,7 @@ impl Default for MatrixConfig {
             message_max_bytes: default_matrix_message_max_bytes(),
             stream_draft_delete: default_true(),
             stream_reasoning: StreamReasoningMode::default(),
+            stream_tool_arguments: Vec::new(),
             mention_only: false,
             recovery_key: None,
             password: None,
@@ -13923,6 +13981,76 @@ impl Default for MatrixConfig {
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
         }
+    }
+}
+
+fn validate_stream_tool_argument_names<'a>(
+    entry_path: &str,
+    field_name: &str,
+    fields: &'a [String],
+) -> Result<std::collections::HashSet<&'a str>> {
+    let mut names = std::collections::HashSet::new();
+    for (field_index, field) in fields.iter().enumerate() {
+        if field.is_empty() || field.trim() != field {
+            anyhow::bail!(
+                "{entry_path}.{field_name}[{field_index}] must be a non-empty exact argument name without surrounding whitespace"
+            );
+        }
+        if !names.insert(field.as_str()) {
+            anyhow::bail!("{entry_path}.{field_name} contains duplicate argument '{field}'");
+        }
+    }
+    Ok(names)
+}
+
+impl MatrixConfig {
+    /// Validate the order-independent tool argument display policy.
+    pub fn validate_stream_tool_arguments(&self) -> Result<()> {
+        let mut saw_defaults = false;
+        let mut tools = std::collections::HashSet::new();
+
+        for (index, entry) in self.stream_tool_arguments.iter().enumerate() {
+            let entry_path = format!("stream_tool_arguments[{index}]");
+            match entry {
+                StreamToolArgumentEntry::Defaults { .. } => {
+                    if saw_defaults {
+                        anyhow::bail!(
+                            "{entry_path}.default_base duplicates the list's default_base entry"
+                        );
+                    }
+                    saw_defaults = true;
+                }
+                StreamToolArgumentEntry::Tool {
+                    tool,
+                    include,
+                    exclude,
+                    ..
+                } => {
+                    if tool.is_empty() || tool.trim() != tool {
+                        anyhow::bail!(
+                            "{entry_path}.tool must be a non-empty exact tool name without surrounding whitespace"
+                        );
+                    }
+                    if !tools.insert(tool.as_str()) {
+                        anyhow::bail!("{entry_path}.tool duplicates the rule for tool '{tool}'");
+                    }
+
+                    let included =
+                        validate_stream_tool_argument_names(&entry_path, "include", include)?;
+                    let excluded =
+                        validate_stream_tool_argument_names(&entry_path, "exclude", exclude)?;
+                    for field in &excluded {
+                        if included.contains(*field) {
+                            anyhow::bail!(
+                                "{entry_path} includes and excludes the same argument '{field}'"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -18563,6 +18691,12 @@ impl Config {
                 &format!("channels.telegram.{alias}.api_base_url"),
                 &tg.api_base_url,
             )?;
+        }
+
+        for (alias, matrix) in &self.channels.matrix {
+            matrix.validate_stream_tool_arguments().with_context(|| {
+                format!("invalid channels.matrix.{alias}.stream_tool_arguments")
+            })?;
         }
 
         // Git forge channel: a PAT-backed provider must name its API origin
@@ -24884,6 +25018,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             message_max_bytes: 48_000,
             stream_draft_delete: true,
             stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -24923,6 +25058,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             message_max_bytes: 48_000,
             stream_draft_delete: true,
             stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -25064,6 +25200,7 @@ allowed_users = ["@u:matrix.org"]
                     message_max_bytes: 48_000,
                     stream_draft_delete: true,
                     stream_reasoning: StreamReasoningMode::Status,
+                    stream_tool_arguments: vec![],
                     recovery_key: None,
                     mention_only: false,
                     password: None,
@@ -29809,6 +29946,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             message_max_bytes: 48_000,
             stream_draft_delete: true,
             stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -29847,6 +29985,19 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             message_max_bytes: 48_000,
             stream_draft_delete: true,
             stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![
+                StreamToolArgumentEntry::Defaults {
+                    default_base: StreamToolArgumentBase::Safe,
+                    argument_chars: Some(80),
+                },
+                StreamToolArgumentEntry::Tool {
+                    tool: "delegate".into(),
+                    base: Some(StreamToolArgumentBase::None),
+                    include: vec!["agent".into(), "background".into()],
+                    exclude: vec![],
+                    argument_chars: Some(0),
+                },
+            ],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -29878,6 +30029,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             message_max_bytes: 48_000,
             stream_draft_delete: true,
             stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -29910,6 +30062,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             message_max_bytes: 48_000,
             stream_draft_delete: true,
             stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -29953,6 +30106,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 message_max_bytes: 48_000,
                 stream_draft_delete: true,
                 stream_reasoning: StreamReasoningMode::Status,
+                stream_tool_arguments: vec![],
                 recovery_key: None,
                 mention_only: false,
                 password: None,
@@ -29995,6 +30149,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 message_max_bytes: 48_000,
                 stream_draft_delete: true,
                 stream_reasoning: StreamReasoningMode::Status,
+                stream_tool_arguments: vec![],
                 recovery_key: None,
                 mention_only: false,
                 password: None,
@@ -30042,6 +30197,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 message_max_bytes: 48_000,
                 stream_draft_delete: true,
                 stream_reasoning: StreamReasoningMode::Status,
+                stream_tool_arguments: vec![],
                 mention_only: false,
                 recovery_key: None,
                 password: None,
@@ -30157,6 +30313,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             message_max_bytes: 48_000,
             stream_draft_delete: true,
             stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -30200,6 +30357,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             message_max_bytes: 48_000,
             stream_draft_delete: true,
             stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -30239,6 +30397,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             message_max_bytes: 48_000,
             stream_draft_delete: true,
             stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -30273,6 +30432,19 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             message_max_bytes: 48_000,
             stream_draft_delete: true,
             stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![
+                StreamToolArgumentEntry::Defaults {
+                    default_base: StreamToolArgumentBase::Safe,
+                    argument_chars: Some(80),
+                },
+                StreamToolArgumentEntry::Tool {
+                    tool: "delegate".into(),
+                    base: Some(StreamToolArgumentBase::None),
+                    include: vec!["agent".into(), "background".into()],
+                    exclude: vec![],
+                    argument_chars: Some(0),
+                },
+            ],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -30318,6 +30490,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let reasoning = by_name["channels.matrix.stream_reasoning"];
         assert!(reasoning.is_enum());
         assert_eq!(reasoning.display_value, "status");
+        let tool_arguments = by_name["channels.matrix.stream_tool_arguments"];
+        assert_eq!(tool_arguments.kind, crate::traits::PropKind::ObjectArray);
 
         // Secret field — masked
         let token = by_name["channels.matrix.access_token"];
@@ -30356,6 +30530,93 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         assert_eq!(
             mx.get_prop("channels.matrix.access_token").unwrap(),
             "**** (encrypted)"
+        );
+    }
+
+    #[test]
+    async fn matrix_stream_tool_arguments_deserialize_from_compact_toml() {
+        let matrix: MatrixConfig = toml::from_str(
+            r#"
+homeserver = "https://matrix.example"
+stream_tool_arguments = [
+    { default_base = "safe", argument_chars = 120 },
+    { tool = "delegate", base = "none", include = ["agent", "background", "prompt"], argument_chars = 0 },
+    { tool = "mock_tool", base = "all", exclude = ["token"] },
+]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(matrix.stream_tool_arguments.len(), 3);
+        assert_eq!(
+            matrix.stream_tool_arguments[0],
+            StreamToolArgumentEntry::Defaults {
+                default_base: StreamToolArgumentBase::Safe,
+                argument_chars: Some(120),
+            }
+        );
+        assert!(matrix.validate_stream_tool_arguments().is_ok());
+    }
+
+    #[test]
+    async fn matrix_stream_tool_arguments_reject_ambiguous_rules() {
+        let matrix = MatrixConfig {
+            stream_tool_arguments: vec![
+                StreamToolArgumentEntry::Defaults {
+                    default_base: StreamToolArgumentBase::Safe,
+                    argument_chars: None,
+                },
+                StreamToolArgumentEntry::Defaults {
+                    default_base: StreamToolArgumentBase::None,
+                    argument_chars: Some(0),
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(
+            matrix
+                .validate_stream_tool_arguments()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicates")
+        );
+
+        let matrix = MatrixConfig {
+            stream_tool_arguments: vec![StreamToolArgumentEntry::Tool {
+                tool: "delegate".into(),
+                base: None,
+                include: vec!["prompt".into()],
+                exclude: vec!["prompt".into()],
+                argument_chars: None,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            matrix
+                .validate_stream_tool_arguments()
+                .unwrap_err()
+                .to_string()
+                .contains("includes and excludes")
+        );
+    }
+
+    #[test]
+    async fn matrix_stream_tool_arguments_round_trip_through_configurable_prop() {
+        let mut matrix = MatrixConfig::default();
+        matrix
+            .set_prop(
+                "channels.matrix.stream_tool_arguments",
+                r#"[{"default_base":"none"},{"tool":"shell","base":"all","exclude":["command"]}]"#,
+            )
+            .unwrap();
+
+        assert_eq!(matrix.stream_tool_arguments.len(), 2);
+        assert!(matrix.validate_stream_tool_arguments().is_ok());
+        assert!(
+            matrix
+                .get_prop("channels.matrix.stream_tool_arguments")
+                .unwrap()
+                .contains("shell")
         );
     }
 

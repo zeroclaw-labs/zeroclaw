@@ -377,6 +377,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         strict_tool_parsing,
         channel,
         draft_reasoning: knobs.draft_reasoning,
+        stream_tool_arguments: knobs.stream_tool_arguments.as_deref(),
         turn_id,
         agent_alias,
     };

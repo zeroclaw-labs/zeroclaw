@@ -72,6 +72,7 @@ pub(crate) async fn record_executed_outcomes(
                 secs,
                 outcome.success,
                 outcome.error_reason.as_deref(),
+                ctx.stream_tool_arguments,
             );
             ::zeroclaw_log::record!(
                 DEBUG,
@@ -103,6 +104,7 @@ mod tests {
             2,
             false,
             Some("api_key = \"sk-live-abcd1234efgh5678\""),
+            None,
         );
         assert!(
             line.contains("[REDACTED]"),
@@ -116,7 +118,7 @@ mod tests {
 
     #[test]
     fn completion_progress_success_has_no_error_text() {
-        let line = render_tool_completion_progress("echo", &json!({}), 0, true, None);
+        let line = render_tool_completion_progress("echo", &json!({}), 0, true, None, None);
         assert!(line.starts_with('\u{2705}'));
         assert!(!line.contains(':'));
     }

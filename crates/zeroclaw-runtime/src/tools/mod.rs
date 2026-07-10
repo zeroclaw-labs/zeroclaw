@@ -1511,7 +1511,7 @@ pub fn all_tools_with_runtime(
             ) {
                 Ok(host) => {
                     let details = host.tool_plugin_details();
-                    let count = details.len();
+                    let mut count = 0usize;
                     let plugin_limits = zeroclaw_plugins::component::PluginLimits {
                         call_fuel: config.plugins.limits.call_fuel,
                         max_memory_bytes: config
@@ -1536,14 +1536,29 @@ pub fn all_tools_with_runtime(
                             .entry_config(&manifest.name)
                             .cloned()
                             .unwrap_or_default();
-                        tool_arcs.push(Arc::new(zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
+                        let plugin_tool = zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
                             wasm_path.to_path_buf(),
                             manifest.permissions.clone(),
                             manifest.name.clone(),
                             manifest.description.clone().unwrap_or_default(),
                             plugin_config,
                             plugin_limits,
-                        )));
+                        );
+                        if wasm_plugin_name_conflicts(plugin_tool.name(), &tool_arcs) {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"tool": plugin_tool.name()})),
+                                "WASM plugin tool shadows an existing tool name; skipping"
+                            );
+                            continue;
+                        }
+                        tool_arcs.push(Arc::new(plugin_tool));
+                        count += 1;
                     }
                     ::zeroclaw_log::record!(
                         INFO,
@@ -1602,11 +1617,24 @@ pub fn all_tools_with_runtime(
     }
 }
 
+#[cfg(feature = "plugins-wasm")]
+fn wasm_plugin_name_conflicts(name: &str, registered_tools: &[Arc<dyn Tool>]) -> bool {
+    crate::agent::turn::progress::has_builtin_stream_tool_policy(name)
+        || registered_tools.iter().any(|tool| tool.name() == name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_config::schema::{BrowserConfig, Config, MemoryConfig};
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn wasm_plugin_names_cannot_shadow_disabled_builtin_stream_policies() {
+        assert!(wasm_plugin_name_conflicts("browser", &[]));
+        assert!(!wasm_plugin_name_conflicts("custom_plugin_tool", &[]));
+    }
 
     #[tokio::test]
     async fn mcp_capability_tools_respect_policy() {

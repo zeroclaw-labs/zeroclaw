@@ -425,6 +425,31 @@ RUST_LOG=zeroclaw::channels::matrix=debug,matrix_sdk_crypto=debug zeroclaw daemo
 
 Matrix specifics: in `partial` mode, tool-execution status is shown through the same edit pipeline as answer text. In `single_message` mode, tool/progress status updates are edited into one sliding draft while the final answer is sent as a separate Matrix message; `stream_draft_lines` controls how many progress entries remain visible (`0` keeps all), and `message_max_bytes` still caps the rendered draft body by dropping older progress entries before editing Matrix. `stream_reasoning` controls provider reasoning visibility in that progress draft: `off` suppresses reasoning-derived draft updates, `status` emits liveness ticks without raw reasoning text, and `full` emits raw provider reasoning text into the draft. `stream_draft_delete` controls whether durable progress transcripts are deleted before the final answer is posted; delete failures are logged and final answer delivery still proceeds. Placeholder-only drafts are removed before the final answer even when transcript retention is enabled. In `multi_message` mode each paragraph posts as its own threaded message, and the split is code-fence-aware, so blank lines inside fenced blocks don't break a code block across messages.
 
+`stream_tool_arguments` controls which tool arguments appear in `single_message`
+progress lines. Missing or empty configuration uses conservative per-tool
+defaults; unknown skill, plugin, and MCP tools show their names only. A single
+`default_base` entry selects `none`, `safe`, or `all`, while exact-name tool
+rules can replace that base or add and remove fields:
+
+```toml
+stream_tool_arguments = [
+    { default_base = "safe", argument_chars = 60 },
+    { tool = "delegate", base = "none", include = ["agent", "background", "prompt"], argument_chars = 0 },
+    { tool = "mock_tool", base = "all", exclude = ["token"] },
+]
+```
+
+Rule order is irrelevant, duplicate tool/default entries are rejected, and an
+omitted rule `base` inherits `default_base`. `include` adds fields after the
+base is selected; `exclude` removes them. Runtime-only fields are never shown,
+credential-named fields are always redacted, and every selected value passes
+credential leak detection and one-line normalization before it reaches Matrix.
+`argument_chars` on the default entry changes the inherited per-value cap from
+`60`; the same field on a tool rule overrides it for that tool. `0` keeps full
+values while `message_max_bytes` still bounds the rendered draft. Explicit
+`all` applies to unknown tools; use an exact-name rule when enabling arguments
+for only one extension tool.
+
 ## 8. Auto-recovery from corrupted local state
 
 The matrix-rust-sdk default SQLite store is single-device and assumes the local view stays in sync with the homeserver. Two failure modes break that assumption irrecoverably; ZeroClaw detects each at startup and (when `password` + `user_id` are both configured) auto-wipes `~/.zeroclaw/state/matrix/` and re-authenticates so a fresh device is created server-side.

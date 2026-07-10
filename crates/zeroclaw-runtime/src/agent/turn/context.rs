@@ -8,7 +8,7 @@ use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
-use zeroclaw_config::schema::{PacingConfig, StreamReasoningMode};
+use zeroclaw_config::schema::{PacingConfig, StreamReasoningMode, StreamToolArgumentEntry};
 
 /// Shared references threaded through the turn step functions.
 ///
@@ -38,6 +38,7 @@ pub(crate) struct TurnCtx<'a> {
     pub(crate) strict_tool_parsing: bool,
     pub(crate) channel: Option<&'a dyn Channel>,
     pub(crate) draft_reasoning: StreamReasoningMode,
+    pub(crate) stream_tool_arguments: Option<&'a [StreamToolArgumentEntry]>,
     pub(crate) turn_id: &'a str,
     pub(crate) agent_alias: Option<&'a str>,
 }

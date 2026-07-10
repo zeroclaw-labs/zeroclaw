@@ -413,6 +413,7 @@ mod cost_usd_regression_tests {
             strict_tool_parsing: false,
             channel: None,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            stream_tool_arguments: None,
             agent_alias: None,
             turn_id: "turn-cost-regression",
         };

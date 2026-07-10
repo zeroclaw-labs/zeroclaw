@@ -394,7 +394,7 @@ pub fn summarize_args(args: &serde_json::Value) -> String {
 /// human-readable summaries. Matches anywhere in the (lowercased) key:
 /// covers `api_key`, `api-key`, `apiKey`, `oauth_token`, `secret`,
 /// `password`, `auth_token`, `bearer`, `client_secret`, `private_key`, etc.
-fn looks_like_secret_key(key: &str) -> bool {
+pub(crate) fn looks_like_secret_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     [
         "secret",

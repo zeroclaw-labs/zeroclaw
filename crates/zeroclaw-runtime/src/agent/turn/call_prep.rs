@@ -248,7 +248,8 @@ pub(crate) async fn prepare_tool_calls(
 
         // ── Progress: tool start ────────────────────────────
         if let Some(tx) = ctx.on_delta {
-            let progress = render_tool_start_progress(&tool_name, &tool_args);
+            let progress =
+                render_tool_start_progress(&tool_name, &tool_args, ctx.stream_tool_arguments);
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
