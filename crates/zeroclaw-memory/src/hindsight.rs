@@ -30,6 +30,7 @@
 //! | `ZC_HINDSIGHT_TOP_K`| Default recall limit when caller passes 0 | `5` |
 //! | `ZC_HINDSIGHT_SHARED_BANK`| Shared/family bank merged read-only into recall/list; written only via the `shared_memory_store` tool | (none) |
 //! | `ZC_HINDSIGHT_SYSTEM_BANK`| System bank merged read-only into recall/list; written only via the `system_memory_store` tool | (none) |
+//! | `ZC_HINDSIGHT_RETAIN_ASYNC`| Send retains with the server-side `async` flag (vectorize off the critical path); falsey (`0`/`false`/`no`) forces sync | `true` |
 //!
 //! Shared and system banks: `ZC_HINDSIGHT_SHARED_BANK` and
 //! `ZC_HINDSIGHT_SYSTEM_BANK` name two extra banks every agent can READ from
@@ -87,6 +88,10 @@ pub struct HindsightMemory {
     system_bank: Option<String>,
     token: String,
     default_top_k: usize,
+    /// When true, retain (write) requests set the server-side `async` flag so
+    /// vectorization runs off the caller's critical path. Applies to `store`
+    /// and `store_to_bank`. Read paths are unaffected.
+    retain_async: bool,
     client: reqwest::Client,
 }
 
@@ -99,6 +104,7 @@ impl std::fmt::Debug for HindsightMemory {
             .field("shared_bank", &self.shared_bank)
             .field("system_bank", &self.system_bank)
             .field("default_top_k", &self.default_top_k)
+            .field("retain_async", &self.retain_async)
             .finish_non_exhaustive()
     }
 }
@@ -185,6 +191,7 @@ impl HindsightMemory {
             system_bank,
             token,
             default_top_k,
+            retain_async: cfg.retain_async,
             client: reqwest::Client::new(),
         })
     }
@@ -225,6 +232,12 @@ impl HindsightMemory {
             .and_then(|s| s.trim().parse::<usize>().ok())
             .filter(|k| *k > 0)
             .unwrap_or(DEFAULT_TOP_K);
+        // Async retain by default; an explicit falsey env forces sync. Parity
+        // with the typed `[memory.hindsight] retain_async` default (true).
+        let retain_async = std::env::var("ZC_HINDSIGHT_RETAIN_ASYNC")
+            .ok()
+            .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+            .unwrap_or(true);
 
         Ok(Self {
             alias: agent_alias.to_string(),
@@ -234,6 +247,7 @@ impl HindsightMemory {
             system_bank,
             token,
             default_top_k,
+            retain_async,
             client: reqwest::Client::new(),
         })
     }
@@ -280,6 +294,7 @@ impl HindsightMemory {
             system_bank: system_bank.map(str::to_string),
             token: token.to_string(),
             default_top_k: DEFAULT_TOP_K,
+            retain_async: true,
             client: reqwest::Client::new(),
         }
     }
@@ -410,7 +425,7 @@ impl HindsightMemory {
                 context: Some(context_owned.as_str()),
                 tags,
             }],
-            is_async: false,
+            is_async: self.retain_async,
         };
         let resp = self
             .client
@@ -593,7 +608,7 @@ impl Memory for HindsightMemory {
                 context: Some(context_owned.as_str()),
                 tags: Self::tags_for(&category),
             }],
-            is_async: false,
+            is_async: self.retain_async,
         };
         let resp = self
             .client
@@ -823,6 +838,7 @@ mod tests {
             system_bank: None,
             token: "test-token".to_string(),
             default_top_k: 5,
+            retain_async: true,
             client: reqwest::Client::new(),
         }
     }
@@ -893,12 +909,14 @@ mod tests {
     #[tokio::test]
     async fn store_posts_retain_payload_to_bank() {
         let server = MockServer::start().await;
+        // Default is async retain: the body carries "async": true so the server
+        // vectorizes off the caller's critical path.
         Mock::given(method("POST"))
             .and(path("/v1/default/banks/zeroclaw-test/memories"))
             .and(header("authorization", "Bearer test-token"))
             .and(body_partial_json(json!({
                 "items": [{ "content": "PURPLE-OTTER-42", "context": "fact" }],
-                "async": false
+                "async": true
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
             .mount(&server)
@@ -908,6 +926,83 @@ mod tests {
         mem.store("fact", "PURPLE-OTTER-42", MemoryCategory::Core, None)
             .await
             .expect("store should succeed against the mock retain endpoint");
+    }
+
+    #[tokio::test]
+    async fn store_uses_async_retain_by_default() {
+        // Assert the async flag explicitly: a retain with retain_async on must
+        // send "async": true so the write returns before vectorization.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories"))
+            .and(body_partial_json(json!({ "async": true })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_for(&server.uri(), "zeroclaw-test");
+        assert!(mem.retain_async);
+        mem.store("k", "v", MemoryCategory::Core, None)
+            .await
+            .expect("async retain should succeed");
+    }
+
+    #[tokio::test]
+    async fn store_uses_sync_retain_when_configured_off() {
+        // With retain_async off, the body must carry "async": false.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-test/memories"))
+            .and(body_partial_json(json!({ "async": false })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+
+        let mut mem = memory_for(&server.uri(), "zeroclaw-test");
+        mem.retain_async = false;
+        mem.store("k", "v", MemoryCategory::Core, None)
+            .await
+            .expect("sync retain should succeed");
+    }
+
+    #[tokio::test]
+    async fn store_to_bank_uses_async_retain_by_default() {
+        // The shared/system write path honors retain_async too.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/default/banks/zeroclaw-house/memories"))
+            .and(body_partial_json(json!({ "async": true })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+
+        let mem = memory_with_tiers(&server.uri(), Some("zeroclaw-house"), None);
+        assert!(mem.retain_async);
+        mem.store_to_bank("zeroclaw-house", "k", "v", MemoryCategory::Core, "shared")
+            .await
+            .expect("async store_to_bank should succeed");
+    }
+
+    #[tokio::test]
+    async fn from_config_defaults_retain_async_true() {
+        let env_name = "ZC_HINDSIGHT_TEST_TOKEN_RETAIN";
+        // SAFETY: single-threaded test; set + remove within this test only.
+        unsafe { std::env::set_var(env_name, "tok") };
+        let cfg = HindsightMemoryConfig {
+            token_env: env_name.to_string(),
+            ..HindsightMemoryConfig::default()
+        };
+        let mem = HindsightMemory::from_config(&cfg, "scout", "").expect("construct");
+        assert!(mem.retain_async, "retain_async must default to true");
+
+        let cfg_off = HindsightMemoryConfig {
+            token_env: env_name.to_string(),
+            retain_async: false,
+            ..HindsightMemoryConfig::default()
+        };
+        let mem_off = HindsightMemory::from_config(&cfg_off, "scout", "").expect("construct");
+        assert!(!mem_off.retain_async, "retain_async off must propagate");
+        unsafe { std::env::remove_var(env_name) };
     }
 
     #[tokio::test]

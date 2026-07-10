@@ -3362,6 +3362,28 @@ impl Channel for TelegramChannel {
         })
     }
 
+    /// A Telegram 1:1 DM is a `private` chat, whose `chat.id` (and therefore
+    /// the inbound `reply_target`) is the user's own positive id. Groups,
+    /// supergroups, and channels always carry NEGATIVE chat ids (supergroups/
+    /// channels are `-100…`), and forum topics append a `:<thread>` suffix that
+    /// only ever occurs on those negative group ids. So a bare, positive
+    /// `reply_target` uniquely identifies a private chat; anything negative (a
+    /// group) or thread-suffixed stays `false`. This lets the orchestrator's
+    /// `should_bypass_reply_intent_precheck` skip the ~2s reply-intent
+    /// classifier on DMs (a DM is definitionally addressed to the bot), while
+    /// group traffic still pays the precheck. Mirrors Slack/WeCom's override.
+    fn is_direct_message(&self, msg: &zeroclaw_api::channel::ChannelMessage) -> bool {
+        let (chat_id, thread_id) = Self::parse_reply_target(&msg.reply_target);
+        // Forum threads only exist in groups; a thread suffix is never a DM.
+        if thread_id.is_some() {
+            return false;
+        }
+        // Private chats have a positive numeric id; groups/supergroups/channels
+        // are negative. A non-numeric target (should not happen for Telegram)
+        // is treated conservatively as not-a-DM.
+        chat_id.parse::<i64>().is_ok_and(|id| id > 0)
+    }
+
     fn supports_draft_updates(&self) -> bool {
         self.stream_mode != StreamMode::Off
     }
@@ -6156,6 +6178,79 @@ mod tests {
             "chat": { "type": "private" }
         });
         assert!(!TelegramChannel::is_group_message(&private_msg));
+    }
+
+    #[test]
+    fn telegram_is_direct_message_only_for_private_chats() {
+        use zeroclaw_api::channel::{Channel, ChannelMessage};
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+
+        // Private DM: reply_target is the user's own positive chat id.
+        let dm = ChannelMessage {
+            reply_target: "60469177".into(),
+            channel: "telegram".into(),
+            ..Default::default()
+        };
+        assert!(
+            ch.is_direct_message(&dm),
+            "a bare positive chat id is a 1:1 private chat"
+        );
+
+        // Group / supergroup: negative chat id -> not a DM.
+        let group = ChannelMessage {
+            reply_target: "-100200300".into(),
+            ..dm.clone()
+        };
+        assert!(
+            !ch.is_direct_message(&group),
+            "a negative (group/supergroup) chat id must not be a DM"
+        );
+
+        // Forum topic thread suffix (only exists in groups) -> not a DM.
+        let forum = ChannelMessage {
+            reply_target: "-100200300:789".into(),
+            ..dm.clone()
+        };
+        assert!(
+            !ch.is_direct_message(&forum),
+            "a thread-suffixed target is a forum group, not a DM"
+        );
+
+        // Defensive: a non-numeric target is treated as not-a-DM.
+        let weird = ChannelMessage {
+            reply_target: "not-a-number".into(),
+            ..dm.clone()
+        };
+        assert!(!ch.is_direct_message(&weird));
+    }
+
+    #[test]
+    fn telegram_dm_triggers_reply_intent_bypass() {
+        // End-to-end intent: a private-chat inbound must make the orchestrator's
+        // bypass predicate fire (explicitly_addressed stays false for Telegram,
+        // so the DM signal is what flips it).
+        use zeroclaw_api::channel::{Channel, ChannelMessage};
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        let dm = ChannelMessage {
+            reply_target: "12345".into(),
+            channel: "telegram".into(),
+            explicitly_addressed: false,
+            ..Default::default()
+        };
+        // Mirror should_bypass_reply_intent_precheck: explicitly_addressed || DM.
+        assert!(dm.explicitly_addressed || ch.is_direct_message(&dm));
     }
 
     #[test]

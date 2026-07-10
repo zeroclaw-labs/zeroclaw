@@ -10652,6 +10652,17 @@ pub struct HindsightMemoryConfig {
     /// shared bank.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub system_bank: String,
+    /// Send retain (write) requests with the server-side `async` flag set, so
+    /// the Hindsight service performs vectorization off the caller's critical
+    /// path. The write is acknowledged as soon as the item is queued instead of
+    /// after embedding, which removes several seconds from an in-turn
+    /// `memory_store` (the model already has the content; nothing in the same
+    /// turn reads the just-written item back). Applies to both the private
+    /// `store` path and the shared/system `store_to_bank` path. Default: true.
+    /// Set to false to force synchronous retains (e.g. if you need the item
+    /// immediately queryable by embedding search right after the write).
+    #[serde(default = "default_true")]
+    pub retain_async: bool,
 }
 
 impl Default for HindsightMemoryConfig {
@@ -10664,6 +10675,7 @@ impl Default for HindsightMemoryConfig {
             token: None,
             shared_bank: String::new(),
             system_bank: String::new(),
+            retain_async: true,
         }
     }
 }
