@@ -62,6 +62,12 @@ macro_rules! slash_commands {
                 fills_only: $fills_only,
             },)+
         ];
+
+        pub(crate) fn slash_command_name(kind: SlashCommandKind) -> &'static str {
+            match kind {
+                $(SlashCommandKind::$kind => $name,)+
+            }
+        }
     };
 }
 
@@ -147,14 +153,6 @@ pub(crate) fn format_skill_invocation_for_input(name: &str, arguments: &str) -> 
     }
 }
 
-pub(crate) fn slash_command_name(kind: SlashCommandKind) -> &'static str {
-    SLASH_COMMANDS
-        .iter()
-        .find(|command| command.kind == kind)
-        .map(|command| command.name)
-        .unwrap_or("")
-}
-
 fn slash_command_argument_prefix(kind: SlashCommandKind) -> String {
     format!("{} ", slash_command_name(kind))
 }
@@ -173,6 +171,17 @@ fn is_reserved_slash_command_name(name: &str) -> bool {
 
 fn is_known_skill(name: &str, skills: &[String]) -> bool {
     skills.iter().any(|skill| skill == name)
+}
+
+fn is_skill_shortcut_choice(choice: &str, skill: &str) -> bool {
+    choice.strip_prefix('/') == Some(skill)
+}
+
+fn is_skill_shortcut_autocomplete_choice(choice: &str, skills: &[String]) -> bool {
+    skills
+        .iter()
+        .filter(|skill| !is_reserved_slash_command_name(skill))
+        .any(|skill| is_skill_shortcut_choice(choice, skill))
 }
 
 fn skill_invocation(name: &str, arguments: &str) -> SkillInvocation {
@@ -885,11 +894,7 @@ impl InputBarState {
         match self.autocomplete_target {
             AutocompleteTarget::Command => {
                 let takes_arg = slash_command_fills_only(choice)
-                    || self
-                        .skill_catalog
-                        .iter()
-                        .filter(|skill| !is_reserved_slash_command_name(skill))
-                        .any(|skill| choice == format!("/{skill}"));
+                    || is_skill_shortcut_autocomplete_choice(choice, &self.skill_catalog);
                 self.input = if takes_arg {
                     format!("{choice} ")
                 } else {
@@ -938,11 +943,7 @@ impl InputBarState {
         self.dismiss_autocomplete();
         let fills_only = target == AutocompleteTarget::Command
             && (slash_command_fills_only(&choice)
-                || self
-                    .skill_catalog
-                    .iter()
-                    .filter(|skill| !is_reserved_slash_command_name(skill))
-                    .any(|skill| choice == format!("/{skill}")));
+                || is_skill_shortcut_autocomplete_choice(&choice, &self.skill_catalog));
         if fills_only || target == AutocompleteTarget::SkillArg {
             return InputBarAction::Consumed;
         }
@@ -1453,14 +1454,20 @@ impl InputBarState {
 
     fn handle_message_inject(&mut self, msg: String) -> InputBarAction {
         match parse_slash_command(&msg) {
-            SlashCommand::NotACommand => self.handle_normal_or_shortcut_inject(msg),
+            SlashCommand::Attach(path) => self.handle_attach_command(path),
+            SlashCommand::Detach(idx) => self.handle_detach_command(idx),
+            SlashCommand::ListAttachments => self.handle_list_attachments_command(),
+            SlashCommand::ClearQueue(idx) => InputBarAction::ClearQueue(idx),
+            SlashCommand::RestartSession => InputBarAction::RestartSession,
+            SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
+            SlashCommand::Model(name) => InputBarAction::SetModel(name.to_string()),
+            SlashCommand::ModelPicker => InputBarAction::OpenModelPicker,
+            SlashCommand::ModelProvider(name) => InputBarAction::SetModelProvider(name.to_string()),
+            SlashCommand::ModelProviderPicker => InputBarAction::OpenModelProviderPicker,
             SlashCommand::Skill(name, arguments) => {
                 self.handle_explicit_skill_inject(name, arguments)
             }
-            _ => {
-                self.insert_text(&msg);
-                self.handle_enter()
-            }
+            SlashCommand::NotACommand => self.handle_normal_or_shortcut_inject(msg),
         }
     }
 
@@ -2605,6 +2612,50 @@ mod tests {
             );
         }
         assert_eq!(listed.len(), SLASH_COMMANDS.len());
+    }
+
+    #[test]
+    fn inject_model_command_with_arg_returns_set_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/model gpt-4o");
+        let action = bar.handle_inject();
+        assert!(matches!(action, InputBarAction::SetModel(model) if model == "gpt-4o"));
+        assert_eq!(bar.input(), "");
+    }
+
+    #[test]
+    fn inject_model_provider_command_with_arg_returns_set_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/model-provider openai.default");
+        let action = bar.handle_inject();
+        assert!(
+            matches!(action, InputBarAction::SetModelProvider(provider) if provider == "openai.default")
+        );
+        assert_eq!(bar.input(), "");
+    }
+
+    #[test]
+    fn inject_explicit_skill_returns_inject_action() {
+        let mut bar = InputBarState::new();
+        bar.set_skill_catalog(vec!["code-review".into()]);
+        bar.insert_text(&format!(
+            "{} code-review inspect",
+            slash_command_name(SlashCommandKind::Skill)
+        ));
+        let action = bar.handle_inject();
+        match action {
+            InputBarAction::Inject { text, skill, .. } => {
+                assert_eq!(text.as_deref(), Some("inspect"));
+                assert_eq!(
+                    skill,
+                    Some(SkillInvocation {
+                        name: "code-review".into(),
+                        arguments: "inspect".into(),
+                    })
+                );
+            }
+            _ => panic!("expected Inject"),
+        }
     }
 
     #[test]

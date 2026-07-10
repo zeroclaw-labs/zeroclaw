@@ -295,8 +295,8 @@ fn skill_prompt_failure_content(error: &JsonRpcError) -> String {
 
 fn expand_skill_template(template: &str, arguments: &str) -> String {
     let indexed = split_command_arguments(arguments);
-    let rendered = template.replace("$ARGUMENTS", arguments);
-    let mut rendered = replace_indexed_placeholders(&rendered, &indexed);
+    let mut rendered =
+        replace_indexed_placeholders(template, &indexed).replace("$ARGUMENTS", arguments);
     if !template.contains("$ARGUMENTS")
         && !has_indexed_placeholder(template)
         && !arguments.trim().is_empty()
@@ -1649,14 +1649,15 @@ impl RpcDispatcher {
         }
         let agent_alias = match self.ctx.sessions.get_agent_alias(&req.session_id).await {
             Some(alias) => alias,
-            None => {
-                let _ = self.rehydrate_reaped_session(&req.session_id).await;
-                self.ctx
+            None => match self.rehydrate_reaped_session(&req.session_id).await {
+                Some(_) => self
+                    .ctx
                     .sessions
                     .get_agent_alias(&req.session_id)
                     .await
-                    .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?
-            }
+                    .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?,
+                None => return Err(rpc_err(SESSION_NOT_FOUND, "Session not found")),
+            },
         };
         let config = self.ctx.config.read().clone();
         let skill = crate::skills::load_skills_for_agent_from_config(&config, &agent_alias)
@@ -1668,9 +1669,16 @@ impl RpcDispatcher {
                     format!("Skill not found for agent `{agent_alias}`: {skill_name}"),
                 )
             })?;
+        let prompt = render_skill_prompt(&skill, &req.arguments);
+        if prompt.trim().is_empty() && req.attachments.is_empty() {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!("Skill `{skill_name}` rendered an empty prompt"),
+            ));
+        }
         Ok(SessionPromptParams {
             session_id: req.session_id,
-            prompt: render_skill_prompt(&skill, &req.arguments),
+            prompt,
             attachments: req.attachments,
         })
     }
@@ -7844,6 +7852,30 @@ mod tests {
         assert_eq!(value["params"]["session_id"], "gone-id");
     }
 
+    #[test]
+    fn expand_skill_template_keeps_arguments_dollar_literals() {
+        assert_eq!(
+            expand_skill_template("Please $ARGUMENTS", "use $1 dollars"),
+            "Please use $1 dollars"
+        );
+    }
+
+    #[test]
+    fn expand_skill_template_replaces_indexed_before_raw_arguments() {
+        assert_eq!(
+            expand_skill_template("First: $1\nRaw: $ARGUMENTS", "alpha $1"),
+            "First: alpha\nRaw: alpha $1"
+        );
+    }
+
+    #[test]
+    fn expand_skill_template_appends_arguments_without_placeholders() {
+        assert_eq!(
+            expand_skill_template("Review this", "diff"),
+            "Review this\n\ndiff"
+        );
+    }
+
     #[tokio::test]
     async fn session_skill_prompt_on_missing_session_emits_turn_complete_failed() {
         let tmp = tempfile::TempDir::new().expect("create temp dir");
@@ -7933,6 +7965,48 @@ mod tests {
             .as_str()
             .expect("turn_complete content must be text");
         assert!(content.contains("Skill not found for agent `test-agent`: not-installed"));
+    }
+
+    #[tokio::test]
+    async fn session_skill_prompt_notification_for_empty_prompt_completes_turn() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let config = make_acp_test_config(&tmp);
+        let workspace = tmp.path().to_string_lossy().to_string();
+        let skill_dir = config
+            .agent_workspace_dir("test-agent")
+            .join("skills")
+            .join("blank-skill");
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            "[skill]\nname = \"blank-skill\"\ndescription = \"\"\n",
+        )
+        .expect("write blank skill");
+        crate::skills::cache::invalidate();
+        let (mut dispatcher, mut rx, sessions) = make_dispatcher_with_capture(config);
+        dispatcher.authenticated = true;
+        insert_minimal_session(&sessions, "notify-empty-skill", "test-agent", &workspace).await;
+
+        dispatcher
+            .process_line_for_test(
+                &json!({
+                    "jsonrpc": JSONRPC_VERSION,
+                    "method": "session/skill_prompt",
+                    "params": {
+                        "session_id": "notify-empty-skill",
+                        "skill": "blank-skill"
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+
+        let value = captured_turn_complete_from_rx(&mut rx).await;
+        assert_eq!(value["params"]["session_id"], "notify-empty-skill");
+        let content = value["params"]["content"]
+            .as_str()
+            .expect("turn_complete content must be text");
+        assert!(content.contains("Skill `blank-skill` rendered an empty prompt"));
     }
 
     #[tokio::test]
