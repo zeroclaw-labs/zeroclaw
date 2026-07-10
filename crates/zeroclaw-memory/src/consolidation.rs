@@ -100,16 +100,18 @@ pub async fn consolidate_turn(
     let result: ConsolidationResult = parse_consolidation_response(&raw, &turn_text);
 
     // Phase 1: Write history entry to Daily category.
-    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let history_key = format!("daily_{date}_{}", uuid::Uuid::new_v4());
-    memory
-        .store(
-            &history_key,
-            &result.history_entry,
-            MemoryCategory::Daily,
-            None,
-        )
-        .await?;
+    //
+    // Gated two ways, independently of the Phase-2 Core dedup (which is
+    // governed by `dedup_on_write`):
+    //   - `consolidate_daily = false` disables the per-turn Daily write
+    //     entirely (Core fact extraction below still runs).
+    //   - `daily_dedup = true` (default) skips the write when an exact or
+    //     near-identical Daily summary already exists, so ordinary question
+    //     turns do not accumulate near-duplicate transient rows on an
+    //     append-only backend.
+    if memory_config.consolidate_daily {
+        write_daily_history(memory, memory_config, &result.history_entry).await?;
+    }
 
     // Phase 2: Write memory update to Core category (if present).
     if let Some(ref update) = result.memory_update
@@ -219,6 +221,56 @@ pub async fn consolidate_turn(
     Ok(())
 }
 
+/// Write the per-turn Daily history summary, applying the `daily_dedup` gate.
+///
+/// When `daily_dedup` is on (default), recalls recent Daily entries and skips
+/// the write if the incoming summary is an exact or near-identical duplicate
+/// (see [`dedup::should_write_daily`]). A blank summary is always skipped. This
+/// keeps the transient Daily log from accumulating near-duplicate rows on an
+/// append-only backend without touching the Phase-2 Core dedup path.
+async fn write_daily_history(
+    memory: &dyn Memory,
+    memory_config: &MemoryConfig,
+    history_entry: &str,
+) -> anyhow::Result<()> {
+    if memory_config.daily_dedup {
+        // Recall recent entries similar to this summary; keep only Daily
+        // candidates. Recall failures must not drop the write - fall back to
+        // inserting (fail-open) so a transient recall error never silently
+        // loses history.
+        let candidates = match memory.recall(history_entry, 10, None, None, None).await {
+            Ok(entries) => dedup::daily_candidates(entries),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "daily dedup recall failed; inserting without dedup"
+                );
+                Vec::new()
+            }
+        };
+        match dedup::should_write_daily(&candidates, history_entry, memory_config) {
+            dedup::DailyWrite::Insert => {}
+            dedup::DailyWrite::Skip { dup_of } => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"duplicate_of": dup_of})),
+                    "memory consolidation skipped duplicate daily history entry"
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let history_key = format!("daily_{date}_{}", uuid::Uuid::new_v4());
+    memory
+        .store(&history_key, history_entry, MemoryCategory::Daily, None)
+        .await
+}
+
 /// Parse the LLM's consolidation response, with fallback for malformed JSON.
 fn parse_consolidation_response(raw: &str, fallback_text: &str) -> ConsolidationResult {
     // Try to extract JSON from the response (LLM may wrap in markdown code blocks).
@@ -255,6 +307,93 @@ fn parse_consolidation_response(raw: &str, fallback_text: &str) -> Consolidation
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sqlite::SqliteMemory;
+    use tempfile::TempDir;
+
+    async fn daily_row_count(mem: &SqliteMemory) -> usize {
+        mem.list(Some(&MemoryCategory::Daily), None)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_turns_do_not_accumulate_daily_rows() {
+        // With the default gate (daily_dedup on), writing the same summary
+        // several times must leave exactly one Daily row.
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let cfg = MemoryConfig::default();
+        assert!(cfg.daily_dedup);
+
+        for _ in 0..4 {
+            write_daily_history(&mem, &cfg, "User asked what time it is")
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            daily_row_count(&mem).await,
+            1,
+            "identical turn summaries must be deduplicated to a single Daily row"
+        );
+    }
+
+    #[tokio::test]
+    async fn dedup_off_writes_every_turn() {
+        // daily_dedup off restores the old unconditional-append behavior.
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let cfg = MemoryConfig {
+            daily_dedup: false,
+            ..MemoryConfig::default()
+        };
+
+        for _ in 0..3 {
+            write_daily_history(&mem, &cfg, "User asked what time it is")
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(daily_row_count(&mem).await, 3);
+    }
+
+    #[tokio::test]
+    async fn consolidate_daily_off_writes_no_daily_row() {
+        // The top-level toggle skips the Daily write entirely. Mirror the
+        // gate consolidate_turn applies (it calls write_daily_history only when
+        // consolidate_daily is true).
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let cfg = MemoryConfig {
+            consolidate_daily: false,
+            ..MemoryConfig::default()
+        };
+
+        if cfg.consolidate_daily {
+            write_daily_history(&mem, &cfg, "User asked what time it is")
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(daily_row_count(&mem).await, 0);
+    }
+
+    #[tokio::test]
+    async fn novel_summaries_still_write_distinct_rows() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let cfg = MemoryConfig::default();
+
+        write_daily_history(&mem, &cfg, "User asked what time it is")
+            .await
+            .unwrap();
+        write_daily_history(&mem, &cfg, "User configured a Postgres memory backend")
+            .await
+            .unwrap();
+
+        assert_eq!(daily_row_count(&mem).await, 2);
+    }
 
     #[test]
     fn parse_valid_json_response() {
