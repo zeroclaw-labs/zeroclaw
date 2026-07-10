@@ -162,7 +162,7 @@ cooldown_secs = 300
 
 [[triggers]]
 type = "amqp"
-routing_key = "org.fedoraproject.prod.*
+routing_key = "org.fedoraproject.prod.*"
 condition = "$.msg.new != \"\""
 ```
 
