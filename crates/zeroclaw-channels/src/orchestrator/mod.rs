@@ -135,10 +135,10 @@ use zeroclaw_memory::{self, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
-    LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    ToolLoop, apply_policy_tool_filter, apply_text_tool_prompt_policy,
+    LoopKnobs, LoopTurnGuard, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
+    ResolvedRuntimeKnobs, ToolLoop, apply_policy_tool_filter, apply_text_tool_prompt_policy,
     build_tool_instructions_for_names, clear_model_switch_request, eager_mcp_tool_allowed,
-    get_model_switch_state, is_model_switch_requested, LoopTurnGuard, mcp_tool_access_policy,
+    get_model_switch_state, is_model_switch_requested, mcp_tool_access_policy,
     register_eager_mcp_tool_if_allowed, run_tool_call_loop, scope_session_key, scope_thread_id,
     scrub_credentials,
 };
