@@ -5,6 +5,10 @@ pub enum MemoryBackendKind {
     Postgres,
     Qdrant,
     Markdown,
+    /// External Hindsight HTTP API (server-side vectorization). Selected via
+    /// the install-wide `[memory] backend = "hindsight"` string; the per-agent
+    /// factory (`create_memory_for_agent`) builds it directly from env.
+    Hindsight,
     None,
     Unknown,
 }
@@ -74,6 +78,15 @@ const NONE_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     optional_dependency: false,
 };
 
+const HINDSIGHT_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
+    key: "hindsight",
+    label: "Hindsight — external HTTP memory with server-side vectorization",
+    auto_save_default: true,
+    uses_sqlite_hygiene: false,
+    sqlite_based: false,
+    optional_dependency: false,
+};
+
 const CUSTOM_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "custom",
     label: "Custom backend — extension point",
@@ -106,6 +119,7 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
         "postgres" => MemoryBackendKind::Postgres,
         "qdrant" => MemoryBackendKind::Qdrant,
         "markdown" => MemoryBackendKind::Markdown,
+        "hindsight" => MemoryBackendKind::Hindsight,
         "none" => MemoryBackendKind::None,
         _ => MemoryBackendKind::Unknown,
     }
@@ -118,6 +132,7 @@ pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
         MemoryBackendKind::Postgres => POSTGRES_PROFILE,
         MemoryBackendKind::Qdrant => QDRANT_PROFILE,
         MemoryBackendKind::Markdown => MARKDOWN_PROFILE,
+        MemoryBackendKind::Hindsight => HINDSIGHT_PROFILE,
         MemoryBackendKind::None => NONE_PROFILE,
         MemoryBackendKind::Unknown => CUSTOM_PROFILE,
     }
