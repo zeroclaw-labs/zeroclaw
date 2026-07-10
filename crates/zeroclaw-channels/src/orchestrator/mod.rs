@@ -112,15 +112,18 @@ pub use zeroclaw_infra::stall_watchdog::StallWatchdog;
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use portable_atomic::{AtomicU64, Ordering};
+use pulldown_cmark::{Event, Options as MarkdownOptions, Parser as MarkdownParser, Tag};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
@@ -902,6 +905,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
             "When responding on WhatsApp Web:\n\
              - Be concise and direct\n\
              - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
+             - To send a native location pin, use marker: [LOCATION:<latitude>,<longitude>,<name>,<address>] where name and address are optional. Double-quote the name if it contains commas; the trailing address may contain commas without quoting.\n\
              - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
              - Do not use http://, https://, data:, file:, or any other URL scheme in WhatsApp Web media markers.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
@@ -2006,6 +2010,66 @@ fn set_scope_override(
     }
 }
 
+/// Per-sender authorization for `/model --agent <model>`. Resolves live
+/// from `Config::peer_groups` via `Config::channel_agent_scope_admins`;
+/// no cache, no per-channel duplicate sender list (consistent with
+/// `AGENTS.md` SINGLE SOURCE OF TRUTH). Default deny
+/// (`RequireExplicit`); operators who want the prior behavior opt in
+/// by marking one or more peer groups `admin_for_agent_scope = true`.
+/// See issue #8044.
+///
+/// **Effective-on-restart semantics:** this gate reads
+/// `ctx.prompt_config`, an `Arc<Config>` snapshot captured when the
+/// runtime context was built. A `peer_groups` edit in `config.toml`
+/// therefore takes effect on context rebuild / daemon restart, not on
+/// the next command — same lifetime as the other `prompt_config`-backed
+/// orchestrator helpers. (The `channel_external_peers` sibling reads a
+/// live `RwLock` for inbound dispatch because the gateway constructs
+/// fresh `peer_resolver` closures per alias; the orchestrator's runtime
+/// context is built once at startup and uses the snapshot path.)
+///
+/// Matching routes through `crate::allowlist::is_user_allowed` so the
+/// gate honors the same wildcard (`["*"]` admits anyone) and per-channel
+/// peer-identity semantics every inbound channel uses, instead of a raw
+/// `==` that ignores wildcard, case, and the leading `@` Telegram strips
+/// before comparison. Both the configured peer list and the incoming
+/// sender are normalized through [`normalize_peer_username`] (strip a
+/// leading `@`, ASCII-lowercase) so an operator who writes
+/// `external_peers = ["@user_1"]` is matched by an inbound `user_1`
+/// sender — matching what every channel's inbound path does before
+/// calling `is_user_allowed`.
+fn is_agent_scope_authorized(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    let channel_type = msg.channel.as_str();
+    let channel_alias = msg.channel_alias.as_deref().unwrap_or(msg.channel.as_str());
+    let agent_alias = ctx.agent_alias.as_str();
+    let admins: Vec<String> = ctx
+        .prompt_config
+        .channel_agent_scope_admins(channel_type, channel_alias, agent_alias)
+        .into_iter()
+        .map(|p| normalize_peer_username(&p))
+        .collect();
+    let sender = normalize_peer_username(msg.sender.as_str());
+    crate::allowlist::is_user_allowed(&admins, &sender, crate::allowlist::Match::Sensitive)
+}
+
+/// Canonical peer-username form used by the agent-scope gate. Inbound
+/// channels (Telegram: `Self::normalize_identity`; IRC: `Match::CaseInsensitive`;
+/// Matrix: same) already collapse the inbound sender into a stripped /
+/// case-folded identity before calling `allowlist::is_user_allowed`. The
+/// gate must apply the same shape to the configured `external_peers`
+/// list so an operator's `"@user_1"` / `"user_1"` / `"@Alice"` entries
+/// all match the same channel-normalized sender identity.
+///
+/// Kept local to this module so any future per-channel nuance (E.164
+/// phone, email domain) can be plumbed explicitly through
+/// `allowlist::is_user_allowed_by` rather than overloading this helper.
+fn normalize_peer_username(raw: &str) -> String {
+    raw.trim_start_matches('@').to_ascii_lowercase()
+}
+
 fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
     ctx.conversation_histories
         .lock()
@@ -2773,12 +2837,57 @@ async fn handle_runtime_command_if_needed(
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
                 "Model ID cannot be empty. Use `/model --user|--agent <model-id>`.".to_string()
+            } else if scope == OverrideScope::Agent && !is_agent_scope_authorized(ctx, msg) {
+                // Per-sender authorization gate for the `--agent` scope only.
+                // `/model --user` is unaffected. See issue #8044.
+                let channel_alias = msg.channel_alias.as_deref().unwrap_or(msg.channel.as_str());
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "sender": msg.sender.as_str(),
+                            "agent": ctx.agent_alias.as_str(),
+                            "channel": msg.channel.as_str(),
+                            "channel_alias": channel_alias,
+                            "model_requested": model.as_str(),
+                            "command": "/model --agent",
+                        })),
+                    "agent-scope /model override rejected"
+                );
+                zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-runtime-agent-scope-rejected",
+                    &[
+                        ("sender", msg.sender.as_str()),
+                        ("agent", ctx.agent_alias.as_str()),
+                        ("model", model.as_str()),
+                    ],
+                )
             } else {
                 // Resolve provider+model the same way bare `/model` does, then
                 // write it at the requested scope instead of the per-sender route.
                 let mut next = current.clone();
                 apply_model_ref(&mut next, &ctx.model_routes, &model);
                 set_scope_override(ctx, scope, msg, next.clone(), &defaults_snapshot);
+                if scope == OverrideScope::Agent {
+                    let channel_alias =
+                        msg.channel_alias.as_deref().unwrap_or(msg.channel.as_str());
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Approve)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "sender": msg.sender.as_str(),
+                                "agent": ctx.agent_alias.as_str(),
+                                "channel": msg.channel.as_str(),
+                                "channel_alias": channel_alias,
+                                "model_provider": next.model_provider.as_str(),
+                                "model": next.model.as_str(),
+                                "command": "/model --agent",
+                            })),
+                        "agent-scope /model override accepted"
+                    );
+                }
                 let mut resp = format!(
                     "Model set to `{}` (model_provider: `{}`) for the **{}** scope. Session-only — resets on restart.",
                     next.model,
@@ -3388,7 +3497,52 @@ fn should_suppress_top_level_tool_protocol_response(
     zeroclaw_tool_call_parser::looks_like_tool_protocol_envelope(response)
 }
 
+#[cfg(test)]
 fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+    sanitize_channel_response_with_leak_detection(
+        response,
+        tools,
+        &zeroclaw_config::schema::LeakDetectionConfig::default(),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundContentFormat {
+    Markdown,
+    PlainText,
+}
+
+fn outbound_content_format_for_channel(channel: &str) -> OutboundContentFormat {
+    let channel_type = channel
+        .split_once('.')
+        .map_or(channel, |(channel_type, _)| channel_type);
+    if channel_type.eq_ignore_ascii_case("irc") || channel_type.eq_ignore_ascii_case("twitch") {
+        OutboundContentFormat::PlainText
+    } else {
+        OutboundContentFormat::Markdown
+    }
+}
+
+#[cfg(test)]
+fn sanitize_channel_response_with_leak_detection(
+    response: &str,
+    tools: &[Box<dyn Tool>],
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+) -> String {
+    sanitize_channel_response_for_format_with_leak_detection(
+        response,
+        tools,
+        leak_detection,
+        OutboundContentFormat::Markdown,
+    )
+}
+
+fn sanitize_channel_response_for_format_with_leak_detection(
+    response: &str,
+    tools: &[Box<dyn Tool>],
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    content_format: OutboundContentFormat,
+) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
@@ -3417,9 +3571,25 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     // Strip leading narration lines that announce tool usage
     let sanitized = strip_tool_narration(&stripped_json);
 
-    // Scan for credential leaks before returning to caller
-    match zeroclaw_runtime::security::LeakDetector::new().scan(&sanitized) {
-        zeroclaw_runtime::security::LeakResult::Clean => sanitized,
+    redact_channel_outbound_leaks(&sanitized, leak_detection, content_format)
+}
+
+fn redact_channel_outbound_leaks(
+    content: &str,
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    content_format: OutboundContentFormat,
+) -> String {
+    if !leak_detection.enabled {
+        return content.to_string();
+    }
+    // Scan for credential leaks before returning to caller. Format-specific
+    // outbound layers identify parsed destinations that must remain intact and
+    // pass only byte ranges to the format-agnostic detector.
+    let protected_spans = channel_outbound_protected_spans(content, content_format);
+    match zeroclaw_runtime::security::LeakDetector::with_config(leak_detection)
+        .scan_with_protected_spans(content, &protected_spans)
+    {
+        zeroclaw_runtime::security::LeakResult::Clean => content.to_string(),
         zeroclaw_runtime::security::LeakResult::Detected { patterns, redacted } => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -3430,6 +3600,201 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
             );
             redacted
         }
+    }
+}
+
+fn channel_outbound_protected_spans(
+    content: &str,
+    content_format: OutboundContentFormat,
+) -> Vec<Range<usize>> {
+    let mut spans = Vec::new();
+    // A file URI is a file reference even when punctuation inside it looks
+    // like query syntax; protect it for every outbound text format.
+    if content
+        .as_bytes()
+        .windows(b"file:".len())
+        .any(|window| window.eq_ignore_ascii_case(b"file:"))
+    {
+        collect_raw_file_uri_spans(content, &mut spans);
+    }
+    match content_format {
+        OutboundContentFormat::Markdown => {
+            if content.contains("](")
+                || content.contains("]:")
+                || (content.contains('<') && content.contains("://"))
+            {
+                collect_markdown_link_destination_spans(content, &mut spans);
+            }
+        }
+        OutboundContentFormat::PlainText => {}
+    }
+    spans
+}
+
+fn collect_markdown_link_destination_spans(content: &str, spans: &mut Vec<Range<usize>>) {
+    let parser = MarkdownParser::new_ext(content, MarkdownOptions::empty());
+
+    for (_, link_def) in parser.reference_definitions().iter() {
+        if let Some(span) =
+            parsed_destination_span(content, link_def.span.clone(), link_def.dest.as_ref())
+        {
+            spans.push(span);
+        }
+    }
+
+    for (event, range) in parser.into_offset_iter() {
+        if let Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. }) = event
+            && let Some(span) = parsed_destination_span(content, range, dest_url.as_ref())
+        {
+            spans.push(span);
+        }
+    }
+}
+
+fn parsed_destination_span(
+    content: &str,
+    source_range: Range<usize>,
+    parsed_destination: &str,
+) -> Option<Range<usize>> {
+    if parsed_destination.is_empty() {
+        return None;
+    }
+    let source = content.get(source_range.clone())?;
+    let search_start = destination_search_start(source);
+    decoded_destination_span(source, search_start, parsed_destination)
+        .map(|span| source_range.start + span.start..source_range.start + span.end)
+}
+
+fn destination_search_start(source: &str) -> usize {
+    source
+        .find("](")
+        .map(|idx| idx + 2)
+        .or_else(|| source.find("]:").map(|idx| idx + 2))
+        .unwrap_or(0)
+}
+
+fn decoded_destination_span(
+    source: &str,
+    search_start: usize,
+    parsed_destination: &str,
+) -> Option<Range<usize>> {
+    for (offset, _) in source[search_start..].char_indices() {
+        let start = search_start + offset;
+        if let Some(end) = decoded_match_end(&source[start..], parsed_destination) {
+            return Some(start..start + end);
+        }
+    }
+    None
+}
+
+fn decoded_match_end(raw: &str, parsed: &str) -> Option<usize> {
+    let mut raw_idx = 0;
+
+    for expected in parsed.chars() {
+        let ch = raw[raw_idx..].chars().next()?;
+        let (decoded, end) = if ch == '\\' {
+            let escaped_idx = raw_idx + ch.len_utf8();
+            let next_ch = raw[escaped_idx..].chars().next()?;
+            if !next_ch.is_ascii_punctuation() {
+                return None;
+            }
+            (next_ch, escaped_idx + next_ch.len_utf8())
+        } else if ch == '&' {
+            decode_markdown_entity(raw, raw_idx)?
+        } else {
+            (ch, raw_idx + ch.len_utf8())
+        };
+
+        if decoded != expected {
+            return None;
+        }
+        raw_idx = end;
+    }
+
+    Some(raw_idx)
+}
+
+fn decode_markdown_entity(raw: &str, amp_idx: usize) -> Option<(char, usize)> {
+    let entity_end = raw[amp_idx..].find(';')? + amp_idx + 1;
+    let entity = &raw[amp_idx + 1..entity_end - 1];
+    let decoded = match entity {
+        "amp" | "AMP" => '&',
+        "lt" | "LT" => '<',
+        "gt" | "GT" => '>',
+        "quot" | "QUOT" => '"',
+        "apos" | "APOS" => '\'',
+        "colon" | "COLON" => ':',
+        "sol" | "SOL" => '/',
+        _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+            let value = u32::from_str_radix(&entity[2..], 16).ok()?;
+            char::from_u32(value)?
+        }
+        _ if entity.starts_with('#') => {
+            let value = entity[1..].parse::<u32>().ok()?;
+            char::from_u32(value)?
+        }
+        _ => return None,
+    };
+    Some((decoded, entity_end))
+}
+
+fn collect_raw_file_uri_spans(content: &str, spans: &mut Vec<Range<usize>>) {
+    let mut token_start = None;
+
+    for (idx, ch) in content.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(start) = token_start.take() {
+                collect_file_uri_token_span(content, start, idx, spans);
+            }
+        } else {
+            token_start.get_or_insert(idx);
+        }
+    }
+
+    if let Some(start) = token_start {
+        collect_file_uri_token_span(content, start, content.len(), spans);
+    }
+}
+
+fn collect_file_uri_token_span(
+    content: &str,
+    token_start: usize,
+    token_end: usize,
+    spans: &mut Vec<Range<usize>>,
+) {
+    let token = &content[token_start..token_end];
+    let trimmed_start = token
+        .char_indices()
+        .find(|(_, ch)| !matches!(ch, '<' | '(' | '[' | '{' | '"' | '\''))
+        .map_or(token.len(), |(idx, _)| idx);
+    let trimmed_end = token
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| {
+            !matches!(
+                ch,
+                '>' | ')' | ']' | '}' | '"' | '\'' | '.' | ',' | ';' | ':'
+            )
+        })
+        .map_or(trimmed_start, |(idx, ch)| idx + ch.len_utf8());
+
+    if trimmed_start >= trimmed_end {
+        return;
+    }
+
+    let trimmed = &token[trimmed_start..trimmed_end];
+    let Some(scheme_offset) = trimmed
+        .as_bytes()
+        .windows(b"file:".len())
+        .position(|window| window.eq_ignore_ascii_case(b"file:"))
+    else {
+        return;
+    };
+    let uri_start = trimmed_start + scheme_offset;
+    let candidate = &token[uri_start..trimmed_end];
+
+    if Url::parse(candidate).is_ok_and(|url| url.scheme().eq_ignore_ascii_case("file")) {
+        spans.push(token_start + uri_start..token_start + trimmed_end);
     }
 }
 
@@ -5190,7 +5555,17 @@ async fn process_channel_message_body(
                 result = timed_tool_loop => LlmExecutionResult::Completed(result),
             };
 
-            // Handle model switch: re-create the model_provider and retry
+            // Handle model switch: re-create the model_provider and retry.
+            //
+            // Resolves the requested provider to a configured
+            // `<type>.<alias>` ref, picks up any route-specific `api_key`
+            // from `ctx.model_routes`, then reuses `get_or_create_provider`
+            // so the new provider lands in the cache (consistent with the
+            // normal route-selection path) and is built with the proper
+            // credentials. The resolved route is persisted via
+            // `set_route_selection` only after the provider is built, so
+            // subsequent messages from this sender keep using the switched
+            // model instead of reverting to the default (#6173).
             if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result
                 && let Some((new_model_provider, new_model)) = is_model_switch_requested(e)
             {
@@ -5224,19 +5599,52 @@ async fn process_channel_message_body(
                     }
                 };
 
+                // Resolve a route-specific api_key by matching the switched
+                // provider/model against `model_routes` (the same lookup the
+                // `/model` command uses). Falls back to None so
+                // `get_or_create_provider` resolves credentials strictly from
+                // the requested provider's own config entry.
+                let resolved_api_key = ctx
+                    .model_routes
+                    .iter()
+                    .find(|r| {
+                        r.model_provider.eq_ignore_ascii_case(&new_model_provider)
+                            && (r.model.eq_ignore_ascii_case(&new_model)
+                                || r.hint.eq_ignore_ascii_case(&new_model))
+                    })
+                    .and_then(|r| r.api_key.clone());
+
                 match get_or_create_provider(
                     ctx.as_ref(),
                     &resolved_model_provider,
-                    None,
+                    resolved_api_key.as_deref(),
                     &runtime_defaults,
                 )
                 .await
                 {
                     Ok(new_prov) => {
+                        // Commit state only after the provider was built
+                        // successfully, so a failure leaves the turn on the
+                        // original provider/model pair instead of a
+                        // half-switched state.
                         active_model_provider = new_prov;
                         route.model_provider = resolved_model_provider;
                         route.model = new_model;
+                        route.api_key = resolved_api_key;
                         clear_model_switch_request();
+
+                        // Persist the route override so subsequent messages
+                        // from this sender continue using the switched model.
+                        set_route_selection(
+                            ctx.as_ref(),
+                            &history_key,
+                            ChannelRouteSelection {
+                                model_provider: route.model_provider.clone(),
+                                model: route.model.clone(),
+                                api_key: route.api_key.clone(),
+                            },
+                            &runtime_defaults,
+                        );
 
                         ctx.observer.record_event(&ObserverEvent::AgentStart {
                             model_provider: route.model_provider.clone(),
@@ -5413,8 +5821,12 @@ async fn process_channel_message_body(
                 }
             }
 
-            let sanitized_response =
-                sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
+            let sanitized_response = sanitize_channel_response_for_format_with_leak_detection(
+                &outbound_response,
+                ctx.tools_registry.as_ref(),
+                &ctx.prompt_config.security.leak_detection,
+                outbound_content_format_for_channel(&msg.channel),
+            );
             let mut delivered_response = if sanitized_response.is_empty()
                 && !outbound_response.trim().is_empty()
             {
@@ -10385,14 +10797,13 @@ pub async fn deliver_announcement(
     output: &str,
 ) -> anyhow::Result<()> {
     use zeroclaw_api::channel::SendMessage;
-    let _ = config;
 
-    // Scan for credential leaks before delivering
-    let leak_detector = zeroclaw_runtime::security::LeakDetector::new();
-    let safe_output = match leak_detector.scan(output) {
-        zeroclaw_runtime::security::LeakResult::Detected { redacted, .. } => redacted,
-        zeroclaw_runtime::security::LeakResult::Clean => output.to_string(),
-    };
+    let safe_output = redact_channel_outbound_leaks(
+        output,
+        &config.security.leak_detection,
+        outbound_content_format_for_channel(channel),
+    );
+    let safe_output = ensure_nonempty_channel_reply(safe_output, output, channel, target);
 
     let make_msg = |s: &str| SendMessage::new(s, target).in_thread(thread_id.clone());
 
@@ -15576,6 +15987,258 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    /// Regression for #6173: when a `model_switch` request is pending
+    /// (set by the `model_switch` tool during the previous tool
+    /// iteration), `process_channel_message` must:
+    ///
+    /// 1. resolve the route-specific `api_key` from `ctx.model_routes`
+    ///    when the switched provider/model matches a route entry,
+    /// 2. route provider construction through `get_or_create_provider`
+    ///    (so the new provider lands in the provider cache),
+    /// 3. persist the resolved route via `set_route_selection` so the
+    ///    next inbound message for the same sender uses the switched
+    ///    provider/model/key.
+    ///
+    /// The test pre-sets `MODEL_SWITCH_REQUEST` to simulate a previous
+    /// turn's tool call. `run_tool_call_loop` short-circuits to
+    /// `ModelSwitchRequested` on its first iteration because the
+    /// pending request already differs from the active route, exercising
+    /// the orchestrator's switch handler.
+    #[tokio::test]
+    async fn process_channel_message_persists_model_switch_with_route_credential() {
+        // Serialize on the process-wide model-switch state so this test
+        // doesn't race other tests that also touch the same static.
+        // `tokio::sync::Mutex` is held across the awaits below; the
+        // `OnceLock` wrapper gives us a `'static` initializer in a
+        // `static` context without `lazy_static`.
+        static MODEL_SWITCH_TEST_GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+        let _guard = MODEL_SWITCH_TEST_GUARD
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        clear_model_switch_request();
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let default_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
+        let switched_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let switched_model_provider: Arc<dyn ModelProvider> = switched_model_provider_impl.clone();
+
+        // The switch handler resolves the requested provider `openrouter` to
+        // a configured `<type>.<alias>` ref via
+        // `resolve_provider_ref_for_runtime_switch`, so the provider that is
+        // built, cached, and persisted is the dotted form.
+        let switched_provider_ref = "openrouter.default";
+        let switched_key = Some("route-specific-key");
+
+        // Seed the provider cache so `get_or_create_provider` returns our
+        // mock for the switched provider instead of constructing a real one.
+        // The cache key hashes the route-specific api_key together with the
+        // resolved (dotted) provider ref at the current (startup) generation.
+        let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        provider_cache_seed.insert(
+            "test-provider".to_string(),
+            Arc::clone(&default_model_provider),
+        );
+        provider_cache_seed.insert(
+            provider_cache_key(switched_provider_ref, switched_key, 0),
+            Arc::clone(&switched_model_provider),
+        );
+
+        let model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".to_string(),
+            model_provider: "openrouter".to_string(),
+            model: "switched-model".to_string(),
+            api_key: Some("route-specific-key".to_string()),
+        }];
+
+        // `resolve_provider_ref_for_runtime_switch` resolves `openrouter`
+        // against the configured providers, so the prompt config must define
+        // the `openrouter.default` entry for the switch to resolve and build.
+        let prompt_config = {
+            let mut cfg = zeroclaw_config::schema::Config::default();
+            {
+                let entry = cfg
+                    .providers
+                    .models
+                    .ensure("openrouter", "default")
+                    .expect("openrouter.default provider slot must be creatable");
+                entry.api_key = Some("config-openrouter-key".to_string());
+                entry.model = Some("switched-model".to_string());
+            }
+            Arc::new(cfg)
+        };
+
+        // Pre-set the model_switch request — simulates the tool having
+        // been called on a previous turn and waiting to be consumed.
+        {
+            let state = get_model_switch_state();
+            let mut guard = state.lock().unwrap();
+            *guard = Some(("openrouter".to_string(), "switched-model".to_string()));
+        }
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::clone(&default_model_provider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::clone(&prompt_config),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(model_routes),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-switch-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "trigger model switch".to_string(),
+                subject: None,
+                channel: "telegram".to_string(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        // After the switch handler runs, the route override must be
+        // persisted for this sender with the resolved api_key.
+        let route_key = "telegram_chat-1_alice";
+        let persisted = runtime_ctx
+            .route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(route_key)
+            .cloned()
+            .expect(
+                "switch handler must persist a route override under the sender's history key \
+                 (this is the regression #6173 — previously the new model was used only for \
+                 the current turn and the next inbound message reverted to the default)",
+            );
+        assert_eq!(persisted.model_provider, switched_provider_ref);
+        assert_eq!(persisted.model, "switched-model");
+        assert_eq!(
+            persisted.api_key.as_deref(),
+            Some("route-specific-key"),
+            "the route-specific api_key from model_routes must be persisted, \
+             not the global key or None — otherwise the next turn loses route auth"
+        );
+
+        // Send a second message from the same sender, with no pending
+        // model_switch this time. The persisted route override must be
+        // honored — `get_route_selection` should return the switched
+        // route and the switched provider should handle the request.
+        let calls_before = switched_model_provider_impl
+            .call_count
+            .load(Ordering::SeqCst);
+        process_channel_message(
+            runtime_ctx.clone(),
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-switch-2".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "follow-up after switch".to_string(),
+                subject: None,
+                channel: "telegram".to_string(),
+                channel_alias: None,
+                timestamp: 2,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls_after = switched_model_provider_impl
+            .call_count
+            .load(Ordering::SeqCst);
+        assert!(
+            calls_after > calls_before,
+            "follow-up message must be served by the switched provider (the persisted \
+             route override), not by the original default provider"
+        );
+
+        // Clean up shared global state so we don't leak into other tests.
+        clear_model_switch_request();
+    }
+
     #[tokio::test]
     async fn process_channel_message_uses_classifier_provider_for_precheck_model_selection() {
         let channel_impl = Arc::new(RecordingChannel::default());
@@ -18825,6 +19488,491 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(parse_runtime_command("telegram", "/clear all"), None);
     }
 
+    // Build a ChannelRuntimeContext with a Config that has peer_groups
+    // populated for the agent-scope authorization tests below. Mirrors
+    // `channel_runtime_context_for_defaults_test` but lets the caller
+    // inject a pre-built peer_groups map. See issue #8044.
+    fn channel_runtime_context_with_peer_groups(
+        zeroclaw_dir: &std::path::Path,
+        peer_groups: std::collections::HashMap<
+            String,
+            zeroclaw_config::multi_agent::PeerGroupConfig,
+        >,
+    ) -> ChannelRuntimeContext {
+        let prompt_config = zeroclaw_config::schema::Config {
+            peer_groups,
+            ..Default::default()
+        };
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            zeroclaw_dir,
+            "agentX",
+            "openrouter.default",
+            "config-default-model",
+        );
+        ctx.prompt_config = Arc::new(prompt_config);
+        ctx
+    }
+
+    fn agent_scope_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: sender.into(),
+            reply_target: "chan-1".into(),
+            channel: "discord".into(),
+            channel_alias: Some("clamps".into()),
+            thread_ts: None,
+            content: "/model --agent gpt-4o".into(),
+            ..Default::default()
+        }
+    }
+
+    fn user_scope_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: sender.into(),
+            reply_target: "chan-1".into(),
+            channel: "discord".into(),
+            channel_alias: Some("clamps".into()),
+            thread_ts: None,
+            content: "/model --user gpt-4o".into(),
+            ..Default::default()
+        }
+    }
+
+    fn peer_group(
+        channel: &str,
+        members: &[&str],
+        admin_for_agent_scope: bool,
+    ) -> zeroclaw_config::multi_agent::PeerGroupConfig {
+        use zeroclaw_config::multi_agent::{
+            AgentAlias, OutputModality, PeerGroupConfig, PeerUsername,
+        };
+        PeerGroupConfig {
+            channel: zeroclaw_config::providers::ChannelRef(channel.into()),
+            agents: Vec::<AgentAlias>::new(),
+            external_peers: members
+                .iter()
+                .map(|s| PeerUsername(s.to_string()))
+                .collect(),
+            ignore: Vec::new(),
+            output_modality: OutputModality::default(),
+            admin_for_agent_scope,
+        }
+    }
+
+    #[test]
+    fn set_model_scoped_agent_allowed_for_listed_admin() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice", "ops"], true),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(is_agent_scope_authorized(&ctx, &agent_scope_msg("alice")));
+        assert!(is_agent_scope_authorized(&ctx, &agent_scope_msg("ops")));
+    }
+
+    #[test]
+    fn set_model_scoped_agent_rejected_for_non_admin_member() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        // Same peer group as the admin test, but the admin flag is OFF.
+        groups.insert(
+            "discord_users".into(),
+            peer_group("discord.clamps", &["alice", "ops"], false),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(!is_agent_scope_authorized(&ctx, &agent_scope_msg("alice")));
+        assert!(!is_agent_scope_authorized(&ctx, &agent_scope_msg("ops")));
+        // Even an unknown sender is rejected (not silently allowed).
+        assert!(!is_agent_scope_authorized(
+            &ctx,
+            &agent_scope_msg("mallory")
+        ));
+    }
+
+    #[test]
+    fn set_model_scoped_agent_rejected_when_no_peer_groups_configured() {
+        // Default config has no peer_groups — default deny.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx =
+            channel_runtime_context_with_peer_groups(tmp.path(), std::collections::HashMap::new());
+
+        assert!(!is_agent_scope_authorized(&ctx, &agent_scope_msg("alice")));
+    }
+
+    #[test]
+    fn set_model_scoped_user_unaffected_by_agent_scope_authz() {
+        // The helper is only invoked on the Agent branch; this test pins
+        // that `/model --user` does not even consult the helper. We
+        // assert by behavior: the helper is gated on OverrideScope::Agent
+        // in `handle_runtime_command_if_needed`, so for the User case
+        // no authorization check runs and the override is written.
+        // Here we simply verify that even when the sender is not an
+        // admin, the auth helper treats them neutrally — i.e. the gate
+        // is on the dispatch site, not the helper itself.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx =
+            channel_runtime_context_with_peer_groups(tmp.path(), std::collections::HashMap::new());
+        // For the User branch the helper is not consulted, so this
+        // negative assertion is structural: the gate sits at the
+        // SetModelScoped dispatch point, not in this helper.
+        assert!(!is_agent_scope_authorized(&ctx, &user_scope_msg("alice")));
+    }
+
+    #[test]
+    fn channel_agent_scope_admins_filters_by_admin_flag() {
+        // The resolver itself honors `admin_for_agent_scope = true`
+        // only — build a `Config` with one admin-flagged group and one
+        // unflagged group covering the same channel; the admin-flagged
+        // group must surface while the unflagged group must not.
+        // (Note: the orchestrator gate reads through a snapshot of this
+        // `Config`, so operator edits become visible after restart — see
+        // `is_agent_scope_authorized` docstring.)
+        use zeroclaw_config::schema::Config;
+        let mut config = Config::default();
+        config.peer_groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice", "ops"], true),
+        );
+        config.peer_groups.insert(
+            "discord_users".into(),
+            peer_group("discord.clamps", &["bob", "carol"], false),
+        );
+        let admins = config.channel_agent_scope_admins("discord", "clamps", "agentX");
+        assert_eq!(admins, vec!["alice".to_string(), "ops".to_string()]);
+    }
+
+    /// Round-3 contract: when a peer group's `agents` list is non-empty,
+    /// the admin privilege is granted only for `agent_alias` values that
+    /// appear in that list. This pins the agent-bound semantics added in
+    /// round 3; without it, dropping or inverting the `agent_alias` filter
+    /// would not regress any existing test (because every prior fixture
+    /// constructs `agents: Vec::new()`, which falls through the legacy
+    /// channel-wide path).
+    fn peer_group_with_agents(
+        channel: &str,
+        members: &[&str],
+        admin_for_agent_scope: bool,
+        agents: &[&str],
+    ) -> zeroclaw_config::multi_agent::PeerGroupConfig {
+        use zeroclaw_config::multi_agent::{
+            AgentAlias, OutputModality, PeerGroupConfig, PeerUsername,
+        };
+        PeerGroupConfig {
+            channel: zeroclaw_config::providers::ChannelRef(channel.into()),
+            agents: agents.iter().map(|a| AgentAlias::new(*a)).collect(),
+            external_peers: members
+                .iter()
+                .map(|s| PeerUsername(s.to_string()))
+                .collect(),
+            ignore: Vec::new(),
+            output_modality: OutputModality::default(),
+            admin_for_agent_scope,
+        }
+    }
+
+    #[test]
+    fn channel_agent_scope_admins_filters_by_agents_list_when_non_empty() {
+        // The same admin peer is granted the privilege for `agentX`
+        // (because `agents = ["agentX"]` includes it) and denied for
+        // `agentY` (because `agentY` is not in the list). The peer is
+        // also denied for `agentX` if the group is constructed with an
+        // empty `agents` list (the legacy channel-wide path), which is
+        // pinned separately below.
+        use zeroclaw_config::schema::Config;
+        let mut config = Config::default();
+        config.peer_groups.insert(
+            "discord_admins".into(),
+            peer_group_with_agents("discord.clamps", &["alice"], true, &["agentX"]),
+        );
+
+        let for_x = config.channel_agent_scope_admins("discord", "clamps", "agentX");
+        assert_eq!(
+            for_x,
+            vec!["alice".to_string()],
+            "agentX is in agents=[agentX], so alice must surface"
+        );
+
+        let for_y = config.channel_agent_scope_admins("discord", "clamps", "agentY");
+        assert!(
+            for_y.is_empty(),
+            "agentY is NOT in agents=[agentX], so the group must be filtered out"
+        );
+    }
+
+    #[test]
+    fn channel_agent_scope_admins_empty_agents_list_means_channel_wide() {
+        // Backward-compatible legacy: an empty `agents` list means the
+        // admin privilege is granted for any agent_alias on the channel.
+        // This is the path every pre-round-3 config falls into.
+        use zeroclaw_config::schema::Config;
+        let mut config = Config::default();
+        config.peer_groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice"], true),
+        );
+        let for_x = config.channel_agent_scope_admins("discord", "clamps", "agentX");
+        let for_y = config.channel_agent_scope_admins("discord", "clamps", "agentY");
+        assert_eq!(for_x, vec!["alice".to_string()]);
+        assert_eq!(for_y, vec!["alice".to_string()]);
+    }
+
+    // --- SSOT normalization + wildcard + leading-`@` + case-insensitive.
+    // The gate routes through `allowlist::is_user_allowed`, so the
+    // helpers below must mirror the inbound-channel normalization shape
+    // (strip leading `@`, ASCII-lowercase) and honor `["*"]` for the
+    // configured peer list. These tests pin that contract so a future
+    // refactor cannot silently fall back to the raw `==` shape that
+    // rejected correctly-configured admins. See issue #8044.
+
+    #[test]
+    fn normalize_peer_username_strips_leading_at_and_lowercases() {
+        assert_eq!(normalize_peer_username("@user_1"), "user_1");
+        assert_eq!(normalize_peer_username("user_1"), "user_1");
+        assert_eq!(normalize_peer_username("@Alice"), "alice");
+        assert_eq!(normalize_peer_username("ALICE"), "alice");
+        // Multiple leading `@` are collapsed to nothing: a config typo
+        // like "@@alice" still resolves to the bare identity.
+        assert_eq!(normalize_peer_username("@@alice"), "alice");
+        // Empty input stays empty (would deny everything downstream).
+        assert_eq!(normalize_peer_username(""), "");
+    }
+
+    #[test]
+    fn agent_scope_gate_matches_inbound_normalized_sender() {
+        // Telegram inbound path strips a leading `@` from the sender
+        // before calling `is_user_allowed`. The gate must accept a
+        // configured `"@user_1"` against a sender that arrived as
+        // `"user_1"` (no leading `@`).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "telegram_admins".into(),
+            peer_group("telegram.prod", &["@user_1"], true),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(
+            is_agent_scope_authorized(
+                &ctx,
+                &agent_scope_msg_with_channel("user_1", "telegram", "prod")
+            ),
+            "leading-`@` config entry must match Telegram's @-stripped sender identity"
+        );
+        // Without normalization, the raw `==` would deny this.
+    }
+
+    #[test]
+    fn agent_scope_gate_matches_case_insensitive_sender() {
+        // Inbound IRC and Matrix use `Match::CaseInsensitive`; the
+        // gate's ASCII-lowercase normalization must produce the same
+        // outcome so a configured `"Alice"` matches an inbound `"alice"`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "irc_admins".into(),
+            peer_group("irc.freenode", &["Alice"], true),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(
+            is_agent_scope_authorized(
+                &ctx,
+                &agent_scope_msg_with_channel("alice", "irc", "freenode")
+            ),
+            "configured `Alice` must match an inbound `alice` sender (RFC 2812 case-insensitive)"
+        );
+        assert!(
+            is_agent_scope_authorized(
+                &ctx,
+                &agent_scope_msg_with_channel("ALICE", "irc", "freenode")
+            ),
+            "configured `Alice` must match an inbound `ALICE` sender"
+        );
+    }
+
+    #[test]
+    fn agent_scope_gate_honors_wildcard_admin() {
+        // A peer group with `external_peers = ["*"]` is the documented
+        // wildcard: every sender on the channel is an admin. The raw
+        // `==` shape denied this; the SSOT shape admits it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "discord_open".into(),
+            peer_group("discord.clamps", &["*"], true),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(is_agent_scope_authorized(&ctx, &agent_scope_msg("anyone")));
+        assert!(is_agent_scope_authorized(
+            &ctx,
+            &agent_scope_msg("even_a_random_handle")
+        ));
+    }
+
+    fn agent_scope_msg_with_channel(
+        sender: &str,
+        channel: &str,
+        alias: &str,
+    ) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: sender.into(),
+            reply_target: "chan-1".into(),
+            channel: channel.into(),
+            channel_alias: Some(alias.into()),
+            thread_ts: None,
+            content: "/model --agent gpt-4o".into(),
+            ..Default::default()
+        }
+    }
+
+    // --- Dispatch-level wiring tests for the agent-scope authorization
+    // gate. These exercise `handle_runtime_command_if_needed` directly so
+    // a future refactor that drops `scope == OverrideScope::Agent &&
+    // !is_agent_scope_authorized(...)` from the dispatch site cannot
+    // silently re-open the hole — every helper-only test would still pass
+    // while the gate was bypassed. See issue #8044 review pass 2.
+
+    fn scope_user_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: sender.into(),
+            reply_target: "chan-1".into(),
+            channel: "discord".into(),
+            channel_alias: Some("clamps".into()),
+            thread_ts: None,
+            content: "/model --user gpt-4o".into(),
+            ..Default::default()
+        }
+    }
+
+    fn scope_agent_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: sender.into(),
+            reply_target: "chan-1".into(),
+            channel: "discord".into(),
+            channel_alias: Some("clamps".into()),
+            thread_ts: None,
+            content: "/model --agent gpt-4o".into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_agent_scope_writes_override_for_admin_sender() {
+        // Authorized sender: dispatch must reach the SetModelScoped(Agent)
+        // accept branch and write a scope override.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice"], true),
+        );
+        let ctx = Arc::new(channel_runtime_context_with_peer_groups(tmp.path(), groups));
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        let handled = handle_runtime_command_if_needed(
+            ctx.as_ref(),
+            &scope_agent_msg("alice"),
+            Some(&target),
+        )
+        .await;
+        assert!(handled, "agent-scope command must be handled by dispatch");
+
+        let overrides = ctx.scope_overrides.lock().unwrap();
+        assert_eq!(
+            overrides.len(),
+            1,
+            "authorized admin must produce exactly one scope override, got {overrides:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_agent_scope_rejects_unauthorized_sender_without_writing() {
+        // Unauthorized sender: dispatch must surface the rejection string
+        // and leave the override map empty. If the gate is dropped, the
+        // override would be written and this test would fail.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice"], true),
+        );
+        let ctx = Arc::new(channel_runtime_context_with_peer_groups(tmp.path(), groups));
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        let handled = handle_runtime_command_if_needed(
+            ctx.as_ref(),
+            &scope_agent_msg("mallory"),
+            Some(&target),
+        )
+        .await;
+        assert!(handled, "command must be handled even when rejected");
+
+        let overrides = ctx.scope_overrides.lock().unwrap();
+        assert!(
+            overrides.is_empty(),
+            "unauthorized sender must NOT write a scope override, got {overrides:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_user_scope_writes_override_regardless_of_admin_status() {
+        // The agent-scope gate must NOT affect `--user`. Even when the
+        // sender is not in any admin peer group, `/model --user` writes
+        // its override. This pins the gate's scope: only the Agent branch
+        // consults `is_agent_scope_authorized`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = Arc::new(channel_runtime_context_with_peer_groups(
+            tmp.path(),
+            std::collections::HashMap::new(),
+        ));
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        let handled = handle_runtime_command_if_needed(
+            ctx.as_ref(),
+            &scope_user_msg("mallory"),
+            Some(&target),
+        )
+        .await;
+        assert!(handled, "user-scope command must be handled");
+
+        let overrides = ctx.scope_overrides.lock().unwrap();
+        assert_eq!(
+            overrides.len(),
+            1,
+            "`/model --user` must write a scope override even when sender is not an admin, got {overrides:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_agent_scope_rejects_when_no_peer_groups_configured() {
+        // Default config (no peer_groups) — every sender must be denied.
+        // Without the gate this would silently write the override.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = Arc::new(channel_runtime_context_with_peer_groups(
+            tmp.path(),
+            std::collections::HashMap::new(),
+        ));
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        let handled = handle_runtime_command_if_needed(
+            ctx.as_ref(),
+            &scope_agent_msg("alice"),
+            Some(&target),
+        )
+        .await;
+        assert!(handled);
+
+        let overrides = ctx.scope_overrides.lock().unwrap();
+        assert!(
+            overrides.is_empty(),
+            "default-deny must produce zero overrides when no peer_groups are configured, got {overrides:?}"
+        );
+    }
+
     #[test]
     fn parse_runtime_command_maps_thinking_levels() {
         assert_eq!(
@@ -20741,6 +21889,10 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             block.contains("When responding on WhatsApp Web:"),
             "whatsapp block must identify itself"
+        );
+        assert!(
+            block.contains("[LOCATION:"),
+            "whatsapp block must include location pin instructions"
         );
         assert!(
             block.contains("[IMAGE:<path>]"),
@@ -23740,6 +24892,277 @@ This is an example JSON object for profile settings."#;
 
         assert!(!result.contains("AKIAABCDEFGHIJKLMNOP")); // gitleaks:allow
         assert!(result.contains("[REDACTED"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_markdown_link_destination_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "https://example.invalid/callback?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let result = sanitize_channel_response(&format!("[callback]({target})"), &tools);
+
+        assert!(result.contains(target), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_markdown_reference_destination_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "https://example.invalid/callback?api_key=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let response = format!("See [callback][cb]\n\n[cb]: {target}");
+
+        let result = sanitize_channel_response(&response, &tools);
+
+        assert!(result.contains(target), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_entity_escaped_markdown_destination_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target =
+            "https://example.invalid/callback?x=1&amp;token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let result = sanitize_channel_response(&format!("[callback]({target})"), &tools);
+
+        assert!(result.contains(target), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_protects_entity_destination_before_title_copy() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target =
+            "https://example.invalid/callback?x=1&amp;token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let title = "https://example.invalid/callback?x=1&token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let result =
+            sanitize_channel_response(&format!("[callback]({target} \"{title}\")"), &tools);
+
+        assert!(result.contains(target), "result: {result}");
+        assert!(!result.contains(title), "result: {result}");
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_protects_reference_destination_before_title_copy() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target =
+            "https://example.invalid/callback?x=1&amp;token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let title = "https://example.invalid/callback?x=1&token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let response = format!("See [callback][cb]\n\n[cb]: {target} \"{title}\"");
+
+        let result = sanitize_channel_response(&response, &tools);
+
+        assert!(result.contains(target), "result: {result}");
+        assert!(!result.contains(title), "result: {result}");
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_protects_url_entity_destination_before_title_copy() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target =
+            "https&colon;&sol;&sol;example.invalid/callback?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let title = "https://example.invalid/callback?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let result =
+            sanitize_channel_response(&format!("[callback]({target} \"{title}\")"), &tools);
+
+        assert!(result.contains(target), "result: {result}");
+        assert!(!result.contains(title), "result: {result}");
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_markdown_autolink_destination_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "https://api.telegram.org/bot123456:ABC-def_GHI/getUpdates";
+
+        let result = sanitize_channel_response(&format!("<{target}>"), &tools);
+
+        assert!(result.contains(target), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_still_scans_markdown_link_text() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let token = "aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let target = "https://example.invalid/callback?ticket=public-id";
+
+        let result = sanitize_channel_response(&format!("[token={token}]({target})"), &tools);
+
+        assert!(!result.contains(token));
+        assert!(result.contains(target), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_scans_link_text_secret_when_match_overlaps_destination() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "file:///tmp/report.md";
+
+        let result =
+            sanitize_channel_response(&format!("[password=longsecretvalue]({target})"), &tools);
+
+        assert!(!result.contains("longsecretvalue"));
+        assert!(result.contains(target), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_scans_link_text_when_label_matches_destination() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let result = sanitize_channel_response(&format!("[{target}]({target})"), &tools);
+
+        assert!(
+            !result.starts_with(&format!("[{target}]")),
+            "result: {result}"
+        );
+        assert!(result.contains(&format!("]({target})")), "result: {result}");
+        assert!(result.contains("[REDACTED"), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_escaped_markdown_destination_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "file:///tmp/report\\(1\\).md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+
+        let result = sanitize_channel_response(&format!("[report]({target})"), &tools);
+
+        assert!(result.contains(target), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_raw_file_uri_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let outbound = format!("Recorded {target}.");
+
+        let spans = channel_outbound_protected_spans(&outbound, OutboundContentFormat::Markdown);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| &outbound[span.start..span.end])
+                .collect::<Vec<_>>(),
+            vec![target],
+        );
+        let result = sanitize_channel_response(&outbound, &tools);
+
+        assert!(result.contains(target), "result: {result}");
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_keyed_raw_file_uri_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let outbound = format!("Recorded path={target}.");
+
+        let spans = channel_outbound_protected_spans(&outbound, OutboundContentFormat::Markdown);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| &outbound[span.start..span.end])
+                .collect::<Vec<_>>(),
+            vec![target],
+        );
+        let result = sanitize_channel_response(&outbound, &tools);
+
+        assert!(
+            result.contains(&format!("path={target}")),
+            "result: {result}"
+        );
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_json_keyed_raw_file_uri_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let outbound = format!(r#"{{"uri":"{target}"}}"#);
+
+        let spans = channel_outbound_protected_spans(&outbound, OutboundContentFormat::Markdown);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| &outbound[span.start..span.end])
+                .collect::<Vec<_>>(),
+            vec![target],
+        );
+        let result = sanitize_channel_response(&outbound, &tools);
+
+        assert!(result.contains(target), "result: {result}");
+    }
+
+    #[test]
+    fn plain_text_leak_guard_preserves_raw_file_uri_filenames() {
+        let target = "file:///home/zeroclaw/.zeroclaw/agents/mission-orchestrator/workspace/tasks/inbox/2026-07-02-11-26-plan-b-for-something-useful.md";
+        let outbound = format!("Recorded {target}.");
+
+        let result = redact_channel_outbound_leaks(
+            &outbound,
+            &zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::PlainText,
+        );
+
+        assert_eq!(result, outbound);
+    }
+
+    #[test]
+    fn irc_family_outbound_format_is_plain_text() {
+        assert_eq!(
+            outbound_content_format_for_channel("irc.default"),
+            OutboundContentFormat::PlainText
+        );
+        assert_eq!(
+            outbound_content_format_for_channel("twitch.default"),
+            OutboundContentFormat::PlainText
+        );
+        assert_eq!(
+            outbound_content_format_for_channel("twitch"),
+            OutboundContentFormat::PlainText
+        );
+        assert_eq!(
+            outbound_content_format_for_channel("telegram.default"),
+            OutboundContentFormat::Markdown
+        );
+    }
+
+    #[test]
+    fn sanitize_channel_response_respects_disabled_leak_detection() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let leaked = "Temporary key: AKIAABCDEFGHIJKLMNOP"; // gitleaks:allow
+        let leak_detection = zeroclaw_config::schema::LeakDetectionConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        let result = sanitize_channel_response_with_leak_detection(leaked, &tools, &leak_detection);
+
+        assert_eq!(result, leaked);
+    }
+
+    #[test]
+    fn leak_only_guard_preserves_protocol_looking_announcement_text() {
+        let input = "[Used tools: shell]\n\nCron output completed.";
+
+        let result = redact_channel_outbound_leaks(
+            input,
+            &zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+        );
+
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn leak_only_guard_preserves_raw_file_uri_credentials() {
+        let target = "file:///tmp/report.md?token=aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let input = format!("Cron output: {target}");
+
+        let result = redact_channel_outbound_leaks(
+            &input,
+            &zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+        );
+
+        assert!(result.contains(target), "result: {result}");
     }
 
     #[test]

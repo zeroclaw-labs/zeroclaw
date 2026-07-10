@@ -13168,6 +13168,7 @@ dependencies = [
  "tokio-tungstenite 0.29.0",
  "tokio-util",
  "toml 1.1.2+spec-1.1.0",
+ "url",
  "urlencoding",
  "uuid",
  "wacore",
@@ -13188,6 +13189,13 @@ dependencies = [
  "zeroclaw-spawn",
  "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
+]
+
+[[package]]
+name = "zeroclaw-commands"
+version = "0.8.2"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
