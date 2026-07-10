@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Plus } from 'lucide-react';
+import { Plus, Undo2 } from 'lucide-react';
 import { t } from '@/lib/i18n';
 import {
   runStateTone,
@@ -191,6 +191,8 @@ interface Props {
   onConnectData: (fromStep: number, fromPin: string, toStep: number, toPin: string) => void;
   onDisconnectData: (toStep: number, toPin: string) => void;
   onMoveNode?: (step: number, x: number, y: number) => void;
+  onUndo?: () => void;
+  canUndo?: boolean;
 }
 
 type ContextMenu = { x: number; y: number; step: number | null };
@@ -298,6 +300,8 @@ export default function SopCanvas({
   onConnectData,
   onDisconnectData,
   onMoveNode,
+  onUndo,
+  canUndo = false,
 }: Props) {
   const [pos, setPos] = useState<Map<number, XY>>(() => seedPositions(graph));
   const [drag, setDrag] = useState<{ step: number; dx: number; dy: number } | null>(null);
@@ -488,6 +492,17 @@ export default function SopCanvas({
     <div ref={scrollRef} className="relative overflow-auto rounded-[var(--radius-lg)] border border-pc-border bg-pc-bg-base">
       {readOnly ? null : (
         <div className="absolute right-2 top-2 z-10 flex gap-1">
+          {onUndo ? (
+            <button
+              type="button"
+              onClick={onUndo}
+              disabled={!canUndo}
+              title={t('sops.undo_hint')}
+              className="inline-flex items-center gap-1 rounded border border-pc-border bg-pc-surface px-2 py-1 text-xs text-pc-text-muted hover:text-pc-text disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Undo2 className="h-3.5 w-3.5" aria-hidden /> {t('sops.undo')}
+            </button>
+          ) : null}
           <button
             type="button"
             onClick={onAddStep}

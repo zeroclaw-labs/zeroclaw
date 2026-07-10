@@ -1646,6 +1646,11 @@ export function SopEditor() {
   const [draft, setDraft] = useState<Sop | null>(loadStoredDraft);
   const [editingName, setEditingName] = useState<string | null>(loadStoredEditingName);
   const [draftGraph, setDraftGraph] = useState<SopGraph | null>(null);
+  // Undo stack of pre-mutation draft snapshots. Every canvas edit (wire
+  // connect/disconnect, data binding, node move) snapshots the draft here
+  // before it mutates, so a single stack undoes them all uniformly.
+  const undoStackRef = useRef<Sop[]>([]);
+  const [undoDepth, setUndoDepth] = useState(0);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [selectedStep, setSelectedStep] = useState<number | null>(null);
@@ -1742,23 +1747,64 @@ export function SopEditor() {
 
   const runCallsByStep = useMemo(() => overlayCallsByStep(latestOverlay), [latestOverlay]);
 
-  const onConnect = useCallback((from: number, to: number, kind: WireRole, portIndex?: number) => {
-    setDraft((d) => {
-      if (!d) return d;
-      wireDraft(d, { op: 'connect', from, to, role: kind, port: portIndex })
-        .then((res) => {
-          setDraft(res.sop);
-          setDraftGraph(res.graph);
-        })
-        .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
-      return d;
-    });
+  // Snapshot the current draft before a canvas mutation so it can be undone.
+  const pushUndo = useCallback((snapshot: Sop) => {
+    const stack = undoStackRef.current;
+    stack.push(snapshot);
+    // Bound the history so a long editing session cannot grow unbounded.
+    if (stack.length > 50) stack.shift();
+    setUndoDepth(stack.length);
   }, []);
+
+  const undo = useCallback(() => {
+    const prev = undoStackRef.current.pop();
+    setUndoDepth(undoStackRef.current.length);
+    if (!prev) return;
+    setSaveError(null);
+    setDraft(prev);
+    graphDraft(prev)
+      .then(setDraftGraph)
+      .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
+  }, []);
+
+  // Ctrl+Z / Cmd+Z undoes the last canvas edit while an editor is open, unless
+  // the user is typing in an input where the browser's native undo should win.
+  useEffect(() => {
+    if (!draft) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.key === 'z' || e.key === 'Z') || !(e.ctrlKey || e.metaKey) || e.shiftKey) return;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || target?.isContentEditable) return;
+      e.preventDefault();
+      undo();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [draft, undo]);
+
+  const onConnect = useCallback(
+    (from: number, to: number, kind: WireRole, portIndex?: number) => {
+      setDraft((d) => {
+        if (!d) return d;
+        pushUndo(d);
+        wireDraft(d, { op: 'connect', from, to, role: kind, port: portIndex })
+          .then((res) => {
+            setDraft(res.sop);
+            setDraftGraph(res.graph);
+          })
+          .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
+        return d;
+      });
+    },
+    [pushUndo],
+  );
 
   const onDisconnect = useCallback(
     (from: number, to: number, kind: WireRole, portIndex?: number) => {
       setDraft((d) => {
         if (!d) return d;
+        pushUndo(d);
         wireDraft(d, { op: 'disconnect', from, to, role: kind, port: portIndex })
           .then((res) => {
             setDraft(res.sop);
@@ -1768,7 +1814,7 @@ export function SopEditor() {
         return d;
       });
     },
-    [],
+    [pushUndo],
   );
 
   const onConnectData = useCallback(
@@ -1776,6 +1822,7 @@ export function SopEditor() {
       const binding = `{{steps.${fromStep}.${fromPin}}}`;
       setDraft((d) => {
         if (!d) return d;
+        pushUndo(d);
         const next = writeStepBinding(d, toStep, toPin, binding);
         graphDraft(next)
           .then((g) => {
@@ -1786,22 +1833,26 @@ export function SopEditor() {
         return next;
       });
     },
-    [],
+    [pushUndo],
   );
 
-  const onDisconnectData = useCallback((toStep: number, toPin: string) => {
-    setDraft((d) => {
-      if (!d) return d;
-      const next = writeStepBinding(d, toStep, toPin, null);
-      graphDraft(next)
-        .then((g) => {
-          setDraft(next);
-          setDraftGraph(g);
-        })
-        .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
-      return next;
-    });
-  }, []);
+  const onDisconnectData = useCallback(
+    (toStep: number, toPin: string) => {
+      setDraft((d) => {
+        if (!d) return d;
+        pushUndo(d);
+        const next = writeStepBinding(d, toStep, toPin, null);
+        graphDraft(next)
+          .then((g) => {
+            setDraft(next);
+            setDraftGraph(g);
+          })
+          .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)));
+        return next;
+      });
+    },
+    [pushUndo],
+  );
 
   useEffect(() => {
     if (!draft) {
@@ -1840,6 +1891,8 @@ export function SopEditor() {
 
   const close = useCallback(
     (toName?: string) => {
+      undoStackRef.current = [];
+      setUndoDepth(0);
       setDraft(null);
       setEditingName(null);
       navigate(toName ? `/sops/${encodeURIComponent(toName)}` : '/sops');
@@ -1893,10 +1946,13 @@ export function SopEditor() {
             steps: d.steps.map((s, j) => (j === i ? { ...s, ...patch } : s)),
           })),
         onMoveNode: (step: number, x: number, y: number) =>
-          mutateDraft((d) => ({
-            ...d,
-            steps: d.steps.map((s) => (s.number === step ? { ...s, pos: { x, y } } : s)),
-          })),
+          mutateDraft((d) => {
+            pushUndo(d);
+            return {
+              ...d,
+              steps: d.steps.map((s) => (s.number === step ? { ...s, pos: { x, y } } : s)),
+            };
+          }),
         onAddStep: () =>
           mutateDraft((d) => ({ ...d, steps: [...d.steps, blankStep(d.steps.length + 1)] })),
         onRemoveStep: (i: number) =>
@@ -1972,6 +2028,8 @@ export function SopEditor() {
               onConnectData={onConnectData}
               onDisconnectData={onDisconnectData}
               onMoveNode={editorHandlers.onMoveNode}
+              onUndo={undo}
+              canUndo={undoDepth > 0}
             />
           ) : null}
         </div>

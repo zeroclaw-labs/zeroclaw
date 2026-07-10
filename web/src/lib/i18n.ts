@@ -1060,6 +1060,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'sops.field_priority': 'Priority',
     'sops.field_execution_mode': 'Execution mode',
     'sops.add_step': 'Add step',
+    'sops.undo': 'Undo',
+    'sops.undo_hint': 'Undo the last canvas edit (Ctrl+Z)',
     'sops.linking': 'Linking',
     'sops.link_hint': 'click a target node',
     'sops.untitled': 'untitled',
