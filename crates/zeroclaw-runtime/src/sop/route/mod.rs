@@ -211,7 +211,9 @@ mod tests {
         run.current_step = 1;
         run.total_steps = 3;
         let mut run_data = RunData::default();
-        run_data.outputs.insert(1, serde_json::json!({"remaining": 0}));
+        run_data
+            .outputs
+            .insert(1, serde_json::json!({"remaining": 0}));
         let ctx = RouteCtx {
             sop: &sop,
             run: &run,
@@ -231,7 +233,9 @@ mod tests {
         let mut run = run();
         run.current_step = 2;
         let mut run_data = RunData::default();
-        run_data.outputs.insert(2, serde_json::json!({"remaining": 0}));
+        run_data
+            .outputs
+            .insert(2, serde_json::json!({"remaining": 0}));
         let ctx = RouteCtx {
             sop: &sop,
             run: &run,
