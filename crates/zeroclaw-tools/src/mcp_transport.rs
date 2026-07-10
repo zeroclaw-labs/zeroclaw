@@ -18,6 +18,10 @@ const MAX_LINE_BYTES: usize = 4 * 1024 * 1024; // 4 MB
 /// Timeout for init/list operations.
 const RECV_TIMEOUT_SECS: u64 = 30;
 
+/// Grace period to let a stdio MCP server exit on its own before it is
+/// force-killed during reaping.
+const REAP_GRACE_MS: u64 = 200;
+
 /// Legacy default HTTP request timeout for non-tool MCP HTTP/SSE requests.
 const DEFAULT_HTTP_REQUEST_TIMEOUT_SECS: u64 = 120;
 
@@ -101,7 +105,7 @@ pub trait McpTransportConn: Send + Sync {
     /// Check whether the underlying transport is still alive without sending a
     /// real request.  The HTTP and SSE transports always return `Ok(true)` —
     /// connection drops surface through `send_and_recv` errors.  The stdio
-    /// transport verifies the child process is still running via `try_wait()`.
+    /// transport reports whether its server process is still being supervised.
     fn health_check(&mut self) -> bool {
         true
     }
@@ -113,14 +117,34 @@ pub trait McpTransportConn: Send + Sync {
 // ── Stdio Transport ──────────────────────────────────────────────────────
 
 /// Stdio-based transport (spawn local process).
+///
+/// The spawned server process is owned by a dedicated monitor task
+/// ([`spawn_child_reaper`]), not by this struct, so it is reaped the moment it
+/// exits — on its own (idle after a response, crash, or timeout) or on teardown
+/// — without depending on a later request polling its stdout. Servers here are
+/// pooled for the daemon's lifetime, so one that is never polled again would
+/// otherwise stay defunct until shutdown.
 pub struct StdioTransport {
-    _child: Child,
+    /// Asks the monitor task to shut the server down (graceful exit within a
+    /// grace period, then force-kill). Sending on it — or dropping it when the
+    /// transport is dropped — triggers reaping; a server that exits on its own
+    /// is reaped by the task regardless.
+    kill_tx: Option<oneshot::Sender<()>>,
     stdin: tokio::process::ChildStdin,
     stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
 }
 
 impl StdioTransport {
     pub fn new(config: &McpServerConfig) -> Result<Self> {
+        Ok(Self::spawn_with_observed_pid(config)?.0)
+    }
+
+    /// Spawn the server, returning the transport together with the OS pid
+    /// observed at the point ownership of the `Child` passes to the monitor
+    /// task. The pid is handed back for one-shot observation (the reap
+    /// regressions) and deliberately not stored on the transport: the process
+    /// identity belongs to the `Child` the task owns.
+    fn spawn_with_observed_pid(config: &McpServerConfig) -> Result<(Self, Option<u32>)> {
         let mut child = Command::new(&config.command)
             .args(&config.args)
             .envs(&config.env)
@@ -159,11 +183,16 @@ impl StdioTransport {
         })?;
         let stdout_lines = BufReader::new(stdout).lines();
 
-        Ok(Self {
-            _child: child,
-            stdin,
-            stdout_lines,
-        })
+        let (kill_tx, pid) = spawn_child_reaper(child, config.name.clone());
+
+        Ok((
+            Self {
+                kill_tx: Some(kill_tx),
+                stdin,
+                stdout_lines,
+            },
+            pid,
+        ))
     }
 
     async fn send_raw(&mut self, line: &str) -> Result<()> {
@@ -181,6 +210,8 @@ impl StdioTransport {
 
     async fn recv_raw(&mut self) -> Result<String> {
         let line = self.stdout_lines.next_line().await?.ok_or_else(|| {
+            // A closed stdout means the server has exited; the monitor task
+            // reaps it independently of this read path.
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -235,16 +266,119 @@ impl McpTransportConn for StdioTransport {
     }
 
     async fn close(&mut self) -> Result<()> {
+        // Signal EOF so a well-behaved server exits (and reaps its own
+        // children), then ask the monitor task to reap it — force-killing only
+        // if it overstays the grace period. The reap runs in the task and its
+        // outcome is logged there, so this returns once shutdown is requested.
         let _ = self.stdin.shutdown().await;
+        if let Some(tx) = self.kill_tx.take() {
+            let _ = tx.send(());
+        }
         Ok(())
     }
 
     fn health_check(&mut self) -> bool {
-        // Verify the child process is still running via try_wait().
-        // Returns true only when the process is alive (has not exited).
-        self._child
-            .try_wait()
-            .map_or(true, |status| status.is_none())
+        // The monitor task owns the child and holds the receiving end of the
+        // shutdown channel for exactly as long as it supervises the process, so
+        // the channel is open while the server is alive. Once the process exits
+        // and is reaped the task finishes, the receiver drops, and the sender
+        // reports closed. A transport already asked to shut down has no sender
+        // left and is likewise not alive.
+        self.kill_tx.as_ref().is_some_and(|tx| !tx.is_closed())
+    }
+}
+
+/// Spawn a task that owns `child` and reaps it as soon as it exits, so a
+/// finished stdio MCP server never lingers as a zombie under the daemon.
+/// Reaping is deliberately independent of any request I/O: the task `wait()`s
+/// on the process directly, covering idle-after-response, crash, and timeout
+/// exits that the read/write paths would never observe.
+///
+/// Sending on the returned channel — or dropping it — asks the task to shut the
+/// server down: it allows a graceful exit within [`REAP_GRACE_MS`], then
+/// force-kills and reaps. This task is the single owner of the child's
+/// lifecycle and reaps it exactly once on every path, so no other code needs to
+/// wait on the process.
+///
+/// Returns the shutdown channel and the pid observed as ownership is taken, so
+/// callers can identify the process without keeping a copy of it alongside this
+/// task's `Child`.
+fn spawn_child_reaper(mut child: Child, server_name: String) -> (oneshot::Sender<()>, Option<u32>) {
+    let pid = child.id();
+    let (kill_tx, kill_rx) = oneshot::channel::<()>();
+    zeroclaw_spawn::spawn!(async move {
+        let asked_to_stop = tokio::select! {
+            result = child.wait() => {
+                log_reap_result(&server_name, pid, result);
+                false
+            }
+            _ = kill_rx => true,
+        };
+        if asked_to_stop {
+            // Teardown requested: let it exit on its own first, then force it.
+            match timeout(Duration::from_millis(REAP_GRACE_MS), child.wait()).await {
+                Ok(result) => log_reap_result(&server_name, pid, result),
+                Err(_) => {
+                    // Grace elapsed without a clean exit. Force-kill and reap in
+                    // one bounded step: `Child::kill` sends the signal and waits
+                    // for the child together, so a real kill failure surfaces as
+                    // an error instead of turning into an unbounded wait on a
+                    // process we could not signal.
+                    match child.kill().await {
+                        Ok(()) => log_reap_result(&server_name, pid, child.wait().await),
+                        Err(err) => ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "mcp_server": &server_name,
+                                "pid": pid,
+                                "error": err.to_string(),
+                            })),
+                            "mcp_transport: failed to force-kill stdio MCP server process"
+                        ),
+                    }
+                }
+            }
+        }
+    });
+    (kill_tx, pid)
+}
+
+/// Record the outcome of reaping a stdio MCP server process. A `wait()` error
+/// means the process could not be reaped and would leak, so it is surfaced at
+/// `ERROR` with the server name and pid rather than discarded.
+fn log_reap_result(
+    server_name: &str,
+    pid: Option<u32>,
+    result: std::io::Result<std::process::ExitStatus>,
+) {
+    match result {
+        Ok(status) => ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "mcp_server": server_name,
+                    "pid": pid,
+                    "exit_status": status.to_string(),
+                })
+            ),
+            "mcp_transport: reaped stdio MCP server process"
+        ),
+        Err(err) => ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "mcp_server": server_name,
+                    "pid": pid,
+                    "error": err.to_string(),
+                })),
+            "mcp_transport: failed to reap stdio MCP server process"
+        ),
     }
 }
 
@@ -1462,6 +1596,207 @@ mod tests {
         };
         let result = create_transport(&config);
         assert!(result.is_err());
+    }
+
+    /// Polls until `pid` has fully disappeared from the process table, proving
+    /// the process was reaped. This is stronger than "not a zombie": a lingering
+    /// zombie stays visible with state `Z`, and a still-running process stays
+    /// visible in some other state, so only genuine reaping empties the output.
+    /// Returns `false` if the pid is still present after the timeout.
+    #[cfg(unix)]
+    async fn wait_until_reaped(pid: u32) -> bool {
+        for _ in 0..200 {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .expect("run ps");
+            if String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    // A stdio MCP server process must be reaped once it exits, independent of
+    // any later request I/O, plus on close and on drop.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_server_reaped_after_idle_response() {
+        // Server answers one request then exits; the transport then goes idle
+        // and never reads stdout again. The monitor task must still reap it —
+        // this is the case a read-driven reaper misses.
+        let config = McpServerConfig {
+            name: "reap-idle".into(),
+            transport: McpTransport::Stdio,
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "IFS= read -r _line; printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\\n'; exit 0"
+                    .into(),
+            ],
+            ..Default::default()
+        };
+        let (mut transport, pid) =
+            StdioTransport::spawn_with_observed_pid(&config).expect("spawn stdio server");
+        let pid = pid.expect("pid");
+
+        let req = JsonRpcRequest::new(1, "ping", serde_json::json!({}));
+        let resp = transport.send_and_recv(&req).await.expect("response");
+        assert_eq!(resp.id, Some(serde_json::json!(1)));
+
+        assert!(
+            wait_until_reaped(pid).await,
+            "MCP server pid {pid} not reaped after an idle response"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_server_reaped_after_exit_without_response() {
+        // Models a read that returns/cancels with the server gone (e.g. a
+        // timed-out request whose server then exits): reaping must not depend on
+        // further I/O on the transport.
+        let config = McpServerConfig {
+            name: "reap-noresp".into(),
+            transport: McpTransport::Stdio,
+            command: "sh".into(),
+            args: vec!["-c".into(), "IFS= read -r _line; exit 0".into()],
+            ..Default::default()
+        };
+        let (mut transport, pid) =
+            StdioTransport::spawn_with_observed_pid(&config).expect("spawn stdio server");
+        let pid = pid.expect("pid");
+
+        let req = JsonRpcRequest::new(1, "ping", serde_json::json!({}));
+        let _ = transport.send_and_recv(&req).await; // errors: server exited
+
+        assert!(
+            wait_until_reaped(pid).await,
+            "MCP server pid {pid} not reaped after it exited without responding"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_server_reaped_after_canceled_read_timeout() {
+        // Mirrors the outer tool timeout in `McpServer::call_tool`: the server is
+        // still alive when an outer `timeout` cancels the in-flight `recv_raw()`
+        // and drops the `send_and_recv` future, while the transport stays pooled.
+        // The server exits only afterwards, so the read never observes its exit.
+        // The monitor task must still reap it.
+        let config = McpServerConfig {
+            name: "reap-timeout".into(),
+            transport: McpTransport::Stdio,
+            command: "sh".into(),
+            // Read the request, stay alive past the outer timeout, then exit.
+            args: vec!["-c".into(), "IFS= read -r _line; sleep 0.3; exit 0".into()],
+            ..Default::default()
+        };
+        let (mut transport, pid) =
+            StdioTransport::spawn_with_observed_pid(&config).expect("spawn stdio server");
+        let pid = pid.expect("pid");
+
+        let req = JsonRpcRequest::new(1, "ping", serde_json::json!({}));
+        // Cancel the read well before the server exits: the future is dropped but
+        // the transport (and its monitor task) are retained.
+        let timed_out = timeout(Duration::from_millis(50), transport.send_and_recv(&req))
+            .await
+            .is_err();
+        assert!(
+            timed_out,
+            "read should have been canceled by the outer timeout"
+        );
+
+        // Reaping must come from the server's own later exit, not from any
+        // further I/O, close(), or drop of the still-retained transport.
+        assert!(
+            wait_until_reaped(pid).await,
+            "MCP server pid {pid} not reaped after a canceled-read timeout"
+        );
+        drop(transport);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_health_check_follows_server_lifetime() {
+        // Liveness is derived from the monitor task rather than from a `Child`
+        // the transport owns, so it must still report a live server as healthy
+        // and flip once that server exits and is reaped.
+        let config = McpServerConfig {
+            name: "health-lifetime".into(),
+            transport: McpTransport::Stdio,
+            command: "sh".into(),
+            args: vec!["-c".into(), "cat".into()],
+            ..Default::default()
+        };
+        let (mut transport, pid) =
+            StdioTransport::spawn_with_observed_pid(&config).expect("spawn stdio server");
+        let pid = pid.expect("pid");
+
+        assert!(
+            transport.health_check(),
+            "a running server must report healthy"
+        );
+
+        transport.close().await.expect("close");
+        assert!(
+            wait_until_reaped(pid).await,
+            "MCP server pid {pid} not reaped after close()"
+        );
+        assert!(
+            !transport.health_check(),
+            "a reaped server must not report healthy"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_close_reaps_server_process() {
+        // `cat` stays alive until its stdin is closed, so close() drives the
+        // graceful-exit-then-reap path.
+        let config = McpServerConfig {
+            name: "reap-on-close".into(),
+            transport: McpTransport::Stdio,
+            command: "sh".into(),
+            args: vec!["-c".into(), "cat".into()],
+            ..Default::default()
+        };
+        let (mut transport, pid) =
+            StdioTransport::spawn_with_observed_pid(&config).expect("spawn stdio server");
+        let pid = pid.expect("pid");
+
+        transport.close().await.expect("close");
+
+        assert!(
+            wait_until_reaped(pid).await,
+            "MCP server pid {pid} not reaped after close()"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_drop_reaps_server_process() {
+        // Dropping the transport without calling close() must still reap: the
+        // dropped kill channel signals the monitor task.
+        let config = McpServerConfig {
+            name: "reap-on-drop".into(),
+            transport: McpTransport::Stdio,
+            command: "sh".into(),
+            args: vec!["-c".into(), "cat".into()],
+            ..Default::default()
+        };
+        let (transport, pid) =
+            StdioTransport::spawn_with_observed_pid(&config).expect("spawn stdio server");
+        let pid = pid.expect("pid");
+
+        drop(transport);
+
+        assert!(
+            wait_until_reaped(pid).await,
+            "MCP server pid {pid} not reaped after the transport was dropped"
+        );
     }
 
     #[test]
